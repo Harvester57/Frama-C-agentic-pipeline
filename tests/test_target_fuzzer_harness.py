@@ -13,6 +13,7 @@ import pytest
 import fuzz_dictionary
 import generate_harness as G
 import run_eacsl_fuzz as R
+import sandbox_exec
 from sandbox_exec import SandboxResult
 from validate_artifacts import schema_warning
 
@@ -381,7 +382,7 @@ def test_campaign_passes_extra_corpus_dirs_in_order_and_skips_missing(tmp_path: 
         calls.append(list(cmd))
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
     binary = tmp_path / "fuzz_mod"
     binary.write_bytes(b"\x7fELF")

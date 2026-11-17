@@ -57,6 +57,8 @@ known-first-party = [
     "function_facts",
     "function_slice",
     "fuzz_assets",
+    "fuzz_build",
+    "fuzz_common",
     "fuzz_dictionary",
     "generate_harness",
     "generate_report",

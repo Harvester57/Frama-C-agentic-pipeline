@@ -14,8 +14,10 @@ import pytest
 
 import cache
 import eacsl_toolchain as T
+import fuzz_build
 import run_eacsl_fuzz as R
 import run_eva_slice
+import sandbox_exec
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 EACSL_MARKER_BYTES = b"\x7fELF...__e_acsl_assert...eacsl_store_block"
@@ -420,7 +422,7 @@ class FakeToolchain:
 
 @pytest.fixture
 def modern_cli(monkeypatch):
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
     monkeypatch.setattr(T.shutil, "which", lambda name: None)
 
 
@@ -512,7 +514,7 @@ def test_agent_scratch_and_selftest_builds_are_never_cached(run, modern_cli, mon
     assert res["returncode"] == 0 and res["cache"] == {"hit": False, "key": None}
     assert not any("-M" in c for c in fake.calls)
 
-    monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0")
+    monkeypatch.setattr(fuzz_build, "framac_version", lambda runner=None: "33.0")
     selftest = R.run_selftest(
         Path("workspace/eacsl_selftest"),
         runner=FakeToolchain(),
@@ -764,7 +766,7 @@ def test_guardrail_verdict_cache_hits_and_invalidates_on_corpus_change(run, monk
         calls.append(list(cmd))
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_sandbox)
     binary = run / "workspace" / "harnesses" / "guard_mod.e-acsl"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_bytes(EACSL_MARKER_BYTES)
@@ -804,7 +806,7 @@ def test_parent_guard_ignores_run_store_verdict_cache(run, tmp_path, monkeypatch
         calls.append(list(cmd))
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_sandbox)
     binary = run / "state" / "parent_guard" / "guard_mod.e-acsl"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_bytes(EACSL_MARKER_BYTES)

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import run_eacsl_fuzz as R
 
 LIB_UNIT = "lib/libkv.a"
@@ -287,7 +288,7 @@ def test_build_module_binary_records_stubbed_and_unresolved_globals(tmp_path: Pa
             return {"engine": "sanitizers", "returncode": 1, "stderr": _undefined(missing, "G_NoType")}
         return {"engine": "sanitizers", "returncode": 0, "binary": str(out)}
 
-    monkeypatch.setattr(R, "compile_sanitizer_binary", fake_compile)
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", fake_compile)
     out = R.build_module_binary(
         ["workspace/work/lib/a.c"], out_bin, engine="sanitizers", dag_path=dag_path, link_module="libkv_a"
     )
@@ -309,7 +310,7 @@ def test_build_module_binary_reports_a_global_it_cannot_define(tmp_path: Path, m
     dag_path = _run_dir(tmp_path)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_sanitizer_binary",
         lambda srcs, out, *a, **k: {"engine": "sanitizers", "returncode": 1, "stderr": _undefined("G_NoType")},
     )

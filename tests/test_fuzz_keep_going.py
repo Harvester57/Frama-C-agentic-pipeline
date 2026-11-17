@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import run_eacsl_fuzz as R
+import sandbox_exec
 from generate_harness import DISPATCH_SKIP_MACRO, _build_invocations
 from sandbox_exec import SandboxResult
 
@@ -299,7 +301,7 @@ def test_fork_mode_command_and_replay_cap(tmp_path, monkeypatch):
                 Path(f"{prefix}crash-{i:03d}").write_bytes(bytes([i]))
         return SandboxResult(1, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
     binary = tmp_path / "fuzz_mod"
     binary.write_bytes(b"\x7fELF")
@@ -359,7 +361,7 @@ def _dual_campaign(tmp_path, monkeypatch, engine: str, san_rc: int = 0) -> tuple
         calls.append((str(binary), max_time))
         return {"status": "clean", "returncode": 0, "artifacts": []}
 
-    monkeypatch.setattr(R, "build_module_binary", fake_build)
+    monkeypatch.setattr(fuzz_build, "build_module_binary", fake_build)
     monkeypatch.setattr(R, "run_fuzz_campaign", fake_campaign)
     out_json = tmp_path / "out.json"
     argv = ["campaign", "--module", "mod", "--sources", "src.c", "harness_mod.c", "--out-bin", "fuzz_mod"]
@@ -648,8 +650,8 @@ def test_runtime_skip_without_the_environ_shim_falls_back_to_skip_rebuilds(tmp_p
     )
     builds: list = []
     envs: list = []
-    monkeypatch.setattr(R, "build_module_binary", _fake_build_recording(builds, environ_keep))
-    monkeypatch.setattr(R, "run_sandboxed", _two_crash_rounds(envs))
+    monkeypatch.setattr(fuzz_build, "build_module_binary", _fake_build_recording(builds, environ_keep))
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", _two_crash_rounds(envs))
     out_json = tmp_path / "reports" / "fuzz.json"
     argv = ["campaign", "--module", "mod", "--sources", str(src), gen["harness_file"], "--out-bin", "fuzz_mod"]
     argv += ["--corpus-dir", "corpus", "--artifacts-dir", "crashes", "--workers", "1", "--max-time", "240"]
@@ -736,8 +738,8 @@ def test_campaign_mode_runtime_skip_never_rebuilds_and_legacy_rebuild_preserves_
             return SandboxResult(1, "", "", False, "rlimits", list(cmd))
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "build_module_binary", fake_build)
-    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    monkeypatch.setattr(fuzz_build, "build_module_binary", fake_build)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_sandbox)
 
     out_json = tmp_path / "reports" / "fuzz_new.json"
     rc = R.main(
@@ -820,7 +822,7 @@ def test_campaign_mode_runtime_skip_never_rebuilds_and_legacy_rebuild_preserves_
 def test_eacsl_stage2_links_environ_keep_shim_when_getenv_present(tmp_path, monkeypatch):
     from subprocess import CompletedProcess
 
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("/usr/bin/e-acsl-gcc", True))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("/usr/bin/e-acsl-gcc", True))
     src = tmp_path / "src.c"
     src.write_text("int target(int x) { return x; }\n", encoding="utf-8")
 

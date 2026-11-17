@@ -12,8 +12,10 @@ from pathlib import Path
 import pytest
 
 import eacsl_toolchain as T
+import fuzz_build
 import ledger
 import run_eacsl_fuzz as R
+import sandbox_exec
 from conftest import makefile_rule, makefile_rules
 from framac_common import scan_undeclared_functions
 from sandbox_exec import SandboxResult
@@ -113,7 +115,7 @@ def test_register_define_stays_in_the_eacsl_build():
     # Harness cppflags also feed Eva and WP: no harness generator, Make template or other phase adds it.
     files = [*(REPO / "scripts").glob("*.py"), *(REPO / "templates").rglob("*.*")]
     owners = sorted(p.name for p in files if p.is_file() and b"-Dregister=" in p.read_bytes())
-    assert owners == ["eacsl_toolchain.py", "run_eacsl_fuzz.py"]
+    assert owners == ["eacsl_toolchain.py", "fuzz_build.py"]
 
 
 def test_eacsl_math_shim_maps_type_generic_dispatch_and_signbit_for_eacsl_only():
@@ -176,7 +178,7 @@ class FakeEacslGcc:
 
 @pytest.fixture
 def modern_cli(monkeypatch):
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
     monkeypatch.setattr(T.shutil, "which", lambda name: None)  # no clang preprocessing in unit tests
 
 
@@ -237,7 +239,7 @@ def test_check_options_are_part_of_the_build_cache_key(tmp_path, modern_cli, mon
 
     with_checks = material()
     assert with_checks is not None and with_checks["check_options"] == list(T.EACSL_GCC_CHECK_OPTIONS)
-    monkeypatch.setattr(R, "EACSL_GCC_CHECK_OPTIONS", ())
+    monkeypatch.setattr(fuzz_build, "EACSL_GCC_CHECK_OPTIONS", ())
     assert material() != with_checks
 
 
@@ -584,7 +586,7 @@ def test_campaign_cli_threads_no_libc_checks(tmp_path, monkeypatch):
             "reduced_checks": [T.EACSL_NO_LIBC_CHECKS],
         }
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", fake_compile)
     monkeypatch.setattr(R, "run_fuzz_campaign", lambda *a, **k: {"status": "clean", "artifacts": []})
     monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path, "--no-libc-checks"))
     R.main()
@@ -617,7 +619,7 @@ def test_campaign_cli_threads_no_rte_initialized(tmp_path, monkeypatch):
             "reduced_checks": ["-no-rte-initialized"],
         }
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", fake_compile)
     monkeypatch.setattr(R, "run_fuzz_campaign", lambda *a, **k: {"status": "clean", "artifacts": []})
     monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path, "--no-rte-initialized"))
     R.main()
@@ -683,7 +685,7 @@ def test_variadic_fallbacks_are_linked_from_a_separate_object(tmp_path, modern_c
 
 
 def test_legacy_cli_also_normalizes(tmp_path, monkeypatch):
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc.sh", False))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc.sh", False))
     monkeypatch.setattr(T.shutil, "which", lambda name: None)
     calls = []
 
@@ -1228,7 +1230,7 @@ def test_differential_replay_attributes_unlocated_eacsl_crash(tmp_path, monkeypa
         (artifacts / "crash-abc").write_bytes(b"FC33")
         return SandboxResult(1, "", "==1== ERROR: libFuzzer: deadly signal\n", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
     built = []
 
     def builder():
@@ -1280,7 +1282,9 @@ def test_main_fuzzes_the_instrumented_binary(tmp_path, monkeypatch):
     seen = {}
     instrumented = tmp_path / "fuzz_mod.e-acsl"
     monkeypatch.setattr(
-        R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 0, "binary": str(instrumented)}
+        fuzz_build,
+        "compile_eacsl_binary",
+        lambda *a, **k: {"engine": "eacsl", "returncode": 0, "binary": str(instrumented)},
     )
 
     def fake_campaign(binary, *a, **k):
@@ -1298,12 +1302,12 @@ def test_main_fuzzes_the_instrumented_binary(tmp_path, monkeypatch):
 
 def test_main_records_engine_fallback_reason(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_eacsl_binary",
         lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "eacsl_binary_not_instrumented"},
     )
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_sanitizer_binary",
         lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": str(tmp_path / "fuzz_mod")},
     )
@@ -1332,17 +1336,17 @@ def test_failed_selftest_skips_eacsl_for_same_version(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0 (Arsenic)")
+    monkeypatch.setattr(fuzz_build, "framac_version", lambda runner=None: "33.0 (Arsenic)")
     assert R.selftest_blocks_eacsl(st) == "eacsl_selftest_failed: instrumented_binary"
-    monkeypatch.setattr(R, "framac_version", lambda runner=None: "34.0")
+    monkeypatch.setattr(fuzz_build, "framac_version", lambda runner=None: "34.0")
     assert R.selftest_blocks_eacsl(st) is None
     assert R.selftest_blocks_eacsl(tmp_path / "missing.json") is None
 
-    monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0 (Arsenic)")
+    monkeypatch.setattr(fuzz_build, "framac_version", lambda runner=None: "33.0 (Arsenic)")
     called = []
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: called.append(1))
     monkeypatch.setattr(
-        R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": "b"}
+        fuzz_build, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": "b"}
     )
     monkeypatch.setattr(R, "run_fuzz_campaign", lambda *a, **k: {"status": "clean", "artifacts": []})
     monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path))
@@ -1352,7 +1356,7 @@ def test_failed_selftest_skips_eacsl_for_same_version(tmp_path, monkeypatch):
 
 
 def test_selftest_with_fake_toolchain(tmp_path, modern_cli, monkeypatch):
-    monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0")
+    monkeypatch.setattr(fuzz_build, "framac_version", lambda runner=None: "33.0")
     canary = R.resolve_canary_source()
     expected = next(
         i for i, ln in enumerate(canary.read_text(encoding="utf-8").splitlines(), 1) if "/* CANARY_OOB */" in ln
@@ -1741,7 +1745,7 @@ def test_two_stage_compile_passes_concurrency_flags_when_pthread_detected(tmp_pa
 
 
 def test_legacy_cli_passes_concurrency_flag_when_pthread_detected(tmp_path, monkeypatch):
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc.sh", False))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc.sh", False))
     monkeypatch.setattr(T.shutil, "which", lambda name: None)
     calls = []
 

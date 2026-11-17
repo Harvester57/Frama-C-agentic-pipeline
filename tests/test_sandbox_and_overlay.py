@@ -26,8 +26,12 @@ def test_preexec_sets_core_limit_to_one_byte(monkeypatch):
 
     calls: dict[str, tuple[int, int]] = {}
     fake = types.SimpleNamespace(
-        RLIMIT_CPU="cpu", RLIMIT_FSIZE="fsize", RLIMIT_NOFILE="nofile",
-        RLIMIT_NPROC="nproc", RLIMIT_AS="as", RLIMIT_CORE="core",
+        RLIMIT_CPU="cpu",
+        RLIMIT_FSIZE="fsize",
+        RLIMIT_NOFILE="nofile",
+        RLIMIT_NPROC="nproc",
+        RLIMIT_AS="as",
+        RLIMIT_CORE="core",
         setrlimit=lambda which, value: calls.__setitem__(which, value),
     )
     monkeypatch.setitem(sys.modules, "resource", fake)
@@ -446,7 +450,7 @@ def test_fuzz_campaign_scratch_dir_in_tmp_and_cleaned_up(tmp_path, monkeypatch):
         )
         return S.SandboxResult(0, "fuzz output", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_run)
+    monkeypatch.setattr(S, "run_sandboxed", fake_run)
 
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()

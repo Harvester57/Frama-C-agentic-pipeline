@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import phase0_gates
 import run_eacsl_fuzz as R
+import sandbox_exec
 from generate_harness import generate_module_harness
 from sandbox_exec import SandboxResult
 
@@ -74,8 +76,8 @@ def _sandbox(new_crash: bytes | None):
 
 def test_campaign_report_and_each_found_artifact_carry_the_harness_identity(tmp_path, monkeypatch):
     sources = _run_dir(tmp_path, monkeypatch)
-    monkeypatch.setattr(R, "build_module_binary", _fake_build)
-    monkeypatch.setattr(R, "run_sandboxed", _sandbox(b"\x02\x41"))
+    monkeypatch.setattr(fuzz_build, "build_module_binary", _fake_build)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", _sandbox(b"\x02\x41"))
     report = _campaign(sources, tmp_path / "workspace/reports/fuzz/mod.json")
 
     digest = phase0_gates.harness_digest(tmp_path, "mod", ignore_exempt=True)
@@ -94,7 +96,7 @@ def test_campaign_report_and_each_found_artifact_carry_the_harness_identity(tmp_
 
 def test_an_artifact_carried_over_keeps_the_identity_it_was_found_under(tmp_path, monkeypatch):
     sources = _run_dir(tmp_path, monkeypatch)
-    monkeypatch.setattr(R, "build_module_binary", _fake_build)
+    monkeypatch.setattr(fuzz_build, "build_module_binary", _fake_build)
     out_json = tmp_path / "workspace/reports/fuzz/mod.json"
     crashes = tmp_path / "workspace/crashes/mod"
     crashes.mkdir(parents=True)
@@ -110,7 +112,7 @@ def test_an_artifact_carried_over_keeps_the_identity_it_was_found_under(tmp_path
     }
     out_json.parent.mkdir(parents=True)
     out_json.write_text(json.dumps(prior), encoding="utf-8")
-    monkeypatch.setattr(R, "run_sandboxed", _sandbox(None))  # exits 1, nothing new: both re-reported
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", _sandbox(None))  # exits 1, nothing new: both re-reported
     report = _campaign(sources, out_json)
 
     by_name = {Path(a["artifact"]).name: a for a in report["artifacts"]}
@@ -143,12 +145,16 @@ def test_campaign_records_the_replay_stack_frames_of_each_crash(tmp_path, monkey
     assert R.stack_frames(ASAN_REPLAY) == [
         {"function": "rec_check", "file": "/framac-run/workspace/work/src/api.c", "line": 4},
         {"function": "rec_parse", "file": "/framac-run/workspace/work/src/api.c", "line": 8},
-        {"function": "__gen_e_acsl_rec_put", "file": "/framac-run/workspace/harnesses/fuzz_mod.instrumented.c", "line": 90},
+        {
+            "function": "__gen_e_acsl_rec_put",
+            "file": "/framac-run/workspace/harnesses/fuzz_mod.instrumented.c",
+            "line": 90,
+        },
         {"function": "malloc", "file": "", "line": 0},
         {"function": "rec_alloc", "file": "/framac-run/workspace/work/src/api.c", "line": 2},
     ]
     sources = _run_dir(tmp_path, monkeypatch)
-    monkeypatch.setattr(R, "build_module_binary", _fake_build)
+    monkeypatch.setattr(fuzz_build, "build_module_binary", _fake_build)
 
     def fake(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
         if "-runs=1" in cmd:
@@ -157,7 +163,7 @@ def test_campaign_records_the_replay_stack_frames_of_each_crash(tmp_path, monkey
         Path(f"{prefix}crash-1").write_bytes(b"\x01")
         return SandboxResult(1, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     report = _campaign(sources, tmp_path / "workspace/reports/fuzz/mod.json")
     assert [f["function"] for f in report["artifacts"][0]["frames"]][:2] == ["rec_check", "rec_parse"]
 

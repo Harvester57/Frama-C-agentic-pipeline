@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 import eacsl_toolchain as T
+import fuzz_build
 import ledger
 import run_eacsl_fuzz as R
 
@@ -141,9 +142,9 @@ class _StageRecorder:
 @pytest.fixture
 def modern_gcc_with_share(tmp_path, monkeypatch):
     share = _fake_share(tmp_path / "image")
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
     monkeypatch.setattr(T.shutil, "which", lambda name: None)
-    monkeypatch.setattr(R, "eacsl_share_dir", lambda eacsl_bin: share)
+    monkeypatch.setattr(fuzz_build, "eacsl_share_dir", lambda eacsl_bin: share)
     src = tmp_path / "mod.c"
     src.write_text("int entry(int x) { return x; }\n", encoding="utf-8")
     return src
@@ -292,12 +293,13 @@ python3 - <<'EOF'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, "/repo/scripts")
+import fuzz_build
 import run_eacsl_fuzz as R
 keys = ("returncode", "reason", "binary", "check_options", "runtime_patches")
 res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
 print("RESULT " + json.dumps({k: res.get(k) for k in keys}))
 # The same build with the image's runtime: the cases the patch lets through must abort there.
-R.eacsl_share_dir = lambda eacsl_bin: None
+fuzz_build.eacsl_share_dir = lambda eacsl_bin: None
 res = R.compile_eacsl_binary(["mod.c"], Path("plain/fuzz_mod"), cppflags="-I.", use_cache=False)
 print("UNPATCHED " + json.dumps({k: res.get(k) for k in keys}))
 EOF

@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import ledger
 import run_eacsl_fuzz as R
+import sandbox_exec
 from conftest import FP_PARSE, confirmed_record, metadata, unit, write_json
 from sandbox_exec import SandboxResult, SandboxUnavailable
 
@@ -70,8 +72,8 @@ def test_build_compiles_only_and_reports_the_cache(tmp_path, monkeypatch):
         seen.update(k)
         return fake(*a, **k)
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", compile_eacsl)
-    monkeypatch.setattr(R, "run_sandboxed", _no_sandbox)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", compile_eacsl)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", _no_sandbox)
     out_json = tmp_path / "build.json"
     rc = R.main(
         [
@@ -101,14 +103,14 @@ def test_build_compiles_only_and_reports_the_cache(tmp_path, monkeypatch):
 
 
 def test_build_falls_back_to_sanitizers_and_fails_cleanly(tmp_path, monkeypatch):
-    monkeypatch.setattr(R, "run_sandboxed", _no_sandbox)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", _no_sandbox)
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_eacsl_binary",
         lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "eacsl_instrumentation_failed"},
     )
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_sanitizer_binary",
         lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": str(tmp_path / "fuzz_mod")},
     )
@@ -130,7 +132,9 @@ def test_build_falls_back_to_sanitizers_and_fails_cleanly(tmp_path, monkeypatch)
     assert res["engine_used"] == "sanitizers" and res["engine_fallback_reason"] == "eacsl_instrumentation_failed"
     assert res["eacsl_compile_attempt"]["returncode"] == 1
 
-    monkeypatch.setattr(R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1})
+    monkeypatch.setattr(
+        fuzz_build, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1}
+    )
     assert R.main(argv) == 1
     res = json.loads((tmp_path / "b.json").read_text(encoding="utf-8"))
     assert res["status"] == "compile_error" and res["binary"] is None
@@ -151,7 +155,7 @@ def test_replay_report_shape_flags_and_determinism(tmp_path, monkeypatch):
     (inputs_dir / "benign").write_bytes(b"fine")
     (inputs_dir / ".hidden").write_bytes(b"CRASH")
     sandbox = FakeSandbox()
-    monkeypatch.setattr(R, "run_sandboxed", sandbox)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", sandbox)
     out_json = tmp_path / "replay.json"
     rc = R.main(
         [
@@ -211,8 +215,8 @@ def test_replay_builds_through_the_cache_and_reports_errors(tmp_path, monkeypatc
     crash = tmp_path / "crash-1"
     crash.write_bytes(b"CRASH")
     binary = tmp_path / "workspace" / "harnesses" / "fuzz_snmp.e-acsl"
-    monkeypatch.setattr(R, "compile_eacsl_binary", _eacsl_ok(binary))
-    monkeypatch.setattr(R, "run_sandboxed", FakeSandbox())
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", _eacsl_ok(binary))
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", FakeSandbox())
     argv = [
         "replay",
         "--module",
@@ -234,8 +238,12 @@ def test_replay_builds_through_the_cache_and_reports_errors(tmp_path, monkeypatc
     assert rep["status"] == "reproduced" and rep["engine_used"] == "eacsl" and rep["cache"]["hit"] is True
     assert rep["binary"] == str(binary) and rep["compile"]["returncode"] == 0
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "x"})
-    monkeypatch.setattr(R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1})
+    monkeypatch.setattr(
+        fuzz_build, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "x"}
+    )
+    monkeypatch.setattr(
+        fuzz_build, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1}
+    )
     assert R.main(argv) == 1
     rep = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
     assert rep["status"] == "error" and rep["reason"].startswith("compile_error") and rep["artifacts"] == []
@@ -243,7 +251,7 @@ def test_replay_builds_through_the_cache_and_reports_errors(tmp_path, monkeypatc
     def unavailable(*a, **k):
         raise SandboxUnavailable("no POSIX host")
 
-    monkeypatch.setattr(R, "run_sandboxed", unavailable)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", unavailable)
     assert (
         R.main(
             [
@@ -328,7 +336,7 @@ def test_replay_report_is_accepted_by_ingest_verifier(run_dir, monkeypatch):
     binary = run_dir / "workspace" / "harnesses" / "fuzz_snmp.e-acsl"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_bytes(EACSL_MARKER_BYTES)
-    monkeypatch.setattr(R, "run_sandboxed", FakeSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", FakeSandbox())
     report = Path("workspace/reports/replay/snmp_verify.json")
     assert (
         R.main(
@@ -359,7 +367,7 @@ def test_unreproduced_replay_does_not_confirm(run_dir, monkeypatch):
     result = _verifier_case(run_dir, b"benign bytes")
     binary = run_dir / "fuzz_snmp.e-acsl"
     binary.write_bytes(EACSL_MARKER_BYTES)
-    monkeypatch.setattr(R, "run_sandboxed", FakeSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", FakeSandbox())
     report = Path("replay.json")
     R.main(
         [
@@ -490,9 +498,9 @@ def _fake_builds(monkeypatch, run_dir: Path) -> tuple[list, list]:
             "cache": {"hit": False, "key": "s" * 64},
         }
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", compile_eacsl)
-    monkeypatch.setattr(R, "compile_sanitizer_binary", compile_san)
-    monkeypatch.setattr(R, "run_sandboxed", FakeSandbox())
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", compile_eacsl)
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", compile_san)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", FakeSandbox())
     return eacsl_calls, san_calls
 
 
@@ -602,7 +610,7 @@ def test_guardrail_caps_corpus_replay_to_max_inputs(tmp_path, monkeypatch):
         calls.append(list(cmd))
         return SandboxResult(0, "", "", False, "rlimits", list(cmd))
 
-    monkeypatch.setattr(R, "run_sandboxed", fake_sandbox)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_sandbox)
 
     # 1. Default max_corpus_inputs=64
     verdict = R.run_guardrail_check(binary, corpus, scratch, runs=50, module="mod", use_cache=False)
@@ -666,7 +674,7 @@ def test_guardrail_cli_max_corpus_inputs(tmp_path, monkeypatch):
         seen_max_corpus.update(kwargs)
         return {"status": "passed_dynamic_oracle", "corpus_dir": str(corpus_dir)}
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", fake_compile)
     monkeypatch.setattr(R, "run_guardrail_check", fake_run_guardrail)
 
     rc = R.main(
@@ -724,7 +732,7 @@ def test_minimize_input_runs_cvise_and_writes_a_verified_min(tmp_path, monkeypat
     tool.write_text("#!/bin/sh\n", encoding="utf-8")
     fake = FakeCviseSandbox()
     monkeypatch.setattr(R, "find_creduce", lambda: str(tool))
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     rep = R.minimize_input(binary, crash, tmp_path / "scratch", module="snmp", fingerprint=FP_PARSE)
     assert rep["status"] == "ok" and rep["reproduced"] is True
     assert rep["tool"] == str(tool) and rep["passes"] == 3
@@ -752,7 +760,7 @@ def test_minimize_input_reports_missing_tool(tmp_path, monkeypatch):
 def test_minimize_interest_exit_codes(tmp_path, monkeypatch):
     binary = tmp_path / "fuzz_mod.e-acsl"
     binary.write_bytes(EACSL_MARKER_BYTES)
-    monkeypatch.setattr(R, "run_sandboxed", FakeCviseSandbox())
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", FakeCviseSandbox())
     crash = tmp_path / "crash-a"
     crash.write_bytes(b"CRASH a")
     ok = tmp_path / "ok"
@@ -777,7 +785,7 @@ def test_minimize_candidates_writes_index_and_min_files(run_dir, monkeypatch):
     tool.write_text("#!/bin/sh\n", encoding="utf-8")
     fake = FakeCviseSandbox()
     monkeypatch.setattr(R, "find_creduce", lambda: str(tool))
-    monkeypatch.setattr(R, "run_sandboxed", fake)
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     rc = R.main(["minimize-candidates", "--selftest-json", "none.json"])
     assert rc == 1  # `ghost` has no build spec -> error, but the others minimize
     index = json.loads((run_dir / "workspace/reports/minimize/index.json").read_text(encoding="utf-8"))

@@ -107,8 +107,8 @@ seed: reach-gate security-props
 
 # --- Phases 1 and 2 --------------------------------------------------------------------------
 
-# Compile only: E-ACSL, or the sanitizer build when the cached selftest failed. Static (it never
-# runs target code), so it does not depend on the selftest.
+# Compile only: what `--engine` asks for, both engines for `auto`. It never reads the selftest result;
+# the campaign applies it and restores these builds from the cache.
 build: $(BUILD_TARGETS)
 $(BUILD_TARGETS): build-%:
 	$(GATE) --module $* --need reach
@@ -117,7 +117,7 @@ $(BUILD_TARGETS): build-%:
 		--out-bin workspace/harnesses/fuzz_$* --cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) $(if $(FUZZ_NO_LIBC_CHECKS_$*),--no-libc-checks) \
 		--engine=$(FUZZ_ENGINE_$*) \
-		--selftest-json $(SELFTEST_JSON) --out-json workspace/build/$*.build.json
+		--out-json workspace/build/$*.build.json
 
 # The E-ACSL toolchain canary (runs a compiled canary, so dynamic).
 selftest:
