@@ -440,3 +440,21 @@ Issues encountered in E-ACSL instrumentation (`e-acsl-gcc`, `eacsl_toolchain.py`
   - For the run: revoke the exemptions, and give these accessors `custom` cases that pass a tag of the right type, for example built with `mpack_tag_make_array`.
   - Expect sanitizer crash candidates on the generated cases, and reject them as harness-made.
   - The supervisor told the driving session about the wrong exemption reason on 2026-11-17 at about 04:40.
+
+### Symptom: An `oom-` Artifact Keeps `failure: null` and No Replay Tail, and Becomes a Module-Wide `unknown_function::oom::` Candidate
+- **Seen on:** mpack run-4, 2026-11-17.
+  - `libmpack_a__mpack_expect_2`: `oom-da39a3ee5e6b4b0d3255bfef95601890afd80709` (0 bytes, the empty input) became candidate `harness_libmpack_a__mpack_expect_2.c#unknown_function::oom::a775df98e4`. A Crash Verifier rejected it as `toolchain_artifact`: it replays clean on both the E-ACSL and the ASan+UBSan builds, and the harness's `size > 0` gate stops it.
+  - `libmpack_a__mpack_expect`: `oom-cfab07d6...` (verifier `fd03be63af`, a 108 GiB malloc-hook OOM at `mpack-reader.c:527`) had the same fingerprint shape.
+  - The run's driving model found the gap; the supervisor confirmed it in the code.
+- **Cause:**
+  - [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) replayed and attributed only `crash` and `leak` artifacts (`kind in ("crash", "leak")`), so an `oom-` input never got an outcome.
+  - [`../../scripts/ledger.py`](../../scripts/ledger.py) built the unattributed fingerprint from `sha256(module + ":oom:")` with no input, so every OOM of a module would merge into one candidate.
+  - The campaign log's `Exceeded heap allocation limit` lines belonged to `crash-` inputs, not to the `oom-` one.
+  - Why libFuzzer wrote an `oom-` for the empty unit is not known: the worker logs are deleted with the campaign scratch directory, the 4000-character tail has no `libFuzzer: out-of-memory` headline, and `peak_rss_mb` is 54.
+- **Fix:** **Open pipeline bug:** fixed on branch `sup/mpack-oom-attribution` (commits `972a644` and `95b117b`, on top of S13 `edb5c34`; run supervisor S16), held until run-4 ends, not merged.
+  - `oom-` artifacts are replayed and sanitizer-attributed like crashes, within the replay budget. An E-ACSL heap-limit abort on the `oom-` input's own replay marks it `eacsl_resource_abort`; the campaign log never stands for an `oom-`.
+  - When the sanitizer build of an `oom-` input also runs out of memory, no marker is set and it stays a candidate, so a real large allocation is still reported (`failure_identity.is_libfuzzer_out_of_memory`, `crash_replay.resource_abort_record(..., kind)`, `ledger._eacsl_resource_abort`).
+  - The unattributed `oom` fingerprint includes the artifact's sha256. An `oom-` past `MAX_REPLAYED_CRASHES` is still listed.
+  - Run-4's empty-input `oom-` would now be replayed, recorded as not reproduced, and stay a candidate keyed by its input, with the note "did not reproduce on replay"; it is not dropped automatically. Re-ingesting run-4's reports would add new fingerprints beside the rejected ones.
+  - Tests: 11 new in `tests/test_eacsl_resource_abort.py`, 8 of which failed on `edb5c34`. The fixer's full suite passed (6058). The supervisor reran the file (28 passed), ran `ruff` and `mypy` (clean), and dry-ran the merge against `phase1-remediation`, S14 and S15 (clean).
+  - **Still open:** campaign worker logs (`fuzz-*.log`) are deleted, so an `oom-`'s libFuzzer headline (`used:` or `malloc(N)`) is lost when it falls outside the stored tail; unattributed timeouts still share one `module:timeout:` fingerprint per module.
