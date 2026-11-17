@@ -408,6 +408,11 @@ Added by the re-check, for the steps before the merge:
   - Re-run on it: the same checks, and the whole suite (6065 passed, 224 skipped). `test_generated_wide_harness_runs_case_280` passes in the rebuilt analysis image.
   - The scripts and templates the tip changed since `b540121` add no reader or writer of the selector byte (their diff was searched for the selector, the first byte and the case index).
   - Still not checked: the three items above.
+- **Rebased a third time (2026-11-17) onto `890a101`** (the open-topics steps O4, O5, O7, O9 to O12 and the mpack run-4 fixes S13 to S19 of the supervision's numbering landed):
+  - One conflict, again in `skills/framac-slice/SKILL.md`: the tip's new `stdin` bullet and its `--api` text are kept with this step's `dispatch` text, and the mirrors are regenerated. The code applied without a conflict.
+  - Re-run on it: `ruff check`, `mypy scripts tests`, the generated-text and mirror checks, and the whole suite (6202 passed, 230 skipped). With `FRAMAC_DOCKER_TESTS=1`, `tests/test_dispatch_selector.py` and `tests/test_dispatch_selector_wide.py` pass on the branch with H1 on top.
+  - The scripts and templates the tip changed since `434d4a9` add no reader or writer of the selector byte (same search of their diff). The `stdin` entry style (O10) is a `main` style and has no selector.
+  - Still not checked: the same three items.
 
 ### S7. Ledger evidence (F7, F9) (S, after S4, S5 and S6a)
 
