@@ -52,6 +52,8 @@ The target is never modified. If the overlay already exists and the target chang
 
 Pipeline output kept inside the target (a folder holding `run-metadata.json`, `coverage-ledger.json`, or `overlay_meta.json`, such as a previous run's results) is not source. `init` does not copy it and lists it in `overlay_meta.json` as `skipped_pipeline_output`. If it reports one, tell the user so they can move it out of the target tree.
 
+`init` also lists the target's scripts with CRLF line endings in `overlay_meta.json` as `crlf_scripts` (`count`, the first `paths`), with a message in `warnings`. A target checked out on Windows with `core.autocrlf=true` has them, and the Linux build container cannot run them: a shebang script fails with `not found` (exit 127), a shell script with `Illegal option -` or `cannot run`. If `warnings` is not empty, show it to the user before the build recipe. They either check the target out again with LF endings, or strip the CRs in the recipe (`sed -i 's/\r$//' <script>`) before the scripts run.
+
 ### Step 1b — Build Recipe and Build Capture
 
 Phase 0 needs the target's own build: what it compiles, links and exports. A target that does not build stops Phase 0 until the user gives a working recipe. There is no fallback inventory.
@@ -91,7 +93,8 @@ Phase 0 needs the target's own build: what it compiles, links and exports. A tar
    - `first_error`;
    - `missing_headers`;
    - `candidate_packages` (a heuristic);
-   - `packages_not_installed`.
+   - `packages_not_installed`;
+   - `crlf_scripts`, when present: the failure points at scripts with CRLF line endings (a Windows checkout). `warnings` names them and says how to fix the checkout or the recipe. `seed_harvest.py record` adds the same hint to its `warnings` when the test command fails on such a script.
 
    Ask for a corrected command, packages or flags, record them with `set-build`, and run the capture again. A successful capture clears the status, and Phase 0 continues.
 

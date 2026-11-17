@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import function_facts  # noqa: E402
 import function_slice  # noqa: E402
+import line_endings  # noqa: E402
 import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
 from acsl_ast import (  # noqa: E402
@@ -305,6 +306,10 @@ def init_overlay(target_dir: Path, overlay_dir: Path, force: bool = False) -> di
 
     _rewrite_compile_commands(work_dir / "compile_commands.json", target_dir, work_dir)
 
+    # A Windows checkout (core.autocrlf=true) has CRLF scripts the build container cannot run: said
+    # here, before the build capture or the test command fails on them with a bare `not found`.
+    crlf = line_endings.scan_crlf_scripts(target_dir)
+    crlf_warning = line_endings.overlay_warning(crlf)
     meta = {
         "target_dir": str(target_dir),
         "overlay_dir": str(overlay_dir),
@@ -312,6 +317,8 @@ def init_overlay(target_dir: Path, overlay_dir: Path, force: bool = False) -> di
         "baseline_dir": str(baseline_dir),
         "copied_count": len(copied_files),
         "skipped_pipeline_output": sorted(skipped_output),
+        "crlf_scripts": line_endings.summary(crlf),
+        "warnings": [crlf_warning] if crlf_warning else [],
     }
     (overlay_dir / "overlay_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return meta

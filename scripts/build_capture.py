@@ -81,6 +81,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import line_endings  # noqa: E402
 import target_env  # noqa: E402
 from framac_common import atomic_write_json, is_pipeline_output_dir, load_json_optional, utc_now  # noqa: E402
 from patterns import parse_make_deps  # noqa: E402
@@ -1848,6 +1849,13 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
         report["diagnostics"] = diagnose(log, missing_pkgs)
         if res.timed_out:
             report["diagnostics"]["first_error"] = f"build timed out after {args.timeout} s"
+        else:
+            # A Windows checkout's CRLF script fails with a bare `not found` or `Illegal option -`.
+            crlf = line_endings.scan_crlf_scripts(tree)
+            hint = line_endings.failure_hint("the build command", res.returncode, log, crlf, recipe["command"])
+            if hint:
+                report["diagnostics"]["crlf_scripts"] = line_endings.summary(crlf)
+                report["warnings"].append(hint)
         return report, EXIT_NEEDS_RECIPE
     cap = classify_executions(execs, str(tree))
     if cap.get("skipped_compiler_like"):
