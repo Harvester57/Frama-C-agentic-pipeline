@@ -433,6 +433,43 @@ def dynamic_gate_lines(run_dir: Path) -> list[str]:
     return lines
 
 
+def header_api_lines(run_dir: Path) -> list[str]:
+    """
+    R1: per module of the dynamic reach report (workspace/reports/harness_reach_dynamic.json), the public
+    header functions the corpus never executed (`header_api_unexecuted`). They are not entry points, so a
+    passing reach gate says nothing about them. Nothing when no module has one.
+    """
+    try:
+        doc = load_json_optional(Path(run_dir) / "workspace/reports/harness_reach_dynamic.json", None)
+    except (ArtifactError, OSError, ValueError):
+        return []
+    rows = doc.get("modules") if isinstance(doc, dict) else None
+    if not isinstance(rows, dict):
+        return []
+    lines: list[str] = []
+    for module, row in sorted(rows.items()):
+        never = row.get("header_api_unexecuted") if isinstance(row, dict) else None
+        if not isinstance(never, dict) or not never.get("count"):
+            continue
+        names = [str(n) for n in never.get("functions") or []]
+        more = f", ... and {never['count'] - len(names)} more" if never["count"] > len(names) else ""
+        lines.append(
+            f"- `{md_escape(str(module))}`: {never['count']} of {row.get('header_api_functions', '?')} public header "
+            f"functions never executed: {md_escape(', '.join(names))}{more}"
+        )
+    if not lines:
+        return []
+    return [
+        "### Public header functions the corpus never executed",
+        "",
+        "A function a public header defines (`static inline`) is not an entry point: no reach gate counts it, "
+        "so a passing gate does not mean it ran.",
+        "",
+        *lines,
+        "",
+    ]
+
+
 def open_work(data: dict) -> dict:
     unverified = [c for c in data["candidates"] if c["status"] == "unverified"]
     open_units = [u for u in data["ledger"] if u["status"] in ("planned", "in_progress")]
@@ -980,6 +1017,7 @@ def render_report(data: dict) -> str:
     out += fuzz_reach_lines(data.get("coverage") or [])
     if data.get("run_dir"):
         out += dynamic_gate_lines(Path(data["run_dir"]))
+        out += header_api_lines(Path(data["run_dir"]))
 
     hardening = [h for u in ledger for h in u.get("bookkeeping", {}).get("hardening", [])]
     if hardening:
