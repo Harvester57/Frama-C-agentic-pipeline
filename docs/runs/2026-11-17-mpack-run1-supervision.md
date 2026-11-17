@@ -54,8 +54,9 @@ External, read-only supervision of the opencode-driven `standard` run of `mpack`
 | S1b | Phase 0 / `build_capture.py run` / S1 recurrence: the test driver's product sources sit in an executable, not a library | `sup/mpack-test-driver-any-holder` (`c57d2ea`) | Held until `run-3` ends |
 | CRLF | Phase 0 / `seed_harvest.py record` / test command exits 127 `not found` on a CRLF shebang (target-side; the pipeline gap is the late diagnosis) | `sup/crlf-script-check` (`90cc197`, `16c86eb`) | Verified by the fixer (5933 passed); held until `run-3` ends |
 | S2 | Phase 0 / `seed_harvest.py record` / only outermost calls before the first longjmp are recorded | `sup/recorder-longjmp-safe` (`84f76b6`) | **Merged live** at 03:45 (fast-forward). Test: `tests/test_seed_harvest_longjmp.py::test_recorder_records_outermost_calls_after_a_longjmp` |
-| S3 | Phase 0 / `generate_harness.py --entry-style argv` / implicit declaration of `main` | fixer running (`sup/mpack-argv-main-prototype`) | In progress |
+| S3 | Phase 0 / `generate_harness.py --entry-style argv` / implicit declaration of `main` | `sup/mpack-argv-main-prototype` (`a13e149`, `2e1fc93`) | Verified by the supervisor (diff read, `tests/test_harness_argv.py` 13 passed, 2 skipped on Windows; the fixer's Docker clang repro goes from exit 1 to exit 0). Held until `run-3` ends |
 | S4 | Phase 0 / `pipeline_make.py build-check` / E-ACSL frontend syntax error on `__restrict__` (host headers) | fixer running (`sup/mpack-eacsl-restrict`) | In progress |
+| S5 | Phase 0 / `pipeline_make.py build-check` / clang rejects Frama-C's `missing proto` redeclaration of `__builtin_{add,mul}_overflow` | same fixer as S4 | In progress |
 
 S1 commits and tests:
 
@@ -106,6 +107,9 @@ Supervisor's check: the branch's `build_capture.py run` was run on the real mpac
 | 03:44 | Phase 0 | `build-check` rerun (container `framac-9f14465bd6b7`). |
 | 03:45 | — | **S2 merged live** into `phase1-remediation` (fast-forward to `84f76b6`), under the user's authorisation to intervene. The supervisor reran the longjmp regression test in `framac-build:latest` (gcc and clang PASS) and `tests/test_seed_harvest*.py` on Windows (23 passed, 1 skipped). |
 | 03:46:32 | — | Supervisor nudge sent to the session with the user's permission (`opencode run --session`, queued behind the running step). It asks the model to rerun `seed_harvest.py record` with the same test command, regenerate the `--api` harnesses so the new seeds bind, rerun reach, gen and build-check, and keep the `__restrict__` workaround. |
+| 03:48:18 | Phase 0 | The nudge is delivered when the build-check step ends. Every module fails at the next step, the clang compile of the E-ACSL output: `fuzz_<mod>.instrumented.c: error: cannot redeclare builtin function '__builtin_add_overflow'`. Frama-C prints `extern int ( /* missing proto */ __builtin_add_overflow)(...)` and `__builtin_mul_overflow`. mpack enables both through `__has_builtin`, which is true under `-G clang` (`mpack-platform.h:1895-1923`). **S5**: the same E-ACSL compat gap as S4, added to the S4 fixer's scope. |
+| 03:49:14 | Phase 0 | The model chooses `-DMPACK_HAS_OVERFLOW_BUILTINS=0` itself, so mpack uses its plain C fallback. It adds the flag to `state/gen_harnesses2.sh`, then reruns the capture and seed harvest as the nudge asked. |
+| 03:50:39 | Phase 0 | The seed harvest with S2 live returns `ok` in 45 s: **55,714 calls recorded (9,641 unique)**, against 3 before, with 342 functions planned. S2 is confirmed in the live run. |
 
 S1 recurrence: the fix is on `sup/mpack-test-driver-any-holder` at `c57d2ea`, verified by the supervisor (diff read, 15 driver tests pass) and **held** until `run-3` ends. It extends the holder condition to any other non-test unit (library, executable, unlinked) that is not itself a test-driver candidate. On the real tree with the no-library recipe, the runner is `test` and `sax-example` stays product with 342 `mpack_*` embedded-API functions.
 

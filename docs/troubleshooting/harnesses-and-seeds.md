@@ -52,6 +52,19 @@ Issues encountered in dual harness generation (`generate_harness.py`, `api_harne
 - **Cause:** the `main` prototype synthesizer read a statement keyword from a preceding macro continuation (`png-fix-itxt.c`'s `GETBREAK`) as the return type; and the default `argv` entry style calls `main(2, argv)` on a `main(void)` (libpng `pngfix-itxt`, `pnggetset`; defects B and C of `docs/progress/2026-11-09-libpng-harness-generation-bugs.md`).
 - **Fix:** B is **fixed** in `scripts/generate_harness.py`: preprocessor continuations are stripped and statement keywords cut from the head. C is handled by failing early (`_check_argv_entry`) with what to do: exempt the module with `harness_reach.py exempt`, or give `--entry-style` with `--call-expr`. **Open pipeline bug:** there is no stdin-fed entry style yet, so programs that read stdin cannot be harnessed (O10 in [`../plans/open-topics-remediation-plan.md`](../plans/open-topics-remediation-plan.md)).
 
+### Symptom: An `argv` Harness Does Not Compile: `call to undeclared function '__framac_target_main'`
+- **Seen on:** mpack run-3 (2026-11-17), module `sax_example`. The entry is `main` in `examples/sax-example.c` and the module header is `examples/sax-example.h`. `generate_harness.py --entry-style argv` wrote a harness that failed under clang/E-ACSL with `harness_sax_example.c:...: error: call to undeclared function '__framac_target_main'; ISO C99 and later do not support implicit function declarations`.
+- **Cause:** pipeline bug in `scripts/generate_harness.py`.
+  - A program's `main` is rarely declared in its module header, but the generator synthesized the entry's declaration from the sources only when no `--header` was given.
+  - With a header that lacks `main`, the harness called `main(argc, argv)` undeclared; `-Dmain=__framac_target_main` renames that call. A comment in `_build_invocations` claimed a "synthesized declaration" that did not exist on this path.
+  - Related gap: `_check_argv_entry` read only the sources, so an `int main(void)` visible only in the header was not refused.
+- **Workaround used in the run:** a run-directory header holding `int main(int argc, char **argv);`, passed with `--extra-include` (`workspace/harnesses/include/sax_main.h`).
+- **Open pipeline bug:** fixed on branch `sup/mpack-argv-main-prototype` (`a13e149`, `2e1fc93`) but held, not yet merged into `phase1-remediation`.
+  - `_argv_entry_declaration` writes `main`'s declaration into the argv harness when no included header declares it. It goes after the headers and before the Eva and fuzz calls, and the `-Dmain=` rename covers it. The declaration is copied from the target's definition, or else is `int main(int argc, char **argv);`.
+  - `_check_argv_entry` also consults the included headers, so `main(void)` is refused there too.
+  - Tests are in `tests/test_harness_argv.py`, e.g. `test_argv_harness_declares_main_when_the_module_header_does_not` and `test_argv_style_refuses_a_main_void_seen_only_in_the_module_header`.
+  - Still not handled: a three-parameter `main(argc, argv, envp)` still gets a two-argument call.
+
 ### Symptom: `--api` Says `no API entry point the generator can call: {}` for an Executable Module
 - **Cause:** an executable's only API entry point is `main`, which `--api` does not drive (no signature it can fill from bytes).
 - **Fix:** use the argv style: `generate_harness.py --module <m> --unit <unit> --sources <required_sources...> --header none --entry-fn main --entry-style argv --cppflags='<DAG cppflags>'`. Modules that take no attacker input (table generators such as nettle's `desdata`/`eccdata`, benchmarks) get `harness_reach.py exempt --module <m> --reason '<why>'`.
