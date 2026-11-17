@@ -249,7 +249,7 @@ The full resource and cache design guide is [`../guides/resources-and-caching.md
 - **Correction and fix (run supervisor, S11):**
   - `ulimit -c 0` does not help. Docker Desktop on WSL2 sets `core_pattern` to the pipe `|/wsl-capture-crash %t %E %p %s`, and with a pipe pattern the kernel ignores a core limit of 0 and streams the whole core anyway. [`../../scripts/sandbox_exec.py`](../../scripts/sandbox_exec.py) already sets 1 byte (`CORE_LIMIT_BYTES`) for this reason, but only for its own children.
   - Pipeline containers started with the engine default: `Max core file size 0 unlimited bytes`. A 4 MB probe abort wrote a 4.6 MB dump, and any process could raise its own limit to unlimited.
-  - **Fixed on branch `sup/mpack-core-limit`, commits `ab05868` and `6be1377`, held until the run ends; still an **Open pipeline bug:** on the integration branch.** Every pipeline container starts with `--ulimit core=1:1`:
+  - **Fixed: commits `ab05868` and `6be1377` from `sup/mpack-core-limit`, merged into `phase1-remediation` on 2026-11-17 (merge `77a1e79`).** Every pipeline container starts with `--ulimit core=1:1`:
     - `wrappers/framac-docker.ps1` `$hardeningArgs` and `wrappers/framac-docker.sh` `HARDENING`, on both the broker and the no-broker paths;
     - `scripts/resources.py` `CORE_ULIMIT_ARGS`, taken from `CORE_LIMIT_BYTES` and used by the cache-volume init container;
     - `docker-compose.yml` `ulimits.core` on both services.
