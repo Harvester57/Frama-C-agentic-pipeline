@@ -314,14 +314,82 @@ def test_sh_new_run_allocation_is_atomic_under_concurrency(tmp_path):
     base = (tmp_path / "base").as_posix()
     (tmp_path / "base" / "run-1").mkdir(parents=True)
 
-    def one(_: int) -> str:
-        proc = subprocess.run([bash, script.as_posix(), base], capture_output=True, text=True)
-        assert proc.returncode == 0, proc.stderr
-        return proc.stdout.strip().rsplit("/", 1)[-1]
+    def one(_: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([bash, script.as_posix(), base], capture_output=True, text=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        names = list(pool.map(one, range(8)))
-    assert sorted(names, key=lambda n: int(n[4:])) == [f"run-{n}" for n in range(2, 10)], names
+        procs = list(pool.map(one, range(8)))
+    _judge_allocations(procs, [f"run-{n}" for n in range(2, 10)])
+
+
+# Cygwin (Git Bash) fork failures under heavy Windows host load: the child dies before it runs anything.
+CYGWIN_FORK_FAILURE = re.compile(r"Win32 error 299|cygheap read copy failed")
+STATUS_DLL_INIT_FAILED = 0xC0000142  # 3221225794 as a Windows return code
+
+
+def _cygwin_fork_failed(proc: subprocess.CompletedProcess[str]) -> bool:
+    """Whether bash, or a child it forked (its stderr is bash's), could not start; any return code."""
+    return proc.returncode & 0xFFFFFFFF == STATUS_DLL_INIT_FAILED or bool(CYGWIN_FORK_FAILURE.search(proc.stderr))
+
+
+def _judge_allocations(procs: list[subprocess.CompletedProcess[str]], expected: list[str]) -> None:
+    """
+    Fail on a run directory claimed twice, whatever else happened. Skip when Git Bash could not fork: a `mkdir`
+    that never ran makes the loop take the next number, so the set of names says nothing about atomicity. Otherwise
+    every process must succeed with the expected names.
+    """
+    names = [p.stdout.strip().rsplit("/", 1)[-1] for p in procs if p.returncode == 0]
+    twice = sorted({n for n in names if names.count(n) > 1})
+    assert not twice, f"run directories allocated twice: {twice} ({names})"
+    forks = [p for p in procs if _cygwin_fork_failed(p)]
+    if forks:
+        pytest.skip(
+            f"Git Bash could not fork in {len(forks)} of {len(procs)} processes (Cygwin Win32 error 299 or "
+            f"0xC0000142 under host load), so the allocation was not exercised; no duplicate among the others. "
+            f"First: rc={forks[0].returncode} {forks[0].stderr.strip()[:200]!r}"
+        )
+    failed = [(p.returncode, p.stderr) for p in procs if p.returncode != 0]
+    assert not failed, f"allocation failed: {failed}"
+    assert sorted(names, key=lambda n: int(n[4:])) == expected, names
+
+
+def _proc(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(["bash"], returncode, stdout, stderr)
+
+
+FORK_ERROR = (
+    "      0 [main] bash 1234 child_copy: cygheap read copy failed, 0x800000000..0x800010D30, done 0, "
+    "windows pid 1234, Win32 error 299\n"
+)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "failed",
+    [_proc(3221225794), _proc(-1073741502), _proc(1, stderr=FORK_ERROR), _proc(0, "/b/run-9\n", FORK_ERROR)],
+    ids=["status-dll-init-failed", "signed-return-code", "win32-error-299", "fork-failure-in-a-child"],
+)
+def test_a_git_bash_fork_failure_skips_the_allocation_check(failed):
+    procs = [_proc(stdout=f"/b/run-{n}\n") for n in range(2, 9)] + [failed]
+    with pytest.raises(pytest.skip.Exception, match="Git Bash could not fork"):
+        _judge_allocations(procs, [f"run-{n}" for n in range(2, 10)])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("with_fork_failure", [False, True])
+def test_a_duplicate_allocation_still_fails_the_check(with_fork_failure):
+    procs = [_proc(stdout=f"/b/run-{n}\n") for n in (2, 3, 3, 4, 5, 6, 7)]
+    procs.append(_proc(3221225794) if with_fork_failure else _proc(stdout="/b/run-8\n"))
+    with pytest.raises(AssertionError, match=r"allocated twice: \['run-3'\]"):
+        _judge_allocations(procs, [f"run-{n}" for n in range(2, 10)])
+
+
+@pytest.mark.unit
+def test_an_ordinary_failure_is_not_taken_for_a_fork_failure():
+    procs = [_proc(stdout=f"/b/run-{n}\n") for n in range(2, 9)] + [_proc(1, stderr="mkdir: Permission denied\n")]
+    with pytest.raises(AssertionError, match="Permission denied"):
+        _judge_allocations(procs, [f"run-{n}" for n in range(2, 10)])
+    _judge_allocations([_proc(stdout=f"/b/run-{n}\n") for n in range(2, 10)], [f"run-{n}" for n in range(2, 10)])
 
 
 @pytest.mark.integration
