@@ -39,7 +39,8 @@ def _crash(tmp_path: Path, case: int) -> dict:
 def _fake_campaign(
     clock: FakeClock, tmp_path: Path, *, workers: int, cpu_per_round: float, crashes, status: str | None = None
 ):
-    """Each round spends `cpu_per_round` CPU-seconds on `workers` workers, so `cpu / workers` wall seconds.
+    """Each round spends `cpu_per_round` CPU-seconds on `workers` workers, so `cpu / workers` wall seconds,
+    and never more than its budget (libFuzzer stops at -max_total_time).
 
     `crashes[i]` lists the cases round i + 1 crashes in; a round past the list is clean. `status`, when
     given, is the status every round reports.
@@ -49,7 +50,7 @@ def _fake_campaign(
     def campaign(binary, seconds, fork, *, extra_env=None):
         i = len(calls)
         calls.append(seconds)
-        clock.now += cpu_per_round / workers
+        clock.now += min(cpu_per_round / workers, seconds)
         arts = [_crash(tmp_path, c) for c in (crashes[i] if i < len(crashes) else [])]
         if status is not None:
             return {"status": status, "returncode": 1, "artifacts": arts}
@@ -82,7 +83,11 @@ def test_one_and_eight_workers_run_the_same_rounds(tmp_path, clock):
     assert len(shape(one)) == 4
     assert shape(one) == shape(eight)
     assert shape(one)[-1][2] == "time_budget_spent"
-    assert one["keep_going"]["cpu_seconds_spent"] == eight["keep_going"]["cpu_seconds_spent"] == 240.0
+    # 1 worker uses all 240 CPU-seconds. 8 workers' last round is budgeted 7 whole wall seconds of the 7.5
+    # left (`-max_total_time` is an integer), so it leaves 4 CPU-seconds unused: same rounds, 236.
+    assert one["keep_going"]["cpu_seconds_spent"] == 240.0
+    assert eight["keep_going"]["cpu_seconds_spent"] == 236.0
+    assert eight["keep_going"]["fuzz_seconds"] <= 30
     # Round 4 crashed in case 3 as the time ran out: that case is not skipped, no round is left to skip it in.
     assert one["keep_going"]["skipped_cases"] == eight["keep_going"]["skipped_cases"] == [0, 1, 2]
 
@@ -160,6 +165,64 @@ def test_keep_going_records_cpu_seconds_spent(tmp_path, clock):
     res = _run(clock, tmp_path, workers=8, max_time=30, cpu_per_round=60, crashes=[[c] for c in range(6)])
     kg = res["keep_going"]
     assert kg["workers"] == 8
-    assert kg["fuzz_seconds"] == 30.0
-    assert kg["cpu_seconds_spent"] == 240.0
+    assert kg["fuzz_seconds"] == 29.5  # the last round is budgeted 7 of the 7.5 wall seconds left
+    assert kg["cpu_seconds_spent"] == 236.0
     assert kg["stopped"] == "time_budget_spent"
+
+
+@pytest.mark.parametrize(
+    ("workers", "max_time", "round_cpu", "budgets"),
+    [
+        (8, 10, 70, [10, 1]),  # 8.75 wall s used: 1.25 left = 10 CPU-s (the floor), a 1-second round
+        (1, 20, 8, [20, 12]),  # 12 wall s left: a 12-second round
+    ],
+)
+def test_a_round_gets_the_wall_time_left(tmp_path, clock, workers, max_time, round_cpu, budgets):
+    res = _run(clock, tmp_path, workers=workers, max_time=max_time, cpu_per_round=round_cpu, crashes=[[0]])
+    kg = res["keep_going"]
+    assert [r["max_time"] for r in kg["rounds"]] == budgets
+    assert kg["fuzz_seconds"] <= max_time  # no round overruns the campaign
+
+
+def test_no_round_when_less_than_a_whole_second_is_left(tmp_path, clock):
+    # 12 workers: 0.9 wall s left is 10.8 CPU-s, over the floor, but libFuzzer cannot run for 0 seconds.
+    res = _run(clock, tmp_path, workers=12, max_time=10, cpu_per_round=109.2, crashes=[[0]])
+    kg = res["keep_going"]
+    assert len(kg["rounds"]) == 1 and kg["stopped"] == "time_budget_spent"
+
+
+@pytest.mark.parametrize(
+    ("failure", "max_time", "runs_fallback"),
+    [
+        ("unskippable_case", 10, False),  # 9 CPU-s left: below the floor, no fork fallback
+        ("unskippable_case", 12, True),  # 11 CPU-s left: fork fallback
+        ("rebuild_failed", 10, False),
+        ("rebuild_failed", 12, True),
+    ],
+)
+def test_the_fork_fallback_needs_the_cpu_floor_and_gets_the_wall_time_left(
+    tmp_path, clock, failure, max_time, runs_fallback
+):
+    # Round 1 crashes in one case and uses 1 CPU-second (1 worker). Case 2 cannot be skipped by a harness
+    # that skips only case 0 and 1; or the rebuild that skips case 0 fails.
+    crashes = [[2]] if failure == "unskippable_case" else [[0]]
+    campaign = _fake_campaign(clock, tmp_path, workers=1, cpu_per_round=1.0, crashes=crashes)
+    calls: list[tuple[int, bool]] = []
+
+    def recording(binary, seconds, fork, *, extra_env=None):
+        calls.append((seconds, fork))
+        return campaign(binary, seconds, fork, extra_env=extra_env)
+
+    rebuild = _failed_rebuild if failure == "rebuild_failed" else _rebuild
+    skippable = 1 if failure == "unskippable_case" else None
+    res = R.run_campaign_rounds(
+        Path("bin0"), max_time, campaign=recording, rebuild=rebuild, n_cases=3, skippable=skippable, workers=1
+    )
+    kg = res["keep_going"]
+    if runs_fallback:
+        assert len(calls) == 2 and calls[1][1] is True
+        assert calls[1][0] <= max_time - 1  # never more than the wall time left
+        assert kg["fork_fallback"]["reason"] == failure and kg["fork_fallback"]["max_time"] <= max_time - 1
+    else:
+        assert len(calls) == 1 and "fork_fallback" not in kg
+        assert kg["rounds"][-1]["stopped"] == "time_budget_spent"

@@ -293,10 +293,6 @@ def fuzz_required_memory_mb(workers: int = 1) -> int:
 GUARDRAIL_PER_INPUT_TIMEOUT_S = 30
 DEFAULT_MAX_TIME_S = 60
 MIN_FUZZ_WALL_S = 30
-# A keep-going round after a crash runs on what is left of the campaign's time, down to this floor.
-# Below MIN_FUZZ_WALL_S on purpose: a campaign sized at that minimum must still get a second round
-# when its first one crashed within a second. Fixed, never derived from the machine.
-MIN_ROUND_WALL_S = 5
 # Rounds are bounded by CPU-seconds: wall seconds times LibFuzzer workers, so a campaign runs the same
 # rounds whatever its worker count. A new round needs at least this many CPU-seconds left. Fixed, never
 # derived from the machine.
@@ -558,7 +554,9 @@ def run_campaign_rounds(
     - A `dispatch` harness (`n_cases`) runs in rounds: each case an input crashed in is skipped from
       the next round on, so a shallow bug stops ending every run and the other cases get the rest of
       the time. Rounds end when a round finds no new crashing case, every case is skipped, less than
-      MIN_ROUND_CPU_S CPU-seconds (wall seconds times `workers`) are left, a round's new crashing cases cannot be skipped
+      MIN_ROUND_CPU_S CPU-seconds (wall seconds times `workers`) or a whole wall second are left. A round's
+      wall budget is the wall time left, rounded down (`-max_total_time`), so no round overruns the
+      campaign. A round's new crashing cases cannot be skipped
       (`unskippable_case`: cases `skippable` and above, for a harness generated before every case
       was skippable), or a rebuild fails. In the last two, the time left runs in fork mode with
       crashes ignored on the last binary built (`fork_fallback`).
@@ -583,7 +581,8 @@ def run_campaign_rounds(
     fallback_reason: str | None = None
     skip_error: str | None = None
     while True:
-        budget = max(MIN_FUZZ_WALL_S if not rounds else MIN_ROUND_WALL_S, int(max_time - spent))
+        # A round never runs longer than the wall time the campaign has left. The first round always runs.
+        budget = max(1, int(max_time - spent)) if not rounds else int(max_time - spent)
         started = time.monotonic()
         if runtime_skip:
             skip_env = {DISPATCH_SKIP_MACRO: format_skip_cases_env(skipped)} if skipped else None
@@ -632,7 +631,8 @@ def run_campaign_rounds(
         if not fresh:
             rnd["stopped"] = "no_new_case"
             break
-        if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S:
+        # The next round needs the CPU floor and at least one whole second of wall time left.
+        if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S or int(max_time - spent) < 1:
             rnd["stopped"] = "time_budget_spent"
             break
         if not new:
@@ -654,8 +654,8 @@ def run_campaign_rounds(
             binary = next_binary
 
     fallback: dict | None = None
-    left = max(MIN_ROUND_WALL_S, int(max_time - spent))
-    if fallback_reason and (max_time - spent) * max(1, workers) >= MIN_ROUND_CPU_S:
+    left = int(max_time - spent)
+    if fallback_reason and left >= 1 and (max_time - spent) * max(1, workers) >= MIN_ROUND_CPU_S:
         # The cases still crashing cannot be skipped: the time left goes to fork mode, which keeps
         # fuzzing past each crash, on the last binary built (its skipped cases stay skipped).
         started = time.monotonic()
