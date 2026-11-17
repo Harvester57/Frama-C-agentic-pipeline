@@ -39,7 +39,8 @@ workspace/reports/imported_corpus/<mod>.json:
 
   - a target fuzz module (sidecar `target_fuzzer`) gets the corpora mapped to its fuzzer, verbatim;
   - any other module gets each corpus whose functions (the mapping's, else its fuzzer's
-    `direct_api_calls`) a harness case passes its whole input to, behind that case's selector byte.
+    `direct_api_calls`) a harness case passes its whole input to, behind that case's selector byte
+    (two bytes, little-endian, for a harness of more than 256 cases).
 
 Inputs longer than the module's `max_input_size` are dropped. A module whose fuzzer ships a
 dictionary also gets workspace/dicts/<mod>.extra.dict. Fuzz assets are an improvement, never a
@@ -867,13 +868,17 @@ def _corpus_inputs(cid: str) -> list[bytes]:
 
 def _whole_input_selectors(sidecar: dict[str, Any], harness_c: str, functions: set[str]) -> list[int | None]:
     """The cases of a harness that pass their whole input to one of `functions` (selector, or None)."""
+    from seed_harvest import selector_width
+
+    # A selector the harness's selector bytes can hold (one byte, two above 256 cases).
+    limit = 256 ** selector_width(sidecar, harness_c)
     if sidecar.get("api_cases"):
         sels: list[int | None] = []
         for lay in sidecar.get("api_cases") or []:
             if not isinstance(lay, dict) or not isinstance(lay.get("selector"), int):
                 continue
             rest, calls = lay.get("rest"), list(lay.get("calls") or [])
-            if lay.get("slots") or not isinstance(rest, dict) or not 0 <= lay["selector"] <= 255:
+            if lay.get("slots") or not isinstance(rest, dict) or not 0 <= lay["selector"] < limit:
                 continue
             k = rest.get("call")
             if isinstance(k, int) and 0 <= k < len(calls) and calls[k] in functions:
@@ -882,7 +887,7 @@ def _whole_input_selectors(sidecar: dict[str, Any], harness_c: str, functions: s
     from seed_harvest import case_bindings, harness_cases, whole_input_cases
 
     bindings = [(sel, case_bindings(stmt, functions)) for sel, stmt in harness_cases(harness_c)]
-    return [s for s in whole_input_cases(bindings) if s is None or 0 <= s <= 255]
+    return [s for s in whole_input_cases(bindings) if s is None or 0 <= s < limit]
 
 
 def write_module(module: str, sidecar: dict[str, Any], harness_c: str, doc: dict[str, Any] | None) -> dict[str, Any]:
@@ -942,13 +947,16 @@ def write_module(module: str, sidecar: dict[str, Any], harness_c: str, doc: dict
         if tf_id in fuzzers:
             used_fuzzers.append(tf_id)
     else:
+        from seed_harvest import selector_width
+
+        width = selector_width(sidecar, harness_c)
         for m in active:
             fid = m.get("fuzzer")
             fns = list(m.get("functions") or []) or list((fuzzers.get(fid) or {}).get("direct_api_calls") or [])
             if not fns:
                 continue
             for sel in _whole_input_selectors(sidecar, harness_c, set(fns)):
-                prefix = bytes([sel]) if sel is not None else b""
+                prefix = sel.to_bytes(width, "little") if sel is not None else b""
                 take("all" if sel is None else str(sel), m["corpus"], prefix, fns)
                 if fid and fid in fuzzers and fid not in used_fuzzers:
                     used_fuzzers.append(fid)

@@ -596,11 +596,12 @@ def test_the_cap_keeps_the_call_sites_that_pass_a_buffer():
 
 def test_the_selector_cap_skips_the_function_only_when_no_case_is_left():
     sites = [{**TF_SITE, "format": f"f{i}"} for i in range(3)]
-    p = ah.plan(_lib_dag("a", "scan"), _lib_model(), "lib", "lib", 128, variadic={"scan": sites}, reserve=253)
+    cap = ah.MAX_CASES
+    p = ah.plan(_lib_dag("a", "scan"), _lib_model(), "lib", "lib", 128, variadic={"scan": sites}, reserve=cap - 2)
     assert [lay["kind"] for lay in p["layouts"]] == ["single", "variadic"] and p["skipped"] == {}
     assert [d["format"] for d in p["variadic_dropped"]] == ["f1", "f2"]
-    p = ah.plan(_lib_dag("a", "scan"), _lib_model(), "lib", "lib", 128, variadic={"scan": sites}, reserve=254)
-    assert p["skipped"] == {"scan": "more than 255 cases"}
+    p = ah.plan(_lib_dag("a", "scan"), _lib_model(), "lib", "lib", 128, variadic={"scan": sites}, reserve=cap - 1)
+    assert p["skipped"] == {"scan": f"more than {cap} cases"}
 
 
 def test_a_variadic_function_takes_no_part_in_sequences():

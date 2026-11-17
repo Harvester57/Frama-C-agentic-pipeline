@@ -267,9 +267,10 @@ from generate_harness import (  # noqa: E402
     DISPATCH_SKIP_FN,
     DISPATCH_SKIP_MACRO,
     DISPATCH_SWITCH_RE,
-    dispatch_case_of,
+    dispatch_case_of_bytes,
     dispatch_selector_of,
     dispatch_selector_of_text,
+    dispatch_selector_width,
 )
 from resources import (  # noqa: E402
     FUZZ_RSS_LIMIT_MB,
@@ -515,18 +516,19 @@ def harness_supports_runtime_skip_cases(sources: Sequence[str | Path] | str | Pa
 
 def artifact_dispatch_case(artifact: dict, n_cases: int, selector: str = DISPATCH_SELECTOR_MODULO) -> int | None:
     """
-    The dispatch case an artifact's input selects under `selector` (generate_harness.dispatch_case_of:
-    the first byte for `identity`, the first byte modulo `n_cases` for `modulo`), or None for an empty
-    input or one the harness rejects.
+    The dispatch case an artifact's input selects under `selector` (generate_harness.dispatch_case_of_bytes:
+    the first byte for `identity`, the first two bytes little-endian for `identity16`, the first byte
+    modulo `n_cases` for `modulo`), or None for an input shorter than the selector or one the harness
+    rejects.
     """
     if n_cases <= 0:
         return None
     try:
         with open(artifact["artifact"], "rb") as fh:
-            first = fh.read(1)
+            prefix = fh.read(dispatch_selector_width(selector))
     except (OSError, KeyError):
         return None
-    return dispatch_case_of(first[0], n_cases, selector) if first else None
+    return dispatch_case_of_bytes(prefix, n_cases, selector)
 
 
 def run_campaign_rounds(

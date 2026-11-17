@@ -146,6 +146,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import load_json_optional  # noqa: E402
+from generate_harness import DISPATCH_MAX_CASES_WIDE  # noqa: E402
 from seed_harvest import (  # noqa: E402
     _CHAR_POINTEES,
     _QUALIFIERS_RE,
@@ -161,7 +162,10 @@ TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
 MAX_SEQUENCE_CASES = 16  # recorded chains first, then synthesized lifecycle cases (H2)
 LIFECYCLE_MAX_CALLS = 8  # calls on the handle per run of a lifecycle case, each picked by one input byte
 MAX_VARIADIC_CASES = 32  # per variadic function: one case per harvested (format, objects)
-MAX_CASES = 255  # one selector byte
+# Two selector bytes above 256 cases (generate_harness.DISPATCH_SELECTOR_IDENTITY16, D7).
+MAX_CASES = DISPATCH_MAX_CASES_WIDE - 1
+# One input byte picks a lifecycle case's method (`fc_op % <n>U`): more methods would never be called.
+LIFECYCLE_MAX_METHODS = 255
 VARIADIC_KIND = "variadic"  # the layout kind of a case built from a call site (scripts/variadic_calls.py)
 NO_VARIADIC_SITE = "variadic: no call site with a literal format and sized objects in the target's own sources"
 CUSTOM_KIND = "custom"  # the layout kind of a hand-written case (`--api --dispatch-case`)
@@ -1982,7 +1986,7 @@ def lifecycle_methods(htype: str, records: dict[str, dict], api: ApiInfo) -> lis
         if name == (api.out_ctors.get(htype) or ("", 0))[0]:
             continue
         out.append(name)
-    return out[:MAX_CASES]
+    return out[:LIFECYCLE_MAX_METHODS]
 
 
 def lifecycle_case(
