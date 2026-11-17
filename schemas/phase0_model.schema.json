@@ -70,6 +70,11 @@
           "cppflags": {"type": ["array", "null"], "items": {"type": "string"}},
           "entry_points": {"type": ["array", "null"], "items": {"$ref": "#/definitions/function_id"}},
           "embedded_api": {"type": ["array", "null"], "items": {"$ref": "#/definitions/function_id"}},
+          "header_api": {
+            "$comment": "A library unit's functions defined in a public header of the build capture (static, header), which it compiles: API entry points without a global symbol. Absent on executables, test units and models made before it",
+            "type": "array",
+            "items": {"$ref": "#/definitions/function_id"}
+          },
           "parse": {
             "type": "object",
             "properties": {
