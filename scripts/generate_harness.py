@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -2106,18 +2106,24 @@ _FUZZ_FN_BLOCK_RE = re.compile(
 )
 
 
-def _check_argv_entry(module_name: str, entry_fn: str, sources: list[str], cppflags: str) -> None:
+def _check_argv_entry(
+    module_name: str, entry_fn: str, sources: list[str], cppflags: str, headers: Sequence[str] = ()
+) -> None:
     """
     An argv entry calls `main(argc, argv)`: a `main(void)` takes no arguments, so the input cannot
     reach it that way (it reads stdin, a fixed file, or nothing). Fail with what to do instead of
-    writing a harness that does not compile. A main whose definition is not found is left to the
-    compiler.
+    writing a harness that does not compile. The definition in `sources` decides; without one, the
+    first of the harness's `headers` that declares main does. A main found in neither is left to
+    the compiler.
     """
-    try:
-        params = extract_function_prototype(entry_fn, None, sources, cppflags)
-    except ValueError:
-        return
-    if params:
+    params: list[dict[str, Any]] | None = None
+    for hdr, srcs in ((None, sources), *((h, None) for h in headers if h)):
+        try:
+            params = extract_function_prototype(entry_fn, hdr, srcs, cppflags)
+        except ValueError:
+            continue
+        break
+    if params is None or params:
         return
     raise ValueError(
         f"{entry_fn}() of module {module_name!r} takes no arguments: an argv harness cannot pass it the "
@@ -2360,7 +2366,13 @@ def _generate_module_harness(
 
     effective_null_terminate = bool(null_terminate or entry_style == "c_string" or auto_needs_nt)
     if entry_style == "argv":
-        _check_argv_entry(module_name, entry_fn, sources, norm_cppflags)
+        _check_argv_entry(
+            module_name,
+            entry_fn,
+            sources,
+            norm_cppflags,
+            headers=[norm_header or "", *norm_extra_includes, *norm_compat_includes],
+        )
         # Rename the target's main in every build of this module (Eva and fuzz alike): the harness
         # calls main(argc, argv), and the -D renames that call together with the target's
         # definition, so libFuzzer's own main is the only main at link time.

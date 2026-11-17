@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import generate_harness
 from generate_harness import _build_invocations, generate_module_harness
 
@@ -252,6 +254,89 @@ def test_argv_harness_keeps_the_module_header_declaration_of_main(tmp_path, monk
     _, text = _sax_harness(_sax_workspace(tmp_path, monkeypatch, header=header))
     # The header's own declaration is the only one: the harness adds none beside it.
     assert _main_declarations(text) == []
+
+
+def test_argv_harness_declaration_stays_below_the_prelude_headers(tmp_path, monkeypatch):
+    # The module header needs a type from a sibling header it never includes: the auto-prelude
+    # inserts that header before it, and main's declaration stays below both.
+    header = SAX_H.replace("size_t length", "blob_len_t length")
+    source = SAX_C.replace('#include "sax.h"', '#include "types.h"\n#include "sax.h"').replace(
+        "size_t length", "blob_len_t length"
+    )
+    run = _sax_workspace(tmp_path, monkeypatch, header=header, source=source)
+    (run / "workspace" / "work" / "types.h").write_text("typedef unsigned long blob_len_t;\n", encoding="utf-8")
+    snapshots: list[str] = []
+
+    def clang(cmd, **kwargs):
+        text = Path(cmd[-1]).read_text(encoding="utf-8")
+        snapshots.append(text)
+        stderr = (
+            "" if '#include "types.h"' in text else "workspace/work/sax.h:4:28: error: unknown type name 'blob_len_t'\n"
+        )
+        return subprocess.CompletedProcess(cmd, 1 if stderr else 0, stdout="", stderr=stderr)
+
+    res = generate_module_harness(
+        module_name="sax_example",
+        sources=["workspace/work/sax.c"],
+        header_include="sax.h",
+        entry_fn="main",
+        max_input_size=256,
+        cppflags="-Iworkspace/work",
+        out_dir=run / "workspace" / "harnesses",
+        entry_style="argv",
+        prelude_clang="clang",
+        prelude_runner=clang,
+    )
+    assert res["prelude_headers"] == ["types.h"]
+    text = (run / "workspace" / "harnesses" / "harness_sax_example.c").read_text(encoding="utf-8")
+    assert _main_declarations(text) == ["int main(int argc, char** argv);"]
+    types_at, header_at = text.index('#include "types.h"'), text.index('#include "sax.h"')
+    assert types_at < header_at < text.index("int main(int argc, char** argv);") < text.index("main(argc, argv);")
+
+
+def test_argv_style_refuses_a_main_void_seen_only_in_the_module_header(tmp_path, monkeypatch):
+    # The definition is not among the sources: the header's `int main(void)` decides.
+    header = SAX_H.replace("#endif", "int main(void);\n#endif")
+    run = _sax_workspace(tmp_path, monkeypatch, header=header)
+    out = run / "workspace" / "harnesses"
+    with pytest.raises(ValueError, match="takes no arguments"):
+        generate_module_harness(
+            module_name="sax_example",
+            sources=["workspace/work/missing.c"],
+            header_include="sax.h",
+            entry_fn="main",
+            max_input_size=256,
+            cppflags="-Iworkspace/work",
+            out_dir=out,
+            entry_style="argv",
+            auto_prelude=False,
+        )
+    assert not (out / "harness_sax_example.c").exists()
+    assert not (out / "harness_sax_example.json").exists()
+
+
+def test_argv_style_refuses_a_main_void_with_a_module_header(tmp_path, monkeypatch):
+    header = SAX_H.replace("#endif", "int main(void);\n#endif")
+    source = SAX_C.replace(
+        "int main(int argc, char** argv) {\n    if (argc > 1) {\n        return parse_blob(argv[1], strlen(argv[1]));\n    }",
+        "int main(void) {",
+    )
+    run = _sax_workspace(tmp_path, monkeypatch, header=header, source=source)
+    out = run / "workspace" / "harnesses"
+    with pytest.raises(ValueError, match="harness_reach.py exempt --module sax_example"):
+        generate_module_harness(
+            module_name="sax_example",
+            sources=["workspace/work/sax.c"],
+            header_include="sax.h",
+            entry_fn="main",
+            max_input_size=256,
+            cppflags="-Iworkspace/work",
+            out_dir=out,
+            entry_style="argv",
+            auto_prelude=False,
+        )
+    assert not (out / "harness_sax_example.c").exists()
+    assert not (out / "harness_sax_example.json").exists()
 
 
 def test_argv_harness_with_header_compiles_without_implicit_declaration(tmp_path, monkeypatch):
