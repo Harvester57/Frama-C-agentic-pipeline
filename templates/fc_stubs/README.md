@@ -45,6 +45,11 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   `string.h` specifications), so host-header mode is the only E-ACSL mode.
 - In host-header mode, `fc_compat_types.h` simply includes glibc `<sys/types.h>`, so
   `__int32_t`, `u_short` and the others come from glibc and are identical by construction.
+- Frama-C's parser knows `restrict` and `__restrict` but not GCC's `__restrict__`; Frama-C's
+  libc maps it (`share/libc/features.h`), host glibc does not. The E-ACSL block of
+  `fc_compat_types.h` therefore defines `__restrict__` as `__restrict` (guarded with `#ifndef`)
+  ahead of its includes, so sources such as mpack's `MPACK_RESTRICT` parse. Clang compiles never
+  see it (the header is empty without `__FRAMAC__`).
 - Variadic calls without a libc specification produce `<fn>_fallback_<N>` symbols.
   `run_eacsl_fuzz.py` defines them in a generated, link-only `eacsl_fallbacks.o`. It forwards to
   the real function when it can; otherwise the call fails with `ENOSYS`, which is recorded in

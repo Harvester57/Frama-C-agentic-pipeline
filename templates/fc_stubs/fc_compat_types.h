@@ -1,8 +1,8 @@
 /*
  * Frama-C Compatibility Primitive Types (force-included by the pipeline)
  *
- * This header is a Frama-C parse aid only. It contains typedefs and includes,
- * never C function bodies, and it is EMPTY whenever __FRAMAC__ is undefined
+ * This header is a Frama-C parse aid only. It contains typedefs, includes,
+ * keyword-spelling macros and contracted declarations, never C function bodies, and it is EMPTY whenever __FRAMAC__ is undefined
  * (Clang compile of the self-contained E-ACSL output, sanitizer builds), so it
  * can never redefine types in code that already contains them.
  *
@@ -51,6 +51,14 @@ _Static_assert(sizeof(long) == 8 && sizeof(void *) == 8,
 #endif
 
 #if defined(__FRAMAC_EACSL__)
+
+/* GCC's `__restrict__` spelling (mpack's MPACK_RESTRICT under __GNUC__). Frama-C's parser knows
+ * `restrict` and `__restrict` only; its own libc maps the GCC spelling (share/libc/features.h), but
+ * the E-ACSL frontend parses with host glibc headers (-no-frama-c-stdlib), which do not. Ahead of
+ * every include so a host header spelling it parses too. */
+#ifndef __restrict__
+#define __restrict__ __restrict
+#endif
 
 #include <stdint.h>
 #include <sys/types.h>

@@ -311,3 +311,70 @@ def test_the_string_vocabulary_runs_under_eacsl_and_proves_under_wp(tmp_path):
     assert proved == total, log.split("==wp==", 1)[1]
     eva = log.split("==eva==", 1)[1]
     assert eva.count("Invalid") + eva.count("invalid") >= 1, eva
+
+
+# ---------------------------------------------------------------------------------------------------
+# GCC's `__restrict__` on the E-ACSL frontend (mpack run-3, 2026-11-17): Frama-C's parser knows
+# `restrict` and `__restrict` only; its own libc maps the GCC spelling (features.h), host glibc does not.
+# ---------------------------------------------------------------------------------------------------
+
+RESTRICT_C = r"""#include <string.h>
+#include <stdio.h>
+#include <wchar.h>
+
+#define MPACK_RESTRICT __restrict__
+
+struct w { char *position; };
+
+void cp(char *__restrict__ dst, const char *__restrict__ src, size_t n);
+void cp(char *MPACK_RESTRICT dst, const char *MPACK_RESTRICT src, size_t n) { memcpy(dst, src, n); }
+
+void d(struct w *writer) { char *MPACK_RESTRICT p = writer->position; p[0] = 0; }
+
+int main(void) {
+  char a[4] = "abc", b[4];
+  struct w x = { b };
+  cp(b, a, 4);
+  d(&x);
+  printf("ok %d\n", (int)strlen(b + 1));
+  return 0;
+}
+"""
+
+
+def _eacsl_host_block() -> str:
+    text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    start = text.index("#if defined(__FRAMAC_EACSL__)")
+    return text[start : text.index("#else /* Frama-C __fc_libc */", start)]
+
+
+@pytest.mark.unit
+def test_eacsl_host_headers_map_the_gcc_restrict_spelling_before_any_include():
+    block = _eacsl_host_block()
+    define = "#ifndef __restrict__\n#define __restrict__ __restrict\n#endif"
+    assert define in block, block[:400]
+    assert block.index(define) < block.index("#include <stdint.h>")
+    # Inside the __FRAMAC__ guard: a clang compile without Frama-C never sees it.
+    text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    assert text.index("#if defined(__FRAMAC__)") < text.index(define)
+
+
+@image
+@slow
+def test_gcc_restrict_spelling_builds_under_eacsl_and_clang(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    script = (
+        EACSL_FLAGS + 'echo "==eacsl=="; '
+        'e-acsl-gcc -c -F -e-acsl-full-mtracking -E "$F" -o r.frama.c -O bin r.c > build.log 2>&1; echo "build=$?"; '
+        './bin.e-acsl 2>&1; echo "run=$?"; '
+        'echo "==cpp=="; gcc -E -D__FRAMAC__ $F r.c 2>/dev/null | grep -c __restrict__; '
+        'echo "==clang=="; clang -fsyntax-only -include /opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h r.c 2>&1; '
+        'echo "clang=$?"; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"r.c": RESTRICT_C}, script, timeout=600)
+    eacsl = log.split("==eacsl==", 1)[1].split("==cpp==", 1)[0]
+    assert "build=0" in eacsl, (tmp_path / "build.log").read_text(encoding="utf-8", errors="replace")
+    assert "ok 2" in eacsl and "run=0" in eacsl, eacsl
+    # No `__restrict__` survives the frontend preprocessing, from the target or from glibc.
+    assert log.split("==cpp==", 1)[1].split("==clang==", 1)[0].strip() == "0", log
+    assert "clang=0" in log.split("==clang==", 1)[1], log
