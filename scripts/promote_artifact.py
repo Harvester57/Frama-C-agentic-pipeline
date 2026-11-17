@@ -85,6 +85,46 @@ def _atomic_write_bytes(dest: Path, blob: bytes) -> None:
         raise
 
 
+def check_promotable(
+    run_dir: Path, agent_id: str, src_rel: str, kind: str = "artifact", pending_bytes: int = 0
+) -> os.stat_result:
+    """
+    The checks promote_file makes before it reads the file: safe path under agents/<agent_id>/scratch/,
+    no symlink, a regular file, the per-file cap of the kind and, for an artifact, the per-agent total
+    (`pending_bytes`: artifacts the same result promotes before this one). Raises PromotionError.
+    `validate_artifacts.py agent-result` runs it too, so an agent sees what the ingest would refuse.
+    """
+    if not is_safe_agent_id(agent_id):
+        raise PromotionError(f"invalid agent_id: {agent_id!r}")
+    norm_rel = src_rel.replace("\\", "/")
+    if not is_safe_relative_path(norm_rel):
+        raise PromotionError(f"unsafe relative path: {src_rel!r}")
+    expected_prefix = f"agents/{agent_id}/scratch/"
+    if not norm_rel.startswith(expected_prefix):
+        raise PromotionError(f"source path {norm_rel!r} must reside under {expected_prefix!r}")
+    if kind not in ("artifact", "seed", "crash"):
+        raise PromotionError(f"unsupported promotion kind: {kind!r}")
+
+    run_dir = run_dir.resolve()
+    st_pre = _lstat_walk_no_symlinks(run_dir, norm_rel)
+    if not stat.S_ISREG(st_pre.st_mode):
+        raise PromotionError(f"{norm_rel}: not a regular file")
+    if os.name != "nt" and st_pre.st_nlink != 1:
+        raise PromotionError(f"{norm_rel}: hardlinked file rejected (st_nlink={st_pre.st_nlink})")
+
+    max_bytes = MAX_SEED_BYTES if kind in ("seed", "crash") else MAX_ARTIFACT_BYTES
+    if st_pre.st_size > max_bytes:
+        raise PromotionError(f"{norm_rel}: file size {st_pre.st_size} bytes exceeds limit ({max_bytes} bytes)")
+
+    if kind == "artifact":
+        used = _agent_artifacts_bytes(run_dir / "agents" / agent_id / "artifacts") + pending_bytes
+        if used + st_pre.st_size > MAX_AGENT_TOTAL_BYTES:
+            raise PromotionError(
+                f"{norm_rel}: cumulative artifacts for {agent_id} would exceed {MAX_AGENT_TOTAL_BYTES} bytes"
+            )
+    return st_pre
+
+
 def promote_file(
     run_dir: Path,
     agent_id: str,
@@ -99,37 +139,11 @@ def promote_file(
     - kind == 'seed':     workspace/corpus/<module>/seed-<sha256[:16]>
     - kind == 'crash':    workspace/crashes/<module>/crash-<sha256[:16]>
     """
-    if not is_safe_agent_id(agent_id):
-        raise PromotionError(f"invalid agent_id: {agent_id!r}")
-    norm_rel = src_rel.replace("\\", "/")
-    if not is_safe_relative_path(norm_rel):
-        raise PromotionError(f"unsafe relative path: {src_rel!r}")
-    expected_prefix = f"agents/{agent_id}/scratch/"
-    if not norm_rel.startswith(expected_prefix):
-        raise PromotionError(f"source path {norm_rel!r} must reside under {expected_prefix!r}")
-    if kind not in ("artifact", "seed", "crash"):
-        raise PromotionError(f"unsupported promotion kind: {kind!r}")
     if kind in ("seed", "crash") and not module:
         raise PromotionError(f"promotion kind {kind!r} requires a module name")
-
+    st_pre = check_promotable(run_dir, agent_id, src_rel, kind)
+    norm_rel = src_rel.replace("\\", "/")
     run_dir = run_dir.resolve()
-    st_pre = _lstat_walk_no_symlinks(run_dir, norm_rel)
-    if not stat.S_ISREG(st_pre.st_mode):
-        raise PromotionError(f"{norm_rel}: not a regular file")
-    if os.name != "nt" and st_pre.st_nlink != 1:
-        raise PromotionError(f"{norm_rel}: hardlinked file rejected (st_nlink={st_pre.st_nlink})")
-
-    max_bytes = MAX_SEED_BYTES if kind in ("seed", "crash") else MAX_ARTIFACT_BYTES
-    if st_pre.st_size > max_bytes:
-        raise PromotionError(f"{norm_rel}: file size {st_pre.st_size} bytes exceeds limit ({max_bytes} bytes)")
-
-    artifacts_dir = run_dir / "agents" / agent_id / "artifacts"
-    if kind == "artifact":
-        used = _agent_artifacts_bytes(artifacts_dir)
-        if used + st_pre.st_size > MAX_AGENT_TOTAL_BYTES:
-            raise PromotionError(
-                f"{norm_rel}: cumulative artifacts for {agent_id} would exceed {MAX_AGENT_TOTAL_BYTES} bytes"
-            )
 
     src_abs = run_dir / norm_rel
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)

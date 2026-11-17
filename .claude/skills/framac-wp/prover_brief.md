@@ -6,7 +6,7 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 
 ## Input Context
 
-- **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
+- **Run directory:** `{run_dir}` on the host, `/framac-run` (the working directory) in the container; the target `{target_dir}` is read-only at `/target`. Run every command through the wrapper, as **How to run commands** below says.
 - **Isolated Scratch C File:** `agents/{agent_id}/scratch/work/{c_file}`
 - **Isolated Scratch Header File:** `agents/{agent_id}/scratch/work/{header_file}`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
@@ -22,6 +22,8 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 A `Known Dead Ends` section, when present, lists clauses already refuted on this function or rejected by a callee; never re-add them.
 
 <!-- spec-kb -->
+
+<!-- run-commands -->
 
 ## Strict Rules
 
@@ -235,7 +237,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 
 ## The Dual-Oracle Verification Loop (Run on Every Iteration)
 
-Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_id}/scratch/work/{header_file}`, run **both** oracles against your scratch work tree through the wrapper (`-TargetDir "{target_dir}" -RunDir "{run_dir}"`):
+Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_id}/scratch/work/{header_file}`, run **both** oracles against your scratch work tree through the wrapper (**How to run commands**):
 
 1. **Oracle 1 — Dynamic Anti-Hallucination Guardrail (`E-ACSL`):**
    ```text
@@ -320,5 +322,7 @@ Each `strengthening_requests` entry has exactly the keys below (`callee_file` ma
 **Validate before you return.** Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py agent-result agents/{agent_id}/scratch/result.json` through the wrapper. It must print `"ok": true`. Otherwise correct `result.json` for every listed error (an `unexpected property` is a key the result schema does not have: remove it, in nested objects too) and run the check again. Do this even when your budget is exhausted: it runs no proof, and the parent discards a result that fails it and reruns the whole task.
 
 A `blocked` result (a guardrail `code_fault`, a repeated `analysis_error`) may leave `unproven_goals` empty, but its `evidence` must name the report that blocked it.
+
+Every `evidence[].tool_output` is a report in the run directory, given relative to it (your `agents/{agent_id}/scratch/` or `workspace/`). Reference manuals and repository docs are not evidence files: name them in prose.
 
 Set `fault_hypothesis` (`input_condition`, `predicate`, `why_not_reproduced`) only when you believe a specific input violates a specific goal (which creates a `needs_validation` bug candidate). When a goal stalls due to a WP/SMT limitation (for example `<stdlib.h>` dynamic allocation predicates `\freeable` / `allocates` or nonlinear arithmetic) or an unreachable branch rather than a code bug, leave `fault_hypothesis` as `null` and set `proof_gap` (`{"predicate": "...", "reason": "..."}`; must be `null` when `status` is `"all_proven"`). A stall without either is reported through `unproven_goals` alone.
