@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+import fuzz_build
 import prover_candidates as PC
 import resources
 import run_eacsl_fuzz as R
@@ -972,7 +973,7 @@ def guard_argv(prover: Prover) -> list[str]:
 
 
 def fake_guardrail(monkeypatch, status: str = PASSED) -> None:
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: {"returncode": 0, "binary": "guard_bin"})
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: {"returncode": 0, "binary": "guard_bin"})
     monkeypatch.setattr(R, "run_guardrail_check", lambda *a, **k: {"status": status})
 
 
@@ -1081,7 +1082,7 @@ def test_the_guardrail_cli_keeps_its_exit_code_and_ignores_other_reports(prover,
     def no_sandbox(*a: Any, **k: Any) -> dict:
         raise R.SandboxUnavailable("no sandbox here")
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", no_sandbox)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", no_sandbox)
     prover.edit(annotated("a"))
     assert R.main(guard_argv(prover)) == 3
     assert json.loads(capsys.readouterr().out)["candidate"]["recorded"] is True

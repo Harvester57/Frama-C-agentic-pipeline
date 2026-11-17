@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import fuzz_dictionary
 import generate_harness
 import run_eacsl_fuzz as R
@@ -87,7 +88,7 @@ def _run_campaign(tmp_path, monkeypatch, *extra) -> tuple[dict, dict]:
     src, harness = _slice(tmp_path)
     instrumented = tmp_path / "fuzz_mod.e-acsl"
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_eacsl_binary",
         lambda *a, **k: {"engine": "eacsl", "returncode": 0, "binary": str(instrumented), "reduced_checks": []},
     )
@@ -263,7 +264,7 @@ def test_guardrail_error_reports_carry_crash_input(tmp_path, monkeypatch):
     plain.write_bytes(b"\x7fELF plain")
     assert R.run_guardrail_check(plain, tmp_path / "c", tmp_path / "s")["crash_input"] is None
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: {"returncode": 1, "reason": "boom"})
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: {"returncode": 1, "reason": "boom"})
     out_json = tmp_path / "g.json"
     R.main(
         [

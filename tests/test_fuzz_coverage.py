@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import pipeline_make as pm
 import resources
 import run_eacsl_fuzz as R
@@ -336,7 +337,7 @@ def _report(tmp_path, **kwargs):
 
 
 def test_report_without_inputs_measures_nothing(tmp_path, monkeypatch):
-    monkeypatch.setattr(R, "compile_coverage_binary", _no_compile)
+    monkeypatch.setattr(fuzz_build, "compile_coverage_binary", _no_compile)
     report = _report(tmp_path)
     assert report["status"] == "no_inputs"
     assert "functions" not in report
@@ -346,7 +347,7 @@ def test_report_without_inputs_measures_nothing(tmp_path, monkeypatch):
 def test_report_compile_error_claims_no_coverage(tmp_path, monkeypatch):
     _corpus(tmp_path, b"x")
     monkeypatch.setattr(
-        R, "compile_coverage_binary", lambda *a, **k: {"engine": "coverage", "returncode": 1, "binary": "b"}
+        fuzz_build, "compile_coverage_binary", lambda *a, **k: {"engine": "coverage", "returncode": 1, "binary": "b"}
     )
     report = _report(tmp_path)
     assert report["status"] == "compile_error"
@@ -355,7 +356,7 @@ def test_report_compile_error_claims_no_coverage(tmp_path, monkeypatch):
 
 def _measured(tmp_path, monkeypatch, *contents, export=None, export_error=None):
     _corpus(tmp_path, *contents)
-    monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
+    monkeypatch.setattr(fuzz_build, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     default = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
     monkeypatch.setattr(
@@ -386,7 +387,7 @@ def test_report_replays_known_crashes_last_and_counts_them(tmp_path, monkeypatch
     (crashes / "crash-0123").write_bytes(b"CRASH seed")
     fake = CoverageSandbox()
     _corpus(tmp_path, b"CRASH seed", b"a", b"b")
-    monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
+    monkeypatch.setattr(fuzz_build, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
     monkeypatch.setattr(
         R, "_export_coverage", lambda *a: (_export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)])), None)
@@ -421,7 +422,7 @@ def _truncated_then_ok(tmp_path, monkeypatch, pre_included: list[str]):
 
     good = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
     results = iter([(None, f"llvm-cov export failed (1): error: {R.COVERAGE_TRUNCATED_MAPPING}"), (good, None)])
-    monkeypatch.setattr(R, "compile_coverage_binary", compile_)
+    monkeypatch.setattr(fuzz_build, "compile_coverage_binary", compile_)
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     monkeypatch.setattr(R, "_export_coverage", lambda *a: next(results))
     monkeypatch.setattr(R, "in_function_includes", lambda sources, cppflags="": pre_included)
@@ -573,7 +574,7 @@ def _cli(tmp_path, *extra):
 
 def test_cli_writes_the_full_report_and_prints_a_summary(tmp_path, monkeypatch, capsys):
     _corpus(tmp_path, b"a")
-    monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
+    monkeypatch.setattr(fuzz_build, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", CoverageSandbox())
     export = _export(_fn("f", "/r/workspace/work/a.c", 1, [_region(1, 2, 1)]))
     monkeypatch.setattr(R, "_export_coverage", lambda *a: (export, None))
@@ -586,7 +587,7 @@ def test_cli_writes_the_full_report_and_prints_a_summary(tmp_path, monkeypatch, 
 
 def test_cli_exits_3_without_the_sandbox(tmp_path, monkeypatch, capsys):
     _corpus(tmp_path, b"a")
-    monkeypatch.setattr(R, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
+    monkeypatch.setattr(fuzz_build, "compile_coverage_binary", _compile_ok(tmp_path / "cov_m"))
 
     def unavailable(*a, **k):
         raise SandboxUnavailable("no sandbox")

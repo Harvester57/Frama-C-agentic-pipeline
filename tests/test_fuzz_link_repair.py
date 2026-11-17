@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import fuzz_build
 import run_eacsl_fuzz as R
 
 
@@ -144,7 +145,7 @@ def _fake_linker(monkeypatch, missing_after: dict[str, str]) -> list[list[str]]:
             return {"engine": "sanitizers", "returncode": 1, "stderr": log}
         return {"engine": "sanitizers", "returncode": 0, "binary": str(out_bin)}
 
-    monkeypatch.setattr(R, "compile_sanitizer_binary", fake_compile)
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", fake_compile)
     return calls
 
 

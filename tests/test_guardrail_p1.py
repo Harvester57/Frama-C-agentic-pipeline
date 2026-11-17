@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import run_eacsl_fuzz as R
 import sandbox_exec
 import workspace_overlay
@@ -62,6 +63,7 @@ def test_selection_without_effective_limit_keeps_all(limit):
 
 def _instrumented(monkeypatch, captured: list) -> None:
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
+    monkeypatch.setattr(fuzz_build, "is_eacsl_instrumented", lambda b: True)
 
     def fake_run(cmd, **kw):
         captured.append(list(cmd))
@@ -115,7 +117,7 @@ def test_guardrail_cli_reach_functions_do_not_narrow_instrumentation(tmp_path, m
         seen["reach"] = k.get("functions")
         return {"status": "passed_dynamic_oracle", "corpus_dir": str(corpus)}
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", compile_ok)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", compile_ok)
     monkeypatch.setattr(R, "run_guardrail_check", guard)
     monkeypatch.setattr(R.prover_candidates, "add_candidate_block", lambda *a, **k: None)
     out = tmp_path / "g.json"
@@ -528,6 +530,7 @@ def chdir_tmp(tmp_path, monkeypatch):
 def _crashing_replays(monkeypatch, crasher: bytes, calls: list, report: str = SEGV_ELSEWHERE) -> None:
     """A fake libFuzzer that stops on the first replayed file whose content is `crasher`, printing `report`."""
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
+    monkeypatch.setattr(fuzz_build, "is_eacsl_instrumented", lambda b: True)
 
     def fake_run(cmd, **kw):
         calls.append(list(cmd))
@@ -782,6 +785,7 @@ def _mutation_guardrail(tmp_path: Path, monkeypatch, functions: list[str], calls
     """
     corpus = _corpus(tmp_path)
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
+    monkeypatch.setattr(fuzz_build, "is_eacsl_instrumented", lambda b: True)
 
     def fake_run(cmd, **kw):
         calls.append(list(cmd))

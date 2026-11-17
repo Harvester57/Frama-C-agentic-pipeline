@@ -14,6 +14,7 @@ import pytest
 
 import cache
 import eacsl_toolchain as T
+import fuzz_build
 import run_eacsl_fuzz as R
 import run_eva_slice
 import sandbox_exec
@@ -421,7 +422,7 @@ class FakeToolchain:
 
 @pytest.fixture
 def modern_cli(monkeypatch):
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
     monkeypatch.setattr(T.shutil, "which", lambda name: None)
 
 
@@ -513,7 +514,7 @@ def test_agent_scratch_and_selftest_builds_are_never_cached(run, modern_cli, mon
     assert res["returncode"] == 0 and res["cache"] == {"hit": False, "key": None}
     assert not any("-M" in c for c in fake.calls)
 
-    monkeypatch.setattr(R, "framac_version", lambda runner=None: "33.0")
+    monkeypatch.setattr(fuzz_build, "framac_version", lambda runner=None: "33.0")
     selftest = R.run_selftest(
         Path("workspace/eacsl_selftest"),
         runner=FakeToolchain(),

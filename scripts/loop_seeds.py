@@ -942,6 +942,7 @@ def default_guard_runner(
         return None
 
     def _run(copy: Path, function: str) -> dict:
+        import fuzz_build
         import run_eacsl_fuzz
         from sandbox_exec import SandboxUnavailable
 
@@ -949,7 +950,7 @@ def default_guard_runner(
         swapped[index] = str(copy)
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
-            comp = run_eacsl_fuzz.compile_eacsl_binary(
+            comp = fuzz_build.compile_eacsl_binary(
                 swapped,
                 out_dir / "guard",
                 cppflags=_with_include(orig_file.parent, cppflags),

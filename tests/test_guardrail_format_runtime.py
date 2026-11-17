@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 import eacsl_toolchain as T
+import fuzz_build
 import run_eacsl_fuzz as R
 from test_eacsl_format_signedness import _fake_share, _StageRecorder
 
@@ -36,9 +37,9 @@ GUARD_SCRATCH = Path("agents") / "prove-checked" / "scratch"
 def guard_run_dir(tmp_path, monkeypatch):
     """A run directory with one source, an agent scratch, a corpus file, and a modern e-acsl-gcc with a share."""
     share = _fake_share(tmp_path / "image")
-    monkeypatch.setattr(R, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
     monkeypatch.setattr(T.shutil, "which", lambda name: None)
-    monkeypatch.setattr(R, "eacsl_share_dir", lambda eacsl_bin: share)
+    monkeypatch.setattr(fuzz_build, "eacsl_share_dir", lambda eacsl_bin: share)
     run = tmp_path / "run"
     (run / GUARD_SCRATCH).mkdir(parents=True)
     (run / "corpus").mkdir()
@@ -63,7 +64,7 @@ def _guard_argv(tag: str) -> list[str]:
 
 def test_guardrail_cli_builds_the_runtime_from_the_patched_share(guard_run_dir, monkeypatch):
     fake = _StageRecorder()
-    monkeypatch.setattr(R, "compile_eacsl_binary", functools.partial(R.compile_eacsl_binary, runner=fake))
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", functools.partial(R.compile_eacsl_binary, runner=fake))
     replayed: list[Path] = []
 
     def fake_guardrail(binary, *args, **kwargs):

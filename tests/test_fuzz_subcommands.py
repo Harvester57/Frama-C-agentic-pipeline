@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import ledger
 import run_eacsl_fuzz as R
 import sandbox_exec
@@ -71,7 +72,7 @@ def test_build_compiles_only_and_reports_the_cache(tmp_path, monkeypatch):
         seen.update(k)
         return fake(*a, **k)
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", compile_eacsl)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", compile_eacsl)
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", _no_sandbox)
     out_json = tmp_path / "build.json"
     rc = R.main(
@@ -104,12 +105,12 @@ def test_build_compiles_only_and_reports_the_cache(tmp_path, monkeypatch):
 def test_build_falls_back_to_sanitizers_and_fails_cleanly(tmp_path, monkeypatch):
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", _no_sandbox)
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_eacsl_binary",
         lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "eacsl_instrumentation_failed"},
     )
     monkeypatch.setattr(
-        R,
+        fuzz_build,
         "compile_sanitizer_binary",
         lambda *a, **k: {"engine": "sanitizers", "returncode": 0, "binary": str(tmp_path / "fuzz_mod")},
     )
@@ -131,7 +132,9 @@ def test_build_falls_back_to_sanitizers_and_fails_cleanly(tmp_path, monkeypatch)
     assert res["engine_used"] == "sanitizers" and res["engine_fallback_reason"] == "eacsl_instrumentation_failed"
     assert res["eacsl_compile_attempt"]["returncode"] == 1
 
-    monkeypatch.setattr(R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1})
+    monkeypatch.setattr(
+        fuzz_build, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1}
+    )
     assert R.main(argv) == 1
     res = json.loads((tmp_path / "b.json").read_text(encoding="utf-8"))
     assert res["status"] == "compile_error" and res["binary"] is None
@@ -212,7 +215,7 @@ def test_replay_builds_through_the_cache_and_reports_errors(tmp_path, monkeypatc
     crash = tmp_path / "crash-1"
     crash.write_bytes(b"CRASH")
     binary = tmp_path / "workspace" / "harnesses" / "fuzz_snmp.e-acsl"
-    monkeypatch.setattr(R, "compile_eacsl_binary", _eacsl_ok(binary))
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", _eacsl_ok(binary))
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", FakeSandbox())
     argv = [
         "replay",
@@ -235,8 +238,12 @@ def test_replay_builds_through_the_cache_and_reports_errors(tmp_path, monkeypatc
     assert rep["status"] == "reproduced" and rep["engine_used"] == "eacsl" and rep["cache"]["hit"] is True
     assert rep["binary"] == str(binary) and rep["compile"]["returncode"] == 0
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "x"})
-    monkeypatch.setattr(R, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1})
+    monkeypatch.setattr(
+        fuzz_build, "compile_eacsl_binary", lambda *a, **k: {"engine": "eacsl", "returncode": 1, "reason": "x"}
+    )
+    monkeypatch.setattr(
+        fuzz_build, "compile_sanitizer_binary", lambda *a, **k: {"engine": "sanitizers", "returncode": 1}
+    )
     assert R.main(argv) == 1
     rep = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
     assert rep["status"] == "error" and rep["reason"].startswith("compile_error") and rep["artifacts"] == []
@@ -491,8 +498,8 @@ def _fake_builds(monkeypatch, run_dir: Path) -> tuple[list, list]:
             "cache": {"hit": False, "key": "s" * 64},
         }
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", compile_eacsl)
-    monkeypatch.setattr(R, "compile_sanitizer_binary", compile_san)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", compile_eacsl)
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", compile_san)
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", FakeSandbox())
     return eacsl_calls, san_calls
 
@@ -667,7 +674,7 @@ def test_guardrail_cli_max_corpus_inputs(tmp_path, monkeypatch):
         seen_max_corpus.update(kwargs)
         return {"status": "passed_dynamic_oracle", "corpus_dir": str(corpus_dir)}
 
-    monkeypatch.setattr(R, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", fake_compile)
     monkeypatch.setattr(R, "run_guardrail_check", fake_run_guardrail)
 
     rc = R.main(

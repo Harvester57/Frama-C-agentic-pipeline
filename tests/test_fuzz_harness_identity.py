@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import fuzz_build
 import phase0_gates
 import run_eacsl_fuzz as R
 import sandbox_exec
@@ -75,7 +76,7 @@ def _sandbox(new_crash: bytes | None):
 
 def test_campaign_report_and_each_found_artifact_carry_the_harness_identity(tmp_path, monkeypatch):
     sources = _run_dir(tmp_path, monkeypatch)
-    monkeypatch.setattr(R, "build_module_binary", _fake_build)
+    monkeypatch.setattr(fuzz_build, "build_module_binary", _fake_build)
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", _sandbox(b"\x02\x41"))
     report = _campaign(sources, tmp_path / "workspace/reports/fuzz/mod.json")
 
@@ -95,7 +96,7 @@ def test_campaign_report_and_each_found_artifact_carry_the_harness_identity(tmp_
 
 def test_an_artifact_carried_over_keeps_the_identity_it_was_found_under(tmp_path, monkeypatch):
     sources = _run_dir(tmp_path, monkeypatch)
-    monkeypatch.setattr(R, "build_module_binary", _fake_build)
+    monkeypatch.setattr(fuzz_build, "build_module_binary", _fake_build)
     out_json = tmp_path / "workspace/reports/fuzz/mod.json"
     crashes = tmp_path / "workspace/crashes/mod"
     crashes.mkdir(parents=True)
@@ -153,7 +154,7 @@ def test_campaign_records_the_replay_stack_frames_of_each_crash(tmp_path, monkey
         {"function": "rec_alloc", "file": "/framac-run/workspace/work/src/api.c", "line": 2},
     ]
     sources = _run_dir(tmp_path, monkeypatch)
-    monkeypatch.setattr(R, "build_module_binary", _fake_build)
+    monkeypatch.setattr(fuzz_build, "build_module_binary", _fake_build)
 
     def fake(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
         if "-runs=1" in cmd:
