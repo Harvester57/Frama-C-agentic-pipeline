@@ -36,12 +36,31 @@ The first sketch of this work had three steps. Two of them meet work that is alr
 
 ## Review of H1 (2026-11-17)
 
-H1 is implemented on `feat/header-entry-points` (seven commits, `e4ed2c3` to `da4f35c`). Checked
-again on the branch: `ruff check` and `mypy` pass, the new tests and the neighbouring test files
-pass (263 passed, 18 skipped), and a dry merge into `phase1-remediation` at `7e431a6` (S5, S6a
-and S12 merged meanwhile) has no conflict. `ruff format --check` reports 48 files, all of them
-already at the base; the only one H1 touches is `scripts/api_harness.py`, at a line H1 did not
-change. The full suite was run by the implementing agent only (5888 passed, 218 skipped).
+H1 is implemented on `feat/header-entry-points`. Checked again on the branch as first written:
+`ruff check` and `mypy` pass, the new tests and the neighbouring test files pass (263 passed, 18
+skipped), and a dry merge into `phase1-remediation` at `7e431a6` (S5, S6a and S12 merged
+meanwhile) has no conflict. `ruff format --check` reports 48 files, all of them already at the
+base; the only one H1 touches is `scripts/api_harness.py`, at a line H1 did not change. The full
+suite was run by the implementing agent only (5888 passed, 218 skipped).
+
+**Rebased (2026-11-17)** onto `p1/s6b-wide-selector`, itself rebased onto `phase1-remediation` at
+`434d4a9` (R1, the mpack run-3 supervisor fixes and the redone S5 merged). So H1 now sits on S6b
+and cannot land before it.
+- The model commit (`header_api`) is on `phase1-remediation` with R1, and the rebase skipped it.
+  The commit that reset the R1 Status row to "open" is dropped.
+- Conflicts were in documents and in `skills/framac-slice/SKILL.md` only; both sides' text is kept.
+- On the rebased branch `ruff check`, `mypy scripts tests`, the generated-text check and the skill
+  mirror check pass, and the whole suite gives 6087 passed, 225 skipped.
+- **One change in code.** H1 left the file of every header-defined entry point out of an `--api`
+  harness's sources. The mpack fix on the tip keeps the header of an exported function a header
+  defines (mpack's `MPACK_INLINE`) in the sources, for E-ACSL's function discovery and the module
+  scope, and takes it off the clang command line. H1 now leaves out only the header of a `static`
+  header function, which `fuzz_build` names from the sidecar's cases. Test:
+  `test_an_exported_function_a_header_defines_keeps_its_header_in_the_sources`.
+- Read, not run: a header case is built by the same `single_case` as an exported one, so it gets
+  the tip's whole-unit initializers, destructors and aligned buffers; a header entry point that
+  is also an initializer stays a root, because `api_helpers` leaves out the module's entry points.
+- Not re-measured: the QCBOR numbers below are from the branch before the rebase.
 
 **Measured offline on the recorded QCBOR run-6 model** (the branch's `header_api()` and
 `build_callgraph_dag.py` on a copy of `phase0_model.json` and `build_capture.json`; no target run):
@@ -219,7 +238,7 @@ These decide how much the new cases find. Each needs a design of its own.
 
 | Step | Size | When | Status |
 | :--- | :--- | :--- | :--- |
-| H1 | M | now, on `feat/header-entry-points`; lands after S6b | implemented 2026-11-17 on `feat/header-entry-points` (`e4ed2c3`..`e360071` and the docs commit), not merged. HD3 only moves `reached`: trust and tiers stay as they were, since `trust.py` does not read `header_api`; a sub-module scoped to the sources is then not held to the header entry points (both open, see the troubleshooting entry). HD8 unverified until the end validation |
+| H1 | M | now, on `feat/header-entry-points`; lands after S6b | implemented 2026-11-17 on `feat/header-entry-points`, rebased onto `p1/s6b-wide-selector` (see "Review of H1"), not merged. HD3 only moves `reached`: trust and tiers stay as they were, since `trust.py` does not read `header_api`; a sub-module scoped to the sources is then not held to the header entry points (both open, see the troubleshooting entry). HD8 unverified until the end validation |
 | H2 | S | with H1 | open: decide whether `trust.py` counts `header_api` (see "Review of H1") |
 | R1 | S | after S5 is merged | merged 2026-11-17: the reach row and the run report list them, no gate reads them; open: on a split unit the numbers are a lower bound |
-| S6b | M | after the merge to `main` (remediation plan, D20) | open, tracked there |
+| S6b | M | after the merge to `main` (remediation plan, D20) | written on `p1/s6b-wide-selector`, rebased onto `phase1-remediation` on 2026-11-17, not merged; tracked there |
