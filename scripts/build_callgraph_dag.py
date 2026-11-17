@@ -766,16 +766,19 @@ def _path_module_records(
 def model_api(model: dict) -> list[str]:
     """
     The model's API: its entry points (exports and `main`) plus each non-test unit's embedded API,
-    the globals of a library compiled straight into an executable. Trust and the unit view already
-    count both; the model's top-level `entry_points` holds only the first.
+    the globals of a library compiled straight into an executable, and its `header_api`, the
+    functions a library defines in its public headers: they take the caller's input as an export
+    does. The unit view counts all three; trust (scripts/trust.py) counts the first two. The model's
+    top-level `entry_points` holds only the first.
     """
-    embedded = [
+    per_unit = [
         e
         for u in (model.get("units") or {}).values()
         if isinstance(u, dict) and not u.get("test")
-        for e in u.get("embedded_api") or []
+        for field in ("embedded_api", "header_api")
+        for e in u.get(field) or []
     ]
-    return sorted({*(model.get("entry_points") or []), *embedded})
+    return sorted({*(model.get("entry_points") or []), *per_unit})
 
 
 def missing_model_features(model: dict) -> dict[str, str]:
@@ -925,7 +928,8 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
         rec["internal_callers"] = sorted(callers[key])
 
     # Header functions get a ledger unit only when an entry point of the build reaches them. An
-    # executable's embedded API (a library compiled straight into it) is API too, as for trust.
+    # executable's embedded API (a library compiled straight into it) is API too, as for trust, and so
+    # is a function a library defines in its public headers (`header_api`): it is reached itself.
     reached: set[str] = set()
     work = [key_of[e] for e in model_api(model) if e in key_of]
     while work:

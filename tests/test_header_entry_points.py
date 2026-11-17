@@ -210,6 +210,40 @@ def test_a_header_api_function_the_unit_does_not_compile_is_left_out(hep_target:
     assert keys["lib_get_int"] not in dag["modules"]["liblib_a"]["candidate_entry_points"]
 
 
+def test_model_api_contains_the_public_header_function() -> None:
+    model = _hep_model()
+    assert bcd.model_api(model) == sorted([HEP_EXPORTED, HEP_PUBLIC])
+    # A test unit's list is not the build's API.
+    model["units"]["tests/run"]["header_api"] = [HEP_PRIVATE]
+    assert HEP_PRIVATE not in bcd.model_api(model)
+    assert bcd.model_api(_hep_model(header_api=False)) == [HEP_EXPORTED]
+
+
+def test_a_public_header_function_is_reached_and_keeps_its_trust_tier(hep_target: Path) -> None:
+    """
+    What HD3 changes: the function counts as reached (the ledger plans it instead of deferring it as
+    an unreached header function, and the tier reason no longer says so). Its trust does not change:
+    scripts/trust.py takes its library API from `entry_points` and `embedded_api` only.
+    """
+    import trust
+
+    def dag_of(header_api: bool) -> dict:
+        model = _hep_model(header_api)
+        trust.annotate_model(model, None)
+        return bcd.build_dag(hep_target, model)
+
+    before, after = dag_of(False), dag_of(True)
+    key = next(k for k, f in after["functions"].items() if f["name"] == "lib_get_int")
+    assert before["functions"][key]["reached"] is False
+    assert after["functions"][key]["reached"] is True
+    assert before["tiers"]["tier3_unreached_header"] == 1
+    assert after["tiers"]["tier3_unreached_header"] == 0
+    assert "header function no entry point of the build reaches" in before["functions"][key]["tier_reasons"]
+    assert "header function no entry point of the build reaches" not in after["functions"][key]["tier_reasons"]
+    assert after["functions"][key]["tier"] == before["functions"][key]["tier"]
+    assert after["functions"][key]["untrusted_path"] is before["functions"][key]["untrusted_path"] is False
+
+
 def test_the_model_schema_accepts_header_api() -> None:
     schema = load_schema(SCRIPTS.parent / "schemas" / "phase0_model.schema.json")
     unit_schema = {**schema["properties"]["units"], "definitions": schema["definitions"]}
