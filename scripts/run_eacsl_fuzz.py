@@ -945,11 +945,17 @@ def run_fuzz_campaign(
             kind = _artifact_kind(p.name)
             if not kind:
                 continue
-            if kind in ("crash", "leak"):
+            # An `oom-` input is replayed like a crash (mpack run-4: one never was, and kept no outcome).
+            # Past the replay budget it is still listed, unreplayed, as before: only crashes and leaks are dropped.
+            replay_it = kind in ("crash", "leak", "oom")
+            if replay_it:
                 if replayed >= MAX_REPLAYED_CRASHES:
-                    unreplayed += 1
-                    continue
-                replayed += 1
+                    replay_it = False
+                    if kind != "oom":
+                        unreplayed += 1
+                        continue
+                else:
+                    replayed += 1
             entry = {
                 "artifact": str(p),
                 "kind": kind,
@@ -961,10 +967,13 @@ def run_fuzz_campaign(
             }
             if pre_existing:
                 entry["pre_existing"] = True
-            if kind in ("crash", "leak"):
+            if replay_it:
                 replay = crash_replay.replay_artifact(binary, p, scratch, per_input_timeout=per_input_timeout)
                 # The campaign log names one failure; it can only stand for this input if it is the only one.
-                failure = replay["failure"] or (parse_runtime_failure(combined_out) if crash_like == 1 else None)
+                # Never for an oom: libFuzzer's out-of-memory is no parsed failure, and an E-ACSL heap-limit
+                # abort ends its input as a deadly signal (crash-), so the log's failure or abort is another input's.
+                from_log = crash_like == 1 and kind != "oom"
+                failure = replay["failure"] or (parse_runtime_failure(combined_out) if from_log else None)
                 entry["reproducible"] = replay["reproduced"]
                 entry["replay_log_tail"] = replay["log_tail"]
                 entry["frames"] = replay.get("frames") or []
@@ -980,6 +989,7 @@ def run_fuzz_campaign(
                             "binary": str(san_bin),
                             "reproduced": san_replay["reproduced"],
                             "failure": san_replay["failure"],
+                            "out_of_memory": bool(san_replay.get("out_of_memory")),
                         }
                         if san_replay["failure"] and not needs_attribution(san_replay["failure"]):
                             failure = san_replay["failure"]
@@ -990,12 +1000,12 @@ def run_fuzz_campaign(
                     # check failed. Kept as a crash artifact so keep-going skips its case like any
                     # other, but marked, so ingest makes no candidate of it (ledger.cmd_ingest_fuzz).
                     abort = replay.get("resource_abort") or (
-                        parse_eacsl_resource_abort(combined_out) if crash_like == 1 else None
+                        parse_eacsl_resource_abort(combined_out) if from_log else None
                     )
                     attribution = entry.get("attribution")
                     record = (
                         crash_replay.resource_abort_record(
-                            abort, attribution if isinstance(attribution, dict) else None
+                            abort, attribution if isinstance(attribution, dict) else None, kind
                         )
                         if abort
                         else None

@@ -838,6 +838,16 @@ def parse_eacsl_resource_abort(text: str) -> dict | None:
     return {"resource": resource, "limit_mb": limit_mb, "message": message, "caller": caller or None}
 
 
+# libFuzzer's own out-of-memory report: its RSS thread (`used: <N>Mb; exceeds: <M>Mb`) or its malloc hook
+# (`malloc(<N>)`, sanitizer builds only). It writes the input as an `oom-` artifact.
+_LIBFUZZER_OOM_RE = re.compile(r"^(?:==\d+==\s*ERROR|SUMMARY): libFuzzer: out-of-memory\b", re.MULTILINE)
+
+
+def is_libfuzzer_out_of_memory(text: str) -> bool:
+    """True when the output holds libFuzzer's own out-of-memory report (no parsed failure: it has no check)."""
+    return bool(text) and _LIBFUZZER_OOM_RE.search(text) is not None
+
+
 def is_sanitizer_allocation_cap(failure: dict | None) -> bool:
     """
     ASan refusing a request past its own allocator maximum (`requested allocation size ... exceeds maximum
