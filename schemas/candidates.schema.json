@@ -36,6 +36,42 @@
       "tool_outputs": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
       "linked_units": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
       "first_seen": {"type": "string", "minLength": 1},
+      "site": {
+        "type": "string",
+        "minLength": 1,
+        "description": "The statement site of the detections (failure_identity.site_key). Two detections at one site are one candidate (D1). Absent on candidates recorded before the site key."
+      },
+      "observations": {
+        "type": "array",
+        "description": "Every detection that landed on this candidate: one entry per fingerprint, origin and engine (D1). Absent on candidates recorded before the site key.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "fingerprint": {"type": "string", "minLength": 1},
+            "origin": {"type": "string", "minLength": 1},
+            "engine": {"type": ["string", "null"]},
+            "kind": {"type": "string"},
+            "message": {"type": "string"},
+            "tool_output": {"type": "string"},
+            "reproducer": {"type": ["string", "null"]}
+          },
+          "required": ["fingerprint", "origin", "engine", "kind", "message", "tool_output", "reproducer"],
+          "additionalProperties": false
+        }
+      },
+      "related": {
+        "type": "array",
+        "description": "Candidates that another engine reports on the same reproducer, in the same file and function (D1b, link-related).",
+        "items": {
+          "type": "object",
+          "properties": {
+            "fingerprint": {"$ref": "#/definitions/fingerprint"},
+            "reason": {"type": "string", "minLength": 1}
+          },
+          "required": ["fingerprint", "reason"],
+          "additionalProperties": false
+        }
+      },
       "notes": {"type": "array", "items": {"type": "string"}},
       "resolved_fingerprints": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/definitions/fingerprint"}},
       "refingerprint_reason": {"type": ["string", "null"]},

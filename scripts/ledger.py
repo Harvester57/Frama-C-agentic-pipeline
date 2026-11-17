@@ -69,6 +69,7 @@ import cache  # noqa: E402
 import decision_point_check  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
+from failure_identity import site_key  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
@@ -308,6 +309,24 @@ def mark_candidate(unit: dict, fingerprint: str) -> None:
     unit["unresolved"] = []
 
 
+def _observe(cand: dict, fp: str, origin: str, engine: str | None, prop: dict, tool_output: str, reproducers) -> None:
+    """Append what one detection saw at the candidate's site (`observations`), once per fingerprint, origin and engine."""
+    observations = cand.setdefault("observations", [])
+    if any(o["fingerprint"] == fp and o["origin"] == origin and o["engine"] == engine for o in observations):
+        return
+    observations.append(
+        {
+            "fingerprint": fp,
+            "origin": origin,
+            "engine": engine,
+            "kind": str((prop or {}).get("kind") or ""),
+            "message": str((prop or {}).get("predicate") or ""),
+            "tool_output": tool_output or "",
+            "reproducer": str(reproducers[0]) if reproducers else None,
+        }
+    )
+
+
 def upsert_candidate(
     candidates,
     fp,
@@ -320,8 +339,21 @@ def upsert_candidate(
     tool_output,
     linked,
     note=None,
+    *,
+    site: str | None = None,
+    engine: str | None = None,
 ) -> dict:
+    """
+    Record one detection and return the candidate it landed on. Its key is `cand["fingerprint"]`, which
+    is not always `fp`: a detection at the `site` of an unverified candidate that `fp` does not key takes
+    that candidate (D1, F5). Callers use the returned candidate's fingerprint for everything after this.
+    """
     cand = candidates.get(fp)
+    if cand is None and site is not None:
+        cand = next(
+            (c for c in candidates.values() if c.get("site") == site and c.get("status") == "unverified"),
+            None,
+        )
     if cand is None:
         cand = {
             "fingerprint": fp,
@@ -335,8 +367,16 @@ def upsert_candidate(
             "tool_outputs": [],
             "linked_units": [],
             "first_seen": utc_now(),
+            "observations": [],
         }
+        if site is not None:
+            cand["site"] = site
         candidates[fp] = cand
+    else:
+        first_engine = (cand.get("observations") or [{}])[0].get("engine")
+        if (origin == "eva" or engine == "eacsl") and first_engine == "sanitizers":
+            # The E-ACSL or Eva reading of a site a sanitizer saw first names the bug better.
+            cand["property"] = prop
     if proposed == "confirmed":
         cand["proposed_verdict"] = "confirmed"
     for r in reproducers:
@@ -351,6 +391,7 @@ def upsert_candidate(
         cand.setdefault("notes", [])
         if note not in cand["notes"]:
             cand["notes"].append(note)
+    _observe(cand, fp, origin, engine, prop, tool_output, reproducers)
     return cand
 
 
@@ -1158,7 +1199,7 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 prior = candidates.get(fp)
                 already_listed = prior is not None and artifact_rel in prior["reproducers"]
                 rejected_before = reopen and prior is not None and _rejected_resolution(prior, findings) is not None
-                upsert_candidate(
+                cand = upsert_candidate(
                     candidates,
                     fp,
                     "fuzz",
@@ -1173,7 +1214,11 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     linked,
                     note,
+                    site=_candidate_site(file, failure.get("line"), source_fn, index),
+                    engine=_detection_engine(art, report),
                 )
+                # A detection at a known site lands on that site's candidate: its key, not `fp`, from here on.
+                fp = cand["fingerprint"]
                 for cid in linked:
                     add_evidence(
                         units[cid],
@@ -1210,7 +1255,7 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak') else ''}".encode()
                 ).hexdigest()[:10]
                 fp = f"harness_{re.sub(r'[^A-Za-z0-9_.-]', '_', module)}.c#unknown_function::{'unparsed_' + kind if kind in ('crash', 'leak') else kind}::{digest}"
-                upsert_candidate(
+                cand = upsert_candidate(
                     candidates,
                     fp,
                     "fuzz",
@@ -1222,7 +1267,9 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     [],
                     "no E-ACSL failure report could be parsed; verifier must triage and link units",
+                    engine=_detection_engine(art, report),
                 )
+                fp = cand["fingerprint"]
             stats["candidates"] += 1
     commit(units, candidates)
     if cache.shared_mode() == "rw" and ingested_modules:
@@ -1360,6 +1407,31 @@ def _dag_line_index(dag_path: Path = DAG_REPORT, dag: dict | None = None) -> dic
                 (line, end, str(rec.get("name") or key))
             )
     return out
+
+
+def _detection_engine(art: dict, report: dict) -> str | None:
+    """The engine that found a fuzz artifact: its own `engine`, else the report's `engine_used` (None for a dual run without one)."""
+    for value in (art.get("engine"), report.get("engine_used")):
+        if value in ("eacsl", "sanitizers"):
+            return value
+    return None
+
+
+def _candidate_site(file: str, line: object, function: str, index: dict[str, list[tuple[int, int, str]]]) -> str | None:
+    """
+    The statement site (failure_identity.site_key) of a detection at `file`:`line` in `function`, the
+    DAG function the line lies in when it is known (the function's line range numbers identical lines).
+    None when the line is not positive or cannot be read: such a detection keys on its own fingerprint.
+    """
+    if not isinstance(line, int) or line <= 0 or not file or file == "unknown":
+        return None
+    norm = normalize_file(file)
+    spans = [s for s in (index or {}).get(norm, []) if s[0] <= line <= s[1]]
+    if not spans:
+        return site_key(file, function, line)
+    # The DAG's name for the line, so that every engine's report of the site names the same function.
+    span = min(spans, key=lambda s: s[1] - s[0])
+    return site_key(file, span[2], line, (span[0], span[1]))
 
 
 def _model_kernel_names(model_path: Path = MODEL_JSON) -> dict[tuple[str, str], dict[str, str]]:
@@ -1759,7 +1831,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             for alarm in unit_invalids:
                 consumed.add(id(alarm))
                 fp = make_fingerprint(u_file, fn, alarm.get("kind", ""), alarm.get("annotation", ""))
-                upsert_candidate(
+                cand = upsert_candidate(
                     candidates,
                     fp,
                     "eva",
@@ -1774,7 +1846,9 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "Eva Invalid status without a concrete witness input"
                     if own
                     else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
+                    site=_candidate_site(u_file, alarm.get("line"), fn, index),
                 )
+                fp = cand["fingerprint"]  # the site's candidate may be another detection's key
                 add_evidence(
                     u,
                     "eva",
@@ -1889,7 +1963,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             if id(alarm) in consumed or not isinstance(alarm, dict):
                 continue
             consumed.add(id(alarm))
-            _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output, unit_module)
+            _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output, unit_module, index)
             stats["candidates"] += 1
 
     # Each touched unit's Eva status, from every module's verdict: covered only when some module's
@@ -1966,6 +2040,7 @@ def _ingest_unscheduled_eva_invalid(
     module: str,
     tool_output: str,
     unit_module: str | None = None,
+    index: dict[str, list[tuple[int, int, str]]] | None = None,
 ) -> None:
     """
     An Eva Invalid alarm no scheduled rte unit took (remediation plan H7), mirroring the fuzz path:
@@ -1975,6 +2050,7 @@ def _ingest_unscheduled_eva_invalid(
     (the candidate's), `unit_module` the DAG module it belongs to (default: the same).
     """
     unit_module = unit_module or module
+    index = _dag_line_index() if index is None else index
     fn = str(alarm.get("function") or "")
     alarm_file = _eva_alarm_path(alarm)
     linked_units = [
@@ -1991,7 +2067,7 @@ def _ingest_unscheduled_eva_invalid(
     if linked_units:
         u_file = linked_units[0]["file"]
         fp = make_fingerprint(u_file, fn, kind, annotation)
-        upsert_candidate(
+        cand = upsert_candidate(
             candidates,
             fp,
             "eva",
@@ -2007,7 +2083,9 @@ def _ingest_unscheduled_eva_invalid(
             "Eva Invalid status without a concrete witness input"
             if linked_units[0]["module"] == unit_module
             else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
+            site=_candidate_site(u_file, line, fn, index),
         )
+        fp = cand["fingerprint"]
         for u in linked_units:
             _unit_eva_verdicts(u)[module] = "invalid"
             add_evidence(
@@ -2037,6 +2115,7 @@ def _ingest_unscheduled_eva_invalid(
         [],
         f"Eva Invalid status without a concrete witness input; no ledger unit for {file}#{function}::rte "
         "(out of scope, not applicable, harness or unseeded code)",
+        site=_candidate_site(file, line, function, index),
     )
 
 
@@ -2534,7 +2613,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             prom_res = promote_file(Path.cwd(), aid, rel(str(result_path)), kind="artifact")
             tool_out = str(prom_res["dest"])
         note = f"input_condition: {fh['input_condition']}; why_not_reproduced: {fh['why_not_reproduced']}"
-        upsert_candidate(
+        cand = upsert_candidate(
             candidates,
             fp,
             role,
@@ -2547,6 +2626,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             linked,
             note,
         )
+        fp = cand["fingerprint"]
         phase = "breaker" if role == "breaker" else "wp"
         for cid in linked:
             add_evidence(
@@ -2583,7 +2663,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         note = str(res.get("analysis") or "breaker reproduced crash")
         already_listed = existing_cand is not None and crash_rel in existing_cand["reproducers"]
         verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
-        upsert_candidate(
+        cand = upsert_candidate(
             candidates,
             fp,
             "breaker",
@@ -2596,6 +2676,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             linked,
             note,
         )
+        fp = cand["fingerprint"]
         for cid in linked:
             add_evidence(
                 units[cid],
@@ -2764,19 +2845,24 @@ def _ingest_prover_code_fault(
         note += f"; no ledger unit for {ffile}#{ffn}::{cls} (harness or unseeded code)"
     already_listed = existing_cand is not None and crash_rel is not None and crash_rel in existing_cand["reproducers"]
     verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
-    upsert_candidate(
+    line = int(failure.get("line") or 0)
+    keys_before = len(candidates)
+    cand = upsert_candidate(
         candidates,
         fp,
         "prover",
         proposed,
         mod,
-        {"file": ffile or "unknown", "line": int(failure.get("line") or 0), "function": ffn or "unknown_function"},
+        {"file": ffile or "unknown", "line": line, "function": ffn or "unknown_function"},
         {"kind": kind, "predicate": pred},
         [crash_rel] if crash_rel else [],
         tool_out,
         linked,
         note,
+        site=_candidate_site(ffile, line, ffn or "unknown_function", _dag_line_index()),
     )
+    fp = cand["fingerprint"]
+    created = len(candidates) > keys_before
     for cid in linked:
         add_evidence(
             units[cid],
@@ -2805,7 +2891,7 @@ def _ingest_prover_code_fault(
         )
         if reopen_outcomes is not None:
             reopen_outcomes.append(outcome)
-    return 1 if existing_cand is None else 0
+    return 1 if created else 0
 
 
 @ledger_locked
