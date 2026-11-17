@@ -71,6 +71,25 @@ and cannot land before it.
   file of its own, and the static would have two definitions. That is the HD8 question again.
 - Not re-measured: the QCBOR numbers below are from the branch before the rebase.
 
+**Rebased again (2026-11-17)** with `p1/s6b-wide-selector` onto `phase1-remediation` at `890a101`
+(the open-topics steps O4, O5, O7, O9 to O12 and the mpack run-4 supervision fixes S13 to S19
+landed).
+- No conflict in H1's own commits; the one conflict of the pair was S6b's, in
+  `skills/framac-slice/SKILL.md`.
+- On the rebased branch `ruff check`, `mypy scripts tests`, the generated-text check and the skill
+  mirror check pass, and the whole suite gives 6224 passed, 231 skipped. With
+  `FRAMAC_DOCKER_TESTS=1`, the harness test files (selector, `--api` callbacks, header entries,
+  argument domains, capture headers, `stdin`, `fuzz_build`, seeds) give 188 passed, 1 skipped:
+  the skip is `tests/test_api_harness_header_entries.py:228`, which needs clang on the host.
+- **Not checked: H1 with the tip's two changes to `scripts/api_harness.py`.** Since O4, `--api`
+  without `--header` takes its headers from the build capture and, when they do not compile in
+  the harness, retries with the public ones alone and then with none; with none, a header entry
+  point's case cannot compile and is dropped. The argument-domain rules (the run-4 fix) now shape
+  every case's arguments. Both merged with H1's code without a conflict and each side's tests
+  pass, but no test builds a header entry point's case through either, and the code where they
+  meet was not read.
+- Not re-measured: the QCBOR numbers below.
+
 **Measured offline on the recorded QCBOR run-6 model** (the branch's `header_api()` and
 `build_callgraph_dag.py` on a copy of `phase0_model.json` and `build_capture.json`; no target run):
 
