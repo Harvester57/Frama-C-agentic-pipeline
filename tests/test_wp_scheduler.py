@@ -88,6 +88,7 @@ class Sim:
         self.modified: dict[str, list[str]] = {}
         self.recheck_calls: list[str] = []
         self.recheck_ok: dict[str, bool] = {}
+        self.refinement: dict[str, dict] = {}
         self.arch_merges: list[tuple] = []
         self.on_prepare = None
         self.clock = 1_000_000.0
@@ -321,9 +322,10 @@ class Sim:
             if aid in self.merge_fail:
                 failed.append({"ok": False, "rolled_back": True, "agent_id": aid, "reason": self.merge_fail[aid]})
             else:
-                merged.append(
-                    {"ok": True, "agent_id": aid, "modified_files": self.modified.get(aid, []), "parent_wp_report": rel}
-                )
+                item = {"ok": True, "agent_id": aid, "modified_files": self.modified.get(aid, []), "parent_wp_report": rel}
+                if aid in self.refinement:
+                    item["contract_refinement"] = self.refinement[aid]
+                merged.append(item)
         return {"ok": not failed, "batch_verified": True, "bisected": bool(failed), "merged": merged, "failed": failed}
 
     def merge_agent_overlay(self, run_dir, agent_id, role, **kw):
@@ -881,6 +883,52 @@ def test_contract_change_rechecks_merged_callers_and_a_failure_reproves_them(sim
     assert units()["src/m/f.c#f::rte"]["status"] == "blocked"
     agents = sorted(x["agent_id"] for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "prove")
     assert agents == ["prove-f-2", "prove-h-2"]
+
+
+def test_weaker_contract_is_recorded_and_rechecks_callers_with_the_lost_clauses(sim, monkeypatch):
+    reasons: list[str] = []
+    real = S._queue_rechecks_for
+
+    def spy(state, merged, reason):
+        reasons.append(reason)
+        return real(state, merged, reason)
+
+    monkeypatch.setattr(S, "_queue_rechecks_for", spy)
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "h": ("src/m/h.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-h", "h", "src/m/h.c", status="stalled_after_k_retries", requests=[request("g", 1)])
+    S.cmd_complete("prove-h")
+    sim.finish("prove-f", "f", "src/m/f.c")
+
+    neg = [x for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "negotiate"][0]
+    # No modified header: the weaker verdict alone queues the re-check.
+    sim.refinement[neg["agent_id"]] = {
+        "verdict": "weaker",
+        "reason": "the new contract does not give what the previous one gave",
+        "clauses": [{"contract": "previous", "kind": "ensures", "text": "\\result == a + b"}],
+        "elapsed_ms": 3900,
+    }
+    out = sim.finish(neg["agent_id"], "g", "src/m/g.c", force=True)
+    entry = out["merged"][0]
+    assert entry["contract_refinement"]["verdict"] == "weaker" and "elapsed_ms" not in entry["contract_refinement"]
+    assert entry["rechecks_queued"] == ["recheck:src/m/f.c#f"] and sim.recheck_calls == ["f"]
+    assert reasons and "weaker than the contract it replaced" in reasons[-1] and "a + b" in reasons[-1]
+
+
+def test_undecided_contract_refinement_alone_queues_no_recheck(sim):
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-f", "f", "src/m/f.c")
+    assert tasks()["prove:src/m/f.c#f"]["outcome"] == "merged"
+    sim.refinement["prove-g"] = {"verdict": "undecided", "reason": "probe timed out"}
+    # A merged prover is not merged again; check the reason helper directly for the undecided case.
+    assert "weaker" not in S._contract_change_reason(tasks()["prove:src/m/g.c#g"], "prove-g", sim.refinement["prove-g"])
 
 
 # ---------------------------------------------------------------------------

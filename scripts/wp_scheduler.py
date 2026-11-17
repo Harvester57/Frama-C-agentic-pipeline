@@ -3710,9 +3710,10 @@ def _complete_agent(agent_id: str) -> dict:
                     ptask["partial_contract_merged"] = True
                     ptask["partial_merged_at"] = utc_now()
                     if pmerged.get("modified_files"):
-                        out["rechecks_queued"] = _queue_rechecks_for(
-                            state, ptask, f"partial contract of {_key(ptask)} merged from {agent_id}"
-                        )
+                        reason = _contract_change_reason(ptask, agent_id, pmerged.get("contract_refinement"))
+                        out["rechecks_queued"] = _queue_rechecks_for(state, ptask, "partial " + reason)
+                    if isinstance(pmerged.get("contract_refinement"), dict):
+                        out["contract_refinement"] = pmerged["contract_refinement"]
                     out["requeued_callers"] = [
                         c for c in partial_merge_job.get("requeue_callers") or [] if _requeue_caller(state, c)
                     ]
@@ -3891,9 +3892,30 @@ def _on_merged(state: dict, task: dict, aid: str, merged: dict, out: dict) -> No
         _resolve_negotiation(state, task, True, f"applied by {aid}; the parent WP re-check passed", out)
     else:
         _finish(state, task, "done", "merged")
-    if merged.get("modified_files"):
-        entry["rechecks_queued"] = _queue_rechecks_for(state, task, f"contract of {_key(task)} changed by {aid}")
+    refinement = merged.get("contract_refinement")
+    weaker = isinstance(refinement, dict) and refinement.get("verdict") == "weaker"
+    if isinstance(refinement, dict):
+        entry["contract_refinement"] = {
+            k: refinement[k] for k in ("verdict", "reason", "clauses") if refinement.get(k) is not None
+        }
+    if merged.get("modified_files") or weaker:
+        entry["rechecks_queued"] = _queue_rechecks_for(state, task, _contract_change_reason(task, aid, refinement))
     out["merged"].append(entry)
+
+
+def _contract_change_reason(task: dict, aid: str, refinement: object) -> str:
+    """
+    Why the merged callers are re-checked. A merge whose contract is weaker than the one it replaced
+    (workspace_overlay.record_contract_refinement) is not rejected: the re-checks reopen exactly the
+    callers whose proof needed what the old contract gave, and the reason names those clauses.
+    """
+    reason = f"contract of {_key(task)} changed by {aid}"
+    if isinstance(refinement, dict) and refinement.get("verdict") == "weaker":
+        clauses = "; ".join(
+            f"{c.get('kind')} {c.get('text')}" for c in refinement.get("clauses") or [] if isinstance(c, dict)
+        )
+        reason += f"; weaker than the contract it replaced, no longer gives: {clauses[:300]}"
+    return reason
 
 
 def _on_merge_failed(state: dict, task: dict, aid: str, failure: dict, out: dict) -> None:

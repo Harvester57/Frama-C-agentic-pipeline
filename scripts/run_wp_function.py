@@ -52,6 +52,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import contract_refinement  # noqa: E402
 import function_facts  # noqa: E402
 import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
@@ -60,8 +61,6 @@ from acsl_ast import (  # noqa: E402
     AcslError,
     contract_shape,
     find_named_clause,
-    function_contract_text,
-    function_returns_void,
     is_trivial_predicate,
 )
 from framac_common import (  # noqa: E402
@@ -2593,50 +2592,69 @@ def layer_clause_limits(goals: list[dict], c_file: Path) -> dict:
     }
 
 
-_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*["<]([^">\n]+)[">]', re.MULTILINE)
-_INCLUDE_DIR_RE = re.compile(r"(?:^|\s)-I\s*(\S+)")
+def _read_contract(c_file: Path, fn_name: str, cppflags: str) -> contract_refinement.FunctionContract | None:
+    try:
+        return contract_refinement.read_function_contract(c_file, fn_name, cppflags)
+    except (OSError, AcslError):
+        return None
 
 
-def contract_shape_limit(c_file: Path, fn_name: str, cppflags: str = "") -> str:
+def contract_shape_limit(
+    c_file: Path, fn_name: str, cppflags: str = "", contract: contract_refinement.FunctionContract | None = None
+) -> str:
     """
     The shape of the contract WP proved for `fn_name` (acsl_ast.contract_shape): `functional`,
     `safety_only` or `not_applicable`. The contract is read where Frama-C takes it from: in front of
     the definition in `c_file`, and on the function's declarations in the headers `c_file` includes
-    directly, merged. A header is looked up beside `c_file` and in the `-I` directories of
-    `cppflags`, a relative one against the working directory as the preprocessor does; a header that
-    is not found there (a system header, the Frama-C libc) is skipped. `unknown` when no contract
-    is found or the source cannot be read: a contract that was not read is never reported as
-    `safety_only`. A contract on a header reached only through another header is not read.
+    directly, merged (contract_refinement.read_function_contract). A header is looked up beside `c_file`
+    and in the `-I` directories of `cppflags`, a relative one against the working directory as the
+    preprocessor does; a header that is not found there (a system header, the Frama-C libc) is skipped.
+    `unknown` when no contract is found or the source cannot be read: a contract that was not read is
+    never reported as `safety_only`. A contract on a header reached only through another header is not read.
     """
-    try:
-        source = c_file.read_text(encoding="utf-8", errors="replace")
-        parts = [function_contract_text(source, fn_name, is_header=False, path=str(c_file))]
-        returns_void = function_returns_void(source, fn_name, is_header=False, path=str(c_file))
-    except (OSError, AcslError):
+    contract = contract or _read_contract(c_file, fn_name, cppflags)
+    if contract is None:
         return SHAPE_UNKNOWN
-    dirs = [c_file.parent]
-    for d in map(Path, _INCLUDE_DIR_RE.findall(cppflags)):
-        dirs += [d] if d.is_absolute() else [Path.cwd() / d, c_file.parent / d]
-    seen: set[Path] = set()
-    for name in [c_file.with_suffix(".h").name, *_INCLUDE_RE.findall(source)]:
-        header = next((d / name for d in dirs if (d / name).is_file()), None)
-        if header is None or header.resolve() in seen:
-            continue
-        seen.add(header.resolve())
-        with contextlib.suppress(OSError, AcslError):
-            text = header.read_text(encoding="utf-8", errors="replace")
-            parts.append(function_contract_text(text, fn_name, is_header=True, path=str(header)))
-            if returns_void is None:
-                returns_void = function_returns_void(text, fn_name, is_header=True, path=str(header))
-    return contract_shape("\n".join(p for p in parts if p), returns_void=bool(returns_void))
+    return contract_shape(contract.text(), returns_void=bool(contract.returns_void))
 
 
-def apply_verdict_limits(res: dict, c_file: Path, vacuity: dict | None, cppflags: str = "") -> dict:
+def frame_only_ensures_limit(
+    c_file: Path,
+    fn_name: str,
+    cppflags: str = "",
+    machdep: str = "gcc_x86_64",
+    contract: contract_refinement.FunctionContract | None = None,
+    work_dir: Path | None = None,
+) -> dict:
+    """
+    Which `ensures` of the proved contract follow from its `requires` and `assigns` alone (use 2 of
+    scripts/contract_refinement.py): `{status, ensures, frame_only, not_frame_only, undecided,
+    all_frame_only, ...}`. `status` `decided` with `all_frame_only` true means every postcondition
+    holds for any body, so the proof is reported with the safety-only ones. `undecided` when the
+    contract cannot be read or the probe cannot decide; `not_applicable` without `ensures`.
+    """
+    contract = contract or _read_contract(c_file, fn_name, cppflags)
+    if contract is None or not contract.pieces:
+        return {"status": contract_refinement.FRAME_UNDECIDED, "reason": "no contract found", "all_frame_only": False}
+    return contract_refinement.frame_only_ensures(contract, c_file, cppflags, machdep, work_dir=work_dir)
+
+
+def apply_verdict_limits(
+    res: dict,
+    c_file: Path,
+    vacuity: dict | None,
+    cppflags: str = "",
+    machdep: str = "gcc_x86_64",
+    semantic: bool = True,
+    work_dir: Path | None = None,
+) -> dict:
     """
     Record what this verdict covered in `res["limits"]`. `coverage-ledger` credits a proof only when
     the limits are recorded (scripts/ledger.py), and a contradictory contract fails the proof here.
     `vacuity` is None when the check did not run. A proof that stands also records
-    `limits.contract_shape`: reported only, it changes no status and no credit.
+    `limits.contract_shape` (syntactic) and, with `semantic`, `limits.frame_only_ensures` (the probe of
+    scripts/contract_refinement.py, one WP run without RTE): both reported only, they change no status
+    and no credit.
     """
     soundness = res.get("soundness") or {}
     missing_spec = sorted(
@@ -2661,7 +2679,13 @@ def apply_verdict_limits(res: dict, c_file: Path, vacuity: dict | None, cppflags
         res["next_synthesis_focus"] = "tier_b_soundness_fix_required"
         res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, "")
     if res.get("status") == "all_proven" and res.get("function"):
-        res["limits"]["contract_shape"] = contract_shape_limit(c_file, str(res["function"]), cppflags)
+        fn_name = str(res["function"])
+        contract = _read_contract(c_file, fn_name, cppflags)
+        res["limits"]["contract_shape"] = contract_shape_limit(c_file, fn_name, cppflags, contract=contract)
+        if semantic:
+            res["limits"]["frame_only_ensures"] = frame_only_ensures_limit(
+                c_file, fn_name, cppflags, machdep, contract=contract, work_dir=work_dir
+            )
     return res
 
 
@@ -3097,7 +3121,7 @@ def main(argv: list[str] | None = None) -> int:
             wp_par=args.wp_par,
             extra_sources=args.extra_sources,
         )
-    apply_verdict_limits(res, args.file, vacuity, cppflags=args.cppflags)
+    apply_verdict_limits(res, args.file, vacuity, cppflags=args.cppflags, machdep=args.machdep)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     if args.counter_examples:
         res["counter_examples"] = True

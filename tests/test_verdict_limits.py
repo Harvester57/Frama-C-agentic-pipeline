@@ -301,6 +301,59 @@ def test_proof_records_the_contract_shape_from_source_and_header(tmp_path, monke
     assert wp_limits_problem(res["limits"]) is None
 
 
+def test_proof_records_frame_only_ensures_beside_the_contract_shape(tmp_path, monkeypatch):
+    import contract_refinement
+
+    c = tmp_path / "a.c"
+    c.write_text("/*@ assigns \\nothing; ensures \\result == a + 1; */\nint zero(int a) { return a + 1; }\n")
+    seen: list[str] = []
+
+    def fake_frame(contract, include, cppflags, machdep, **kw):
+        seen.append(contract.function)
+        return {"status": "decided", "ensures": 1, "frame_only": [], "not_frame_only": [1], "all_frame_only": False}
+
+    monkeypatch.setattr(contract_refinement, "frame_only_ensures", fake_frame)
+    consistent = {"status": "consistent", "doomed": [], "dead_goals": 0}
+    res = W.apply_verdict_limits(_report(function="zero"), c, consistent)
+    assert res["limits"]["contract_shape"] == "functional"
+    assert res["limits"]["frame_only_ensures"]["status"] == "decided" and seen == ["zero"]
+    # Reported only: the semantic field changes no status and no credit.
+    assert res["status"] == "all_proven" and wp_limits_problem(res["limits"]) is None
+    res = W.apply_verdict_limits(_report(function="zero"), c, consistent, semantic=False)
+    assert "frame_only_ensures" not in res["limits"] and seen == ["zero"]
+    res = W.apply_verdict_limits(_report(function="zero", status="unproven_goals_remain"), c, consistent)
+    assert "frame_only_ensures" not in res["limits"]
+    # No contract found: undecided, without a probe run.
+    res = W.apply_verdict_limits(_report(function="zero"), tmp_path / "gone.c", consistent)
+    assert res["limits"]["frame_only_ensures"]["status"] == "undecided" and seen == ["zero"]
+
+
+def _framed(file: str, function: str, shape: str, frame: dict | None) -> dict:
+    entry = _credited(file, function, "rte", shape)
+    if frame is not None:
+        entry["evidence"][0]["details"]["limits"]["frame_only_ensures"] = frame
+    return entry
+
+
+def test_report_reads_frame_only_ensures_as_safety_only():
+    frame_all = {"status": "decided", "ensures": 2, "frame_only": [1, 2], "all_frame_only": True}
+    frame_some = {"status": "decided", "ensures": 2, "frame_only": [1], "all_frame_only": False}
+    ledger = [
+        _framed("a.c", "copy_frame", "functional", frame_all),
+        _framed("a.c", "sum", "functional", frame_some),
+        _framed("a.c", "open", "functional", {"status": "undecided", "reason": "probe timed out"}),
+        _framed("b.c", "log", "not_applicable", {"status": "not_applicable"}),
+        _framed("b.c", "old", "functional", None),
+    ]
+    text = "\n".join(verdict_limits_section(ledger))
+    assert "1 `safety_only` by the semantic reading" in text
+    assert "3 of 4 `ensures` in 2 proven functions" in text
+    assert "could not decide for 1 function" in text
+    assert "- Proven with a safety-only contract (1): `a.c#copy_frame (semantic)`" in text
+    assert "`a.c#sum`" not in text.split("safety-only contract")[-1]
+    assert "`b.c#log`" not in text.split("safety-only contract")[-1]
+
+
 def test_validator_rejects_discharging_wp_evidence_without_limits():
     base = evidence(phase="wp", result="wp_proven", tool_output=None)
     bare = unit("a.c", "f", "rte", status="covered", evidence=[base])

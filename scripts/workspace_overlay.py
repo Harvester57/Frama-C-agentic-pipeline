@@ -40,6 +40,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import contract_refinement  # noqa: E402
 import function_facts  # noqa: E402
 import function_slice  # noqa: E402
 import line_endings  # noqa: E402
@@ -1437,6 +1438,62 @@ def _run_parent_reverify(
     return True, "verified"
 
 
+def _merged_contract(
+    work_dir: Path, c_file: str | None, function: str | None, cppflags: str
+) -> contract_refinement.FunctionContract | None:
+    """The contract of `function` as it stands in `work_dir` (None when it cannot be read)."""
+    if not c_file or not function:
+        return None
+    try:
+        return contract_refinement.read_function_contract(work_dir / c_file, function, cppflags)
+    except (OSError, AcslError):
+        return None
+
+
+def record_contract_refinement(
+    run_dir: Path,
+    overlay_dir: Path,
+    agent_id: str,
+    c_file: str,
+    function: str,
+    cppflags: str,
+    previous: contract_refinement.FunctionContract | None,
+) -> dict | None:
+    """
+    Merge re-check, use 1 of scripts/contract_refinement.py: whether the contract just merged for
+    `function` gives everything the contract it replaced did. Runs on the merged tree after the parent
+    WP re-check passed, and writes the verdict into the parent WP report (`contract_refinement`) and its
+    canonical copy. `weaker` and `undecided` never block the merge: the scheduler re-checks the merged
+    callers against the new contract and reopens any whose proof no longer holds. None (nothing recorded)
+    when no contract was merged before.
+    """
+    if previous is not None and not previous.pieces:
+        return None
+    work_dir = overlay_dir / "work"
+    new = _merged_contract(work_dir, c_file, function, cppflags)
+    if previous is None or new is None:
+        res: dict = {
+            "verdict": contract_refinement.UNDECIDED,
+            "reason": "the previous or the merged contract could not be read",
+            "probe_run": False,
+        }
+    else:
+        try:
+            res = contract_refinement.refinement_check(new, previous, work_dir / c_file, cppflags)
+        except Exception as exc:  # the check is a record: it never fails a merge that passed its re-check
+            res = {"verdict": contract_refinement.UNDECIDED, "reason": f"{type(exc).__name__}: {exc}"}
+    wp_json = run_dir / _parent_wp_report_rel(agent_id, function)
+    try:
+        wp_report = json.loads(wp_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        wp_report = None
+    if isinstance(wp_report, dict):
+        wp_report["contract_refinement"] = res
+        wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
+        _publish_canonical_wp(run_dir, overlay_dir, wp_json, c_file, function)
+    return res
+
+
 def _parent_guard_json(run_dir: Path, agent_id: str, function: str | None, module: str | None) -> Path:
     """Where `_run_parent_reverify` writes its guardrail report."""
     return run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}.json"
@@ -1946,6 +2003,12 @@ def _merge_agent_overlay_locked(
     patch_stem = function if role == "prover" and function else Path(norm_header_file or "header").stem
     patch_path = artifacts_dir / f"{patch_stem}.patch"
 
+    # The contract this merge replaces, read before the splice is written: the merge re-check compares
+    # the merged contract against it (record_contract_refinement).
+    previous_contract = (
+        _merged_contract(shared_work, norm_c_file, function, cppflags) if role == "prover" and changed_rels else None
+    )
+
     if journal:
         _write_merge_journal(run_dir, f"merge-agent:{agent_id}", backups)
     try:
@@ -2063,6 +2126,15 @@ def _merge_agent_overlay_locked(
     if role == "prover" and function and not skip_reverify and verify_hook is None:
         # The report to ingest: written for this agent only, so same-named functions never collide.
         result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
+        if norm_c_file and changed_rels:
+            refinement = record_contract_refinement(
+                run_dir, overlay, agent_id, norm_c_file, function, cppflags, previous_contract
+            )
+            if refinement is not None:
+                result["contract_refinement"] = refinement
+    elif role == "prover" and skip_reverify and previous_contract is not None:
+        # A batch splice: the batch re-check runs the comparison once its round passes.
+        result["previous_contract"] = previous_contract.to_dict()
     return result
 
 
@@ -2501,6 +2573,8 @@ def _merge_agent_batch_locked(
 
     if skip_reverify or not spliced_entries:
         merged_results = [r for _, r in spliced_entries]
+        for r in merged_results:
+            r.pop("previous_contract", None)
         return {
             "ok": len(failed_results) == 0,
             "batch_verified": not skip_reverify,
@@ -2549,8 +2623,26 @@ def _merge_agent_batch_locked(
 
     merged_results = []
     for item, r in active:
+        raw_previous = r.pop("previous_contract", None)
         if verify_hook is None and item["role"] == "prover" and item.get("function"):
             r["parent_wp_report"] = _parent_wp_report_rel(item["agent_id"], item["function"])
+            if item.get("c_file") and r.get("modified_files"):
+                previous = (
+                    contract_refinement.FunctionContract.from_dict(raw_previous)
+                    if isinstance(raw_previous, dict)
+                    else None
+                )
+                refinement = record_contract_refinement(
+                    run_dir,
+                    overlay,
+                    item["agent_id"],
+                    _normalize_work_relpath(item["c_file"]),
+                    item["function"],
+                    item["cppflags"],
+                    previous,
+                )
+                if refinement is not None:
+                    r["contract_refinement"] = refinement
         merged_results.append(r)
 
     for item, batch_reason in deferred:

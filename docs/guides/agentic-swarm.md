@@ -80,6 +80,12 @@ Every single iteration of the Function Prover Subagent ([`../../skills/framac-wp
 - **Constructs it cannot carry (`undecided`):** a variadic prototype, an unnamed formal in the definition, a K&R definition or a nested declarator (a function returning a function pointer), and a compared contract without `assigns`, whose frame the kernel would generate. Static functions and structures passed by value work.
 - **Fixed limits:** provers Alt-Ergo, Z3 and CVC5, a 3 s per-goal timeout (`PROBE_GOAL_TIMEOUT_S`) and a 180 s wall limit, whatever the machine; only `-wp-par` follows the job budget.
 - **CLI:** `contract_refinement.py compare --file new.c --previous-file old.c --function f` and `contract_refinement.py frame-only --file f.c --function f` (which `ensures` follow from the `requires` and `assigns` alone), both with `--cppflags` and `--out-json`.
+- **Cost, measured in `framac-analysis:latest`:** about 0.6 s when every goal is proved, about 3.9 s when a goal is refuted (the 3 s per-goal timeout of the other provers, then the model).
+
+Two places use it:
+
+- **Merge re-check** (`workspace_overlay.record_contract_refinement`). A prover merge that replaces a contract reads the contract before the splice, and once the parent WP re-check has passed it compares the merged contract against it. Single and batch merges both do it; a batch compares after its round passes. The verdict goes into the parent WP report as `contract_refinement` (`verdict`, `reason`, `clauses`, `elapsed_ms`, `probe_run`). It never rejects the merge, because the scheduler already re-checks merged callers when a contract changes: `_on_merged` queues a re-check of every merged caller and recursion-group peer (`_queue_rechecks_for`), and `_apply_recheck` reopens a caller whose parent WP re-check fails and blocks its units. A `weaker` verdict also queues those re-checks when no file was reported modified, and the re-check reason names the clauses the new contract no longer gives. `undecided` (including a probe that failed to run) is recorded and changes nothing. A first contract (nothing merged before) records nothing; an unchanged contract is `refines` without a probe run.
+- **Frame-only postconditions** (`limits.frame_only_ensures`, see [`./v2-design.md`](./v2-design.md)). An `all_proven` WP result also asks which `ensures` follow from the `requires` and `assigns` alone. `REPORT.md` then counts a function whose every `ensures` is frame-only as `safety_only`, whatever its syntactic `contract_shape`.
 
 ### Per-Goal Solver Cost (`FRAMAC_WP_GOAL_COSTS`, on by default)
 

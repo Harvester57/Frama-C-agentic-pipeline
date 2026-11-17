@@ -485,8 +485,9 @@ def build_probe(
 
 
 def _under_work_tree(path: Path) -> bool:
+    """Under `workspace/work/` or an agent's `scratch/work/`: trees a merge diffs against their baseline."""
     parts = path.resolve().as_posix().split("/")
-    return any(a == "workspace" and b == "work" for a, b in zip(parts, parts[1:], strict=False))
+    return any(a in ("workspace", "scratch") and b == "work" for a, b in zip(parts, parts[1:], strict=False))
 
 
 def probe_command(
