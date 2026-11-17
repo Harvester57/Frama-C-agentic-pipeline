@@ -37,5 +37,5 @@ reproducer before and after.
   their tests need regenerating.
 - `37-*` and `38-*` apply in either order; 38's fix is complete under `-G clang` only with 37.
 - `35-*` and `39-*` touch the kernel and the libc (`tests/syntax` and `tests/libc` were run).
-- A patch must not change file modes: a test file copied into the container with `docker cp` from
-  Windows has mode 755. `revalidate.sh` reports it.
+- A patch must not change the mode of a file or create an executable one: a file copied into the
+  container with `docker cp` from Windows has mode 755. `revalidate.sh` reports both.

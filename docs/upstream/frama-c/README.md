@@ -66,7 +66,8 @@ This section is newer than the one below and wins where they differ.
   same output on both, apart from the Alt-Ergo version and the times in 40. Seven have a patch (32, 33, 35, 36, 37, 38, 39); 34 and 40 are issues only.
   - **Second run of every patch**, after the drafting agents' own validation, with `revalidate.sh`
     in fresh containers:
-    - `git am --keep-non-patch` applies each on `95408044f7`, and no patch changes a file mode.
+    - `git am --keep-non-patch` applies each on `95408044f7`. No patch changes the mode of an
+      existing file or creates an executable one (after the correction of 39 below).
     - Each reproducer prints the documented "before" output on the pristine image and the
       documented "after" output with the patch installed.
     - Each new test fails on `master`'s sources and passes with the patch: 33 in the default and
@@ -81,7 +82,22 @@ This section is newer than the one below and wins where they differ.
     (`special/` in `dev`, and both reproducers: every line passes, including the `-G clang` line
     that 38 alone leaves failing).
   - **Corrected during the second run:** patch 39 carried two file-mode changes
-    (`100644` to `100755`); it was re-exported without them (commit `9b52dce322` in the container).
+    (`100644` to `100755`) and was re-exported without them. A read of the seven patches
+    (2026-11-18) then found that the same patch still created four new files as executable
+    (`share/libc/sys/epoll.h`, `share/libc/sys/inotify.h` and their two test sources), which the
+    check of that time did not look for. It was re-exported again (from commit `732f33be36`; `git
+    am` gives the same tree), `revalidate.sh` now also reports `create mode 100755`, and the whole
+    `package 39` run was repeated on the new file: every step as before.
+  - **What the read covered (2026-11-18):** every source hunk of 32, 33, 35, 36, 37, 38 and 39,
+    line by line, with 32 and 37 checked against the upstream code around them: nothing else
+    found. The new test sources were read; their oracles were checked by running the tests, not
+    by reading them. The 8,400 lines of regenerated oracles in 33 were classified mechanically:
+    every removed line has an added counterpart that differs only by a string literal replaced
+    with its `__fc_lit_string` global or by line wrapping, and the added lines are those globals,
+    their `store_block` / `mark_readonly` / `full_init` / `delete_block` calls, the
+    `__e_acsl_globals_init` scaffolding, and the tracking of two locals passed to a format
+    function (`buf`, `pstr`). The `signal_eval` literals change too because that test helper
+    passes its argument to `fprintf("%s")`.
   - **Limits stated in the packages:** 32 leaves POSIX numbered `*` arguments (`%2$*1$d`)
     unchecked. 33 regenerates three existing default oracles (`gen_printf.0.c`, `gen_fprintf.0.c`,
     `gen_sprintf.0.c`), and upstream already tracks the defect privately as e-acsl#118 (named in a

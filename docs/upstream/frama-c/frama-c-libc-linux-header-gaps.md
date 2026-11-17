@@ -34,7 +34,7 @@ Frama-C stops earlier, at the missing file.
 |---|---|
 | `35.0~~dev (Bromine)`, `master` at `95408044f7` (image `framac-master-audit:9540804`) | **both headers missing** (2 of 2 reproducer checks fail) |
 | `34.0~beta (Selenium)` (image `framac-analysis:latest`) | **both missing**, identical output |
-| `master` + patch (commit `9b52dce322`, built and installed in a container from the master image) | `RESULT: fixed` |
+| `master` + patch (commit `732f33be36`, built and installed in a container from the master image) | `RESULT: fixed` |
 
 ## Inventory
 

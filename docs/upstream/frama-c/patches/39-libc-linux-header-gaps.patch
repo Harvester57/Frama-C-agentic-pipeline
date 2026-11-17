@@ -1,4 +1,4 @@
-From 9b52dce322eedce81c02df295bf54703feb27c1d Mon Sep 17 00:00:00 2001
+From 732f33be360ffb5e1f7b4a17ccecc41a90a0e9d8 Mon Sep 17 00:00:00 2001
 From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
 Date: Tue, 17 Nov 2026 18:28:23 +0000
 Subject: [PATCH] [libc] add Linux headers sys/epoll.h and sys/inotify.h
@@ -36,12 +36,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  tests/libc/sys_epoll_h.c                     |  30 ++++
  tests/libc/sys_inotify_h.c                   |  20 +++
  10 files changed, 468 insertions(+)
- create mode 100755 share/libc/sys/epoll.h
- create mode 100755 share/libc/sys/inotify.h
+ create mode 100644 share/libc/sys/epoll.h
+ create mode 100644 share/libc/sys/inotify.h
  create mode 100644 tests/libc/oracle/sys_epoll_h.0.res.oracle
  create mode 100644 tests/libc/oracle/sys_inotify_h.0.res.oracle
- create mode 100755 tests/libc/sys_epoll_h.c
- create mode 100755 tests/libc/sys_inotify_h.c
+ create mode 100644 tests/libc/sys_epoll_h.c
+ create mode 100644 tests/libc/sys_inotify_h.c
 
 diff --git a/share/libc/__fc_libc.h b/share/libc/__fc_libc.h
 index 6cc3b0e54e..6bb667917f 100644
@@ -58,7 +58,7 @@ index 6cc3b0e54e..6bb667917f 100644
  #include "sys/ipc.h"
  #include "syslog.h"
 diff --git a/share/libc/sys/epoll.h b/share/libc/sys/epoll.h
-new file mode 100755
+new file mode 100644
 index 0000000000..737046d6e8
 --- /dev/null
 +++ b/share/libc/sys/epoll.h
@@ -204,7 +204,7 @@ index 0000000000..737046d6e8
 +__POP_FC_STDLIB
 +#endif
 diff --git a/share/libc/sys/inotify.h b/share/libc/sys/inotify.h
-new file mode 100755
+new file mode 100644
 index 0000000000..ce33c3b82a
 --- /dev/null
 +++ b/share/libc/sys/inotify.h
@@ -534,7 +534,7 @@ index 0000000000..eed79e385b
 +  wd ∈ [-1..2147483647] or UNINITIALIZED
 +  __retres ∈ {0; 1}
 diff --git a/tests/libc/sys_epoll_h.c b/tests/libc/sys_epoll_h.c
-new file mode 100755
+new file mode 100644
 index 0000000000..4b02b00e4a
 --- /dev/null
 +++ b/tests/libc/sys_epoll_h.c
@@ -570,7 +570,7 @@ index 0000000000..4b02b00e4a
 +  return 0;
 +}
 diff --git a/tests/libc/sys_inotify_h.c b/tests/libc/sys_inotify_h.c
-new file mode 100755
+new file mode 100644
 index 0000000000..91e06a8532
 --- /dev/null
 +++ b/tests/libc/sys_inotify_h.c

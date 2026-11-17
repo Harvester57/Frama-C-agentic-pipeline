@@ -61,7 +61,9 @@ package)
   srcs=$(git diff --name-only master..HEAD | grep -v -E '(^|/)tests/')
   modsrcs=$(git diff --name-only --diff-filter=M master..HEAD | grep -v -E '(^|/)tests/')
   addsrcs=$(git diff --name-only --diff-filter=A master..HEAD | grep -v -E '(^|/)tests/')
-  git diff --summary master..HEAD | grep -E 'mode change' && echo "[exit=1] the patch changes file modes"
+  # Files copied in with `docker cp` from Windows are 755: neither a changed nor a new file may be.
+  git diff --summary master..HEAD | grep -E 'mode change|create mode 100755' \
+    && echo "[exit=1] the patch changes file modes or adds executable files"
   newtests=$(git diff --name-only --diff-filter=A master..HEAD | grep -E '(^|/)tests/' | grep -v '/oracle' | grep -E '[.](c|i)$')
   testdirs=$(git diff --name-only master..HEAD | grep -E '(^|/)tests/' | sed -E 's#^((.*/)?tests/[^/]+)/.*#\1#' | sort -u)
   echo "sources: $srcs"; echo "new tests: $newtests"; echo "test dirs: $testdirs"

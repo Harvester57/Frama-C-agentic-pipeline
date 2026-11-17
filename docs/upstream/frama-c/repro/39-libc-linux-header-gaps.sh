@@ -29,7 +29,7 @@
 #   accept4: frama-c Calling undeclared function accept4; gcc ok
 #   RESULT: bug present (2 of 2 checks fail)
 #
-# Output after (master 95408044f7 + patch, commit 9b52dce322 in the audit
+# Output after (master 95408044f7 + patch, commit 732f33be36 in the audit
 # container):
 #   --- 39-libc-linux-header-gaps-epoll.c (Eva)
 #   ok
