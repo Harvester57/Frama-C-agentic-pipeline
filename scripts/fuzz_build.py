@@ -71,6 +71,36 @@ def _decode(data) -> str:
     return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
 
 
+def _harness_header_entries(sources: list[str]) -> list[str]:
+    """
+    The functions defined in a public header that an `--api` harness among `sources` calls as entry
+    points (docs/plans/header-entry-points-plan.md, HD8): the `entry` of its sidecar's `api_cases`
+    (`harness_<m>.json` next to it) that the DAG (`workspace/reports/callgraph_dag.json`, two levels
+    up from the harness) records as `header` and `is_static`. Nothing when either file is missing.
+    """
+    out: set[str] = set()
+    for src in sources:
+        p = Path(src)
+        if not (p.name.startswith("harness_") and p.suffix == ".c"):
+            continue
+        try:
+            sidecar = load_json_optional(p.with_suffix(".json"), None)
+            dag = load_json_optional(p.parent.parent / "reports" / "callgraph_dag.json", None)
+        except Exception:  # noqa: BLE001 - an unreadable sidecar or DAG adds no name, as a missing one
+            continue
+        if not isinstance(sidecar, dict) or not isinstance(dag, dict):
+            continue
+        functions = dag.get("functions") or {}
+        for lay in sidecar.get("api_cases") or []:
+            key = lay.get("entry") if isinstance(lay, dict) else None
+            if not isinstance(key, str):
+                continue
+            rec = functions.get(key)
+            if isinstance(rec, dict) and rec.get("header") and rec.get("is_static"):
+                out.add(str(rec.get("name") or key.rsplit("#", 1)[-1]))
+    return sorted(out)
+
+
 def _discover_slice_functions(
     sources: list[str],
     explicit_functions: list[str] | None = None,
@@ -87,7 +117,14 @@ def _discover_slice_functions(
     """
     if explicit_functions:
         return sorted({f.strip() for f in explicit_functions if f.strip()})
-    discovered: set[str] = set()
+    # The public header functions an `--api` harness calls (`_harness_header_entries`): no source
+    # defines them, so the scan below never sees them. A name Frama-C does not know is dropped by the
+    # instrumentation's retry (`rte_select_dropped`).
+    discovered: set[str] = {
+        n
+        for n in _harness_header_entries(sources)
+        if n not in ("eva_main", "main") and not is_harness_fuzz_function(n) and n not in TYPE_MODIFIERS_AND_PRIMITIVES
+    }
     for src in sources:
         p = Path(src)
         if not p.is_file() or p.name.startswith("harness_"):

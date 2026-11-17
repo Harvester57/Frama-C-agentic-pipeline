@@ -26,13 +26,107 @@ The first sketch of this work had three steps. Two of them meet work that is alr
 | :--- | :--- | :--- |
 | HD1 | Which functions. | A function the Phase 0 model records with `static` and `header`, whose file is one of the public headers the build capture found for the unit (`public.files`). Library units only (static and shared); not test units, not executables. No naming rule: `_Private_` helpers defined in a public header count too. |
 | HD2 | Where it is computed. | In `phase0_model.py`, as a per-unit list `header_api`, next to `entry_points` and `embedded_api`. The build capture cannot see these functions: they have no global symbol. `build_callgraph_dag.py` adds them to the unit's `candidate_entry_points`, after the global ones. |
-| HD3 | Trust. | `model_api()` includes `header_api`: a header function takes the caller's input like an exported one. This feeds the risk tiers of every target, so it is its own commit with its own test, and the commit message states what changes. |
+| HD3 | Reached, and trust. | `model_api()` includes `header_api`: a header function takes the caller's input like an exported one. **Corrected by the H1 review:** `model_api()` decides the DAG's `reached` flag, not trust. A reached header function gets an active ledger unit where it was `header_unreached` (deferred) before. Trust and tiers do not move, because `trust.py` (rule 1) reads only `entry_points` and `embedded_api`. Whether trust should count `header_api` is **H2**, open. |
 | HD4 | Case order. | The generated cases of the global entry points keep their index. Header cases come after them. Where the hand-written `--dispatch-case` cases sit after the generated ones, their index moves; the step reports whether it does, since the identity selector then orphans their seeds. |
 | HD5 | More entry points than cases. | Unchanged: `api_harness.py` records the overflow in `api_skipped` (`more than 255 cases`), which the static reach gate reports as gaps. On QCBOR, 171 + 440 entry points against 255 cases would fail the gate, so **H1 does not land before S6b**. A test fixes this behavior. |
 | HD6 | Opt-out. | None. An entry point that cannot be driven from bytes is exempted with `harness_reach.py exempt` and a reason, as today. |
 | HD7 | Fuzz budget. | Not changed here. A module's budget is shared by its cases, so more cases give each case a smaller share (QCBOR: about a third). The per-case floor pass of [`./fuzz-budget-design.md`](./fuzz-budget-design.md) (P6a) is the answer to that, and it is a proposal. The end validation measures the effect. |
 | HD8 | E-ACSL and RTE selection. | A header entry point the harness calls is added to the `-rte-select` / `-e-acsl-functions` list through the existing name filter of `fuzz_build.py` (Frama-C aborts on an unknown name). Unverified on a real build until the end validation. |
 | HD9 | Seeds. | The seed recorder wraps global symbols (`-Wl,--wrap`), so it cannot record a header function. It skips them without an error, and their cases start without recorded seeds. |
+
+## Review of H1 (2026-11-17)
+
+H1 is implemented on `feat/header-entry-points`. Checked again on the branch as first written:
+`ruff check` and `mypy` pass, the new tests and the neighbouring test files pass (263 passed, 18
+skipped), and a dry merge into `phase1-remediation` at `7e431a6` (S5, S6a and S12 merged
+meanwhile) has no conflict. `ruff format --check` reports 48 files, all of them already at the
+base; the only one H1 touches is `scripts/api_harness.py`, at a line H1 did not change. The full
+suite was run by the implementing agent only (5888 passed, 218 skipped).
+
+**Rebased (2026-11-17)** onto `p1/s6b-wide-selector`, itself rebased onto `phase1-remediation` at
+`434d4a9` (R1, the mpack run-3 supervisor fixes and the redone S5 merged). So H1 now sits on S6b
+and cannot land before it.
+- The model commit (`header_api`) is on `phase1-remediation` with R1, and the rebase skipped it.
+  The commit that reset the R1 Status row to "open" is dropped.
+- Conflicts were in documents and in `skills/framac-slice/SKILL.md` only; both sides' text is kept.
+- On the rebased branch `ruff check`, `mypy scripts tests`, the generated-text check and the skill
+  mirror check pass, and the whole suite gives 6087 passed, 225 skipped.
+- **One change in code.** H1 left the file of every header-defined entry point out of an `--api`
+  harness's sources. The mpack fix on the tip keeps the header of an exported function a header
+  defines (mpack's `MPACK_INLINE`) in the sources, for E-ACSL's function discovery and the module
+  scope, and takes it off the clang command line. H1 now leaves out only the header of a `static`
+  header function, which `fuzz_build` names from the sidecar's cases. Test:
+  `test_an_exported_function_a_header_defines_keeps_its_header_in_the_sources`.
+- Read, not run: a header case is built by the same `single_case` as an exported one, so it gets
+  the tip's whole-unit initializers, destructors and aligned buffers; a header entry point that
+  is also an initializer stays a root, because `api_helpers` leaves out the module's entry points.
+- **What else puts a file in the sources.** `generate_harness._merge_dag_harness_sources` adds,
+  for every function a case names, the sources its lexer module needs, and the function's own
+  file only when that module lists none. Read from the recorded runs, nothing written to them:
+  in QCBOR run-6 all 470 static header functions are in a lexer module that lists `.c` sources
+  only, and the sidecar has no header; in mpack run-3 the sidecars list one to four headers, all
+  from exported header functions (its DAG has no static header function). So on these two a
+  static header entry point brings no header in. **Open:** on a target whose header functions
+  sit in a lexer module with no source, the header would come in, Frama-C would parse it as a
+  file of its own, and the static would have two definitions. That is the HD8 question again.
+- Not re-measured: the QCBOR numbers below are from the branch before the rebase.
+
+**Rebased again (2026-11-17)** with `p1/s6b-wide-selector` onto `phase1-remediation` at `890a101`
+(the open-topics steps O4, O5, O7, O9 to O12 and the mpack run-4 supervision fixes S13 to S19
+landed).
+- No conflict in H1's own commits; the one conflict of the pair was S6b's, in
+  `skills/framac-slice/SKILL.md`.
+- On the rebased branch `ruff check`, `mypy scripts tests`, the generated-text check and the skill
+  mirror check pass, and the whole suite gives 6224 passed, 231 skipped. With
+  `FRAMAC_DOCKER_TESTS=1`, the harness test files (selector, `--api` callbacks, header entries,
+  argument domains, capture headers, `stdin`, `fuzz_build`, seeds) give 188 passed, 1 skipped:
+  the skip is `tests/test_api_harness_header_entries.py:228`, which needs clang on the host.
+- **Read, not run: H1 with the tip's two changes to `scripts/api_harness.py`.** Both merged with
+  H1's code without a conflict.
+  - Since O4, `--api` without `--header` takes its headers from the build capture and, when they
+    do not compile in the harness, retries with the public ones alone and then with none. Each
+    attempt plans again from its own layout probe, so a header entry point gets its case in the
+    attempts whose headers declare it, and is skipped (`HEADER_NOT_VISIBLE`) in the attempt with
+    none. No test builds a header entry point's case through the capture's choice.
+  - A header case is built by the same `single_case` with the same `ApiInfo`, so the
+    argument-domain rules of the run-4 fix apply to it; the header-entry tests plan their cases
+    through that code and pass.
+- Not re-measured: the QCBOR numbers below.
+
+**Measured offline on the recorded QCBOR run-6 model** (the branch's `header_api()` and
+`build_callgraph_dag.py` on a copy of `phase0_model.json` and `build_capture.json`; no target run):
+
+| | Before | With H1 |
+| :--- | :--- | :--- |
+| Entry points of `libqcbor_a` | 171 | 611 (440 from 13 public headers, 9 of them `_Private_`) |
+| Header functions `reached` | 88 of 470 | 470 of 470 |
+| Tiers | 342 Tier 1A, 8 Tier 1B, 4 Tier 2, 401 Tier 3 | the same |
+| Harness modules | 1 (`libqcbor_a`) | 10 cluster sub-modules: the entry points now reach more than 400 functions, so `unit_split.py` splits the unit. The largest has 280 entry points and 402 functions |
+
+What this means, beyond "more cases":
+- **Phase 3 and Eva get the header functions.** In run-6 the ledger holds 410 `deferred` units
+  under `inc/` (of 480): those functions were analyzed by no phase. With H1 they are reached, so
+  they are planned.
+- **QCBOR becomes ten harnesses, ten Eva runs and ten campaigns** in place of one. That is the
+  designed answer to a large unit, but it was calibrated on exported entry points; the clusters
+  and their cost need the end validation.
+- **S6b is still needed** (HD5): the largest cluster has 280 entry points against 255 cases. The
+  other nine fit.
+- **Hand-written `--dispatch-case` cases move** behind the header cases (HD4), and with the split
+  they belong to another module anyway. A run's harness repairs have to be redone.
+
+Open after H1, each recorded in the troubleshooting entry:
+- **H2, trust:** public header functions stay Tier 3 ("no untrusted path"). A sub-module scoped
+  to source files is then not held to them, and the unit's own gate row asks only for Tier 1 and
+  2 entry points. Needs `scripts/trust.py`, which H1 did not own.
+- **Shared libraries only:** the build capture computes `public_headers` only when the build has
+  a static library, so such a target gets no `header_api`.
+- **A scope with header entry points only** fails in `api_harness.generate` before the layout
+  probe can make their cases.
+- **The static reach gate follows header wrappers**, so a header entry point that only another
+  header entry point calls is never a gap.
+- **HD8 on a real build:** whether Frama-C keeps the plain name of the header copy the harness
+  compiles. The legacy `e-acsl-gcc.sh` path has no retry for an unknown name.
 
 ## Steps
 
@@ -175,6 +269,7 @@ These decide how much the new cases find. Each needs a design of its own.
 
 | Step | Size | When | Status |
 | :--- | :--- | :--- | :--- |
-| H1 | M | now, on `feat/header-entry-points`; lands after S6b | dispatched 2026-11-17 |
+| H1 | M | now, on `feat/header-entry-points`; lands after S6b | implemented 2026-11-17 on `feat/header-entry-points`, rebased onto `p1/s6b-wide-selector` (see "Review of H1"), not merged. HD3 only moves `reached`: trust and tiers stay as they were, since `trust.py` does not read `header_api`; a sub-module scoped to the sources is then not held to the header entry points (both open, see the troubleshooting entry). HD8 unverified until the end validation |
+| H2 | S | with H1 | open: decide whether `trust.py` counts `header_api` (see "Review of H1") |
 | R1 | S | after S5 is merged | merged 2026-11-17: the reach row and the run report list them, no gate reads them; open: on a split unit the numbers are a lower bound |
-| S6b | M | lands after the merge to `main` (remediation plan, D20) | started early on 2026-11-17 (user), on `p1/s6b-wide-selector`, cut from `phase1-remediation` at `0b0101e`; to be rebased over S5 |
+| S6b | M | after the merge to `main` (remediation plan, D20) | written on `p1/s6b-wide-selector`, rebased onto `phase1-remediation` on 2026-11-17, not merged; tracked there |

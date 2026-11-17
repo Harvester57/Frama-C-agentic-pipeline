@@ -193,6 +193,37 @@ def test_plan_recorder_records_an_executables_embedded_api():
     assert [p["name"] for p in plans] == ["crypto_box"]
 
 
+def test_plan_recorder_wraps_no_public_header_function():
+    # HD9 (docs/plans/header-entry-points-plan.md): a function a library defines in its public header
+    # (`header_api`) has no symbol for `-Wl,--wrap`. The recorder plans no wrapper for it and does not
+    # fail; its harness case starts without recorded seeds.
+    model = {
+        "entry_points": ["src/lib.c#lib_decode"],
+        "units": {
+            "liblib.a": {
+                "kind": "static_lib",
+                "test": False,
+                "entry_points": ["src/lib.c#lib_decode"],
+                "header_api": ["inc/lib.h#lib_get_int"],
+            }
+        },
+        "functions": {
+            "src/lib.c#lib_decode": {"name": "lib_decode", "signature": "int(char *, int)"},
+            "inc/lib.h#lib_get_int": {
+                "name": "lib_get_int",
+                "signature": "int(char *)",
+                "static": True,
+                "inline": True,
+                "header": True,
+            },
+        },
+    }
+    plans, skipped = sh.plan_recorder(model)
+    assert [p["name"] for p in plans] == ["lib_decode"]
+    assert "lib_get_int" not in sh.wrapper_source(plans, [])
+    assert skipped == {}
+
+
 def test_strace_opened_and_data_files(tmp_path):
     tree = tmp_path / "tree"
     (tree / "tests" / "data").mkdir(parents=True)
