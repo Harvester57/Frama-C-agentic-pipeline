@@ -362,6 +362,11 @@ def test_validator_rejects_discharging_wp_evidence_without_limits():
     assert any("did not pass" in e for e in validate_ledger([{**bare, "evidence": [contradictory]}]))
     consistent = {**base, "details": {"limits": {"vacuity": {"status": "consistent"}}}}
     assert list(validate_ledger([{**bare, "evidence": [consistent]}])) == []
+    # The reported-only fields beside it pass the validator unchanged.
+    frame = {"status": "decided", "ensures": 1, "frame_only": [], "not_frame_only": [], "all_frame_only": False}
+    limits = {"vacuity": {"status": "consistent"}, "contract_shape": "functional", "frame_only_ensures": frame}
+    reported = {**base, "details": {"limits": limits, "contract_refinement": {"verdict": "undecided"}}}
+    assert list(validate_ledger([{**bare, "evidence": [reported]}])) == []
 
 
 CASES = {

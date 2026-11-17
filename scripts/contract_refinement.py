@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -490,6 +491,37 @@ def _under_work_tree(path: Path) -> bool:
     return any(a in ("workspace", "scratch") and b == "work" for a, b in zip(parts, parts[1:], strict=False))
 
 
+_PATH_FLAGS = ("-I", "-iquote", "-isystem", "-idirafter", "-include", "-imacros")
+
+
+def absolute_path_flags(cppflags: str, base: Path) -> str:
+    """
+    `cppflags` with the relative paths of its include options made absolute against `base`: the probe runs
+    the preprocessor from its own directory, so `-I.` or `-Iwork/include` must keep naming the caller's.
+    """
+    try:
+        tokens = shlex.split(cppflags)
+    except ValueError:
+        return cppflags
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        flag = next((f for f in _PATH_FLAGS if tok.startswith(f)), None)
+        if flag is None or (tok == flag and i + 1 >= len(tokens)):
+            out.append(tok)
+            i += 1
+            continue
+        if tok == flag:
+            value, i = tokens[i + 1], i + 2
+        else:
+            value, i = tok[len(flag) :], i + 1
+        if not value.startswith("/") and not Path(value).is_absolute():
+            value = (base / value).as_posix()
+        out += [flag + value] if flag == "-I" else [flag, value]
+    return " ".join(shlex.quote(t) for t in out)
+
+
 def probe_command(
     probe_path: Path, function: str, cppflags: str, machdep: str, wp_par: int, json_path: Path, goals_dir: Path
 ) -> list[str]:
@@ -570,7 +602,8 @@ def run_probe(
         probe_path.write_text(unit.text, encoding="utf-8", newline="\n")
         if json_path.exists():
             json_path.unlink()
-        cmd = probe_command(probe_path, unit.function, cppflags, machdep, wp_par, json_path, goals_dir)
+        flags = absolute_path_flags(cppflags, Path.cwd())
+        cmd = probe_command(probe_path, unit.function, flags, machdep, wp_par, json_path, goals_dir)
         try:
             proc = subprocess.run(
                 cmd,

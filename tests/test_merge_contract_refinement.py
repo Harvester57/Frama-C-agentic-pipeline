@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -73,7 +74,7 @@ def test_single_merge_compares_against_the_contract_before_the_splice(tmp_path, 
     )
     assert res["ok"] is True, res
     assert res["contract_refinement"]["verdict"] == "weaker"
-    (new, previous), = probe_calls
+    ((new, previous),) = probe_calls
     assert "\\result > a" in new and "\\result == a + 1" in previous
     wp = json.loads((run_dir / "agents/prove-inc/scratch/parent_wp/inc.json").read_text(encoding="utf-8"))
     assert wp["contract_refinement"]["verdict"] == "weaker"
@@ -103,6 +104,21 @@ def test_a_failing_probe_is_recorded_as_undecided_and_the_merge_stands(tmp_path,
     assert "\\result > a" in (overlay / "work/calc.c").read_text(encoding="utf-8")
 
 
+@pytest.mark.integration
+@pytest.mark.skipif(shutil.which("frama-c") is None, reason="Frama-C not available")
+def test_real_merge_recheck_records_weaker(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(workspace_overlay, "_run_parent_reverify", _fake_reverify)
+    monkeypatch.chdir(tmp_path)
+    run_dir, overlay = _run(tmp_path, {"prove-inc": MERGE_WEAKER_C})
+    res = workspace_overlay.merge_agent_overlay(
+        run_dir=run_dir, agent_id="prove-inc", role="prover", overlay_dir=overlay, c_file="calc.c", function="inc"
+    )
+    refinement = res["contract_refinement"]
+    assert refinement["verdict"] == "weaker", refinement
+    assert [c["text"] for c in refinement["clauses"]] == ["\\result == a + 1"]
+    print(f"merge re-check probe (ms): {refinement.get('elapsed_ms')}")
+
+
 def test_batch_merge_records_the_check_once_the_round_passes(tmp_path, probe_calls) -> None:
     run_dir, overlay = _run(tmp_path, {"prove-inc": MERGE_WEAKER_C, "prove-twice": MERGE_TWICE_C})
     out = workspace_overlay.merge_agent_batch(
@@ -118,5 +134,5 @@ def test_batch_merge_records_the_check_once_the_round_passes(tmp_path, probe_cal
     assert by_agent["prove-inc"]["contract_refinement"]["verdict"] == "weaker"
     assert "contract_refinement" not in by_agent["prove-twice"]
     assert all("previous_contract" not in m for m in out["merged"])
-    (new, previous), = probe_calls
+    ((new, previous),) = probe_calls
     assert "\\result > a" in new and "\\result == a + 1" in previous

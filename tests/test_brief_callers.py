@@ -188,7 +188,7 @@ def test_long_contracts_are_cut(tmp_path, monkeypatch):
 
 
 def test_source_text_cannot_leave_its_code_block(tmp_path):
-    (tmp_path / "a.c").write_text('int g(void) {\n    f(1); /* ``` */\n    return 0;\n}\n', encoding="utf-8")
+    (tmp_path / "a.c").write_text("int g(void) {\n    f(1); /* ``` */\n    return 0;\n}\n", encoding="utf-8")
     dag: dict[str, dict] = {
         "f": {"name": "f", "file": "a.c", "internal_callers": ["g"]},
         "g": {"name": "g", "file": "a.c"},

@@ -395,3 +395,56 @@ def test_real_probe_refinement_weakening_and_frame_only(tmp_path, monkeypatch):
     print(f"probe timings (ms): {json.dumps(timings)}")
     # Nothing was left behind: the probe directory is temporary.
     assert not any((tmp_path / "probe").glob("contract_probe_*"))
+
+
+@pytest.mark.unit
+def test_relative_include_paths_are_made_absolute():
+    base = Path("/run")
+    flags = CR.absolute_path_flags("-I. -Iwork/include -I /abs -isystem sys -include cfg.h -DX=1 -O2", base)
+    assert flags == "-I/run -I/run/work/include -I/abs -isystem /run/sys -include /run/cfg.h -DX=1 -O2"
+    assert CR.absolute_path_flags("", base) == ""
+    assert CR.absolute_path_flags("-I'unterminated", base) == "-I'unterminated"
+
+
+RUN_LAYOUT_HEADER = """\
+/*@ assigns \\nothing;
+    ensures \\result == a + b; */
+int add(int a, int b);
+/*@ requires \\valid(p) && \\valid_read(q) && \\separated(p, q);
+    assigns *p;
+    ensures *q == \\old(*q); */
+void touch(int *p, const int *q);
+"""
+
+RUN_LAYOUT_C = """\
+#include <lib/api.h>
+int add(int a, int b) { return a + b; }
+void touch(int *p, const int *q) { *p = 0; }
+"""
+
+
+@pytest.mark.integration
+@needs_framac
+def test_real_pipeline_uses_on_a_run_layout(tmp_path, monkeypatch):
+    """The contract sits on a header found only through a relative `-I`, as in a run directory."""
+    import run_wp_function
+
+    monkeypatch.chdir(tmp_path)
+    _write(tmp_path, "work/include/lib/api.h", RUN_LAYOUT_HEADER)
+    c_file = _write(tmp_path, "work/src/api.c", RUN_LAYOUT_C)
+    flags = "-I. -Iwork/include"
+    consistent = {"status": "consistent", "doomed": [], "dead_goals": 0}
+    report = {"status": "all_proven", "function": "touch", "soundness": {"ok": True}, "layer_goals": []}
+    limits = run_wp_function.apply_verdict_limits(report, c_file, consistent, cppflags=flags)["limits"]
+    assert limits["frame_only_ensures"]["status"] == CR.FRAME_DECIDED, limits
+    assert limits["frame_only_ensures"]["all_frame_only"] is True
+    previous = CR.read_function_contract(c_file, "add", flags)
+    weaker_header = RUN_LAYOUT_HEADER.replace("\\result == a + b", "\\result >= a")
+    _write(tmp_path, "work/include/lib/api.h", weaker_header)
+    new = CR.read_function_contract(c_file, "add", flags)
+    res = CR.refinement_check(new, previous, c_file, flags)
+    assert res["verdict"] == CR.WEAKER, res
+    print(
+        f"run-layout probe timings (ms): frame {limits['frame_only_ensures'].get('elapsed_ms')}, "
+        f"weaker {res.get('elapsed_ms')}"
+    )
