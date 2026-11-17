@@ -50,6 +50,18 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   `fc_compat_types.h` therefore defines `__restrict__` as `__restrict` (guarded with `#ifndef`)
   ahead of its includes, so sources such as mpack's `MPACK_RESTRICT` parse. Clang compiles never
   see it (the header is empty without `__FRAMAC__`).
+- Checked-arithmetic builtins (`__builtin_add_overflow`, `_sub_`, `_mul_`, their `_p` forms and the
+  typed `__builtin_sadd_overflow` ... `__builtin_umulll_overflow`). With Frama-C's own libc on a GCC
+  machdep (Eva, WP, Phase 0), `FRAMAC_SHARE/libc/__fc_gcc_builtins.h` declares the typed forms with
+  contracts and maps the generic ones onto them with `_Generic`; only the `_p` forms are missing. The
+  E-ACSL frontend (host headers) knows none of them, calls them as undeclared functions, and clang
+  refuses the redeclaration it prints. `fc_compat_types.h` therefore defines the `_p` forms for every
+  Frama-C parse, and the others only under `__FRAMAC_EACSL__`. They are GNU statement expressions with
+  GCC's semantics that never wrap or convert out of range, so they raise no alarm of their own. They
+  must not be defined for a kernel-libc parse: this header is force-included first, so a macro for a
+  typed form would break `__fc_gcc_builtins.h`'s declarations (`syntax error`). Frama-C's `_Generic`
+  picks the typed form from the first operand's type only, so mixed operand types call the wrong one
+  (`incompatible-types-call`); that is Frama-C's model, not changed here.
 - Variadic calls without a libc specification produce `<fn>_fallback_<N>` symbols.
   `run_eacsl_fuzz.py` defines them in a generated, link-only `eacsl_fallbacks.o`. It forwards to
   the real function when it can; otherwise the call fails with `ENOSYS`, which is recorded in

@@ -378,3 +378,180 @@ def test_gcc_restrict_spelling_builds_under_eacsl_and_clang(tmp_path):
     # No `__restrict__` survives the frontend preprocessing, from the target or from glibc.
     assert log.split("==cpp==", 1)[1].split("==clang==", 1)[0].strip() == "0", log
     assert "clang=0" in log.split("==clang==", 1)[1], log
+
+
+# ---------------------------------------------------------------------------------------------------
+# Checked-arithmetic builtins (mpack run-3, 2026-11-17): Frama-C called __builtin_add_overflow & co as
+# undeclared functions; clang refused the E-ACSL output's redeclaration, Eva and WP lost the store.
+# ---------------------------------------------------------------------------------------------------
+
+OVERFLOW_BUILTINS = tuple(
+    f"__builtin_{name}_overflow"
+    for name in (
+        "add", "sub", "mul",
+        "sadd", "saddl", "saddll", "uadd", "uaddl", "uaddll",
+        "ssub", "ssubl", "ssubll", "usub", "usubl", "usubll",
+        "smul", "smull", "smulll", "umul", "umull", "umulll",
+    )
+) + ("__builtin_add_overflow_p", "__builtin_sub_overflow_p", "__builtin_mul_overflow_p")  # fmt: skip
+
+OVERFLOW_C = r"""#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define P(e) printf("%d ", (int)(e))
+
+static int calls;
+static long next(long v) {
+  calls++;
+  return v;
+}
+
+/* mpack's use: size_t operands behind a cast, result through a pointer. */
+int grow(size_t a, size_t b, size_t *out) { return __builtin_add_overflow((size_t)(a), (size_t)(b), out); }
+
+int main(void) {
+  int i;
+  unsigned u;
+  long l;
+  unsigned long ul;
+  long long ll;
+  unsigned long long ull;
+  signed char sc;
+  unsigned char uc;
+  short sh;
+  size_t z;
+  P(__builtin_add_overflow(INT_MAX, 1, &i)); P(i);
+  P(__builtin_add_overflow(INT_MIN, -1, &i)); P(i);
+  P(__builtin_sub_overflow(0u, 1u, &u)); printf("%u ", u);
+  P(__builtin_sub_overflow(0u, 1u, &i)); P(i);
+  P(__builtin_add_overflow(-1, 1u, &u)); printf("%u ", u);
+  P(__builtin_add_overflow(LLONG_MIN, LLONG_MIN, &ll)); printf("%lld ", ll);
+  P(__builtin_sub_overflow(LLONG_MIN, 1, &ll)); printf("%lld ", ll);
+  P(__builtin_mul_overflow(LLONG_MIN, -1, &ll)); printf("%lld ", ll);
+  P(__builtin_mul_overflow(LLONG_MIN, -1, &ull)); printf("%llu ", ull);
+  P(__builtin_mul_overflow(ULLONG_MAX, ULLONG_MAX, &ull)); printf("%llu ", ull);
+  P(__builtin_mul_overflow(ULLONG_MAX, 2ull, &ll)); printf("%lld ", ll);
+  P(__builtin_mul_overflow((size_t)1 << 40, (size_t)1 << 30, &ul)); printf("%lu ", ul);
+  P(__builtin_mul_overflow(0x123456789abcdefull, 0xfedcba987654321ull, &ull)); printf("%llu ", ull);
+  P(__builtin_mul_overflow(-0x123456789abcdefll, 0x7edcba987654321ll, &ll)); printf("%lld ", ll);
+  P(__builtin_add_overflow(ULLONG_MAX, ULLONG_MAX, &ull)); printf("%llu ", ull);
+  P(__builtin_add_overflow(200, 100, &uc)); P(uc);
+  P(__builtin_add_overflow(100, 100, &sc)); P(sc);
+  P(__builtin_sub_overflow(-100, 100, &sc)); P(sc);
+  P(__builtin_mul_overflow(-300, 300, &sh)); P(sh);
+  P(__builtin_sub_overflow(-5, -7, &u)); printf("%u ", u);
+  P(__builtin_sub_overflow(5, 7, &ul)); printf("%lu ", ul);
+  P(__builtin_sub_overflow(LLONG_MIN, LLONG_MAX, &ull)); printf("%llu ", ull);
+  P(__builtin_sub_overflow(ULLONG_MAX, LLONG_MIN, &ll)); printf("%lld ", ll);
+  i = 7; P(__builtin_add_overflow(i, i, &i)); P(i);
+  calls = 0; P(__builtin_mul_overflow(next(3), next(4), &l)); P(l); P(calls);
+  P(__builtin_add_overflow(1, 2, &i) || __builtin_mul_overflow(INT_MAX, 2, &i)); P(i);
+  P(__builtin_add_overflow_p(INT_MAX, 1, (int)0));
+  P(__builtin_mul_overflow_p(1000, 1000, (short)0));
+  P(__builtin_sub_overflow_p(1, 2, 0u));
+  P(__builtin_sadd_overflow(INT_MAX, 1, &i)); P(i);
+  P(__builtin_uaddl_overflow(ULONG_MAX, 1ul, &ul)); printf("%lu ", ul);
+  P(__builtin_umull_overflow(1ul << 33, 1ul << 31, &ul)); printf("%lu ", ul);
+  P(__builtin_ssubll_overflow(LLONG_MIN, 1, &ll)); printf("%lld ", ll);
+  P(grow(SIZE_MAX, 1, &z)); printf("%zu ", z);
+  P(grow(40, 2, &z)); printf("%zu", z);
+  printf("\n");
+  return 0;
+}
+"""
+
+
+@pytest.mark.unit
+def test_overflow_builtins_are_defined_only_where_frama_c_lacks_them():
+    text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    framac = text.index("#if defined(__FRAMAC__)")
+    block = text.index("#ifndef __FC_OVF")
+    block_end = text.index("#endif /* __FC_OVF */")
+    eacsl = text.index("#if defined(__FRAMAC_EACSL__)", block)
+    eacsl_end = text.index("#endif /* __FRAMAC_EACSL__ */", eacsl)
+    assert framac < block < eacsl < eacsl_end < block_end
+    for name in OVERFLOW_BUILTINS:
+        at = text.index(f"#define {name}(")
+        assert block < at < block_end, name
+        if name.endswith("_p"):
+            # Frama-C's own libc has no `_p` form: every parse gets it.
+            assert not eacsl < at < eacsl_end, name
+        else:
+            # FRAMAC_SHARE/libc/__fc_gcc_builtins.h declares these on a GCC machdep, after this header:
+            # only the E-ACSL frontend (host headers) may define them.
+            assert eacsl < at < eacsl_end, name
+
+
+KERNEL_LIBC_C = r"""#include <stddef.h>
+#include <stdint.h>
+
+int typed(int a, int b, int *r) { return __builtin_sadd_overflow(a, b, r); }
+int generic(size_t a, size_t b, size_t *r) { return __builtin_mul_overflow(a, b, r); }
+int pred(size_t a, size_t b) { return __builtin_mul_overflow_p(a, b, (size_t)0); }
+
+int main(void) {
+  int i;
+  size_t z;
+  return typed(1, 2, &i) + generic(3, 4, &z) + pred(5, 6);
+}
+"""
+
+
+@image
+@slow
+def test_overflow_builtins_parse_with_frama_c_libc_on_the_pipeline_machdep(tmp_path):
+    """Eva, WP and Phase 0 parse with Frama-C's libc on gcc_x86_64, whose __fc_machdep.h includes
+    __fc_gcc_builtins.h after the force-included compat header (2026-11-17: a macro for a typed form broke
+    that header's declarations, `__fc_gcc_builtins.h:37: syntax error`)."""
+    require_docker_images(ANALYSIS_IMAGE)
+    warn = "-warn-signed-downcast -warn-unsigned-overflow -warn-unsigned-downcast"
+    script = (
+        FRAMAC_FLAGS + 'echo "==eva=="; '
+        f'frama-c -no-unicode -machdep gcc_x86_64 k.c -cpp-extra-args="$A" -eva -eva-precision 1 {warn} 2>&1; '
+        'echo "rc=$?"; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"k.c": KERNEL_LIBC_C}, script, timeout=300)
+    eva = log.split("==eva==", 1)[1].split("==end==", 1)[0]
+    assert "rc=0" in eva, eva
+    assert "syntax error" not in eva, eva
+    # The typed and generic forms come from Frama-C's libc, the `_p` form from the compat header.
+    assert "implicit-function-declaration" not in eva and "missing-spec" not in eva, eva
+    assert "0 alarms generated" in eva, eva
+
+
+@image
+@slow
+def test_overflow_builtins_match_gcc_under_eacsl(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    eacsl_flags = (
+        f"F=$(python3 -c '{PY}import eacsl_toolchain as T; "
+        'print(T.build_eacsl_flag_sets("-I.", fuzzer=False, full_mtracking=True)["frontend"])\'); '
+        f"B=$(python3 -c '{PY}import eacsl_toolchain as T; "
+        'print(T.build_eacsl_flag_sets("-I.", fuzzer=False, full_mtracking=True)["backend"])\'); '
+    )
+    checks = "--libc-replacements --validate-format-strings"
+    script = (
+        eacsl_flags + 'echo "==gcc=="; gcc -O1 -w o.c -o native && ./native; '
+        # The two stages of scripts/fuzz_build.py, clang preprocessing and backend included.
+        f'echo "==eacsl=="; e-acsl-gcc -n --no-constfold {checks} -G clang '
+        f'-F "-rte -machdep gcc_x86_64 -e-acsl-full-mtracking -rte-initialized @all -warn-unsigned-downcast" '
+        '-E "$F" -o o.instrumented.c o.c > s1.log 2>&1; echo "stage1=$?"; '
+        f'e-acsl-gcc -C {checks} -G clang -e "$B" -O ebin o.instrumented.c > s2.log 2>&1; echo "stage2=$?"; '
+        'echo "proto=$(grep -c "missing proto" o.instrumented.c)"; ./ebin.e-acsl; echo "run=$?"; '
+        'echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"o.c": OVERFLOW_C}, script, timeout=600)
+    native = log.split("==gcc==", 1)[1].split("==eacsl==", 1)[0].strip()
+    eacsl = log.split("==eacsl==", 1)[1].split("==end==", 1)[0]
+    build = "\n".join(
+        (tmp_path / f).read_text(encoding="utf-8", errors="replace")
+        for f in ("s1.log", "s2.log")
+        if (tmp_path / f).is_file()
+    )
+    assert "stage1=0" in eacsl and "stage2=0" in eacsl, build
+    assert "proto=0" in eacsl, eacsl
+    assert "run=0" in eacsl, eacsl
+    # Same results as GCC's own builtins, case by case.
+    assert native and native in eacsl, (native, eacsl)
