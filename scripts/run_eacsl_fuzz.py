@@ -698,6 +698,9 @@ def run_campaign_rounds(
         "skippable_cases": skippable,
         "skipped_cases": sorted(skipped),
         "fuzz_seconds": round(spent, 1),
+        "workers": max(1, workers),
+        "cpu_seconds_spent": round(spent * max(1, workers), 1),
+        "stopped": rounds[-1].get("stopped"),
         "rounds": rounds,
     }
     if runtime_skip:

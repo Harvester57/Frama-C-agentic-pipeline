@@ -82,6 +82,7 @@ def test_one_and_eight_workers_run_the_same_rounds(tmp_path, clock):
     assert len(shape(one)) == 4
     assert shape(one) == shape(eight)
     assert shape(one)[-1][2] == "time_budget_spent"
+    assert one["keep_going"]["cpu_seconds_spent"] == eight["keep_going"]["cpu_seconds_spent"] == 240.0
     # Round 4 crashed in case 3 as the time ran out: that case is not skipped, no round is left to skip it in.
     assert one["keep_going"]["skipped_cases"] == eight["keep_going"]["skipped_cases"] == [0, 1, 2]
 
@@ -152,3 +153,13 @@ def _rounds_ending_with(name: str, clock: FakeClock, tmp_path: Path) -> dict:
 def test_every_exit_records_stopped(tmp_path, clock, name):
     res = _rounds_ending_with(name, clock, tmp_path)
     assert res["keep_going"]["rounds"][-1]["stopped"] == name
+    assert res["keep_going"]["stopped"] == name
+
+
+def test_keep_going_records_cpu_seconds_spent(tmp_path, clock):
+    res = _run(clock, tmp_path, workers=8, max_time=30, cpu_per_round=60, crashes=[[c] for c in range(6)])
+    kg = res["keep_going"]
+    assert kg["workers"] == 8
+    assert kg["fuzz_seconds"] == 30.0
+    assert kg["cpu_seconds_spent"] == 240.0
+    assert kg["stopped"] == "time_budget_spent"
