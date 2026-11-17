@@ -184,3 +184,19 @@ Issues encountered in coverage ledger ingestion (`ledger.py`), Crash Verifier sc
 - **Seen on:** code review of S4, 2026-11-17. The agent-result schema (`schemas/agent-result.schema.json`, `fault_hypothesis`: `input_condition`, `predicate`, `why_not_reproduced`) and the breaker's `failing_predicate` carry no line, so `ledger.py` ingests them with `line: 0` and `site=None`. They merge with a candidate by function and kind only (`_find_matching_sink_candidate`), not by statement site.
 - **Cause:** the result contracts were written before the site key (D1a). S4 does not own them and adds no field.
 - **Fix:** none yet. **Open pipeline bug:** when the prover or breaker names a line for its predicate, add it to the schema and pass it as the `line` of `ledger.py` `cmd_ingest_agent_hypothesis` (the site is then computed as in `_ingest_prover_code_fault`).
+
+### Symptom: A Verifier Verdict Is Lost (`requeued_ingest_error`) Because It Cites a Repository Doc as `evidence[].tool_output`, Although Its Own `agent-result` Check Passed
+- **Seen on:** mpack run-4, 2026-11-17 at about 15:10, `verify-mpack_write_false_2e1ac57099`, whose verdict was a correct `contract_overconstraint` rejection.
+  - `wp_scheduler.py step --complete` answered `action: requeued_ingest_error` with `refusing to write invalid ledger/candidates/findings: findings: $[14].evidence[7].tool_output: referenced file does not exist under run dir: docs/references/rte/frama-c-rte-manual.md`.
+  - A fresh verifier must redo the task.
+  - The run's model recorded it in the entry about the 1 MiB promotion limit; the supervisor gave it its own fix (S17).
+- **Cause:** two gaps together.
+  - The verifier brief points to the manuals through `{references_dir}` but never said that a `tool_output` must be a file in the run directory.
+  - `validate_artifacts.py agent-result` checked only the schema and the path syntax, not that cited files exist or fit the promotion limits. So the agent's pre-return check passed, and the parent's ingest refused the whole result: the existence check when `findings.json` is written, or `promote_file`'s size limits for a scratch file above 1 MiB.
+- **Fix:** **Open pipeline bug:** fixed on branch `sup/mpack-brief-wrapper` (`4dfaeea`, on top of S15; run supervisor S17), held until run-4 ends, not merged.
+  - The pre-read checks of `promote_file` are now `promote_artifact.check_promotable`. `validate_agent_result(data, run_dir)` runs them on a crash verifier's scratch evidence, reproducers and `fix_patch`; any other cited file must exist under the run directory.
+  - `agent-result` gains `--run-dir`, defaulting to the run directory of an `agents/<id>/scratch/result.json`, so the command the briefs already give now runs these checks. The ingest itself is unchanged.
+  - The verifier, prover and header architect briefs say that manuals and repository docs are cited in prose, and give the size limits.
+  - Tests: `tests/test_agent_result_evidence_files.py` (a repository doc, a missing file, an oversized file refused; valid files pass); 3 of 4 failed before the fix.
+  - The supervisor reran the related tests (11 and 40 passed), ran `ruff` and `mypy` (clean), and dry-ran the merges (clean). Run on run-4's lost result, the branch's `agent-result` check now refuses it with the ingest's error.
+  - Still open: an oversized evidence file is still refused at ingest rather than skipped (see the 1 MiB promotion limit entry above), but the agent now sees the error before it returns.
