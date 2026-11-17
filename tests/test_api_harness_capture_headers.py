@@ -56,6 +56,7 @@ def _setup(
     """A DAG module `lib` of link unit `libx.a`, its headers on disk, and a logging fake harness writer."""
     import generate_harness
 
+    tmp_path.mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(tmp_path)
     root = Path(target_dir[len("/framac-run/") :]) if target_dir else Path(".")
     for rel, text in HEADER_TEXT.items():
@@ -92,7 +93,12 @@ def _setup(
         calls.append(kw)
         cases = list(kw["dispatch_cases"])
         harness = out / f"harness_{kw['module_name']}.c"
-        harness.write_text("".join(f"    case {i}U: {{ {c} }} break;\n" for i, c in enumerate(cases)))
+        # The cases first (line i is case i), then the headers the harness includes, for the fake probes.
+        includes = [h for h in [kw["header_include"], *(kw["extra_includes"] or [])] if h]
+        harness.write_text(
+            "".join(f"    case {i}U: {{ {c} }} break;\n" for i, c in enumerate(cases))
+            + "".join(f'#include "{h}"\n' for h in includes)
+        )
         meta = out / f"harness_{kw['module_name']}.json"
         sidecar = {
             "module": kw["module_name"],
@@ -244,6 +250,100 @@ def test_a_freely_named_sub_module_looks_for_the_entry_points_of_its_scope_files
     # The public header declares every entry point of src/a.c: no internal header is needed.
     in_a = ah.capture_headers(dag, "mysub", "lib", capture, ["src/a.c"])
     assert in_a["internal"] == [] and in_a["header"] == PUB_H and in_a["extra_includes"] == []
+
+
+# --- an automatic choice never fails a module: it degrades in steps -----------------------------------
+
+
+def _broken_by(monkeypatch: pytest.MonkeyPatch, *broken: str) -> list[list[str]]:
+    """A probe whose harness does not compile outside its cases while it includes a `broken` header."""
+    seen: list[list[str]] = []
+
+    def probe(harness_c: Any, cppflags: str, clang: str | None = None) -> tuple[dict[int, str], list[str]]:
+        included = [ln.split('"')[1] for ln in Path(harness_c).read_text().splitlines() if ln.startswith("#include")]
+        seen.append(included)
+        bad = [h for h in included if h in broken]
+        return {}, [f"{h}:1:1: error: unknown type name 'gmp_t'" for h in bad]
+
+    monkeypatch.setattr(ah, "probe_cases", probe)
+    return seen
+
+
+def test_a_broken_internal_header_falls_back_to_the_public_ones(tmp_path, monkeypatch):
+    out, calls = _setup(tmp_path, monkeypatch, _capture())
+    seen = _broken_by(monkeypatch, INTERNAL_H)
+    layout_probes: list[str] = []
+    monkeypatch.setattr(ah, "probe_layouts", lambda h, c, *a, **k: layout_probes.append(Path(h).read_text()))
+    res = _run(out)
+
+    assert seen == [[PUB_H, INTERNAL_H], [PUB_H]]
+    # Each attempt probes its own struct layouts: none comes from the harness with the dropped header.
+    assert len(layout_probes) == 2 and INTERNAL_H not in layout_probes[1]
+    assert calls[-1]["header_include"] == PUB_H and calls[-1]["extra_includes"] == []
+    assert res["api_cases"] == 3 and "api_warnings" not in res  # every case kept
+    side = _sidecar(out)["api_headers"]
+    assert side["source"] == "capture"
+    assert side["public"] == [PUB_H] and side["internal"] == []
+    assert side["fallbacks"] == [
+        {"dropped": [INTERNAL_H], "errors": [f"{INTERNAL_H}:1:1: error: unknown type name 'gmp_t'"]}
+    ]
+    assert "public header(s) only" in side["why"]
+    from validate_artifacts import schema_problems
+
+    assert not [p for p in schema_problems("harness_sidecar", _sidecar(out)) if "api_headers" in p]
+
+
+@pytest.mark.parametrize("internal", [True, False], ids=["internal header", "public only"])
+def test_when_every_capture_header_breaks_the_harness_is_the_no_header_one(tmp_path, monkeypatch, capsys, internal):
+    # The harness without any header, as before the capture was used.
+    ref_out, ref_calls = _setup(tmp_path / "ref", monkeypatch, None)
+    ref = _run(ref_out)
+    ref_side = _sidecar(ref_out)
+    capsys.readouterr()
+
+    cap = _capture()
+    if not internal:
+        cap["compiles"][0]["headers"] = [CONFIG_H, PUB_H]
+    out, calls = _setup(tmp_path / "cap", monkeypatch, cap)
+    _broken_by(monkeypatch, PUB_H, INTERNAL_H)
+    res = _run(out)
+
+    assert calls[-1]["header_include"] is None and calls[-1]["extra_includes"] == []
+    assert calls[-1]["dispatch_cases"] == ref_calls[-1]["dispatch_cases"]
+    # The warning of the old behaviour, which with a capture names its public headers.
+    assert len(ref["api_warnings"]) == 1
+    assert res["api_warnings"] == [ah.no_header_warning(Path("build_capture.json"))]
+    assert "pub.h" in res["api_warnings"][0]
+    assert "api_harness: warning: --api without --header" in capsys.readouterr().err
+    side = _sidecar(out)
+    for key in ("api_cases", "api_skipped", "dispatch_cases"):
+        assert side[key] == ref_side[key]
+    headers = side["api_headers"]
+    assert headers["source"] == "capture_failed" and headers["public"] == [] and headers["internal"] == []
+    if internal:
+        assert [f["dropped"] for f in headers["fallbacks"]] == [[INTERNAL_H], [PUB_H]]
+    else:
+        assert [f["dropped"] for f in headers["fallbacks"]] == [[PUB_H]]
+    from validate_artifacts import schema_problems
+
+    assert not [p for p in schema_problems("harness_sidecar", side) if "api_headers" in p]
+
+
+def test_a_broken_given_header_still_fails_the_module(tmp_path, monkeypatch):
+    out, _ = _setup(tmp_path, monkeypatch, _capture())
+    (out / "harness_lib.json").write_text('{"previous": true}')
+    _broken_by(monkeypatch, "pub.h")
+    with pytest.raises(ah.ApiHarnessError, match="does not compile outside its cases"):
+        _run(out, "pub.h")
+    assert (out / "harness_lib.json").read_text() == '{"previous": true}'
+
+
+def test_a_clean_compile_records_no_fallback(tmp_path, monkeypatch):
+    out, _ = _setup(tmp_path, monkeypatch, _capture())
+    seen = _broken_by(monkeypatch)
+    _run(out)
+    assert seen == [[PUB_H, INTERNAL_H]]
+    assert "fallbacks" not in _sidecar(out)["api_headers"]
 
 
 def test_a_rooted_header_is_included_by_file_name_with_its_directory_on_the_include_path():

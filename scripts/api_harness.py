@@ -124,6 +124,7 @@ reports an entry point the harness does not call directly as a gap. A variadic f
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import shutil
@@ -2644,6 +2645,12 @@ def generate(
     `api_cases` layout of kind `custom` (no calls, no slots: the seed writers make nothing for it).
     None keeps the previous sidecar's custom cases; a list replaces them (an empty one drops them).
     One that does not compile fails the generation: it is never dropped silently.
+
+    Without `header`, the headers come from the build capture (`header_attempts`): all chosen ones,
+    then the public ones alone, then none (the harness as without a capture). An attempt whose
+    harness does not compile outside its cases is abandoned for the next and recorded in the
+    sidecar's `api_headers.fallbacks`; the automatic choice never fails the module. A given
+    `header` fails it, as before.
     """
     from generate_harness import (
         _norm_scope_files,
@@ -2686,21 +2693,8 @@ def generate(
         return [*planned["cases"], *custom], lays, dict(planned["skipped"])
 
     warnings: list[str] = []
-    if header is None:
-        # nettle: without a header 22 of 35 libnettle clusters failed. The build capture's public
-        # headers the unit includes, and the internal ones declaring an entry point, stand in for it.
-        chosen = capture_headers(dag, module, unit, dag_file.parent / "build_capture.json", scope)
-        header = chosen.pop("header")
-        extra_includes = [*chosen.pop("extra_includes"), *(extra_includes or [])]
-        api_headers: dict[str, Any] = chosen
-    else:
-        none = header.strip().lower() == "none"
-        api_headers = {"source": "none" if none else "given", "why": f"--header {header}"}
-    if header is None:
-        # c-ares run-1: 18 of 19 cases dropped as `call to undeclared function`. Not a failure: a header
-        # given through --extra-include, or a module of one function, still works.
-        warnings.append(no_header_warning(dag_file.parent / "build_capture.json"))
-        print(f"api_harness: warning: {warnings[-1]}", file=sys.stderr)
+    capture_path = dag_file.parent / "build_capture.json"
+    attempts = header_attempts(dag, module, unit, capture_path, scope, header, extra_includes)
     traces = load_traces(traces_path)
     if variadic is None:
         from variadic_calls import ensure
@@ -2730,19 +2724,27 @@ def generate(
         | {str(s) for s in req_sources if s}
     )
     first = str((functions.get(p["entries"][0]) or {}).get("name") or p["entries"][0].split("#")[-1])
-    cases, layouts, skipped = with_custom(p)
-    dropped: list[dict] = list(p["variadic_dropped"])
-    result: dict[str, Any] = {}
-    # Struct layouts come from the first harness written (its headers and prelude): the cases are
-    # planned again with them before the compile probe. Each later round drops at least one case, so
-    # the loop ends; the harness is written again after every drop, so the one left on disk is the one
-    # whose cases the sidecar lists. Failed generation leaves the previous harness files as they were
-    # (generate_harness.harness_files_kept_on_failure).
-    need_layouts = probe and struct_layouts is None
-    layouts_probed: tuple[dict[str, dict], set[str]] | None = (
-        (struct_layouts, visible) if struct_layouts is not None and visible is not None else None
-    )
-    with harness_files_kept_on_failure(out_dir, module):
+    planned = copy.deepcopy(p)  # header-free: every attempt at the headers starts from it
+
+    def attempt(header: str | None, extra_includes: list[str] | None, more: bool) -> tuple[Any, ...]:
+        """
+        One harness with these headers: (p, cases, layouts, skipped, dropped, result). With `more`
+        (an automatic header choice that has a next step), a harness that does not compile outside
+        its cases, or whose cases none compiles, raises `_HeadersBroken` instead of failing.
+        """
+        p = copy.deepcopy(planned)
+        cases, layouts, skipped = with_custom(p)
+        dropped: list[dict] = list(p["variadic_dropped"])
+        result: dict[str, Any] = {}
+        # Struct layouts come from the first harness written (its headers and prelude): the cases are
+        # planned again with them before the compile probe. Each later round drops at least one case, so
+        # the loop ends; the harness is written again after every drop, so the one left on disk is the one
+        # whose cases the sidecar lists. Failed generation leaves the previous harness files as they were
+        # (generate_harness.harness_files_kept_on_failure).
+        need_layouts = probe and struct_layouts is None
+        layouts_probed: tuple[dict[str, dict], set[str]] | None = (
+            (struct_layouts, visible) if struct_layouts is not None and visible is not None else None
+        )
         while True:
             # While the probe drops cases, a compile error is the probe's to judge; without the
             # probe, generate_module_harness fails on it itself.
@@ -2810,6 +2812,8 @@ def generate(
                 if p["cases"]:
                     cases, layouts, skipped = with_custom(p)
                     continue
+            if other and more:
+                raise _HeadersBroken(other[:3])
             if other:
                 raise ApiHarnessError(
                     f"module {module!r}: the harness does not compile outside its cases: {'; '.join(other[:3])}"
@@ -2829,12 +2833,41 @@ def generate(
                 if layouts[i]["kind"] == VARIADIC_KIND:
                     why = f"the case does not compile with the target's headers: {diag}"
                     dropped.append(_dropped_variadic(layouts[i], why))
+            if not keep and more:
+                raise _HeadersBroken([bad[i] for i in sorted(bad)][:3])
             if not keep:
                 raise ApiHarnessError(f"module {module!r}: no API case compiles: {sorted(skipped.items())}")
             cases = [cases[i] for i in keep]
             layouts = [layouts[i] for i in keep]
             for sel, lay in enumerate(layouts):
                 lay["selector"] = sel
+        return p, cases, layouts, skipped, dropped, result
+
+    # An automatic header choice degrades in steps and never fails the module for its own headers:
+    # each abandoned attempt leaves the harness files as they were before it, and is recorded.
+    fallbacks: list[dict[str, list[str]]] = []
+    with harness_files_kept_on_failure(out_dir, module):
+        for n, (hdr, extra, _, included) in enumerate(attempts):
+            if hdr is None:
+                # c-ares run-1: 18 of 19 cases dropped as `call to undeclared function`. Not a failure: a
+                # header given through --extra-include, or a module of one function, still works.
+                warnings.append(no_header_warning(capture_path))
+                print(f"api_harness: warning: {warnings[-1]}", file=sys.stderr)
+            try:
+                with harness_files_kept_on_failure(out_dir, module):
+                    p, cases, layouts, skipped, dropped, result = attempt(hdr, extra, n + 1 < len(attempts))
+                api_headers = attempts[n][2]
+                break
+            except _HeadersBroken as exc:
+                left = attempts[n + 1][3]
+                fallbacks.append({"dropped": [h for h in included if h not in left], "errors": exc.errors})
+                print(
+                    f"api_harness: warning: the build capture's headers do not compile in the harness, "
+                    f"dropping {', '.join(fallbacks[-1]['dropped'])}: {'; '.join(exc.errors)}",
+                    file=sys.stderr,
+                )
+        if fallbacks:
+            api_headers = {**api_headers, "fallbacks": fallbacks}
         sidecar_path = Path(result["harness_meta"])
         sidecar = load_json_optional(sidecar_path, {}) or {}
         sidecar["api_harness"] = True
@@ -2886,7 +2919,12 @@ def header_declares(path: Path, names: set[str]) -> set[str]:
 
 
 def capture_headers(
-    dag: dict, module: str, unit: str | None, capture_path: Path, scope_files: list[str] | None = None
+    dag: dict,
+    module: str,
+    unit: str | None,
+    capture_path: Path,
+    scope_files: list[str] | None = None,
+    public_only: bool = False,
 ) -> dict[str, Any]:
     """
     The headers an `--api` harness without `--header` includes, from the build capture (step O4 of
@@ -2906,7 +2944,8 @@ def capture_headers(
     the DAG's `target_dir` as its `cppflags` are (`workspace/work/<tree path>`). `source` is
     `capture` when a header was chosen, else `not_found`, with `why`: no capture, no record of the
     module's link unit in it, or none of its headers is public or declares an entry point.
-    `scope_files` give a freely named sub-module its entry points, as in `plan`.
+    `scope_files` give a freely named sub-module its entry points, as in `plan`. `public_only`
+    leaves the internal headers out (`generate`'s second attempt, when one of them breaks the harness).
     """
     from module_map import ModuleMap
     from phase0_model import public_header_files
@@ -2953,6 +2992,8 @@ def capture_headers(
     declares = {h: header_declares(Path(rooted(h)), wanted) for h in unit_headers}
     by_public = {n for h in public for n in declares[h]}
     internal = {h: sorted(declares[h] - by_public) for h in unit_headers if h not in public and declares[h] - by_public}
+    if public_only:
+        internal = {}
     chosen: list[str] = []
     dropped: list[dict[str, str]] = []
     for h in [*public, *internal]:
@@ -2981,6 +3022,11 @@ def capture_headers(
         f"includes, and {len(kept)} internal header(s) declaring entry points the public ones "
         "do not declare"
     )
+    if public_only:
+        why = (
+            f"--header not given: the {len(public)} public header(s) only of the build capture that link unit "
+            f"{cap_unit} includes; the internal headers did not compile in the harness (`fallbacks`)"
+        )
     return {
         "source": "capture",
         "why": why,
@@ -2988,6 +3034,74 @@ def capture_headers(
         "header": rooted(main),
         "extra_includes": [rooted(h) for h in chosen if h != main],
     }
+
+
+class _HeadersBroken(ApiHarnessError):
+    """An automatic header choice does not compile in the harness: `generate` tries the next one."""
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = list(errors)
+
+
+HeaderAttempt = tuple[str | None, list[str], dict[str, Any], list[str]]
+
+
+def header_attempts(
+    dag: dict,
+    module: str,
+    unit: str | None,
+    capture_path: Path,
+    scope_files: list[str] | None,
+    header: str | None,
+    extra_includes: list[str] | None,
+) -> list[HeaderAttempt]:
+    """
+    The header sets `generate` tries in turn, each (header, extra includes, the sidecar's
+    `api_headers`, the tree headers it includes). A given `--header` (or `none`) is the only one.
+    Without it, from the build capture (`capture_headers`):
+
+    1. every chosen header;
+    2. only when internal headers were chosen: the public ones alone;
+    3. no capture header (`source: capture_failed`): the harness as without a capture, with the
+       caller's `--extra-include` and `no_header_warning`.
+
+    `generate` moves on while a set does not compile outside the cases (or none of its cases
+    compiles) and records each abandoned set in `api_headers.fallbacks`. Without a capture choice
+    (`not_found`) there is one attempt, without a header. `public` and `internal` list what that
+    attempt's harness includes.
+    """
+    given = list(extra_includes or [])
+    if header is not None:
+        none = header.strip().lower() == "none"
+        return [(header, given, {"source": "none" if none else "given", "why": f"--header {header}"}, [])]
+
+    def take(chosen: dict[str, Any]) -> HeaderAttempt:
+        hdr = chosen.pop("header")
+        extra = [*chosen.pop("extra_includes"), *given]
+        included = [*chosen.get("public", []), *(i["header"] for i in chosen.get("internal", []))]
+        return hdr, extra, chosen, included
+
+    chosen = capture_headers(dag, module, unit, capture_path, scope_files)
+    if chosen["source"] != "capture":
+        return [take(chosen)]
+    out = [take(chosen)]
+    if chosen["internal"]:
+        pub = capture_headers(dag, module, unit, capture_path, scope_files, public_only=True)
+        if pub["source"] == "capture":
+            out.append(take(pub))
+    failed: dict[str, Any] = {
+        "source": "capture_failed",
+        "why": (
+            "--header not given: none of the build capture's headers compiles in the harness (`fallbacks`), "
+            "so it includes none of them, as without a capture"
+        ),
+        "unit": chosen.get("unit"),
+        "public": [],
+        "internal": [],
+    }
+    out.append((None, given, failed, []))
+    return out
 
 
 def no_header_warning(capture_path: Path) -> str:

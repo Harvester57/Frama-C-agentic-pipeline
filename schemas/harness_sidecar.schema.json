@@ -181,10 +181,10 @@
     "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason. A variadic function is here only when none of its call sites made a case", "type": "object", "additionalProperties": {"type": "string"}},
     "api_helpers": {"$comment": "Functions from outside the module's scope (another cluster of the unit) the cases call only to set up or release a struct object: its initializer and destructor (api_harness.case_helpers). harness_reach.check_module counts none of them as a root of the module. Absent on an older sidecar.", "$ref": "#/definitions/strings"},
     "api_headers": {
-      "$comment": "Where the headers of an --api harness came from (api_harness.capture_headers): `given` (--header), `none` (--header none), `capture` (no --header: the build capture's public headers the module's link unit includes, plus the internal headers declaring an entry point no public header declares, with the names), or `not_found` (no --header and the capture gave none; `why` says why). Paths are tree-relative. Absent on an older sidecar.",
+      "$comment": "Where the headers of an --api harness came from (api_harness.capture_headers): `given` (--header), `none` (--header none), `capture` (no --header: the build capture's public headers the module's link unit includes, plus the internal headers declaring an entry point no public header declares, with the names), `not_found` (no --header and the capture gave none; `why` says why), or `capture_failed` (none of the capture's headers compiled in the harness: it includes none, as without a capture). An automatic choice degrades in steps (all chosen headers, then the public ones alone, then none) and never fails the module for its own headers; `fallbacks` lists each abandoned step, the headers it dropped and the first compile errors. `public` and `internal` list what the final harness includes. Paths are tree-relative. Absent on an older sidecar.",
       "type": "object",
       "properties": {
-        "source": {"type": "string", "enum": ["given", "none", "capture", "not_found"]},
+        "source": {"type": "string", "enum": ["given", "none", "capture", "not_found", "capture_failed"]},
         "why": {"type": "string", "minLength": 1},
         "unit": {"type": ["string", "null"]},
         "public": {"$ref": "#/definitions/strings"},
@@ -203,6 +203,15 @@
             "type": "object",
             "properties": {"header": {"type": "string", "minLength": 1}, "why": {"type": "string", "minLength": 1}},
             "required": ["header", "why"],
+            "additionalProperties": false
+          }
+        },
+        "fallbacks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {"dropped": {"$ref": "#/definitions/strings"}, "errors": {"$ref": "#/definitions/strings"}},
+            "required": ["dropped", "errors"],
             "additionalProperties": false
           }
         }
