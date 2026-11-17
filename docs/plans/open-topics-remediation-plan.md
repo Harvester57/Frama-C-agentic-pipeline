@@ -42,7 +42,7 @@ It does not repeat work that another plan already owns:
 The rules of [`./phase1-remediation-plan.md`](./phase1-remediation-plan.md#rules-for-every-step) apply:
 - **Checks:** `ruff`, `ruff format --check`, `mypy scripts tests` and the full suite (`python -m pytest tests -n auto`) pass after each step.
 - **Docs and skills** change in the same step as the behavior; never commit the "deletion" of the skill mirrors.
-- **Code steps** run in the worktree `../frama-c-phase1`, not in the main checkout, because benchmark runs mount its live `scripts/`.
+- **Code steps** run in a worktree of their own, not in the main checkout, because runs mount its live `scripts/`. Since 2026-11-17 each step has its own worktree and branch (see "Review and dispatch"); `../frama-c-phase1` is no longer used.
 
 Two more rules for this plan:
 - **Troubleshooting:** each step updates its own entry in [`../troubleshooting/`](../troubleshooting/README.md) in the same commit: open or fixed, with the commit.
@@ -115,6 +115,8 @@ Two more rules for this plan:
 - **Acceptance:** the replay of `mnl_attr_get_len` passes on 35, or its rejection names a real cause.
 
 ### O3. Link repair for data symbols (P1, M)
+
+**Done 2026-11-11, by another route than the one below.** The link repair looks up a symbol the DAG's function map lacks among the model's defined globals (`_model_global_variables` and `_place_global`, now in `scripts/fuzz_build.py` since Phase 1 S3 moved the link repair). The build capture records no `defined_data` and the DAG has no `data_symbol_files`. Unit-tested only: the acceptance on nettle `xts` waits for O6. See the data-table bullet of the nettle run-3 entry in [`../troubleshooting/harnesses-and-seeds.md`](../troubleshooting/harnesses-and-seeds.md). The original text follows.
 
 - **Goal:** a harness whose functions read a constant table defined in another file links. Today nettle `xts`, `arctwo`, `chacha_poly1305` and `camellia256_set_decrypt_key` stop with `undefined reference to '_nettle_aes_encrypt_table'` or `'_nettle_camellia_table'`. Crypto libraries commonly keep their tables in files of their own.
 - **Entry:** the open data-table bullet of the nettle run-3 entry, Section 1.
@@ -216,6 +218,7 @@ Two more rules for this plan:
   - E-ACSL no longer treats those objects as read-only. The compiler still enforces `const` on the real build, and Eva and WP read the original.
   - The objects are zero and never written, so no reachable behavior changes.
 - **Decision for the user:** accept that trade-off, or keep `--fuzz-engine sanitizers` for those modules.
+- **Decided 2026-11-17: accept.** Taken by Claude when the user asked for the open topics to be worked on, under `CLAUDE.md` ("how it's built is your call"); the user can reverse it, and the step is on a branch of its own for that reason. Why: without the rewrite these modules get no E-ACSL check at all, and with it they lose one property (a write to an object that is zero and that the compiler already refuses to write). Conditions: the rewrite touches the E-ACSL frontend's text only, every rewritten declaration is counted in the build report, and the run report says which modules were built with it. The upstream bug is filed (pub/frama-c#2795, Issues 23 and 27 of [`../upstream/frama-c/README.md`](../upstream/frama-c/README.md)); the rewrite goes when an image carries the fix.
 - **Work, if accepted:**
   - the rewrite, counted in the build report;
   - the `build-check` next step updated;
@@ -278,23 +281,63 @@ O11 before Phase 1 S11 (same file)
 - **`syscall`'s variadic contract assumes no memory is written** (Section 4). By design; results that depend on a buffer filled through `syscall` are optimistic.
 - **GMP inside E-ACSL:** no pipeline-side fix exists. O8 reports it, and the affected modules use the sanitizers.
 
+## Review and dispatch (2026-11-17)
+
+The Status table had not been updated since 2026-11-10. Each open item was checked against the code of `phase1-remediation` at `b74a9f2`:
+
+| ID | State found | Evidence |
+| :--- | :--- | :--- |
+| M2 | Done in effect | S1 to S7 are merged; `scripts/failure_identity.py` and `scripts/fuzz_dictionary.py` exist. Branch `phase1-s1` and worktree `../frama-c-phase1` are still there (M3). |
+| M3 | Partly done | The `fd-*` worktrees and branches are gone. The skill mirrors are tracked plain copies, kept in step by `tools/sync_skill_mirrors.py`. Left: `phase1-s1`, and the worktrees of branches merged since. The push stays the user's. |
+| O3 | Done 2026-11-11, another route | `_model_global_variables`, `_place_global` in `scripts/fuzz_build.py`. No `defined_data`, no `data_symbol_files`. |
+| O4 | Open | `api_harness.no_header_warning` names the capture's public headers in a warning; nothing takes them. |
+| O5 | Open, not diagnosed | The cap is checked in one place (`wp_scheduler.py`, the `settled` check). |
+| O7 | Open | `framac_common.augment_framac_cppflags` still adds the image's `/usr/include` directories. |
+| O8 | Done 2026-11-15 | See the step. |
+| O9 | Decided 2026-11-17: accept | See the step. |
+| O10 | Open | `VALID_ENTRY_STYLES` has no `stdin`. |
+| O11 | Open | `prover_candidates.note_oracle` writes no patch. Phase 1 S11 has not started, so O11 lands first. |
+| O12 | Open | No skip in `tests/test_run_identity_wrappers.py`. |
+| O13 | Done 2026-11-17 | The two items are one in [`./backlog.md`](./backlog.md). |
+
+**Dispatched 2026-11-17**, one agent (Claude Opus 5.5) per row, each in its own worktree under `.claude/worktrees/`, cut from the commit of this review:
+
+| Steps | Branch | Owns | Must not touch |
+| :--- | :--- | :--- | :--- |
+| O4 | `ot/o4-api-headers` | Header resolution in `scripts/api_harness.py` (`generate`, `no_header_warning`), what the sidecar records about the choice, new tests | `scripts/generate_harness.py` (O10). If the `--header` default there has to change, the step says so in its result. |
+| O10 | `ot/o10-stdin-entry` | The entry styles of `scripts/generate_harness.py` (`VALID_ENTRY_STYLES`, `_check_argv_entry`), `templates/harness_dual.c.template`, the places in `scripts/harness_reach.py` and the sidecar schema that name `argv`, new tests | `scripts/api_harness.py` (O4) |
+| O5 | `ot/o5-negotiation-cap` | Negotiation emission and dispatch in `scripts/wp_scheduler.py`, new tests | — |
+| O7 | `ot/o7-system-headers` | `scripts/target_env.py`, `augment_framac_cppflags` in `scripts/framac_common.py`, the snapshot export of `scripts/build_capture.py` and its schema, new tests | `scripts/fuzz_build.py` |
+| O9 | `ot/o9-const-union` | `scripts/fc_cpp_wrapper_eacsl.py`, the E-ACSL frontend call and its build report, the `eacsl_static_const_union` row of `build-check` in `scripts/pipeline_make.py`, the line of the run report, new tests | The link repair in `scripts/fuzz_build.py`; `scripts/framac_common.py` (O7) |
+| O11, O12 | `ot/o11-o12-small` | `scripts/prover_candidates.py`, `tests/test_run_identity_wrappers.py`, new tests | — |
+
+Rules for these steps, on top of "Rules for every step":
+- **No main checkout.** A run is live there (mpack run-4, started 2026-11-17 09:54), and every cache key hashes `scripts/` and `templates/`.
+- **Commits.** Code and tests first. Then one commit for the step's own troubleshooting entry, the guide and the skill it changes (`skills/` only, then `python tools/sync_skill_mirrors.py`). A step does not edit this plan, `backlog.md` or `README.md` of this folder: it returns what its Status row should say.
+- **Load.** The focused tests while working; the whole suite once at the end, with `-n 8`, because a run shares the machine.
+- **Docker.** Only for a test the step needs, from PowerShell, with a timeout, and only containers the step started.
+- **No target run.** Recorded run directories are read, never written. O6 stays the user's.
+- **No merge, no push.** The reviewer reads each diff, runs the checks on all the branches merged together, and lands them when no run reads the main checkout's scripts.
+
+After they land, `p1/s6b-wide-selector` and `feat/header-entry-points` are rebased again: O4 and O10 change `api_harness.py`, `generate_harness.py` and `harness_reach.py`, which both branches also change.
+
 ## Status
 
 | ID | Status |
 | :--- | :--- |
 | M1 | decided 2026-11-10: option (b), merge after O1 and O2 |
-| M2 | open, after M1 |
-| M3 | open, after M1 |
+| M2 | done in effect: S1 was redone and merged with S2 to S7; `phase1-s1` and `../frama-c-phase1` are left to M3 |
+| M3 | partly done (see "Review and dispatch"); the rest waits for the user |
 | O1 | done 2026-11-10: tests, plus a fix for the `needs_validation` regression and the safety-net reason they found |
 | O2 | done 2026-11-10: a seed reproducing a known bug elsewhere in the module stopped the replay; such inputs are now excluded (evidence kept in `targets/libmnl/ab-2026-11-09-tier6/`) |
-| O3 | open |
-| O4 | open |
-| O5 | open |
-| O6 | waits for O3, O4, then the user |
-| O7 | open |
-| O8 | open |
-| O9 | waits for the user's decision |
-| O10 | open |
-| O11 | open |
-| O12 | open |
-| O13 | open |
+| O3 | done 2026-11-11 by another route (the model's defined globals); unit-tested only, acceptance with O6 |
+| O4 | dispatched 2026-11-17, `ot/o4-api-headers` |
+| O5 | dispatched 2026-11-17, `ot/o5-negotiation-cap` |
+| O6 | waits for O4, then the user |
+| O7 | dispatched 2026-11-17, `ot/o7-system-headers` |
+| O8 | done 2026-11-15 |
+| O9 | decided 2026-11-17 (accept); dispatched, `ot/o9-const-union` |
+| O10 | dispatched 2026-11-17, `ot/o10-stdin-entry` |
+| O11 | dispatched 2026-11-17, `ot/o11-o12-small` |
+| O12 | dispatched 2026-11-17, `ot/o11-o12-small` |
+| O13 | done 2026-11-17 |
