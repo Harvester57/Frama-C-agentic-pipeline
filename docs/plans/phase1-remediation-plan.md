@@ -403,6 +403,11 @@ Added by the re-check, for the steps before the merge:
   - The selector enum is in `schemas/harness_sidecar.schema.json` only, so a crash artifact stamped `identity16` validates. The skip function takes `unsigned int`, so `templates/harness_dual.c.template` did not need to change.
   - The seed cost above is one run per size on a trivial harness; it is recorded as an open gap in `docs/troubleshooting/harnesses-and-seeds.md`.
   - Not checked: the skip of a case at or above 256 in a compiled harness, Eva on a wide harness (one analysis over 300 or more cases, and a shard's `-DFRAMAC_EVA_SHARD_CASE_<k>` list for that many cases), and a real target.
+- **Rebased again (2026-11-17) onto `434d4a9`** (R1, the mpack run-3 supervisor fixes and the redone S5 merged):
+  - One conflict, in the `argv` and `dispatch` lines of `skills/framac-slice/SKILL.md`: the tip's `argv` text and this step's `dispatch` text are kept, and the mirrors are regenerated.
+  - Re-run on it: the same checks, and the whole suite (6065 passed, 224 skipped). `test_generated_wide_harness_runs_case_280` passes in the rebuilt analysis image.
+  - The scripts and templates the tip changed since `b540121` add no reader or writer of the selector byte (their diff was searched for the selector, the first byte and the case index).
+  - Still not checked: the three items above.
 
 ### S7. Ledger evidence (F7, F9) (S, after S4, S5 and S6a)
 
