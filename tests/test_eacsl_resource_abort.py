@@ -155,6 +155,71 @@ def test_campaign_unlocated_sanitizer_failure_keeps_the_crash_for_a_verifier(tmp
     assert "eacsl_resource_abort" not in art
 
 
+# mpack run-4 (2026-11-17): ASan's own allocation cap (1 TiB) on the sanitizer replay of an input that
+# made the E-ACSL runtime abort on its heap zone. Verbatim from a probe in framac-analysis:latest
+# (clang -fsanitize=fuzzer,address,undefined, ASAN_OPTIONS=abort_on_error=1), stack shortened.
+_ASAN_SIZE_TOO_BIG = (
+    "==17==ERROR: AddressSanitizer: requested allocation size 0x7fffffffffff (0x800000001000 after adjustments "
+    "for alignment, red zones etc.) exceeds maximum supported size of 0x10000000000 (thread T0)\n"
+    "    #0 0x64ece7bf3713 in malloc (/tmp/probe+0x108713) (BuildId: 453a5dbfcc2ee17f)\n"
+    "    #1 0x64ece7c34ebf in mpack_read_bytes_alloc_impl /framac-run/workspace/work/src/mpack.c:527:15\n"
+    "==17==HINT: if you don't care about these errors you may set allocator_may_return_null=1\n"
+    "SUMMARY: AddressSanitizer: allocation-size-too-big (/tmp/probe+0x108713) in malloc\n"
+    "==17==ABORTING\n"
+)
+
+
+def _asan_options(env: dict | None) -> set[str]:
+    return set(str((env or {}).get("ASAN_OPTIONS", "")).split(":"))
+
+
+def test_sanitizer_runs_let_asan_return_null_on_requests_past_its_cap(tmp_path, monkeypatch):
+    """
+    run-4: ASan aborted on `malloc(<2^40+)` instead of returning NULL, so the target's own check of
+    malloc's result (mpack-reader.c:527-531) never ran and the abort hid the E-ACSL heap-limit marker.
+    Campaigns and replays run with allocator_may_return_null=1, keeping abort_on_error=1.
+    """
+    envs: list[tuple[str, dict | None]] = []
+    artifacts = tmp_path / "artifacts"
+
+    def fake_run(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        envs.append(("replay" if "-runs=1" in cmd else "campaign", extra_env))
+        if "-runs=1" in cmd:
+            return SandboxResult(77, "", _RUN3_CAMPAIGN_LOG + _RUN3_REPLAY_TAIL, False, "rlimits", list(cmd))
+        (artifacts / "crash-abc").write_bytes(b"\x0b")
+        return SandboxResult(77, "", _RUN3_CAMPAIGN_LOG, False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
+    san_bin = tmp_path / "fuzz.sanreplay"
+    san_bin.write_bytes(b"san")
+    R.run_fuzz_campaign(tmp_path / "fuzz.e-acsl", tmp_path / "corpus", artifacts, attribution_builder=lambda: san_bin)
+    assert {k for k, _ in envs} == {"campaign", "replay"}
+    for _, env in envs:
+        assert {"abort_on_error=1", "allocator_may_return_null=1"} <= _asan_options(env)
+
+
+def test_asan_null_return_warning_is_no_failure_and_an_unchecked_null_still_is():
+    """With the option, the refused request is a WARNING only; a target that writes through NULL still fails."""
+    assert parse_runtime_failure("==29==WARNING: AddressSanitizer failed to allocate 0x7fffffffffff bytes\n") is None
+    unchecked = (
+        "==35==WARNING: AddressSanitizer failed to allocate 0x7fffffffffff bytes\n"
+        "probe.c:19:5: runtime error: applying zero offset to null pointer\n"
+        "    #0 0x59ac0d122f98 in consume /probe/probe.c:19:10\n"
+        "    #1 0x59ac0d122f98 in LLVMFuzzerTestOneInput /probe/probe.c:33:3\n"
+        "SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior probe.c:19:5 \n"
+    )
+    failure = parse_runtime_failure(unchecked)
+    assert failure is not None and failure["function"] == "consume" and failure["line"] == 19
+
+
+def test_campaign_asan_size_cap_on_the_sanitizer_replay_keeps_the_resource_abort(tmp_path, monkeypatch):
+    """run-4 crash-05589b85...: a report written before the option. ASan's cap is the same tool limit."""
+    art = _campaign(tmp_path, monkeypatch, _ASAN_SIZE_TOO_BIG)["artifacts"][0]
+    assert art["failure"] is None and art["fingerprint"] is None
+    assert art["attribution"]["failure"]["kind"] == "asan_requested_allocation_size"
+    assert art["eacsl_resource_abort"]["sanitizer_replay"] == "allocation_size_too_big"
+
+
 _DAG_ONE_FN = {
     "callgraph_source": "frama_c",
     "modules": {"mp": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"}},
@@ -207,6 +272,23 @@ def test_ingest_resource_abort_is_no_candidate(run_dir, marked):
     units = json.loads((run_dir / "coverage-ledger.json").read_text(encoding="utf-8"))
     ev = [e for u in units for e in u["evidence"] if e["result"] == "fuzz_eacsl_resource_limit"]
     assert ev and all(e["discharging"] is False and "heap" in e["summary"] for e in ev)
+
+
+def test_ingest_run4_report_with_asan_size_cap_attribution_is_no_candidate(run_dir):
+    """run-4's unmarked reports (crash-05589b85..., -8e6bf00d..., -999ff5f0...) ingest as resource aborts."""
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", _DAG_ONE_FN)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
+    san_failure = parse_runtime_failure(_ASAN_SIZE_TOO_BIG)
+    art = _run3_artifact(attribution={"source": "sanitizer_replay", "reproduced": True, "failure": san_failure})
+    report = {"mode": "campaign", "module": "mp", "status": "crash_found", "artifacts": [art]}
+    write_json(run_dir / "workspace/reports/fuzz/mp.json", report)
+    stats = L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/mp.json"])
+    cands = (
+        json.loads((run_dir / "candidates.json").read_text(encoding="utf-8"))
+        if (run_dir / "candidates.json").exists()
+        else []
+    )
+    assert cands == [] and stats["candidates"] == 0 and stats["eacsl_resource_aborts"] == 1
 
 
 def test_zone_size_option_is_fixed_and_bounded():
