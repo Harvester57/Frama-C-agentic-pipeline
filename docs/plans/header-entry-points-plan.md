@@ -118,12 +118,19 @@ The first sketch of this work had three steps. Two of them meet work that is alr
     is in no row. On a split unit the numbers are therefore a lower bound. This is read from the
     code: no split unit was run, and QCBOR is one module before H1. A count per unit over all of
     its modules' coverage would close it.
-  - Not re-run by the reviewer: the whole suite, and nothing on `b540121` (the branch is at
-    `fe9775f`; the merge into `b540121` is clean).
+  - On the branch itself the reviewer did not re-run the whole suite. It was run on the merge
+    (next bullet).
+  - **Merged (2026-11-17)** on `integ/r1-merge`, which `phase1-remediation` fast-forwards to. The
+    checks ran on the merge with the tip `6632b74` (after the mpack run-3 supervisor fixes):
+    `ruff check`, `mypy scripts tests`, the generated-text check and the skill mirror check pass,
+    and the whole suite gives 6042 passed, 221 skipped. The tip then gained one commit of
+    documents only (`6fd8634`); on the merge with it, the generated-text check and the docs
+    structure test were run again.
   - **After H1, corrected:** the list is made from coverage only, so a header entry point that a
     crash proved executed is still listed.
-  - The Status row below is left as it is on `phase1-remediation`, because the H1 branch changes
-    the rows next to it; update it when this branch lands.
+  - `feat/header-entry-points` (H1) has to be rebased onto the merge, not merged: both branches
+    add `tests/test_header_entry_points.py`. The rebase also meets the R1 row of the Status table
+    below and the R1 status line in the troubleshooting entry.
 
 ### S6b. Two-byte selector
 
@@ -169,5 +176,5 @@ These decide how much the new cases find. Each needs a design of its own.
 | Step | Size | When | Status |
 | :--- | :--- | :--- | :--- |
 | H1 | M | now, on `feat/header-entry-points`; lands after S6b | dispatched 2026-11-17 |
-| R1 | S | after S5 is merged | open |
+| R1 | S | after S5 is merged | merged 2026-11-17: the reach row and the run report list them, no gate reads them; open: on a split unit the numbers are a lower bound |
 | S6b | M | lands after the merge to `main` (remediation plan, D20) | started early on 2026-11-17 (user), on `p1/s6b-wide-selector`, cut from `phase1-remediation` at `0b0101e`; to be rebased over S5 |
