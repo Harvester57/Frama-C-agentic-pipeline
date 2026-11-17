@@ -167,8 +167,10 @@ def test_replay_runs_an_observation_reproducer_on_its_engine(tmp_path, monkeypat
 
     def fake_replay(module, inputs, scratch, *, prepared, per_input_timeout):
         calls.append((Path(prepared["binary"]).name, [Path(p).name for p in inputs]))
-        fp = XB_FP_EAC if prepared["binary"].endswith("cross_eacsl_snmp") else XB_FP_SAN
-        return {"status": "crash_found", "artifacts": [{"fingerprint": fp, "failure": {}}]}
+        # Only the E-ACSL build reproduces anything: the candidate's key itself never fails here.
+        if prepared["binary"].endswith("cross_eacsl_snmp"):
+            return {"status": "crash_found", "artifacts": [{"fingerprint": XB_FP_EAC, "failure": {}}]}
+        return {"status": "clean", "artifacts": []}
 
     monkeypatch.setattr(crash_replay, "replay_build_spec", lambda *a, **k: dict(XB_SPEC))
     monkeypatch.setattr(crash_replay, "prepare_replay_binary", fake_prepare)
@@ -181,7 +183,7 @@ def test_replay_runs_an_observation_reproducer_on_its_engine(tmp_path, monkeypat
     report = json.loads(
         (tmp_path / "replay" / f"{crash_replay._candidate_slug(XB_FP_SAN)}.json").read_text(encoding="utf-8")
     )
-    assert {a["fingerprint"] for a in report["artifacts"]} == {XB_FP_SAN, XB_FP_EAC}
+    assert {a["fingerprint"] for a in report["artifacts"]} == {XB_FP_EAC}
     # An observation's fingerprint is this candidate's failure too.
     assert report["fingerprint_matches"] is True
 
