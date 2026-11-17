@@ -59,7 +59,7 @@ def test_input_slice_by_value_points_at_the_input_never_takes_input_bytes_as_a_p
     # The first slice takes the rest of the input; the second a generator buffer read from the input.
     assert "c0a0.ptr = (void *)(fuzz_buf + fuzz_off); c0a0.len = (unsigned long)(fuzz_len - fuzz_off);" in stmt
     assert layout["rest"] == {"call": 0, "param": 0, "kind": "bytes", "off": 0}
-    assert f"static unsigned char c0a1f0[{ah.PAIR_BYTES}]" in stmt and "c0a1.ptr = (void *)c0a1f0;" in stmt
+    assert f"static _Alignas(16) unsigned char c0a1f0[{ah.PAIR_BYTES}]" in stmt and "c0a1.ptr = (void *)c0a1f0;" in stmt
     assert f"if ((unsigned long long)c0a1.len > {ah.PAIR_BYTES}ULL)" in stmt
     assert [(s["param"], s["kind"], s["size"], s.get("off")) for s in layout["slots"]] == [
         (1, "field_bytes", ah.PAIR_BYTES, 0),
@@ -74,7 +74,7 @@ def test_output_slice_by_value_gets_spare_storage_and_a_clamped_length():
     }
     stmt, layout, _ = ah.single_case("UsefulOutBuf_Init", rec, SPARE, _api())
     assert stmt is not None and layout is not None
-    assert f"static unsigned char c0a1f0[{SPARE}]" in stmt and "c0a1.ptr = (void *)c0a1f0;" in stmt
+    assert f"static _Alignas(16) unsigned char c0a1f0[{SPARE}]" in stmt and "c0a1.ptr = (void *)c0a1f0;" in stmt
     assert f"if ((unsigned long long)c0a1.len > {SPARE}ULL)" in stmt
     assert layout["slots"] == [{"call": 0, "param": 1, "size": 8, "kind": "field_len", "off": 0, "max": SPARE}]
     assert layout["rest"] is None
@@ -156,7 +156,7 @@ def test_context_pointer_is_initialized_before_the_call_under_test():
     stmt, layout, _ = ah.single_case("QCBORDecode_GetInt64", GET_INT, SPARE, api)
     assert stmt is not None and layout is not None
     assert "struct _QCBORDecodeContext c0a0; memset(&c0a0, 0, sizeof(c0a0));" in stmt
-    assert "static unsigned char c0a0[" not in stmt
+    assert "unsigned char c0a0[" not in stmt
     init = "(void)QCBORDecode_Init((struct _QCBORDecodeContext *)&c0a0, c1a1, c1a2);"
     assert init in stmt and stmt.index(init) < stmt.index("(void)QCBORDecode_GetInt64(&c0a0, &c0a1);")
     # The initializer's input slice is the rest of the input (the CBOR to decode); its mode is a slot.
@@ -608,7 +608,7 @@ def test_an_opaque_handle_is_constructed_and_released_around_the_call():
     # Only the handle: the plain `void *` beside it stays a spare buffer.
     stmt, _, _ = ah.single_case("export_mem", recs["export_mem"], SPARE, api)
     assert stmt is not None and f"{CTX} c0a0 = seccomp_init(c1a0);" in stmt
-    assert f"static unsigned char c0a1[{SPARE}];" in stmt
+    assert f"static _Alignas(16) unsigned char c0a1[{SPARE}];" in stmt
 
 
 def test_the_destructor_and_the_constructor_cases_do_not_release_twice_or_construct_first():

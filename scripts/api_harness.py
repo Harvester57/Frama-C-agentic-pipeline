@@ -264,6 +264,21 @@ def _storage(size: int | None) -> str:
     return "" if size else "static "
 
 
+# The alignment of every byte buffer a case declares: `alignof(max_align_t)` on x86_64, the
+# strictest of any object Frama-C accepts (its machdep refuses `_Alignas(32)`: "exceeds
+# alignof(max_align_t): 16, and machdep does not allow extended alignment"). Spelled as a number:
+# `max_align_t` is missing from C99 headers, and E-ACSL builds compile with -std=c99. A buffer backs
+# typed objects (`node.data = (void *)c0a0f0`, a struct shared by a sequence): a plain
+# `unsigned char[]` left `\aligned(node.data, 8)` Unknown for Eva (mpack run-3). `_Alignas` is what
+# Eva reads; it does not use a trailing `__attribute__((aligned(16)))` on such an array.
+BYTE_BUFFER_ALIGN = 16
+
+
+def _byte_buffer(storage: str, var: str, n: int | str) -> str:
+    """The zeroed declaration of byte buffer `var[n]`, aligned for any object (`BYTE_BUFFER_ALIGN`)."""
+    return f"{storage}_Alignas({BYTE_BUFFER_ALIGN}) unsigned char {var}[{n}]; memset({var}, 0, sizeof({var}));"
+
+
 def _is_input(formals: list[dict], index: int) -> bool:
     """A pointer the function only reads (`const` pointee), per the model; unknown counts as input."""
     if index < len(formals) and isinstance(formals[index], dict):
@@ -454,9 +469,7 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
                 case.post.append(f"{fx} = (void *)(fuzz_buf + fuzz_off); {lx} = ({nxt['ctype']})(fuzz_len - fuzz_off);")
             else:
                 size = PAIR_BYTES if f.get("const") else case.spare
-                case.decls.append(
-                    f"{_storage(None)}unsigned char {case.declare(tag)}[{size}]; memset({tag}, 0, sizeof({tag}));"
-                )
+                case.decls.append(_byte_buffer(_storage(None), case.declare(tag), size))
                 if f.get("const"):
                     case.slot(tag, size, call, param, "field_bytes", addr=False, off=off)
                 case.slot(lx, int(nxt["size"]), call, param, "field_len", off=off, max=size)
@@ -466,9 +479,7 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
             i += 2
             continue
         if f["kind"] == "ptr":
-            case.decls.append(
-                f"static unsigned char {case.declare(tag)}[{case.spare}]; memset({tag}, 0, sizeof({tag})); {fx} = (void *){tag};"
-            )
+            case.decls.append(f"{_byte_buffer('static ', case.declare(tag), case.spare)} {fx} = (void *){tag};")
         elif f["kind"] == "int" and f.get("ctype") == "_Bool":
             case.bool_slot(fx, call, param, "field", off=off)
         elif f["kind"] in ("int", "float", "enum") or (f["kind"] in ("array", "record") and _raw_ok(f)):
@@ -726,12 +737,10 @@ def _bind_call(
                     args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
                 else:
                     buf = size or case.spare
-                    case.decls.append(
-                        f"{_storage(size)}unsigned char {case.declare(v)}[{buf}]; memset({v}, 0, sizeof({v}));"
-                    )
+                    case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
                     if size and is_input:
                         case.slot(v, size, call, i, "bytes", addr=False)
-                    ln = f"c{call}a{i + 1}"
+                    ln =f"c{call}a{i + 1}"
                     case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
                     case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
                     case.decls.append(f"if ((unsigned long long){ln} > {buf}ULL) {{ {ln} = ({nxt['ctype']}){buf}; }}")
@@ -741,9 +750,7 @@ def _bind_call(
                 continue
             if charlike:
                 buf = size or case.spare
-                case.decls.append(
-                    f"{_storage(size)}unsigned char {case.declare(v)}[{buf}]; memset({v}, 0, sizeof({v}));"
-                )
+                case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
                 if size and is_input:
                     case.slot(v, size, call, i, "bytes", addr=False)
                     if _sentinel_sized(rec, i):
@@ -794,7 +801,7 @@ def _bind_call(
                     _fill_fields(case, call, i, f"{v}[0]", lay, 0)
                 args.append(f"({p['type']}){v}")
             elif varlen and _lone_output(params, formals, i):
-                case.decls.append(f"static unsigned char {case.declare(v)}[{case.spare}]; memset({v}, 0, sizeof({v}));")
+                case.decls.append(_byte_buffer("static ", case.declare(v), case.spare))
                 args.append(f"({p['type']}){v}")
             else:
                 case.decls.append(f"{elem} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
@@ -1493,9 +1500,7 @@ def _sequence_case(
                 if is_record:
                     # Room for the whole object, whatever size the call sites showed.
                     n_bytes = f"({n_bytes} > sizeof({pointee}) ? {n_bytes} : sizeof({pointee}))"
-                case.decls.append(
-                    f"{_storage(size or None)}unsigned char {case.declare(var)}[{n_bytes}]; memset({var}, 0, sizeof({var}));"
-                )
+                case.decls.append(_byte_buffer(_storage(size or None), case.declare(var), n_bytes))
                 # Filled from the input when its first use reads it, its size is known, and it holds
                 # no pointer.
                 raw_ok = not is_record or _raw_ok(lay)
