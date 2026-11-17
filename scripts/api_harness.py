@@ -2063,6 +2063,12 @@ def _lifecycle_case(
     return case.statements([make, loop, *frees]), layout, None
 
 
+# A function defined in a public header (static) has no symbol to link: a case calls the copy the
+# harness compiles from the header, which the layout probe must have seen declared.
+HEADER_NOT_VISIBLE = "static header function: the layout probe did not see the harness declare it"
+HEADER_VARIADIC = "static header function, variadic: the generator takes no call site for it"
+
+
 def plan(
     dag: dict,
     model: dict,
@@ -2086,6 +2092,10 @@ def plan(
     to its file-scope definition. `variadic` gives each variadic function's harvested call sites
     (`variadic_calls.load_cases`): its cases come after the single ones, and it is skipped only when
     it has none. `variadic_dropped` lists the call sites that made no case, with the reason.
+    An entry point defined in a public header (`static`, `header`: the model's `header_api`) gets a
+    single case when `visible` has it, after every other generated case (so the cases of the global
+    entry points keep their selectors, and these go first over the case limit); without the probe it
+    is skipped as `HEADER_NOT_VISIBLE`.
     """
     max_cases = max(0, MAX_CASES - reserve)
     from module_map import ModuleMap
@@ -2164,10 +2174,19 @@ def plan(
         limits=limit_parameters(model.get("functions") or {}),
         bounds=dict(getattr(visible, "bound_forwards", None) or {}),
     )
+    header_entries: list[tuple[str, str]] = []
     for key in entries:
         drec = functions.get(key) or {}
         name = str(drec.get("name") or key.split("#")[-1])
         if name == "main":
+            continue
+        if drec.get("is_static") and drec.get("header"):
+            # Defined in a public header (`header_api`): callable once the layout probe saw the
+            # harness declare it. Its case comes after every other generated one (HD4).
+            if visible is not None and name in visible:
+                header_entries.append((key, name))
+            else:
+                skipped[key] = HEADER_NOT_VISIBLE
             continue
         if drec.get("is_static"):
             skipped[key] = "static: not callable from the harness"
@@ -2231,6 +2250,24 @@ def plan(
         n_seq += 1
         cases.append(stmt)
         layouts.append(layout)
+    # The functions defined in a public header, last: the cases above keep their selectors, and these
+    # are the first to go over the case limit. They stay out of `records`, which builds the sequence
+    # and lifecycle cases above, so those are the same with or without them.
+    for key, name in header_entries:
+        mrec = _model_record(model, functions.get(key) or {}, key)
+        if not mrec:
+            skipped[key] = "not in the Phase 0 model"
+            continue
+        if is_variadic(str(mrec.get("signature") or ""), mrec.get("formals")):
+            skipped[key] = HEADER_VARIADIC
+            continue
+        stmt, layout, why = single_case(name, mrec, spare, api)
+        if stmt is None or layout is None:
+            skipped[key] = str(why)
+            continue
+        names.append(key)
+        cases.append(stmt)
+        layouts.append({**layout, "entry": key})
     if len(cases) > max_cases:
         for lay in layouts[max_cases:]:
             if lay.get("entry"):
@@ -3323,8 +3360,14 @@ def generate(
     functions = dag.get("functions") or {}
     dag_mod = (dag.get("modules") or {}).get(module) or {}
     req_sources = dag_mod.get("required_sources") or []
+    # A function defined in a public header is compiled from the header the harness includes: its file
+    # is no source to build.
     sources = sorted(
-        {str((functions.get(k) or {}).get("file")) for k in p["entries"] if (functions.get(k) or {}).get("file")}
+        {
+            str((functions.get(k) or {}).get("file"))
+            for k in p["entries"]
+            if (functions.get(k) or {}).get("file") and not (functions.get(k) or {}).get("header")
+        }
         | {str(s) for s in req_sources if s}
     )
     first = str((functions.get(p["entries"][0]) or {}).get("name") or p["entries"][0].split("#")[-1])
