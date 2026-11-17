@@ -60,6 +60,15 @@ and cannot land before it.
 - Read, not run: a header case is built by the same `single_case` as an exported one, so it gets
   the tip's whole-unit initializers, destructors and aligned buffers; a header entry point that
   is also an initializer stays a root, because `api_helpers` leaves out the module's entry points.
+- **What else puts a file in the sources.** `generate_harness._merge_dag_harness_sources` adds,
+  for every function a case names, the sources its lexer module needs, and the function's own
+  file only when that module lists none. Read from the recorded runs, nothing written to them:
+  in QCBOR run-6 all 470 static header functions are in a lexer module that lists `.c` sources
+  only, and the sidecar has no header; in mpack run-3 the sidecars list one to four headers, all
+  from exported header functions (its DAG has no static header function). So on these two a
+  static header entry point brings no header in. **Open:** on a target whose header functions
+  sit in a lexer module with no source, the header would come in, Frama-C would parse it as a
+  file of its own, and the static would have two definitions. That is the HD8 question again.
 - Not re-measured: the QCBOR numbers below are from the branch before the rebase.
 
 **Measured offline on the recorded QCBOR run-6 model** (the branch's `header_api()` and
