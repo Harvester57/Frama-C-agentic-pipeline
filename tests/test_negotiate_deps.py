@@ -123,6 +123,30 @@ def test_a_negotiation_waits_for_the_architect_and_the_gate_of_its_module(sim):
     assert NEG_B in ids(S.cmd_next("auto", prepare=True))
 
 
+def test_a_negotiation_of_a_leaf_callee_waits_only_for_the_gate_of_its_module(sim):
+    """b is a leaf (no callees to wait on) and m has no header (no architect): only the gate holds the negotiation."""
+    _chain(
+        sim,
+        {"a": ("src/m/a.c", "m", ["b"]), "b": ("src/m/b.c", "m", []), "d": ("src/m/d.c", "m", [])},
+        sidecars={"m": {}},
+    )
+    fp = sim.eva_candidate("m", "src/m/d.c", "d")
+    rows = base.load("coverage-ledger.json")
+    for row in rows:
+        if row["function"] == "b":
+            row["status"] = "covered"
+            row["evidence"] = [base.evidence(tool_output="workspace/reports/eva/m.json")]
+    write_json(Path("coverage-ledger.json"), rows)
+    S.cmd_init()
+    assert tasks()[NEG_B]["deps"] == ["gate:m"]
+    assert ids(S.cmd_next("auto", prepare=True)) == [f"verify:{fp}"]
+    assert NEG_B not in base.ready()
+    ver = tasks()[f"verify:{fp}"]["agent_id"]
+    L.cmd_scaffold_verifier(fp, "needs_validation", ver, out_path=Path(f"agents/{ver}/scratch/result.json"))
+    S.cmd_complete(ver)
+    assert NEG_B in ids(S.cmd_next("auto", prepare=True))
+
+
 def test_a_negotiation_waits_for_the_architect_of_its_module(sim):
     _chain(sim, CHAIN, sidecars={"m": {"header": "src/m/m.h"}})
     S.cmd_init()
