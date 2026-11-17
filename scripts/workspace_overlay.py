@@ -2896,6 +2896,73 @@ def _caller_usage_section(overlay: Path, function: str | None, fn_meta: dict, da
     return out
 
 
+PROVEN_EXAMPLES_MAX = 2
+PROVEN_EXAMPLE_MAX_LINES = 30
+
+
+def _example_candidates(function: str, fn_meta: dict, dag_fns: dict) -> list[tuple[int, str]]:
+    """(distance, DAG key) of the functions near `function`: its direct callees (0), then the other callees
+    of its direct callers (1), in DAG order, each once and never `function` itself."""
+    name = function.rpartition("#")[2]
+    out: dict[str, int] = {}
+    for key in fn_meta.get("internal_callees") or []:
+        out.setdefault(str(key), 0)
+    for caller in fn_meta.get("internal_callers") or []:
+        for key in dag_function_record(dag_fns, str(caller)).get("internal_callees") or []:
+            out.setdefault(str(key), 1)
+    return [(d, k) for k, d in out.items() if k.rpartition("#")[2] != name]
+
+
+def _proven_examples_section(
+    overlay: Path, function: str | None, fn_meta: dict, dag_fns: dict, cppflags: str, role: str
+) -> str:
+    """
+    "Proven Contracts Near This Function" in a prover's brief: up to PROVEN_EXAMPLES_MAX contracts of
+    functions already `all_proven` in this run (their latest WP report, `load_function_wp_report`), the
+    nearest in the call graph first (direct callees, then functions sharing a caller) and, at the same
+    distance, a `functional` contract shape before any other. Each contract is inlined as written in
+    `workspace/work/`, cut at PROVEN_EXAMPLE_MAX_LINES lines. Empty when none is proven yet.
+    """
+    if role != "prover" or not function or not fn_meta:
+        return ""
+    work = overlay / "work"
+    found: list[tuple[int, int, str, str, contract_refinement.FunctionContract]] = []
+    for order, (distance, key) in enumerate(_example_candidates(function, fn_meta, dag_fns)):
+        rec = dag_function_record(dag_fns, key)
+        cfile = _normalize_work_relpath(str(rec.get("file") or "")) if rec else ""
+        cname = str(rec.get("name") or key.rpartition("#")[2]) if rec else ""
+        if not cfile or not cname:
+            continue
+        report = load_function_wp_report(overlay, cfile, cname)
+        if report.get("status") != "all_proven":
+            continue
+        contract = _merged_contract(work, cfile, cname, cppflags)
+        if contract is None or not contract.pieces:
+            continue
+        shape = str((report.get("limits") or {}).get("contract_shape") or "not recorded")
+        found.append((distance * 2 + (shape != "functional"), order, cname, cfile, contract))
+    if not found:
+        return ""
+    found.sort(key=lambda item: item[:2])
+    blocks = []
+    for _, _, cname, cfile, contract in found[:PROVEN_EXAMPLES_MAX]:
+        lines: list[str] = []
+        for piece in contract.pieces:
+            lines += [*piece.acsl.splitlines(), f"{piece.declarator};"]
+        cut = len(lines) - PROVEN_EXAMPLE_MAX_LINES
+        if cut > 0:
+            lines = [*lines[:PROVEN_EXAMPLE_MAX_LINES], f"/* ... {cut} more line(s) in workspace/work/{cfile} */"]
+        code = "\n".join(lines).replace("```", "'''")
+        blocks.append(f"`{cname}` (`{cfile}`):\n\n```c\n{code}\n```\n")
+    return (
+        "\n## Proven Contracts Near This Function\n\n"
+        "Contracts this run has already proven (WP `all_proven`) for functions close to yours in the call "
+        "graph, as they stand in `workspace/work/`. WP proved them on this code base, so their idioms, "
+        "predicates and level of detail are a model to follow. Never copy a clause without checking that it "
+        "holds for your function.\n\n" + "\n".join(blocks)
+    )
+
+
 def _rejected_result_section(rejected_result: dict | None, agent_id: str, role: str) -> str:
     """
     Appended to the brief of an agent that re-runs a task whose previous result.json failed validation
@@ -3390,6 +3457,7 @@ def prepare_agent(
         )
         rendered += _negotiation_evidence_section(caller_evidence, callee_history)
     rendered += _caller_usage_section(overlay, function, fn_meta, dag_fns, role)
+    rendered += _proven_examples_section(overlay, function, fn_meta, dag_fns, eff_cppflags, role)
     rendered += _callees_without_contract_section(callees_without_contract, role)
     rendered += _rejected_result_section(rejected_result, agent_id, role)
 
