@@ -243,6 +243,59 @@ def test_a_code_fault_at_a_known_site_links_the_site_candidates_key(ber_run):
     assert units_by_id(ber_run)[RTE_UNIT]["result_fingerprints"] == [key]
 
 
+def test_a_hypothesis_with_a_line_merges_by_site(ber_run):
+    """A prover's code fault carries a line, so it merges by site (D1c), not by the function-and-kind rule."""
+    from test_ledger_p1 import _code_fault_report, _prover_result
+
+    key_a = _fuzz(ber_run, "a", engine="sanitizers", predicate=PRED_SAN, line=42)
+    key_b = _fuzz(ber_run, "b", engine="sanitizers", predicate=PRED_SAN_NEXT, line=47)
+    aid = "prover-line-site"
+    scratch = ber_run / "agents" / aid / "scratch"
+    report = _code_fault_report("/container/run/none")
+    report["failure"]["line"] = 47
+    report["failure"]["predicate"] = r"\valid_read(buf + off + 9)"
+    write_json(scratch / "guard_ber_decode_len.json", report)
+    write_json(scratch / "wp_ber_decode_len.json", {"status": "unproven_goals_remain"})
+    res_path = scratch / "result.json"
+    write_json(
+        res_path,
+        _prover_result(
+            aid,
+            [
+                {"tool_output": f"agents/{aid}/scratch/wp_ber_decode_len.json", "result": "unproven_goals_remain"},
+                {"tool_output": f"agents/{aid}/scratch/guard_ber_decode_len.json", "result": "code_fault"},
+            ],
+        ),
+    )
+    L.cmd_ingest_agent_hypothesis(res_path, module="snmp")
+    cands = _candidates(ber_run)
+    # The function-and-kind rule alone would pick the first candidate (key_a): the site picks key_b.
+    assert sorted(cands) == sorted([key_a, key_b])
+    assert len(cands[key_b]["observations"]) == 2 and len(cands[key_a]["observations"]) == 1
+
+
+def test_a_hypothesis_without_a_line_merges_by_function_and_kind(ber_run):
+    from test_ledger_p1 import _prover_result
+
+    key_a = _fuzz(ber_run, "a", engine="sanitizers", predicate=PRED_SAN, line=42)
+    aid = "prover-hyp-kind"
+    scratch = ber_run / "agents" / aid / "scratch"
+    write_json(scratch / "wp.json", {"status": "unproven_goals_remain"})
+    res_path = scratch / "result.json"
+    hypothesis = {
+        "input_condition": "off past the end of buf",
+        "predicate": PRED_SAN_NEXT,
+        "why_not_reproduced": "the guard holds on the corpus",
+    }
+    evidence = [{"tool_output": f"agents/{aid}/scratch/wp.json", "result": "unproven_goals_remain"}]
+    write_json(res_path, _prover_result(aid, evidence, fault_hypothesis=hypothesis))
+    out = L.cmd_ingest_agent_hypothesis(res_path, module="snmp")
+    assert out["candidates_added"] == 0
+    cands = _candidates(ber_run)
+    assert list(cands) == [key_a]
+    assert len(cands[key_a]["observations"]) == 2
+
+
 def test_candidates_without_site_load_and_validate(run_dir):
     old_fp = make_fingerprint(BER, "ber_decode_len", "mem_access", PRED_SAN)
     old = {

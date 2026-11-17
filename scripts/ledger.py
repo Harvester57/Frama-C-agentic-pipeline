@@ -2491,12 +2491,20 @@ def _find_matching_sink_candidate(
     function: str,
     kind_or_cls: str,
     predicate: str,
+    site: str | None = None,
 ) -> dict | None:
     """
     Find an existing candidate for the same `(file, function, normalized_kind)` sink
     so a prover/breaker hypothesis or breaker crash merges with an existing fuzz/Eva
     candidate instead of inflating `candidates.json` with a second fingerprint.
+
+    With a `site` (a detection with a line, D1c), the candidate at that site wins; the function-and-kind
+    rule applies only when no candidate has the site, or when the detection has none.
     """
+    if site is not None:
+        at_site = next((c for c in candidates.values() if c.get("site") == site), None)
+        if at_site is not None:
+            return at_site
     norm_f = normalize_file(file)
     norm_k = normalize_kind(kind_or_cls, predicate)
     for cand in candidates.values():
@@ -2824,7 +2832,11 @@ def _ingest_prover_code_fault(
     kind = str(failure.get("alarm_kind") or failure.get("kind") or "assertion")
     pred = str(failure.get("predicate") or "")
     exact_fp = make_fingerprint(ffile, ffn, kind, pred)
-    existing_cand = candidates.get(exact_fp) or _find_matching_sink_candidate(candidates, ffile, ffn, kind, pred)
+    line = int(failure.get("line") or 0)
+    site = _candidate_site(ffile, line, ffn or "unknown_function", _dag_line_index())
+    existing_cand = candidates.get(exact_fp) or _find_matching_sink_candidate(
+        candidates, ffile, ffn, kind, pred, site=site
+    )
     fp = existing_cand["fingerprint"] if existing_cand is not None else exact_fp
     cls = goal_obligation_class({"kind": failure.get("kind", ""), "annotation": pred})
     fn_units = [
@@ -2845,7 +2857,6 @@ def _ingest_prover_code_fault(
         note += f"; no ledger unit for {ffile}#{ffn}::{cls} (harness or unseeded code)"
     already_listed = existing_cand is not None and crash_rel is not None and crash_rel in existing_cand["reproducers"]
     verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
-    line = int(failure.get("line") or 0)
     keys_before = len(candidates)
     cand = upsert_candidate(
         candidates,
@@ -2859,7 +2870,7 @@ def _ingest_prover_code_fault(
         tool_out,
         linked,
         note,
-        site=_candidate_site(ffile, line, ffn or "unknown_function", _dag_line_index()),
+        site=site,
     )
     fp = cand["fingerprint"]
     created = len(candidates) > keys_before
