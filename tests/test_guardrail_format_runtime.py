@@ -167,6 +167,7 @@ printf 'AB' > corpus/seed-ab
 python3 - <<'EOF'
 import json, sys
 sys.path.insert(0, "/repo/scripts")
+import fuzz_build
 import run_eacsl_fuzz as R
 
 def run(tag):
@@ -181,7 +182,7 @@ def run(tag):
     print(f"GUARD {tag} rc={rc} " + json.dumps(keep))
 
 run("patched")
-R.eacsl_share_dir = lambda eacsl_bin: None
+fuzz_build.eacsl_share_dir = lambda eacsl_bin: None
 run("stock")
 EOF
 for tag in patched stock; do

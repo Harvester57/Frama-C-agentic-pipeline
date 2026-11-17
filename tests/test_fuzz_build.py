@@ -106,7 +106,7 @@ def test_the_moved_build_functions_are_defined_in_fuzz_build_only():
 
 
 @pytest.mark.parametrize("module", ["fuzz_build", "fuzz_common"])
-def test_the_new_modules_do_not_import_run_eacsl_fuzz(module):
+def test_fuzz_build_and_fuzz_common_do_not_import_run_eacsl_fuzz(module):
     imports = _imported_modules(BUILD_SCRIPTS / f"{module}.py")
     assert "run_eacsl_fuzz" not in imports
 
@@ -119,16 +119,46 @@ def _built(returncode: int, engine: str) -> dict:
     return {"returncode": returncode, "binary": f"{engine}.bin", "engine": engine, "cache": {"hit": False, "key": None}}
 
 
-def test_build_compiles_eacsl_without_reading_the_selftest(monkeypatch, tmp_path):
-    # D8: `build` does not apply a failed selftest; the campaign does (the next test).
+def _build_args(out: Path, engine: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        module="mod",
+        sources=["mod.c"],
+        out_bin=out / "fuzz_mod",
+        engine=engine,
+        machdep="gcc_x86_64",
+        cppflags="-Iinc",
+        ldflags="",
+        rte="all",
+        functions=None,
+        no_variadic_translation=False,
+        warn_unsigned_downcast=False,
+        no_rte_initialized=False,
+        no_libc_checks=False,
+        selftest_json=out / "no-selftest.json",
+    )
+
+
+def test_build_ignores_a_failed_selftest(monkeypatch, tmp_path):
+    # D8: `build` compiles what --engine asks for and does not apply a failed selftest; the campaign does.
     monkeypatch.setattr(fuzz_build, "selftest_blocks_eacsl", lambda *a, **k: "eacsl_selftest_failed: canary")
     monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: _built(0, "eacsl"))
     monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", lambda *a, **k: _built(0, "sanitizers"))
-    built = fuzz_build.build_module_binary(["m.c"], tmp_path / "fuzz_m", engine="auto", apply_selftest=False)
-    assert built["engine_used"] == "eacsl" and built["engine_fallback_reason"] is None
+    res = R._run_build_mode(_build_args(tmp_path, "auto"))
+    assert res["status"] == "built" and res["engine_used"] == "eacsl"
+    assert "engine_fallback_reason" not in res
 
 
-def test_the_campaign_still_applies_the_selftest(monkeypatch, tmp_path):
+def test_build_auto_records_both_builds(monkeypatch, tmp_path):
+    monkeypatch.setattr(fuzz_build, "selftest_blocks_eacsl", lambda *a, **k: None)
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: _built(0, "eacsl"))
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", lambda *a, **k: _built(0, "sanitizers"))
+    auto = R._run_build_mode(_build_args(tmp_path, "auto"))
+    assert auto["sanitizer_compile"]["returncode"] == 0
+    for engine in ("eacsl", "sanitizers"):
+        assert "sanitizer_compile" not in R._run_build_mode(_build_args(tmp_path, engine))
+
+
+def test_campaign_still_applies_the_selftest(monkeypatch, tmp_path):
     monkeypatch.setattr(fuzz_build, "selftest_blocks_eacsl", lambda *a, **k: "eacsl_selftest_failed: canary")
     monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: _built(0, "eacsl"))
     monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", lambda *a, **k: _built(0, "sanitizers"))
@@ -137,7 +167,8 @@ def test_the_campaign_still_applies_the_selftest(monkeypatch, tmp_path):
     assert campaign["engine_fallback_reason"] == "eacsl_selftest_failed: canary"
 
 
-def test_build_auto_records_the_sanitizer_build_and_the_campaign_compiles_nothing(tmp_path, monkeypatch):
+def test_a_campaign_after_build_compiles_nothing(tmp_path, monkeypatch):
+    # The real cache, with the cache tests' fake toolchain: the campaign's builds restore what `build` compiled.
     run = tmp_path / "run-1"
     run.mkdir()
     (run / "run-metadata.json").write_text("{}\n", encoding="utf-8")
@@ -154,22 +185,7 @@ def test_build_auto_records_the_sanitizer_build_and_the_campaign_compiles_nothin
     monkeypatch.setattr(
         fuzz_build, "compile_sanitizer_binary", lambda *a, **k: real_sanitizer(*a, **{"runner": fake, **k})
     )
-    args = argparse.Namespace(
-        module="mod",
-        sources=["mod.c"],
-        out_bin=Path("workspace/harnesses/fuzz_mod"),
-        engine="auto",
-        machdep="gcc_x86_64",
-        cppflags="-Iinc",
-        ldflags="",
-        rte="all",
-        functions=None,
-        no_variadic_translation=False,
-        warn_unsigned_downcast=False,
-        no_rte_initialized=False,
-        no_libc_checks=False,
-        selftest_json=run / "no-selftest.json",
-    )
+    args = _build_args(Path("workspace/harnesses"), "auto")
 
     built = R._run_build_mode(args)
     assert built["status"] == "built" and built["engine_used"] == "eacsl"

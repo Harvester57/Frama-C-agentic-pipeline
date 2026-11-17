@@ -33,8 +33,8 @@ def test_canary_exercises_result_init_isnan_and_errno_on_every_input():
 # Each variant takes one step out of the production build, through the module attribute it reads.
 VARIANTS = {
     "production": "",
-    "no_result_init": "R.mark_wrapper_results_initialized = lambda t: (t, 0)",
-    "no_errno_shim": "R.build_errno_shim_object = lambda *a, **k: {'status': 'none', 'wrapped': []}",
+    "no_result_init": "FB.mark_wrapper_results_initialized = lambda t: (t, 0)",
+    "no_errno_shim": "FB.build_errno_shim_object = lambda *a, **k: {'status': 'none', 'wrapped': []}",
     "no_snan": "T.EACSL_DEFINES = tuple(d for d in T.EACSL_DEFINES if d != '-D__SUPPORT_SNAN__')",
 }
 
@@ -44,11 +44,13 @@ import json, sys
 from pathlib import Path
 sys.path.insert(0, "/opt/framac-pipeline/scripts")
 import eacsl_toolchain as T
+import fuzz_build as FB
 import run_eacsl_fuzz as R
 variants = json.loads(Path("/fixture/variants.json").read_text())
 for name, patch in variants.items():
     import importlib
     T = importlib.reload(T)
+    FB = importlib.reload(FB)
     R = importlib.reload(R)
     exec(patch)
     res = R.run_selftest(Path(name))

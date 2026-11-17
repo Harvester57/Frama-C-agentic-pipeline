@@ -31,7 +31,7 @@ def seam_functions(module_name: str) -> set[str]:
     return {name for name, obj in vars(module).items() if inspect.isfunction(obj) and obj.__module__ == module_name}
 
 
-def seam_bare_calls(source: str) -> list[str]:
+def bare_seam_calls(source: str) -> list[str]:
     """Calls, by name, of seam functions that a module-level `from <seam> import ...` binds to a bare name."""
     tree = ast.parse(source)
     bound: dict[str, str] = {}
@@ -75,11 +75,11 @@ def seam_patches_on_moved_from(source: str) -> list[str]:
 
 
 def test_the_guard_sees_a_bare_call():
-    assert seam_bare_calls("from sandbox_exec import run_sandboxed\nrun_sandboxed([], [], 1)\n") == ["run_sandboxed"]
+    assert bare_seam_calls("from sandbox_exec import run_sandboxed\nrun_sandboxed([], [], 1)\n") == ["run_sandboxed"]
 
 
 def test_the_guard_accepts_a_module_attribute_call():
-    assert seam_bare_calls("import sandbox_exec\nsandbox_exec.run_sandboxed([], [], 1)\n") == []
+    assert bare_seam_calls("import sandbox_exec\nsandbox_exec.run_sandboxed([], [], 1)\n") == []
 
 
 def test_the_guard_sees_a_patch_on_run_eacsl_fuzz():
@@ -99,10 +99,10 @@ def test_no_script_calls_a_seam_function_by_its_bare_name(script):
     if script[:-3] in SEAM_MODULES:
         pytest.skip("the home itself")
     source = (SEAM_SCRIPTS / script).read_text(encoding="utf-8")
-    assert seam_bare_calls(source) == [], f"{script} calls a seam function by a bare name; call <home>.<name>"
+    assert bare_seam_calls(source) == [], f"{script} calls a seam function by a bare name; call <home>.<name>"
 
 
-@pytest.mark.parametrize("test_file", sorted(p.name for p in SEAM_TESTS.glob("test_*.py")))
+@pytest.mark.parametrize("test_file", sorted(p.name for p in SEAM_TESTS.glob("*.py")))
 def test_no_test_patches_a_seam_function_on_run_eacsl_fuzz(test_file):
     source = (SEAM_TESTS / test_file).read_text(encoding="utf-8")
     assert seam_patches_on_moved_from(source) == [], (

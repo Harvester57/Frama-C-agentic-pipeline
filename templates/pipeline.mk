@@ -107,8 +107,8 @@ seed: reach-gate security-props
 
 # --- Phases 1 and 2 --------------------------------------------------------------------------
 
-# Compile only: what --engine asks for, both engines for `auto`. Static (it never runs target code).
-# It never reads the selftest result: the campaign applies it and restores these builds from the cache.
+# Compile only: what `--engine` asks for, both engines for `auto`. It never reads the selftest result;
+# the campaign applies it and restores these builds from the cache.
 build: $(BUILD_TARGETS)
 $(BUILD_TARGETS): build-%:
 	$(GATE) --module $* --need reach

@@ -293,12 +293,13 @@ python3 - <<'EOF'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, "/repo/scripts")
+import fuzz_build
 import run_eacsl_fuzz as R
 keys = ("returncode", "reason", "binary", "check_options", "runtime_patches")
 res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_mod"), cppflags="-I.", use_cache=False)
 print("RESULT " + json.dumps({k: res.get(k) for k in keys}))
 # The same build with the image's runtime: the cases the patch lets through must abort there.
-R.eacsl_share_dir = lambda eacsl_bin: None
+fuzz_build.eacsl_share_dir = lambda eacsl_bin: None
 res = R.compile_eacsl_binary(["mod.c"], Path("plain/fuzz_mod"), cppflags="-I.", use_cache=False)
 print("UNPATCHED " + json.dumps({k: res.get(k) for k in keys}))
 EOF

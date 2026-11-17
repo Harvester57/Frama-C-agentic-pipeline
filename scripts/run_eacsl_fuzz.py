@@ -263,6 +263,8 @@ def fuzz_required_memory_mb(workers: int = 1) -> int:
     return FUZZ_WORKER_OVERHEAD_MB + max(1, workers) * int(FUZZ_RSS_LIMIT_MB * 1.25)
 
 
+# Per-input LibFuzzer -timeout of guardrails (contract checks add overhead). The campaign and replay
+# value, DEFAULT_PER_INPUT_TIMEOUT_S, is in fuzz_common. Fixed values, never derived from the machine.
 GUARDRAIL_PER_INPUT_TIMEOUT_S = 30
 DEFAULT_MAX_TIME_S = 60
 MIN_FUZZ_WALL_S = 30
