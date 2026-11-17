@@ -34,7 +34,18 @@ byte selects it), with arguments built from the model's signature of each functi
     `*Init*`, `*_new`, `*_create` whose first parameter is a non-const pointer to that struct; the one
     the recorded traces call first, else the plainest): one object, initialized by that call before
     the call under test (its own arguments built by the same rules; the case's `inits` name it). The
-    initializer's own case does not call it first;
+    initializer's own case does not call it first. After the call under test the object is released
+    with the struct's destructor when the unit has one (a function of the unit named like a
+    destructor whose one parameter is a non-const pointer to that struct, `struct_destructors`):
+    `mpack_writer_init_growable` mallocs and `mpack_writer_init_filename` opens a file, and a case run
+    millions of times must not keep either. The initializer's own case releases its object the same
+    way; the destructor's own case does not release twice. The release reads no input: the layout
+    does not change;
+  - a byte-string parameter named like a file-system path (`filename`, `file_name`, `fname`, `path`,
+    `pathname`, `filePath`, `dirname`; `path_parameter`): the function is skipped with the reason,
+    and is never chosen as an initializer or constructor. A path read from the input makes the
+    target open or create a file the fuzzer names, anywhere the sandbox user can write (the run
+    directory included), on every execution;
   - an opaque handle (a typedef of `void *`, or a pointer to a struct the headers only declare, as
     the layout probe saw the parameter written): the result of the API's constructor for that type
     (a function named like an initializer that returns it), released after the call under test with
@@ -151,6 +162,14 @@ MAX_HANDLE_DEPTH = 3  # parents built for a child handle (a record set needs its
 _DTOR_NAME_RE = re.compile(
     r"(?:^|_)(?:release|free|destroy|delete|close|cleanup|deinit|fini|unref)(?:$|_)|"
     r"(?:^|(?<=[a-z0-9_]))(?:Free|Destroy|Release)(?=[A-Z0-9_]|$)"
+)
+# File-system path parameter names, as words of the formal's name (`filename`, `file_name`, `filePath`).
+_PATH_WORDS = frozenset({"filename", "fname", "path", "pathname", "filepath", "dirname", "dirpath"})
+_PATH_WORD_PAIRS = frozenset({("file", "name"), ("file", "path"), ("dir", "name"), ("dir", "path"), ("path", "name")})
+_NAME_WORD_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+PATH_SKIP_REASON = (
+    "takes a file-system path (parameter `{name}`): the harness never passes input bytes as a path, "
+    "which would open or create a file the fuzzer names on every execution"
 )
 
 # Byte size of the scalars a slot can hold (x86_64): a seed needs it to lay out the input.
@@ -289,6 +308,10 @@ class ApiInfo:
     # {type, pointee} as the declaration writes them (`const char **`, `const char *`). The model drops
     # the nested `const` (`char **`), which a compiler refuses to pass (gcc 14) or warns about (clang).
     qual_ptrs: dict[str, dict[int, dict[str, str]]] = field(default_factory=dict)
+    # Struct objects (`struct_destructors`): per struct type, the destructor that releases what an
+    # initializer set up in it, and every function named like a destructor of it.
+    struct_dtors: dict[str, str] = field(default_factory=dict)
+    struct_dtor_names: dict[str, set[str]] = field(default_factory=dict)
 
 
 class _Case:
@@ -565,6 +588,14 @@ def _construct(
     return before, release, later, f"{var} != 0"
 
 
+def _struct_release(api: ApiInfo, pointee: str, name: str, expr: str) -> str | None:
+    """The release of struct object `expr` after call `name`, or None (no destructor, or `name` is one)."""
+    dtor = api.struct_dtors.get(pointee)
+    if dtor is None or name in api.struct_dtor_names.get(pointee, set()):
+        return None
+    return f"(void){dtor}({expr});"
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -588,6 +619,7 @@ def _bind_call(
     before: list[str] = []
     after: list[str] = []
     guards: list[str] = []
+    bound_handles: set[int] = set()  # parameters a handle constructor built (released as handles)
     api = case.api
     handles = api.handles.get(name) or {}
     outs = api.outs.get(name) or {}
@@ -616,6 +648,7 @@ def _bind_call(
             else:
                 # A handle: the constructor's result, released afterwards unless this call is the release.
                 made_here, release, parents_release, guard = _construct(case, htype, v, call, i)
+                bound_handles.add(i)
                 before += made_here
                 if guard:
                     guards.append(guard)
@@ -678,6 +711,9 @@ def _bind_call(
                 case.decls.append(f"{pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
                 before.append(_init_call(case, pointee, f"&{v}", call, i))
                 args.append(f"&{v}")
+                release = _struct_release(api, pointee, name, f"&{v}")
+                if release:
+                    after.append(release)
                 i += 1
                 continue
             if pair and nxt is not None and (i + 1) not in shared:
@@ -782,6 +818,14 @@ def _bind_call(
         args.append(v)
         i += 1
     args += extra_args or []
+    if allow_init and params and 0 not in shared and 0 not in bound_handles and params[0]["kind"] == "ptr":
+        # An initializer's own case: what it set up in its (unshared) object is released after it. A
+        # handle a constructor built is released as a handle already (`_construct`), never twice.
+        pointee0 = str(params[0].get("pointee") or "")
+        if name in api.candidates.get(pointee0, set()):
+            release = _struct_release(api, pointee0, name, args[0])
+            if release:
+                after.append(release)
     made = case.api.returns.get(name) if allow_init else None
     if made is not None and made in case.api.dtors:
         # The call under test makes a handle: release it, or every run of the case leaks one.
@@ -1054,6 +1098,62 @@ def still_skipped(layouts: Sequence[dict], skipped: dict[str, str]) -> dict[str,
     return {k: v for k, v in skipped.items() if k not in alive}
 
 
+def _is_path_name(name: str) -> bool:
+    words = [w.lower() for w in _NAME_WORD_RE.findall(name)]
+    pairs = zip(words, words[1:], strict=False)
+    return any(w in _PATH_WORDS for w in words) or any(p in _PATH_WORD_PAIRS for p in pairs)
+
+
+def path_parameter(rec: dict) -> str | None:
+    """
+    The name of the first byte-string parameter of a model record named like a file-system path
+    (`filename`, `file_name`, `fname`, `path`, `filePath`, `dirname`), or None. Such a function opens,
+    creates or lists what the string names (mpack's `mpack_writer_init_filename` fopen()s it for
+    writing): fed input bytes, it would touch a file the fuzzer names on every execution.
+    """
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    formals = list(rec.get("formals") or [])
+    for i, p in enumerate(params or []):
+        name = _name(formals, i)
+        if name and p["kind"] == "ptr" and p.get("pointee") in ("char", "signed char", "unsigned char"):
+            if _is_path_name(name):
+                return name
+    return None
+
+
+def struct_destructors(
+    functions: dict[str, dict], visible: set[str] | None = None
+) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """
+    Per struct type, the destructor that releases a struct object an initializer set up, and every
+    function named like a destructor of it: named like a destructor (`*_destroy`, `*_free`, ...), one
+    parameter, a non-const pointer to that struct (`mpack_error_t mpack_writer_destroy(mpack_writer_t
+    *)`). `functions` are the model's records the harness links (the unit's); a header `static` one
+    counts only when the layout probe saw it declared (`visible`), and with a probe every one must be.
+    Several candidates: the first name.
+    """
+    names: dict[str, set[str]] = {}
+    for key, rec in functions.items():
+        if not isinstance(rec, dict):
+            continue
+        name = str(rec.get("name") or key.split("#")[-1])
+        if not _DTOR_NAME_RE.search(name):
+            continue
+        if rec.get("static") and not rec.get("header"):
+            continue
+        if (rec.get("static") and visible is None) or (visible is not None and name not in visible):
+            continue
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        if not params or len(params) != 1 or params[0]["kind"] != "ptr":
+            continue
+        if _is_input(list(rec.get("formals") or []), 0):
+            continue
+        pointee = str(params[0].get("pointee") or "")
+        if _is_record(pointee) and "*" not in pointee:
+            names.setdefault(pointee, set()).add(name)
+    return {t: min(n) for t, n in names.items()}, names
+
+
 def initializers(
     functions: dict[str, dict], traces: list[list[dict]] | None = None, visible: set[str] | None = None
 ) -> tuple[dict[str, str], dict[str, set[str]], dict[str, dict]]:
@@ -1081,6 +1181,8 @@ def initializers(
         formals = list(rec.get("formals") or [])
         if not params or params[0]["kind"] != "ptr" or _is_input(formals, 0):
             continue
+        if path_parameter(rec):
+            continue  # it would open a file the input names (path_parameter)
         pointee = str(params[0].get("pointee") or "")
         # A `struct tag **` first parameter is an out-parameter constructor (`outparam_constructors`),
         # not an initializer of a struct object.
@@ -1145,7 +1247,7 @@ def handle_functions(
         ret = proto.get("ret")
         if ret:
             returns[name] = ret
-        if ret and not mine and _INIT_NAME_RE.search(name):
+        if ret and not mine and _INIT_NAME_RE.search(name) and not path_parameter(rec):
             ctor_cands.setdefault(ret, []).append(name)
         if len(params) == 1 and mine and _DTOR_NAME_RE.search(name):
             dtor_cands.setdefault(mine[0], set()).add(name)
@@ -1206,6 +1308,8 @@ def outparam_constructors(
         takes = handles.get(name) or {}
         if len(written) != 1 or len(takes) > 1 or not _OUT_CTOR_NAME_RE.search(name):
             continue
+        if path_parameter(rec):
+            continue  # it would open a file the input names (path_parameter)
         ((_, htype),) = written.items()
         if htype in takes.values():
             continue  # a copy (`*_dup(dest, src)`) needs a handle of the type first
@@ -1516,6 +1620,19 @@ def plan(
     inits, candidates, init_records = initializers(init_pool, traces, visible)
     handles, ctors, dtors, dtor_names, ctor_records, returns = handle_functions(init_pool, visible)
     outp = outparam_constructors(init_pool, visible, handles, traces)
+    # Destructors of struct objects may lie outside the scope (mpack_writer_destroy is in another
+    # cluster than mpack_writer_init): any function of the unit, which the harness links whole.
+    unit_names = {
+        str((functions.get(k) or {}).get("name") or str(k).split("#")[-1])
+        for k in mm.unit_record(module).get("functions") or []
+    } | entry_names
+    dtor_pool = {
+        k: rec
+        for k, rec in (model.get("functions") or {}).items()
+        if isinstance(rec, dict)
+        and (str(rec.get("name") or k.split("#")[-1]) in unit_names or (rec.get("static") and rec.get("header")))
+    }
+    struct_dtors, struct_dtor_names = struct_destructors(dtor_pool, visible)
     # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
     out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
     api = ApiInfo(
@@ -1536,6 +1653,8 @@ def plan(
         callbacks=dict(getattr(visible, "callbacks", None) or {}) if callback_stubs else {},
         enum_ptrs=dict(getattr(visible, "enum_pointers", None) or {}),
         qual_ptrs=dict(getattr(visible, "qualified_pointers", None) or {}),
+        struct_dtors=struct_dtors,
+        struct_dtor_names=struct_dtor_names,
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -1548,6 +1667,10 @@ def plan(
         mrec = _model_record(model, drec, key)
         if not mrec:
             skipped[key] = "not in the Phase 0 model"
+            continue
+        path = path_parameter(mrec)
+        if path:
+            skipped[key] = PATH_SKIP_REASON.format(name=path)
             continue
         if is_variadic(str(mrec.get("signature") or ""), mrec.get("formals")):
             # Not in `records`: a sequence or a lifecycle case builds its calls from the signature.
