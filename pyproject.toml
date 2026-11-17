@@ -69,6 +69,7 @@ known-first-party = [
     "kernel_ast",
     "ledger",
     "libc_gap_report",
+    "line_endings",
     "loop_seeds",
     "minischema",
     "module_map",

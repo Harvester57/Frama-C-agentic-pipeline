@@ -77,6 +77,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import line_endings  # noqa: E402
 from framac_common import VA_PARAMS, atomic_write_json, load_json_optional, utc_now  # noqa: E402
 
 SCHEMA_VERSION = 1
@@ -943,6 +944,17 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
             f"the test command exited {res.returncode}{' (timed out)' if res.timed_out else ''}: "
             "calls recorded before that are kept"
         )
+        if not res.timed_out:
+            # A Windows checkout's CRLF script exits 127 with a bare `not found`: name it.
+            hint = line_endings.failure_hint(
+                "the test command",
+                res.returncode,
+                (res.stdout or "") + (res.stderr or ""),
+                line_endings.scan_crlf_scripts(tree),
+                command,
+            )
+            if hint:
+                report["warnings"].append(hint)
     opened: list[str] = []
     if strace_log.is_file():
         opened = strace_opened(strace_log.read_text(encoding="utf-8", errors="replace"), tree)

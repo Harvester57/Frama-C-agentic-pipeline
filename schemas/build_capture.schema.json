@@ -98,7 +98,18 @@
         "proposed_recipe": {"type": ["object", "null"]},
         "instructions": {"type": "array", "items": {"type": "string"}},
         "heuristic": {"type": "string"},
-        "log_tail": {"type": "string"}
+        "log_tail": {"type": "string"},
+        "crlf_scripts": {
+          "$comment": "Set when the failed build points at scripts with CRLF line endings (a Windows checkout): how many the tree holds, the first paths, and whether the bounded scan saw the whole tree. The matching hint is in `warnings`.",
+          "type": "object",
+          "properties": {
+            "count": {"type": "integer", "minimum": 0},
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "complete": {"type": "boolean"}
+          },
+          "required": ["count", "paths", "complete"],
+          "additionalProperties": false
+        }
       },
       "required": ["first_error", "missing_headers", "candidate_packages", "packages_not_installed"]
     },
