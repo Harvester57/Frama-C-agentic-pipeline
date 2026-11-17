@@ -11,7 +11,7 @@
                                  allowlisted command
 
     Container hardening: no network, all capabilities dropped, no-new-privileges, the engine's default seccomp
-    and AppArmor/SELinux profiles, CPU/memory/PID limits, no core dumps (--ulimit core=1:1), and an environment
+    and AppArmor/SELinux profiles, CPU/memory/PID limits, a 1-byte core limit (--ulimit core=1:1), and an environment
     limited to an explicit allowlist.
     The container is the isolation boundary. Inside it, target-controlled binaries run through
     scripts/sandbox_exec.py (rlimits, environment allowlist, timeout); there is no filesystem isolation
@@ -585,9 +585,10 @@ try {
     }
 } catch {}
 
-# --ulimit core=1:1 as in framac-docker.sh: no process in the container can dump a core (soft = hard =
-# 1 byte, sandbox_exec's CORE_LIMIT_BYTES; resources.py CORE_ULIMIT_ARGS). Docker Desktop on WSL2 pipes
-# cores to the host's crash capture, which ignores a limit of 0 and wrote a 23 GB dump that filled the disk.
+# --ulimit core=1:1 as in framac-docker.sh: every process in the container starts with a 1-byte core limit
+# it cannot raise (soft = hard = sandbox_exec's CORE_LIMIT_BYTES; resources.py CORE_ULIMIT_ARGS). Docker
+# Desktop on WSL2 pipes cores to the host's crash capture, which ignores a limit of 0 and wrote a 23 GB dump
+# that filled the disk. A process that lowers its own limit to 0 (`ulimit -c 0`) re-enables that pipe dump.
 $hardeningArgs = @(
     "--rm", "-i",
     "--network", "none",

@@ -3121,7 +3121,8 @@ _MANAGED_FLAGS = frozenset({"--cpus", "--cpuset-cpus", "--memory", "-m", "--memo
 # unlimited hard one) and writes the whole core to %TEMP%\wsl-crashes on the Windows host: an E-ACSL
 # abort reproduced outside sandbox_exec wrote 23 GB and filled the disk. The wrappers put the same
 # flag in their hardening flags (framac-docker.sh HARDENING, framac-docker.ps1 $hardeningArgs), so it
-# reaches the broker path through the caller's argv; docker-compose.yml sets it per service.
+# reaches the broker path through the caller's argv; docker-compose.yml sets it per service. A
+# process can still lower its own limit to 0 (`ulimit -c 0`), which re-enables the pipe dump.
 CORE_ULIMIT_ARGS: tuple[str, str] = ("--ulimit", f"core={CORE_LIMIT_BYTES}:{CORE_LIMIT_BYTES}")
 
 
