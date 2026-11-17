@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import shutil
 from pathlib import Path
 
@@ -203,3 +204,38 @@ def test_a_campaign_after_build_compiles_nothing(tmp_path, monkeypatch):
     assert "sanitizer_compile" not in only_eacsl
     only_sanitizers = R._run_build_mode(argparse.Namespace(**{**vars(args), "engine": "sanitizers"}))
     assert "sanitizer_compile" not in only_sanitizers
+
+
+def _header_entry_run(tmp_path: Path, with_dag: bool = True) -> list[str]:
+    """An `--api` harness with a case for an exported, a public header and a source-static entry point."""
+    hdir = tmp_path / "workspace/harnesses"
+    hdir.mkdir(parents=True)
+    (tmp_path / "workspace/reports").mkdir()
+    src = tmp_path / "lib.c"
+    src.write_text("int lib_decode(int x) { return x; }\n", encoding="utf-8")
+    harness = hdir / "harness_lib.c"
+    harness.write_text("int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 0; }\n")
+    cases = [{"kind": "single", "selector": i, "calls": [n], "entry": n} for i, n in enumerate(["lib_decode", "h_get"])]
+    cases.append({"kind": "single", "selector": 2, "calls": ["s_one"], "entry": "s_one"})
+    (hdir / "harness_lib.json").write_text(json.dumps({"api_harness": True, "api_cases": cases}), encoding="utf-8")
+    if with_dag:
+        functions = {
+            "lib_decode": {"name": "lib_decode", "file": "lib.c", "is_static": False, "header": False},
+            "h_get": {"name": "h_get", "file": "inc/lib.h", "is_static": True, "header": True},
+            "s_one": {"name": "s_one", "file": "lib.c", "is_static": True, "header": False},
+        }
+        (tmp_path / "workspace/reports/callgraph_dag.json").write_text(json.dumps({"functions": functions}))
+    return [str(src), str(harness)]
+
+
+def test_the_function_list_adds_the_header_entry_points_the_harness_calls(tmp_path):
+    """HD8: `-rte-select` / `-e-acsl-functions` cover a public header entry point the harness calls."""
+    sources = _header_entry_run(tmp_path)
+    assert fuzz_build._discover_slice_functions(sources) == ["h_get", "lib_decode"]
+    # An explicit list is the caller's choice, as before.
+    assert fuzz_build._discover_slice_functions(sources, ["lib_decode"]) == ["lib_decode"]
+
+
+def test_the_function_list_without_a_dag_is_the_scan_of_the_sources(tmp_path):
+    sources = _header_entry_run(tmp_path, with_dag=False)
+    assert fuzz_build._discover_slice_functions(sources) == ["lib_decode"]
