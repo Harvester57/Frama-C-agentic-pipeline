@@ -1109,6 +1109,40 @@ def fuzz_engine_note(report: dict) -> str:
     return "E-ACSL + LibFuzzer"
 
 
+def _fuzz_coverage_executions(module: str) -> tuple[dict[tuple[str, str], int] | None, str]:
+    """
+    Executions per (file, function) in the module's coverage report, or None with the reason the report
+    cannot say which functions ran. A usable report (D21) is `ok`, or `partial` with no input left
+    unreplayed. A function the report does not list did not run; the file is compared normalized, as
+    every ledger match is (`units_for_function`), not by suffix.
+    """
+    path = COVERAGE_REPORT_DIR / f"{module}.json"
+    if not path.is_file():
+        return None, "no coverage report"
+    try:
+        cov = load_json_optional(path, None)
+    except (ArtifactError, OSError, ValueError):
+        return None, "coverage report unreadable"
+    if not isinstance(cov, dict):
+        return None, "coverage report unreadable"
+    status = cov.get("status")
+    if status == "partial":
+        inputs: dict = cov["inputs"] if isinstance(cov.get("inputs"), dict) else {}
+        missing = inputs.get("not_replayed") or 0
+        if missing:
+            return None, f"partial coverage: {missing} of {inputs.get('total') or '?'} inputs not replayed"
+    elif status != "ok":
+        return None, f"coverage report status {status or 'unknown'}"
+    counts: dict[tuple[str, str], int] = {}
+    for row in cov.get("functions") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("function"), str) or not row.get("file"):
+            continue
+        key = (normalize_file(str(row["file"])), row["function"])
+        executions = row.get("executions")
+        counts[key] = counts.get(key, 0) + (executions if isinstance(executions, int) else 0)
+    return counts, ""
+
+
 @ledger_locked
 def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -1133,7 +1167,31 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
 
         if status == "clean":
             ingested_modules.append(module)
+            executions, unmeasured = _fuzz_coverage_executions(module)
             for u in mod_units:
+                if executions is None:
+                    add_evidence(
+                        u,
+                        "fuzz",
+                        "run_eacsl_fuzz.py",
+                        "fuzz_clean",
+                        False,
+                        tool_output,
+                        f"{engine_note} campaign found no failure (not a proof). "
+                        f"Which functions ran was not measured ({unmeasured}).",
+                    )
+                    continue
+                if executions.get((normalize_file(u["file"]), u["function"]), 0) == 0:
+                    add_evidence(
+                        u,
+                        "fuzz",
+                        "run_eacsl_fuzz.py",
+                        "fuzz_not_executed",
+                        False,
+                        tool_output,
+                        f"{engine_note} campaign: no replayed input executed this function (not evidence of anything).",
+                    )
+                    continue
                 add_evidence(
                     u,
                     "fuzz",
