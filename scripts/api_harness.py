@@ -2689,7 +2689,7 @@ def generate(
     if header is None:
         # nettle: without a header 22 of 35 libnettle clusters failed. The build capture's public
         # headers the unit includes, and the internal ones declaring an entry point, stand in for it.
-        chosen = capture_headers(dag, module, unit, dag_file.parent / "build_capture.json")
+        chosen = capture_headers(dag, module, unit, dag_file.parent / "build_capture.json", scope)
         header = chosen.pop("header")
         extra_includes = [*chosen.pop("extra_includes"), *(extra_includes or [])]
         api_headers: dict[str, Any] = chosen
@@ -2885,7 +2885,9 @@ def header_declares(path: Path, names: set[str]) -> set[str]:
     return {alias.get(n, n) for n in found}
 
 
-def capture_headers(dag: dict, module: str, unit: str | None, capture_path: Path) -> dict[str, Any]:
+def capture_headers(
+    dag: dict, module: str, unit: str | None, capture_path: Path, scope_files: list[str] | None = None
+) -> dict[str, Any]:
     """
     The headers an `--api` harness without `--header` includes, from the build capture (step O4 of
     docs/plans/open-topics-remediation-plan.md): {source, why, unit, public, internal, dropped,
@@ -2904,6 +2906,7 @@ def capture_headers(dag: dict, module: str, unit: str | None, capture_path: Path
     the DAG's `target_dir` as its `cppflags` are (`workspace/work/<tree path>`). `source` is
     `capture` when a header was chosen, else `not_found`, with `why`: no capture, no record of the
     module's link unit in it, or none of its headers is public or declares an entry point.
+    `scope_files` give a freely named sub-module its entry points, as in `plan`.
     """
     from module_map import ModuleMap
     from phase0_model import public_header_files
@@ -2914,7 +2917,8 @@ def capture_headers(dag: dict, module: str, unit: str | None, capture_path: Path
     cap = load_json_optional(capture_path, None)
     if not isinstance(cap, dict):
         return not_found(f"no build capture ({capture_path.as_posix()})")
-    mm = ModuleMap(dag, {module: {"unit": unit}} if unit else {})
+    sidecar = {**({"unit": unit} if unit else {}), **({"scope_files": scope_files} if scope_files else {})}
+    mm = ModuleMap(dag, {module: sidecar} if sidecar else {})
     rec = mm.unit_record(module)
     cap_unit = rec.get("unit")
     cap_rec = (cap.get("units") or {}).get(cap_unit) if isinstance(cap_unit, str) else None

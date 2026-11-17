@@ -230,3 +230,26 @@ def test_header_declares_reads_renaming_macros_and_ignores_calls(tmp_path):
     )
     assert ah.header_declares(h, {"_nettle_set_key", "g", "f"}) == {"_nettle_set_key", "f"}
     assert ah.header_declares(tmp_path / "missing.h", {"f"}) == set()
+
+
+def test_a_freely_named_sub_module_looks_for_the_entry_points_of_its_scope_files(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch, _capture())
+    dag = json.loads(Path("dag.json").read_text(encoding="utf-8"))
+    dag["functions"]["src/a.c#_nettle_c"]["file"] = "src/c.c"
+    capture = Path("build_capture.json")
+
+    in_c = ah.capture_headers(dag, "mysub", "lib", capture, ["src/c.c"])
+    assert in_c["internal"] == [{"header": INTERNAL_H, "declares": ["_nettle_c"]}]
+    assert in_c["header"] == INTERNAL_H  # it declares the sub-module's first entry point
+    # The public header declares every entry point of src/a.c: no internal header is needed.
+    in_a = ah.capture_headers(dag, "mysub", "lib", capture, ["src/a.c"])
+    assert in_a["internal"] == [] and in_a["header"] == PUB_H and in_a["extra_includes"] == []
+
+
+def test_a_rooted_header_is_included_by_file_name_with_its_directory_on_the_include_path():
+    """The real consumer of the rooted paths (generate_harness), which the fakes above stand in for."""
+    import generate_harness as gh
+
+    name, flags = gh._normalize_header_include(f"workspace/work/{PUB_H}", "")
+    assert name == "pub.h"
+    assert "-Iworkspace/work/include/x" in flags.split()
