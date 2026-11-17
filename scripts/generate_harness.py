@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1232,7 +1232,9 @@ def _build_invocations(
         # 256-byte argv buffers made unknown. Fuzz side: argv[1] is the input as a NUL-terminated
         # string. The target's main is renamed via -Dmain=__framac_target_main in the sidecar
         # cppflags (see generate_module_harness), so libFuzzer's main does not clash at link time;
-        # the -D renames this call and the synthesized declaration consistently.
+        # the -D renames this call and main's declaration consistently. That declaration is the
+        # module header's when it declares main, else the one generate_module_harness writes into
+        # the harness (_argv_entry_declaration).
         eva_call = (
             "(void)input_buf; (void)input_len; (void)fuzz_buf; (void)fuzz_len;\n"
             "    int argc = Frama_C_interval(0, 5);\n"
@@ -2104,18 +2106,24 @@ _FUZZ_FN_BLOCK_RE = re.compile(
 )
 
 
-def _check_argv_entry(module_name: str, entry_fn: str, sources: list[str], cppflags: str) -> None:
+def _check_argv_entry(
+    module_name: str, entry_fn: str, sources: list[str], cppflags: str, headers: Sequence[str] = ()
+) -> None:
     """
     An argv entry calls `main(argc, argv)`: a `main(void)` takes no arguments, so the input cannot
     reach it that way (it reads stdin, a fixed file, or nothing). Fail with what to do instead of
-    writing a harness that does not compile. A main whose definition is not found is left to the
-    compiler.
+    writing a harness that does not compile. The definition in `sources` decides; without one, the
+    first of the harness's `headers` that declares main does. A main found in neither is left to
+    the compiler.
     """
-    try:
-        params = extract_function_prototype(entry_fn, None, sources, cppflags)
-    except ValueError:
-        return
-    if params:
+    params: list[dict[str, Any]] | None = None
+    for hdr, srcs in ((None, sources), *((h, None) for h in headers if h)):
+        try:
+            params = extract_function_prototype(entry_fn, hdr, srcs, cppflags)
+        except ValueError:
+            continue
+        break
+    if params is None or params:
         return
     raise ValueError(
         f"{entry_fn}() of module {module_name!r} takes no arguments: an argv harness cannot pass it the "
@@ -2123,6 +2131,18 @@ def _check_argv_entry(module_name: str, entry_fn: str, sources: list[str], cppfl
         f"harness_reach.py exempt --module {module_name} --reason '<why>'; otherwise give --entry-style "
         "with --call-expr."
     )
+
+
+def _argv_entry_declaration(entry_fn: str, sources: list[str], cppflags: str) -> str:
+    """
+    The declaration of an argv entry (`main`) for a harness whose headers do not declare it: a
+    program's main is rarely in its module header, and calling it undeclared is an implicit function
+    declaration, an error under clang and E-ACSL. The target's own definition gives it (so a
+    `const char *argv[]` main keeps its types), else the canonical `int <entry_fn>(int argc, char **argv);`.
+    Written into the harness, it is renamed by the sidecar's -Dmain= together with the call.
+    """
+    decl = extract_function_declaration(entry_fn, None, sources, cppflags)
+    return decl or f"int {entry_fn}(int argc, char **argv);"
 
 
 @contextlib.contextmanager
@@ -2346,7 +2366,13 @@ def _generate_module_harness(
 
     effective_null_terminate = bool(null_terminate or entry_style == "c_string" or auto_needs_nt)
     if entry_style == "argv":
-        _check_argv_entry(module_name, entry_fn, sources, norm_cppflags)
+        _check_argv_entry(
+            module_name,
+            entry_fn,
+            sources,
+            norm_cppflags,
+            headers=[norm_header or "", *norm_extra_includes, *norm_compat_includes],
+        )
         # Rename the target's main in every build of this module (Eva and fuzz alike): the harness
         # calls main(argc, argv), and the -D renames that call together with the target's
         # definition, so libFuzzer's own main is the only main at link time.
@@ -2430,12 +2456,25 @@ def _generate_module_harness(
         if not norm_header and target_fuzzer_record is None:
             if effective_self_harnessed:
                 inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
+            elif entry_style == "argv":
+                inc_lines.append(_argv_entry_declaration(entry_fn, sources, norm_cppflags))
             else:
                 synth_decl = extract_function_declaration(entry_fn, None, sources, norm_cppflags)
                 if synth_decl:
                     inc_lines.append(synth_decl)
         elif effective_self_harnessed:
             inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
+        elif (
+            entry_style == "argv"
+            and target_fuzzer_record is None
+            and not any(
+                extract_function_declaration(entry_fn, h, None, norm_cppflags) is not None
+                for h in (norm_header, *norm_extra_includes, *norm_compat_includes)
+            )
+        ):
+            # The module header (and the headers included beside it) do not declare main: declare
+            # it after them, so its parameter types are known, and before the calls below.
+            inc_lines.append(_argv_entry_declaration(entry_fn, sources, norm_cppflags))
     if target_fuzzer_record is not None:
         inc_lines.append(_target_fuzzer_prelude(bool(target_fuzzer_record["initialize"])))
 
