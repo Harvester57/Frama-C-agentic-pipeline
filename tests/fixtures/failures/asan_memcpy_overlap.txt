@@ -1,0 +1,5 @@
+==4257==ERROR: AddressSanitizer: memcpy-param-overlap: memory ranges [0x602000000010,0x602000000020) and [0x602000000018, 0x602000000028) overlap
+    #0 0x55555558b0c1 in __asan_memcpy
+    #1 0x55555558b200 in copy_block src/demo.c:22:5
+    #2 0x55555558b300 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+    #3 0x55555558b400 in main

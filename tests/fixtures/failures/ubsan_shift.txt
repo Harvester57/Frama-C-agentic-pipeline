@@ -1,0 +1,4 @@
+src/demo.c:76:14: runtime error: left shift of negative value -5
+    #0 0x55555558c300 in shift_bits src/demo.c:76:14
+    #1 0x55555558c400 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/demo.c:76:14 in shift_bits

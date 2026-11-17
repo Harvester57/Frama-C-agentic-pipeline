@@ -1,0 +1,9 @@
+=================================================================
+==5150==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 16 byte(s) in 1 object(s) allocated from:
+    #0 0x55555558d111 in __interceptor_malloc
+    #1 0x55555558d222 in make_buf src/demo.c:14:16
+    #2 0x55555558d333 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+
+SUMMARY: AddressSanitizer: 16 byte(s) leaked in 1 allocation(s).

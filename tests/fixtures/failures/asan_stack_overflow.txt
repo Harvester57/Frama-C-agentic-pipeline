@@ -1,0 +1,9 @@
+=================================================================
+==4250==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7ffd4c2f0b44 at pc 0x55555558a2f1 bp 0x7ffd4c2f0b20 sp 0x7ffd4c2f0b18
+READ of size 4 at 0x7ffd4c2f0b44 thread T0
+    #0 0x55555558a2f0 in stack_overflow src/demo.c:54:12
+    #1 0x55555558a3c0 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+    #2 0x55555558a500 in main
+
+Address 0x7ffd4c2f0b44 is located in stack of thread T0 at offset 52 in frame
+    #0 0x55555558a1f0 in stack_overflow src/demo.c:51

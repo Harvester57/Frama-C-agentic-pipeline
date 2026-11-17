@@ -1,0 +1,11 @@
+=================================================================
+==4254==ERROR: AddressSanitizer: heap-use-after-free on address 0x602000000010 at pc 0x55555558ab21 bp 0x7ffd4c2f0b20 sp 0x7ffd4c2f0b18
+READ of size 4 at 0x602000000010 thread T0
+    #0 0x55555558ab20 in free_then_read src/demo.c:28:12
+    #1 0x55555558abc0 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+    #2 0x55555558ac00 in main
+
+0x602000000010 is located 0 bytes inside of 16-byte region [0x602000000010,0x602000000020)
+freed by thread T0 here:
+    #0 0x55555558a100 in __interceptor_free
+    #1 0x55555558ad20 in free_then_read src/demo.c:27:5

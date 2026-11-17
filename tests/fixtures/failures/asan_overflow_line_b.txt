@@ -1,0 +1,6 @@
+=================================================================
+==4253==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000064 at pc 0x55555558a8f1 bp 0x7ffd4c2f0b20 sp 0x7ffd4c2f0b18
+READ of size 4 at 0x602000000064 thread T0
+    #0 0x55555558a8f0 in two_overflows src/demo.c:65:15
+    #1 0x55555558a9c0 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+    #2 0x55555558aa00 in main

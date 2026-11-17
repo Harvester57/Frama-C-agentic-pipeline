@@ -1,0 +1,155 @@
+{
+  "eacsl_assertion": {
+    "file": "src/demo.c",
+    "line": 86,
+    "function": "checked_div",
+    "kind": "assertion",
+    "alarm_kind": "division_by_zero",
+    "predicate": "y != 0",
+    "synthetic": true
+  },
+  "eacsl_segment": {
+    "file": "src/demo.c",
+    "line": 9,
+    "function": "read_slot",
+    "kind": "eacsl_runtime_error",
+    "alarm_kind": "mem_access",
+    "predicate": "rte: mem_access: Use of invalid address in unsafe_read",
+    "synthetic": true
+  },
+  "eacsl_initialized": {
+    "file": "src/demo.c",
+    "line": 92,
+    "function": "read_uninit",
+    "kind": "assertion",
+    "alarm_kind": "initialization",
+    "predicate": "\\initialized(&v)",
+    "synthetic": true
+  },
+  "asan_heap_overflow": {
+    "file": "src/demo.c",
+    "line": 46,
+    "function": "heap_overflow",
+    "kind": "asan_heap_buffer_overflow",
+    "alarm_kind": "mem_access",
+    "predicate": "rte: mem_access: AddressSanitizer: heap-buffer-overflow (READ) [line e901911ebf]",
+    "synthetic": true
+  },
+  "asan_stack_overflow": {
+    "file": "src/demo.c",
+    "line": 54,
+    "function": "stack_overflow",
+    "kind": "asan_stack_buffer_overflow",
+    "alarm_kind": "mem_access",
+    "predicate": "rte: mem_access: AddressSanitizer: stack-buffer-overflow (READ) [line beadf78e75]",
+    "synthetic": true
+  },
+  "asan_global_overflow": {
+    "file": "src/demo.c",
+    "line": 59,
+    "function": "global_overflow",
+    "kind": "asan_global_buffer_overflow",
+    "alarm_kind": "mem_access",
+    "predicate": "rte: mem_access: AddressSanitizer: global-buffer-overflow (READ) [line 50339b431b]",
+    "synthetic": true
+  },
+  "asan_overflow_line_a": {
+    "file": "src/demo.c",
+    "line": 64,
+    "function": "two_overflows",
+    "kind": "asan_heap_buffer_overflow",
+    "alarm_kind": "mem_access",
+    "predicate": "rte: mem_access: AddressSanitizer: heap-buffer-overflow (READ) [line 210ffdca4f]",
+    "synthetic": true
+  },
+  "asan_overflow_line_b": {
+    "file": "src/demo.c",
+    "line": 65,
+    "function": "two_overflows",
+    "kind": "asan_heap_buffer_overflow",
+    "alarm_kind": "mem_access",
+    "predicate": "rte: mem_access: AddressSanitizer: heap-buffer-overflow (READ) [line 67846f8c28]",
+    "synthetic": true
+  },
+  "asan_use_after_free": {
+    "file": "src/demo.c",
+    "line": 28,
+    "function": "free_then_read",
+    "kind": "asan_heap_use_after_free",
+    "alarm_kind": "dangling_pointer",
+    "predicate": "rte: dangling_pointer: AddressSanitizer: heap-use-after-free (READ) [line 624304c3a2]",
+    "synthetic": true
+  },
+  "asan_double_free": {
+    "file": "src/demo.c",
+    "line": 34,
+    "function": "release_twice",
+    "kind": "asan_attempting_double_free",
+    "alarm_kind": "freeable",
+    "predicate": "rte: freeable: AddressSanitizer: attempting double-free in free from release_twice [line a185639ec7]",
+    "synthetic": true
+  },
+  "asan_bad_free": {
+    "file": "src/demo.c",
+    "line": 40,
+    "function": "release_local",
+    "kind": "asan_attempting_free_on_address_which_was_not_malloc_ed",
+    "alarm_kind": "freeable",
+    "predicate": "rte: freeable: AddressSanitizer: attempting free on address which was not malloc()-ed in free from release_local [line 71f9849e4f]",
+    "synthetic": true
+  },
+  "asan_memcpy_overlap": {
+    "file": "src/demo.c",
+    "line": 22,
+    "function": "copy_block",
+    "kind": "asan_memcpy_param_overlap",
+    "alarm_kind": "separation",
+    "predicate": "rte: separation: AddressSanitizer: memcpy-param-overlap in memcpy from copy_block [line 537556d54e]",
+    "synthetic": true
+  },
+  "ubsan_signed_overflow": {
+    "file": "src/demo.c",
+    "line": 71,
+    "function": "add_wrap",
+    "kind": "ubsan_runtime_error",
+    "alarm_kind": "signed_overflow",
+    "predicate": "rte: signed_overflow: signed integer overflow: N + N cannot be represented in type 'int'",
+    "synthetic": true
+  },
+  "ubsan_shift": {
+    "file": "src/demo.c",
+    "line": 76,
+    "function": "shift_bits",
+    "kind": "ubsan_runtime_error",
+    "alarm_kind": "shift",
+    "predicate": "rte: shift: left shift of negative value N",
+    "synthetic": true
+  },
+  "ubsan_abs_int_min": {
+    "file": "src/demo.c",
+    "line": 81,
+    "function": "abs_min",
+    "kind": "ubsan_runtime_error",
+    "alarm_kind": "signed_overflow",
+    "predicate": "rte: signed_overflow: negation of N cannot be represented in type 'int'; cast to an unsigned type to negate this value to itself",
+    "synthetic": true
+  },
+  "lsan_direct": {
+    "file": "src/demo.c",
+    "line": 14,
+    "function": "make_buf",
+    "kind": "lsan_direct_leak",
+    "alarm_kind": "memory_leak",
+    "predicate": "memory_leak: LeakSanitizer: direct leak allocated in make_buf [line 7af165c654]",
+    "synthetic": true
+  },
+  "lsan_indirect": {
+    "file": "src/demo.c",
+    "line": 45,
+    "function": "heap_overflow",
+    "kind": "lsan_indirect_leak",
+    "alarm_kind": "memory_leak",
+    "predicate": "memory_leak: LeakSanitizer: indirect leak allocated in heap_overflow [line e9536c50ca]",
+    "synthetic": true
+  }
+}

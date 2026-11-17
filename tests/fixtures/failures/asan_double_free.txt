@@ -1,0 +1,10 @@
+==4255==ERROR: AddressSanitizer: attempting double-free on address 0x602000000010 in thread T0:
+    #0 0x55555558a100 in __interceptor_free
+    #1 0x55555558ae20 in release_twice src/demo.c:34:5
+    #2 0x55555558aec0 in LLVMFuzzerTestOneInput harness_demo.c:12:5
+    #3 0x55555558af00 in main
+
+0x602000000010 is located 0 bytes inside of 16-byte region [0x602000000010,0x602000000020)
+freed by thread T0 here:
+    #0 0x55555558a100 in __interceptor_free
+    #1 0x55555558ae20 in release_twice src/demo.c:33:5
