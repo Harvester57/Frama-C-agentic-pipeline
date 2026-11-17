@@ -87,7 +87,8 @@ byte selects it), with arguments built from the model's signature of each functi
     `notes` say which. A function pointer inside a struct stays NULL;
   - argument domains (mpack run-4, `_domain_rules`, `_realloc_like`, `_owned_result`): a value read
     from the input that breaks a documented precondition is normalized after the read, and only
-    then, so slots and seeds do not move: (min, max) bounds ordered (A); a NUL-terminated output's
+    then, so slots and seeds do not move: (min, max) bounds ordered, and a lone bound an inline
+    wrapper forwards to such a range with a literal other bound kept past it (A, `bound_forwards`); a NUL-terminated output's
     capacity and a limit setter's `max_*` at least 1 (B); an initializer's (buffer, size, count)
     count at most the size (C); an enum by value one of its declared constants (D, from the probe);
     a realloc-like call given a harness malloc (E); a heap result or `char **` output the caller
@@ -213,6 +214,9 @@ PATH_SKIP_REASON = (
 # A. The bounds of a range (`min_value`/`max_value`, `lo`/`hi`, `low`/`high`, `lower`/`upper`,
 #    `minimum`/`maximum`: the same name but for that one word, the same scalar type) are ordered, and a
 #    NaN bound of a floating range replaced (MPack: `mpack_assert(min_value <= max_value)`).
+#    A lone bound whose function forwards it to such a range with a literal other bound (an inline
+#    function of the headers, read from the probe's AST: `bound_forwards`) is kept on its side of
+#    that literal (mpack run-4: `mpack_expect_i8_max(reader, -1)` reached the same assert).
 _RANGE_WORDS = frozenset({("min", "max"), ("lo", "hi"), ("low", "high"), ("lower", "upper"), ("minimum", "maximum")})
 # B. The capacity of a writable NUL-terminated output (a byte pair of a function named with the word
 #    `cstr`) is at least 1: room for the terminator (`mpack_node_copy_cstr`: "you must have room for
@@ -420,6 +424,8 @@ class ApiInfo:
     const_returns: set[str] = field(default_factory=set)
     allocating: set[str] = field(default_factory=set)
     limits: dict[str, set[str]] = field(default_factory=dict)
+    # Per function, parameter index -> (">=" or "<=", constant) of a lone range bound (`bound_forwards`).
+    bounds: dict[str, dict[int, tuple[str, str]]] = field(default_factory=dict)
 
 
 class _Case:
@@ -899,6 +905,20 @@ def _domain_rules(
             case.decls.append(f"if ({b} < {a}) {{ {ct} fc_t = {a}; {a} = {b}; {b} = fc_t; }}")
             case.note(call, j, f"range bound: ordered after argument {i} (the API requires {_name(formals, i)} <= {_name(formals, j)})")
             taken |= {i, j}
+    # A': a lone bound forwarded to a range-like callee with a constant other bound (`bound_forwards`).
+    for k, (op, const) in sorted((case.api.bounds.get(name) or {}).items()):
+        if k not in scalars or k in taken or not plain(k):
+            continue
+        num = _number(const)
+        if num is None or (str(params[k]["ctype"]).startswith("unsigned") and num <= 0):
+            continue  # an unsigned value is never below 0, and a negative constant does not fit it
+        v = scalars[k]
+        if params[k]["kind"] == "float":
+            case.decls.append(f"if ({v} != {v}) {{ {v} = {const}; }}")
+        cmp = "<" if op == ">=" else ">"
+        case.decls.append(f"if ({v} {cmp} {const}) {{ {v} = {const}; }}")
+        side = "upper" if op == ">=" else "lower"
+        case.note(call, k, f"range bound: forwarded as the {side} bound of a range whose other bound is {const}: kept {op} {const}")
     lengths = {i + 1: (ln, rest) for i, ln, rest in pairs}
     # B: a NUL-terminated output's capacity; a limit of an initializer or a limit setter.
     if set(_words(name)) & _CSTR_WORDS:
@@ -2137,6 +2157,7 @@ def plan(
         const_returns=set(getattr(visible, "const_returns", None) or ()),
         allocating=allocating_functions(model.get("functions") or {}),
         limits=limit_parameters(model.get("functions") or {}),
+        bounds=dict(getattr(visible, "bound_forwards", None) or {}),
     )
     for key in entries:
         drec = functions.get(key) or {}
@@ -2298,6 +2319,7 @@ class Declared(set):  # type: ignore[type-arg]
     qualified_pointers: dict[str, dict[int, dict[str, str]]]
     enum_params: dict[str, dict[int, list[str]]]
     const_returns: set[str]
+    bound_forwards: dict[str, dict[int, tuple[str, str]]]
 
     def __init__(
         self,
@@ -2308,6 +2330,7 @@ class Declared(set):  # type: ignore[type-arg]
         qualified_pointers: dict[str, dict[int, dict[str, str]]] | None = None,
         enum_params: dict[str, dict[int, list[str]]] | None = None,
         const_returns: set[str] | None = None,
+        bound_forwards: dict[str, dict[int, tuple[str, str]]] | None = None,
     ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
@@ -2322,6 +2345,8 @@ class Declared(set):  # type: ignore[type-arg]
         self.enum_params = enum_params or {}
         # `const_returns`: the functions whose declaration returns a pointer to `const`.
         self.const_returns = set(const_returns or ())
+        # `bound_forwards`: per function, parameter index -> (">=" or "<=", constant) of a lone range bound.
+        self.bound_forwards = bound_forwards or {}
 
 
 def _spelled(t: str) -> str:
@@ -2622,6 +2647,120 @@ def const_returns(tree: dict) -> set[str]:
     return out
 
 
+_TRANSPARENT_EXPRS = frozenset({"ImplicitCastExpr", "ParenExpr", "ConstantExpr"})
+
+
+def _strip_expr(node: Any) -> Any:
+    """`node` without implicit casts and parentheses (an explicit cast stays: it may change the value)."""
+    while isinstance(node, dict) and node.get("kind") in _TRANSPARENT_EXPRS and node.get("inner"):
+        node = node["inner"][0]
+    return node
+
+
+def _literal(node: Any) -> str | None:
+    """The text of an integer or floating literal, a negated one included (`-5`), else None."""
+    node = _strip_expr(node)
+    if not isinstance(node, dict):
+        return None
+    if node.get("kind") in ("IntegerLiteral", "FloatingLiteral") and isinstance(node.get("value"), str):
+        return node["value"]
+    if node.get("kind") == "UnaryOperator" and node.get("opcode") in ("-", "+") and node.get("inner"):
+        inner = _literal(node["inner"][0])
+        if inner is not None and not inner.startswith("-"):
+            return inner if node["opcode"] == "+" else f"-{inner}"
+    return None
+
+
+def _number(text: str) -> float | None:
+    try:
+        return float(int(text, 0))
+    except ValueError:
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+
+def _param_ref(arg: Any, pids: list[str]) -> int | None:
+    """The index of the parameter (by AST id) an argument passes unchanged but for implicit conversions."""
+    a = _strip_expr(arg)
+    decl = a.get("referencedDecl") if isinstance(a, dict) and a.get("kind") == "DeclRefExpr" else None
+    if isinstance(decl, dict) and decl.get("kind") == "ParmVarDecl" and decl.get("id") in pids:
+        return pids.index(decl["id"])
+    return None
+
+
+def bound_forwards(tree: dict) -> dict[str, dict[int, tuple[str, str]]]:
+    """
+    Per function with a body in the probe's AST (an inline function of a header), its lone range
+    bounds (rule A'): parameter index -> (">=", constant) when it passes that parameter, unchanged
+    but for implicit conversions, as the upper bound of a range-like callee (two parameters
+    `_range_partner` pairs, `min_value`/`max_value`) and a literal constant as the lower bound
+    (`mpack_expect_i8_max(reader, max_value)` returns `mpack_expect_i8_range(reader, 0, max_value)`),
+    or ("<=", constant) for a lower bound under a constant upper one. The callee asserts
+    `min <= max`, so a value past the constant is a precondition the wrapper passes on. With several
+    such calls the strictest constant is kept. An explicit cast, an expression or a constant macro
+    that is not a literal gives nothing.
+    """
+    names: dict[str, list[str]] = {}
+    bodies: list[tuple[str, list[str], dict]] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if node.get("kind") != "FunctionDecl":
+            stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+            continue
+        name = node.get("name")
+        if not isinstance(name, str):
+            continue
+        inner = [n for n in node.get("inner") or [] if isinstance(n, dict)]
+        parms = [n for n in inner if n.get("kind") == "ParmVarDecl"]
+        pnames = [str(p.get("name") or "") for p in parms]
+        if all(pnames) and name not in names:
+            names[name] = pnames
+        body = next((n for n in inner if n.get("kind") == "CompoundStmt"), None)
+        if body is not None:
+            bodies.append((name, [str(p.get("id") or "") for p in parms], body))
+
+    def ranges(callee: str) -> list[tuple[int, int]]:
+        ps = names.get(callee) or []
+        return [(i, j) for i in range(len(ps)) for j in range(i + 1, len(ps)) if _range_partner(ps[i], ps[j])]
+
+    out: dict[str, dict[int, tuple[str, str]]] = {}
+    for name, pids, body in bodies:
+        calls: list[dict] = []
+        walk: list[Any] = [body]
+        while walk:
+            cur = walk.pop()
+            if isinstance(cur, dict):
+                if cur.get("kind") == "CallExpr":
+                    calls.append(cur)
+                walk.extend(reversed(cur.get("inner") or []))
+        for call in calls:
+            parts = [n for n in call.get("inner") or [] if isinstance(n, dict)]
+            if not parts:
+                continue
+            ref = _strip_expr(parts[0])
+            callee = str(((ref or {}).get("referencedDecl") or {}).get("name") or "")
+            args = parts[1:]
+            for lo, hi in ranges(callee):
+                if hi >= len(args):
+                    continue
+                for bound, const_at, op in ((hi, lo, ">="), (lo, hi, "<=")):
+                    k, c = _param_ref(args[bound], pids), _literal(args[const_at])
+                    if k is None or c is None or _number(c) is None:
+                        continue
+                    old = out.get(name, {}).get(k)
+                    if old is not None:
+                        if old[0] != op:
+                            continue
+                        prev, new = _number(old[1]), _number(c)
+                        if prev is not None and new is not None and (new <= prev if op == ">=" else new >= prev):
+                            continue
+                    out.setdefault(name, {})[k] = (op, c)
+    return out
+
+
 def _callee_names(model_functions: dict) -> dict[str, set[str]]:
     """Per model function name, the names it calls directly (call sites and external calls)."""
     callees: dict[str, set[str]] = {}
@@ -2880,6 +3019,7 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         qualified_pointer_spellings(tree),
         param_enums(tree),
         const_returns(tree),
+        bound_forwards(tree),
     )
 
 

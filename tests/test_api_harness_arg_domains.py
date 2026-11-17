@@ -52,6 +52,23 @@ AD_RECS: dict[str, tuple[str, list[tuple[str, str]], list[str]]] = {
         [("r", "pointer"), ("min_value", "value"), ("max_value", "value")],
         [],
     ),
+    # A': one bound forwarded to a range with a constant other bound (mpack_expect_i8_max calls
+    # mpack_expect_i8_range(reader, 0, max_value)), as the probe reads the inline body.
+    "rd_i8_max": (
+        "signed char(struct rd *,signed char)",
+        [("r", "pointer"), ("max_value", "value")],
+        ["rd_i8_range"],
+    ),
+    "rd_u8_max": (
+        "unsigned char(struct rd *,unsigned char)",
+        [("r", "pointer"), ("max_value", "value")],
+        ["rd_u8_range"],
+    ),
+    "rd_double_min": (
+        "double(struct rd *,double)",
+        [("r", "pointer"), ("min_value", "value")],
+        ["rd_double_range"],
+    ),
     "clampi": ("int(int,int,int)", [("v", "value"), ("lo", "value"), ("hi", "value")], []),
     "addi": ("int(int,int)", [("a", "value"), ("b", "value")], []),
     # B: NUL-terminated output capacity; a byte copy may take 0.
@@ -134,6 +151,12 @@ AD_LAYOUTS = {
 # What the layout probe reads from the headers (`param_enums`, `const_returns`).
 AD_ENUMS = {"type_name": {0: ["TY_NIL", "TY_INT", "TY_STR"]}}
 AD_CONST_RETURNS = {"type_name", "flag_name", "rd_name_alloc"}
+# `bound_forwards`: a lone bound a function forwards to a range-like callee with a constant other bound.
+AD_BOUNDS = {
+    "rd_i8_max": {1: (">=", "0")},
+    "rd_u8_max": {1: (">=", "0")},
+    "rd_double_min": {1: ("<=", "100.5")},
+}
 
 
 def _ad_plan(
@@ -170,6 +193,7 @@ def _ad_plan(
         None,
         enum_params=AD_ENUMS if enums is None else enums,
         const_returns=AD_CONST_RETURNS,
+        bound_forwards=AD_BOUNDS,
     )
     return ah.plan(dag, model, "lib", "lib", 64, None, None, AD_LAYOUTS, declared)
 
@@ -210,6 +234,99 @@ def test_a_floating_range_replaces_nan_bounds_then_orders(ad_plan):
     assert "if (c0a1 != c0a1) { c0a1 = 0; }" in text, text
     assert "if (c0a2 != c0a2) { c0a2 = c0a1; }" in text, text
     assert "if (c0a2 < c0a1) { double fc_t = c0a1; c0a1 = c0a2; c0a2 = fc_t; }" in text, text
+
+
+def test_a_lone_bound_forwarded_to_a_range_keeps_the_constant_other_bound(ad_plan):
+    # mpack run-4, verify-mpack_expect_i8_range_6856d80f4e: mpack_expect_i8_max(reader, -1) calls
+    # mpack_expect_i8_range(reader, 0, -1), whose `min_value <= max_value` assert is a UBSan unreachable.
+    text, lay = _ad_case(ad_plan, "rd_i8_max")
+    assert "if (c0a1 < 0) { c0a1 = 0; }" in text, text
+    assert text.index("if (c0a1 < 0)") < _call_at(text, "rd_i8_max")
+    assert [s["param"] for s in lay["slots"] if s["call"] == 0] == [1], lay
+    assert any("forwarded" in n for n in lay.get("notes") or []), lay
+    # The mirror: a lone lower bound under a constant upper bound; NaN replaced first.
+    text, _ = _ad_case(ad_plan, "rd_double_min")
+    assert "if (c0a1 != c0a1) { c0a1 = 100.5; }" in text, text
+    assert "if (c0a1 > 100.5) { c0a1 = 100.5; }" in text, text
+
+
+def test_an_unsigned_bound_above_zero_needs_no_rewrite(ad_plan):
+    text, _ = _ad_case(ad_plan, "rd_u8_max")
+    assert "c0a1 < 0" not in text, text
+
+
+def test_a_lone_max_that_is_forwarded_to_no_range_is_not_clamped_by_the_bound_rule(ad_plan):
+    # A limit (0 may mean "unlimited", as mpack_tree_init_stdfile's max_bytes) is not a range bound.
+    for fn, var in (("tr_init_file", "c0a2"), ("tr_peek", "c0a1")):
+        text, _ = _ad_case(ad_plan, fn)
+        assert f"if ({var} < 0)" not in text and f"{var} < 1" not in text, (fn, text)
+
+
+def _bf_call(callee: str, *args: dict[str, Any]) -> dict[str, Any]:
+    fn_ref = {
+        "kind": "ImplicitCastExpr",
+        "inner": [
+            {"kind": "DeclRefExpr", "referencedDecl": {"id": f"f_{callee}", "kind": "FunctionDecl", "name": callee}}
+        ],
+    }
+    return {"kind": "CallExpr", "inner": [fn_ref, *args]}
+
+
+def _bf_parm_ref(pid: str, name: str) -> dict[str, Any]:
+    ref = {"kind": "DeclRefExpr", "referencedDecl": {"id": pid, "kind": "ParmVarDecl", "name": name}}
+    return {"kind": "ImplicitCastExpr", "castKind": "LValueToRValue", "inner": [ref]}
+
+
+def _bf_int(value: str) -> dict[str, Any]:
+    return {"kind": "ImplicitCastExpr", "inner": [{"kind": "IntegerLiteral", "value": value}]}
+
+
+def _bf_fn(name: str, parms: list[tuple[str, str]], body: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    inner: list[dict[str, Any]] = [
+        {"kind": "ParmVarDecl", "id": pid, "name": pname, "type": {"qualType": "int"}} for pid, pname in parms
+    ]
+    if body is not None:
+        inner.append({"kind": "CompoundStmt", "inner": [{"kind": "ReturnStmt", "inner": body}]})
+    return {"kind": "FunctionDecl", "name": name, "type": {"qualType": "int (int, int)"}, "inner": inner}
+
+
+def test_bound_forwards_reads_an_inline_body_of_the_clang_ast():
+    rng = _bf_fn("i8_range", [("p0", "reader"), ("p1", "min_value"), ("p2", "max_value")])
+    lone_max = _bf_fn(
+        "i8_max",
+        [("q0", "reader"), ("q1", "max_value")],
+        [_bf_call("i8_range", _bf_parm_ref("q0", "reader"), _bf_int("0"), _bf_parm_ref("q1", "max_value"))],
+    )
+    neg = {"kind": "UnaryOperator", "opcode": "-", "inner": [{"kind": "IntegerLiteral", "value": "5"}]}
+    lone_min = _bf_fn(
+        "i8_min",
+        [("s0", "reader"), ("s1", "min_value")],
+        [_bf_call("i8_range", _bf_parm_ref("s0", "reader"), _bf_parm_ref("s1", "min_value"), neg)],
+    )
+    # Both bounds forwarded (rule A covers the pair), a cast bound (its value may change), and a call
+    # to a function with no range pair: none gives a bound.
+    both = _bf_fn(
+        "i8_both",
+        [("t0", "reader"), ("t1", "lo"), ("t2", "hi")],
+        [_bf_call("i8_range", _bf_parm_ref("t0", "reader"), _bf_parm_ref("t1", "lo"), _bf_parm_ref("t2", "hi"))],
+    )
+    cast = {"kind": "CStyleCastExpr", "inner": [_bf_parm_ref("u1", "max_value")]}
+    casted = _bf_fn(
+        "i8_cast",
+        [("u0", "reader"), ("u1", "max_value")],
+        [_bf_call("i8_range", _bf_parm_ref("u0", "reader"), _bf_int("0"), cast)],
+    )
+    put = _bf_fn("put", [("v0", "reader"), ("v1", "a"), ("v2", "b")])
+    other = _bf_fn(
+        "put_max",
+        [("w0", "reader"), ("w1", "max_bytes")],
+        [_bf_call("put", _bf_parm_ref("w0", "reader"), _bf_int("0"), _bf_parm_ref("w1", "max_bytes"))],
+    )
+    tree = {"kind": "TranslationUnitDecl", "inner": [rng, lone_max, lone_min, both, casted, put, other]}
+    assert ah.bound_forwards(tree) == {"i8_max": {1: (">=", "0")}, "i8_min": {1: ("<=", "-5")}}
+    _, declared = ah.record_layouts(tree)
+    assert isinstance(declared, ah.Declared)
+    assert declared.bound_forwards == {"i8_max": {1: (">=", "0")}, "i8_min": {1: ("<=", "-5")}}
 
 
 def test_lo_hi_is_a_range_and_two_unrelated_integers_are_not(ad_plan):
@@ -443,6 +560,8 @@ void rd_init(struct rd *r, char *buffer, size_t size, size_t count);
 void rd_destroy(struct rd *r);
 unsigned char rd_u8_range(struct rd *r, unsigned char min_value, unsigned char max_value);
 double rd_double_range(struct rd *r, double min_value, double max_value);
+signed char rd_i8_range(struct rd *r, signed char min_value, signed char max_value);
+inline signed char rd_i8_max(struct rd *r, signed char max_value) { return rd_i8_range(r, 0, max_value); }
 void rd_copy_cstr(struct rd *r, char *buffer, size_t bufsize);
 char *rd_cstr_alloc(struct rd *r, size_t maxsize);
 const char *ty_name(ty_t type);
@@ -471,6 +590,11 @@ double rd_double_range(struct rd *r, double min_value, double max_value) {
     REQUIRE(min_value <= max_value);
     return r->count ? max_value : min_value;
 }
+signed char rd_i8_range(struct rd *r, signed char min_value, signed char max_value) {
+    REQUIRE(min_value <= max_value);
+    return r->count ? max_value : min_value;
+}
+extern inline signed char rd_i8_max(struct rd *r, signed char max_value);
 void rd_copy_cstr(struct rd *r, char *buffer, size_t bufsize) {
     REQUIRE(bufsize >= 1);
     size_t n = r->count < bufsize - 1 ? r->count : bufsize - 1;
@@ -525,6 +649,12 @@ AD_E2E_RECS: dict[str, tuple[str, list[tuple[str, str]], list[str]]] = {
     "rd_destroy": ("void(struct rd *)", [("r", "pointer")], []),
     "rd_u8_range": AD_RECS["rd_u8_range"],
     "rd_double_range": AD_RECS["rd_double_range"],
+    "rd_i8_range": (
+        "signed char(struct rd *,signed char,signed char)",
+        [("r", "pointer"), ("min_value", "value"), ("max_value", "value")],
+        [],
+    ),
+    "rd_i8_max": AD_RECS["rd_i8_max"],
     "rd_copy_cstr": AD_RECS["rd_copy_cstr"],
     "rd_cstr_alloc": ("char *(struct rd *,unsigned long)", [("r", "pointer"), ("maxsize", "value")], ["malloc"]),
     "ty_name": ("char *(enum ty)", [("type", "value")], []),
@@ -571,6 +701,8 @@ def test_cases_respect_the_preconditions_of_a_real_header_and_fuzz_clean(tmp_pat
     assert declared.enum_params["err_name"] == {0: ["E_OK", "E_IO", "E_BUG"]}
     # A flag enum (`1 << n` initializers, evaluated by clang) is left as read: callers combine them.
     assert "fl_name" not in declared.enum_params, declared.enum_params
+    # The inline wrapper's body, as real clang dumps it: its lone upper bound stays >= 0.
+    assert declared.bound_forwards == {"rd_i8_max": {1: (">=", "0")}}, declared.bound_forwards
     recs = AD_E2E_RECS
     functions = {n: {"name": n, "file": "lib.c", "is_static": False, "module": "lib"} for n in recs}
     dag = {
