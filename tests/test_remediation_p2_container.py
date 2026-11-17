@@ -209,6 +209,18 @@ def test_compose_identity_check_sees_every_service(old, new, count):
     assert _compose_identity_errors(mutated)
 
 
+def test_compose_services_cap_core_dumps_like_the_wrappers():
+    """S11: every compose service carries the wrappers' container-wide core limit (soft = hard = 1 byte)."""
+    from sandbox_exec import CORE_LIMIT_BYTES
+
+    blocks = _compose_service_blocks(_read("docker-compose.yml"))
+    assert tuple(blocks) == COMPOSE_SERVICES
+    for name, block in blocks.items():
+        m = re.search(r"^\s+ulimits:\s*\n\s+core:\s*\n\s+soft:\s*(\d+)\s*\n\s+hard:\s*(\d+)\s*$", block, re.M)
+        assert m, f"{name}: no ulimits.core"
+        assert (int(m.group(1)), int(m.group(2))) == (CORE_LIMIT_BYTES, CORE_LIMIT_BYTES), name
+
+
 def test_ps1_passes_the_host_user_on_linux_and_macos_like_the_sh_wrapper():
     ps1 = _read("wrappers/framac-docker.ps1")
     assert '$OuterSandbox -eq "docker-hardened" -and ($IsLinux -or $IsMacOS)' in ps1

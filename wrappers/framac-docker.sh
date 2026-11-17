@@ -35,7 +35,8 @@
 # writable only for the exactly allowlisted trusted commands (read-only everywhere with
 # FRAMAC_CACHE_RW=off; --cache-rw is the default and kept for compatibility).
 # Hardening: --network none, --cap-drop ALL, no-new-privileges, the engine's default
-# seccomp and AppArmor/SELinux profiles, cpu/memory/pids limits, allowlisted environment.
+# seccomp and AppArmor/SELinux profiles, cpu/memory/pids limits, a 1-byte core
+# limit (--ulimit core=1:1), allowlisted environment.
 # The container is the isolation boundary; target-controlled binaries run through
 # scripts/sandbox_exec.py (rlimits, env allowlist, timeout) with no filesystem
 # isolation inside the container.
@@ -364,7 +365,11 @@ if [[ -n "${TARGET_COMMIT}" ]]; then
     fi
 fi
 
-HARDENING=(--rm -i --network none --cap-drop ALL --security-opt no-new-privileges)
+# --ulimit core=1:1: every process in the container starts with a 1-byte core limit it cannot raise
+# (soft = hard = sandbox_exec's CORE_LIMIT_BYTES; resources.py CORE_ULIMIT_ARGS). Docker Desktop on WSL2
+# pipes cores to the host's crash capture, which ignores a limit of 0 and wrote a 23 GB dump that filled
+# the disk. A process that lowers its own limit to 0 (`ulimit -c 0`) re-enables that pipe dump.
+HARDENING=(--rm -i --network none --cap-drop ALL --security-opt no-new-privileges --ulimit core=1:1)
 if [[ "${OUTER_SANDBOX}" == "docker-hardened" ]]; then
     HARDENING+=(--user "$(id -u):$(id -g)")
 fi

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -39,6 +40,46 @@ def test_preexec_sets_core_limit_to_one_byte(monkeypatch):
     assert S.CORE_LIMIT_BYTES == 1
     assert calls["core"] == (1, 1)
     assert calls["cpu"] == (600, 600) and "as" not in calls
+
+
+# Every pipeline container carries this core limit (S11): a process not started by sandbox_exec
+# (an agent's ad-hoc reproduction of an E-ACSL abort) streamed a 23 GB core to WSL's crash capture.
+CORE_ULIMIT_PAIR = ("--ulimit", f"core={S.CORE_LIMIT_BYTES}:{S.CORE_LIMIT_BYTES}")
+
+
+def test_wrappers_cap_core_dumps_for_every_container_they_start():
+    import resources as R
+
+    assert R.CORE_ULIMIT_ARGS == CORE_ULIMIT_PAIR
+    sh = _read("wrappers/framac-docker.sh")
+    ps1 = _read("wrappers/framac-docker.ps1")
+    # In the hardening flags, which both the broker and the --no-broker path pass to `<engine> run`.
+    hardening = re.search(r"^HARDENING=\((.*)\)$", sh, re.M)
+    assert hardening and f"{CORE_ULIMIT_PAIR[0]} {CORE_ULIMIT_PAIR[1]}" in hardening.group(1)
+    assert sh.count('"${ENGINE}" run "${HARDENING[@]}"') == 2
+    block = ps1.split("$hardeningArgs = @(", 1)[1].split(")", 1)[0]
+    assert f'"{CORE_ULIMIT_PAIR[0]}", "{CORE_ULIMIT_PAIR[1]}"' in block
+    assert ps1.count("$hardeningArgs + $labelArgs") == 2
+
+
+def test_cache_volume_init_container_caps_core_dumps(tmp_path, monkeypatch):
+    import subprocess
+
+    import resources as R
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kw):
+        calls.append(list(argv))
+        code = 1 if argv[1:3] == ["volume", "inspect"] else 0
+        return subprocess.CompletedProcess(argv, code, "", "")
+
+    monkeypatch.setattr(R.subprocess, "run", fake_run)
+    assert R.ensure_cache_volume("docker", "framac-cache-x", "sha256:feedface", tmp_path) is None
+    runs = [argv for argv in calls if argv[1] == "run"]
+    assert len(runs) == 1
+    pairs = list(zip(runs[0], runs[0][1:], strict=False))
+    assert pairs.count(CORE_ULIMIT_PAIR) == 1
 
 
 @pytest.mark.skipif(os.name != "posix", reason="sandbox_mode() is 'rlimits' only on POSIX hosts")
@@ -197,6 +238,7 @@ def _assert_broker_flags(args, pairs, job_class):
     assert ("--entrypoint", "/bin/bash") in pairs and "/opt/framac-pipeline/skills:ro" in " ".join(args)
     assert env["FRAMAC_SHARED_CACHE_DIR"] == "/framac-cache" and env["FRAMAC_CACHE_MODE"] in ("ro", "rw")
     assert args.index("--init") < args.index("--network")  # injected before the caller's hardening flags
+    assert list(zip(args, args[1:], strict=False)).count(CORE_ULIMIT_PAIR) == 1  # S11: once, from the hardening
     return env
 
 
@@ -242,6 +284,7 @@ def test_wrappers_divide_cpu_memory_pids_and_mount_skills(tmp_path):
     assert "/opt/framac-pipeline/skills:ro" in docker_invocation
     # The legacy path keeps today's static flags: no lease, no entry shim, the command string last.
     assert "--init" not in args and "--entrypoint" not in args and args[-1] == "true"
+    assert list(zip(args, args[1:], strict=False)).count(CORE_ULIMIT_PAIR) == 1  # S11
     labels = [b for a, b in zip(args, args[1:], strict=False) if a == "--label"]
     assert [lab.split("=", 1)[0] for lab in labels] == ["framac.repo", "framac.run"]  # identity only, no lease
 
@@ -334,6 +377,7 @@ def test_sh_wrapper_broker_and_legacy_paths(tmp_path):
     assert proc.returncode == 0, proc.stderr
     args, pairs = _engine_run_args(log_file)
     assert ("--pids-limit", "1365") in pairs and "--init" not in args and args[-1] == "true"
+    assert list(zip(args, args[1:], strict=False)).count(CORE_ULIMIT_PAIR) == 1  # S11
 
     proc = subprocess.run([*base, "--class", "wp", "--", "true"], env=env, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
