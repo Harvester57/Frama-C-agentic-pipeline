@@ -7,7 +7,9 @@ Ingest follows `tests/test_r2_ledger_seed_fuzz.py`: a seeded ledger in a run dir
 import pytest
 
 import ledger as L
+import run_eacsl_fuzz as R
 from conftest import write_json
+from fingerprint import make_fingerprint
 from test_ledger import load, seed, units_by_id
 from validate_artifacts import validate_ledger
 
@@ -161,3 +163,83 @@ def test_without_a_usable_coverage_report_the_clean_evidence_says_unmeasured(run
         summary = evidence[0]["summary"]
         assert summary.startswith("E-ACSL + LibFuzzer campaign found no failure (not a proof).")
         assert summary.endswith(f"Which functions ran was not measured ({reason}).")
+
+
+# ----------------------------------------------------------------- engines that did not complete (F9)
+
+PRED = "mem_access: \\valid_read(buf + off)"
+
+
+def _engine_run(status: str, artifacts=(), error_summary=None, returncode: int = 0) -> dict:
+    run = {"status": status, "returncode": returncode, "timed_out": False, "artifacts": list(artifacts)}
+    if error_summary is not None:
+        run["error_summary"] = error_summary
+    return run
+
+
+def _asan_crash(run_dir) -> dict:
+    crash = run_dir / "workspace/crashes/snmp/crash-abc"
+    crash.parent.mkdir(parents=True, exist_ok=True)
+    crash.write_bytes(b"\x30\x84")
+    return {
+        "artifact": str(crash),
+        "kind": "crash",
+        "sha256": "x",
+        "size_bytes": 2,
+        "reproducible": True,
+        "fingerprint": make_fingerprint("src/snmp/ber.c", "ber_decode_len", "mem_access", PRED),
+        "failure": {
+            "file": "/framac-run/workspace/work/src/snmp/ber.c",
+            "function": "ber_decode_len",
+            "line": 42,
+            "kind": "asan_heap_buffer_overflow",
+            "alarm_kind": "mem_access",
+            "is_rte": True,
+            "predicate": PRED,
+        },
+    }
+
+
+def test_merge_records_the_engine_that_failed(run_dir):
+    merged = R.merge_engine_campaigns(
+        {
+            "sanitizers": _engine_run("crash_found", [_asan_crash(run_dir)]),
+            "eacsl": _engine_run("fuzzer_error", returncode=1, error_summary=["libFuzzer exited 1"]),
+        }
+    )
+    assert merged["status"] == "crash_found"
+    assert merged["engine_errors"] == {"eacsl": {"status": "fuzzer_error", "reason": "libFuzzer exited 1"}}
+
+
+def test_merge_names_the_return_code_when_the_engine_recorded_no_reason(run_dir):
+    merged = R.merge_engine_campaigns({"eacsl": _engine_run("fuzzer_error", returncode=3)})
+    assert merged["status"] == "fuzzer_error"
+    assert merged["engine_errors"] == {"eacsl": {"status": "fuzzer_error", "reason": "returncode 3"}}
+
+
+def test_merge_without_a_failed_engine_has_no_engine_errors(run_dir):
+    merged = R.merge_engine_campaigns({"sanitizers": _engine_run("clean"), "eacsl": _engine_run("clean")})
+    assert merged["status"] == "clean"
+    assert "engine_errors" not in merged
+
+
+def test_an_asan_crash_and_an_eacsl_fuzzer_error_are_both_ingested(run_dir):
+    seed(run_dir)
+    merged = R.merge_engine_campaigns(
+        {
+            "sanitizers": _engine_run("crash_found", [_asan_crash(run_dir)]),
+            "eacsl": _engine_run("fuzzer_error", returncode=1, error_summary=["libFuzzer exited 1"]),
+        }
+    )
+    merged["module"] = "snmp"
+    write_json(run_dir / "workspace/reports/fuzz/snmp.json", merged)
+    L.cmd_ingest_fuzz([run_dir / "workspace/reports/fuzz/snmp.json"])
+    fp = make_fingerprint("src/snmp/ber.c", "ber_decode_len", "mem_access", PRED)
+    cand = {c["fingerprint"]: c for c in load(run_dir / "candidates.json")}[fp]
+    assert cand["linked_units"] == ["src/snmp/ber.c#ber_decode_len::rte"]
+    expected = "eacsl campaign did not run to completion (libFuzzer exited 1); the other engine's results are ingested."
+    snmp = {k: v for k, v in _fuzz_evidence(run_dir).items() if k.startswith("src/snmp/")}
+    for coverage_id, evidence in snmp.items():
+        errors = [e for e in evidence if e["result"] == "fuzz_fuzzer_error"]
+        assert [e["summary"] for e in errors] == [expected], coverage_id
+        assert all(e["discharging"] is False for e in errors)

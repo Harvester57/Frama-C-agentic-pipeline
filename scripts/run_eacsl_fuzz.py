@@ -749,6 +749,18 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
     }
     if errors := [f"{engine}: {e}" for engine, run in runs.items() for e in run.get("error_summary") or []]:
         merged["error_summary"] = errors
+    # An engine that did not run to completion stays visible even when another engine's crash is the
+    # merged status (F9): ledger ingest reads this, not only the status.
+    if engine_errors := {
+        engine: {
+            "status": "fuzzer_error",
+            "reason": "; ".join(str(e) for e in run.get("error_summary") or [])
+            or f"returncode {run.get('returncode')}",
+        }
+        for engine, run in runs.items()
+        if run.get("status") == "fuzzer_error"
+    }:
+        merged["engine_errors"] = engine_errors
     return merged
 
 

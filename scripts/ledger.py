@@ -1164,6 +1164,21 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
         # A sub-module's campaign speaks for the functions in its scope, within its link unit.
         mod_units = _module_units(units, *_report_scope(mm, module))
         engine_note = fuzz_engine_note(report)
+        # Each engine that failed is recorded on the module's units whatever the merged status is: a crash
+        # by the other engine does not hide it (F9). Placed before the status dispatch, so every branch reaches it.
+        engine_errors = report.get("engine_errors")
+        for engine, err in engine_errors.items() if isinstance(engine_errors, dict) else []:
+            reason = str((err or {}).get("reason") or "no reason recorded")
+            for u in mod_units:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_fuzzer_error",
+                    False,
+                    tool_output,
+                    f"{engine} campaign did not run to completion ({reason}); the other engine's results are ingested.",
+                )
 
         if status == "clean":
             ingested_modules.append(module)
