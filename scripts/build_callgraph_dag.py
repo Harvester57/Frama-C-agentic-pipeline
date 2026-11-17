@@ -1208,7 +1208,8 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
     - one module per non-test link unit, libraries first: its own sources plus those of the project
       libraries it links (`required_sources`), its compile flags (`unit_cppflags`), the libraries it
       links from outside the project (`ldflags`, `unit_link_options`), its API entry points (exported
-      functions, `main` for an executable, and an executable's embedded API), `concurrent`;
+      functions, `main` for an executable, and an executable's embedded API, then a library's
+      functions defined in its public headers, `header_api`), `concurrent`;
     - a source file belongs to the first unit that compiles it, a header function to the first unit
       it is compiled into;
     - each function keeps its path module (`lexer_module`); the path modules are kept under
@@ -1282,6 +1283,11 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
         fn_set = {k for k in fns if not functions[k].get("model_only")}  # entry points the build defines
         api = [*(rec.get("entry_points") or []), *(rec.get("embedded_api") or [])]
         entries = [k for k in dict.fromkeys(key_of[e] for e in api if e in key_of) if k in fn_set]
+        entries = entries or [k for k in fns if k in fn_set and not functions[k].get("is_static")]
+        # Functions defined in a public header (no global symbol) come after the global ones, so
+        # their harness cases follow the existing ones (docs/plans/header-entry-points-plan.md, HD4).
+        header = [key_of[e] for e in rec.get("header_api") or [] if e in key_of]
+        entries += [k for k in dict.fromkeys(header) if k in fn_set and k not in entries]
         sources = compiled.map(sources)
         flags, forced = unit_cppflags(list(rec.get("cppflags") or []), include_dirs(sources, capture), root)
         modules[name] = {
@@ -1302,7 +1308,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "ldflags": link_options.get(u, []),
             "function_count": len(fns),
             "functions": fns,
-            "candidate_entry_points": entries or [k for k in fns if k in fn_set and not functions[k].get("is_static")],
+            "candidate_entry_points": entries,
             "lexer_modules": sorted({functions[k]["lexer_module"] for k in fns if functions[k].get("lexer_module")}),
             # Step I7: the threat model's status for the unit (each function's `trust` holds its own).
             "threat_model": (rec.get("trust") or {}).get("threat_model"),
