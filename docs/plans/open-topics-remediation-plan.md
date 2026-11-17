@@ -199,7 +199,7 @@ Two more rules for this plan:
   - **E-ACSL:** `-e-acsl-full-mtracking` aborts on a `register` local (`Cil.mkAddrOf`). Workaround: `-Dregister=` in the E-ACSL frontend.
   - **Kernel printer:** `_Alignas` of a struct or union member printed after the declarator. Workaround: `rewrite_trailing_alignas`.
   - **E-ACSL:** `Unregistered("__gmpz_clear")` when the target includes `<gmp.h>` and E-ACSL needs GMP itself. No workaround: modules fall back to sanitizers.
-  - **E-ACSL:** `static const` union, `implicit cast ... to void *`. No workaround yet: see O9.
+  - **E-ACSL:** `static const` union, `implicit cast ... to void *`. Since O9 (2026-11-17) the E-ACSL frontend drops the `const` in its own text; a form the rewrite misses is a `build-check` row with `rewrite_missed`.
   - **Kernel:** `offsetof(T, m[i])` with a non-constant index (`Index is not constant`). Workaround: `fc_cpp_wrapper.py`.
 - **Work:** one draft per bug in `docs/upstream/frama-c/`, in the format of `frama-c-eacsl-formal-params-initialized.md`. Add the three E-ACSL ones to [`../upstream/frama-c/frama-c-e-acsl-issues.md`](../upstream/frama-c/frama-c-e-acsl-issues.md) as Issues 15–17. Filing them, and Issues 13 and 14 (drafted, not filed), stays the user's decision.
 
@@ -321,6 +321,31 @@ Rules for these steps, on top of "Rules for every step":
 
 After they land, `p1/s6b-wide-selector` and `feat/header-entry-points` are rebased again: O4 and O10 change `api_harness.py`, `generate_harness.py` and `harness_reach.py`, which both branches also change.
 
+### Result (2026-11-17)
+
+All six branches came back the same day. Each diff was read, and the six were merged together on `ot/combined` (cut from the commit of this review), where the checks ran on the combination.
+
+| Steps | Branch | What it does | Verified | Not verified |
+| :--- | :--- | :--- | :--- | :--- |
+| O4 | `ot/o4-api-headers` | Without `--header`, an `--api` harness includes the capture's public headers that the unit's compiles include, and the internal ones declaring an entry point no public header declares (`api_harness.capture_headers`). The choice is in the sidecar (`api_headers`). | Unit tests with a fake harness writer and probe. | The real writer and compiler with capture headers; nettle (O6). |
+| O5 | `ot/o5-negotiation-cap` | The cap is checked where requests join the task, where a round would reopen, and before every dispatch. A request an agent was handed is closed as `closed after dispatch`. | A replay of run 1's sequence and four more unit tests; four of the five fail on the code before. | A real Phase 3 run. |
+| O7 | `ot/o7-system-headers` | The build image's `linux-libc-dev` headers and `elf.h` are exported to `<snapshot>/libc/` and searched before the analysis image's. The order is in `target_env.with_include_flags(nostdinc=True)`; `-idirafter` is matched as a whole token. | Unit tests; one Docker test: a capture in `framac-build`, a Frama-C parse in `framac-analysis`, every such header read from the snapshot. | A target run. The Docker test was not run against the code before. |
+| O9 | `ot/o9-const-union` | `fc_cpp_wrapper_eacsl.py` blanks `const` in `static const union` objects. The build report counts it (`compile.const_union_rewrites`), `REPORT.md` names the modules. Switch: `REWRITE_STATIC_CONST_UNIONS`. | Unit tests; one Docker test: the reproduction builds and runs with the rewrite, fails with `implicit cast` without. | The ten nettle modules (O6). |
+| O10 | `ot/o10-stdin-entry` | `--entry-style stdin`: the fuzz side feeds each input through a fresh pipe on fd 0 after purging stdio; Eva reads Frama-C's model of stdin; the reach gate treats it as `argv`. | Unit tests; three Docker tests (plain clang, E-ACSL libFuzzer build, Eva). | A target (libpng `pngfix`); inputs above 64 KiB are rejected, untested; a program that closes stdin. |
+| O11, O12 | `ot/o11-o12-small` | Each prover candidate keeps `candidates/c<n>/candidate.patch`, at most 256 KiB. The allocation race test fails on a duplicate, passes a correct allocation, skips on a Git Bash fork failure. | Unit tests; 100 stress rounds of the race on this host. | A real prover run. One failure of the first version of the O12 check was not captured and did not come back. |
+
+Decisions taken in review:
+- **O4:** the first version failed a module whose chosen header did not compile in the harness, where the module had a harness with fewer cases before. Sent back: the choice now degrades in steps (all chosen headers, the public ones alone, none) and records each abandoned step (`api_headers.fallbacks`). A given `--header` still fails.
+- **O5:** the cap is a hard cap. The earlier exemption for a callee whose last round was applied is gone, as this plan's goal states. Consequences: a callee whose negotiations were applied three times refuses a fourth request, and a third round that ends in an invalid result gets no retry.
+- **O7:** the analysis image's `/usr/include` directories stay last for every capture, not only an older one. The export holds what the build's dependency lists name; a Frama-C parse can reach other libc headers.
+- **O9:** the first version gave a module with a form the rewrite misses (no `static`, a typedef name, `const` after the type) no way to continue. Sent back: the row keeps the sanitizers command and carries `rewrite_missed`.
+
+Found outside the steps:
+- **Fixed on `ot/combined`:** `stub_gen.system_path` did not map `snapshot/libc/` back to a system path; the `--api` re-plan with NULL callbacks lost the variadic call sites; the `--header` help text and the skill's `--entry-style` list were out of date.
+- **Recorded as open** in [`../troubleshooting/README.md`](../troubleshooting/README.md)'s documents: E-ACSL's format validation aborts on a `*` width or precision (upstream, no draft yet); two negotiate close paths in `wp_scheduler.py`; package headers behind symlinks in the snapshot's `root/`.
+
+Checks on `ot/combined`: see the Status table. Landing waits until no run reads the main checkout's scripts.
+
 ## Status
 
 | ID | Status |
@@ -331,13 +356,15 @@ After they land, `p1/s6b-wide-selector` and `feat/header-entry-points` are rebas
 | O1 | done 2026-11-10: tests, plus a fix for the `needs_validation` regression and the safety-net reason they found |
 | O2 | done 2026-11-10: a seed reproducing a known bug elsewhere in the module stopped the replay; such inputs are now excluded (evidence kept in `targets/libmnl/ab-2026-11-09-tier6/`) |
 | O3 | done 2026-11-11 by another route (the model's defined globals); unit-tested only, acceptance with O6 |
-| O4 | dispatched 2026-11-17, `ot/o4-api-headers` |
-| O5 | dispatched 2026-11-17, `ot/o5-negotiation-cap` |
-| O6 | waits for O4, then the user |
-| O7 | dispatched 2026-11-17, `ot/o7-system-headers` |
+| O4 | done 2026-11-17 on `ot/o4-api-headers`: capture headers for `--api` without `--header`, degrading in steps; unit-tested only, nettle acceptance with O6 |
+| O5 | done 2026-11-17 on `ot/o5-negotiation-cap`: run 1 had no per-callee cap yet and its `not dispatched:` note was typed by hand; today's scheduler let follow-up, requeue and retry rounds past the cap. Hard cap before every dispatch; unit-tested only |
+| O6 | waits for the O4, O7, O9 and O10 changes to land, then the user |
+| O7 | done 2026-11-17 on `ot/o7-system-headers`: libc gaps exported to the snapshot's `libc/`, order in `target_env.with_include_flags(nostdinc=True)`, exact `-idirafter` match; Docker-verified on a fixture, no target run |
 | O8 | done 2026-11-15 |
-| O9 | decided 2026-11-17 (accept); dispatched, `ot/o9-const-union` |
-| O10 | dispatched 2026-11-17, `ot/o10-stdin-entry` |
-| O11 | dispatched 2026-11-17, `ot/o11-o12-small` |
-| O12 | dispatched 2026-11-17, `ot/o11-o12-small` |
+| O9 | done 2026-11-17 on `ot/o9-const-union`: E-ACSL-only rewrite, counted and reported, switch `REWRITE_STATIC_CONST_UNIONS`; Docker-verified on a reproduction, nettle modules with O6 |
+| O10 | done 2026-11-17 on `ot/o10-stdin-entry`: `--entry-style stdin`; Docker-verified on two small programs (clang, E-ACSL, Eva), no target run |
+| O11 | done 2026-11-17 on `ot/o11-o12-small`: `candidates/c<n>/candidate.patch`, at most 256 KiB; unit-tested only |
+| O12 | done 2026-11-17 on `ot/o11-o12-small`: duplicate fails, correct allocation passes, Git Bash fork failure skips |
 | O13 | done 2026-11-17 |
+
+**Where the 2026-11-17 steps are:** merged together on the local branch `ot/combined`, with the review fixes. Not on `phase1-remediation`, not pushed. Checks on `ot/combined` (2026-11-17): `ruff check` and `mypy scripts tests` pass, `tools/check_generated_text.py` and the mirror check pass, `pytest -n 8`: 6113 passed, 228 skipped; with `FRAMAC_DOCKER_TESTS=1` the five Docker tests of O7, O9 and O10 pass. No target was run.
