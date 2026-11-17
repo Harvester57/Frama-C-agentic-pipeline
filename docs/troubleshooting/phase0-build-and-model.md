@@ -37,6 +37,13 @@ Issues encountered during build capture (`build_capture.py`), Phase 0 model pars
 - **Cause:** the target's working tree has CRLF line endings (`core.autocrlf=true`, or a `.gitattributes` `text` rule with the platform's native `eol`). `#!/bin/sh\r` or `#!/bin/sh -e\r` cannot run in the container, so `autogen.sh`, `config.sub`, `configure.ac`, `aclocal.m4` and every script fail. The git index is LF; only the checkout is wrong. Found on nettle (`file config.sub` says "with CRLF line terminators") and libseccomp (`autogen.sh` shebang triggers `/bin/sh: 0: Illegal option -`). This is a target-side checkout issue, not a pipeline defect.
 - **Fix:** check the target out as LF, then start a **new run**: `git config --local core.autocrlf false`, `git config --local core.eol lf` (the `eol` setting is needed when `.gitattributes` marks files `text`), then `git rm -rq --cached . && git reset -q --hard` on a clean tree. The overlay of the earlier run holds the CRLF files and `workspace_overlay.py init` refuses a changed target, so do not resume it. Alternatively put a `sed -i 's/\r$//'` over the text files at the start of the recipe's command: the build runs in a copy, so the target stays untouched.
 - **Check first:** `file config.sub configure.ac` (or `git ls-files --eol`) before the first capture on a Windows host.
+- **Also seen:** mpack run-3 (2026-11-17). `seed_harvest.py record` with the test command `tools/unit.sh more` gave `no_calls_recorded`, the warning "the test command exited 127", and the log `sh: 1: tools/unit.sh: not found`. The build passed only because the recipe runs `python3 test/unit/configure.py` explicitly. In a repro, the same CRLF `#!/bin/sh` script run as the capture's build command (under `bear intercept`) exited 2 with `tools/run.sh: 2: set: Illegal option -`, while a plain `sh -c 'tools/run.sh more'` exited 127 with `not found`.
+- **Detection:** fixed but held. It is on branch `sup/crlf-script-check` (`90cc197`, `16c86eb`), not yet merged into `phase1-remediation`.
+  - `scripts/line_endings.py` lists CRLF shebang scripts and CRLF `configure`, `config.sub` and `*.sh` files.
+  - `workspace_overlay.py init` reports them up front in `overlay_meta.json` (`crlf_scripts`, `warnings`).
+  - A failed build adds `diagnostics.crlf_scripts` and a hint to `warnings` in `build_capture.json`.
+  - A failing test command adds the same hint to `warnings` in `seed_harvest.json`, naming the script (e.g. "tools/unit.sh has CRLF line endings").
+  - The pipeline gap was the late, opaque diagnosis. To check a target read-only, run `python scripts/line_endings.py <target>`; on mpack it finds 12 scripts, including `tools/unit.sh`.
 
 ### Symptom: A Generated Header (`config.h`) Is Missing in Eva, WP or the E-ACSL Build
 - **Cause:** generated headers stay in the build tree on the scratch volume, and the later analyses read `workspace/work`, which holds only the target's source tree.
@@ -93,6 +100,12 @@ Issues encountered during build capture (`build_capture.py`), Phase 0 model pars
   - Tests are in [`../../tests/test_build_capture.py`](../../tests/test_build_capture.py).
   - Checked on the real mpack tree: the runner is `test` (`main_in_test_source`) and `libmpack.a` gets 319 entry points (0 before).
   - This is separate from the header-defined entry points of plan H1 ([`../plans/header-entry-points-plan.md`](../plans/header-entry-points-plan.md)).
+- **Open pipeline bug (recurrence on `mpack` `run-3`, 2026-11-17; fix held on `sup/mpack-test-driver-any-holder` at `c57d2ea` until the run ends):**
+  - **Seen:** with the recipe `make -C examples sax-example && python3 test/unit/configure.py && ninja -f .build/unit/build.ninja`, no library unit exists. The product sources `src/mpack/mpack-*.c` were held only by `examples/sax-example`, a non-test executable. `.build/unit/everything-debug/runner` stayed `test=False`, with `test/unit/src/test.c#main` as an entry point and `warnings []`.
+  - **Cause:** `mark_test_drivers` accepted only a non-test static or shared library as the holder of a driver's product sources.
+  - **Fix on the branch:** the holder may be any other non-test unit (library, executable or `unlinked:<dir>`, all analysed as product code) that is not itself a driver candidate (an executable whose `main` is in a test source). Two drivers over product code that no product unit holds therefore do not mark each other. Tests: `test_a_test_driver_whose_product_sources_an_example_program_holds_is_a_test_unit` and `test_a_driver_is_marked_only_when_another_product_unit_holds_its_sources` (6 cases).
+  - **Checked** on the real mpack tree with that recipe (tag `sup-mpack-real2`): the runner is `test`, and `examples/sax-example` stays product with 342 `mpack_*` embedded-API functions and no `test_*`.
+  - **Workaround in the run:** the agent added `build/libmpack.a` to the recipe, which the merged rule already handles.
 
 ### Symptom: Unrecognized Compiler Variants Dropped Silently During Build Capture
 - **Seen:** 2026-11-11, regex audit (Milestone M2). Intercepted build commands using `tcc`, `icx`, `afl-clang-fast`, or posix-suffixed compilers like `gcc-13-posix` were not recognized as compilers, and skipped compiler-like executions were dropped without warnings.

@@ -51,6 +51,11 @@ External, read-only supervision of the opencode-driven `standard` run of `mpack`
 | Id | Fingerprint | Branch | State |
 | :--- | :--- | :--- | :--- |
 | S1 | Phase 0 / `build_capture.py run` / a test executable that mixes product and test sources is classified non-test | `sup/mpack-test-runner-classification` (`c2ddddb`, `a6edeb5`, `339919b`) | Merged into `phase1-remediation` as `c9b29a4` after the user stopped `run-2` |
+| S1b | Phase 0 / `build_capture.py run` / S1 recurrence: the test driver's product sources sit in an executable, not a library | `sup/mpack-test-driver-any-holder` (`c57d2ea`) | Held until `run-3` ends |
+| CRLF | Phase 0 / `seed_harvest.py record` / test command exits 127 `not found` on a CRLF shebang (target-side; the pipeline gap is the late diagnosis) | `sup/crlf-script-check` (`90cc197`, `16c86eb`) | Verified by the fixer (5933 passed); held until `run-3` ends |
+| S2 | Phase 0 / `seed_harvest.py record` / only outermost calls before the first longjmp are recorded | `sup/recorder-longjmp-safe` (`84f76b6`) | **Merged live** at 03:45 (fast-forward). Test: `tests/test_seed_harvest_longjmp.py::test_recorder_records_outermost_calls_after_a_longjmp` |
+| S3 | Phase 0 / `generate_harness.py --entry-style argv` / implicit declaration of `main` | fixer running (`sup/mpack-argv-main-prototype`) | In progress |
+| S4 | Phase 0 / `pipeline_make.py build-check` / E-ACSL frontend syntax error on `__restrict__` (host headers) | fixer running (`sup/mpack-eacsl-restrict`) | In progress |
 
 S1 commits and tests:
 
@@ -71,6 +76,39 @@ Supervisor's check: the branch's `build_capture.py run` was run on the real mpac
 - Effect 1: the target's unit-test suite would enter Phases 1-3 as Tier 1A product code. The model avoided that by restarting with `--scope src/mpack`, and lost `run-1`.
 - Effect 2: `seed_harvest.py` builds its recorder from the model's entry points and embedded API. The runner's embedded API includes the `test_*` driver functions, and only outermost calls are recorded, so the harvest recorded `test_system` and `test_common` and nothing from the mpack API. The library unit has `embedded_api: []` and no API entry points. Phase 1 therefore starts with only the 5 imported `.mp` files as seeds.
 
+## run-3
+
+| Parameter | Value |
+| :--- | :--- |
+| Run directory | `C:\Users\Florian\framac-pipeline\mpack\run-3` (created 02:06:27 UTC, `standard`, no scope) |
+| opencode session | `ses_e18bf3f4dffeZGjIvB98TOZiz2` ("framac-verify full mode mpack standard") |
+| Pipeline | `phase1-remediation` at `fe9775f` (includes the S1 merge `c9b29a4`) |
+
+| Time (UTC) | Phase | Event |
+| :--- | :--- | :--- |
+| 02:06:27 | Phase 0 | `run-3` created. |
+| 02:11:13 | Phase 0 | The model proposes a different recipe from run-2: `make -C examples sax-example && python3 test/unit/configure.py && ninja -f .build/unit/build.ninja`, with no static library. Its alternative "add a static library unit" was not chosen. |
+| 02:12:34 | Phase 0 | Build capture: `runner` **test = false** again; `examples/sax-example` (example plus `src/mpack/*.c`) is the product unit; `flagtest`. **S1 recurrence 1/3**: `mark_test_drivers` requires the product sources to be in a *library*, and here they are in an executable. |
+| 02:13:04 | Phase 0 | The model misreads `TEST_DIRS` (it believes `unit` is in it) while diagnosing. The pipeline bug is real, but its explanation is wrong. |
+| 02:13:46 | Phase 0 | The model proposes adding a static library to the recipe itself (`build/libmpack.a` from `src/mpack/*.c`), so that S1's library rule applies. The user accepts. The first `set-build` is mangled by host PowerShell (`basename` expanded); the model rewrites it without `$` or quotes. |
+| 02:15:52 | Phase 0 | Re-capture in the same run: `runner` is `test` (`main_in_test_source`); `build/libmpack.a` has 319 entry points (public-header fallback); `examples/sax-example` is a product unit. |
+| 02:16:36 | Phase 0 | `phase0_model.py run` `ok`: 476 functions (700 in run-2, when the test code was included), 1007 edges, 321 entry points. 128 warnings, all of one kind: `mpack-platform.c` emits the inline functions (`MPACK_EMIT_INLINE_DEFS`), and the model maps each to its header definition. This is benign noise. |
+| 02:22:12 | Phase 0 | `seed_harvest.py record` with test command `tools/unit.sh more`: `no_calls_recorded`, exit 127, `sh: 1: tools/unit.sh: not found`. The target checkout is CRLF (`core.autocrlf=true`, `i/lf w/crlf`), so the shebang reads `#!/bin/sh\r`. This is target-side. The model diagnosed it at 02:23:57. At the user's request, a fixer (`sup/crlf-script-check`) is adding an early CRLF-script check and failure hints. |
+| 02:25:07 | Phase 0 | Harvest rerun with `python3 test/unit/configure.py && ninja -f .build/unit/build.ninja more`: status `ok`, the suite passes, but only **3 calls** are recorded (`mpack_realloc` ×2, `mpack_tag_cmp`), although the runner was relinked with 342 wrappers. **S2:** the recorder's `fc_depth` counter is not `longjmp`-safe. mpack's tests `longjmp` out of library calls (`test/unit/src/test.c:51`, `TEST_TRUE_SETJMP`), `fc_leave()` is skipped, and every later call looks nested. |
+| 02:28:55-02:30:21 | Phase 0 | No fuzz assets: `test/fuzz/fuzz.c` is an AFL stdin harness. The DAG has 3 modules and 12 `libmpack_a` clusters (363 Tier 1A, 77 1B, 28 Tier 2, 8 Tier 3). Security properties: 3. The `.mp` corpus is mapped to `mpack_tree_init_{data,pool}` and `mpack_reader_init{,_data}`. |
+| 02:30:34-02:32:14 | Phase 0 | `--api` harnesses for all 12 clusters; the only skipped cases are the 3 `*_init_stdfile` ones (`FILE` is incomplete under Frama-C). |
+| 02:32:14-02:34 | Phase 0 | `sax_example` argv harness: **S3**. The argv entry style calls `main(argc, argv)` with no declaration (the comment at `generate_harness.py:1235` claims a synthesized declaration, but none is emitted), so it fails when the module header does not declare `main`. The model's workarounds hit target-side limits: `--include-source` fails because `sax-example.h` has no include guard, and `--header none --include-source` fails because mpack cannot be built as one translation unit (`MPACK_INTERNAL`, include guards). S3 is queued behind the two running fixers. |
+| 02:34:18-02:34:41 | Phase 0 | S3 workaround in the run directory: a prototype header `workspace/harnesses/include/sax_main.h` passed with `--extra-include`. The `sax_example` harness then compiles (prelude clean). |
+| 02:35:12 | Phase 0 | `flagtest` exempted (the configure flag probe `.build/unit/flagtest.c`). `harness_reach.py check` fails on 4 modules. Three clusters miss only `mpack_{tree,reader,writer}_init_stdfile` (skipped because `FILE` is incomplete). `sax_example` misses 7 extension/timestamp functions that exist only in its build: the example is compiled with `-DMPACK_EXTENSIONS=1` and `libmpack.a` is not. This is a recipe choice, not a pipeline bug; building the library with `-DMPACK_EXTENSIONS=1` would analyse the extension code in the library. |
+| ~03:35 | Phase 0 | The model exempts the `*_init_stdfile` cases and the 7 `sax_example` extension/timestamp functions. Its reach gate passes. |
+| 03:38:25 | Phase 0 | `pipeline_make.py build-check`: every module is `build_failed`, with `[kernel] workspace/work/src/mpack/mpack-writer.c:1274: User Error: syntax error ... char* __restrict__ p`. **S4**, a pipeline gap. Frama-C 34 knows only `restrict` and `__restrict`. Its own libc defines `__restrict__` (`share/libc/features.h:94`), so Phase 0, Eva and WP parse. The E-ACSL frontend uses host headers (`-no-frama-c-stdlib`), where nothing defines it. mpack spells `MPACK_RESTRICT` as `__restrict__` under `__GNUC__` (`mpack-platform.h:1329`). |
+| 03:40:45 | Phase 0 | The model reaches the same diagnosis on its own. As a run-local workaround, it regenerates every harness with `-D__restrict__=restrict` in the cppflags (`state/gen_harnesses2.sh`), then reruns the reach gate and `pipeline_make.py gen`. |
+| 03:44 | Phase 0 | `build-check` rerun (container `framac-9f14465bd6b7`). |
+| 03:45 | — | **S2 merged live** into `phase1-remediation` (fast-forward to `84f76b6`), under the user's authorisation to intervene. The supervisor reran the longjmp regression test in `framac-build:latest` (gcc and clang PASS) and `tests/test_seed_harvest*.py` on Windows (23 passed, 1 skipped). |
+| 03:46:32 | — | Supervisor nudge sent to the session with the user's permission (`opencode run --session`, queued behind the running step). It asks the model to rerun `seed_harvest.py record` with the same test command, regenerate the `--api` harnesses so the new seeds bind, rerun reach, gen and build-check, and keep the `__restrict__` workaround. |
+
+S1 recurrence: the fix is on `sup/mpack-test-driver-any-holder` at `c57d2ea`, verified by the supervisor (diff read, 15 driver tests pass) and **held** until `run-3` ends. It extends the holder condition to any other non-test unit (library, executable, unlinked) that is not itself a test-driver candidate. On the real tree with the no-library recipe, the runner is `test` and `sax-example` stays product with 342 `mpack_*` embedded-API functions.
+
 ## Model struggles that are not pipeline bugs
 
 | Time (UTC) | Message | Observation | Suggested skill or brief change |
@@ -80,4 +118,5 @@ Supervisor's check: the branch's `build_capture.py run` was run on the real mpac
 
 ## Open pipeline bugs
 
-- None from this run: S1 is fixed and merged. Two gaps are noted, not fixed: there is no `run_metadata.py set-scope`, and the shipped `.mp` fixtures are not discovered as a corpus (`fuzz_assets.py` only looks in directories named `corpus`, `seed` or `fuzz`).
+- run-3: S1b and CRLF are fixed and held on their branches. S3 and S4 have fixers running. The run works around both: S3 with `workspace/harnesses/include/sax_main.h`, S4 with `-D__restrict__=restrict` in the harness cppflags.
+- run-1 and run-2: S1 is fixed and merged. Two gaps are noted, not fixed: there is no `run_metadata.py set-scope`, and the shipped `.mp` fixtures are not discovered as a corpus (`fuzz_assets.py` only looks in directories named `corpus`, `seed` or `fuzz`).
