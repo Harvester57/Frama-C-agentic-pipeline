@@ -81,13 +81,16 @@ landed).
   `FRAMAC_DOCKER_TESTS=1`, the harness test files (selector, `--api` callbacks, header entries,
   argument domains, capture headers, `stdin`, `fuzz_build`, seeds) give 188 passed, 1 skipped:
   the skip is `tests/test_api_harness_header_entries.py:228`, which needs clang on the host.
-- **Not checked: H1 with the tip's two changes to `scripts/api_harness.py`.** Since O4, `--api`
-  without `--header` takes its headers from the build capture and, when they do not compile in
-  the harness, retries with the public ones alone and then with none; with none, a header entry
-  point's case cannot compile and is dropped. The argument-domain rules (the run-4 fix) now shape
-  every case's arguments. Both merged with H1's code without a conflict and each side's tests
-  pass, but no test builds a header entry point's case through either, and the code where they
-  meet was not read.
+- **Read, not run: H1 with the tip's two changes to `scripts/api_harness.py`.** Both merged with
+  H1's code without a conflict.
+  - Since O4, `--api` without `--header` takes its headers from the build capture and, when they
+    do not compile in the harness, retries with the public ones alone and then with none. Each
+    attempt plans again from its own layout probe, so a header entry point gets its case in the
+    attempts whose headers declare it, and is skipped (`HEADER_NOT_VISIBLE`) in the attempt with
+    none. No test builds a header entry point's case through the capture's choice.
+  - A header case is built by the same `single_case` with the same `ApiInfo`, so the
+    argument-domain rules of the run-4 fix apply to it; the header-entry tests plan their cases
+    through that code and pass.
 - Not re-measured: the QCBOR numbers below.
 
 **Measured offline on the recorded QCBOR run-6 model** (the branch's `header_api()` and
