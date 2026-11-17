@@ -3360,13 +3360,17 @@ def generate(
     functions = dag.get("functions") or {}
     dag_mod = (dag.get("modules") or {}).get(module) or {}
     req_sources = dag_mod.get("required_sources") or []
-    # A function defined in a public header is compiled from the header the harness includes: its file
-    # is no source to build.
+    # A `static` function defined in a public header (`header_api`) is compiled from the header the
+    # harness includes, and fuzz_build names it for E-ACSL from the sidecar's cases
+    # (`_harness_header_entries`): its file is no source. An exported function a header defines (mpack's
+    # MPACK_INLINE) keeps its header here, where E-ACSL's function discovery and the module scope read
+    # it; the clang builds leave it off their command line (framac_common.compile_inputs).
     sources = sorted(
         {
             str((functions.get(k) or {}).get("file"))
             for k in p["entries"]
-            if (functions.get(k) or {}).get("file") and not (functions.get(k) or {}).get("header")
+            if (functions.get(k) or {}).get("file")
+            and not ((functions.get(k) or {}).get("header") and (functions.get(k) or {}).get("is_static"))
         }
         | {str(s) for s in req_sources if s}
     )

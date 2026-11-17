@@ -132,7 +132,13 @@ def test_a_variadic_header_function_is_skipped() -> None:
 # --- generate(): sources and the hand-written cases (HD4) ------------------------------------------------
 
 
-def _hdr_generate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header: list[str]) -> tuple[Path, list[dict]]:
+def _hdr_generate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    header: list[str],
+    exported: tuple[str, ...] = (),
+) -> tuple[Path, list[dict]]:
+    """`exported`: the functions of `header` with a global symbol (an inline the library also emits)."""
     import generate_harness
 
     monkeypatch.chdir(tmp_path)
@@ -140,6 +146,8 @@ def _hdr_generate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header: list[
     out.mkdir(parents=True)
     names = ["a", *header]
     dag = _hdr_dag(names, header=header)
+    for n in exported:
+        dag["functions"][n]["is_static"] = False
     (tmp_path / "dag.json").write_text(json.dumps(dag))
     (tmp_path / "model.json").write_text(json.dumps(_hdr_model(dag)))
     calls: list[dict] = []
@@ -183,6 +191,25 @@ def test_hand_written_cases_move_behind_the_header_cases(tmp_path: Path, monkeyp
     # The header is compiled through the harness's include, not as a source.
     assert all(not str(s).endswith(".h") for s in calls[-1]["sources"])
     assert "lib.c" in calls[-1]["sources"]
+
+
+def test_an_exported_function_a_header_defines_keeps_its_header_in_the_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    mpack's MPACK_INLINE functions have a global symbol and are defined in a header. Their header
+    stays in the harness's sources (E-ACSL's function discovery and the module scope read it; the
+    clang builds leave it out, tests/test_clang_build_inputs.py). Only a `static` header function,
+    which fuzz_build names from the sidecar's cases, adds no source.
+    """
+    out, calls = _hdr_generate(tmp_path, monkeypatch, header=["h_inline"], exported=("h_inline",))
+    assert calls[-1]["sources"] == [HDR_FILE, "lib.c"]
+    meta = json.loads((out / "harness_lib.json").read_text())
+    assert [(lay["kind"], lay.get("entry")) for lay in meta["api_cases"]] == [
+        ("single", "a"),
+        ("single", "h_inline"),
+        ("custom", None),
+    ]
 
 
 def test_without_header_cases_the_hand_written_case_follows_the_exported_one(
