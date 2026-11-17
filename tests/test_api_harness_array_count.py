@@ -75,7 +75,19 @@ def _case(p: dict[str, Any], entry: str) -> tuple[str, dict[str, Any]]:
 
 
 def _clamp(var: str, n: str) -> str:
-    return f"1ULL + ((unsigned long long){var} - 1ULL) % {n}"
+    return f"1ULL + ((unsigned long long){var} % {n} + ({n} - 1ULL)) % {n}"
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5, 1000, 2**64 - 1])
+def test_the_count_mapping_keeps_1_to_n_and_never_wraps(count: int):
+    # The C expression, evaluated on unsigned long long: no intermediate leaves 0..2**64-1.
+    m = 2**64
+    inner = count % N + (N - 1)
+    assert 0 <= inner < m
+    got = (1 + inner % N) % m
+    assert 1 <= got <= N
+    if 1 <= count <= N:
+        assert got == count
 
 
 def test_a_string_array_gets_valid_elements_and_a_bounded_count():

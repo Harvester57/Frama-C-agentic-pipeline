@@ -542,7 +542,9 @@ def _array_args(
     ct = params[j]["ctype"]
     case.decls.append(f"{ct} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
     case.slot(ln, SCALAR_BYTES.get(ct), call, j, "int")
-    case.decls.append(f"{ln} = ({ct})(1ULL + ((unsigned long long){ln} - 1ULL) % {bound});")
+    # 1..bound, counts 1..bound kept as read; no unsigned wrap (a short input leaves the count 0),
+    # which -warn-unsigned-overflow and E-ACSL's --rte=all would report in the harness.
+    case.decls.append(f"{ln} = ({ct})(1ULL + ((unsigned long long){ln} % {bound} + ({bound} - 1ULL)) % {bound});")
     return [*args, ln]
 
 
@@ -869,7 +871,8 @@ def _bind_call(
             # No array of the group may be an object the generator builds otherwise: shared with
             # another call, a handle, or a struct the unit initializes.
             if j is not None and not any(
-                k in shared or k in handles or str(params[k].get("pointee") or "") in api.inits for k in range(i, j + 1)
+                k in shared or k in handles or k in outs or str(params[k].get("pointee") or "") in api.inits
+                for k in range(i, j + 1)
             ):
                 args += _array_args(case, call, params, formals, rec, i, j)
                 i = j + 1
@@ -922,7 +925,9 @@ def _bind_call(
             # pointer (`const char **`): input bytes would become an address the callee follows.
             lay = case.api.structs.get(pointee) if _is_record(pointee) else None
             raw_ok = pointee != "_Bool" and not pointee.endswith("*") and (not _is_record(pointee) or _raw_ok(lay))
-            if is_input and not raw_ok and lay is None:
+            if is_input and pointee.endswith("*"):
+                case.note(call, i, f"{pointee}: a pointer, zeroed (NULL), never read from the input")
+            elif is_input and not raw_ok and lay is None:
                 case.note(call, i, f"{_layout_why(case.api, pointee)}: the object is zeroed, not read from the input")
             # The object's type as declared: the header's spelling of a qualified pointer (`decl`,
             # `_respell_qualified_pointers`), else the model's pointee.
