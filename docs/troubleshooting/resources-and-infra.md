@@ -226,3 +226,15 @@ The full resource and cache design guide is [`../guides/resources-and-caching.md
 - **Seen on:** a worktree cut from `phase1-remediation` at `a07c7ef`, 2026-11-16, full `python -m pytest tests -n auto` (5328 passed, 1 failed).
 - **Cause:** committed documents (`docs/troubleshooting/harnesses-and-seeds.md`, `wp-and-guardrail.md`, `docs/runs/2026-11-14-qcbor-run6-supervision.md`, ...) link to upstream drafts under `docs/upstream/frama-c/` that exist on disk in the main checkout but are not committed (`git ls-files docs/upstream/frama-c` lists none of them), so every clean worktree of the branch fails the check.
 - **Fix:** **Open pipeline bug** (repository content, not code): commit the drafts, or drop the links until they are committed.
+
+### Symptom: Mid-Run, Every Docker Call Fails With `Error response from daemon: Docker Desktop is unable to start` (or the API Returns `500 Internal Server Error`)
+- **Seen on:** mpack run-3, Phase 3, 2026-11-17 at 05:27. The session found C: at 0 bytes free. Right after, `docker system df` returned `request returned 500 Internal Server Error for API route ... /system/df`, and every later Docker call failed with `Docker Desktop is unable to start`. The run's containers, 4 to 5 Crash Verifier builds in parallel, dropped to 0.
+- **Cause:** the Windows host disk filled up. Docker Desktop's VM failed and did not restart on its own after about 23 GB were free again.
+  - The run directory was only 5.2 GB. The space went to earlier runs' directories (about 30 GB under `C:\Users\Florian\framac-pipeline`), session scratch directories under `%TEMP%`, and Docker's own disk image.
+  - Each Phase 3 verifier writes 17-19 MB instrumented C files plus build caches, so parallel verifier dispatch adds up quickly.
+  - This is not a pipeline code defect, but the pipeline has a gap: neither the wrapper nor `wp_scheduler.py` checks free disk space before dispatching parallel containers. **Open pipeline bug.**
+- **Fix:**
+  - Free disk space by removing finished runs' directories you no longer need, or move them off C:.
+  - Restart Docker Desktop, and check it with `docker info`.
+  - Resume the run; containers interrupted mid-step leave their leases to expire.
+  - Suggested pipeline change: a free-space preflight in the wrapper and the scheduler. Refuse to dispatch, and report `blocked: low_disk`, below a threshold derived from the measured per-task footprint.
