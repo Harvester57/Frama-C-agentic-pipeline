@@ -1067,6 +1067,7 @@ _DRIVER_SYMBOLS = {
     "test/unit/src/test.c": {"main": ("T", None)},
     "test/unit/src/test-reader.c": {"test_reader": ("T", None)},
     "tools/cli.c": {"main": ("T", None)},
+    "examples/sax-example.c": {"main": ("T", None)},
 }
 _DRIVER_HEADERS = {
     "src/mpack/mpack.h": "int mpack_read(int fd);\nint mpack_write(int fd);\n",
@@ -1076,7 +1077,7 @@ _DRIVER_HEADERS = {
 }
 
 
-def _driver_execs(with_cli: bool) -> list[dict]:
+def _driver_execs(with_cli: bool, with_lib: bool = True, with_example: bool = False) -> list[dict]:
     lib = ["src/mpack/mpack-reader.c", "src/mpack/mpack-writer.c"]
     tests = ["test/unit/src/test.c", "test/unit/src/test-reader.c"]
     execs: list[dict] = []
@@ -1086,8 +1087,14 @@ def _driver_execs(with_cli: bool) -> list[dict]:
         execs.extend(cc("-Isrc/mpack", "-c", "-o", o, s) for s, o in zip(srcs, objs, strict=True))
         return objs
 
-    lib_objs = compile_all(lib, ".build/mpack-lib")
-    execs.append({"exe": "/usr/bin/ar", "args": ["ar", "rcs", ".build/mpack-lib/libmpack.a", *lib_objs], "cwd": TREE})
+    if with_lib:
+        lib_objs = compile_all(lib, ".build/mpack-lib")
+        execs.append(
+            {"exe": "/usr/bin/ar", "args": ["ar", "rcs", ".build/mpack-lib/libmpack.a", *lib_objs], "cwd": TREE}
+        )
+    if with_example:
+        example_objs = compile_all(["examples/sax-example.c", *lib], "examples/obj")
+        execs.append(cc("-o", "examples/sax-example", *example_objs))
     runner_objs = compile_all(lib + tests, ".build/unit/everything-debug/obj")
     execs.append(cc("-o", ".build/unit/everything-debug/runner", *runner_objs))
     if with_cli:
@@ -1097,7 +1104,12 @@ def _driver_execs(with_cli: bool) -> list[dict]:
 
 
 def _driver_capture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_cli: bool = False, headers: dict[str, str] | None = None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_cli: bool = False,
+    headers: dict[str, str] | None = None,
+    with_lib: bool = True,
+    with_example: bool = False,
 ) -> dict:
     """analyse() on the mpack-shaped build, with the probes (cc -M, nm, install, snapshot) stubbed."""
     tree = tmp_path / "tree"
@@ -1114,7 +1126,7 @@ def _driver_capture(
     monkeypatch.setattr(bc, "try_install", lambda *a: ([], "no install target"))
     monkeypatch.setattr(bc, "generated_headers", lambda *a: [])
     monkeypatch.setattr(bc, "build_snapshot", lambda *a, **k: {"files": 0})
-    cap = bc.classify_executions(_driver_execs(with_cli), TREE)
+    cap = bc.classify_executions(_driver_execs(with_cli, with_lib, with_example), TREE)
     report: dict = {"warnings": [], "build": {}, "target": str(tmp_path / "target")}
     bc.analyse(report, cap, tree, tmp_path / "scratch", {}, 60, 1)
     return report
@@ -1151,6 +1163,20 @@ def test_the_seed_recorder_no_longer_wraps_the_test_drivers_functions(tmp_path, 
     # was wrapped, and only the outermost call is recorded, so no library call reached calls.jsonl.
     assert _driver_plans(_driver_capture(tmp_path, monkeypatch, with_cli=True)) == ["mpack_read", "mpack_write"]
     assert _driver_plans(_driver_capture(tmp_path, monkeypatch)) == ["mpack_read", "mpack_write"]
+
+
+@pytest.mark.unit
+def test_a_test_driver_whose_product_sources_an_example_program_holds_is_a_test_unit(tmp_path, monkeypatch):
+    # mpack run-3: `make -C examples sax-example` and the unit tests, no library. The product sources
+    # are held by examples/sax-example, a non-test executable whose `main` is in examples/.
+    report = _driver_capture(tmp_path, monkeypatch, with_lib=False, with_example=True)
+    units = report["units"]
+    runner = units[".build/unit/everything-debug/runner"]
+    assert (runner["test"], runner["test_reason"]) == (True, "main_in_test_source")
+    assert (units["examples/sax-example"]["test"], units["examples/sax-example"]["test_reason"]) == (False, None)
+    assert any("runner: a test driver" in w and "in a non-test unit" in w for w in report["warnings"])
+    assert not any(e.startswith("test/") for e in report["entry_points"])
+    assert _driver_plans(report) == ["mpack_read", "mpack_write"]
 
 
 @pytest.mark.unit
@@ -1208,6 +1234,41 @@ def test_only_drivers_with_main_in_a_test_source_over_library_sources_are_marked
     assert units["app"]["test"] is marked
     assert units["app"]["test_reason"] == ("main_in_test_source" if marked else None)
     assert not units["libx.a"]["test"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("others", "marked"),
+    [
+        # mpack run-3: an example program holds the product sources, no library.
+        ({"examples/ex": _unit("executable", ["examples/ex.c", "src/a.c"])}, True),
+        # Objects linked into nothing are analysed as product code: they hold their sources too.
+        ({"unlinked:src": _unit("unlinked", ["src/a.c"])}, True),
+        # A shared library holds them like a static one.
+        ({"libx.so": _unit("shared_lib", ["src/a.c"])}, True),
+        # A test unit is not analysed: it holds nothing.
+        ({"testlib.a": _unit("static_lib", ["src/a.c"], test=True)}, False),
+        # A second driver over the same product code: neither may drop it for the other.
+        ({"runner2": _unit("executable", ["src/a.c", "test/t2.c"])}, False),
+        # The same two drivers next to a library holding the code: both are marked.
+        (
+            {
+                "runner2": _unit("executable", ["src/a.c", "test/t2.c"]),
+                "liba.a": _unit("static_lib", ["src/a.c"]),
+            },
+            True,
+        ),
+    ],
+)
+def test_a_driver_is_marked_only_when_another_product_unit_holds_its_sources(others, marked):
+    units = {"app": _unit("executable", ["src/a.c", "test/t.c"]), **others}
+    mains = {"app": "test/t.c", "runner2": "test/t2.c", "examples/ex": "examples/ex.c"}
+    got = bc.mark_test_drivers(units, {n: m for n, m in mains.items() if n in units})
+    assert units["app"]["test"] is marked
+    assert ("app" in got) is marked
+    if "runner2" in units:
+        assert units["runner2"]["test"] is marked
+    assert all(not u["test"] for n, u in units.items() if n not in ("app", "runner2", "testlib.a"))
 
 
 if __name__ == "__main__":

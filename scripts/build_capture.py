@@ -102,9 +102,10 @@ TEST_RULE = (
     "unittests/testsuite; or a directory of its path is test/tests/testing/check/checks/unittest(s); or all "
     "its own sources are test sources (in such a directory, or named with such a word); or its name ends in "
     "`test`/`tests` and one of its own sources is a test source; or it is an executable whose `main` is "
-    "defined in a test source and whose other own sources are all sources of a non-test library of the "
-    "build (a test driver compiling the library's sources again, mpack's `runner`): its product code is "
-    "analysed in that library. The test command is not run here (step I6)."
+    "defined in a test source and whose other own sources are all sources of other non-test units of the "
+    "build (a library, an executable or an unlinked unit) that are not themselves such test drivers (a "
+    "test driver compiling the product sources again, mpack's `runner`): its product code is analysed in "
+    "those units. The test command is not run here (step I6)."
 )
 PUBLIC_FALLBACK_RULE = (
     "the public headers chosen for a static library (installed, or outside the source directories) that "
@@ -879,19 +880,27 @@ def mark_test_drivers(units: dict[str, dict], main_file: dict[str, str]) -> list
     Mark the test drivers the name rules miss (TEST_RULE, last case), in place; returns their names.
 
     `main_file` maps an executable unit to the source defining its global `main`. A driver is an
-    executable whose `main` is in a test source and whose other own sources are all sources of a
-    non-test library unit: dropping it loses no product code. A program whose `main` is in product
-    code, or a test driver compiling product sources no library holds, stays a product unit.
+    executable whose `main` is in a test source and whose other own sources are all sources of another
+    non-test unit (library, executable or `unlinked:<dir>`) that is not itself such a driver: dropping
+    it loses no product code. A program whose `main` is in product code, or a test driver compiling
+    product sources no other product unit holds, stays a product unit.
     """
-    lib_files = {
-        f for u in units.values() if u["kind"] in ("static_lib", "shared_lib") and not u["test"] for f in u["files"]
+    candidates = {
+        name
+        for name, u in units.items()
+        if u["kind"] == "executable"
+        and not u["test"]
+        and (main := main_file.get(name)) is not None
+        and is_test_source(main)
     }
+    # Every non-test unit is analysed as product code (an `unlinked:<dir>` one too), so its sources are
+    # kept when a driver is dropped. Candidates do not hold for each other: two drivers over product
+    # code no other unit compiles would otherwise drop it both times.
+    held = {f for name, u in units.items() if not u["test"] and name not in candidates for f in u["files"]}
     marked: list[str] = []
-    for name, u in sorted(units.items()):
-        main = main_file.get(name)
-        if u["kind"] != "executable" or u["test"] or not main or not is_test_source(main):
-            continue
-        if all(is_test_source(f) or f in lib_files for f in u["files"]):
+    for name in sorted(candidates):
+        u = units[name]
+        if all(is_test_source(f) or f in held for f in u["files"]):
             u["test"] = True
             u["test_reason"] = "main_in_test_source"
             marked.append(name)
@@ -1944,7 +1953,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     }
     for name in mark_test_drivers(units, main_files):
         report["warnings"].append(
-            f"{name}: a test driver (`main` in {main_files[name]}, its other sources in a library), marked `test`"
+            f"{name}: a test driver (`main` in {main_files[name]}, its other sources in a non-test unit), marked `test`"
         )
     for c in entries:
         # What the compiler emitted, for the DAG to compare with what Frama-C parsed: code behind a
