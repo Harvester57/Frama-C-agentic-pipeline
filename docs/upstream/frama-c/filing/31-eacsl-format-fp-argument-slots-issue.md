@@ -53,7 +53,7 @@ NUL-terminated):
 ### Contextual information
 
 - Frama-C installation mode: from source (`master`) and opam (Docker image based on `framac/frama-c:dev`)
-- Frama-C version: 35.0~~dev (Bromine), `master` at 3dff90fc70; also 34.0~beta (Selenium), same output
+- Frama-C version: 35.0~~dev (Bromine), `master` at 95408044f7 (and 3dff90fc70); also 34.0~beta (Selenium), same output
 - Plug-in used: E-ACSL (`e-acsl-gcc --validate-format-strings`)
 - OS name: Debian GNU/Linux
 - OS version: 13 (trixie), gcc 14.2.0, x86_64

@@ -1,7 +1,7 @@
 # [e-acsl] read each format argument with its own type
 
 - Source branch: `fix/eacsl-format-fp-args` on the fork of `pub/frama-c`; target branch `master`.
-- Based on: `3dff90fc70`. Patch: [`../patches/31-eacsl-format-fp-argument-slots.patch`](../patches/31-eacsl-format-fp-argument-slots.patch)
+- Based on: `3dff90fc70`; re-validated on `95408044f7` (2026-11-17), the base to branch from. Patch: [`../patches/31-eacsl-format-fp-argument-slots.patch`](../patches/31-eacsl-format-fp-argument-slots.patch)
 
 <!-- Everything below this line is the merge request description. -->
 
@@ -82,6 +82,13 @@ oracles, so no existing oracle changes. Not run: the `dev` configuration of
 - The patch applies with `git am` on `3dff90fc70` alone, before or after the patch for #ISSUE-30,
   and on top of the patches of my other reports applied in sequence (!25 to !45, and the one
   proposed in #2816), with `git am --3way`.
+- Rerun on current `master` (`95408044f7`): the patch applies with `git am`; the reproducer gives the
+  same results before and after; the new test fails on the unpatched sources in the `dev`
+  configuration and passes with the patch; the default configuration of the whole E-ACSL suite (198
+  results) and `./dev/check-files.sh -p HEAD~1` pass. With the patch for #ISSUE-30 applied too, the
+  `dev` configuration of all of `format/` (`fprintf.c`, `printf.c`, `sprintf.c` and the two new
+  tests) and the default configuration of the whole E-ACSL suite pass, which covers the runs listed
+  as not run above (32-bit targets excepted).
 
 The analysis and fix were prepared with LLM assistance (Claude Code); I reviewed them and ran the
 reproducer and tests described above.

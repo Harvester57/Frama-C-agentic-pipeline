@@ -27,7 +27,7 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   [`../../../../tools/upstream_audit/revalidate.sh`](../../../../tools/upstream_audit/revalidate.sh)
   runs a reproducer before and after its patch. An abort in a container now takes 6 ms on this
   host with the core limit at 0, so the slowness described above is gone.
-- The scripts of 36, 37 and 38 print a table and always exit 0: compare their output with the
+- The scripts of 32, 33, 36, 37 and 38 print a table and always exit 0: compare their output with the
   "before" and "after" blocks in their headers. Their optional `EACSL_SHARE` points `e-acsl-gcc` at
   another copy of the runtime sources. 34 and 40 have no patch, so only a "before" output.
 - Patched images `framac-master-audit:3dff90f-p28` to `-p31` held `master` with one patch each

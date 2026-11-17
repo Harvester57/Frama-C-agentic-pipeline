@@ -110,7 +110,7 @@ Same result with `-G clang`, with `-M` (`-e-acsl-full-mtracking`), with both, an
 ### Contextual information
 
 - Frama-C installation mode: from source (`master`) and opam (Docker image based on `framac/frama-c:dev`)
-- Frama-C version: 35.0~~dev (Bromine), `master` at 3dff90fc70; also 34.0~beta (Selenium)
+- Frama-C version: 35.0~~dev (Bromine), `master` at 95408044f7 (and 3dff90fc70); also 34.0~beta (Selenium)
 - Plug-in used: E-ACSL (`e-acsl-gcc`)
 - OS name: Debian GNU/Linux
 - OS version: 13 (trixie)

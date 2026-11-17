@@ -1,7 +1,7 @@
 # [e-acsl] demote the string literals registered under full memory tracking
 
 - Source branch: `fix/eacsl-full-mtracking-literals` on the fork of `pub/frama-c`; target branch `master`.
-- Based on: `3dff90fc70`. Patch: [`../patches/28-eacsl-full-mtracking-tail-merged-literals.patch`](../patches/28-eacsl-full-mtracking-tail-merged-literals.patch)
+- Based on: `3dff90fc70`; re-validated on `95408044f7` (2026-11-17), the base to branch from. Patch: [`../patches/28-eacsl-full-mtracking-tail-merged-literals.patch`](../patches/28-eacsl-full-mtracking-tail-merged-literals.patch)
 
 <!-- Everything below this line is the merge request description. -->
 
@@ -45,7 +45,8 @@ All on Debian 13 (gcc 14.2.0, clang 19.1.7, GNU ld 2.44), `master` at `3dff90fc7
 - A global initializer `const char *tbl[] = {" ,", ",", "x"};` with clang and full tracking: `tbl` is initialized with the named arrays, and the program runs clean before and after.
 - The new test, built with clang and full tracking as above, aborts on `master` and runs clean with the patch. Its oracle check fails on unpatched `master` (oracle difference: the five literals are printed as literals, registered as `__e_acsl_store_block((void *)" ,",3UL)`, and `char buf[3UL] = "ab";`) and passes with the patch.
 - `frama-c-ptests -create-missing-oracles plugins/e-acsl/tests`, then `dune build --release -j 8 @plugins/e-acsl/tests/ptests_config` (198 results): the only differences are the new test's oracles and the two concurrency oracles above, which I promoted; on the final run every test matches its oracle.
-- `ptests_config_dev` (compiled and run) of `full-mtracking`, `concurrency`, `builtin`, `special`, `bts` and `memory`: every test matches its oracle. In `format`, which also runs with full tracking, `printf.0` takes more than 1,000 s here on both `master` and the patched tree. I stopped it there: the tests that finished match, and the output of `printf.0` up to that point is the same with and without the patch.
+- `ptests_config_dev` (compiled and run) of `full-mtracking`, `concurrency`, `builtin`, `special`, `bts` and `memory`: every test matches its oracle.
+- Rerun on current `master` (`95408044f7`): the patch applies with `git am`; the reproducer gives the same results before and after; the new test's oracle check fails on the unpatched sources and passes with the patch; the default configuration of the whole E-ACSL suite (198 results) passes; and the `dev` configuration of `format/` (`fprintf.c`, `printf.c`, `sprintf.c`), which also runs with full tracking, passes.
 - `tests/misc/string_literal.ml` (`dune build @tests/misc/runtest`, the kernel test that calls `Demote_string_literal.demote`) passes; a negative control (an extra line in its `.expected`) fails.
 - `./dev/check-files.sh -p HEAD~1` (`make check-lint` and `make check-headers` on the changed files, with ocp-indent 1.10.0, headache 1.08 and clang-format 19.1.7): passes; the new test is clang-formatted.
 

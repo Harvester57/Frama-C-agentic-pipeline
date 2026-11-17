@@ -1,7 +1,7 @@
 # [e-acsl] accept a promoted unsigned char or short for %u and %x
 
 - Source branch: `fix/eacsl-format-promoted` on the fork of `pub/frama-c`; target branch `master`.
-- Based on: `3dff90fc70`. Patch: [`../patches/30-eacsl-format-promoted-argument-signedness.patch`](../patches/30-eacsl-format-promoted-argument-signedness.patch)
+- Based on: `3dff90fc70`; re-validated on `95408044f7` (2026-11-17), the base to branch from. Patch: [`../patches/30-eacsl-format-promoted-argument-signedness.patch`](../patches/30-eacsl-format-promoted-argument-signedness.patch)
 
 <!-- Everything below this line is the merge request description. -->
 
@@ -114,6 +114,13 @@ patch:
 - The patch applies with `git am` on `3dff90fc70` alone, before or after the patch for #ISSUE-31,
   and on top of the patches of my other reports applied in sequence (!25 to !45, and the one
   proposed in #2816), with `git am --3way`.
+- Rerun on current `master` (`95408044f7`): the patch applies with `git am`; the reproducer gives the
+  same results before and after; the new test fails on the unpatched sources in both configurations
+  and passes with the patch; the default configuration of the whole E-ACSL suite (198 results) and
+  `./dev/check-files.sh -p HEAD~1` pass. With the patch for #ISSUE-31 applied too, the `dev`
+  configuration of all of `format/` (`fprintf.c`, `printf.c`, `sprintf.c` and the two new tests) and
+  the default configuration of the whole E-ACSL suite pass, which covers the runs listed as not run
+  above.
 
 The analysis and fix were prepared with LLM assistance (Claude Code); I reviewed them and ran the
 reproducer and tests described above.

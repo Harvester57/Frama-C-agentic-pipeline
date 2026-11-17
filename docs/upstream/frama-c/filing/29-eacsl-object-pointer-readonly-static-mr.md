@@ -1,7 +1,7 @@
 # [e-acsl] \object_pointer does not require the object to be writable
 
 - Source branch: `fix/eacsl-object-pointer-readonly` on the fork of `pub/frama-c`; target branch `master`.
-- Based on: `3dff90fc70`. Patch: [`../patches/29-eacsl-object-pointer-readonly-static.patch`](../patches/29-eacsl-object-pointer-readonly-static.patch)
+- Based on: `3dff90fc70`; re-validated on `95408044f7` (2026-11-17), the base to branch from. Patch: [`../patches/29-eacsl-object-pointer-readonly-static.patch`](../patches/29-eacsl-object-pointer-readonly-static.patch)
 
 <!-- Everything below this line is the merge request description. -->
 
@@ -65,6 +65,10 @@ with this patch, rebuilt and installed:
   ocp-indent 1.10.0, headache 1.08 and clang-format 19.1.7): passes.
 - The patch applies with `git am` on `3dff90fc70` alone, and on top of my other open merge requests
   (applied in sequence) without conflict. Its test has no function formal, so it does not depend on !28.
+- Rerun on current `master` (`95408044f7`): the patch applies with `git am`; the reproducers give the
+  same results before and after; the new test fails on the unpatched sources in both configurations
+  and passes with the patch; the default configuration of the whole E-ACSL suite (198 results) and
+  `./dev/check-files.sh -p HEAD~1` pass.
 
 Note, not changed here: with `-m bittree`, the read-only mark does not take effect (`\valid(p)` holds on a
 `const` array or a string literal), and `stdin`, `stdout`, `stderr` and `errno` are not registered as safe
