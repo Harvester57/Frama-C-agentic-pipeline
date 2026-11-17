@@ -20,7 +20,9 @@ on 2026-11-09. It predates Issues 15 to 40, so do not rely on it alone for dedup
 
 This section is newer than the ones below and wins where they differ.
 
-- **Filed: 28 to 40**, on the owner's go-ahead ("file everything"), from the account Harvester57.
+- **Filed: 28 to 40**, on the owner's go-ahead, from the account Harvester57. Asked which of 28 to
+  40 to file first, the owner wrote "prepare doc-only patch for 40, then fill everything"; "fill"
+  was read as "file".
   Every package of this folder now has its issue filed; 22's merge request still waits for the
   maintainers' answer.
   - **Issues:** 28 to 31 as #2817 to #2820, 33 as #2821, 32 as #2822, 34 to 40 as #2823 to #2829
@@ -56,6 +58,21 @@ This section is newer than the ones below and wins where they differ.
   close the issue.
 - **Text changes made while filing:** 29's merge request cites #2826 and #2827 for the two bittree
   defects of its closing note; 40's issue says a manual-only merge request is sent.
+- **Open questions settled by filing as they stood:** the owner did not answer the rows of 28 to
+  39 in "Open questions for the owner" one by one, so each package went up with the option that
+  row calls "current". The ones that shape what the maintainers see:
+  - 33 is filed although upstream tracks the defect privately as e-acsl#118 (its text says so);
+  - 30, 31 and 32 are three merge requests, and 33 a fourth that regenerates three oracles;
+  - 34 is one issue for the kernel and the libc parts;
+  - 28 adds a kernel function (`demote_list`) inside an E-ACSL merge request;
+  - 39 keeps the packed attribute on `struct epoll_event`;
+  - 35 leaves `#define __restrict__` in `features.h`, and 36 leaves `tls:N` unread.
+  Any of these can still change on the merge request if the maintainers or the owner prefer.
+- **Rendering checked:** each stored description was rendered through GitLab's markdown endpoint.
+  No user mention, no strikethrough (`35.0~~dev` stays literal), every code block closed, and the
+  `#N` / `!N` links are the intended ones.
+- **Not run:** `make default-tests` as a whole on the new branches (the suites named in each
+  merge request were), 32-bit targets, and the manual build for !57.
 - **Patch 39** was corrected before filing (four new files were created executable); see the
   2026-11-17 section.
 
@@ -336,6 +353,9 @@ Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11.
      !37, !40), saying who regenerates the oracles depending on the merge order.
 
 ## Open questions for the owner
+
+28 to 40 were filed on 2026-11-18 with the option each row calls "current"; their rows stay as
+points the maintainers may raise, and are no longer blocking.
 
 | # | Question |
 | :-- | :-- |
