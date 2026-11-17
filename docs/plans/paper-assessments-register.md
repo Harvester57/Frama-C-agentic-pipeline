@@ -48,7 +48,7 @@ Massart, Alberti, Bühler, Prevosto, DEBT workshop at ECOOP 2026, four pages. Re
 
 - **Claim.** The first debugger that steers an abstract interpreter while it runs: stepping, breakpoints on abstract states, choice of branch order, and ACSL annotations injected at a breakpoint, through the Debug Adapter Protocol with a VS Code client. Eva's iteration order is changed from a weak topological order to a weak partial order to make this possible.
 - **Evidence.** A tool description with stepping rules and one session on `cmdparse.c` of chrony: nine buffer-overflow alarms share one cause (a pointer offset with no upper bound), and one loop invariant or `loop unroll` removes all nine. There is no evaluation and no user study. The prototype supports a subset of ACSL and shows intervals only.
-- **Transfer.** Low. The tool is interactive and needs an editor; the pipeline runs Eva in batch ([`../../scripts/run_eva.py`](../../scripts/run_eva.py), with slevel and fallback tiers). Whether the debugger ships with the Frama-C 34 of the analysis image was not checked.
+- **Transfer.** Low. The tool is interactive and needs an editor; the pipeline runs Eva in batch ([`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py), with slevel and fallback tiers). Whether the debugger ships with the Frama-C 34 of the analysis image was not checked.
   - **Idea noted, not planned:** group Eva alarms by the imprecise location they share before they are queued for Phase 3, so that one annotation is tried for the group. Whether the pipeline already groups alarms this way was not checked.
   - The protocol runs over standard input and output, so an agent could in principle drive it. That is speculation until the tool's availability is known.
 
