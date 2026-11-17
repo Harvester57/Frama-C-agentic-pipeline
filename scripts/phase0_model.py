@@ -658,6 +658,64 @@ def reconcile_api_ids(units: dict[str, dict], functions: dict[str, dict]) -> lis
     return warnings
 
 
+LIBRARY_UNIT_KINDS = ("static_lib", "shared_lib")
+
+
+def public_header_files(public: dict | None, headers: Iterable[str]) -> set[str]:
+    """
+    The public headers of the build capture (`public_headers.files`) as paths relative to the tree.
+    They are already, except with the method `install`: the headers the install staged, as absolute
+    paths under the scratch directory. Each of those is mapped back to the tree header among
+    `headers` (the project's headers) that shares the longest trailing path with it
+    (`.../include/qcbor/qcbor_decode.h` -> `inc/qcbor/qcbor_decode.h`); a tie keeps every tied header.
+    """
+    files = [str(f).replace("\\", "/") for f in (public or {}).get("files") or [] if f]
+    tree_headers = sorted({str(h).replace("\\", "/") for h in headers})
+    out: set[str] = set()
+    for f in files:
+        if not (f.startswith("/") or re.match(r"[A-Za-z]:/", f)):
+            out.add(f)
+            continue
+        parts = f.split("/")
+        best, hits = 0, []
+        for h in tree_headers:
+            hp = h.split("/")
+            n = 0
+            while n < min(len(hp), len(parts)) and hp[-1 - n] == parts[-1 - n]:
+                n += 1
+            if n and n > best:
+                best, hits = n, [h]
+            elif n and n == best:
+                hits.append(h)
+        out.update(hits)
+    return out
+
+
+def header_api(
+    units: dict[str, dict], functions: dict[str, dict], public: dict | None, project_headers: Iterable[str] = ()
+) -> dict[str, list[str]]:
+    """
+    Per library unit (static or shared, not a test unit), the functions defined in one of the build
+    capture's public headers (`static` and `header` in the model) that the unit compiles: API entry
+    points without a global symbol, so the capture's `entry_points` cannot list them. Private
+    helpers count too: there is no naming rule (docs/plans/header-entry-points-plan.md, HD1).
+    `project_headers` (the headers the capture's compiles include) are the tree headers an installed
+    header may stand for, with those defining a function.
+    """
+    candidates = {*project_headers, *(str(f.get("file")) for f in functions.values() if f.get("header"))}
+    pub = public_header_files(public, candidates)
+    out: dict[str, list[str]] = {}
+    for name, rec in units.items():
+        if rec.get("test") or rec.get("kind") not in LIBRARY_UNIT_KINDS:
+            continue
+        out[name] = sorted(
+            fid
+            for fid, f in functions.items()
+            if f.get("static") and f.get("header") and f.get("file") in pub and name in (f.get("units") or [])
+        )
+    return out
+
+
 class ModelBuilder:
     """Merges the parse results of all jobs into one model, resolving across units as the linker does."""
 
@@ -1101,6 +1159,9 @@ def build_model(
             # recorder size them from what the project's own callers pass.
             f["param_sizes"] = sizes
     model["warnings"].extend(reconcile_api_ids(units_out, builder.functions))
+    included = {str(h) for c in capture.get("compiles") or [] for h in c.get("headers") or [] if str(h).endswith(".h")}
+    for name, ids in header_api(units_out, builder.functions, capture.get("public_headers"), included).items():
+        units_out[name]["header_api"] = ids
     # Phase 0 stops when Frama-C parses no unit: every later phase but fuzzing needs its AST. The
     # model is still written whole, so the fallback errors can be shown to the user.
     parsed = [n for n, u in units_out.items() if u["parse"]["status"] == "ok"]

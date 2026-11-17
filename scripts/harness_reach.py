@@ -1328,6 +1328,48 @@ def _load_module_sidecar(module: str, mm: ModuleMap, harnesses_dir: Path | None)
     return fallback if isinstance(fallback, dict) else {}
 
 
+_HEADER_API_NAMES_MAX = 20
+
+
+def _header_api_fields(
+    module: str,
+    dag: dict[str, Any],
+    mm: ModuleMap,
+    model: dict[str, Any] | None,
+    runs: dict[str, list[tuple[str, int]]],
+) -> dict[str, Any]:
+    """
+    R1 (docs/plans/header-entry-points-plan.md): the functions the public headers define that the
+    module's unit compiles (the Phase 0 model's `header_api`, HD1), and those the coverage report shows
+    with no execution or does not list (D21). They have no global symbol, so they are not entry points
+    and no gate counts them: the row reports them so that a passing gate is not read as "the API ran".
+    A sub-module counts those in its scope, as `_module_entries` scopes entry points. Names are DAG keys,
+    as in `gaps`. Nothing when the model has no `header_api` for the unit (a model made before it) or
+    the module is a target fuzz module.
+    """
+    if model is None or isinstance((mm.sidecars.get(module) or {}).get("target_fuzzer"), dict):
+        return {}
+    unit = mm.unit_record(module).get("unit")
+    ids = ((model.get("units") or {}).get(unit) or {}).get("header_api") if isinstance(unit, str) else None
+    if not isinstance(ids, list):
+        return {}
+    functions = dag.get("functions") or {}
+    # DAG key of a model id (`file#name`): the plain name when it is unique (build_callgraph_dag.py).
+    keys = {
+        fid: fid if fid in functions or fid.rpartition("#")[2] not in functions else fid.rpartition("#")[2]
+        for fid in ids
+        if isinstance(fid, str)
+    }
+    if mm.units_are_link_units and mm.unit_of(module) != module:
+        scope = set(mm.scope_functions(module))
+        keys = {fid: key for fid, key in keys.items() if key in scope}
+    never = sorted(key for fid, key in keys.items() if not _entry_executions(fid, {}, runs))
+    return {
+        "header_api_functions": len(keys),
+        "header_api_unexecuted": {"count": len(never), "functions": never[:_HEADER_API_NAMES_MAX]},
+    }
+
+
 def check_dynamic(
     module: str,
     dag: dict[str, Any],
@@ -1338,13 +1380,15 @@ def check_dynamic(
     *,
     harness_dir: Path | None = None,
     static_gaps: set[str] | list[str] | None = None,
+    model: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     The dynamic reach row of a harness module: its gate entry points the corpus never executed, minus
     those its sidecar exempts or that reproducible fuzz crashes of the current harness already proved
     executed (`_crashed_entry_points`; `crash_notes` says why the others proved nothing). An entry point
     the coverage build does not list (a header inline function no translation unit instantiated) counts
-    as never executed unless proven by a fuzz crash.
+    as never executed unless proven by a fuzz crash. With the Phase 0 `model`, the row also reports the
+    public header functions the corpus never executed (`_header_api_fields`); they decide nothing.
     """
     resolved_hdir = harnesses_dir if harnesses_dir is not None else harness_dir
     sidecar = _load_module_sidecar(module, mm, resolved_hdir)
@@ -1393,6 +1437,7 @@ def check_dynamic(
         "executions": dict(sorted(executed.items())),
         "gaps": never,
         "passed": not never,
+        **_header_api_fields(module, dag, mm, model, runs),
     }
     if crash_notes and never:
         # Why the crashes of the fuzz report did not close these gaps.
@@ -1458,6 +1503,13 @@ def run_dynamic(
         raise ValueError(f"{dag_path}: not a call-graph DAG object")
     mm = ModuleMap(dag, load_sidecars(resolved_hdir))
     static_gaps = _static_gaps_by_module(dag_path)
+    try:
+        # R1: the model next to the DAG gives each unit's public header functions (`header_api`).
+        model = load_json_optional(dag_path.parent / "phase0_model.json", None)
+    except (ArtifactError, OSError, ValueError):
+        model = None
+    if not isinstance(model, dict):
+        model = None
     rows: list[dict[str, Any]] = []
     for module in modules or sorted(mm.sidecars):
         cov = load_json_optional(coverage_dir / f"{module}.json", None)
@@ -1475,8 +1527,11 @@ def run_dynamic(
                 fuzz_dir=fuzz_dir,
                 harnesses_dir=resolved_hdir,
                 static_gaps=static_gaps.get(module),
+                model=model,
             )
             if proven["passed"]:
+                # No coverage measured the header functions: their count stays, not which ones ran.
+                proven.pop("header_api_unexecuted", None)
                 rows.append({**proven, "measured_by": "crashes"})
                 continue
             rows.append({"module": module, "mode": "dynamic", "passed": None, "error": f"no coverage ({status})"})
@@ -1489,10 +1544,12 @@ def run_dynamic(
             fuzz_dir=fuzz_dir,
             harnesses_dir=resolved_hdir,
             static_gaps=static_gaps.get(module),
+            model=model,
         )
         if (reason := partial_coverage_reason(cov)) is not None:
             # Keep what was measured for the reader; the gaps are only a lower bound and decide nothing.
             row.update(passed=None, error=reason, gaps_lower_bound=row.pop("gaps"))
+            row.pop("header_api_unexecuted", None)
         rows.append(row)
     crashed_total = sum(len(r.get("crashed_entry_points") or []) for r in rows if r.get("passed") is not None)
     return {

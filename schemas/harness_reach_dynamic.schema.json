@@ -23,6 +23,17 @@
           "gaps": {"type": "array", "items": {"type": "string", "minLength": 1}},
           "failed_inputs": {"$comment": "inputs that crashed the coverage replay when every input was replayed (inputs.failed); the reach stands", "type": "integer", "minimum": 1},
           "passed": {"type": "boolean"},
+          "header_api_functions": {"$comment": "R1: the public header functions (the Phase 0 model's `header_api` of the module's unit; for a sub-module, those in its scope). Not entry points, so they decide nothing. Absent when the model has no `header_api` for the unit", "type": "integer", "minimum": 0},
+          "header_api_unexecuted": {
+            "$comment": "R1: those of `header_api_functions` the coverage report shows with 0 executions or does not list (D21): their count and the first 20 DAG keys, sorted. Absent when no coverage report measured the module (`measured_by` crashes)",
+            "type": "object",
+            "properties": {
+              "count": {"type": "integer", "minimum": 0},
+              "functions": {"type": "array", "maxItems": 20, "items": {"type": "string", "minLength": 1}}
+            },
+            "required": ["count", "functions"],
+            "additionalProperties": false
+          },
           "measured_by": {"$comment": "`crashes` when the module had no usable coverage report and its reproducible fuzz crashes proved every entry point executed (run_dynamic); absent when the coverage report measured it", "const": "crashes"},
           "harness_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
         },
