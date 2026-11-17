@@ -70,7 +70,7 @@ import cache  # noqa: E402
 import decision_point_check  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
-from failure_identity import parse_eacsl_resource_abort, site_key  # noqa: E402
+from failure_identity import is_sanitizer_allocation_cap, parse_eacsl_resource_abort, site_key  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
@@ -1157,7 +1157,11 @@ def _eacsl_resource_abort(art: dict) -> dict | None:
     if found is None:
         return None
     attribution = art.get("attribution")
-    if isinstance(attribution, dict) and attribution.get("failure"):
+    san_failure = attribution.get("failure") if isinstance(attribution, dict) else None
+    if is_sanitizer_allocation_cap(san_failure):
+        # ASan's own allocator cap on the same input (run-4 reports, before allocator_may_return_null=1).
+        return {**found, "sanitizer_replay": "allocation_size_too_big"}
+    if san_failure:
         return None
     return {**found, "sanitizer_replay": "unavailable" if not attribution else "no_failure"}
 
