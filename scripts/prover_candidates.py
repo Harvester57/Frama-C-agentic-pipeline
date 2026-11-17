@@ -17,8 +17,12 @@ FRAMAC_CANDIDATE_RANK=legacy restores the earlier (failed, invalid, -proved) ran
 
 State, under agents/<id>/scratch/candidates/:
   state.json   the best candidate, the candidates seen, and one history entry per recorded oracle run
-  c<n>/        the latest report of each oracle on candidate n
-  best/        work/<rel>, wp_<fn>.json and guard_<fn>.json of the best candidate
+  c<n>/        the latest report of each oracle on candidate n, and candidate.patch: its tracked files as a unified
+               diff against scratch/base (empty when they equal it), written once when the candidate is first seen, so
+               the iterations can be replayed after scratch/base and scratch/work are gone. A diff above
+               MAX_CANDIDATE_PATCH_BYTES is not written: candidate.patch.omitted.json and the candidate's `patch` entry
+               in state.json give its size and sha256 instead.
+  best/       work/<rel>, wp_<fn>.json and guard_<fn>.json of the best candidate
   last/        what restore_best replaced in scratch/ (for example the code_fault report of the last iteration)
 
 CLI (run from the run directory; each prints one JSON object):
@@ -67,6 +71,11 @@ CANDIDATES_DIR = "candidates"
 STATE_FILE = f"{CANDIDATES_DIR}/state.json"
 BEST_DIR = f"{CANDIDATES_DIR}/best"
 LAST_DIR = f"{CANDIDATES_DIR}/last"
+CANDIDATE_PATCH = "candidate.patch"
+CANDIDATE_PATCH_OMITTED = "candidate.patch.omitted.json"
+# A prover's annotation diff is a few KiB; a diff this large means the tracked files were rewritten wholesale, and one
+# per iteration would fill the run directory.
+MAX_CANDIDATE_PATCH_BYTES = 256 * 1024
 STAGED_DIR = f"{CANDIDATES_DIR}/.best.new"
 RETIRED_DIR = f"{CANDIDATES_DIR}/.best.old"
 
@@ -529,6 +538,32 @@ def _not_recorded(state: dict | None, reason: str) -> dict:
     }
 
 
+def _keep_candidate_patch(scratch: Path, cand: dict, contents: dict[str, bytes | None]) -> None:
+    """
+    Write candidates/c<n>/candidate.patch once per candidate (the files are identified by their digest, so a later
+    oracle run on the same candidate would write the same bytes), and record what was kept in cand["patch"]. Above
+    MAX_CANDIDATE_PATCH_BYTES the diff is not written; candidate.patch.omitted.json says so. A write error is recorded
+    and retried on the next oracle run; it never stops the candidate from being recorded.
+    """
+    if "patch" in cand and "error" not in cand["patch"]:
+        return
+    cand_dir = f"{CANDIDATES_DIR}/c{cand['id']}"
+    try:
+        patch = _patch_bytes(scratch, sorted(contents), contents)
+        info: dict = {"bytes": len(patch), "sha256": hashlib.sha256(patch).hexdigest()}
+        if len(patch) > MAX_CANDIDATE_PATCH_BYTES:
+            info.update(file=None, omitted=f"above the {MAX_CANDIDATE_PATCH_BYTES}-byte bound")
+            _write_under(
+                scratch, f"{cand_dir}/{CANDIDATE_PATCH_OMITTED}", _report_bytes({"candidate": cand["id"], **info})
+            )
+        else:
+            _write_under(scratch, f"{cand_dir}/{CANDIDATE_PATCH}", patch)
+            info["file"] = CANDIDATE_PATCH
+    except (OSError, ArtifactError) as exc:
+        info = {"error": f"{type(exc).__name__}: {exc}"}
+    cand["patch"] = info
+
+
 def note_oracle(out_json: Path, oracle: str, report: dict, digest_before: str | None) -> dict | None:
     """
     Record one finished oracle run, already written to `out_json`, and evaluate its candidate if the other oracle has
@@ -573,6 +608,7 @@ def note_oracle(out_json: Path, oracle: str, report: dict, digest_before: str | 
             state["next_id"] += 1
         name = _report_name(oracle, function)
         _write_under(scratch, f"{CANDIDATES_DIR}/c{cand['id']}/{name}", _report_bytes(report))
+        _keep_candidate_patch(scratch, cand, contents)
         cand[oracle] = _oracle_summary(oracle, report)
         if oracle == "wp":
             # Recorded in both rank modes, so an A/B comparison can count them.
@@ -653,12 +689,15 @@ def _diff_lines(data: bytes | None) -> list[str]:
     return [line for line in re.split(r"(?<=\n)", text) if line]
 
 
-def _patch_bytes(scratch: Path, rels: list[str]) -> bytes:
-    """The annotation diff the brief asks for: scratch/base vs scratch/work on the tracked files."""
+def _patch_bytes(scratch: Path, rels: list[str], work: dict[str, bytes | None] | None = None) -> bytes:
+    """
+    The annotation diff the brief asks for: scratch/base vs scratch/work on the tracked files. `work` gives the files'
+    bytes instead of reading scratch/work (None: absent).
+    """
     chunks: list[str] = []
     for rel in rels:
         before = _diff_lines(_read_regular(scratch, f"base/{rel}"))
-        after = _diff_lines(_read_regular(scratch, f"work/{rel}"))
+        after = _diff_lines(work[rel] if work is not None else _read_regular(scratch, f"work/{rel}"))
         for line in difflib.unified_diff(before, after, fromfile=f"a/{rel}", tofile=f"b/{rel}"):
             chunks.append(line if line.endswith("\n") else f"{line}\n\\ No newline at end of file\n")
     return "".join(chunks).encode("utf-8", "surrogateescape")
