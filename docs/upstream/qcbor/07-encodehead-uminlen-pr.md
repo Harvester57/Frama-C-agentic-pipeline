@@ -12,14 +12,14 @@ Fixes #<issue>.
 
 - `src/qcbor_main_encode.c`: `QCBOREncode_EncodeHead()` returns `NULLUsefulBufC` when `uMinLen` is more than 8, as it already does for a buffer that is too small. The `EXTRA_ENCODE_HEAD_CHECK` block now says `Buffer.ptr` instead of `buffer.ptr`, so it compiles when enabled.
 - `inc/qcbor/qcbor_main_encode.h`: the `@param uMinLen` and `@return` documentation state the limit.
-- `test/qcbor_encode_tests.c`: `QCBORHeadTest()` checks that `uMinLen` 8 still gives `1b 00 00 00 00 00 00 00 00` (-4), and that 9 returns NULL (-5).
+- `test/qcbor_encode_tests.c`: `QCBORHeadTest()` checks that `uMinLen` 9 returns NULL (-4). The existing test -2 already covers `uMinLen` 8.
 
 ## Testing
 
 All on `dev` `19c3367`, with gcc and clang 19.1.7 on Linux x86_64:
 
 - Without the fix in `src/`, the new test crashes the test binary with a segmentation fault: the writes before `RightSize` corrupt the stack.
-- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and `qcbortest` passes 90/90.
+- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and all `qcbortest` tests pass.
 - The test suite under ASan + UBSan reports nothing new.
 - The reproducer in the issue prints `OK`, also under ASan + UBSan.
 - This PR applies on its own to `dev`. Merged with my other open QCBOR PRs, the same checks pass, and the test suite is also clean under MSan.
@@ -46,7 +46,7 @@ Fixes #<issue> for 1.x. This is the same change as #<dev PR> on `dev`.
 All on `master` `1d06057`, with gcc and clang 19.1.7 on Linux x86_64:
 
 - Without the fix in `src/`, the new test crashes the test binary with a segmentation fault.
-- `make warn` with gcc and with clang, for each of the 10 configurations in the CI workflow, builds with no warning, and `qcbortest` passes 76/76.
+- `make warn` with gcc and with clang, for each of the 10 configurations in the CI workflow, builds with no warning, and all `qcbortest` tests pass.
 - The test suite under ASan + UBSan reports nothing new.
 - The reproducer in the issue prints `OK`. Without the fix, the plain build crashes with a segmentation fault.
 

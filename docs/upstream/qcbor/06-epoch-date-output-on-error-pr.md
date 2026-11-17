@@ -12,7 +12,7 @@ The six epoch date and days getters copied `Item.val` into the caller's output e
 All on `dev` `19c3367`, with gcc and clang 19.1.7 on Linux x86_64:
 
 - Without the fix in `src/`, the new test fails: `SpiffyDateDecodeTest FAILED (returned 1081)`.
-- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and `qcbortest` passes 90/90.
+- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and all `qcbortest` tests pass.
 - The test suite under ASan + UBSan reports nothing new, and under MSan it is clean.
 - The reproducer in the issue prints `OK`, with and without MSan. The label-not-found case of the four `InMap` getters is clean under MSan. The latched-error case of `GetTEpochDate()` / `GetTEpochDays()` keeps the caller's value, and is clean under MSan built with `-fno-sanitize-memory-param-retval` (see the note below).
 - This PR applies on its own to `dev`. Merged with my other open QCBOR PRs, the same checks pass.

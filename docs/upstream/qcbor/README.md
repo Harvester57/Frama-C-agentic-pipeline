@@ -37,6 +37,70 @@ QCBOR run-5 and run-6. The assessments are in
   | 10 | [#444](https://github.com/laurencelundblade/QCBOR/issues/444) | [#450](https://github.com/laurencelundblade/QCBOR/pull/450) | [#452](https://github.com/laurencelundblade/QCBOR/pull/452) |
 
   The private follow-up email has not been sent yet. It now points to these references.
+- **05: review round on 2026-11-17.** The maintainer reviewed
+  [#447](https://github.com/laurencelundblade/QCBOR/pull/447) on 2026-11-16: he likes the change
+  and asked for six small things. A second commit, `b3aa0da`, was pushed to the PR branch and a
+  [reply](https://github.com/laurencelundblade/QCBOR/pull/447#issuecomment-6933621255) posted.
+  The changes:
+  - `uComparison` is `nComparison` (it is an `int`).
+  - The `Code Reviewers: THIS FUNCTION DOES POINTER MATH` note is back, with why the indexing is safe.
+  - `UsefulBuf.c` has an edit history entry.
+  - "substring" is "prefix" in the header and in two code comments, and the header text uses the
+    parameter names `uStart1` and `uStart2`.
+  - The header says the state of the `UsefulOutBuf` is not checked: the guarantee holds for one
+    that is initialized, not corrupted and has a buffer. With a `NULL` buffer (size calculation)
+    that has data in it, the function reads through the `NULL` pointer. The code before the fix
+    did the same. Whether the encoder can sort a map in that mode was not checked.
+  - No copyright line was added (the maintainer left it optional).
+
+  Checked on the branch at `b3aa0da`: `make warn` with gcc and clang in the 12 CI configurations
+  builds with no new warning and no test fails, and the test suite under ASan + UBSan reports
+  nothing new. The PR is waiting for the maintainer.
+- **Self-review of the other PRs on 2026-11-17.** The seven other PRs were checked for the kind of
+  comments the maintainer made on #447, for consistency and for correctness. All seven fixes are
+  correct. Three more commits were pushed and the eight PR descriptions were edited:
+  - **#446** (`91b444f`): the header now says there is no negative zero. The description says that
+    one case also needs #445: a negative zero with `QCBOR_ENCODE_AS_BORROWED` and no preferred
+    serialization is `c3 41 00` with #446 alone and `41 00` with both.
+  - **#449** (`25f3c4d`): the new `uMinLen` 8 test is gone, because the existing test -2 covers it.
+    The test is now the same as in #451 (-4: `uMinLen` 9 returns NULL).
+  - **#447** (`2ea93a4`): `UsefulBuf.h` has an edit history entry too. No comment was posted on
+    the PR for this third commit.
+  - **All eight descriptions:** "passes 90/90" (76/76 on 1.x) is now "all tests pass". The number
+    of tests run depends on the configuration: 81 to 90 on `dev`, 68 to 76 on 1.x.
+
+  Upstream `dev` moved to `d511b6b` on 2026-11-16 (#438, #453 and #455). Each `dev` PR merges
+  onto it without conflict. On that merge, and on each branch alone, `make warn` with gcc and
+  clang in the default configuration builds with no warning, no test fails, and the ASan + UBSan
+  suite reports nothing new. The 12-configuration matrix and MSan were not run again.
+
+  The maintainer's comment types on #447, for the next PRs: `n` prefix for an `int`; an edit
+  history entry in `UsefulBuf.c` and `UsefulBuf.h`; keep the `Code Reviewers` notes; the header
+  must say what the code does; he likes smaller object code.
+- **#454 and `c9caf8b` checked on 2026-11-17: nothing the run should have found.**
+  - [#454](https://github.com/laurencelundblade/QCBOR/issues/454) (third party, 2026-11-16)
+    describes two behaviours of `QCBORDecode_GetItemsInMap()` that upstream had already fixed
+    (#404 and #427 on `master`, #406 and #428 on `dev`), but that no release has.
+    [`repro/issue454_mapsearch.c`](./repro/issue454_mapsearch.c) under ASan + UBSan:
+
+    | Tree | Query of 65 items | Empty query, integer input | Empty query, entered array |
+    | :--- | :--- | :--- | :--- |
+    | v1.5.3, v1.6.1, v2.0-alpha-6 | `QCBOR_ERR_DUPLICATE_LABEL`, shift exponent 64 | NULL dereference, crash | `QCBOR_SUCCESS` |
+    | `master` `1d06057`, `dev` `9bd0845` and `d511b6b` | `QCBOR_ERR_TOO_MANY_GET_ITEMS` | `QCBOR_ERR_MAP_NOT_ENTERED` | `QCBOR_ERR_MAP_NOT_ENTERED` |
+
+    The `dev` fixes are from 2026-09-05 and 2026-10-23, before the analyzed commit (2026-11-03).
+    The release tags were only used to check where our own bugs reproduce. Not run: the read past
+    a query with no sentinel, and the later `QCBOR_ERR_EXIT_MISMATCH`.
+  - **The run-6 harness does not exercise this API, so it would not have shown them.** On `dev`,
+    `QCBORDecode_GetItemsInMap()` is defined in the public header, so it is not an entry point:
+    the harness never calls it, and the coverage report has 0 executions for it. This is an open
+    pipeline gap, recorded in
+    [`../../troubleshooting/harnesses-and-seeds.md`](../../troubleshooting/harnesses-and-seeds.md)
+    ("Public API Functions Defined in a Header"). For 1.x, where the function is in
+    `src/qcbor_decode.c`, this is not established: the pipeline never ran on 1.x.
+  - `c9caf8b` is #438, the fix for 04. It also fixes a shift that is out of range only where
+    `unsigned long` is 32 bits, which we did not report and could not see on x86_64. See the end
+    of [04](./04-ieee754-out-of-range-shift.md).
 
 **Exposure in this repository.** `origin` (`Harvester57/Frama-C-agentic-pipeline`) is a public
 GitHub repository:
@@ -123,7 +187,7 @@ literal has a zero byte after it.
 
 | Series | Applies to | Contents |
 | :--- | :--- | :--- |
-| `patches/public/` (7) | `dev` `19c3367`, each patch on its own | One patch per PR: 0001 = 02, 0002 = 03, 0004 = 05, 0005 = 06, 0006 = 07, 0007 = 09, 0008 = 10 |
+| `patches/public/` (7) | `dev` `19c3367`, each patch on its own | One patch per PR: 0001 = 02, 0002 = 03, 0004 = 05, 0005 = 06, 0006 = 07, 0007 = 09, 0008 = 10. 0002, 0004 and 0006 were regenerated on 2026-11-17: each is all the commits of its PR branch (#446, #447, #449) as one patch |
 | `patches/private/` (2) | `dev` `19c3367`, each patch on its own | Fixes 01 and 08. Rebased 2026-11-15; both applied cleanly. |
 | `patches/v1/` (3) | `master` `1d06057`, each patch on its own | 0001 = 04, 0002 = 07, 0003 = 10 for 1.x |
 
@@ -164,6 +228,9 @@ already cover under UBSan. Every new test was checked to fail on the sources bef
   [`repro/consume_item.c`](./repro/consume_item.c) (bug 10, with [`repro/consume_indef.c`](./repro/consume_indef.c) for the loop
   condition), [`repro/epoch_days_sz.c`](./repro/epoch_days_sz.c) (the sixth getter of 06), and
   [`repro/getiteminmap.c`](./repro/getiteminmap.c) (the `uOffset` case under "Not reported").
+- [`repro/issue454_mapsearch.c`](./repro/issue454_mapsearch.c) is not for one of our bugs. It
+  shows on which trees the two behaviours of #454 exist (see "Status"). It builds on 1.x and
+  `dev`, and `run_all.sh` does not run it.
 
 The runs used gcc and clang 19.1.7 on Linux x86_64, inside the `framac-analysis` container
 (`docker run --security-opt seccomp=unconfined …` for MSan).
@@ -174,21 +241,21 @@ For each `dev` patch on its own, and for all seven merged together:
 
 | Check | Result |
 | :--- | :--- |
-| `make warn` with gcc and clang, 12 CI configurations, then `qcbortest` | 24 jobs per tree. Every job builds and passes 90/90, with no warning except the 10 that `QCBOR_DISABLE_DECODE_CONFORMANCE` already gives on unpatched `dev` |
+| `make warn` with gcc and clang, 12 CI configurations, then `qcbortest` | 24 jobs per tree. Every job builds and no test fails (81 to 90 tests run, depending on the configuration), with no warning except the 10 that `QCBOR_DISABLE_DECODE_CONFORMANCE` already gives on unpatched `dev` |
 | New tests on unpatched `src/` | 0001 `BigNumEncodeTests` -5; 0002 `BigNumEncodeTests` 7003000; 0004 `UOBExtraTests` "Comparison with wrapping offset"; 0005 `SpiffyDateDecodeTest` 1081; 0006 segfault (the write before the buffer); 0008 `EnterMapTest` 3002 |
 | Minimal reproducers | `BUG` on unpatched `dev`, `OK` with the fix, plain and under the relevant sanitizer |
 | Test suite, ASan + recoverable UBSan | 90/90; only the reports listed below |
 | Test suite, MSan with `-fno-sanitize-memory-param-retval` | 90/90 and clean, on unpatched `dev`, with 0005, with 0008, and with all seven |
 
 For the private patches on `19c3367`, each alone and both merged with the seven public ones: all 72 CI
-jobs build with no new warning and pass 90/90. The new tests fail on unpatched `src/`
+jobs build with no new warning and no test fails. The new tests fail on unpatched `src/`
 (`BigNumEncodeTests` -3; `GetMapAndArrayTest` 110). [`repro/bignum_zero.c`](./repro/bignum_zero.c) goes from `c2 41 a5` / `18 a5`
 and an ASan heap-buffer-overflow to `c2 41 00` / `00`, clean. [`repro/getarray_empty.c`](./repro/getarray_empty.c) goes from a garbage
 or 0 length and an MSan report in all four modes to `len=1`, clean. The test suite reports nothing new under ASan + UBSan, and
 is clean under MSan.
 
 For `master` `1d06057`: with `v1/0002` alone and with `v1/0003` alone, all 10 CI configurations build with
-gcc and clang with no warning, 76/76 pass, the new tests fail without the fix (0002: segfault;
+gcc and clang with no warning, no test fails (68 to 76 tests run, depending on the configuration), the new tests fail without the fix (0002: segfault;
 0003: `EnterMapTest` 3002), the reproducer prints `OK`, and the ASan + UBSan suite reports
 nothing new. With `v1/0003`, the suite is also clean under MSan.
 
@@ -199,7 +266,8 @@ that path (see "Not reported"). Lazy MSan (`-fno-sanitize-memory-param-retval`) 
 
 **UBSan reports left after the patches.** These are on every tree, not caused by these bugs, and
 not reported: `memcpy`/`memcmp` passed a NULL pointer with length 0, at `UsefulBuf.h:2195`
-(`:2196` once patch 0004 shifts the header by a line, `:1859` on 1.x) and `UsefulBuf.c:102`, `:122` and `:506`. This is formally undefined in C17 and
+(`:2203` with patch 0004, which makes the header longer, `:1859` on 1.x) and `UsefulBuf.c:102`, `:122` and `:506`
+(`:103`, `:123` and `:507` with patch 0004, for its edit history line). This is formally undefined in C17 and
 harmless in practice. C2y makes it defined (N3322). `ieee754.c:466` and `:625` remain until #438 is
 merged, and `qcbor_number_decode.c:1964` and `:2008` until 09 is fixed.
 
@@ -218,6 +286,11 @@ nine bugs still reproduce on `19c3367`
 - **The 13 "toolchain artifact" rejections** come from an E-ACSL bug, not a QCBOR one. That bug
   is reported to Frama-C in
   [`../frama-c/frama-c-eacsl-formal-params-initialized.md`](../frama-c/frama-c-eacsl-formal-params-initialized.md).
+- **`qcbor_err_to_str()` has no entry for `QCBOR_ERR_TOO_MANY_GET_ITEMS`.** The error was added
+  with #404 and #406, but not to `src/qcbor_err_to_str.c`, so the function returns
+  "Unidentified QCBOR error" for it. Seen on `master` `1d06057` and `dev` `9bd0845` and `d511b6b`
+  with [`repro/issue454_mapsearch.c`](./repro/issue454_mapsearch.c) (`many 65`). It is cosmetic.
+  No upstream issue mentions it (searched on 2026-11-17).
 
 ## What not to publish yet
 

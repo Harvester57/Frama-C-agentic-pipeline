@@ -1,6 +1,6 @@
-From 46bd4043af5f3d570e194b723a9f4935e95c4f44 Mon Sep 17 00:00:00 2001
-From: Florian Stosse <florian.stosse@gmail.com>
-Date: Mon, 9 Nov 2026 15:23:59 +0100
+From 8a02a5239b78daff626db78e62f212679e3713ca Mon Sep 17 00:00:00 2001
+From: Florian Stosse <7060295+Harvester57@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 01:49:58 +0100
 Subject: [PATCH] Reject uMinLen > 8 in QCBOREncode_EncodeHead()
 
 QCBOREncode_EncodeHead() is public and its uMinLen is documented only
@@ -18,11 +18,12 @@ Also fix the EXTRA_ENCODE_HEAD_CHECK sanity check, which referred to
 buffer.ptr instead of Buffer.ptr and did not compile.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 ---
- inc/qcbor/qcbor_main_encode.h |  6 ++++--
- src/qcbor_main_encode.c       |  9 ++++++++-
- test/qcbor_encode_tests.c     | 17 +++++++++++++++++
- 3 files changed, 29 insertions(+), 3 deletions(-)
+ inc/qcbor/qcbor_main_encode.h | 6 ++++--
+ src/qcbor_main_encode.c       | 9 ++++++++-
+ test/qcbor_encode_tests.c     | 9 +++++++++
+ 3 files changed, 21 insertions(+), 3 deletions(-)
 
 diff --git a/inc/qcbor/qcbor_main_encode.h b/inc/qcbor/qcbor_main_encode.h
 index b664250..5104895 100644
@@ -71,28 +72,20 @@ index 465e37e..e4b26af 100644
     }
  #endif /* EXTRA_ENCODE_HEAD_CHECK */
 diff --git a/test/qcbor_encode_tests.c b/test/qcbor_encode_tests.c
-index e9e5977..65d068b 100644
+index e9e5977..2de4d47 100644
 --- a/test/qcbor_encode_tests.c
 +++ b/test/qcbor_encode_tests.c
-@@ -3429,6 +3429,23 @@ int32_t QCBORHeadTest(void)
+@@ -3429,6 +3429,15 @@ int32_t QCBORHeadTest(void)
        return -3;
     }
  
 +   // ---- uMinLen of 8 is the maximum; more is an error ----
 +   encoded = QCBOREncode_EncodeHead(RightSize,
 +                                    CBOR_MAJOR_TYPE_POSITIVE_INT,
-+                                    8,
-+                                    0);
-+   if(UsefulBuf_Compare(encoded, UsefulBuf_FROM_SZ_LITERAL("\x1B\x00\x00\x00\x00\x00\x00\x00\x00"))) {
-+      return -4;
-+   }
-+
-+   encoded = QCBOREncode_EncodeHead(RightSize,
-+                                    CBOR_MAJOR_TYPE_POSITIVE_INT,
 +                                    9,
 +                                    0);
 +   if(!UsefulBuf_IsNULLC(encoded)) {
-+      return -5;
++      return -4;
 +   }
 +
     return 0;

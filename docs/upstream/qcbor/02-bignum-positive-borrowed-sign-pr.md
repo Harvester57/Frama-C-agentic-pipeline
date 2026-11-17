@@ -12,7 +12,7 @@ Fixes #<issue>.
 All on `dev` `19c3367`, with gcc and clang 19.1.7 on Linux x86_64:
 
 - Without the fix in `src/`, the new test fails: `BigNumEncodeTests FAILED (returned -5)`.
-- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and `qcbortest` passes 90/90.
+- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and all `qcbortest` tests pass.
 - The test suite under ASan + UBSan reports nothing new.
 - The reproducer in the issue prints `OK`.
 - This PR applies on its own to `dev`. Merged with my other open QCBOR PRs, the same checks pass, and the test suite is also clean under MSan.

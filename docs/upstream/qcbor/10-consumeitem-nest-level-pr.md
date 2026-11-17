@@ -18,7 +18,7 @@ Fixes #<issue>.
 All on `dev` `19c3367`, with gcc and clang 19.1.7 on Linux x86_64:
 
 - Without the fix in `src/`, the new test fails: `EnterMapTest FAILED (returned 3002)`. That check reads a stack byte, so it could pass by chance on another platform. MSan always reports it.
-- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and `qcbortest` passes 90/90.
+- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and all `qcbortest` tests pass.
 - The test suite under ASan + UBSan reports nothing new, and under MSan it is clean.
 - The reproducer in the issue prints `OK`, with and without MSan. A truncated map (`b7` with nothing after it) is clean under MSan too.
 - This PR applies on its own to `dev`. Merged with my other open QCBOR PRs, the same checks pass.
@@ -44,7 +44,7 @@ Fixes #<issue> for 1.x. This is the same fix as #<dev PR> on `dev`.
 All on `master` `1d06057`, with gcc and clang 19.1.7 on Linux x86_64:
 
 - Without the fix in `src/`, the new test fails: `EnterMapTest FAILED (returned 3002)`.
-- `make warn` with gcc and with clang, for each of the 10 configurations in the CI workflow, builds with no warning, and `qcbortest` passes 76/76.
+- `make warn` with gcc and with clang, for each of the 10 configurations in the CI workflow, builds with no warning, and all `qcbortest` tests pass.
 - The test suite under ASan + UBSan reports nothing new, and under MSan it is clean.
 - The reproducer in the issue prints `OK`, with and without MSan.
 

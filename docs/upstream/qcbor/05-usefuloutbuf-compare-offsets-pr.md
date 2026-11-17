@@ -13,8 +13,8 @@ Fixes #<issue>.
 All on `dev` `19c3367`, with gcc and clang 19.1.7 on Linux x86_64:
 
 - Without the fix in `src/`, the new tests fail: `UOBExtraTests FAILED (returned Comparison with wrapping offset)`.
-- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and `qcbortest` passes 90/90.
-- The test suite under ASan + UBSan reports nothing new. The only line change in its output is the existing NULL `memcpy` report at `UsefulBuf.h:2195`, which moves to `:2196` because the header comment is one line longer.
+- `make warn` with gcc and with clang, for each of the 12 configurations in the CI workflow, builds with no new warning, and all `qcbortest` tests pass.
+- The test suite under ASan + UBSan reports nothing new. The only line change in its output is the existing NULL `memcpy` report at `UsefulBuf.h:2195`, which moves down a few lines because the header comment is longer.
 - The reproducer in the issue prints `OK` in plain, ASan and UBSan builds.
 - This PR applies on its own to `dev`. Merged with my other open QCBOR PRs, the same checks pass, and the test suite is also clean under MSan.
 

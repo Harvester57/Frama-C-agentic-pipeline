@@ -130,3 +130,24 @@ and [`logs/v1-master.log`](./logs/v1-master.log).
 The other UBSan reports in the test suite are on both branches, with and without the patches:
 `memcpy`/`memcmp` passed a NULL pointer with length 0 (`UsefulBuf.h`, `UsefulBuf.c`). They are not
 part of this report.
+
+## What #438 fixes besides this bug
+
+The maintainer's fix (`c9caf8b`, 2026-11-15) has the same shape as the fix above for both
+functions. It has a third change that this report did not have:
+
+```c
+/* IEEE754_Private_CountPrecisionBits(), src/ieee754.c:692 at 9bd0845 */
+for(nNonZeroBitsCount = 64; nNonZeroBitsCount > 0; nNonZeroBitsCount--) {
+   uMask = 0x01UL << (64 - nNonZeroBitsCount);      /* now 0x01ULL */
+```
+
+- The shift count goes from 0 to 63. Where `unsigned long` is 32 bits (Windows, 32-bit targets),
+  a count of 32 or more is undefined behavior, and the mask cannot test the upper 32 bits of the
+  significand.
+- The callers are `IEEE754_DoubleToInt()`, `IEEE754_SingleToInt()` and `IEEE754_UintToDouble()`.
+  The function is on `dev` only; 1.x does not have it.
+- **We did not find it, and could not have:** the pipeline analyzes with the `gcc_x86_64`
+  machdep, and the sanitizer builds are Linux x86_64. There `unsigned long` is 64 bits and the
+  shift is valid.
+- This was read from the code on 2026-11-17. It was not reproduced on a 32-bit build.
