@@ -562,6 +562,7 @@ Issues encountered in Phase 3 deductive verification (`run_wp_function.py`), Dua
   - Pipeline gap 1: `requeue` does not look for a result the agent already wrote. It discards a finished verdict as "never returned", and the work is redone (about 15 min of agent time per verifier).
   - Pipeline gap 2: `requeue --stale-minutes 0` reassigns every running task with no guard. It does not check the agent's age against its `wall_budget_s`, or whether its scratch directory is still being written. So one confused call duplicates live work.
   - Pipeline gap 3: `status` gives no hint that a running task's result already sits on disk, waiting for `complete`.
+  - Contributing factor: `step` nests its dispatch list under `next.tasks`, while `next` returns `tasks` at the top level. The parent's reader assumed the `step` shape and printed 0 for a `next` output that held 10 tasks. It confirmed this at 17:03.
 - **Fix:** **Open pipeline bug:** not fixed.
   - Suggested change: `requeue` and `status` report a running task whose `agents/<id>/scratch/result.json` validates as `result_waiting` and point to `step --complete <id>`.
   - Suggested change: `requeue` refuses tasks younger than their `wall_budget_s` unless the call passes `--force`.
