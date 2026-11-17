@@ -46,6 +46,12 @@ services:
     cpus: 4
     mem_limit: 8g
     pids_limit: 4096
+    # No core dumps (soft = hard = 1 byte), as the wrappers' --ulimit core=1:1: Docker Desktop on WSL2
+    # pipes cores to the host's crash capture, which ignores a limit of 0.
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
     environment:
       - PYTHONIOENCODING=utf-8
       - OPAMROOT=/home/opam/.opam
@@ -104,6 +110,10 @@ services:
     cpus: 4
     mem_limit: 8g
     pids_limit: 4096
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
     environment:
       - PYTHONIOENCODING=utf-8
       - S=/opt/framac-pipeline/scripts

@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Any
 
 from patterns import parse_mem
+from sandbox_exec import CORE_LIMIT_BYTES
 
 try:  # POSIX advisory locks
     import fcntl
@@ -3115,6 +3116,14 @@ def allocate_cpuset(topology: dict, allowed: Iterable[int], taken: Iterable[int]
 
 _MANAGED_FLAGS = frozenset({"--cpus", "--cpuset-cpus", "--memory", "-m", "--memory-swap", "--pids-limit", "--name"})
 
+# Container-wide core size limit, soft = hard = sandbox_exec's 1 byte. Docker Desktop on WSL2 pipes
+# cores to /wsl-capture-crash, which ignores a limit of 0 (the engine's default soft limit, with an
+# unlimited hard one) and writes the whole core to %TEMP%\wsl-crashes on the Windows host: an E-ACSL
+# abort reproduced outside sandbox_exec wrote 23 GB and filled the disk. The wrappers put the same
+# flag in their hardening flags (framac-docker.sh HARDENING, framac-docker.ps1 $hardeningArgs), so it
+# reaches the broker path through the caller's argv; docker-compose.yml sets it per service.
+CORE_ULIMIT_ARGS: tuple[str, str] = ("--ulimit", f"core={CORE_LIMIT_BYTES}:{CORE_LIMIT_BYTES}")
+
 
 def build_engine_argv(
     engine_argv: list[str],
@@ -3371,6 +3380,7 @@ def ensure_cache_volume(
                 "ALL",
                 "--security-opt",
                 "no-new-privileges",
+                *CORE_ULIMIT_ARGS,
                 "--user",
                 "0:0",
                 "--label",
