@@ -560,3 +560,15 @@ Diagnosed on nettle (`./configure --disable-fat --disable-assembler`, Frama-C 35
   - Struct-field (pointer, count) pairs in `_fill_fields` are still clamped in bytes, not elements.
   - An array shared between the calls of a sequence case keeps an unclamped count.
   - A count named neither count, len nor size (`npts`, `max`) is not detected. Workaround: a `custom` case.
+
+### Symptom: Most `--api` Crashes on a Library Come From Argument Values the API Documents as Invalid (Unordered `min`/`max`, Zero Sizes, Raw Enum Integers, `realloc` on a Static Buffer, Results Never Freed)
+- **Seen on:** mpack run-4 (2026-11-17), Phase 1: 106 artifacts in 12 of 14 modules. A read-only pre-assessment by the run supervisor (no replay) found every library group harness-made. Case numbers below are run-4's (selector `identity`: first input byte = case):
+  - unordered `(min, max)` in every `mpack_expect_*_range` case (`mpack_common` cases 2, 5, 8, 10, 12, 14, 20, 23, 25; `mpack_expect` 16, 32): mpack asserts `min <= max` (`mpack-expect.c` about 267-271), which is `__builtin_unreachable` in release, so UBSan reports "unreachable";
+  - capacities allowed to be 0: `mpack_expect_cstr` (`mpack_expect_2` case 1), `mpack_node_copy_cstr` / `_utf8_cstr` (`mpack_node` case 5, `mpack_node_2` case 3), `mpack_tree_init_stream` `max_message_nodes` (`mpack_node_3` case 8);
+  - `mpack_reader_init(reader, buffer, size, count)` with `size` capped but `count` unbounded (`mpack_reader` cases 4, 8; `count` is the bytes already in the buffer, `mpack-reader.h:184`);
+  - a raw `int` for `mpack_type_t` / `mpack_error_t` (`mpack_writer` cases 0, 1);
+  - `mpack_realloc` on a static buffer (`mpack_node_4` case 14, `mpack_writer_2` case 2), already rejected in run-3;
+  - documented-owned results never freed, giving LSan leaks: `mpack_read_bytes_alloc` (`mpack_expect` case 61), `mpack_expect_cstr_alloc` / `_utf8_cstr_alloc` (`mpack_expect_2` cases 2, 11), the growable writer's `*data` after `mpack_writer_destroy` (`mpack_writer_3` case 6);
+  - lower priority: typed tag accessors given a zeroed tag (`mpack_common` cases 49-87); `mpack_node_t` built from zeroed buffers and internal inline helpers such as `mpack_node_child` exposed as cases; call order ignored (`mpack_complete_array` without `mpack_build_array`, `mpack_writer_2` cases 26-27; `mpack_reader_set_skip` on a data reader, `mpack_reader` case 7).
+- **Cause:** **Open pipeline bug.** [`../../scripts/api_harness.py`](../../scripts/api_harness.py) gives each parameter its C type's full domain, except for the bounds added by S9, S10 and S12. It does not apply value domains the API documents, such as ordered bounds, nonzero capacities, `count <= size`, enum constants, heap-only pointers for realloc-like parameters, or freeing owned results. Each such crash costs a Crash Verifier run and ends `harness_induced`.
+- **Fix:** none merged. A fixer (run supervisor S14, branch `sup/mpack-api-arg-domains`) is preparing declaration-driven rules; the patterns it leaves open will be listed here.

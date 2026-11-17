@@ -1,0 +1,55 @@
+# mpack run-4 supervision report (2026-11-17)
+
+- **Runs index:** [`./README.md`](./README.md)
+- **Troubleshooting catalog:** [`../troubleshooting/README.md`](../troubleshooting/README.md)
+- **Previous runs (run-1 to run-3):** [`./2026-11-17-mpack-run1-supervision.md`](./2026-11-17-mpack-run1-supervision.md)
+
+External supervision of the opencode-driven clean rerun of `mpack` after the run-3 fixes (S1b, S3-S12) were merged. The user allowed the supervisor to message the session when it struggles or stops. This report is updated at each milestone.
+
+## Parameters
+
+| Parameter | Value |
+| :--- | :--- |
+| Run directory | `C:\Users\Florian\framac-pipeline\mpack\run-4` (created 09:44:58 local) |
+| Target | `mpack` at `9eacca4d3127` (target checkout dirty, CRLF) |
+| Profile / scope | `standard`, whole target |
+| opencode session | `ses_e175297eeffeSgNlIBbVTHlI0t` ("Mpack full verification") |
+| Pipeline | `phase1-remediation` at `b74a9f2` (clean tree) |
+| Poll / stall / recurrence limit | 90 s state poll, 60 s transcript watch / 10 min / 3 |
+| Fix mode | `hold` |
+| Host | Docker engine `default-ulimits` core 1:1 applied (2026-11-17 09:41) |
+
+## Timeline (local time, from the supervisor's observations)
+
+| Time | Phase | Event |
+| :--- | :--- | :--- |
+| 09:44:58 | Setup | `run-4` created. |
+| 09:47 | Phase 0 | Build capture: 4 units, the test runner classified `test` (S1/S1b hold). Phase 0 model: 476 functions, 1007 edges, no GCC fallback (`run-2` had 700 functions and 2983 edges with the test runner counted as product code). CodeQL next. |
+| 09:49-09:50 | Phase 0 | Threat-model check `ok` (17 threat-model untrusted marks); CodeQL adds 2 (`mpack_utf8_check_impl`, `mpack_utf8_check_no_null`). Seed recording `ok` in 42 s: 342 functions wrapped, **55,714 calls recorded (9,641 unique)** across the mpack API (`run-2`: 2 calls). Observation: the kept seed files include build outputs (`.build/unit/build.ninja` 868 KB, `.ninja_log`, `.ninja_deps`) among the 115 files the tests opened in the tree. |
+| 09:50-09:53 | Phase 0 | DAG: 3 modules (`libmpack_a` split into 12 submodules, `flagtest`, `sax_example`), 476 functions (1A 363, 1B 77, T2 28, T3 8), no warnings. The model reads `run-3`'s sidecars for reference, notices their `-D__restrict__=restrict -DMPACK_HAS_OVERFLOW_BUILTINS=0` flags and drops them as forbidden, then generates the 13 harnesses with `--api`. |
+| 09:54-09:59 | Phase 0 | Reach gate: `sax_example` has 7 unreached entry points (`mpack_done_ext`, `mpack_expect_ext_max`, `mpack_expect_ext_size`, `mpack_finish_ext`, `mpack_tag_ext`, `mpack_write_timestamp_seconds`, `mpack_write_timestamp_struct`). They are `MPACK_INLINE` extension APIs that exist only in the example's unit, because `examples/Makefile` builds with `MPACK_EXTENSIONS` and the recipe's `libmpack.a` does not; `main` never calls them. `run-3` exempted them with a reason (legitimate, unlike its `mpack_common` exemption). The user's prompt forbade header-function exemptions, so the model instead splits the unit into two harness sub-modules, `sax_example__program` (argv) and `sax_example__ext` (dispatch cases driving the extension API). `harness_reach.check_unit` supports several sub-modules per link unit, so this is a supported pattern and covers more than the exemption did. The supervisor's prompt was broader than intended here. |
+| 10:03 | Phase 0 | Reach gate passes for all 15 modules (`flagtest` exempted as a module, as in `run-3`). Ledger seeded. |
+| 10:04-10:12 | Phase 0 done | `progress.json` appears (`running`). `build-check`: **all 14 harness modules build under E-ACSL** with no workaround flag: S3 (argv `main` prototype), S4 (`__restrict__`), S5 (overflow builtins, redone) and S6 (headers in harness sources) hold. Phase 0 checkpoint saved at 10:12, 27 min after the run started (`run-3`: about 3.5 h with the workarounds). |
+| 10:13-10:21 | Phase 1 | Fuzz campaigns, then coverage and the dynamic reach gate. The gate flags the three `*_init_filename` functions (0 executions): since S7 the API harness never passes a fuzz-made path, by design. The model exempts them with the path reason it already recorded for the static reach gate. Observation: the dynamic gate does not inherit a static-gate exemption for the same function, so the same reason is recorded twice. |
+| 10:42 | Phase 1 done | Dynamic reach gate closed. **Both engines ran on every module** (`eacsl+sanitizers`; S6 holds; `run-3` was E-ACSL-only on the library), and no campaign hit `Too many open files` (S7 holds). 12 of 14 modules `crash_found`, `mpack_node_5` and `sax_example__ext` clean; 106 artifacts. 7 are marked E-ACSL resource aborts (S8: `mpack_expect` 1, `mpack_expect_2` 6) instead of `unparsed_crash` candidates. The largest groups: UBSan in `mpack_common` accessors (32 artifacts, e.g. `mpack_tag_array_count`, `mpack_tag_bytes`, `mpack_expect_i32_range`), `mpack_node_child` (5), `mpack_type_to_string` (4), `realloc` of a non-heap address in `mpack_node_4` and `mpack_writer_2` (2 each), LSan leaks of `mpack_read_bytes_alloc_impl` and `mpack_realloc`. Several look harness-made (an accessor called on a tag of the wrong type reaches mpack's release-mode `mpack_assert`, i.e. `__builtin_unreachable`; a stack buffer reaching `realloc`); the Crash Verifiers decide. `sax_example__program` has an empty corpus (every input crashes `main`, as in `run-3`), so it is unmeasured, which blocks nothing. Eva next. |
+| 10:43-11:16+ | Phase 2 | `pipeline_make.py run eva-tune`: most module reports are written by 10:42; `mpack_node_4` runs four tuning rungs (slevel, unroll, history, values) in parallel for 27+ min at about 8 CPUs and 5.7 GiB. Busy, not stalled. At 11:46 seven rungs (slevel, unroll, history, values, returns, precision, perfn) have run 57 min; each has `--timeout 7200 --no-timeout-fallback`, so the phase is bounded at about 12:44. `run-3`'s whole Phase 2 took about 35 min; a plausible cause of the difference is that S10 now gives `mpack_node_4`'s cases initialised node contexts, so Eva explores more paths (not verified). |
+
+## Pre-assessment of the Phase 1 crashes (read-only, about 12:10)
+
+At the user's request, a read-only subagent grouped the 106 Phase 1 artifacts and judged each group against MPack's documented API preconditions, without running anything. The Crash Verifiers still decide; this only says what to expect.
+
+- **Promising, new:** `examples/sax-example.c:186-187`. `main` does not check `mmap()`'s result: with a directory as `argv[1]`, `open` and `fstat` succeed, `mmap` fails, and `MAP_FAILED` reaches `parse_messagepack`, which UBSan reports as a pointer overflow in `mpack_reader_init_data` (`mpack-reader.c:62`, 3 artifacts, inputs `/`, `./`, `//`). The supervisor checked the source: line 186 passes the `mmap` result on unchecked. A verifier may merge it with `run-3`'s finding as "main checks no return value".
+- **Promising, known:** `run-3`'s confirmed bug reappears (`__framac_target_main` E-ACSL initialization assertion at `sax-example.c:186`, empty path).
+- **Library:** every group looks harness-made or noise, so no library bug is expected. Harness-made: unordered `min`/`max` in the `*_range` calls; buffer sizes and limits allowed to be 0; a `count` not bounded by its `size` in `mpack_reader_init`; a raw `int` passed as an enum; `mpack_realloc` given a static buffer (as in `run-3`); heap results never freed (LSan); typed accessors given a zeroed tag; fabricated `mpack_node_t` and internal helpers exposed as cases; call order ignored (`complete_*` without `build_*`, `set_skip` on a data reader). Noise: fuzz-chosen sizes passed straight to `*_alloc` (ASan allocation size), E-ACSL heap-limit aborts. The weakest call is `mpack_tree_set_limits` with a 0 node limit (the header does not say nonzero).
+- **S8 gap:** 3 E-ACSL heap-limit aborts have no `eacsl_resource_abort` marker (S13 below).
+
+## Fixes
+
+| Id | Fingerprint | Branch / commit | Status |
+| :--- | :--- | :--- | :--- |
+| S13 | Phase 1 / campaign attribution / E-ACSL heap-limit abort without `eacsl_resource_abort`: the stored `replay_log_tail` ends with the libFuzzer stack, so the `Exceeded heap allocation limit` line S8 parses is cut off; the frames still show `private_assert_fail` ← `set_heap_segment` (`e_acsl_segment_tracking.c:528`). 3 of 10 such aborts in `mpack_expect`/`mpack_expect_2`; the sanitizer replay then attributes them as `asan_requested_allocation_size` in `malloc`. On review, S8 lets a sanitizer-replay failure win by design, so the likely gap is that ASan's "requested allocation size exceeds maximum" abort is the same tool limit (the target checks `malloc`'s result, ASan aborts before it can); the fixer was redirected to check this and to consider `allocator_may_return_null=1` | `sup/mpack-eacsl-abort-frames` (fixer running) | Possibly not an S8 miss; recurrence count pending the fixer's finding |
+| S14 | Phase 0 / `api_harness.py` / argument domains that violate documented API preconditions (patterns A-I in the pre-assessment) | `sup/mpack-api-arg-domains` (fixer running) | — |
+
+## Model struggles that are not pipeline bugs
+
+## Open pipeline bugs
