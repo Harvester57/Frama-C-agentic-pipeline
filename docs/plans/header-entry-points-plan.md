@@ -175,6 +175,6 @@ These decide how much the new cases find. Each needs a design of its own.
 
 | Step | Size | When | Status |
 | :--- | :--- | :--- | :--- |
-| H1 | M | now, on `feat/header-entry-points`; lands after S6b | dispatched 2026-11-17 |
+| H1 | M | now, on `feat/header-entry-points`; lands after S6b | implemented 2026-11-17 on `feat/header-entry-points` (`e4ed2c3`..`e360071` and the docs commit), not merged. HD3 only moves `reached`: trust and tiers stay as they were, since `trust.py` does not read `header_api`; a sub-module scoped to the sources is then not held to the header entry points (both open, see the troubleshooting entry). HD8 unverified until the end validation |
 | R1 | S | after S5 is merged | merged 2026-11-17: the reach row and the run report list them, no gate reads them; open: on a split unit the numbers are a lower bound |
-| S6b | M | lands after the merge to `main` (remediation plan, D20) | started early on 2026-11-17 (user), on `p1/s6b-wide-selector`, cut from `phase1-remediation` at `0b0101e`; to be rebased over S5 |
+| S6b | M | after the merge to `main` (remediation plan, D20) | open, tracked there |
