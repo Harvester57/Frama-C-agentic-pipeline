@@ -626,7 +626,11 @@ def run_campaign_rounds(
             break
         fresh = [c for c in crashed if c not in skipped]
         new = [c for c in fresh if c < skippable]
-        if last.get("status") == "insufficient_memory" or not fresh:
+        if last.get("status") == "insufficient_memory":
+            rnd["stopped"] = "insufficient_memory"
+            break
+        if not fresh:
+            rnd["stopped"] = "no_new_case"
             break
         if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S:
             rnd["stopped"] = "time_budget_spent"
