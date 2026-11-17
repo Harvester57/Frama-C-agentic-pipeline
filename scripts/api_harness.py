@@ -21,6 +21,14 @@ byte selects it), with arguments built from the model's signature of each functi
     whose formal name says length, never an enum): the first input pair gets the rest of the input
     itself, so a read past it is caught; an output pair gets a spare buffer and a length read from
     the input, clamped to the buffer;
+  - pointers to non-byte elements followed by their count (`const char *strings[], size_t count`;
+    `const char *keys[], bool found[], size_t count`; `mpack_node_data_t *node_pool, size_t
+    node_pool_count`; `_array_count`: the count's formal name says count, or length or size when no
+    array points to a struct): each array gets ARRAY_ELEMENTS valid elements (an array of byte
+    strings distinct NUL-terminated strings, other pointers NULL, scalars and structs zeroed with
+    element 0 read from the input as one object would be), and the count, still read from the input,
+    is mapped into 1..ARRAY_ELEMENTS (never 0: mpack asserts `count != 0`). A single object passed
+    for such an array was read past for any count above 1 (mpack run-3, `mpack_expect_enum`);
   - a byte pointer with a size the call sites in the code base agree on (`param_sizes` in the model,
     step "call-site sizes"): a buffer of exactly that size (the largest), read from the input when it
     is an input (a `const` pointee), else zeroed. An input byte array whose call sites pass several
@@ -132,6 +140,7 @@ from framac_common import load_json_optional  # noqa: E402
 from seed_harvest import (  # noqa: E402
     _CHAR_POINTEES,
     _QUALIFIERS_RE,
+    _norm_type,
     classify_type,
     is_length,
     is_variadic,
@@ -148,6 +157,19 @@ VARIADIC_KIND = "variadic"  # the layout kind of a case built from a call site (
 NO_VARIADIC_SITE = "variadic: no call site with a literal format and sized objects in the target's own sources"
 CUSTOM_KIND = "custom"  # the layout kind of a hand-written case (`--api --dispatch-case`)
 PAIR_BYTES = 256  # an input (pointer, length) field pair that does not get the rest of the input
+# A pointer to non-byte elements followed by their count (`mpack_expect_enum(reader, const char
+# *strings[], size_t count)`): an array of ARRAY_ELEMENTS elements, the count mapped into
+# 1..ARRAY_ELEMENTS. Never 0: `mpack_expect_enum_optional` asserts `count != 0`, which a release build
+# turns into `__builtin_unreachable()`, a crash only the harness would make.
+ARRAY_ELEMENTS = 4
+# The elements of an array of byte strings: distinct, NUL-terminated, the empty string included.
+ARRAY_STRINGS = ("", "a", "bc", "def")
+ARRAY_STRING_BYTES = 16  # the storage of each element of an array of `const` strings
+# The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`.
+_ARRAY_COUNT_RE = re.compile(r"[Cc]ount|[Cc]nt|^n(?:[A-Z_0-9]|$)|^num|^N$|[Nn]memb|[Nn]elem|[Nn]items")
+# `len` and `size` count elements too, except after a struct pointer: `(struct ctx *c, size_t size)`
+# is far more often a context and some size than an array of contexts.
+_ARRAY_LEN_RE = re.compile(r"[Ll]en|[Ss]ize")
 MAX_DIAGNOSTIC_CHARS = 300
 POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
 # The source of a copy the harness makes itself: the input, or in eva_main an initialized shadow of it
@@ -409,6 +431,119 @@ def _is_pair(params: list[dict], i: int, formals: list[dict] | None = None) -> b
     p = params[i]
     nxt = params[i + 1] if i + 1 < len(params) else None
     return p["kind"] == "ptr" and _charlike(p) and nxt is not None and is_length(nxt, _name(formals or [], i + 1))
+
+
+def _array_element(p: dict) -> bool:
+    return p["kind"] == "ptr" and not _charlike(p) and not p.get("anon_enum")
+
+
+def _array_count(params: list[dict], i: int, formals: list[dict]) -> int | None:
+    """
+    The index of the count of the arrays starting at parameter `i`, or None. An array is a pointer to
+    non-byte elements; one or more of them in a row followed by their count make a group
+    (`const char *strings[], size_t count`; `const char *keys[], bool found[], size_t count`). The
+    count is an integer `is_length` accepts whose formal name says count (`_ARRAY_COUNT_RE`), or
+    length or size when no array of the group points to a struct. Only the last array of a group
+    may point to a struct, and only with a count-named count: `(struct ctx *c, size_t size)` is far
+    more often a context and some size than an array of contexts. Without the count's name nothing
+    says it counts elements: a pointer and a value (`int *dst, unsigned value`) stay one object and
+    a scalar.
+    """
+    j = i
+    while j < len(params) and _array_element(params[j]):
+        j += 1
+    if j == i or j >= len(params):
+        return None
+    name = _name(formals, j)
+    if name is None or not is_length(params[j], name):
+        return None
+    records = [_is_record(str(params[k].get("pointee") or "")) for k in range(i, j)]
+    if any(records[:-1]):
+        return None
+    if _ARRAY_COUNT_RE.search(name):
+        return j
+    return None if records[-1] or not _ARRAY_LEN_RE.search(name) else j
+
+
+def _array_object(case: _Case, call: int, i: int, p: dict, size: int | None, is_input: bool) -> str:
+    """
+    Declare the array behind parameter `i` (`_array_count`); returns its element count as a C
+    expression. It has ARRAY_ELEMENTS valid elements (or the elements of its call sites' size,
+    `param_size`): an array of byte strings points each element to a distinct NUL-terminated string
+    (`ARRAY_STRINGS`, in writable storage), other pointer elements are NULL, scalars and structs are
+    zeroed, and element 0 is read from the input as the one object was before, so the layout does
+    not change. A pointer element is never read from the input.
+    """
+    v = f"c{call}a{i}"
+    pointee = str(p.get("pointee") or "void")
+    elem = str(p.get("decl") or pointee)
+    n_expr = f"{ARRAY_ELEMENTS}ULL"
+    if pointee.endswith("*"):
+        inner = pointee[:-1].strip()
+        case.decls.append(f"{elem} {case.declare(v)}[{ARRAY_ELEMENTS}]; memset({v}, 0, sizeof({v}));")
+        if inner in ("char", "signed char", "unsigned char"):
+            # `const` strings get room for their text; strings the callee may write a spare buffer each.
+            width = ARRAY_STRING_BYTES if "const" in elem.rsplit("*", 1)[0] else case.spare
+            store = case.declare(f"{v}s")
+            case.decls.append(
+                f"static {inner} {store}[{ARRAY_ELEMENTS}][{width}]; memset({store}, 0, sizeof({store}));"
+            )
+            for k, s in enumerate(ARRAY_STRINGS[:ARRAY_ELEMENTS]):
+                if s:
+                    case.decls.append(f'memcpy({store}[{k}], "{s}", {len(s)});')
+                case.decls.append(f"{v}[{k}] = ({elem}){store}[{k}];")
+            what = "distinct NUL-terminated strings"
+        else:
+            what = "NULL pointers"
+    else:
+        lay = case.api.structs.get(pointee) if _is_record(pointee) else None
+        raw_ok = pointee != "_Bool" and (not _is_record(pointee) or _raw_ok(lay))
+        if is_input and not raw_ok and lay is None:
+            case.note(call, i, f"{_layout_why(case.api, pointee)}: the elements are zeroed, not read from the input")
+        if size:
+            case.decls.append(
+                f"{elem} {case.declare(v)}[({size} + sizeof({elem}) - 1) / sizeof({elem})]; memset({v}, 0, sizeof({v}));"
+            )
+            if is_input and raw_ok:
+                case.slot(v, size, call, i, "bytes", addr=False)
+            n_expr = f"(sizeof({v}) / sizeof({v}[0]))"
+        else:
+            case.decls.append(f"{elem} {case.declare(v)}[{ARRAY_ELEMENTS}]; memset({v}, 0, sizeof({v}));")
+            if is_input and pointee == "_Bool":
+                case.bool_slot(f"{v}[0]", call, i, "pointee")
+            elif is_input and raw_ok:
+                case.slot(f"{v}[0]", SCALAR_BYTES.get(pointee) or (lay or {}).get("size"), call, i, "pointee")
+        if is_input and not raw_ok and lay is not None and lay.get("what") == "struct":
+            _fill_fields(case, call, i, f"{v}[0]", lay, 0)
+        what = "zeroed elements, element 0 read from the input" if is_input else "zeroed elements"
+    if size:
+        case.note(call, i, f"array of the call sites' {size} bytes ({what}); its count is mapped into 1..its elements")
+    else:
+        n = ARRAY_ELEMENTS
+        case.note(call, i, f"array of {n} elements ({what}); its count is mapped into 1..{n}")
+    return n_expr
+
+
+def _array_args(
+    case: _Case, call: int, params: list[dict], formals: list[dict], rec: dict, i: int, j: int
+) -> list[str]:
+    """
+    The arguments of arrays `i`..`j - 1` and their count `j` (`_array_count`). The count keeps the
+    input slot it had and is mapped into 1..elements of the smallest array: never past an array, and
+    never 0 (`ARRAY_ELEMENTS`).
+    """
+    args: list[str] = []
+    bound = ""
+    for k in range(i, j):
+        n_expr = _array_object(case, call, k, params[k], param_size(rec, k), _is_input(formals, k))
+        bound = n_expr if not bound or bound == n_expr else f"({bound} < {n_expr} ? {bound} : {n_expr})"
+        args.append(f"({params[k]['type']})c{call}a{k}")
+    ln = f"c{call}a{j}"
+    ct = params[j]["ctype"]
+    case.decls.append(f"{ct} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+    case.slot(ln, SCALAR_BYTES.get(ct), call, j, "int")
+    case.decls.append(f"{ln} = ({ct})(1ULL + ((unsigned long long){ln} - 1ULL) % {bound});")
+    return [*args, ln]
 
 
 def _variable_length(params: list[dict], formals: list[dict], rec: dict, shared: dict[int, str]) -> bool:
@@ -730,6 +865,15 @@ def _bind_call(
                     after.append(release)
                 i += 1
                 continue
+            j = _array_count(params, i, formals)
+            # No array of the group may be an object the generator builds otherwise: shared with
+            # another call, a handle, or a struct the unit initializes.
+            if j is not None and not any(
+                k in shared or k in handles or str(params[k].get("pointee") or "") in api.inits for k in range(i, j + 1)
+            ):
+                args += _array_args(case, call, params, formals, rec, i, j)
+                i = j + 1
+                continue
             if pair and nxt is not None and (i + 1) not in shared:
                 if is_input and case.rest is None and size is None:
                     case.rest = {"call": call, "param": i, "kind": "bytes"}
@@ -774,9 +918,10 @@ def _bind_call(
                 i += 1
                 continue
             # A pointer to a scalar or a struct: an array of the known size, else one object. A struct
-            # with pointers (or of unknown layout) is never read from the input as raw bytes.
+            # with pointers (or of unknown layout) is never read from the input as raw bytes, nor is a
+            # pointer (`const char **`): input bytes would become an address the callee follows.
             lay = case.api.structs.get(pointee) if _is_record(pointee) else None
-            raw_ok = pointee != "_Bool" and (not _is_record(pointee) or _raw_ok(lay))
+            raw_ok = pointee != "_Bool" and not pointee.endswith("*") and (not _is_record(pointee) or _raw_ok(lay))
             if is_input and not raw_ok and lay is None:
                 case.note(call, i, f"{_layout_why(case.api, pointee)}: the object is zeroed, not read from the input")
             # The object's type as declared: the header's spelling of a qualified pointer (`decl`,
@@ -889,7 +1034,12 @@ def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | Non
             else:
                 m = _ANON_TAG_RE.search(pointee)
                 return None, f"pointer to an anonymous {m.group(1) if m else 'struct'}"
-        # An array parameter is a pointer: cast to `void *`, which converts to it.
+        # An array parameter is a pointer: cast to `void *`, which converts to it. An array of pointers
+        # (`char *[]`) points to pointers, as `char **` does; any other array stays a byte buffer.
+        if c["kind"] == "ptr" and "[" in t:
+            elem = _norm_type(t[: t.index("[")])
+            if elem.endswith("*"):
+                c["pointee"] = elem
         c["type"] = "void *" if "[" in t else " ".join(t.split())
         params.append(c)
     return params, None
