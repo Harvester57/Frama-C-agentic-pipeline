@@ -528,7 +528,8 @@ def _compile_eacsl_binary_uncached(
             log_parts.append(
                 f"Dropped `const` from {n} `static const union` declaration(s) in the E-ACSL frontend's text only "
                 "(E-ACSL bug pub/frama-c#2795: it cannot mark a const union read-only); E-ACSL does not check "
-                "them as read-only, the compiler and Eva/WP read the original.\n"
+                "them as read-only and this binary holds them as writable data. The sanitizer and coverage "
+                "builds, Eva and WP read the original.\n"
             )
 
     check_options = _check_options(is_modern, libc_checks)

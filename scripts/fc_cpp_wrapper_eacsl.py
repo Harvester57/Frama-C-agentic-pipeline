@@ -13,8 +13,10 @@ gcc `-wrapper` for the E-ACSL frontend only: fc_cpp_wrapper.py plus two E-ACSL-o
    (`implicit cast: cast from union u to void *`, pub/frama-c#2795, Issues 23 and 27 of
    docs/upstream/frama-c/README.md). This wrapper drops `const` from every object declared `static const union`
    (local or at file scope, initialized or not), replacing the keyword with blanks so lines and columns stay put.
-   E-ACSL then no longer treats the object as read-only; the real compiler still enforces `const`, and Eva and
-   WP read the original. A pointer (`static const union u *p`) or a function returning a union is left alone:
+   E-ACSL then no longer treats the object as read-only, and the E-ACSL binary, compiled from that text, holds
+   it as writable data: a write to it through a cast pointer is not caught in that binary. The sanitizer and
+   coverage builds compile the original source, and Eva and WP read it. A pointer (`static const union u *p`)
+   or a function returning a union is left alone:
    neither is a const union object. Each rewrite is reported on stderr like the others
    (`[fc-cpp] <file>:<line>: static const union rewritten: ...`); fuzz_build counts those lines into the build
    report (`const_union_rewrites`). Set REWRITE_STATIC_CONST_UNIONS to False once the analysis image carries

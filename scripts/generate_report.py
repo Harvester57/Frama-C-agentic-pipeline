@@ -493,8 +493,9 @@ def const_union_rewrite_lines(run_dir: Path) -> list[str]:
     return [
         f"- **E-ACSL `static const union` rewrite:** {len(built)} module(s) were built with `const` dropped from "
         f"their `static const union` declarations (count in parentheses) in the E-ACSL frontend's text only, "
-        f"because of an E-ACSL bug (pub/frama-c#2795): E-ACSL did not check those objects as read-only; the "
-        f"compiled program, Eva and WP keep `const`. {shown}.",
+        f"because of an E-ACSL bug (pub/frama-c#2795): E-ACSL did not check those objects as read-only, and "
+        f"the E-ACSL binary holds them as writable data. The sanitizer and coverage builds, Eva and WP keep "
+        f"`const`. {shown}.",
         "",
     ]
 
