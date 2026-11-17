@@ -37,6 +37,7 @@ from framac_common import (  # noqa: E402
 )
 from ledger import INDUCTIVE_LEMMA_GAP  # noqa: E402
 from mutation_check import classify_open_unit  # noqa: E402
+from phase0_gates import dynamic_gaps  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
 from workspace_overlay import map_work_to_baseline_line  # noqa: E402
 
@@ -407,6 +408,28 @@ def fuzz_reach_lines(reports: list[dict]) -> list[str]:
         if len(unreached) > 50:
             lines.append(f"- ... and {len(unreached) - 50} more (see workspace/reports/coverage/)")
         lines.append("")
+    return lines
+
+
+def dynamic_gate_lines(run_dir: Path) -> list[str]:
+    """
+    The modules the dynamic reach gate holds back from WP (D2, D18): one line each with its entry points
+    the corpus never executed. Their fuzz and Eva still run; their planned units are blocked
+    (`ledger.py gate-reach`). Nothing when no module is held back.
+    """
+    gaps = dynamic_gaps(Path(run_dir))
+    if not gaps:
+        return []
+    lines = [
+        "### Modules held back from WP by the dynamic reach gate",
+        "",
+        "Their planned units are blocked (`ledger.py gate-reach`) until the gap closes; their fuzz and Eva ran.",
+        "",
+    ]
+    lines += [
+        f"- `{md_escape(module)}`: never executed {md_escape(', '.join(entries))}" for module, entries in gaps.items()
+    ]
+    lines.append("")
     return lines
 
 
@@ -955,6 +978,8 @@ def render_report(data: dict) -> str:
     if not blocked and not reasons:
         out += ["No blocked, deferred, or out-of-scope units.", ""]
     out += fuzz_reach_lines(data.get("coverage") or [])
+    if data.get("run_dir"):
+        out += dynamic_gate_lines(Path(data["run_dir"]))
 
     hardening = [h for u in ledger for h in u.get("bookkeeping", {}).get("hardening", [])]
     if hardening:

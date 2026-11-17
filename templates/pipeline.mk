@@ -160,7 +160,7 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 # corpus as it stands: a dependency on fuzz-% would start a new campaign, because every target is phony.
 coverage: $(COVERAGE_TARGETS)
 $(COVERAGE_TARGETS): coverage-%:
-	$(GATE) --module $* --need reach --allow-dynamic-gap
+	$(GATE) --module $* --need reach
 	$(RUN) --class replay --key $* --output workspace/reports/coverage/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py coverage --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/cov_$* --corpus-dir workspace/corpus/$* \
@@ -170,8 +170,10 @@ $(COVERAGE_TARGETS): coverage-%:
 		--out-json workspace/reports/coverage/$*.json
 
 # Dynamic reach gate: after coverage-<mod>, an API entry point of the module that its corpus never
-# executed reopens the reach gate (phase0_gates.json), so fuzz-<mod> and Eva stop until the parent
-# repairs the harness or exempts the entry point (`reach-gate` keeps the gap while the harness is unchanged).
+# executed is a dynamic gap (phase0_gates.json). A dynamic gap stops no fuzz, coverage or Eva target: it
+# holds the module's planned units out of WP (`ledger.py gate-reach`, run by wp-replay and wp_scheduler init)
+# until the parent repairs the harness or exempts the entry point. `reach-gate` keeps the gap while the
+# harness is unchanged.
 reach-dynamic: $(REACH_DYNAMIC_TARGETS)
 $(REACH_DYNAMIC_TARGETS): reach-dynamic-%: coverage-%
 	$(RUN) --class light --key reach-dynamic -- $(PY) $(S)/harness_reach.py dynamic --module $*
@@ -330,6 +332,7 @@ minimize: replay
 # Not leased per function: merges are serialized by the merge lock, so one `wp` lease covers it.
 wp-replay: ingest facts
 	$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"
+	$(RUN) --class light --key wp-replay -- $(PY) $(S)/ledger.py gate-reach
 	-$(RUN) --class wp --key wp-replay --output workspace/reports/proof-carry/summary.json -- $(PM) wp-replay
 
 # Phases 1 and 2 are done once the Phase-3 queue is built from their ingested reports: record it,

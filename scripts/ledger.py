@@ -23,7 +23,8 @@ Subcommands (run with the run directory as working directory):
   transition               --id COVERAGE_ID --status STATUS [--agent-id ID] [--reason TEXT] [--expect STATUS ...]
   transition-many          --spec-json JSON|PATH
   close-remaining          --reason TEXT
-  scaffold-verifier        --fingerprint FP --decision DECISION [...]
+  gate-reach               hold the planned units of dynamically gated modules out of WP, release them when the gap closes
+  scaffold-verifier       --fingerprint FP --decision DECISION [...]
   mark-carried             --report <wp report> --entry <restored proofs entry> --key KEY
                            (scripts/proof_carry.py: evidence of a re-proven carried contract)
   audit-hypotheses         [--dag workspace/reports/callgraph_dag.json]
@@ -3900,6 +3901,80 @@ def cmd_close_remaining(reason: str) -> dict:
     }
 
 
+# D2, D18: a dynamic reach gap holds back the planned units of its module from WP. Such a unit is `blocked`,
+# with this reason and a `reach_gated` evidence entry (non-discharging). When the gap is gone it returns to
+# `planned`, unless another reason still blocks it.
+DYNAMIC_GAP_REASON = "dynamic_reach_gap: "
+REACH_GATED_RESULT = "reach_gated"
+REACH_GATE_TOOL_OUTPUT = "workspace/reports/harness_reach_dynamic.json"
+
+
+def _is_reach_gated(evidence: dict) -> bool:
+    return evidence.get("result") == REACH_GATED_RESULT
+
+
+@ledger_locked
+def cmd_gate_reach(run_dir: Path = Path(".")) -> dict:
+    """
+    Hold the planned units of each dynamically gated module out of WP, and release them once the gap is gone.
+
+    For each module of `phase0_gates.dynamic_gaps`: every `planned` unit in its scope becomes `blocked`, with
+    the reason `dynamic_reach_gap: <entry points>` and `reach_gated` evidence; a unit already blocked by that
+    reason has both refreshed. Every other unit is left as it is. A `blocked` unit whose dynamic reason is
+    not among the current gaps loses that reason, and returns to `planned` only when no reason is left (a
+    unit blocked for another reason stays blocked). Its `reach_gated` evidence goes too, unless the unit would
+    stay blocked with no other evidence: `blocked` needs partial evidence.
+    """
+    gaps = phase0_gates.dynamic_gaps(Path(run_dir))
+    units, candidates = load_state()
+    gated_cids: set[str] = set()
+    blocked = 0
+    if gaps:
+        mm = ModuleMap.load(run_dir)
+        for module, entry_points in gaps.items():
+            reason = DYNAMIC_GAP_REASON + ", ".join(entry_points)
+            for u in _module_units(units, *_report_scope(mm, module)):
+                others = [r for r in u["unresolved"] if not r.startswith(DYNAMIC_GAP_REASON)]
+                has_dynamic = len(others) != len(u["unresolved"])
+                if not (u["status"] == "planned" or (u["status"] == "blocked" and has_dynamic)):
+                    continue
+                u["status"] = "blocked"
+                u["unresolved"] = sorted(set(others + [reason]))
+                u["evidence"] = [e for e in u["evidence"] if not _is_reach_gated(e)]
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "harness_reach.py",
+                    REACH_GATED_RESULT,
+                    False,
+                    REACH_GATE_TOOL_OUTPUT,
+                    f"Dynamic reach gate: {module} never executed {', '.join(entry_points)} in its corpus; "
+                    "the unit waits for the gap to close (not a proof).",
+                )
+                gated_cids.add(u["coverage_id"])
+                blocked += 1
+    reopened = 0
+    for cid, u in units.items():
+        if cid in gated_cids or u["status"] != "blocked":
+            continue
+        if not any(r.startswith(DYNAMIC_GAP_REASON) for r in u["unresolved"]):
+            continue
+        others = [r for r in u["unresolved"] if not r.startswith(DYNAMIC_GAP_REASON)]
+        kept = [e for e in u["evidence"] if not _is_reach_gated(e)]
+        if others:
+            u["unresolved"] = others
+            if kept:
+                u["evidence"] = kept
+        else:
+            u["status"] = "planned"
+            u["agent_id"] = None
+            u["unresolved"] = []
+            u["evidence"] = kept
+        reopened += 1
+    commit(units, candidates)
+    return {"gated_modules": gaps, "blocked": blocked, "reopened": reopened}
+
+
 def cmd_scaffold_verifier(
     cand_fp: str,
     decision: str,
@@ -4404,6 +4479,10 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="JSON list (or path to JSON file) of {id, status, agent_id?, reason?, expected?} transitions",
     )
+    sub.add_parser(
+        "gate-reach",
+        help="Hold the planned units of dynamically gated modules out of WP, release the rest (D2, D18)",
+    )
     p_close = sub.add_parser("close-remaining")
     p_close.add_argument("--reason", required=True, help="Reason for closing remaining planned/in_progress units")
     p_scaf = sub.add_parser("scaffold-verifier")
@@ -4465,6 +4544,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_transition_many(_parse_transitions_spec(args.spec_json))
         elif args.cmd == "close-remaining":
             out = cmd_close_remaining(args.reason)
+        elif args.cmd == "gate-reach":
+            out = cmd_gate_reach()
         elif args.cmd == "scaffold-verifier":
             out = cmd_scaffold_verifier(
                 args.fingerprint,

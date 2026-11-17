@@ -180,6 +180,7 @@ def record_reach(
             # Why crash inputs did not count as execution of a gap (harness_reach.py `crash_notes`).
             "notes": [str(n) for n in (row.get("crash_notes") or [])],
             "exempt": row.get("exempt"),
+            "origin": "dynamic" if row.get("error") == DYNAMIC_GAP_ERROR else "static",
             "harness_digest": harness_digest(run_dir, name),
             "dag_digest": dag,
         }
@@ -229,10 +230,36 @@ def _section_ok(section: str, entry: dict[str, Any]) -> bool:
     return bool(entry.get("passed") if section == "reach" else entry.get("ok"))
 
 
-def _row_reach_ok(row: dict[str, Any], allow_dynamic_gap: bool = False) -> bool:
-    if row.get("passed"):
-        return True
-    return bool(allow_dynamic_gap and row.get("error") == DYNAMIC_GAP_ERROR)
+def row_origin(row: dict[str, Any]) -> str:
+    """
+    `dynamic` for a row that failed only on the dynamic corpus gap, `static` for every other failure. A row
+    written before `origin` was recorded is dynamic when its error is the dynamic gap's.
+    """
+    origin = row.get("origin")
+    if origin in ("dynamic", "static"):
+        return str(origin)
+    return "dynamic" if row.get("error") == DYNAMIC_GAP_ERROR else "static"
+
+
+def _row_reach_ok(row: dict[str, Any]) -> bool:
+    """
+    A row passes when the check passed, or when it failed only on a dynamic gap (D2): that gap holds back
+    the module's planned units from WP (`ledger.py gate-reach`), and no fuzz, coverage or Eva target.
+    """
+    return bool(row.get("passed")) or row_origin(row) == "dynamic"
+
+
+def dynamic_gaps(run_dir: Path) -> dict[str, list[str]]:
+    """Module -> the entry points its dynamic reach row never saw executed, for the rows that did not pass."""
+    reach = load_gates(Path(run_dir)).get("reach")
+    rows = reach.get("modules") if isinstance(reach, dict) else None
+    if not isinstance(rows, dict):
+        return {}
+    return {
+        str(module): [str(g) for g in row.get("gaps") or []]
+        for module, row in sorted(rows.items())
+        if isinstance(row, dict) and not row.get("passed") and row_origin(row) == "dynamic"
+    }
 
 
 def current_build_status(run_dir: Path, module: str, row: dict[str, Any]) -> tuple[bool, str] | None:
@@ -262,15 +289,16 @@ def check(
     need: tuple[str, ...] = SECTIONS,
     modules_expected: list[str] | None = None,
     fuzzed_expected: list[str] | None = None,
-    allow_dynamic_gap: bool = False,
 ) -> list[str]:
     """
     Reasons the gate fails for `module` (or for the whole run when None); empty when it passes.
 
     For the whole run, every recorded module must pass, and a harness or a DAG changed since the
-    reach check fails it (for one module, its own row). `modules_expected` (every module of the plan) and `fuzzed_expected` (its fuzzed ones)
-    name the modules each section must have checked: a harness added after the check, or a module
-    build-check never built, fails the gate instead of passing unseen.
+    reach check fails it (for one module, its own row). A row that failed only on a dynamic gap passes
+    (D2; `dynamic_gaps` lists them, and `ledger.py gate-reach` holds their units back). `modules_expected`
+    (every module of the plan) and `fuzzed_expected` (its fuzzed ones) name the modules each section must
+    have checked: a harness added after the check, or a module build-check never built, fails the gate
+    instead of passing unseen.
     """
     run_dir = Path(run_dir)
     gates = load_gates(run_dir)
@@ -290,7 +318,7 @@ def check(
                     reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
                 expected = fuzzed_expected
             else:
-                failed = sorted(m for m, r in modules.items() if not _row_reach_ok(r, allow_dynamic_gap))
+                failed = sorted(m for m, r in modules.items() if not _row_reach_ok(r))
                 if failed or (not modules and not _section_ok(section, entry)):
                     reasons.append(
                         f"{section} failed for {', '.join(failed) or 'the run'}; {_reach_next_step('<mod>')}"
@@ -298,14 +326,12 @@ def check(
                 stale = sorted(
                     m
                     for m, r in modules.items()
-                    if _row_reach_ok(r, allow_dynamic_gap) and r.get("harness_digest") != harness_digest(run_dir, m)
+                    if _row_reach_ok(r) and r.get("harness_digest") != harness_digest(run_dir, m)
                 )
                 if stale:
                     reasons.append(f"the harness of {', '.join(stale)} changed after the reach gate ran; run it again")
                 dag_stale = sorted(
-                    m
-                    for m, r in modules.items()
-                    if _row_reach_ok(r, allow_dynamic_gap) and r.get("dag_digest") != current_dag
+                    m for m, r in modules.items() if _row_reach_ok(r) and r.get("dag_digest") != current_dag
                 )
                 if dag_stale:
                     reasons.append(_dag_changed(", ".join(dag_stale)))
@@ -321,7 +347,7 @@ def check(
             reasons.append(f"{section}: module {module} was not checked; run `{HOW_TO_RUN[section]}` again")
             continue
         if section == "reach":
-            if not _row_reach_ok(row, allow_dynamic_gap):
+            if not _row_reach_ok(row):
                 detail = row.get("error") or f"entry points not reached: {', '.join(row.get('gaps') or [])}"
                 if row.get("notes"):
                     detail += f" ({'; '.join(row['notes'][:3])})"
@@ -382,11 +408,6 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Whole run: the plan's fuzzed modules (space-separated), each needing a build row",
     )
-    c.add_argument(
-        "--allow-dynamic-gap",
-        action="store_true",
-        help="Allow reach rows that failed only on dynamic corpus gaps when harness and DAG digests still match",
-    )
     a = p.parse_args(argv)
     need = tuple(s.strip() for s in a.need.split(",") if s.strip())
     unknown = [s for s in need if s not in SECTIONS]
@@ -401,7 +422,6 @@ def main(argv: list[str] | None = None) -> int:
             need,
             None if a.modules is None else a.modules.split(),
             None if a.fuzzed is None else a.fuzzed.split(),
-            allow_dynamic_gap=a.allow_dynamic_gap,
         )
     except (ArtifactError, OSError, ValueError) as exc:
         reasons = [f"cannot read {GATES_JSON}: {exc}"]

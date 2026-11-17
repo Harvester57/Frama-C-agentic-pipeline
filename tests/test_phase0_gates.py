@@ -58,10 +58,10 @@ def test_the_reach_gate_reason_says_why_crash_inputs_did_not_count(tmp_path):
     note = "custom case 181 crashed in helper(), not in the entry"
     row = {"module": "api", "passed": False, "gaps": ["rec_put"], "error": phase0_gates.DYNAMIC_GAP_ERROR}
     phase0_gates.record_reach(tmp_path, {"modules": [{**row, "crash_notes": [note]}]})
-    (reason,) = phase0_gates.check(tmp_path, "api", ("reach",))
-    assert phase0_gates.DYNAMIC_GAP_ERROR in reason and note in reason
-    # The error text itself is unchanged: --allow-dynamic-gap matches it exactly.
-    assert phase0_gates.check(tmp_path, "api", ("reach",), allow_dynamic_gap=True) == []
+    # A dynamic gap passes the gate (D2); the row keeps why crash inputs did not count, and dynamic_gaps lists it.
+    assert phase0_gates.check(tmp_path, "api", ("reach",)) == []
+    assert phase0_gates.load_gates(tmp_path)["reach"]["modules"]["api"]["notes"] == [note]
+    assert phase0_gates.dynamic_gaps(tmp_path) == {"api": ["rec_put"]}
 
 
 @pytest.mark.unit
@@ -203,7 +203,7 @@ def _recipe(text: str, target: str) -> list[str]:
     [
         ("$(BUILD_TARGETS)", "build-%", "reach"),
         ("$(FUZZ_TARGETS)", "fuzz-%", "reach,build_check"),
-        ("$(COVERAGE_TARGETS)", "coverage-%", "reach --allow-dynamic-gap"),
+        ("$(COVERAGE_TARGETS)", "coverage-%", "reach"),
         ("$(EVA_TARGETS)", "eva-%", "reach"),
         ("$(EVA_BASE_TARGETS)", "evabase-%", "reach"),
         ("$(EVA_TUNE_TARGETS)", "evatune-%", "reach"),
