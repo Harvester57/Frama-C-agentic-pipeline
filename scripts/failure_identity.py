@@ -776,6 +776,68 @@ def parse_runtime_failure(text: str) -> dict | None:
     return parse_eacsl_failure(text) or parse_sanitizer_failure(text)
 
 
+# E-ACSL runtime aborts on its own resource limits, not on a target check (share/e-acsl/observation_model/
+# segment_model/e_acsl_segment_tracking.c). Its private_assert prints `<runtime file>:<line>: <message>` and
+# raises SIGABRT. set_heap_segment asserts twice that a new block lies inside the tracked heap zone
+# (E_ACSL_HEAP_SIZE MiB, `e-acsl-gcc --zone-sizes heap:<N>`, eacsl_toolchain.EACSL_HEAP_ZONE_MB), and
+# shadow_copy that its internal allocation succeeded. A closed list anchored at a line start behind the
+# runtime's own path, so target output of the same words is not read as one.
+_EACSL_RESOURCE_TEMPLATES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (
+        re.compile(r"^(?:[^\s:]*e[-_]acsl[^\s:]*\.c:\d+: )" + rx + r"[ \t]*$", re.MULTILINE),
+        resource,
+    )
+    for rx, resource in (
+        (r"(?P<msg>Exceeded heap allocation limit of (?P<mb>\d+)MB(?: -- heap memory space moved\.)?)", "heap"),
+        (r"(?P<msg>Shadow copy failed)", "heap"),
+    )
+)
+
+# The same aborts when the message is gone (a replay tail cut mid-stack): the runtime's assert called
+# straight from the function whose only asserts are these limits.
+_EACSL_RESOURCE_FRAMES = {"set_heap_segment": "heap", "shadow_copy": "heap"}
+
+
+def parse_eacsl_resource_abort(text: str) -> dict | None:
+    """
+    An E-ACSL runtime abort on its own resource limit: `{resource, limit_mb, message, caller}`, or None.
+    It is no target failure: no check failed, so it never gets a fingerprint or a candidate. `limit_mb`
+    is None when only the stack shows it; `caller` is the first target frame above the runtime's.
+    """
+    if not text:
+        return None
+    resource = message = None
+    limit_mb: int | None = None
+    for rx, res in _EACSL_RESOURCE_TEMPLATES:
+        m = rx.search(text)
+        if m:
+            resource, message = res, m.group("msg")
+            mb = m.groupdict().get("mb")
+            limit_mb = int(mb) if mb else None
+            break
+    frames = list(_STACK_FRAME_RE.finditer(text))
+    if resource is None:
+        for prev, cur in zip(frames, frames[1:], strict=False):
+            if prev.group("function") == "private_assert_fail" and cur.group("function") in _EACSL_RESOURCE_FRAMES:
+                resource = _EACSL_RESOURCE_FRAMES[cur.group("function")]
+                message = f"E-ACSL runtime assertion in {cur.group('function')}"
+                break
+    if resource is None:
+        return None
+    caller, _ = _caller_of_eacsl_runtime(text)
+    if not caller:
+        # Runtime frames named by function only (`unsafe_malloc`, `malloc` in the runtime's files).
+        for m in frames:
+            fn, fpath = m.group("function"), m.group("file") or ""
+            if is_runtime_function(fn, fpath) or fn in ("raise", "abort", "private_assert_fail", "raise_abort"):
+                continue
+            if "::" in fn or is_harness_fuzz_function(fn) or fn in _PROCESS_FRAME_FNS:
+                continue
+            caller = fn
+            break
+    return {"resource": resource, "limit_mb": limit_mb, "message": message, "caller": caller or None}
+
+
 def needs_attribution(failure: dict | None) -> bool:
     """True when a failure has no usable target location (missing, line 0, unknown or runtime-internal function)."""
     if not failure:

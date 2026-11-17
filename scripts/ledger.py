@@ -70,7 +70,7 @@ import cache  # noqa: E402
 import decision_point_check  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
-from failure_identity import site_key  # noqa: E402
+from failure_identity import parse_eacsl_resource_abort, site_key  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
@@ -1143,6 +1143,25 @@ def _fuzz_coverage_executions(module: str) -> tuple[dict[tuple[str, str], int] |
     return counts, ""
 
 
+def _eacsl_resource_abort(art: dict) -> dict | None:
+    """
+    The E-ACSL runtime resource abort of an artifact without a failure (run_eacsl_fuzz.py marks it as
+    `eacsl_resource_abort`; an older report is read from its replay tail's stack), or None.
+    """
+    if art.get("failure") or art.get("engine") not in (None, "eacsl"):
+        return None
+    marked = art.get("eacsl_resource_abort")
+    if isinstance(marked, dict):
+        return marked
+    found = parse_eacsl_resource_abort(str(art.get("replay_log_tail") or ""))
+    if found is None:
+        return None
+    attribution = art.get("attribution")
+    if isinstance(attribution, dict) and attribution.get("failure"):
+        return None
+    return {**found, "sanitizer_replay": "unavailable" if not attribution else "no_failure"}
+
+
 @ledger_locked
 def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -1246,6 +1265,7 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     f"Keep-going fuzz rounds stopped early, the remaining dispatch cases were not fuzzed: {kg_error}",
                 )
+        resource_aborts: list[tuple[str, dict]] = []
         for art in report.get("artifacts", []):
             artifact_rel = rel(art["artifact"])
             failure = art.get("failure")
@@ -1335,6 +1355,11 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     )
                     if outcome in ("reopened", "contradicted"):
                         stats[outcome] = stats.get(outcome, 0) + 1
+            elif (resource_abort := _eacsl_resource_abort(art)) is not None:
+                # The E-ACSL runtime stopped on its own limit (its tracked heap zone): no target check
+                # failed and no sanitizer replay located a failure. Not a candidate; the units say so.
+                resource_aborts.append((artifact_rel, resource_abort))
+                continue
             else:
                 kind = art.get("kind", "crash")
                 digest = hashlib.sha256(
@@ -1357,6 +1382,31 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 )
                 fp = cand["fingerprint"]
             stats["candidates"] += 1
+        if resource_aborts:
+            stats["eacsl_resource_aborts"] = stats.get("eacsl_resource_aborts", 0) + len(resource_aborts)
+            limits = sorted(
+                {
+                    f"{a.get('resource')} limit"
+                    + (f" of {a['limit_mb']} MiB" if a.get("limit_mb") else "")
+                    + f" (sanitizer replay: {a.get('sanitizer_replay', 'unavailable')})"
+                    for _, a in resource_aborts
+                }
+            )
+            shown = [r for r, _ in resource_aborts[:5]]
+            more = f" and {len(resource_aborts) - 5} more" if len(resource_aborts) > 5 else ""
+            for u in mod_units:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_eacsl_resource_limit",
+                    False,
+                    tool_output,
+                    f"{len(resource_aborts)} input(s) stopped the E-ACSL runtime on its own {'; '.join(limits)}, "
+                    "not on a target check: no candidate. E-ACSL checked nothing past that allocation for these "
+                    "inputs; replay them on the sanitizer build to cover them.",
+                    {"artifacts": shown + ([more.strip()] if more else [])},
+                )
     commit(units, candidates)
     if cache.shared_mode() == "rw" and ingested_modules:
         published_corpora: dict[str, int] = {}
