@@ -1096,10 +1096,12 @@ def _driver_execs(with_cli: bool) -> list[dict]:
     return execs
 
 
-def _driver_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_cli: bool = False) -> dict:
+def _driver_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_cli: bool = False, headers: dict[str, str] | None = None
+) -> dict:
     """analyse() on the mpack-shaped build, with the probes (cc -M, nm, install, snapshot) stubbed."""
     tree = tmp_path / "tree"
-    for rel, text in _DRIVER_HEADERS.items():
+    for rel, text in (headers or _DRIVER_HEADERS).items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
         (tree / rel).write_text(text, encoding="utf-8")
 
@@ -1147,25 +1149,32 @@ def _driver_plans(report: dict) -> list[str]:
 def test_the_seed_recorder_no_longer_wraps_the_test_drivers_functions(tmp_path, monkeypatch):
     # Before the fix the runner was a product unit: its embedded API (test_reader, from test.h)
     # was wrapped, and only the outermost call is recorded, so no library call reached calls.jsonl.
-    # With the CLI, the library API comes from the CLI's embedded API; without it, nothing is planned
-    # until the static library has entry points (the xfail below).
     assert _driver_plans(_driver_capture(tmp_path, monkeypatch, with_cli=True)) == ["mpack_read", "mpack_write"]
-    assert "test_reader" not in _driver_plans(_driver_capture(tmp_path, monkeypatch))
+    assert _driver_plans(_driver_capture(tmp_path, monkeypatch)) == ["mpack_read", "mpack_write"]
 
 
 @pytest.mark.unit
-@pytest.mark.xfail(
-    strict=True,
-    reason="open: a static library whose public headers are chosen outside the source directories "
-    "(a stray examples/ header) gets no entry point; public-header API entry points are plan H1 "
-    "(docs/plans/header-entry-points-plan.md), not this fix",
-)
-def test_a_stray_header_outside_the_sources_hides_a_static_librarys_api(tmp_path, monkeypatch):
+def test_a_stray_header_outside_the_sources_does_not_hide_a_static_librarys_api(tmp_path, monkeypatch):
+    # mpack run-2: the only headers outside the source directories were examples/sax-example.h and
+    # test/fuzz/fuzz-config.h, so libmpack.a had no entry point (PUBLIC_FALLBACK_RULE).
     report = _driver_capture(tmp_path, monkeypatch)
     assert report["public_headers"]["method"] == "outside_source_dirs"
     lib = report["units"][".build/mpack-lib/libmpack.a"]
     assert lib["entry_points"] == ["src/mpack/mpack-reader.c#mpack_read", "src/mpack/mpack-writer.c#mpack_write"]
+    assert any("libmpack.a: the outside_source_dirs public headers declare none" in w for w in report["warnings"])
+    assert report["entry_points"] == lib["entry_points"]
     assert _driver_plans(report) == ["mpack_read", "mpack_write"]
+
+
+@pytest.mark.unit
+def test_public_headers_that_declare_the_librarys_functions_are_kept(tmp_path, monkeypatch):
+    # include/mpack.h, outside the sources, declares only mpack_read: that is the public API, and the
+    # internal src/mpack/mpack.h (declaring mpack_write too) must not be read in its place.
+    headers = {**_DRIVER_HEADERS, "include/mpack.h": "int mpack_read(int fd);\n"}
+    report = _driver_capture(tmp_path, monkeypatch, headers=headers)
+    assert report["public_headers"]["files"] == ["examples/sax-example.h", "include/mpack.h"]
+    assert report["units"][".build/mpack-lib/libmpack.a"]["entry_points"] == ["src/mpack/mpack-reader.c#mpack_read"]
+    assert not any("public headers declare none" in w for w in report["warnings"])
 
 
 def _unit(kind: str, files: list[str], test: bool = False) -> dict:

@@ -26,7 +26,8 @@ the run's named Docker volume at /framac-scratch:
   5. entry points: `main` (executables); `nm -D` exports, which already reflect version scripts and
      visibility (shared libraries); global functions declared in the public headers (static libraries).
      Public headers come from `make install DESTDIR=` (or `cmake --install`) when that works, else the
-     headers outside the source directories, else the project headers the library's consumers include;
+     headers outside the source directories, else the project headers the library's consumers include
+     (also when the first two declare none of the library's functions: PUBLIC_FALLBACK_RULE);
   6. a snapshot for the analysis image under <run>/workspace/snapshot/root/ (absolute paths kept), with a
      digest, read by scripts/target_env.py:
      the headers the compiler's dependency lists (`cc -M` per TU) name outside the project and outside libc
@@ -104,6 +105,12 @@ TEST_RULE = (
     "defined in a test source and whose other own sources are all sources of a non-test library of the "
     "build (a test driver compiling the library's sources again, mpack's `runner`): its product code is "
     "analysed in that library. The test command is not run here (step I6)."
+)
+PUBLIC_FALLBACK_RULE = (
+    "the public headers chosen for a static library (installed, or outside the source directories) that "
+    "declare none of its global functions are not its headers (a stray example or test header): its entry "
+    "points then come from the project headers its consumers include, or every project header when no unit "
+    "links it, as when no public header is found"
 )
 CANDIDATE_RULE = (
     "best effort, no apt-file: a table of common headers, pkg-config modules, CMake packages and commands; "
@@ -1090,6 +1097,45 @@ def outside_source_dirs(headers: list[str], src_dirs: set[str]) -> list[str]:
     return sorted(h for h in headers if not under(h))
 
 
+def static_lib_entries(
+    name: str,
+    globals_: dict[str, str],
+    units: dict[str, dict],
+    compiles: dict[str, dict],
+    public: dict[str, Any],
+    public_paths: list[Path],
+    project_headers: list[str],
+    tree: Path,
+    flags: list[str],
+) -> tuple[set[str], str | None]:
+    """
+    A static library's entry points: its global functions declared in the public headers, and a warning
+    when the public headers declared none of them (PUBLIC_FALLBACK_RULE). `public["files"]` grows with
+    the headers chosen from the consumers.
+    """
+
+    def from_consumers() -> list[Path]:
+        consumers = [compiles[o] for v in units.values() if name in v["links"] for o in v["objects"] if o in compiles]
+        used = sorted({h for c in consumers for h in c["headers"] if h.endswith(".h")})
+        # No consumer in the build: every project header is a candidate.
+        chosen = used or [h for h in project_headers if not posixpath.isabs(h)]
+        public["files"] = sorted(set(public["files"]) | set(chosen))
+        return [tree / h for h in chosen]
+
+    headers = from_consumers() if public["method"] == "consumers" else list(public_paths)
+    if not headers or not globals_:
+        return set(globals_.values()), None
+    found = declared_in(headers, set(globals_), flags)
+    if found or public["method"] == "consumers":
+        return {globals_[n] for n in found}, None
+    found = declared_in(from_consumers(), set(globals_), flags)
+    warning = (
+        f"{name}: the {public['method']} public headers declare none of its {len(globals_)} global "
+        f"function(s); {len(found)} entry point(s) from its consumers' or the project's headers instead"
+    )
+    return {globals_[n] for n in found}, warning
+
+
 # ---------------------------------------------------------------------------------------------------
 # 4. System files: dpkg ownership and the snapshot
 # ---------------------------------------------------------------------------------------------------
@@ -1953,21 +1999,12 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
             exported = {s for s, (typ, _) in parse_nm(out).items() if typ in FUNCTION_TYPES} if rc == 0 else set()
             entries_ = {i for n, i in globals_.items() if n in exported}
         elif u["kind"] == "static_lib":
-            headers_ = list(public_paths)
-            if public["method"] == "consumers":
-                consumers = [
-                    compiles[o] for v in units.values() if name in v["links"] for o in v["objects"] if o in compiles
-                ]
-                used = sorted({h for c in consumers for h in c["headers"] if h.endswith(".h")})
-                # No consumer in the build: every project header is a candidate.
-                chosen = used or [h for h in project_headers if not posixpath.isabs(h)]
-                headers_ = [tree / h for h in chosen]
-                public["files"] = sorted(set(public["files"]) | set(chosen))
             flags = absolute_flags(own[0]["flags"], t) + own[0]["system_flags"] if own else []
-            if headers_:
-                entries_ = {globals_[n] for n in declared_in(headers_, set(globals_), flags)}
-            else:
-                entries_ = set(globals_.values())
+            entries_, warning = static_lib_entries(
+                name, globals_, units, compiles, public, public_paths, project_headers, tree, flags
+            )
+            if warning:
+                report["warnings"].append(warning)
         u["entry_points"] = sorted(entries_)
         u["embedded_api"] = sorted(embedded)
     report["units"] = {n: units[n] for n in sorted(units)}
