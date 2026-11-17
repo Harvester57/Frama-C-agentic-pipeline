@@ -122,6 +122,61 @@ def test_an_api_harness_keeps_cases_above_255():
     assert [lay["selector"] for lay in p["layouts"]] == list(range(300))
 
 
+@pytest.mark.parametrize(("refused", "selector"), [(10, "identity16"), (50, "identity")])
+def test_an_api_harness_selector_follows_the_cases_left_after_the_compile_probe(
+    tmp_path, monkeypatch, refused, selector
+):
+    # 300 planned cases; the compile probe refuses the last `refused`. The harness is written again after
+    # every drop, so the text on disk and the sidecar agree on the cases left and on their selector.
+    import api_harness as ah
+    from test_api_harness import _dag, _fn, _formals, _model
+
+    monkeypatch.chdir(tmp_path)
+    names = [f"f{i:03d}" for i in range(300)]
+    (tmp_path / "lib.c").write_text("/* lib */\n")
+    reports = tmp_path / "workspace" / "reports"
+    reports.mkdir(parents=True)
+    dag = {
+        **_dag({n: _fn(n) for n in names}, names),
+        "schema_version": 1,
+        "callgraph_source": "frama_c",
+        "warnings": [],
+    }
+    for rec in dag["functions"].values():
+        rec.update(internal_callees=[], internal_callers=[])
+    (reports / "callgraph_dag.json").write_text(json.dumps(dag))
+    model = _model(**{n: {"signature": "int(int)", "formals": _formals("value")} for n in names})
+    (reports / "phase0_model.json").write_text(json.dumps(model))
+    gone = set(names[300 - refused :])
+
+    def probe(harness_c, cppflags, clang=None):
+        cases = seed_harvest.harness_cases(Path(harness_c).read_text(encoding="utf-8"))
+        return {i: "error: refused" for i, (_, stmt) in enumerate(cases) if any(f"{n}(" in stmt for n in gone)}, []
+
+    monkeypatch.setattr(ah, "probe_layouts", lambda *a, **k: None)
+    monkeypatch.setattr(ah, "probe_cases", probe)
+    out = tmp_path / "workspace" / "harnesses"
+    result = ah.generate(
+        module="lib",
+        header=None,
+        max_input_size=128,
+        cppflags="-I.",
+        out_dir=out,
+        unit="lib",
+        auto_prelude=False,
+        dag_path=reports / "callgraph_dag.json",
+        model_path=reports / "phase0_model.json",
+        traces_path=tmp_path / "none" / "traces.jsonl",
+    )
+    left = 300 - refused
+    side = json.loads((out / "harness_lib.json").read_text(encoding="utf-8"))
+    text = (out / "harness_lib.c").read_text(encoding="utf-8")
+    assert result["api_cases"] == left and side["dispatch_case_count"] == left
+    assert side["dispatch_selector"] == selector
+    assert G.dispatch_selector_of_text(text) == (selector, left)
+    assert len(side["api_skipped"]) == refused
+
+
 # --- readers -------------------------------------------------------------------------------------
 
 
