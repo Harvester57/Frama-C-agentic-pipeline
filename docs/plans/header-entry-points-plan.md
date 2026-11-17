@@ -97,6 +97,33 @@ The first sketch of this work had three steps. Two of them meet work that is alr
   point counts.
 - **After H1:** the header functions are entry points and the gate holds the module to them; R1's
   numbers then cover only exempted ones.
+- **Written (2026-11-17)** on `feat/header-coverage-report`, cut from `phase1-remediation` at
+  `fe9775f`: H1's model commit cherry-picked (`header_api`), then `feat(reach)` and `docs`. A row
+  gains `header_api_functions` (a count) and `header_api_unexecuted` (`count`, and the first 20
+  names, sorted). A row measured by its crashes, or with partial coverage, keeps only the count.
+  The run report prints one line per module that has unexecuted ones.
+- **Review (2026-11-17):**
+  - Re-run on the branch: `ruff check`, `mypy scripts tests`, and the tests around the change
+    (77 passed). The agent's own full run: 5922 passed, 218 skipped.
+  - Applied offline to the recorded QCBOR run-6 coverage, with `header_api` added to a copy of the
+    model: the `libqcbor_a` row keeps `passed: true` with 171 entry points and no gap, and reports
+    383 of 440 public header functions never executed. That is the number counted by hand from
+    the same coverage report before this step existed. Nothing was written to the run.
+  - Dry merges: clean into `phase1-remediation` (`b540121`) and into `p1/s6b-wide-selector`. A
+    rebase of `feat/header-entry-points` onto this branch skips the cherry-picked model commit and
+    stops on one conflict, the status lines both branches add to the same troubleshooting entry.
+  - **Open, split units:** a sub-module row counts only the header functions in its scope
+    (`ModuleMap.scope_functions`). A file-scoped sub-module scopes source files, so it counts
+    none. A cluster sub-module counts those its anchors reach, so a header function nothing calls
+    is in no row. On a split unit the numbers are therefore a lower bound. This is read from the
+    code: no split unit was run, and QCBOR is one module before H1. A count per unit over all of
+    its modules' coverage would close it.
+  - Not re-run by the reviewer: the whole suite, and nothing on `b540121` (the branch is at
+    `fe9775f`; the merge into `b540121` is clean).
+  - **After H1, corrected:** the list is made from coverage only, so a header entry point that a
+    crash proved executed is still listed.
+  - The Status row below is left as it is on `phase1-remediation`, because the H1 branch changes
+    the rows next to it; update it when this branch lands.
 
 ### S6b. Two-byte selector
 
