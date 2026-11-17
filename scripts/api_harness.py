@@ -131,7 +131,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -2687,6 +2687,16 @@ def generate(
 
     warnings: list[str] = []
     if header is None:
+        # nettle: without a header 22 of 35 libnettle clusters failed. The build capture's public
+        # headers the unit includes, and the internal ones declaring an entry point, stand in for it.
+        chosen = capture_headers(dag, module, unit, dag_file.parent / "build_capture.json")
+        header = chosen.pop("header")
+        extra_includes = [*chosen.pop("extra_includes"), *(extra_includes or [])]
+        api_headers: dict[str, Any] = chosen
+    else:
+        none = header.strip().lower() == "none"
+        api_headers = {"source": "none" if none else "given", "why": f"--header {header}"}
+    if header is None:
         # c-ares run-1: 18 of 19 cases dropped as `call to undeclared function`. Not a failure: a header
         # given through --extra-include, or a module of one function, still works.
         warnings.append(no_header_warning(dag_file.parent / "build_capture.json"))
@@ -2834,6 +2844,7 @@ def generate(
         sidecar["api_cases"] = layouts
         sidecar["api_skipped"] = skipped
         sidecar["api_helpers"] = case_helpers(cases, layouts, p.get("helper_pool") or [])
+        sidecar["api_headers"] = api_headers
         sidecar.pop("api_variadic_dropped", None)
         if dropped:
             sidecar["api_variadic_dropped"] = dropped
@@ -2853,11 +2864,134 @@ def generate(
     return result
 
 
+_ALIAS_DEFINE_RE = re.compile(r"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*$")
+
+
+def header_declares(path: Path, names: set[str]) -> set[str]:
+    """
+    The names of `names` the header at `path` declares, read from its text (no preprocessor). A name
+    reached through a renaming macro counts: nettle's `aes-internal.h` writes `#define _aes_set_key
+    _nettle_aes_set_key` and declares `void _aes_set_key(...)`, the model's `_nettle_aes_set_key`.
+    An unreadable header declares nothing.
+    """
+    from build_capture import declared_names
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    alias = {a: n for a, n in _ALIAS_DEFINE_RE.findall(text) if n in names}
+    found = declared_names(text, names | set(alias))
+    return {alias.get(n, n) for n in found}
+
+
+def capture_headers(dag: dict, module: str, unit: str | None, capture_path: Path) -> dict[str, Any]:
+    """
+    The headers an `--api` harness without `--header` includes, from the build capture (step O4 of
+    docs/plans/open-topics-remediation-plan.md): {source, why, unit, public, internal, dropped,
+    header, extra_includes}, the sidecar's `api_headers` plus the two include slots.
+
+    - `public`: the capture's public headers (`public_headers.files`, an installed one mapped back
+      to its tree header, `phase0_model.public_header_files`) that the unit's own compiles include
+      (`compiles[].headers`);
+    - `internal`: each other header those compiles include that declares an entry point of the
+      module's scope no public header declares, with the names it declares;
+    - `dropped`: a header whose file name another chosen header already has (the harness includes
+      by file name, with `-I` on its directory, so the second would be the first again).
+
+    `header` is the chosen header that declares the module's first entry point, else the first
+    public one; the others are `extra_includes`, public before internal. The paths are rooted at
+    the DAG's `target_dir` as its `cppflags` are (`workspace/work/<tree path>`). `source` is
+    `capture` when a header was chosen, else `not_found`, with `why`: no capture, no record of the
+    module's link unit in it, or none of its headers is public or declares an entry point.
+    """
+    from module_map import ModuleMap
+    from phase0_model import public_header_files
+
+    def not_found(why: str, **extra: Any) -> dict[str, Any]:
+        return {"source": "not_found", "why": why, **extra, "header": None, "extra_includes": []}
+
+    cap = load_json_optional(capture_path, None)
+    if not isinstance(cap, dict):
+        return not_found(f"no build capture ({capture_path.as_posix()})")
+    mm = ModuleMap(dag, {module: {"unit": unit}} if unit else {})
+    rec = mm.unit_record(module)
+    cap_unit = rec.get("unit")
+    cap_rec = (cap.get("units") or {}).get(cap_unit) if isinstance(cap_unit, str) else None
+    compiles = [c for c in cap.get("compiles") or [] if isinstance(c, dict)]
+    if not isinstance(cap_rec, dict) or not compiles:
+        return not_found(f"the build capture has no compiles of the module's link unit ({cap_unit or 'unknown'})")
+    objects = {str(o) for o in cap_rec.get("objects") or []}
+    files = {str(f) for f in rec.get("files") or []}
+    own = [c for c in compiles if str(c.get("object")) in objects] or [
+        c for c in compiles if str(c.get("source")) in files
+    ]
+    unit_headers = sorted(
+        {str(h) for c in own for h in c.get("headers") or [] if str(h).endswith(".h") and not str(h).startswith("/")}
+    )
+    if not unit_headers:
+        return not_found(f"the compiles of link unit {cap_unit} include no project header", unit=cap_unit)
+    every_header = {str(h) for c in compiles for h in c.get("headers") or [] if str(h).endswith(".h")}
+    public = sorted(public_header_files(cap.get("public_headers"), every_header) & set(unit_headers))
+
+    target = str(dag.get("target_dir") or "").replace("\\", "/")
+    root = target[len("/framac-run/") :] if target.startswith("/framac-run/") else target
+
+    def rooted(rel: str) -> str:
+        return f"{root.rstrip('/')}/{rel}" if root else rel
+
+    functions = dag.get("functions") or {}
+    entries = mm.scope_entry_points(module) or list(
+        ((dag.get("modules") or {}).get(module) or {}).get("candidate_entry_points") or []
+    )
+    names = [str((functions.get(k) or {}).get("name") or str(k).split("#")[-1]) for k in entries]
+    wanted = {n for n in names if n != "main"}
+    declares = {h: header_declares(Path(rooted(h)), wanted) for h in unit_headers}
+    by_public = {n for h in public for n in declares[h]}
+    internal = {h: sorted(declares[h] - by_public) for h in unit_headers if h not in public and declares[h] - by_public}
+    chosen: list[str] = []
+    dropped: list[dict[str, str]] = []
+    for h in [*public, *internal]:
+        same = next((c for c in chosen if PurePosixPath(c).name == PurePosixPath(h).name), None)
+        if same is not None:
+            dropped.append({"header": h, "why": f"same file name as {same}, which the harness includes"})
+        else:
+            chosen.append(h)
+    kept = [{"header": h, "declares": d} for h, d in internal.items() if h in chosen]
+    picked: dict[str, Any] = {
+        "unit": cap_unit,
+        "public": public,
+        "internal": kept,
+        **({"dropped": dropped} if dropped else {}),
+    }
+    if not chosen:
+        return not_found(
+            f"none of the {len(unit_headers)} headers link unit {cap_unit} includes is a public header "
+            "or declares an entry point of the module",
+            **picked,
+        )
+    first = next((n for n in names if n != "main"), None)
+    main = next((h for h in chosen if first is not None and first in declares[h]), chosen[0])
+    why = (
+        f"--header not given: {len(public)} public header(s) of the build capture that link unit {cap_unit} "
+        f"includes, and {len(kept)} internal header(s) declaring entry points the public ones "
+        "do not declare"
+    )
+    return {
+        "source": "capture",
+        "why": why,
+        **picked,
+        "header": rooted(main),
+        "extra_includes": [rooted(h) for h in chosen if h != main],
+    }
+
+
 def no_header_warning(capture_path: Path) -> str:
     """
     Why an `--api` harness without `--header` loses its cases: the harness declares only the first
     entry point, so every other case calls an undeclared function and the compile probe drops it.
-    Names the build capture's public headers (`public_headers.files`) when it has them.
+    Names the build capture's public headers (`public_headers.files`) when it has them. Given only when
+    the capture gives the module no header (`capture_headers`).
     """
     cap = load_json_optional(capture_path, None)
     pub = cap.get("public_headers") if isinstance(cap, dict) else None

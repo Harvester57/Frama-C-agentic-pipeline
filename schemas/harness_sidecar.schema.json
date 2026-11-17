@@ -180,6 +180,36 @@
     },
     "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason. A variadic function is here only when none of its call sites made a case", "type": "object", "additionalProperties": {"type": "string"}},
     "api_helpers": {"$comment": "Functions from outside the module's scope (another cluster of the unit) the cases call only to set up or release a struct object: its initializer and destructor (api_harness.case_helpers). harness_reach.check_module counts none of them as a root of the module. Absent on an older sidecar.", "$ref": "#/definitions/strings"},
+    "api_headers": {
+      "$comment": "Where the headers of an --api harness came from (api_harness.capture_headers): `given` (--header), `none` (--header none), `capture` (no --header: the build capture's public headers the module's link unit includes, plus the internal headers declaring an entry point no public header declares, with the names), or `not_found` (no --header and the capture gave none; `why` says why). Paths are tree-relative. Absent on an older sidecar.",
+      "type": "object",
+      "properties": {
+        "source": {"type": "string", "enum": ["given", "none", "capture", "not_found"]},
+        "why": {"type": "string", "minLength": 1},
+        "unit": {"type": ["string", "null"]},
+        "public": {"$ref": "#/definitions/strings"},
+        "internal": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {"header": {"type": "string", "minLength": 1}, "declares": {"$ref": "#/definitions/strings"}},
+            "required": ["header", "declares"],
+            "additionalProperties": false
+          }
+        },
+        "dropped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {"header": {"type": "string", "minLength": 1}, "why": {"type": "string", "minLength": 1}},
+            "required": ["header", "why"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["source", "why"],
+      "additionalProperties": false
+    },
     "api_variadic_dropped": {
       "$comment": "Call sites of a variadic entry point that made no case (over a cap, a type the harness cannot declare, a case the compiler refused), with the reason. Absent when there is none.",
       "type": "array",
