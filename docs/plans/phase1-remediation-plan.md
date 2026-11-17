@@ -395,6 +395,12 @@ Added by the re-check, for the steps before the merge:
   - `test_keep_going_skips_case_280`;
   - when host clang is present, as `test_generated_dispatch_harness_runs_case_k_for_byte_k` does: `test_generated_wide_harness_runs_case_280`.
 - **Acceptance:** the standard checks; `python -m pytest tests/test_dispatch_selector.py tests/test_dispatch_selector_wide.py tests/test_fuzz_keep_going.py tests/test_harness_reach.py tests/test_harness_reach_crash_credit.py -q`.
+- **Review (2026-11-17), on the branch rebased onto `b540121` (S1 to S7 and S12 merged):**
+  - Re-run: `ruff check`, `mypy scripts tests`, `tools/check_generated_text.py`, `tools/sync_skill_mirrors.py --check`, `tests/test_docs_structure.py`, and the whole suite (5941 passed, 219 skipped). `ruff format --check` reports 44 files, all in lines the branch did not write (the four it touches were unformatted before the step too).
+  - `test_generated_wide_harness_runs_case_280` passes in the analysis image (`FRAMAC_DOCKER_TESTS=1`): a compiled 300-case harness runs case k for selector k, and nothing for a selector at or above 300 or a one-byte input.
+  - After the rebase no script outside the ones this step owns reads or writes the selector byte (searched at `b540121`: `read(1)`, `bytes([sel])`, `first_byte`, `<= 255`).
+  - Measured with libFuzzer on trivial harnesses from an empty corpus (`-seed=1`, cases reached after 2,000 / 10,000 / 30,000 executions): 250 cases, one byte: 188 / 250 / 250. 300 cases, two bytes: 98 / 225 / 292. 1,000 cases: 175 / 545 / 872. At 300,000 executions every case of 300 and of 1,000 is reached, and 3,950 of 4,000. So the two-byte selector does not hide cases, but a case without a seed costs about three times the executions to find. With one two-byte seed per case in the corpus every case runs when the corpus is loaded. The pipeline writes no such seed today (open, not part of this step).
+  - Not checked: Eva on a wide harness (one analysis over 300 or more cases, and a shard's `-DFRAMAC_EVA_SHARD_CASE_<k>` list for that many cases), and a real target.
 
 ### S7. Ledger evidence (F7, F9) (S, after S4, S5 and S6a)
 
