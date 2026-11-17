@@ -156,6 +156,130 @@ def test_argv_harness_compiles_with_gcc(tmp_path):
     assert '#include "__fc_builtin.h"' in text
 
 
+# mpack run-3, module sax_example: the module header (examples/sax-example.h) declares the module's
+# API but not main, which lives in examples/sax-example.c.
+SAX_H = """\
+#ifndef SAX_H
+#define SAX_H
+#include <stddef.h>
+int parse_blob(const char *data, size_t length);
+#endif
+"""
+
+SAX_C = """\
+#include <string.h>
+#include "sax.h"
+
+int parse_blob(const char *data, size_t length) {
+    return length > 0 && data[0] == 'x';
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1) {
+        return parse_blob(argv[1], strlen(argv[1]));
+    }
+    return 0;
+}
+"""
+
+
+def _sax_workspace(tmp_path: Path, monkeypatch, header: str = SAX_H, source: str = SAX_C) -> Path:
+    # Sources and -I directories are run-relative, as in a real run.
+    monkeypatch.chdir(tmp_path)
+    work = tmp_path / "workspace" / "work"
+    work.mkdir(parents=True)
+    (work / "sax.h").write_text(header, encoding="utf-8")
+    (work / "sax.c").write_text(source, encoding="utf-8")
+    return tmp_path
+
+
+def _sax_harness(run: Path) -> tuple[dict, str]:
+    harnesses = run / "workspace" / "harnesses"
+    res = generate_module_harness(
+        module_name="sax_example",
+        sources=["workspace/work/sax.c"],
+        header_include="sax.h",
+        entry_fn="main",
+        max_input_size=256,
+        cppflags="-Iworkspace/work",
+        out_dir=harnesses,
+        entry_style="argv",
+        auto_prelude=False,
+    )
+    return res, (harnesses / "harness_sax_example.c").read_text(encoding="utf-8")
+
+
+def _main_declarations(text: str) -> list[str]:
+    return [ln.strip() for ln in text.splitlines() if ln.strip().startswith("int main(") and ln.strip().endswith(";")]
+
+
+def test_argv_harness_declares_main_when_the_module_header_does_not(tmp_path, monkeypatch):
+    _, text = _sax_harness(_sax_workspace(tmp_path, monkeypatch))
+    assert _main_declarations(text) == ["int main(int argc, char** argv);"]
+    decl_at = text.index("int main(int argc, char** argv);")
+    # After the module header (so its types are known), before both calls (Eva and fuzz).
+    assert text.index('#include "sax.h"') < decl_at < text.index("main(argc, argv);")
+    assert decl_at < text.index("main(2, argv);")
+
+
+def test_argv_harness_declaration_follows_the_target_definition(tmp_path, monkeypatch):
+    # A `const char *argv[]` main: the canonical `char **argv` prototype would conflict with it.
+    source = SAX_C.replace("int main(int argc, char** argv)", "int main(int argc, const char *argv[])")
+    _, text = _sax_harness(_sax_workspace(tmp_path, monkeypatch, source=source))
+    assert _main_declarations(text) == ["int main(int argc, const char *argv[]);"]
+
+
+def test_argv_harness_declares_canonical_main_when_the_definition_is_not_found(tmp_path, monkeypatch):
+    run = _sax_workspace(tmp_path, monkeypatch)
+    harnesses = run / "workspace" / "harnesses"
+    generate_module_harness(
+        module_name="sax_example",
+        sources=["workspace/work/missing.c"],
+        header_include="sax.h",
+        entry_fn="main",
+        max_input_size=256,
+        cppflags="-Iworkspace/work",
+        out_dir=harnesses,
+        entry_style="argv",
+        auto_prelude=False,
+    )
+    text = (harnesses / "harness_sax_example.c").read_text(encoding="utf-8")
+    assert _main_declarations(text) == ["int main(int argc, char **argv);"]
+
+
+def test_argv_harness_keeps_the_module_header_declaration_of_main(tmp_path, monkeypatch):
+    header = SAX_H.replace("#endif", "int main(int, char *[]);\n#endif")
+    _, text = _sax_harness(_sax_workspace(tmp_path, monkeypatch, header=header))
+    # The header's own declaration is the only one: the harness adds none beside it.
+    assert _main_declarations(text) == []
+
+
+def test_argv_harness_with_header_compiles_without_implicit_declaration(tmp_path, monkeypatch):
+    """The mpack sax_example shape compiles with the sidecar cppflags and implicit declarations as errors."""
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if cc is None:
+        import pytest
+
+        pytest.skip("no C compiler available")
+    run = _sax_workspace(tmp_path, monkeypatch)
+    res, _ = _sax_harness(run)
+    proc = subprocess.run(
+        [
+            cc,
+            "-fsyntax-only",
+            "-Werror=implicit-function-declaration",
+            "-D__FRAMAC_EACSL__",
+            *res["cppflags"].split(),
+            str(run / "workspace/harnesses/harness_sax_example.c"),
+            str(run / "workspace/work/sax.c"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=run,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
 # png-fix-itxt.c: K&R-style `int\nmain(void)` right after a macro whose last continuation line ends
 # in `break`.
 NO_ARG_MAIN_C = """\

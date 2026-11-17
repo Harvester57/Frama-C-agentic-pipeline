@@ -1232,7 +1232,9 @@ def _build_invocations(
         # 256-byte argv buffers made unknown. Fuzz side: argv[1] is the input as a NUL-terminated
         # string. The target's main is renamed via -Dmain=__framac_target_main in the sidecar
         # cppflags (see generate_module_harness), so libFuzzer's main does not clash at link time;
-        # the -D renames this call and the synthesized declaration consistently.
+        # the -D renames this call and main's declaration consistently. That declaration is the
+        # module header's when it declares main, else the one generate_module_harness writes into
+        # the harness (_argv_entry_declaration).
         eva_call = (
             "(void)input_buf; (void)input_len; (void)fuzz_buf; (void)fuzz_len;\n"
             "    int argc = Frama_C_interval(0, 5);\n"
@@ -2125,6 +2127,18 @@ def _check_argv_entry(module_name: str, entry_fn: str, sources: list[str], cppfl
     )
 
 
+def _argv_entry_declaration(entry_fn: str, sources: list[str], cppflags: str) -> str:
+    """
+    The declaration of an argv entry (`main`) for a harness whose headers do not declare it: a
+    program's main is rarely in its module header, and calling it undeclared is an implicit function
+    declaration, an error under clang and E-ACSL. The target's own definition gives it (so a
+    `const char *argv[]` main keeps its types), else the canonical `int <entry_fn>(int argc, char **argv);`.
+    Written into the harness, it is renamed by the sidecar's -Dmain= together with the call.
+    """
+    decl = extract_function_declaration(entry_fn, None, sources, cppflags)
+    return decl or f"int {entry_fn}(int argc, char **argv);"
+
+
 @contextlib.contextmanager
 def harness_files_kept_on_failure(out_dir: Path, module_name: str) -> Iterator[None]:
     """
@@ -2430,12 +2444,25 @@ def _generate_module_harness(
         if not norm_header and target_fuzzer_record is None:
             if effective_self_harnessed:
                 inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
+            elif entry_style == "argv":
+                inc_lines.append(_argv_entry_declaration(entry_fn, sources, norm_cppflags))
             else:
                 synth_decl = extract_function_declaration(entry_fn, None, sources, norm_cppflags)
                 if synth_decl:
                     inc_lines.append(synth_decl)
         elif effective_self_harnessed:
             inc_lines.append("int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);")
+        elif (
+            entry_style == "argv"
+            and target_fuzzer_record is None
+            and not any(
+                extract_function_declaration(entry_fn, h, None, norm_cppflags) is not None
+                for h in (norm_header, *norm_extra_includes, *norm_compat_includes)
+            )
+        ):
+            # The module header (and the headers included beside it) do not declare main: declare
+            # it after them, so its parameter types are known, and before the calls below.
+            inc_lines.append(_argv_entry_declaration(entry_fn, sources, norm_cppflags))
     if target_fuzzer_record is not None:
         inc_lines.append(_target_fuzzer_prelude(bool(target_fuzzer_record["initialize"])))
 
