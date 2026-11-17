@@ -193,7 +193,7 @@ Issues encountered in coverage ledger ingestion (`ledger.py`), Crash Verifier sc
 - **Cause:** two gaps together.
   - The verifier brief points to the manuals through `{references_dir}` but never said that a `tool_output` must be a file in the run directory.
   - `validate_artifacts.py agent-result` checked only the schema and the path syntax, not that cited files exist or fit the promotion limits. So the agent's pre-return check passed, and the parent's ingest refused the whole result: the existence check when `findings.json` is written, or `promote_file`'s size limits for a scratch file above 1 MiB.
-- **Fix:** **Open pipeline bug:** fixed on branch `sup/mpack-brief-wrapper` (`4dfaeea`, on top of S15; run supervisor S17), held until run-4 ends, not merged.
+- **Fix:** **Fixed:** `4dfaeea` from `sup/mpack-brief-wrapper` (run supervisor S17), merged into `phase1-remediation` on 2026-11-17 (merge `ff418c7`).
   - The pre-read checks of `promote_file` are now `promote_artifact.check_promotable`. `validate_agent_result(data, run_dir)` runs them on a crash verifier's scratch evidence, reproducers and `fix_patch`; any other cited file must exist under the run directory.
   - `agent-result` gains `--run-dir`, defaulting to the run directory of an `agents/<id>/scratch/result.json`, so the command the briefs already give now runs these checks. The ingest itself is unchanged.
   - The verifier, prover and header architect briefs say that manuals and repository docs are cited in prose, and give the size limits.
