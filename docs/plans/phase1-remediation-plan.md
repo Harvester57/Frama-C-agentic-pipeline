@@ -400,7 +400,9 @@ Added by the re-check, for the steps before the merge:
   - `test_generated_wide_harness_runs_case_280` passes in the analysis image (`FRAMAC_DOCKER_TESTS=1`): a compiled 300-case harness runs case k for selector k, and nothing for a selector at or above 300 or a one-byte input.
   - After the rebase no script outside the ones this step owns reads or writes the selector byte (searched at `b540121`: `read(1)`, `bytes([sel])`, `first_byte`, `<= 255`).
   - Measured with libFuzzer on trivial harnesses from an empty corpus (`-seed=1`, cases reached after 2,000 / 10,000 / 30,000 executions): 250 cases, one byte: 188 / 250 / 250. 300 cases, two bytes: 98 / 225 / 292. 1,000 cases: 175 / 545 / 872. At 300,000 executions every case of 300 and of 1,000 is reached, and 3,950 of 4,000. So the two-byte selector does not hide cases, but a case without a seed costs about three times the executions to find. With one two-byte seed per case in the corpus every case runs when the corpus is loaded. The pipeline writes no such seed today (open, not part of this step).
-  - Not checked: Eva on a wide harness (one analysis over 300 or more cases, and a shard's `-DFRAMAC_EVA_SHARD_CASE_<k>` list for that many cases), and a real target.
+  - The selector enum is in `schemas/harness_sidecar.schema.json` only, so a crash artifact stamped `identity16` validates. The skip function takes `unsigned int`, so `templates/harness_dual.c.template` did not need to change.
+  - The seed cost above is one run per size on a trivial harness; it is recorded as an open gap in `docs/troubleshooting/harnesses-and-seeds.md`.
+  - Not checked: the skip of a case at or above 256 in a compiled harness, Eva on a wide harness (one analysis over 300 or more cases, and a shard's `-DFRAMAC_EVA_SHARD_CASE_<k>` list for that many cases), and a real target.
 
 ### S7. Ledger evidence (F7, F9) (S, after S4, S5 and S6a)
 
