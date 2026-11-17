@@ -62,6 +62,8 @@ from acsl_ast import (  # noqa: E402
     function_trust_records,
     is_trust_boundary,
     locate_all_prototype_spans,
+    locate_function_span,
+    mask_comments_and_literals,
     splice_architect_header,
     splice_prover_changes,
     tokenize_c_acsl,
@@ -2808,6 +2810,92 @@ def _callees_without_contract_section(callees: list[str] | None, role: str) -> s
     )
 
 
+CALLER_USAGE_MAX_CALLERS = 6
+CALLER_USAGE_LINES_AFTER = 4
+CALLER_USAGE_MAX_LINE_CHARS = 160
+
+
+def _call_sites(work_dir: Path, caller_file: str, caller: str, callee: str) -> list[tuple[int, list[str]]]:
+    """
+    The textual calls of `callee` in the definition of `caller` (`work_dir/caller_file`): for each, its
+    1-based line and the source lines from the call line on (at most CALLER_USAGE_LINES_AFTER after it,
+    never past the caller's body). Comments, literals and ACSL are not searched. [] when the file or the
+    definition cannot be read, or the call is not written by name (a call through a pointer).
+    """
+    try:
+        text = (work_dir / caller_file).read_text(encoding="utf-8", errors="replace")
+        span = locate_function_span(text, caller, path=caller_file)
+    except (OSError, AcslError):
+        return []
+    if span is None:
+        return []
+    body = text[span.start_byte : span.end_byte]
+    masked = mask_comments_and_literals(body, acsl="blank", on_error="mask", path=caller_file)
+    lines = text.splitlines()
+    sites: list[tuple[int, list[str]]] = []
+    seen: set[int] = set()
+    for match in re.finditer(rf"(?<![A-Za-z0-9_.>]){re.escape(callee)}\s*\(", masked):
+        line = span.start_line + masked.count("\n", 0, match.start())
+        if line in seen:
+            continue
+        seen.add(line)
+        last = min(line + CALLER_USAGE_LINES_AFTER, span.end_line, len(lines))
+        sites.append((line, [lines[i - 1][:CALLER_USAGE_MAX_LINE_CHARS] for i in range(line, last + 1)]))
+    return sites
+
+
+def _caller_usage_section(overlay: Path, function: str | None, fn_meta: dict, dag_fns: dict, role: str) -> str:
+    """
+    "How the callers use this function" in a prover's brief: for each direct caller in the call-graph
+    DAG, its first textual call of `function` and the lines after it, read from `workspace/work/`. A
+    function with no caller in the DAG gets a sentence saying it is an entry point. Empty for other roles
+    and when the DAG has no record of the function.
+    """
+    if role != "prover" or not function or not fn_meta:
+        return ""
+    name = function.rpartition("#")[2]
+    callers = [str(c) for c in fn_meta.get("internal_callers") or []]
+    head = "\n## How the Callers Use This Function\n\n"
+    if not callers:
+        return (
+            head + f"No function in the analysed code calls `{name}`: it is an API entry point (or reached only "
+            "through a function pointer). Its callers are outside the slice, so its contract is what they rely "
+            "on: state in `ensures` what the function gives them (the result's range and meaning, the memory "
+            "it writes), not only that it runs without errors.\n"
+        )
+    blocks: list[str] = []
+    not_shown = 0
+    for key in callers:
+        rec = dag_function_record(dag_fns, key)
+        cfile = _normalize_work_relpath(str(rec.get("file") or "")) if rec else ""
+        cname = str(rec.get("name") or key.rpartition("#")[2]) if rec else key.rpartition("#")[2]
+        if len(blocks) >= CALLER_USAGE_MAX_CALLERS:
+            not_shown += 1
+            continue
+        sites = _call_sites(overlay / "work", cfile, cname, name) if cfile else []
+        if not sites:
+            not_shown += 1
+            continue
+        line, text = sites[0]
+        more = f", and {len(sites) - 1} more call(s) in it" if len(sites) > 1 else ""
+        code = "\n".join(text).replace("```", "'''")
+        blocks.append(f"`{cname}` (`{cfile}` line {line}{more}):\n\n```c\n{code}\n```\n")
+    if blocks:
+        out = (
+            head
+            + f"Where the direct callers of `{name}` call it, and what they do next (from `workspace/work/`):\n\n"
+            + "\n".join(blocks)
+        )
+    else:
+        out = head + f"No call of `{name}` by name was found in its callers' code.\n"
+    if not_shown:
+        out += (
+            f"\n{not_shown} caller(s) not shown: over the limit of {CALLER_USAGE_MAX_CALLERS}, or calling "
+            "through a pointer or a macro.\n"
+        )
+    return out
+
+
 def _rejected_result_section(rejected_result: dict | None, agent_id: str, role: str) -> str:
     """
     Appended to the brief of an agent that re-runs a task whose previous result.json failed validation
@@ -3301,6 +3389,7 @@ def prepare_agent(
             "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
         )
         rendered += _negotiation_evidence_section(caller_evidence, callee_history)
+    rendered += _caller_usage_section(overlay, function, fn_meta, dag_fns, role)
     rendered += _callees_without_contract_section(callees_without_contract, role)
     rendered += _rejected_result_section(rejected_result, agent_id, role)
 
