@@ -2485,6 +2485,56 @@ def _candidate_harness_module(mm: ModuleMap, cand: dict) -> str:
     return harness_module_for_function(mm, module, loc.get("file"), loc.get("function")) or module
 
 
+def _add_related(cand: dict, other_fp: str, reason: str) -> bool:
+    """Record a `related` link on a candidate, once per other fingerprint. True when it was added."""
+    related = cand.setdefault("related", [])
+    if any(r.get("fingerprint") == other_fp for r in related):
+        return False
+    related.append({"fingerprint": other_fp, "reason": reason})
+    return True
+
+
+@ledger_locked
+def cmd_link_related(index_path: Path) -> dict:
+    """
+    D1b: link candidates that other engines report on one reproducer. A replay index entry's
+    `cross_engine.failures` names the failures its reproducer makes on the other engine. A failure whose
+    fingerprint keys another candidate, or is one of its observations, and that lies in the same file and
+    function as the entry's candidate, gives both candidates a `related` entry, once. The verifier then sees
+    one bug (D17: the second is rejected as `duplicate`).
+    """
+    index = load_json_strict(index_path)
+    units, candidates = load_state()
+    owner: dict[str, str] = {}
+    for key, cand in candidates.items():
+        owner.setdefault(key, key)
+        for obs in cand.get("observations") or []:
+            owner.setdefault(obs["fingerprint"], key)
+    links = 0
+    for entry_fp, entry in (index.get("by_fingerprint") or {}).items():
+        cross = entry.get("cross_engine") if isinstance(entry, dict) else None
+        found = candidates.get(entry_fp)
+        if not isinstance(cross, dict) or found is None:
+            continue
+        loc = found.get("location") or {}
+        file, function = normalize_file(loc.get("file") or ""), loc.get("function")
+        for failure in cross.get("failures") or []:
+            other_key = owner.get(str(failure.get("fingerprint") or ""))
+            if other_key is None or other_key == entry_fp:
+                continue
+            if normalize_file(str(failure.get("file") or "")) != file or failure.get("function") != function:
+                continue
+            reason = (
+                f"cross-engine replay: {cross.get('engine')} fails at "
+                f"{failure.get('file')}:{failure.get('line')} on the same reproducer"
+            )
+            links += _add_related(found, other_key, reason)
+            links += _add_related(candidates[other_key], entry_fp, reason)
+    if links:
+        commit(units, candidates)
+    return {"index": str(index_path), "links_added": links}
+
+
 def _find_matching_sink_candidate(
     candidates: dict[str, dict],
     file: str,
@@ -4361,6 +4411,10 @@ def main(argv: list[str] | None = None) -> int:
     p_mc.add_argument("--key", required=True)
     p_audit = sub.add_parser("audit-hypotheses", help="Resolve valid_under_hyp assumptions against callgraph_dag.json")
     p_audit.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
+    p_related = sub.add_parser("link-related", help="Link candidates that other engines report on one reproducer (D1b)")
+    p_related.add_argument(
+        "--index", type=Path, required=True, help="The replay index (replay-candidates --cross-engine)"
+    )
     sub.add_parser("summary")
     sub.add_parser("status", help="Alias for summary")
     args = parser.parse_args(argv)
@@ -4391,6 +4445,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_record_stub_contracts(args.report, args.check_report)
         elif args.cmd == "ingest-verifier":
             out = cmd_ingest_verifier(args.result, args.replay_report, args.harness_meta)
+        elif args.cmd == "link-related":
+            out = cmd_link_related(args.index)
         elif args.cmd == "transition":
             out = cmd_transition(args.id, args.status, args.agent_id, args.reason, args.expect or None)
         elif args.cmd == "transition-many":

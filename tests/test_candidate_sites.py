@@ -296,6 +296,45 @@ def test_a_hypothesis_without_a_line_merges_by_function_and_kind(ber_run):
     assert len(cands[key_a]["observations"]) == 2
 
 
+def test_link_related_links_two_candidates_of_one_reproducer(ber_run):
+    """LIBMNL-04's shape: E-ACSL's initialization at line 42 and ASan's access at 47, one function, one reproducer."""
+    fp_eac = _fuzz(ber_run, "eac", engine="eacsl", predicate=PRED_EACSL, line=42)
+    fp_san = _fuzz(ber_run, "san", engine="sanitizers", predicate=PRED_SAN_NEXT, line=47)
+    index = {
+        "by_fingerprint": {
+            fp_eac: {
+                "report": "workspace/reports/replay/x.json",
+                "module": "snmp",
+                "status": "crash_found",
+                "cross_engine": {
+                    "engine": "sanitizers",
+                    "status": "crash_found",
+                    "failures": [
+                        {
+                            "fingerprint": fp_san,
+                            "file": "/framac-run/workspace/work/src/snmp/ber.c",
+                            "line": 47,
+                            "function": "ber_decode_len",
+                            "kind": "mem_access",
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    index_path = ber_run / "workspace" / "reports" / "replay" / "index.json"
+    write_json(index_path, index)
+    out = L.cmd_link_related(index_path)
+    assert out["links_added"] == 2
+    cands = _candidates(ber_run)
+    assert [r["fingerprint"] for r in cands[fp_eac]["related"]] == [fp_san]
+    assert [r["fingerprint"] for r in cands[fp_san]["related"]] == [fp_eac]
+    assert cands[fp_eac]["related"][0]["reason"].startswith("cross-engine replay: sanitizers fails at ")
+    # Once: a second run adds nothing.
+    assert L.cmd_link_related(index_path)["links_added"] == 0
+    assert list(validate_candidates(load(ber_run / "candidates.json"))) == []
+
+
 def test_candidates_without_site_load_and_validate(run_dir):
     old_fp = make_fingerprint(BER, "ber_decode_len", "mem_access", PRED_SAN)
     old = {

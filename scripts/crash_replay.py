@@ -15,6 +15,7 @@ import re
 import shlex
 import shutil
 from pathlib import Path
+from typing import Any
 
 import fuzz_build
 import sandbox_exec
@@ -379,6 +380,65 @@ def _reproducer_paths(cand: dict) -> list[Path]:
     return paths
 
 
+def _cross_engine_replay(
+    *,
+    module: str,
+    harness_module: str,
+    spec: dict,
+    reproducers: list[Path],
+    other: str,
+    bin_dir: Path | None,
+    scratch: Path,
+    per_input_timeout: int,
+    prepared_cache: dict[tuple[str, str], dict],
+    attribution: bool,
+    selftest_json: Path | None,
+    machdep: str,
+) -> dict:
+    """
+    Replay a candidate's reproducers on the other engine's binary of its module (D1b). A build that fails
+    is recorded (`build_failed`) and skipped. `failures` lists each distinct failure once, by its fingerprint.
+    """
+    key = (harness_module, other)
+    if key not in prepared_cache:
+        out_bin = (bin_dir if bin_dir is not None else Path("workspace/harnesses")) / f"cross_{other}_{harness_module}"
+        prepared_cache[key] = prepare_replay_binary(
+            harness_module,
+            spec["sources"],
+            out_bin,
+            attribution=attribution,
+            engine=other,
+            selftest_json=selftest_json,
+            machdep=machdep,
+            cppflags=spec["cppflags"],
+            ldflags=spec["ldflags"],
+            rte_initialized=bool(spec.get("rte_initialized", True)),
+            libc_checks=bool(spec.get("libc_checks", True)),
+        )
+    prepared = prepared_cache[key]
+    if prepared.get("binary") is None:
+        return {"engine": other, "status": "build_failed", "reason": prepared.get("reason"), "failures": []}
+    report = replay_report(module, reproducers, scratch, prepared=prepared, per_input_timeout=per_input_timeout)
+    failures: list[dict] = []
+    seen: set[str] = set()
+    for art in report.get("artifacts") or []:
+        fp = art.get("fingerprint")
+        if not fp or fp in seen:
+            continue
+        seen.add(fp)
+        failure = art.get("failure") or {}
+        failures.append(
+            {
+                "fingerprint": fp,
+                "file": failure.get("file"),
+                "line": failure.get("line"),
+                "function": failure.get("function"),
+                "kind": failure.get("alarm_kind") or failure.get("kind"),
+            }
+        )
+    return {"engine": other, "status": report.get("status"), "failures": failures}
+
+
 def replay_candidates(
     candidates_path: Path,
     harness_dir: Path,
@@ -393,6 +453,7 @@ def replay_candidates(
     only: str | None = None,
     inputs: list[Path] | None = None,
     out_json: Path | None = None,
+    cross_engine: bool = False,
 ) -> dict:
     """
     Replay the reproducers of every unverified candidate on its module's binary, built with
@@ -418,6 +479,7 @@ def replay_candidates(
     bin_dir = Path(bin_dir) if bin_dir is not None else Path("workspace/harnesses")
     specs: dict[tuple[str, str, str], dict | str] = {}
     prepared_by_key: dict[tuple[str, str], dict] = {}
+    cross_prepared: dict[tuple[str, str], dict] = {}
     index: dict[str, dict] = {}
     by_status: dict[str, int] = {}
     for cand in todo:
@@ -467,7 +529,25 @@ def replay_candidates(
         report["fingerprint_matches"] = any(a.get("fingerprint") == fingerprint for a in report["artifacts"])
         report_path = Path(out_json) if out_json is not None else out_dir / f"{_candidate_slug(fingerprint)}.json"
         atomic_write_json(report_path, report)
-        index[fingerprint] = {"report": report_path.as_posix(), "module": module, "status": report["status"]}
+        entry: dict[str, Any] = {"report": report_path.as_posix(), "module": module, "status": report["status"]}
+        if cross_engine and only is None and eng in ("eacsl", "sanitizers") and not isinstance(spec, str):
+            # D1b: the same reproducers on the other engine's binary, so one bug seen by both links (link-related).
+            other = "sanitizers" if eng == "eacsl" else "eacsl"
+            entry["cross_engine"] = _cross_engine_replay(
+                module=module,
+                harness_module=harness_module,
+                spec=spec,
+                reproducers=_reproducer_paths(cand),
+                other=other,
+                bin_dir=bin_dir,
+                scratch=out_dir / ".scratch" / f"{_candidate_slug(fingerprint)}-cross-{other}",
+                per_input_timeout=per_input_timeout,
+                prepared_cache=cross_prepared,
+                attribution=attribution,
+                selftest_json=selftest_json,
+                machdep=machdep,
+            )
+        index[fingerprint] = entry
         by_status[report["status"]] = by_status.get(report["status"], 0) + 1
     if only is not None and out_json is not None:
         if not todo:

@@ -312,7 +312,8 @@ ingest:
 replay: ingest
 	$(RUN) --class replay --key candidates --output workspace/reports/replay/index.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py replay-candidates --candidates candidates.json \
-		--harness-dir workspace/harnesses --out-dir workspace/reports/replay
+		--harness-dir workspace/harnesses --out-dir workspace/reports/replay --cross-engine
+	$(RUN) --class light --key candidates -- $(PY) $(S)/ledger.py link-related --index workspace/reports/replay/index.json
 
 # Minimizes every unverified candidate's reproducer with cvise/creduce (writes <artifact>.min next
 # to each crash input; indexed by workspace/reports/minimize/index.json). Best run after `replay`;

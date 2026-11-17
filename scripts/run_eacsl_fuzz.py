@@ -2552,6 +2552,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_cands.add_argument("--inputs", type=Path, nargs="+", default=None, help="With --fingerprint: the input files")
     p_cands.add_argument("--out-json", type=Path, default=None, help="With --fingerprint: the replay report")
+    p_cands.add_argument(
+        "--cross-engine",
+        action="store_true",
+        help="Also replay each candidate's reproducers on the other engine's binary (index.json: cross_engine)",
+    )
 
     p_min = sub.add_parser("minimize", help="Minimize crash input(s) with cvise/creduce on a given or built binary")
     _add_build_args(p_min, sources_required=False)
@@ -2622,6 +2627,7 @@ def main(argv: list[str] | None = None) -> int:
             only=args.fingerprint,
             inputs=args.inputs,
             out_json=args.out_json,
+            cross_engine=args.cross_engine,
         )
         print(json.dumps(summary, indent=2))
         return 0 if summary["status"] == "ok" else 1
