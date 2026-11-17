@@ -419,6 +419,15 @@ def _rename(declarator: str, function: str, new_name: str) -> str:
     return re.sub(rf"(?<![A-Za-z0-9_]){re.escape(function)}(?=\s*\()", new_name, declarator, count=1)
 
 
+def _annotated(body: str) -> list[str]:
+    """
+    The annotation comment for one contract piece, or nothing when the piece has no clause left. A contract
+    split between a header prototype and the definition leaves a piece that holds only `ensures`; once those
+    are stripped the comment would be empty, which Frama-C refuses (`unexpected token ''`).
+    """
+    return ["/*@", body, "*/"] if body.strip() else []
+
+
 def build_probe(
     given: list[Piece],
     probe: list[Piece],
@@ -451,13 +460,8 @@ def build_probe(
         if strip_given_ensures:
             body = strip_ensures(body)
         given_text.append(body)
-        lines += [
-            "/*@",
-            _labelled(body, p, "given", unit, label),
-            "*/",
-            _rename(head, function, function + GIVEN_SUFFIX) + ";",
-            "",
-        ]
+        lines += _annotated(_labelled(body, p, "given", unit, label))
+        lines += [_rename(head, function, function + GIVEN_SUFFIX) + ";", ""]
     if not any(kind == "assigns" for body in given_text for kind, *_ in iter_clauses(body)):
         raise ProbeError(
             f"{function}: the contract compared against has no `assigns` clause, so the kernel would "
@@ -466,7 +470,8 @@ def build_probe(
     for p in probe:
         head = _check_piece(p, function, f"the declaration at {p.file}:{p.line}")
         body = _labelled(acsl_body(p.acsl), p, "probe", unit, label)
-        lines += ["/*@", body, "*/", _rename(head, function, function + PROBE_SUFFIX) + ";", ""]
+        lines += _annotated(body)
+        lines += [_rename(head, function, function + PROBE_SUFFIX) + ";", ""]
     args = ", ".join(definition.params)
     call = f"{function}{GIVEN_SUFFIX}({args});"
     lines += [

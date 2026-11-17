@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -55,6 +56,28 @@ def test_reads_pieces_from_the_definition_and_the_header(tmp_path):
     assert c.definition is not None and c.definition.declarator == "int add(int a, int b)"
     assert c.definition.params == ["a", "b"] and c.returns_void is False
     assert CR.FunctionContract.from_dict(json.loads(json.dumps(c.to_dict()))) == c
+
+
+@pytest.mark.unit
+def test_frame_only_probe_of_a_split_contract_has_no_empty_annotation(tmp_path):
+    # libmnl run 1, mnl_nlmsg_batch_is_empty: requires/assigns on the header prototype, the only ensures on
+    # the definition. Stripping the ensures left `/*@ */`, which Frama-C refuses.
+    header = PROBE_HEADER.replace(
+        "int add(int a, int b);", "/*@ requires small(a);\n    assigns \\nothing; */\nint add(int a, int b);"
+    )
+    c = _contract(
+        tmp_path,
+        "api.c",
+        '#include "api.h"\n/*@ ensures \\result == a + b; */\nint add(int a, int b) { return a + b; }\n',
+        "add",
+        header,
+    )
+    assert c.definition is not None
+    unit = CR.build_probe(c.pieces, c.pieces, c.definition, False, Path("/w/api.c"), "add", strip_given_ensures=True)
+    comments = re.findall(r"/\*@(.*?)\*/", unit.text, flags=re.S)
+    assert comments and all(body.strip() for body in comments)
+    assert unit.text.count("int add__given(int a, int b);") == 2
+    assert unit.text.count("ensures") == 1
 
 
 @pytest.mark.unit
