@@ -946,11 +946,16 @@ def run_fuzz_campaign(
             if not kind:
                 continue
             # An `oom-` input is replayed like a crash (mpack run-4: one never was, and kept no outcome).
-            if kind in ("crash", "leak", "oom"):
+            # Past the replay budget it is still listed, unreplayed, as before: only crashes and leaks are dropped.
+            replay_it = kind in ("crash", "leak", "oom")
+            if replay_it:
                 if replayed >= MAX_REPLAYED_CRASHES:
-                    unreplayed += 1
-                    continue
-                replayed += 1
+                    replay_it = False
+                    if kind != "oom":
+                        unreplayed += 1
+                        continue
+                else:
+                    replayed += 1
             entry = {
                 "artifact": str(p),
                 "kind": kind,
@@ -962,7 +967,7 @@ def run_fuzz_campaign(
             }
             if pre_existing:
                 entry["pre_existing"] = True
-            if kind in ("crash", "leak", "oom"):
+            if replay_it:
                 replay = crash_replay.replay_artifact(binary, p, scratch, per_input_timeout=per_input_timeout)
                 # The campaign log names one failure; it can only stand for this input if it is the only one.
                 # Never for an oom: libFuzzer's out-of-memory is no parsed failure, and an E-ACSL heap-limit

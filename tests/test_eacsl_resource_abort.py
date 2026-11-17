@@ -559,3 +559,22 @@ def test_ingest_unmarked_oom_with_sanitizer_out_of_memory_stays_a_candidate(run_
     stats, cands = _ingest(run_dir, [art])
     assert [c["fingerprint"] for c in cands if "::oom::" in c["fingerprint"]]
     assert stats.get("eacsl_resource_aborts", 0) == 0
+
+
+def test_campaign_oom_past_the_replay_budget_is_still_listed(tmp_path, monkeypatch, run_dir):
+    """
+    `oom-` sorts after every crash- and leak-: past MAX_REPLAYED_CRASHES it is listed unreplayed (as before
+    the fix), never dropped, and ingests as a candidate keyed by its input.
+    """
+    monkeypatch.setattr(R, "MAX_REPLAYED_CRASHES", 1)
+    arts, res = _oom_campaign(
+        tmp_path,
+        monkeypatch,
+        oom_replay=(77, _RUN3_CAMPAIGN_LOG + _RUN3_REPLAY_TAIL),
+        crash_replay_out=(77, _RUN3_CAMPAIGN_LOG + _RUN3_REPLAY_TAIL),
+    )
+    art = arts["oom"]
+    assert art["reproducible"] is None and "replay_log_tail" not in art and "eacsl_resource_abort" not in art
+    assert "artifacts_omitted" not in res
+    stats, cands = _ingest(run_dir, [{**art, "artifact": f"workspace/crashes/mp/{_OOM_EMPTY}", "engine": "eacsl"}])
+    assert [c["fingerprint"] for c in cands if "::oom::" in c["fingerprint"]] and stats["candidates"] == 1
