@@ -115,8 +115,15 @@ NO_TOUCH = ledger.NO_TOUCH
 
 MAX_NEGOTIATIONS_PER_PAIR = 2  # negotiation rounds per (caller, callee) pair
 # Dispatches of one callee's negotiation task: many callers can each ask for a stronger contract the callee cannot
-# be proved to give, and every round costs an agent run for the same stall.
+# be proved to give, and every round costs an agent run for the same stall. Checked where requests join the task
+# (`_emit_negotiations`), where a round would reopen for follow-ups (`_resolve_negotiation`) and before every dispatch
+# (`cmd_next`), so no reopen path (follow-up, new request, requeue, retry) goes past it.
 MAX_NEGOTIATION_ROUNDS_PER_CALLEE = 3
+# The note prefix of a request no negotiate agent was ever handed: Tier 1 (`spec_kb`) reads it as a structural
+# rejection and leaves the request out of "Known Dead Ends". A request closed after it was assigned gets
+# NEGOTIATION_CLOSED_AFTER_DISPATCH instead (`_negotiation_request_note`).
+NOT_DISPATCHED = spec_kb.STRUCTURAL_REJECTION_PREFIX
+NEGOTIATION_CLOSED_AFTER_DISPATCH = "closed after dispatch"
 # Seam evidence in a negotiate brief (A/B switch FRAMAC_NEGOTIATE_EVIDENCE, `off` disables): each caller's unproven
 # goals at the call site and the callee's previous prover run.
 NEGOTIATE_EVIDENCE_ENV = "FRAMAC_NEGOTIATE_EVIDENCE"
@@ -549,6 +556,11 @@ def _assign_agent(state: dict, task: dict) -> str:
     )
     task.pop("requeued_from", None)
     task.setdefault("agents", []).append(aid)
+    if task["kind"] == "negotiate":
+        # The agents each request was handed to: a request closed later is no longer "not dispatched".
+        handed = task.setdefault("request_agents", {})
+        for rid in task.get("requests") or []:
+            handed.setdefault(str(rid), []).append(aid)
     state["agents"][aid] = task["id"]
     _event(state, "assigned", task["id"], agent_id=aid)
     return aid
@@ -1187,10 +1199,7 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
             verifiability = ctx.verifiability(task["file"], task["function"])
             neg_verdict = _negotiate_skip_verdict(fn_units, open_verify, verifiability)
             if neg_verdict:
-                note = f"not dispatched: callee unit is {neg_verdict}"
-                for rid in task.get("requests") or []:
-                    _resolve_request([], str(rid), "rejected_by_callee", note)
-                _finish(state, task, "skipped", neg_verdict, reason=note)
+                _close_negotiation_unrun(state, task, "skipped", neg_verdict, f"callee unit is {neg_verdict}", [])
                 changes["skipped"].append(tid)
 
     prove_modules = sorted({t["module"] for t in tasks.values() if t["kind"] == "prove" and t["state"] != "skipped"})
@@ -2620,9 +2629,19 @@ def cmd_init(reconcile: bool = False) -> dict:
     return out
 
 
+def _forget_request_agent(task: dict, aid: str | None) -> None:
+    """A refunded dispatch (no agent ever ran): its requests were not handed to anyone."""
+    handed = task.get("request_agents") or {}
+    for rid in list(handed):
+        handed[rid] = [a for a in handed[rid] if a != aid]
+        if not handed[rid]:
+            del handed[rid]
+
+
 def _prepare_failed(state: dict, task: dict, error: str) -> None:
     task["prepare_errors"] = int(task.get("prepare_errors") or 0) + 1
     task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+    _forget_request_agent(task, task.get("agent_id"))
     if task["prepare_errors"] >= MAX_PREPARE_ERRORS:
         _finish(state, task, "blocked", "prepare_failed", reason=error)
     else:
@@ -2704,11 +2723,19 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                     ctx.verifiability(task["file"], task["function"]),
                 )
                 if neg_refusal:
-                    note = f"not dispatched: callee unit is {neg_refusal}"
-                    for rid in task.get("requests") or []:
-                        _resolve_request(out["errors"], str(rid), "rejected_by_callee", note)
-                    _finish(state, task, "skipped", neg_refusal, reason=note)
+                    _close_negotiation_unrun(
+                        state, task, "skipped", neg_refusal, f"callee unit is {neg_refusal}", out["errors"]
+                    )
                     out["skipped"].append({"task": task["id"], "reason": neg_refusal})
+                    continue
+                if _negotiation_capped(task):
+                    _close_negotiation_unrun(
+                        state, task, "done", "rejected", _negotiation_cap_reason(task), out["errors"]
+                    )
+                    out["skipped"].append({"task": task["id"], "reason": "negotiation_round_cap"})
+                    out.setdefault("negotiations_capped", []).extend(
+                        {"request": str(rid), "callee": _key(task)} for rid in task.get("requests") or []
+                    )
                     continue
             _assign_agent(state, task)
             picked.append(task["id"])
@@ -3016,20 +3043,11 @@ def _emit_negotiations(
             )
             out.setdefault("negotiations_skipped", []).append({"request": rid, "callee": key, "reason": neg_verdict})
             continue
-        settled = tasks.get(f"negotiate:{key}")
-        if (
-            settled is not None
-            and settled["state"] in TERMINAL
-            and settled.get("outcome") != "applied"
-            and int(settled.get("dispatches") or 0) >= MAX_NEGOTIATION_ROUNDS_PER_CALLEE
-        ):
-            resolve(
-                out["errors"],
-                rid,
-                "rejected_by_callee",
-                f"not dispatched: callee {key} went through {settled['dispatches']} negotiation rounds "
-                f"(cap {MAX_NEGOTIATION_ROUNDS_PER_CALLEE}) without an accepted contract",
-            )
+        existing = tasks.get(f"negotiate:{key}")
+        if existing is not None and _negotiation_capped(existing):
+            # Whatever its state: a terminal task would reopen, a pending one is refused at dispatch, and a
+            # running one is the last round, so the request would only wait for a round that never comes.
+            resolve(out["errors"], rid, "rejected_by_callee", f"{NOT_DISPATCHED} {_negotiation_cap_reason(existing)}")
             out.setdefault("negotiations_capped", []).append({"request": rid, "callee": key})
             continue
         pair = f"{caller['id']}|{key}"
@@ -3095,19 +3113,65 @@ def _requeue_caller(state: dict, caller_id: str) -> bool:
     return False
 
 
+def _negotiation_capped(task: dict) -> bool:
+    """Whether the callee's negotiate task has used up its rounds (`MAX_NEGOTIATION_ROUNDS_PER_CALLEE`)."""
+    return int(task.get("dispatches") or 0) >= MAX_NEGOTIATION_ROUNDS_PER_CALLEE
+
+
+def _negotiation_cap_reason(task: dict) -> str:
+    return (
+        f"callee {_key(task)} reached the negotiation round cap "
+        f"({int(task.get('dispatches') or 0)} dispatches, cap {MAX_NEGOTIATION_ROUNDS_PER_CALLEE})"
+    )
+
+
+def _negotiation_request_note(task: dict, rid: str, reason: str) -> str:
+    """
+    The resolution note of a request closed without a result of its own: `not dispatched:` only when no
+    negotiate agent was ever handed the request (Tier 1 then leaves it out of "Known Dead Ends").
+    """
+    agents = (task.get("request_agents") or {}).get(str(rid))
+    if agents:
+        return f"{NEGOTIATION_CLOSED_AFTER_DISPATCH} to {agents[-1]}: {reason}"
+    return f"{NOT_DISPATCHED} {reason}"
+
+
+def _close_negotiation_unrun(state: dict, task: dict, new_state: str, outcome: str, reason: str, errors: list) -> None:
+    """Close a negotiate task that will not run (again): its requests are rejected, each with its own note."""
+    for rid in task.get("requests") or []:
+        _resolve_request(errors, str(rid), "rejected_by_callee", _negotiation_request_note(task, str(rid), reason))
+    prefix = NOT_DISPATCHED if not int(task.get("dispatches") or 0) else "not dispatched again:"
+    _finish(state, task, new_state, outcome, reason=f"{prefix} {reason}")
+
+
 def _resolve_negotiation(state: dict, task: dict, applied: bool, note: str, out: dict) -> None:
-    """Close a negotiation round: resolve its requests, requeue the callers whose request was applied."""
+    """
+    Close a negotiation round: resolve its requests, requeue the callers whose request was applied.
+    Follow-up requests get the next round, unless the callee is at its round cap.
+    """
     status = "verified_and_applied" if applied else "rejected_by_callee"
+    if note.startswith(NOT_DISPATCHED):
+        # Every call site closes a round an agent was handed, so its requests were dispatched (libmnl run 1 closed
+        # `req_0015` by hand with this prefix, and Tier 1 dropped it from "Known Dead Ends").
+        note = f"{NEGOTIATION_CLOSED_AFTER_DISPATCH}: {note[len(NOT_DISPATCHED) :].strip()}"
     for rid in task.get("requests") or []:
         _resolve_request(out["errors"], rid, status, note)
     _finish(state, task, "done", "applied" if applied else "rejected", reason=note)
     requeued = [c for c in (task.get("callers") or []) if applied and _requeue_caller(state, c)]
     out.setdefault("negotiation", []).append({"task": task["id"], "status": status, "requeued_callers": requeued})
-    if task.get("followup_requests"):
-        task["requests"] = list(dict.fromkeys(task["followup_requests"]))
-        task["callers"] = list(dict.fromkeys(task.get("followup_callers") or []))
-        task["followup_requests"], task["followup_callers"] = [], []
-        _reopen(state, task, "follow-up strengthening requests")
+    followups = list(dict.fromkeys(task.get("followup_requests") or []))
+    if not followups:
+        return
+    followup_callers = list(dict.fromkeys(task.get("followup_callers") or []))
+    task["followup_requests"], task["followup_callers"] = [], []
+    if _negotiation_capped(task):
+        reason = _negotiation_cap_reason(task)
+        for rid in followups:
+            _resolve_request(out["errors"], rid, "rejected_by_callee", _negotiation_request_note(task, rid, reason))
+            out.setdefault("negotiations_capped", []).append({"request": rid, "callee": _key(task)})
+        return
+    task["requests"], task["callers"] = followups, followup_callers
+    _reopen(state, task, "follow-up strengthening requests")
 
 
 def _ensure_breaker(state: dict, prove_task: dict, agent_id: str, wp_report: str | None, out: dict) -> None:
@@ -4311,6 +4375,7 @@ def cmd_requeue(agent_id: str | None = None, stale_minutes: float | None = None)
                 # no agent ever ran for `previous`, so do not burn the task's dispatch budget.
                 _reopen(state, task, f"requeued: agent {previous} was never prepared (missing brief.md)")
                 task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+                _forget_request_agent(task, previous)
             entry_info: dict[str, Any] = {"task": task["id"], "agent_id": previous, "units_released": released}
             if not had_brief:
                 entry_info["unprepared"] = True
