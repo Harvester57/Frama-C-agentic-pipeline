@@ -361,6 +361,7 @@ Added by the re-check, for the steps before the merge:
   1. Add `MIN_ROUND_CPU_S = 10` next to `MIN_ROUND_WALL_S`, with the comment: fixed, never derived from the machine.
   2. `run_campaign_rounds` gains the keyword `workers: int = 1`. `_engine_campaign` in `_run_campaign_mode` passes `workers=workers`.
   3. The test for another round, `max_time - spent < MIN_ROUND_WALL_S`, becomes `(max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S`. The fork fallback's test, `left >= MIN_ROUND_WALL_S`, becomes `(max_time - spent) * max(1, workers) >= MIN_ROUND_CPU_S`. A round's wall time stays `max(MIN_FUZZ_WALL_S if not rounds else MIN_ROUND_WALL_S, int(max_time - spent))`, and the fallback's is `max(MIN_ROUND_WALL_S, int(max_time - spent))`.
+     - **Changed in review (`cb56350`):** that wall floor let the last round overrun the budget by up to 5 s times the workers. A round's and the fallback's wall time is now the wall time left, `int(max_time - spent)` (at least 1 s for the first round); a later round also needs a whole second left. `MIN_ROUND_WALL_S` is gone.
   4. `stopped` on every exit of the loop: the `break` on `not fresh` sets `rnd["stopped"] = "no_new_case"`, and the one on `insufficient_memory` sets `"insufficient_memory"`. The other names stay.
   5. `keep_going` (mode `dispatch_rounds`) gains `stopped` (the last round's), `workers` and `cpu_seconds_spent` (`round(spent * max(1, workers), 1)`). `fuzz_seconds` stays. Mode `fork` has no loop and gets no `stopped`.
   6. `skills/framac-fuzz/SKILL.md`: rounds are bounded by CPU-seconds; the list of `stopped` values. Then `python tools/sync_skill_mirrors.py`.
@@ -599,19 +600,19 @@ Re-scoped on 2026-11-17 (D11). "Before merge" steps gate the merge to `main`; th
 | Step | Size | When | Status |
 | :--- | :--- | :--- | :--- |
 | S0 | — | — | dropped; its checks are in V |
-| S1 | S | before merge | open |
-| S2 | M | before merge | open; F8 (headline and `freeable`) is on the branch, F1 and leaks are to do |
-| S3 | M | before merge | open |
-| S4 | L | before merge | open |
-| S5 | M | before merge | open; the crash credit of F2(a) is on the branch (`d5ae38a`, `a923d42`, `ffca52b`), D2 is to do |
-| S6a | S | before merge | open (F6, `stopped`) |
+| S1 | S | before merge | done (2026-11-17), merge `d5d2aa7` |
+| S2 | M | before merge | done (2026-11-17), merge `aa3aa9c`; known-bug fingerprints are recomputed in V |
+| S3 | M | before merge | done (2026-11-17), merge `018c159` |
+| S4 | L | before merge | done (2026-11-17), merge `4de97ca`; replay and minimize accept a candidate's observations (`586d28d`); hypotheses without a line stay at function + kind (open entry in `ledger-and-verifier.md`) |
+| S5 | M | before merge | done (2026-11-17), merge `72db709` (in `cd4f827`) |
+| S6a | S | before merge | done (2026-11-17), merge `7e431a6`; round wall time is the time left (`cb56350`) |
 | S6b | M | after merge (D20) | open; F3 is fixed on the branch (`18bc5e9`, `45c7a5f`), the two-byte selector (D7) is an extension |
-| S7 | S | before merge | open |
+| S7 | S | before merge | done (2026-11-17), merge `9890f29` |
 | S8 | S | after merge | open, after V |
 | S9 | M | before merge | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |
 | S10 | — | after merge | waits for the user |
 | S11 | M | after merge | open |
-| S12 | S | F14, F16 before merge; F13 after | open |
+| S12 | S | F14, F16 before merge; F13 after | F14 and F16 done (2026-11-17, merge `cd4f827`); F13 open |
 | S13 | S | after merge | open |
 | S14 | M | before merge | done; seeded benchmark 9/9 bugs, 0/4 decoys (run seeded-s14, s09 found by both `tf_fuzz_parse` and the imported corpus in `librcf_a`); a c-ares coverage comparison is still to do |
-| V | — | last before merge | waits for S1–S7, F14 and F16, then the user |
+| V | — | last before merge | ready: S1–S7, F14 and F16 are on the branch (implemented by Claude Haiku 5.5, reviewed per step); waits for the user |

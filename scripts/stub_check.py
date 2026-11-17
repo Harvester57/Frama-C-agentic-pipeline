@@ -574,7 +574,7 @@ def build_driver(work: Path, ldflags: str) -> dict:
     E-ACSL build of the driver, in the two stages of run_eacsl_fuzz.py, without `-e-acsl-functions`:
     E-ACSL checks a declared function's contract around each call only when no selection leaves it out,
     and the option refuses a function without a body (so does `-rte-select`, which
-    run_eacsl_fuzz.compile_eacsl_binary passes the same list). The instrumented file gets the same text
+    fuzz_build.compile_eacsl_binary passes the same list). The instrumented file gets the same text
     repairs as a fuzz build.
     """
     from eacsl_toolchain import (
