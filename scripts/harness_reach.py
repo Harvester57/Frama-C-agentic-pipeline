@@ -117,6 +117,8 @@ DEFAULT_OUT = Path("workspace/reports/harness_reach.json")
 MODULE_EXEMPT_FILE = "reach_exempt_modules.json"
 # Tiers Phase 0 must harness (framac-slice Step 4); a Tier 3 module without a harness is by design.
 HARNESSED_TIER_PREFIXES = ("Tier 1A", "Tier 1B", "Tier 2")
+# Entry styles that drive a whole program through its `main` (generate_harness.MAIN_ENTRY_STYLES).
+WHOLE_PROGRAM_ENTRY_STYLES = ("argv", "stdin")
 _IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
 _DEFINE_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(.*)$")
 _HEADER_SUFFIXES = (".h", ".hh", ".hpp", ".inc")
@@ -531,9 +533,9 @@ def check_module(
     # An entry point counts only when the harness calls it itself: a root, or behind header inline
     # wrappers of a root. One that only another function calls is driven with that caller's arguments
     # (minmea run-1: `minmea_scan` behind the `minmea_parse_*` roots, its 's' format branch never run).
-    # An `argv` harness drives a program through its `main(argc, argv)`, the one real entry: the DAG's
+    # An `argv` or `stdin` harness drives a program through its `main`, the one real entry: the DAG's
     # entry points are the program's non-static helpers, which no harness could call any better.
-    whole_program = sidecar.get("entry_style") == "argv"
+    whole_program = sidecar.get("entry_style") in WHOLE_PROGRAM_ENTRY_STYLES
     direct = reached if whole_program else callee_closure(roots, by_name, unit, follow=is_header_inline)
 
     exempt_raw = sidecar.get("reach_exempt")

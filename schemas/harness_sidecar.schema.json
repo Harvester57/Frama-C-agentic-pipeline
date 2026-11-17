@@ -148,7 +148,7 @@
     "cppflags": {"type": "string"},
     "ldflags": {"type": "string"},
     "entry_fn": {"type": "string", "minLength": 1},
-    "entry_style": {"type": "string", "enum": ["buffer_len", "c_string", "global_buffer", "struct_arg", "void_call", "custom", "auto_prototype", "argv", "dispatch"]},
+    "entry_style": {"type": "string", "enum": ["buffer_len", "c_string", "global_buffer", "struct_arg", "void_call", "custom", "auto_prototype", "argv", "dispatch", "stdin"]},
     "global_buf": {"type": ["string", "null"]},
     "global_len": {"type": ["string", "null"]},
     "self_harnessed": {"type": "boolean"},
