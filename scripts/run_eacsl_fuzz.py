@@ -992,11 +992,16 @@ def run_fuzz_campaign(
                     abort = replay.get("resource_abort") or (
                         parse_eacsl_resource_abort(combined_out) if crash_like == 1 else None
                     )
-                    if abort:
-                        attribution = entry.get("attribution")
-                        entry["eacsl_resource_abort"] = crash_replay.resource_abort_record(
+                    attribution = entry.get("attribution")
+                    record = (
+                        crash_replay.resource_abort_record(
                             abort, attribution if isinstance(attribution, dict) else None
                         )
+                        if abort
+                        else None
+                    )
+                    if record is not None:
+                        entry["eacsl_resource_abort"] = record
                 if failure:
                     entry["fingerprint"] = make_fingerprint(
                         failure["file"],

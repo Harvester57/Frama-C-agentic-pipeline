@@ -102,12 +102,15 @@ def replay_artifact(
     }
 
 
-def resource_abort_record(abort: dict, attribution: dict | None) -> dict:
+def resource_abort_record(abort: dict, attribution: dict | None) -> dict | None:
     """
     An artifact's `eacsl_resource_abort`: the E-ACSL runtime stopped on its own limit (no target check
     failed), and what the sanitizer replay of the same input said: `unavailable` (no sanitizer build),
-    `not_reproduced` or `no_failure`. A located sanitizer failure makes the artifact a candidate instead.
+    `not_reproduced` or `no_failure`. None when the sanitizer replay reported a failure, located or not:
+    the artifact then stays an ordinary (unparsed) crash for a verifier.
     """
+    if attribution and attribution.get("failure"):
+        return None
     if not attribution:
         san = "unavailable"
     elif not attribution.get("reproduced"):
@@ -161,7 +164,9 @@ def replay_inputs(
                     entry["failure_source"] = "sanitizer_replay"
         entry["failure"] = failure
         if not failure and rep.get("resource_abort"):
-            entry["eacsl_resource_abort"] = resource_abort_record(rep["resource_abort"], entry.get("attribution"))
+            record = resource_abort_record(rep["resource_abort"], entry.get("attribution"))
+            if record is not None:
+                entry["eacsl_resource_abort"] = record
         if failure:
             entry["fingerprint"] = make_fingerprint(
                 failure.get("file") or "unknown",

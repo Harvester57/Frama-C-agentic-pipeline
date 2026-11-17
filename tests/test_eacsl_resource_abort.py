@@ -147,6 +147,14 @@ def test_campaign_sanitizer_failure_wins_over_the_resource_abort(tmp_path, monke
     assert "eacsl_resource_abort" not in art
 
 
+def test_campaign_unlocated_sanitizer_failure_keeps_the_crash_for_a_verifier(tmp_path, monkeypatch):
+    """The sanitizer build saw a failure it could not locate: not dropped as an E-ACSL limit."""
+    asan = "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000011\n"
+    art = _campaign(tmp_path, monkeypatch, asan)["artifacts"][0]
+    assert art["attribution"]["failure"] is not None and art["failure"] is None
+    assert "eacsl_resource_abort" not in art
+
+
 _DAG_ONE_FN = {
     "callgraph_source": "frama_c",
     "modules": {"mp": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"}},
@@ -211,12 +219,18 @@ def test_zone_size_option_is_fixed_and_bounded():
 
 
 def test_zone_size_reaches_stage_two_and_the_cache_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
     material = fuzz_build._eacsl_cache_material(
         [str(tmp_path / "a.c")], tmp_path / "fuzz_a", "gcc_x86_64", "-I.", "all", True, None, "", True, False, True
     )
-    assert material is not None
-    if material["eacsl_gcc"][1]:
-        assert material["zone_sizes"] == eacsl_zone_size_options()
+    assert material is not None and material["zone_sizes"] == eacsl_zone_size_options()
+    # A build with another zone is another cache entry: a cached 128 MiB binary is never reused.
+    monkeypatch.setattr(fuzz_build, "EACSL_HEAP_ZONE_MB", 512)
+    other = fuzz_build._eacsl_cache_material(
+        [str(tmp_path / "a.c")], tmp_path / "fuzz_a", "gcc_x86_64", "-I.", "all", True, None, "", True, False, True
+    )
+    assert other is not None and other["zone_sizes"] != material["zone_sizes"]
+    monkeypatch.setattr(fuzz_build, "EACSL_HEAP_ZONE_MB", EACSL_HEAP_ZONE_MB)
     calls: list[list[str]] = []
 
     class _Proc:

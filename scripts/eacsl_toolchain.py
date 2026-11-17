@@ -93,10 +93,13 @@ EACSL_GCC_CHECK_OPTIONS = ("--libc-replacements", "--validate-format-strings")
 # 55 -> 126 MB max RSS; of a 1000 MiB block: 1.2 GB), while the zone itself is reserved address
 # space only (no RLIMIT_AS, see sandbox_exec.py); startup RSS and throughput did not change from 128.
 # 1024 keeps the largest tracked block plus its shadow inside the fixed -rss_limit_mb of 2048
-# (resources.FUZZ_RSS_LIMIT_MB), and a calloc'd one (block, shadow and init shadow all written)
-# inside the 1.25x per-worker sizing; a larger block aborts in the runtime as before. 2048 itself is
-# not possible: the runtime computes `E_ACSL_HEAP_SIZE * MB` in `int`, which overflows at 2048 and the
-# binary segfaults at startup on every input (measured: exit 139 on every input).
+# (resources.FUZZ_RSS_LIMIT_MB; measured: 1.2 GB max RSS for a 1000 MiB block). A calloc'd one (block,
+# shadow and init shadow all written) comes to about 2.2 GB by computation, not measured: inside the
+# 1.25x per-worker sizing, where libFuzzer's RSS check should report an oom- artifact. The time spent
+# writing the shadow of a 500-1000 MiB block against the per-input timeout is not measured yet. A
+# larger block aborts in the runtime as before. 2048 itself is not possible (measured: exit 139 at
+# startup on every input); the cause is inferred from the source: the runtime computes
+# `E_ACSL_HEAP_SIZE * MB` in `int`, which overflows at 2048. 2047 is untested.
 EACSL_HEAP_ZONE_MB = 1024
 _EACSL_MIN_HEAP_ZONE_MB = 64  # e-acsl-gcc's MIN_HEAP
 _EACSL_MAX_HEAP_ZONE_MB = 2047  # E_ACSL_HEAP_SIZE * MB is an int product in the runtime
