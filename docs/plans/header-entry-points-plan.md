@@ -103,6 +103,16 @@ The first sketch of this work had three steps. Two of them meet work that is alr
 As specified in [`./phase1-remediation-plan.md`](./phase1-remediation-plan.md). Not changed by
 this plan. H1 needs it before it lands (HD5).
 
+Started early on 2026-11-17, on the user's decision, in parallel with S5 and H1:
+- **Base:** S5 is not merged yet, so the branch is cut from the `phase1-remediation` tip and must
+  be rebased over S5. Both change `scripts/harness_reach.py` and `scripts/run_eacsl_fuzz.py`.
+- **Scope beyond the remediation plan's list:** every reader and writer of the selector is
+  checked, including Eva sharding (`scripts/eva_shards.py`), which that list does not name.
+- **Commits:** two, not one: code and tests, then skills and docs, because S5 and H1 edit the
+  same skills.
+- **With H1:** S6b owns `MAX_CASES` in `scripts/api_harness.py`; H1's overflow test is written
+  against that constant, not the number 255.
+
 ## Not in this plan
 
 These decide how much the new cases find. Each needs a design of its own.
@@ -133,4 +143,4 @@ These decide how much the new cases find. Each needs a design of its own.
 | :--- | :--- | :--- | :--- |
 | H1 | M | now, on `feat/header-entry-points`; lands after S6b | dispatched 2026-11-17 |
 | R1 | S | after S5 is merged | open |
-| S6b | M | after the merge to `main` (remediation plan, D20) | open, tracked there |
+| S6b | M | lands after the merge to `main` (remediation plan, D20) | started early on 2026-11-17 (user), on `p1/s6b-wide-selector`, cut from `phase1-remediation` at `0b0101e`; to be rebased over S5 |
