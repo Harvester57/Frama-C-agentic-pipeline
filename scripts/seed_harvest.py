@@ -331,7 +331,17 @@ RECORDER_RUNTIME = r"""
 #define FC_MAX_CALLS %(max_calls)d
 #define FC_FUNCS %(funcs)d
 
-static __thread int fc_depth;
+/* The active wrappers, outermost first: the address of a token in each wrapper's frame and the
+   unique value it wrote there. A test may longjmp out of a wrapped call (an assert handler, cmocka,
+   check), skipping its fc_leave: entering a wrapper therefore first drops every entry that is no
+   longer live. The stack grows down (x86-64): a live enclosing wrapper's token lies strictly above
+   the current one, and still holds its value; a dead frame is either below the current one or has
+   been reused by later frames, which overwrote the token. */
+#define FC_STACK 256
+struct fc_frame { volatile unsigned long *at; unsigned long val; };
+static __thread struct fc_frame fc_frames[FC_STACK];
+static __thread int fc_nframes;
+static __thread unsigned long fc_seq;
 static int fc_fd = -1;
 static long fc_fd_pid = -1;
 static int fc_pipe[2] = {-1, -1};
@@ -394,15 +404,32 @@ static size_t fc_copy(unsigned char *dst, const void *p, size_t n) {
     return done;
 }
 
-int fc_enter(int fn) {
-    fc_depth++;
-    if (fc_depth != 1 || fn < 0 || fn >= FC_FUNCS || fc_total >= FC_TOTAL) return 0;
+/* `tok` is a local of the calling wrapper. Only an outermost call is recorded; when the frame stack
+   is full the call is not tracked and counts as nested. */
+int fc_enter(int fn, volatile unsigned long *tok) {
+    int live = 0;
+    for (int i = 0; i < fc_nframes; i++) {
+        struct fc_frame e = fc_frames[i];
+        if ((uintptr_t)e.at > (uintptr_t)tok && *e.at == e.val) fc_frames[live++] = e;
+    }
+    fc_nframes = live;
+    int outer = fc_nframes == 0;
+    *tok = ++fc_seq;
+    if (fc_nframes < FC_STACK) {
+        fc_frames[fc_nframes].at = tok;
+        fc_frames[fc_nframes].val = fc_seq;
+        fc_nframes++;
+    }
+    if (!outer || fn < 0 || fn >= FC_FUNCS || fc_total >= FC_TOTAL) return 0;
     if (fc_calls[fn] >= FC_MAX_CALLS) return 0;
     fc_calls[fn]++;
     return 1;
 }
 
-void fc_leave(void) { fc_depth--; }
+void fc_leave(volatile unsigned long *tok) {
+    if (fc_nframes > 0 && fc_frames[fc_nframes - 1].at == tok) fc_nframes--;
+    *tok = 0;
+}
 
 void fc_begin(const char *name) {
     fc_len = 0;
@@ -528,8 +555,8 @@ def wrapper_source(plans: list[dict[str, Any]], headers: list[str]) -> str:
         "/* Seed recorder wrappers (scripts/seed_harvest.py). Compiled with the test's own flags. */",
         "#include <stddef.h>",
         *[f'#include "{h}"' for h in headers],
-        "int fc_enter(int fn);",
-        "void fc_leave(void);",
+        "int fc_enter(int fn, volatile unsigned long *tok);",
+        "void fc_leave(volatile unsigned long *tok);",
         "void fc_begin(const char *name);",
         "void fc_raw(int idx, char kind, const void *p, size_t n);",
         "void fc_mem(int idx, char kind, const void *p, size_t n);",
@@ -547,13 +574,14 @@ def wrapper_source(plans: list[dict[str, Any]], headers: list[str]) -> str:
         rec += [f"fc_addr({i}, a{i});" for i, p in enumerate(params) if p["kind"] == "ptr"]
         lines.append(f"extern {ret['ctype']} __real_{name}({decl});")
         lines.append(f"{ret['ctype']} __wrap_{name}({decl}) {{")
-        lines.append(f'    if (fc_enter({k})) {{ fc_begin("{name}"); {" ".join(rec)} fc_end(); }}')
+        lines.append("    volatile unsigned long fc_tok;")
+        lines.append(f'    if (fc_enter({k}, &fc_tok)) {{ fc_begin("{name}"); {" ".join(rec)} fc_end(); }}')
         if ret["kind"] == "void":
             lines.append(f"    __real_{name}({call});")
-            lines.append("    fc_leave();")
+            lines.append("    fc_leave(&fc_tok);")
         else:
             lines.append(f"    {ret['ctype']} r = __real_{name}({call});")
-            lines.append("    fc_leave();")
+            lines.append("    fc_leave(&fc_tok);")
             lines.append("    return r;")
         lines.append("}")
     return "\n".join(lines) + "\n"
