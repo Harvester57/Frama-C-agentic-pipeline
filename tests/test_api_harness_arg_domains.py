@@ -274,9 +274,10 @@ def test_an_operation_keeps_a_count_larger_than_its_buffer(ad_plan):
 
 def test_an_enum_argument_is_mapped_onto_the_declared_constants(ad_plan):
     text, lay = _ad_case(ad_plan, "type_name")
-    assert "static const long long fc_e[3] = { TY_NIL, TY_INT, TY_STR };" in text, text
     # A declared value is kept; any other is mapped onto one of them.
-    assert "if (!fc_in) { c0a0 = (int)fc_e[(unsigned int)c0a0 % 3U]; }" in text, text
+    member = " || ".join(f"(long long)c0a0 == (long long){c}" for c in ("TY_NIL", "TY_INT", "TY_STR"))
+    assert f"if (!({member})) {{ static const long long fc_e[3] = {{ TY_NIL, TY_INT, TY_STR }}; " in text, text
+    assert "c0a0 = (int)fc_e[(unsigned int)c0a0 % 3U]; }" in text, text
     assert text.index("fc_e[3]") < _call_at(text, "type_name")
     assert lay["slots"] == [{"call": 0, "param": 0, "size": 4, "kind": "int"}]
 
@@ -388,6 +389,38 @@ def test_the_growable_output_of_an_initializer_run_first_is_freed_after_the_call
     assert text.index("wr_destroy(&c0a0);") < text.index("free(c1a1);"), text
 
 
+def test_lifecycle_methods_get_the_rules_inside_their_own_branch():
+    # A lifecycle case runs a method several times: its normalization and its free belong to the
+    # branch that declares its arguments afresh on every run, never once for the whole loop.
+    hd = "struct hd *"
+
+    def rec(name: str, sig: str, formals: list[tuple[str, str]]) -> dict[str, Any]:
+        return {"name": name, "signature": sig, "formals": [{"name": a, "kind": k} for a, k in formals]}
+
+    recs = {
+        "hd_new": rec("hd_new", "struct hd *(void)", []),
+        "hd_free": rec("hd_free", "void(struct hd *)", [("h", "pointer")]),
+        "hd_range": rec("hd_range", "int(struct hd *,int,int)", [("h", "pointer"), ("lo", "value"), ("hi", "value")]),
+        "hd_name_dup": rec("hd_name_dup", "char *(struct hd *)", [("h", "pointer")]),
+    }
+    api = ah.ApiInfo(
+        probed=True,
+        records={"hd_new": recs["hd_new"]},
+        handles={n: {0: hd} for n in ("hd_free", "hd_range", "hd_name_dup")},
+        ctors={hd: "hd_new"},
+        dtors={hd: "hd_free"},
+        dtor_names={hd: {"hd_free"}},
+        returns={"hd_new": hd},
+        allocating={"hd_name_dup"},
+    )
+    stmt, _, why = ah.lifecycle_case(hd, ["hd_range", "hd_name_dup"], recs, AD_SPARE, api)
+    assert stmt is not None, why
+    branch0 = stmt[stmt.index("if (fc_k == 0U) {") : stmt.index("else if (fc_k == 1U)")]
+    assert "if (c1a2 < c1a1) { int fc_t = c1a1; c1a1 = c1a2; c1a2 = fc_t; }" in branch0, stmt
+    branch1 = stmt[stmt.index("else if (fc_k == 1U)") :]
+    assert "{ void *c2r = (void *)hd_name_dup((struct hd *)fc_h); free(c2r); }" in branch1, stmt
+
+
 def test_rules_need_the_probe_only_for_enums():
     p = _ad_plan(probed=False)
     text, _ = _ad_case(p, "rd_u8_range")
@@ -403,6 +436,8 @@ def test_rules_need_the_probe_only_for_enums():
 AD_LIB_H = """#include <stddef.h>
 typedef enum ty { TY_NIL = 1, TY_INT, TY_STR } ty_t;
 typedef enum { E_OK, E_IO, E_BUG } err_t;
+typedef enum { FL_A = 1 << 0, FL_B = 1 << 1, FL_C = 1 << 2 } fl_t;
+const char *fl_name(fl_t flags);
 struct rd { const char *data; size_t size; size_t count; };
 void rd_init(struct rd *r, char *buffer, size_t size, size_t count);
 void rd_destroy(struct rd *r);
@@ -456,6 +491,7 @@ const char *err_name(err_t error) {
     switch (error) { case E_OK: return "ok"; case E_IO: return "io"; case E_BUG: return "bug"; }
     __builtin_unreachable();
 }
+const char *fl_name(fl_t flags) { return (flags & FL_B) ? "b" : "-"; }
 void *lib_realloc(void *old_ptr, size_t used_size, size_t new_size) {
     if (new_size == 0) { free(old_ptr); return NULL; }
     void *p = malloc(new_size);
@@ -493,6 +529,7 @@ AD_E2E_RECS: dict[str, tuple[str, list[tuple[str, str]], list[str]]] = {
     "rd_cstr_alloc": ("char *(struct rd *,unsigned long)", [("r", "pointer"), ("maxsize", "value")], ["malloc"]),
     "ty_name": ("char *(enum ty)", [("type", "value")], []),
     "err_name": ("char *(enum __anonenum_err_t_1)", [("error", "value")], []),
+    "fl_name": ("char *(enum __anonenum_fl_t_2)", [("flags", "value")], []),
     "lib_realloc": (
         "void *(void *,unsigned long,unsigned long)",
         [("old_ptr", "pointer"), ("used_size", "value"), ("new_size", "value")],
@@ -532,6 +569,8 @@ def test_cases_respect_the_preconditions_of_a_real_header_and_fuzz_clean(tmp_pat
     assert isinstance(declared, ah.Declared)
     assert declared.enum_params["ty_name"] == {0: ["TY_NIL", "TY_INT", "TY_STR"]}
     assert declared.enum_params["err_name"] == {0: ["E_OK", "E_IO", "E_BUG"]}
+    # A flag enum (`1 << n` initializers, evaluated by clang) is left as read: callers combine them.
+    assert "fl_name" not in declared.enum_params, declared.enum_params
     recs = AD_E2E_RECS
     functions = {n: {"name": n, "file": "lib.c", "is_static": False, "module": "lib"} for n in recs}
     dag = {

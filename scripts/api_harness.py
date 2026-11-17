@@ -937,10 +937,11 @@ def _domain_rules(
             )
             continue
         v, ct, n = scalars[k], params[k]["ctype"], len(names)
+        # A plain disjunction, which Eva narrows the value by, unlike a loop over the table.
+        member = " || ".join(f"(long long){v} == (long long){c}" for c in names)
         case.decls.append(
-            f"{{ static const long long fc_e[{n}] = {{ {', '.join(names)} }}; unsigned int fc_k; int fc_in = 0; "
-            f"for (fc_k = 0; fc_k < {n}U; fc_k++) {{ if ((long long){v} == fc_e[fc_k]) {{ fc_in = 1; }} }} "
-            f"if (!fc_in) {{ {v} = ({ct})fc_e[(unsigned int){v} % {n}U]; }} }}"
+            f"if (!({member})) {{ static const long long fc_e[{n}] = {{ {', '.join(names)} }}; "
+            f"{v} = ({ct})fc_e[(unsigned int){v} % {n}U]; }}"
         )
         case.note(call, k, f"enum: a value none of its {n} declared constants is mapped onto one")
 
@@ -2032,7 +2033,9 @@ def _lifecycle_case(
     )
     layout = case.layout("lifecycle", [ctor, dtor])
     layout.update(handle=htype, methods=list(methods), max_calls=max_calls)
-    return case.statements([make, loop]), layout, None
+    # Rule F's outputs of the constructor (built with allow_init=False), freed after its destructor.
+    frees, case.owned_frees = case.owned_frees, []
+    return case.statements([make, loop, *frees]), layout, None
 
 
 def plan(
