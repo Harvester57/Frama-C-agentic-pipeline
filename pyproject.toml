@@ -40,6 +40,7 @@ known-first-party = [
     "codeql_trust",
     "conftest",
     "contract_negotiator",
+    "contract_refinement",
     "crash_replay",
     "decision_point_check",
     "eacsl_toolchain",
