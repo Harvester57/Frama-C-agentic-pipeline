@@ -197,8 +197,7 @@ def test_d_seed_only_repair_clears_the_gate_end_to_end(tmp_path, monkeypatch):
     _coverage(run, {"rec_parse": 20, "rec_put": 0})
     assert harness_reach.main(["dynamic", "--module", "api"]) == 1
     gate = ["check", "--run-dir", str(run), "--module", "api", "--need", "reach"]
-    assert phase0_gates.main(gate) == 1
-    assert phase0_gates.main([*gate, "--allow-dynamic-gap"]) == 0
+    assert phase0_gates.main(gate) == 0  # a dynamic gap passes the gate (D2)
     _coverage(run, {"rec_parse": 20, "rec_put": 3})
     assert harness_reach.main(["dynamic", "--module", "api"]) == 0
     assert phase0_gates.main(gate) == 0
@@ -493,7 +492,9 @@ def test_run6_crashes_credit_the_entries_they_ran_under_182_cases(tmp_path, monk
 def test_run6_crashes_credit_nothing_once_the_harness_has_181_cases(tmp_path, monkeypatch):
     credited, notes, _ = _run6(tmp_path, monkeypatch, n_cases=181)
     assert credited == []
-    assert any("found under 182 dispatch cases, case 57; the harness now has 181 dispatch cases, case 58" in n for n in notes), notes[:3]
+    assert any(
+        "found under 182 dispatch cases, case 57; the harness now has 181 dispatch cases, case 58" in n for n in notes
+    ), notes[:3]
 
 
 def test_run6_unstamped_report_older_than_the_harness_credits_nothing(tmp_path, monkeypatch):

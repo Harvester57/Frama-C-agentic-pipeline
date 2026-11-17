@@ -784,7 +784,7 @@ def test_partial_coverage_with_unreplayed_inputs_is_unmeasured_and_clears_a_stal
     # An earlier, complete measurement failed the module.
     _coverage(run, {"rec_parse": 40, "rec_put": 0})
     assert harness_reach.main(["dynamic", "--module", "api"]) == 1
-    assert phase0_gates.check(run, "api", ("reach",))
+    assert phase0_gates.check(run, "api", ("reach",)) == []  # a dynamic gap passes the gate (D2)
 
     inputs = {"total": 2240, "replayed": 253, "failed": 16, "not_replayed": 1971}
     _coverage(run, {"rec_parse": 40, "rec_put": 0}, status="partial", inputs=inputs)
@@ -816,7 +816,7 @@ def test_replayed_corpus_with_failing_inputs_is_a_measurement(tmp_path, monkeypa
     doc = _dynamic_doc(run)
     assert doc["modules"]["api"]["failed_inputs"] == 4 and doc["modules"]["api"]["gaps"] == ["rec_put"]
     assert validate_dynamic_reach(doc) == [] and "warnings" not in doc
-    assert phase0_gates.check(run, "api", ("reach",))
+    assert phase0_gates.check(run, "api", ("reach",)) == []
     # The corpus later executes everything: the dynamic failure is lifted without a manual reach-gate.
     _coverage(run, {"rec_parse": 40, "rec_put": 3}, inputs={"total": 25, "replayed": 25, "not_replayed": 0})
     assert harness_reach.main(["dynamic", "--module", "api"]) == 0
@@ -867,13 +867,13 @@ def test_unexecuted_entry_point_reopens_the_gate_until_the_harness_changes(tmp_p
     dyn = json.loads((run / "workspace/reports/harness_reach_dynamic.json").read_text())["modules"]["api"]
     assert dyn["gaps"] == ["rec_put"] and dyn["executions"] == {"rec_parse": 40, "rec_print": 0, "rec_put": 0}
     assert dyn["harness_digest"] == phase0_gates.harness_digest(run, "api", ignore_exempt=True)
-    [reason] = phase0_gates.check(run, "api", ("reach",))
-    assert "never executed" in reason
+    assert phase0_gates.check(run, "api", ("reach",)) == []  # a dynamic gap passes the gate (D2)
+    assert phase0_gates.dynamic_gaps(run) == {"api": ["rec_put"]}
 
     # The static check keeps the gap while the harness is the one coverage measured...
     capsys.readouterr()
     assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 1
-    assert phase0_gates.check(run, "api", ("reach",))
+    assert phase0_gates.check(run, "api", ("reach",)) == []
     # ...and a repaired harness clears it.
     _write_harness(
         run,
@@ -913,16 +913,14 @@ def test_exempting_a_dynamic_gap_reopens_the_gate_without_a_reach_gate_run(tmp_p
     assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
     _coverage(run, {"rec_parse": 40, "rec_put": 0, "rec_print": 0})
     assert harness_reach.main(["dynamic", "--module", "api"]) == 1
-    [reason] = phase0_gates.check(run, "api", ("reach",))
-    # The gate's message names both ways out.
-    assert "never executed" in reason and "harness_reach.py check" in reason
-    assert "harness_reach.py exempt --module api --function <fn>" in reason
+    assert phase0_gates.check(run, "api", ("reach",)) == []  # a dynamic gap passes the gate (D2)
+    assert phase0_gates.dynamic_gaps(run) == {"api": ["rec_put", "rec_print"]}
 
     # One of the two gaps exempted: re-checked, still failing on the other.
     out = _exempt_cli(hdir, capsys, "rec_put")
     assert out["gate"]["rechecked"] == ["api"] and "never executed" in out["gate"]["still_failing"]["api"]
     assert phase0_gates.load_gates(run)["reach"]["modules"]["api"]["gaps"] == ["rec_print"]
-    assert phase0_gates.check(run, "api", ("reach",))
+    assert phase0_gates.check(run, "api", ("reach",)) == []
 
     out = _exempt_cli(hdir, capsys, "rec_print")
     assert out["gate"] == {"rechecked": ["api"]}
@@ -1121,7 +1119,7 @@ def test_b11_callees_from_clang_ast():
 
 
 # ---------------------------------------------------------------------------
-# Crash-proven dynamic reach & --allow-dynamic-gap (QCBOR run-6)
+# Crash-proven dynamic reach (QCBOR run-6)
 # ---------------------------------------------------------------------------
 
 
@@ -1235,7 +1233,11 @@ def test_dynamic_direct_crash_in_entry_point_counts_as_executed(tmp_path, monkey
                 "frames": [
                     {"function": "__sanitizer_memcpy", "file": "", "line": 0},
                     {"function": "rec_put", "file": "/framac-run/workspace/work/src/api.c", "line": 46},
-                    {"function": "LLVMFuzzerTestOneInput", "file": "/framac-run/workspace/harnesses/harness_api.c", "line": 3},
+                    {
+                        "function": "LLVMFuzzerTestOneInput",
+                        "file": "/framac-run/workspace/harnesses/harness_api.c",
+                        "line": 3,
+                    },
                 ],
             }
         ],
@@ -1376,18 +1378,18 @@ def test_dynamic_dispatch_crash_in_init_helper_not_reachable_from_entry_stays_ga
 
 
 @pytest.mark.unit
-def test_phase0_gates_allow_dynamic_gap_unblocks_coverage_only_when_digests_match(tmp_path, monkeypatch):
+def test_phase0_gates_pass_a_dynamic_gap_only_when_digests_match(tmp_path, monkeypatch):
     import phase0_gates
 
     run = _run_dir(tmp_path, monkeypatch)
-    # Missing gate stamp still fails even with allow_dynamic_gap=True.
-    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+    # Missing gate stamp still fails.
+    assert phase0_gates.check(run, "api", ("reach",))
 
-    # Static reach failure (unreached rec_put, no DYNAMIC_GAP_ERROR) still fails with allow_dynamic_gap=True.
+    # Static reach failure (unreached rec_put, no DYNAMIC_GAP_ERROR) still fails.
     hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len);", reach_exempt={"rec_print": "debug output"})
     harness_reach.record_exempt(hdir, "tools", None, "examples")
     assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 1
-    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+    assert phase0_gates.check(run, "api", ("reach",))
 
     # Pass static reach, then fail dynamic reach (records DYNAMIC_GAP_ERROR).
     _write_harness(
@@ -1399,50 +1401,49 @@ def test_phase0_gates_allow_dynamic_gap_unblocks_coverage_only_when_digests_matc
     _coverage(run, {"rec_parse": 20, "rec_put": 0})
     assert harness_reach.main(["dynamic", "--module", "api"]) == 1
 
-    # Default check (fuzz / eva) blocks on DYNAMIC_GAP_ERROR; allow_dynamic_gap=True (coverage) passes.
-    assert phase0_gates.check(run, "api", ("reach",))
-    assert phase0_gates.main(["check", "--run-dir", str(run), "--module", "api", "--need", "reach"]) == 1
-    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True) == []
-    assert (
-        phase0_gates.main(["check", "--run-dir", str(run), "--module", "api", "--need", "reach", "--allow-dynamic-gap"])
-        == 0
-    )
+    # A dynamic gap passes the gate (D2): the default check, which every caller uses, lets the module through.
+    assert phase0_gates.check(run, "api", ("reach",)) == []
+    assert phase0_gates.main(["check", "--run-dir", str(run), "--module", "api", "--need", "reach"]) == 0
+    assert phase0_gates.dynamic_gaps(run) == {"api": ["rec_put"]}
 
     # Other needed gates (e.g. build_check) still must pass.
     phase0_gates.record_build_check(run, {"ok": False, "modules": {"api": {"ok": False, "status": "build_failed"}}})
-    reasons = phase0_gates.check(run, "api", ("reach", "build_check"), allow_dynamic_gap=True)
+    reasons = phase0_gates.check(run, "api", ("reach", "build_check"))
     assert len(reasons) == 1 and "build-check failed" in reasons[0]
 
-    # Stale harness_digest still fails even when allow_dynamic_gap=True.
+    # Stale harness_digest still fails.
     harness_c = hdir / "harness_api.c"
     orig_c = harness_c.read_text(encoding="utf-8")
     harness_c.write_text(orig_c + "/* edited */\n", encoding="utf-8")
-    [stale_h] = phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+    [stale_h] = phase0_gates.check(run, "api", ("reach",))
     assert "harness of api changed" in stale_h
     harness_c.write_text(orig_c, encoding="utf-8")
-    assert phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True) == []
+    assert phase0_gates.check(run, "api", ("reach",)) == []
 
-    # Stale dag_digest still fails even when allow_dynamic_gap=True.
+    # Stale dag_digest still fails.
     dag_file = run / "workspace" / "reports" / "callgraph_dag.json"
     dag_data = json.loads(dag_file.read_text(encoding="utf-8"))
     dag_data["extra_note"] = "mutated"
     dag_file.write_text(json.dumps(dag_data), encoding="utf-8")
-    [stale_dag] = phase0_gates.check(run, "api", ("reach",), allow_dynamic_gap=True)
+    [stale_dag] = phase0_gates.check(run, "api", ("reach",))
     assert "call-graph DAG changed" in stale_dag
 
 
 @pytest.mark.unit
-def test_pipeline_mk_coverage_uses_allow_dynamic_gap_while_fuzz_and_eva_block():
+def test_pipeline_mk_gates_carry_no_dynamic_gap_flag():
     from conftest import makefile_rule
 
     mk_path = Path(__file__).resolve().parent.parent / "templates" / "pipeline.mk"
     text = mk_path.read_text(encoding="utf-8")
-    assert makefile_rule(text, "$(COVERAGE_TARGETS)").recipe[0] == (
-        "$(GATE) --module $* --need reach --allow-dynamic-gap"
-    )
+    assert makefile_rule(text, "$(COVERAGE_TARGETS)").recipe[0] == "$(GATE) --module $* --need reach"
     assert makefile_rule(text, "$(FUZZ_TARGETS)").recipe[0] == "$(GATE) --module $* --need reach,build_check"
     assert makefile_rule(text, "$(EVA_TARGETS)").recipe[0] == "$(GATE) --module $* --need reach"
     assert makefile_rule(text, "$(BUILD_TARGETS)").recipe[0] == "$(GATE) --module $* --need reach"
     gate_lines = [ln.strip() for ln in text.splitlines() if "$(GATE)" in ln or "$$(GATE)" in ln]
-    allow_lines = [ln for ln in gate_lines if "--allow-dynamic-gap" in ln]
-    assert allow_lines == ["$(GATE) --module $* --need reach --allow-dynamic-gap"]
+    # Every reach-only gate line is the same call: direct (`$*`) or expanded by the eval of a Make loop (`$(1)`).
+    reach_lines = [ln for ln in gate_lines if ln.endswith("--need reach")]
+    assert reach_lines and set(reach_lines) <= {
+        "$(GATE) --module $* --need reach",
+        "$$(GATE) --module $(1) --need reach",
+    }
+    assert [ln for ln in gate_lines if "--allow-dynamic-gap" in ln] == []

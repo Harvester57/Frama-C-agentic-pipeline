@@ -160,7 +160,7 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 # corpus as it stands: a dependency on fuzz-% would start a new campaign, because every target is phony.
 coverage: $(COVERAGE_TARGETS)
 $(COVERAGE_TARGETS): coverage-%:
-	$(GATE) --module $* --need reach --allow-dynamic-gap
+	$(GATE) --module $* --need reach
 	$(RUN) --class replay --key $* --output workspace/reports/coverage/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py coverage --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/cov_$* --corpus-dir workspace/corpus/$* \
