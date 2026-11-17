@@ -25,7 +25,11 @@ LIFE_FNS = ["ctx_init", "ctx_init_error", "ctx_init_stdfile", "ctx_destroy"]
 UNIT_INIT_MODEL: dict[str, Any] = {
     "status": "ok",
     "functions": {
-        f"{'api.c' if n in API_FNS else 'life.c'}#{n}": {"name": n, "signature": sig, "formals": [{"name": a, "kind": k} for a, k in formals]}
+        f"{'api.c' if n in API_FNS else 'life.c'}#{n}": {
+            "name": n,
+            "signature": sig,
+            "formals": [{"name": a, "kind": k} for a, k in formals],
+        }
         for n, sig, formals in [
             (
                 "ctx_write",
@@ -130,9 +134,7 @@ def test_an_input_backed_buffer_initializer_wins():
         n: {
             "name": n,
             "signature": sig,
-            "formals": [
-                {"name": (names.get(n) or ["r", "a", "b", "c"])[i], "kind": k} for i, k in enumerate(kinds)
-            ],
+            "formals": [{"name": (names.get(n) or ["r", "a", "b", "c"])[i], "kind": k} for i, k in enumerate(kinds)],
         }
         for n, (sig, kinds) in recs.items()
     }
