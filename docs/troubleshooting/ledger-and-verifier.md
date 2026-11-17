@@ -158,3 +158,13 @@ Issues encountered in coverage ledger ingestion (`ledger.py`), Crash Verifier sc
   - A `located` or `model` `toolchain_artifact` still reopens, up to `max_reopenings`.
   - Ingest does not check a stated `checked` basis against `record.evidence`.
   - A run on a checkout older than the merge (such as c-ares run-1) reads the old brief: its verifiers may still confirm these two families, or reject them as `harness_induced`.
+
+### Symptom: A Candidate Merged by Site Replays Its Reproducers on One Engine, and `fingerprint_matches` / the Minimize Interest Test Read a Detection of the Other Engine as Not Reproduced
+- **Seen on:** code review of S4 (site grouping, `phase1-remediation`, 2026-11-17). No run yet; the cause is in the code, not a log.
+- **Cause:** a candidate now holds the detections of every engine at its site under its first key (`observations`, D1a). `crash_replay.replay_candidates` replays all the candidate's reproducers on one engine (`_candidate_engine`: the first tool output's engine), and compares the report with the candidate key only (`fingerprint_matches`). `crash_replay.minimize_candidates` passes the key as the interest test's fingerprint. A reproducer that the other engine found therefore reads as not reproduced, and a minimized reproducer is judged against the wrong fingerprint.
+- **Fix:** none yet. **Open pipeline bug:** the cross-engine index (`replay-candidates --cross-engine`, `cross_engine.failures`) records the other engine's failures, but the own-engine replay and the minimization still assume one engine and one fingerprint per candidate. Intended fix: take each reproducer's engine from the observation whose `reproducer` names it, and let `fingerprint_matches` accept any observation fingerprint of the candidate.
+
+### Symptom: A Fault Hypothesis or a Breaker Crash Never Gets a Site, Because Its Result Has No Line
+- **Seen on:** code review of S4, 2026-11-17. The agent-result schema (`schemas/agent-result.schema.json`, `fault_hypothesis`: `input_condition`, `predicate`, `why_not_reproduced`) and the breaker's `failing_predicate` carry no line, so `ledger.py` ingests them with `line: 0` and `site=None`. They merge with a candidate by function and kind only (`_find_matching_sink_candidate`), not by statement site.
+- **Cause:** the result contracts were written before the site key (D1a). S4 does not own them and adds no field.
+- **Fix:** none yet. **Open pipeline bug:** when the prover or breaker names a line for its predicate, add it to the schema and pass it as the `line` of `ledger.py` `cmd_ingest_agent_hypothesis` (the site is then computed as in `_ingest_prover_code_fault`).
