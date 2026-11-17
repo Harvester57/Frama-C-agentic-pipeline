@@ -141,7 +141,9 @@ patch.
 On this image, with the bittree model, `int main(void) { return 0; }` crashes with a segmentation
 fault without `-M` (gcc and clang), and with `-M` the clang build aborts with no message (exit 134)
 while the gcc build runs. `main(int, char **)` runs with gcc and clang without `-M`. This is not the
-`environ` bug and the patch does not change it; not investigated further.
+`environ` bug and the patch does not change it. Diagnosed on 2026-11-17 as
+[package 37](./frama-c-eacsl-bittree-lookup-uninitialized.md) (an empty tree dereferenced at exit, and
+`pt_lookup` returning an uninitialized pointer).
 
 ## Workaround
 

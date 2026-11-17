@@ -1,0 +1,397 @@
+From 1d623bb0fb4f9a019ba30e2a147e50e6a9a62a7c Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Tue, 17 Nov 2026 18:36:56 +0000
+Subject: [PATCH] [e-acsl] bittree model: return the block found by pt_lookup
+
+pt_lookup, the exact-address lookup of the Patricia trie behind bt_lookup,
+left its result uninitialized when it found the block: the assignment of
+the leaf was lost in 29af68df0e ("[eacsl] Add C support for concurrency").
+Every operation of the bittree model that looks a block up by its start
+address (full_init, mark_readonly, freeable, delete_block, realloc, free)
+then read an indeterminate value. With gcc -O2 it behaved as "not found":
+\freeable and read-only marks were wrong, blocks were not removed at the
+end of their scope, and every free aborted with "Not a start of block".
+Without optimisation it was stack garbage, and the program crashed.
+
+Return the leaf when its address is the one looked for, and look up in an
+empty trie (all the blocks removed) without dereferencing a NULL root.
+bt_clean also asserted that the tree exists, but the tree is only created
+when the first block is stored: a program that stores no block (such as
+`int main(void)` without --full-mtracking) crashed when it ended.
+
+New test special/e-acsl-bittree-lookup.c, and a run of
+special/e-acsl-bittree-model.c without --full-mtracking (dev
+configuration).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../bittree_model/e_acsl_bittree.c            |   4 +-
+ .../internals/e_acsl_patricia_trie.c          |  11 +-
+ .../tests/special/e-acsl-bittree-lookup.c     |  29 +++
+ .../tests/special/e-acsl-bittree-model.c      |   3 +
+ .../oracle/e-acsl-bittree-lookup.0.res.oracle |  10 +
+ .../oracle/gen_e-acsl-bittree-lookup.0.c      | 238 ++++++++++++++++++
+ 6 files changed, 290 insertions(+), 5 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/special/e-acsl-bittree-lookup.c
+ create mode 100644 plugins/e-acsl/tests/special/oracle/e-acsl-bittree-lookup.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-lookup.0.c
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree.c b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree.c
+index 912e26dc55..92c3ea768c 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree.c
+@@ -123,7 +123,9 @@ bt_block *bt_find(void *ptr) {
+ }
+ 
+ void bt_clean() {
+-  DASSERT(bittree != NULL);
++  // The tree is only created when the first block is stored
++  if (bittree == NULL)
++    return;
+   // Indicates to `bt_clean` (called by `pt_destroy`) that it should deallocate
+   // the leaves of the tree
+   bt_clean_with_deallocation = 1;
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/internals/e_acsl_patricia_trie.c b/plugins/e-acsl/share/e-acsl/observation_model/internals/e_acsl_patricia_trie.c
+index 5bd0988b55..2fcb377ecc 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/internals/e_acsl_patricia_trie.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/internals/e_acsl_patricia_trie.c
+@@ -425,11 +425,14 @@ pt_leaf_t pt_lookup(const pt_struct_t *pt, void *ptr) {
+   DASSERT(ptr != NULL);
+ 
+   E_ACSL_RLOCK(pt->lock);
+-  DASSERT(pt->root != NULL);
+ 
+-  pt_leaf_t res;
++  pt_leaf_t res = NULL;
+   pt_node_t *tmp = pt->root;
+ 
++  // the trie is empty once all its leaves have been removed
++  if (tmp == NULL)
++    goto end;
++
+   /*@ loop assigns tmp;
+     @*/
+   while (!tmp->is_leaf) {
+@@ -454,8 +457,8 @@ pt_leaf_t pt_lookup(const pt_struct_t *pt, void *ptr) {
+     }
+   }
+ 
+-  if (pt->get_ptr_fct(tmp->leaf) != ptr) {
+-    res = NULL;
++  if (pt->get_ptr_fct(tmp->leaf) == ptr) {
++    res = tmp->leaf;
+   }
+ 
+ end:
+diff --git a/plugins/e-acsl/tests/special/e-acsl-bittree-lookup.c b/plugins/e-acsl/tests/special/e-acsl-bittree-lookup.c
+new file mode 100644
+index 0000000000..b3b4414b47
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/e-acsl-bittree-lookup.c
+@@ -0,0 +1,29 @@
++/* run.config
++   COMMENT: Lookup of blocks by their start address in the bittree memory model
++*/
++/* run.config_dev
++   MACRO: ROOT_EACSL_GCC_OPTS_EXT --memory-model bittree
++   EXECNOW: LOG @EACSL_ERR@ @EACSL_EXEC@
++   MACRO: ROOT_EACSL_GCC_OPTS_EXT --memory-model bittree --full-mtracking
++*/
++
++#include <stdlib.h>
++
++int main(void) {
++  int *q;
++  {
++    int x = 1;
++    q = &x;
++    /* marked initialized when assigned */
++    //@ check in_scope: \valid(q) && \initialized(q);
++  }
++  /* removed at the end of its scope */
++  //@ check out_of_scope: !\valid(q);
++
++  int *p = malloc(sizeof(int));
++  //@ check freeable: \freeable(p);
++  free(p);
++  /* no block is left: lookup in an empty tree */
++  //@ check freed: !\freeable(p);
++  return 0;
++}
+diff --git a/plugins/e-acsl/tests/special/e-acsl-bittree-model.c b/plugins/e-acsl/tests/special/e-acsl-bittree-model.c
+index cefea47b8a..27b61667ec 100644
+--- a/plugins/e-acsl/tests/special/e-acsl-bittree-model.c
++++ b/plugins/e-acsl/tests/special/e-acsl-bittree-model.c
+@@ -4,6 +4,9 @@
+  */
+ /* run.config_dev
+   MACRO: ROOT_EACSL_GCC_OPTS_EXT --full-mtracking --memory-model bittree
++  EXECNOW: LOG @EACSL_ERR@ @EACSL_EXEC@
++  COMMENT: Without full memory tracking, this program stores no block
++  MACRO: ROOT_EACSL_GCC_OPTS_EXT --memory-model bittree
+  */
+ int main() {
+   return 0;
+diff --git a/plugins/e-acsl/tests/special/oracle/e-acsl-bittree-lookup.0.res.oracle b/plugins/e-acsl/tests/special/oracle/e-acsl-bittree-lookup.0.res.oracle
+new file mode 100644
+index 0000000000..a9eb232a4e
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/e-acsl-bittree-lookup.0.res.oracle
+@@ -0,0 +1,10 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] e-acsl-bittree-lookup.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] e-acsl-bittree-lookup.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:locals-escaping] e-acsl-bittree-lookup.c:15: Warning: 
++  locals {x} escaping the scope of a block of main through q
++[eva:alarm] e-acsl-bittree-lookup.c:21: Warning: 
++  accessing left-value that contains escaping addresses. assert !\dangling(&q);
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-lookup.0.c b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-lookup.0.c
+new file mode 100644
+index 0000000000..6da0e19eff
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-lookup.0.c
+@@ -0,0 +1,238 @@
++/* Generated by Frama-C */
++#include "errno.h"
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "stdlib.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++int main(void)
++{
++  int __retres;
++  int *q;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_store_block((void *)(& q),8UL);
++  {
++    int x = 1;
++    __e_acsl_store_block((void *)(& x),4UL);
++    __e_acsl_full_init((void *)(& x));
++    __e_acsl_full_init((void *)(& q));
++    q = & x;
++    {
++      int __gen_e_acsl_aligned;
++      int __gen_e_acsl_valid;
++      int __gen_e_acsl_and;
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data =
++        {.values = (void *)0};
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++        {.values = (void *)0};
++      __gen_e_acsl_aligned = __e_acsl_aligned((void *)q,4UL);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"q",
++                                   (void *)q);
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                   "\"pointer alignment\": \\aligned(q,4)",0,
++                                   __gen_e_acsl_aligned);
++      /*@ assert E_ACSL: "pointer alignment": \aligned(q,4); */
++      {
++        __gen_e_acsl_assert_data_2.blocking = 1;
++        __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++        __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(q,4)";
++        __gen_e_acsl_assert_data_2.file = "e-acsl-bittree-lookup.c";
++        __gen_e_acsl_assert_data_2.fct = "main";
++        __gen_e_acsl_assert_data_2.line = 18;
++        __gen_e_acsl_assert_data_2.name = "pointer alignment";
++        __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++      }
++      __gen_e_acsl_valid = __e_acsl_valid((void *)q,sizeof(int),(void *)q,
++                                          (void *)(& q));
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"q",(void *)q);
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                     "sizeof(int)",0,sizeof(int));
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"\\valid(q)",0,
++                                   __gen_e_acsl_valid);
++      if (__gen_e_acsl_valid) {
++        int __gen_e_acsl_aligned_2;
++        int __gen_e_acsl_initialized;
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++          {.values = (void *)0};
++        __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)q,4UL);
++        __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"q",
++                                     (void *)q);
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                     "\"pointer alignment\": \\aligned(q,4)",
++                                     0,__gen_e_acsl_aligned_2);
++        /*@ assert E_ACSL: "pointer alignment": \aligned(q,4); */
++        {
++          __gen_e_acsl_assert_data_3.blocking = 1;
++          __gen_e_acsl_assert_data_3.kind = "E-ACSL RTE";
++          __gen_e_acsl_assert_data_3.pred_txt = "\\aligned(q,4)";
++          __gen_e_acsl_assert_data_3.file = "e-acsl-bittree-lookup.c";
++          __gen_e_acsl_assert_data_3.fct = "main";
++          __gen_e_acsl_assert_data_3.line = 18;
++          __gen_e_acsl_assert_data_3.name = "pointer alignment";
++          __e_acsl_assert(__gen_e_acsl_aligned_2,
++                          & __gen_e_acsl_assert_data_3);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++        }
++        __gen_e_acsl_initialized = __e_acsl_initialized((void *)q,
++                                                        sizeof(int));
++        __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"q",
++                                     (void *)q);
++        __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,
++                                       "sizeof(int)",0,sizeof(int));
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                     "\\initialized(q)",0,
++                                     __gen_e_acsl_initialized);
++        __gen_e_acsl_and = __gen_e_acsl_initialized;
++      }
++      else __gen_e_acsl_and = 0;
++      __gen_e_acsl_assert_data.blocking = 0;
++      __gen_e_acsl_assert_data.kind = "Assertion";
++      __gen_e_acsl_assert_data.pred_txt = "\\valid(q) && \\initialized(q)";
++      __gen_e_acsl_assert_data.file = "e-acsl-bittree-lookup.c";
++      __gen_e_acsl_assert_data.fct = "main";
++      __gen_e_acsl_assert_data.line = 18;
++      __gen_e_acsl_assert_data.name = "in_scope";
++      __e_acsl_assert(__gen_e_acsl_and,& __gen_e_acsl_assert_data);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    }
++    /*@ check in_scope: \valid(q) && \initialized(q); */ ;
++    __e_acsl_delete_block((void *)(& x));
++  }
++  {
++    int __gen_e_acsl_aligned_3;
++    int __gen_e_acsl_valid_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++      {.values = (void *)0};
++    /*@ assert Eva: dangling_pointer: !\dangling(&q); */
++    __gen_e_acsl_aligned_3 = __e_acsl_aligned((void *)q,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"q",(void *)q);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,
++                                 "\"pointer alignment\": \\aligned(q,4)",0,
++                                 __gen_e_acsl_aligned_3);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(q,4); */
++    {
++      __gen_e_acsl_assert_data_5.blocking = 1;
++      __gen_e_acsl_assert_data_5.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_5.pred_txt = "\\aligned(q,4)";
++      __gen_e_acsl_assert_data_5.file = "e-acsl-bittree-lookup.c";
++      __gen_e_acsl_assert_data_5.fct = "main";
++      __gen_e_acsl_assert_data_5.line = 21;
++      __gen_e_acsl_assert_data_5.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_3,& __gen_e_acsl_assert_data_5);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
++    }
++    __gen_e_acsl_valid_2 = __e_acsl_valid((void *)q,sizeof(int),(void *)q,
++                                          (void *)(& q));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"q",(void *)q);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_4,
++                                   "sizeof(int)",0,sizeof(int));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,"\\valid(q)",0,
++                                 __gen_e_acsl_valid_2);
++    __gen_e_acsl_assert_data_4.blocking = 0;
++    __gen_e_acsl_assert_data_4.kind = "Assertion";
++    __gen_e_acsl_assert_data_4.pred_txt = "!\\valid(q)";
++    __gen_e_acsl_assert_data_4.file = "e-acsl-bittree-lookup.c";
++    __gen_e_acsl_assert_data_4.fct = "main";
++    __gen_e_acsl_assert_data_4.line = 21;
++    __gen_e_acsl_assert_data_4.name = "out_of_scope";
++    __e_acsl_assert(! __gen_e_acsl_valid_2,& __gen_e_acsl_assert_data_4);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++  }
++  /*@ check out_of_scope: !\valid(q); */ ;
++  int *p = malloc(4UL);
++  __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
++  {
++    int __gen_e_acsl_aligned_4;
++    int __gen_e_acsl_freeable;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_4 = __e_acsl_aligned((void *)p,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_7,"p",(void *)p);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,
++                                 "\"pointer alignment\": \\aligned(p,4)",0,
++                                 __gen_e_acsl_aligned_4);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(p,4); */
++    {
++      __gen_e_acsl_assert_data_7.blocking = 1;
++      __gen_e_acsl_assert_data_7.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_7.pred_txt = "\\aligned(p,4)";
++      __gen_e_acsl_assert_data_7.file = "e-acsl-bittree-lookup.c";
++      __gen_e_acsl_assert_data_7.fct = "main";
++      __gen_e_acsl_assert_data_7.line = 24;
++      __gen_e_acsl_assert_data_7.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_4,& __gen_e_acsl_assert_data_7);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_7);
++    }
++    __gen_e_acsl_freeable = __e_acsl_freeable((void *)p);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_6,"p",(void *)p);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,
++                                 "freeable: \\freeable(p)",0,
++                                 __gen_e_acsl_freeable);
++    __gen_e_acsl_assert_data_6.blocking = 0;
++    __gen_e_acsl_assert_data_6.kind = "Assertion";
++    __gen_e_acsl_assert_data_6.pred_txt = "\\freeable(p)";
++    __gen_e_acsl_assert_data_6.file = "e-acsl-bittree-lookup.c";
++    __gen_e_acsl_assert_data_6.fct = "main";
++    __gen_e_acsl_assert_data_6.line = 24;
++    __gen_e_acsl_assert_data_6.name = "freeable";
++    __e_acsl_assert(__gen_e_acsl_freeable,& __gen_e_acsl_assert_data_6);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++  }
++  /*@ check freeable: \freeable(p); */ ;
++  free((void *)p);
++  {
++    int __gen_e_acsl_aligned_5;
++    int __gen_e_acsl_freeable_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_9 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_5 = __e_acsl_aligned((void *)p,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_9,"p",(void *)p);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_9,
++                                 "\"pointer alignment\": \\aligned(p,4)",0,
++                                 __gen_e_acsl_aligned_5);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(p,4); */
++    {
++      __gen_e_acsl_assert_data_9.blocking = 1;
++      __gen_e_acsl_assert_data_9.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_9.pred_txt = "\\aligned(p,4)";
++      __gen_e_acsl_assert_data_9.file = "e-acsl-bittree-lookup.c";
++      __gen_e_acsl_assert_data_9.fct = "main";
++      __gen_e_acsl_assert_data_9.line = 27;
++      __gen_e_acsl_assert_data_9.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_5,& __gen_e_acsl_assert_data_9);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_9);
++    }
++    __gen_e_acsl_freeable_2 = __e_acsl_freeable((void *)p);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_8,"p",(void *)p);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,
++                                 "\\freeable(p)",0,__gen_e_acsl_freeable_2);
++    __gen_e_acsl_assert_data_8.blocking = 0;
++    __gen_e_acsl_assert_data_8.kind = "Assertion";
++    __gen_e_acsl_assert_data_8.pred_txt = "!\\freeable(p)";
++    __gen_e_acsl_assert_data_8.file = "e-acsl-bittree-lookup.c";
++    __gen_e_acsl_assert_data_8.fct = "main";
++    __gen_e_acsl_assert_data_8.line = 27;
++    __gen_e_acsl_assert_data_8.name = "freed";
++    __e_acsl_assert(! __gen_e_acsl_freeable_2,& __gen_e_acsl_assert_data_8);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_8);
++  }
++  /*@ check freed: !\freeable(p); */ ;
++  __retres = 0;
++  __e_acsl_delete_block((void *)(& p));
++  __e_acsl_delete_block((void *)(& q));
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+-- 
+2.47.3
+

@@ -282,6 +282,15 @@ comment "Tracking safe locations" but never calls `collect_safe_locations()`; th
 fail with `-m bittree` before and after the patch, for these two reasons; the test suite runs the
 segment model.
 
+**Update, 2026-11-17:** both are now diagnosed and drafted as their own packages. The lost read-only
+mark is [package 37](./frama-c-eacsl-bittree-lookup-uninitialized.md): `pt_lookup` never assigns its
+result, so the `bt_lookup` of `eacsl_mark_readonly` finds no block. The untracked streams are
+[package 38](./frama-c-eacsl-bittree-standard-streams-untracked.md). Measured on `master`
+`95408044f7` by the agent that drafted them (new test built by hand with gcc, `-m bittree`): with 37
+alone the reproducer gives `0 0 134 134`, so the bug of this page shows in that model too; with 29 and
+37 it gives `0 0 0 0` with gcc and clang; with 29, 37 and 38 the new test passes. The bittree rows of
+the table below are the results without 37 and 38.
+
 ## Validation
 
 `master` at `3dff90fc70` in `framac-master-audit:3dff90f`, then the same tree with the patch, rebuilt

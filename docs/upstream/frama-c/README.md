@@ -12,9 +12,86 @@ This folder holds everything needed to report the Frama-C bugs the pipeline foun
 - [`./patches/`](./patches/README.md): `git format-patch` files.
 
 The snapshot `./pub-frama-c_work_items_2026-11-09.csv` lists the 202 upstream items that were open
-on 2026-11-09. It predates Issues 15 to 31, so do not rely on it alone for deduplication.
+on 2026-11-09. It predates Issues 15 to 40, so do not rely on it alone for deduplication.
 
 ---
+
+## Status update (2026-11-17)
+
+This section is newer than the one below and wins where they differ.
+
+- **Upstream moved:** `master` is `95408044f7` (2026-11-16, the 34.0 Selenium release merged; 30
+  commits after `3dff90fc70`). It changes `plugins/e-acsl/src/analyses/typing.ml`, which patches 04
+  (!29), 05 (!36) and 16 (!37) also change. All three, and 28 to 31, still apply
+  (`git apply --check`). GitLab reports !36 and !37 as mergeable and has not computed !29. None of
+  the three filed patches was rebuilt on the new base.
+- **Images:** `framac-master-audit:3dff90f`, its `-p28` to `-p31` variants and `framac-lint:3dff90f`
+  no longer exist on the host (gone since the disk-full incident of 2026-11-17), and their recipe
+  was never recorded. The recipe is now
+  [`../../../tools/upstream_audit/Dockerfile`](../../../tools/upstream_audit/Dockerfile); it built
+  `framac-master-audit:9540804` (8.6 GB: `master` `95408044f7`, ocp-indent 1.10.0, headache 1.08,
+  clang-format 19.1.7, alt-ergo 2.6.4, why3 1.8.2, Z3 4.13.3, CVC5 1.1.2). One image now serves the
+  builds and the lint.
+- **28 to 31 re-validated on `95408044f7`** with
+  [`../../../tools/upstream_audit/revalidate.sh`](../../../tools/upstream_audit/revalidate.sh), one
+  patch per branch from `master`. Every step gave the expected result:
+  - `git am --keep-non-patch` applies each patch.
+  - The reproducer shows the bug on pristine `master` and the documented output with the patch.
+  - Each new test fails on `master`'s sources and passes with the patch: 28 in the default
+    configuration (generated code), 29 and 30 in the default and `dev` configurations, 31 in `dev`
+    (a runtime fix; its default oracle does not depend on it). 28's test passes in `dev` on
+    `master`, as its commit message says: the suite compiles with gcc and `-fno-merge-constants`.
+  - The default configuration of the whole E-ACSL suite passes with each patch (198 result logs).
+  - `./dev/check-files.sh -p HEAD~1` passes for each. Negative controls on the new image: a
+    mis-indented `.ml`, an unformatted `.c` and a `.ml` without its licence header are each rejected.
+  - Cases that must still abort do: `%u` with a `signed char`, `%d` with an `unsigned int` and
+    `%lu` with an `unsigned char` (30); an unterminated string after a `double`, reported on its own
+    directive (31); `\object_pointer` one byte before and two past a `const` array (29).
+- **Not-run items of 2026-11-16, now run:** the `format/` `dev` configuration with 28 (`fprintf.c`,
+  `printf.c` with its 380 cases, `sprintf.c`) passes; with 30 and 31 together (`git am`, then
+  `git am --3way`), the `format/` `dev` configuration (the three upstream tests and the two new
+  ones) and the default configuration of the whole E-ACSL suite pass. Each `dev` run took about
+  11 s: an abort in a container now takes 6 ms on this host, with the core limit at 0.
+- **Still not run for 28 to 31:** 32-bit targets (no 32-bit libc in the image), and `make
+  default-tests` outside E-ACSL for 28, which changes the kernel module `Demote_string_literal`
+  (the old `demote` keeps its behaviour; E-ACSL is its only caller checked).
+- **Fork:** `Harvester57/frama-c` is `internal` since 2026-11-17 (an admin lifted the instance
+  restriction), so reviewers can fetch the branches.
+- **Triage by the maintainers (2026-11-17), no comment on content yet:** the E-ACSL issues got the
+  `e-acsl` label; #2800, #2801 and #2808 are assigned to `jischard`, #2811 to `lcorrenson`; !27 is
+  under review by `perrelle`. 15 (#2815) and 22 (#2816) still wait for their design answer.
+- **Drafted, not filed (2026-11-17): 32 to 40.** Nine candidates from the pipeline's runs
+  and from the earlier audit notes, analysed on `95408044f7`. All nine reproduce on `master`
+  and on `34.0~beta`. Seven have a patch (32, 33, 35, 36, 37, 38, 39); 34 and 40 are issues only.
+  - **Second run of every patch**, after the drafting agents' own validation, with `revalidate.sh`
+    in fresh containers:
+    - `git am --keep-non-patch` applies each on `95408044f7`, and no patch changes a file mode.
+    - Each reproducer prints the documented "before" output on the pristine image and the
+      documented "after" output with the patch installed.
+    - Each new test fails on `master`'s sources and passes with the patch: 33 in the default and
+      `dev` configurations; 35 and 39 in the default one (a syntax error, and
+      `fatal error: sys/epoll.h`); 32, 36, 37 and 38 in `dev` (runtime fixes; their default oracles
+      do not depend on the fix).
+    - The default configuration of the whole E-ACSL suite passes with each patch, and so do
+      `tests/syntax` with 35 and `tests/libc` with 39.
+    - `./dev/check-files.sh -p HEAD~1` passes for each.
+  - **Combinations run:** 30, 31 and 32 as a stack (`format/` in `dev`, and the whole E-ACSL suite
+    in the default configuration); 33 alone with `format/` in `dev`; 37 and 38 together
+    (`special/` in `dev`, and both reproducers: every line passes, including the `-G clang` line
+    that 38 alone leaves failing).
+  - **Corrected during the second run:** patch 39 carried two file-mode changes
+    (`100644` to `100755`); it was re-exported without them (commit `9b52dce322` in the container).
+  - **Limits stated in the packages:** 32 leaves POSIX numbered `*` arguments (`%2$*1$d`)
+    unchecked. 33 regenerates three existing default oracles (`gen_printf.0.c`, `gen_fprintf.0.c`,
+    `gen_sprintf.0.c`), and upstream already tracks the defect privately as e-acsl#118 (named in a
+    comment of its test configuration). 36 does not make `--zone-sizes tls:N` work (the value is
+    never read). 38 is complete under `-G clang` only with 37.
+  - **Not run:** 32-bit targets; 33 together with 30 to 32 (the `gen_*.0.c` oracles of their tests
+    then need regenerating); the bittree model on test directories other than `special/` and
+    `memory/`; `make default-tests` as a whole (only the suites named above).
+  - **Duplicates:** each drafting agent searched the tracker through the read-only API (issues and
+    merge requests, all states) and found none. Neighbours named in the texts: #980 (closed),
+    #2802 / !33, #2807, #2810 / !41.
 
 ## Status (2026-11-15)
 
@@ -96,7 +173,7 @@ All paths below are relative to this folder.
 - **Draft:** the long analysis.
 - **Repro:** `repro/<NN>-<slug>.sh` plus its `.c` files.
 - **Patch:** `patches/<NN>-<slug>.patch`. "Validated" means built, and the reproducer run before and
-  after on `master` `3dff90fc70`.
+  after on `master` `3dff90fc70` (01 to 27) or `95408044f7` (28 to 40).
 
 | # | Component | Bug | Draft | Issue | MR | Repro | Patch |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -128,6 +205,15 @@ All paths below are relative to this folder.
 | 29 | E-ACSL | `\object_pointer` false on read-only data (literals, `const` arrays) | [draft](./frama-c-eacsl-object-pointer-readonly-static.md) | [issue](./filing/29-eacsl-object-pointer-readonly-static-issue.md), not filed | [MR](./filing/29-eacsl-object-pointer-readonly-static-mr.md), not opened | [sh](./repro/29-eacsl-object-pointer-readonly-static.sh) | [validated](./patches/29-eacsl-object-pointer-readonly-static.patch) |
 | 30 | E-ACSL | `--validate-format-strings`: `"%u"` with a promoted `unsigned char` aborts | [draft](./frama-c-eacsl-format-promoted-argument-signedness.md) | [issue](./filing/30-eacsl-format-promoted-argument-signedness-issue.md), not filed (partly a question on `int`/`unsigned`) | [MR](./filing/30-eacsl-format-promoted-argument-signedness-mr.md), not opened | [sh](./repro/30-eacsl-format-promoted-argument-signedness.sh) | [validated](./patches/30-eacsl-format-promoted-argument-signedness.patch) (static fix; no existing oracle changes) |
 | 31 | E-ACSL | `--validate-format-strings`: `%s` after a `double` checks the wrong argument | [draft](./frama-c-eacsl-format-fp-argument-slots.md) | [issue](./filing/31-eacsl-format-fp-argument-slots-issue.md), not filed | [MR](./filing/31-eacsl-format-fp-argument-slots-mr.md), not opened | [sh](./repro/31-eacsl-format-fp-argument-slots.sh) | [validated](./patches/31-eacsl-format-fp-argument-slots.patch) |
+| 32 | E-ACSL | `--validate-format-strings`: a `*` width or precision shifts every later argument check | [draft](./frama-c-eacsl-format-star-width-precision.md) | [issue](./filing/32-eacsl-format-star-width-precision-issue.md), not filed | [MR](./filing/32-eacsl-format-star-width-precision-mr.md), not opened | [sh](./repro/32-eacsl-format-star-width-precision.sh) | [validated](./patches/32-eacsl-format-star-width-precision.patch) (runtime only; stacks with 30 and 31 in any order; numbered `*` not covered) |
+| 33 | E-ACSL | `--validate-format-strings` without `-M`: every call with a literal format aborts | [draft](./frama-c-eacsl-format-literal-without-full-mtracking.md) | [issue](./filing/33-eacsl-format-literal-without-full-mtracking-issue.md), not filed (upstream's private e-acsl#118) | [MR](./filing/33-eacsl-format-literal-without-full-mtracking-mr.md), not opened | [sh](./repro/33-eacsl-format-literal-without-full-mtracking.sh) | [validated](./patches/33-eacsl-format-literal-without-full-mtracking.patch) (regenerates 3 existing `format/` oracles) |
+| 34 | Libc / Kernel | GCC `__builtin_{add,sub,mul}_overflow`: wrong Eva result for mixed operand types, parse error for `char` operands, `_p` forms missing, uncompilable implicit declaration | [draft](./frama-c-kernel-gcc-overflow-builtins.md) | [issue](./filing/34-kernel-gcc-overflow-builtins-issue.md), not filed | none | [sh](./repro/34-kernel-gcc-overflow-builtins.sh) | none (the issue lists five options) |
+| 35 | Kernel | `__restrict__` is a syntax error unless a Frama-C libc header is included | [draft](./frama-c-kernel-restrict-gnu-spelling.md) | [issue](./filing/35-kernel-restrict-gnu-spelling-issue.md), not filed | [MR](./filing/35-kernel-restrict-gnu-spelling-mr.md), not opened | [sh](./repro/35-kernel-restrict-gnu-spelling.sh) | [validated](./patches/35-kernel-restrict-gnu-spelling.patch) (one lexer line and a test) |
+| 36 | E-ACSL | `--zone-sizes heap:2048` or `stack:2048`: every run crashes (`int` overflow of the size in bytes) | [draft](./frama-c-eacsl-heap-zone-size-overflow.md) | [issue](./filing/36-eacsl-heap-zone-size-overflow-issue.md), not filed | [MR](./filing/36-eacsl-heap-zone-size-overflow-mr.md), not opened | [sh](./repro/36-eacsl-heap-zone-size-overflow.sh) | [validated](./patches/36-eacsl-heap-zone-size-overflow.patch) |
+| 37 | E-ACSL | bittree model: `pt_lookup` returns an uninitialized pointer (every `free` aborts); `int main(void)` crashes at exit | [draft](./frama-c-eacsl-bittree-lookup-uninitialized.md) | [issue](./filing/37-eacsl-bittree-lookup-uninitialized-issue.md), not filed | [MR](./filing/37-eacsl-bittree-lookup-uninitialized-mr.md), not opened | [sh](./repro/37-eacsl-bittree-lookup-uninitialized.sh) | [validated](./patches/37-eacsl-bittree-lookup-uninitialized.patch) |
+| 38 | E-ACSL | bittree model: `stdin`, `stdout`, `stderr` and `errno` are not tracked | [draft](./frama-c-eacsl-bittree-standard-streams-untracked.md) | [issue](./filing/38-eacsl-bittree-standard-streams-untracked-issue.md), not filed | [MR](./filing/38-eacsl-bittree-standard-streams-untracked-mr.md), not opened | [sh](./repro/38-eacsl-bittree-standard-streams-untracked.sh) | [validated](./patches/38-eacsl-bittree-standard-streams-untracked.patch) (one line; complete under `-G clang` only with 37) |
+| 39 | Libc | Linux `<sys/epoll.h>` and `<sys/inotify.h>` are missing (feature request) | [draft](./frama-c-libc-linux-header-gaps.md) | [issue](./filing/39-libc-linux-header-gaps-issue.md), not filed | [MR](./filing/39-libc-linux-header-gaps-mr.md), not opened | [sh](./repro/39-libc-linux-header-gaps.sh) | [validated](./patches/39-libc-linux-header-gaps.patch) (two headers with contracts, 10 files) |
+| 40 | WP | `-wp-report-json` keeps one prover per goal (feature request); two errors in the manual | [draft](./frama-c-wp-report-per-prover-results.md) | [issue](./filing/40-wp-report-per-prover-results-issue.md), not filed | none | [sh](./repro/40-wp-report-per-prover-results.sh) | none |
 
 Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11.
 
@@ -139,8 +225,11 @@ Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11.
    - 23 and 27 cite each other: done (27 filed first, then 23, then 27's description edited).
    - 12 before 10.
    - 8 and 13 can go together.
-3. **Replace the placeholders** with the real numbers: `#<issue>` and `#ISSUE-NN` in the texts, and
-   `!<MR>` in MR 10.
+   - 30 to 33: the MR texts of 32 and 33 cite the issues of 30 and 31 (and 33's cites 32's), and
+     32's issue cites 33's. File the four issues before filling in any of these texts.
+   - 37 before 38: 38's issue and MR cite 37's issue (`#<issue-37>`).
+3. **Replace the placeholders** with the real numbers: `#<issue>`, `#<issue-37>` and `#ISSUE-NN` in
+   the texts, and `!<MR>` in MR 10.
 4. **Merge request.** Fork `pub/frama-c`, create the branch named in the MR text from `3dff90fc70` (or
    current `master`), then apply the patch and push:
 
@@ -200,9 +289,18 @@ Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11.
 | 26 | Keep the `fd_set` part (independent), and should the dead `__USE_MISC`/`__USE_GNU` guards in `__fc_inet.h` go? Only glibc was compared. |
 | 27 | Structs without bitfields keep per-field read-only marking (from e-acsl#223); the const-pointer case is real in the generated code, but no failing program was found. |
 | 28 | Is a kernel API (`demote_list`) acceptable inside an E-ACSL MR? Should default mode use it too (4,000 asserted literals take 217 s on `master`)? Is the 467-line generated oracle of the new test acceptable? |
-| 29 | Keep the impact counts (minmea 371/372, nettle 15/24) in the issue? Keep the `\object_pointer(stdin)` case in the test? File the bittree gap (`eacsl_memory_init` never calls `collect_safe_locations`, so standard streams are untracked) as its own issue? |
+| 29 | Keep the impact counts (minmea 371/372, nettle 15/24) in the issue? Keep the `\object_pointer(stdin)` case in the test? The MR's closing note describes two bittree defects that are now packages 37 and 38: cite their issues there if they are filed first. |
 | 30 | `_Bool` reuses the letter `C`, so a rejected `_Bool` is named `'unsigned char'`; a new letter would shift 85 lines of the `printf.c` dev oracle. |
 | 30 / 31 | The MR texts reference each other's issue (`#ISSUE-30`, `#ISSUE-31`): file both issues before filling them in. 31's issue notes the cosmetic `%n` message ("argument 1" for directive 2) without fixing it. |
+| 30 / 31 / 32 | Three merge requests (current; they apply in any order and pass together), or one for the three format fixes? |
+| 32 | Offer a follow-up for POSIX numbered `*` arguments (`%2$*1$d`), which the patch leaves unchecked? |
+| 33 | File it although upstream tracks it privately as e-acsl#118? The issue text says so. Its patch regenerates three existing oracles (`gen_printf.0.c` alone: 3,297 lines added, 547 removed); land it after 30 to 32, or let whichever lands second regenerate the `gen_*.0.c` of the other tests? |
+| 34 | One issue (current), or two: the kernel part (an implicit declaration printed as C that no compiler accepts) and the libc part (the `_Generic` model)? No patch is proposed; the issue lists five options. |
+| 35 | Also remove the now redundant `#define __restrict__ __restrict` from `share/libc/features.h`? |
+| 36 | Make `--zone-sizes tls:N` work, or document that it does nothing? `PGM_TLS_SIZE` is never read; the patch leaves it. |
+| 37 / 38 | Is the bittree model still supported upstream? Every `free` has aborted there since 25.0, and the manual recommends the model for targets other than x86-64. Its other defects are listed under "Seen during the audit, not drafted". |
+| 39 | Keep the packed attribute on `struct epoll_event` (Frama-C then warns `addr-of-packed-field`)? Report `pipe2`, `dup3` and `accept4` (POSIX.1-2024) as a separate issue? |
+| 40 | Keep the two manual errors in the feature request (current), file them separately, or offer a manual-only merge request? |
 
 ## Identified, not filed
 
@@ -216,13 +314,22 @@ Each of these is worked around or documented in the pipeline. None is a defect t
 | E-ACSL rejects pointers from uninstrumented libraries | same | Inherent to shadow memory |
 | WP `Typed`: casts between pointer types, unions | [`../../troubleshooting/wp-and-guardrail.md`](../../troubleshooting/wp-and-guardrail.md) | Documented memory-model limitation; the pipeline uses `Bytes` |
 | WP: no framing stub for variadic callees | [`../../troubleshooting/harnesses-and-seeds.md`](../../troubleshooting/harnesses-and-seeds.md) | Documented limitation |
-| Frama-C libc missing headers and declarations (`<netinet/ip_icmp.h>`, glibc `__int8_t` aliases, Linux declarations) | `templates/fc_stubs/` | Coverage gaps, not wrong contracts; a candidate for one libc feature request later |
+| Frama-C libc missing headers and declarations (`<netinet/ip_icmp.h>`, glibc `__int8_t` aliases, Linux declarations) | `templates/fc_stubs/` | Coverage gaps, not wrong contracts. `sys/epoll.h` and `sys/inotify.h` are now package 39, whose issue lists the other Linux gaps and asks which are wanted |
 
 ## Seen during the audit, not drafted
 
-- **E-ACSL bittree model crashes on `int main(void)`.** It segfaults without `-M`; with `-M` the
-  clang build aborts with exit 134. `main(int, char **)` is fine. Not investigated; noted in
-  [`./frama-c-eacsl-memory-init-clobbers-environ.md`](./frama-c-eacsl-memory-init-clobbers-environ.md).
+- **Other defects of the E-ACSL bittree model** (seen on 2026-11-17 while drafting 37 and 38; the
+  first two fail in upstream's `memory/` suite run with `--memory-model bittree`, the rest were
+  read in the source and not run):
+  - a `__attribute__((constructor))` that allocates crashes (`memory/constructor.c`);
+  - `\initialized` on a range past the end of a block is true (`memory/ranges_in_builtins.c:65`);
+  - `free` seems not to release the `bt_block`;
+  - `eacsl_make_memory_spaces(MB_SZ(64), MB_SZ(64))` evaluates to 0 and 0;
+  - `eacsl_memory_init` is not run-once.
+- **`e-acsl-gcc --zone-sizes tls:N` has no effect** (`PGM_TLS_SIZE` is never read), and
+  `e-acsl-gcc:381` spells a variable `OPTIONS_TLS_SIZE`. Noted in package 36, not fixed.
+- **`--validate-format-strings` does not check POSIX numbered `*` arguments** (`%2$*1$d`). Noted in
+  package 32, not fixed.
 - **Dead branch in `e_acsl_temporal.c`.** `eacsl_temporal_save_return` tests a comma expression,
   which is always true. Noted in
   [`./frama-c-eacsl-temporal-function-address-argument.md`](./frama-c-eacsl-temporal-function-address-argument.md).
@@ -230,8 +337,6 @@ Each of these is worked around or documented in the pipeline. None is a defect t
   `strcpy` reports "strlen" and `strncat` reports "strcat". Mentioned in issue 17 as a follow-up.
 - **Kernel accepts `sizeof x` on an incomplete struct** in a file-scope initializer. Seen while
   probing `ip_mreqn`; not confirmed.
-- **`--validate-format-strings` without `-M` rejects a literal format string.**
-  `snprintf(t, sizeof t, "%u.%u.%u.%u", ...)` aborts with
-  `snprintf: invalid format string (unallocated or unterminated)` unless full memory tracking is on
-  (34.0~beta). Not analysed; noted in
-  [`./frama-c-eacsl-format-promoted-argument-signedness.md`](./frama-c-eacsl-format-promoted-argument-signedness.md).
+
+Drafted since this list was written: the bittree crash on `int main(void)` is package 37, and the
+literal format string rejected without `-M` is package 33.

@@ -21,7 +21,16 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   [`../../../troubleshooting/resources-and-infra.md`](../../../troubleshooting/resources-and-infra.md).
   The scripts of 28 to 31 use `prlimit --core=0`, which a piped `core_pattern` ignores: they give
   the right result, only more slowly, and print "core dumped".
-- Patched images `framac-master-audit:3dff90f-p28` to `-p31` hold `master` with one patch each
+- **2026-11-17:** `framac-master-audit:3dff90f` and the patched images below no longer exist. The
+  current one is `framac-master-audit:9540804` (`master` `95408044f7`), built from
+  [`../../../../tools/upstream_audit/Dockerfile`](../../../../tools/upstream_audit/Dockerfile);
+  [`../../../../tools/upstream_audit/revalidate.sh`](../../../../tools/upstream_audit/revalidate.sh)
+  runs a reproducer before and after its patch. An abort in a container now takes 6 ms on this
+  host with the core limit at 0, so the slowness described above is gone.
+- The scripts of 36, 37 and 38 print a table and always exit 0: compare their output with the
+  "before" and "after" blocks in their headers. Their optional `EACSL_SHARE` points `e-acsl-gcc` at
+  another copy of the runtime sources. 34 and 40 have no patch, so only a "before" output.
+- Patched images `framac-master-audit:3dff90f-p28` to `-p31` held `master` with one patch each
   (the "after" runs of 28 to 31). In the master image, install a rebuilt tree with
   `dune install --release --prefix /home/opam/.opam/5.5` (plain `dune install` fails with
   "The mandir installation directory is unknown").

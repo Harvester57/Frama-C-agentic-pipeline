@@ -94,6 +94,7 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
   - They declare nothing, so `stub_gen.py` still classifies `epoll_*` and `inotify_*` as `host_header`.
   - Tests: `tests/test_fc_stub_repairs.py::test_frama_c_parses_glibc_epoll_and_inotify_with_the_pipeline_flags` (Docker) and `::test_linux_event_shims_only_reconcile_glibc_for_eva_and_wp`.
   - Commit `20a23bd` on branch `sup/c-ares-linux-header-shims`. **Open pipeline bug:** held on that branch until c-ares run-1 ends.
+- **Upstream (2026-11-17):** drafted as package 39, a feature request with a validated patch on `master` `95408044f7` that adds `sys/epoll.h` and `sys/inotify.h` with contracts to Frama-C's libc, [`../upstream/frama-c/frama-c-libc-linux-header-gaps.md`](../upstream/frama-c/frama-c-libc-linux-header-gaps.md). Not filed. Its issue also lists the smaller Linux gaps (`netinet/ip_icmp.h`, `sys/syscall.h`, `sys/eventfd.h`, `sys/timerfd.h`, `sys/signalfd.h`, `explicit_bzero`, `pipe2`, `dup3`, `accept4`, `_IOWR`).
 
 ---
 
@@ -182,6 +183,7 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
   - Clang compiles never see it, because the header is empty without `__FRAMAC__`.
   - Tests: `tests/test_fc_compat_contracts.py::test_eacsl_host_headers_map_the_gcc_restrict_spelling_before_any_include` and `::test_gcc_restrict_spelling_builds_under_eacsl_and_clang` (Docker, `FRAMAC_DOCKER_TESTS=1`).
   - The analysis image copies in `templates/` (`Dockerfile:83,166`), so after merging, rebuild it for runs that do not bind-mount the checkout.
+- **Upstream cause, corrected (2026-11-17):** the position of the declaration does not matter. Frama-C's lexer (`clexer.mll`) knows `restrict` and `__restrict` but not `__restrict__`, which it reads as an identifier, in every position. Frama-C's libc only hides this: `share/libc/features.h:94` defines `__restrict__` as `__restrict`. Drafted as package 35 with a validated one-line kernel patch on `master` `95408044f7`, [`../upstream/frama-c/frama-c-kernel-restrict-gnu-spelling.md`](../upstream/frama-c/frama-c-kernel-restrict-gnu-spelling.md). Not filed.
 
 ### Symptom: Complex C Declarators Dropped or Void Functions Misclassified in Stubs and Layout Checks
 - **Seen:** 2026-11-11, regex audit (Milestone M1).

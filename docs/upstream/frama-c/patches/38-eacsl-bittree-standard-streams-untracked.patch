@@ -1,0 +1,266 @@
+From 1003c650f87545434fb49ada90d18009e08976df Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Tue, 17 Nov 2026 18:40:31 +0000
+Subject: [PATCH] [e-acsl] bittree model: track the safe locations
+
+The segment model registers errno, stdout, stderr and stdin as safe
+locations at start-up (collect_safe_locations). The bittree model has the
+comment "Tracking safe locations" in eacsl_memory_init but never called
+it: every check on a standard stream or on errno that reaches the runtime
+(\valid of a copy of stdout, \object_pointer(stdout), the -rte
+-warn-invalid-pointer guard of fputs(..., stdout), \valid(&errno) through
+a pointer) failed in that model only.
+
+Call collect_safe_locations in eacsl_memory_init. The bittree model does
+not support threads (eacsl_pthread_create aborts), so one call covers the
+program.
+
+New test special/e-acsl-bittree-std-streams.c, run with both memory models
+(dev configuration).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../e_acsl_bittree_observation_model.c        |   1 +
+ .../special/e-acsl-bittree-std-streams.c      |  20 +++
+ .../e-acsl-bittree-std-streams.0.res.oracle   |  20 +++
+ .../oracle/gen_e-acsl-bittree-std-streams.0.c | 162 ++++++++++++++++++
+ 4 files changed, 203 insertions(+)
+ create mode 100644 plugins/e-acsl/tests/special/e-acsl-bittree-std-streams.c
+ create mode 100644 plugins/e-acsl/tests/special/oracle/e-acsl-bittree-std-streams.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-std-streams.0.c
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+index af459ec298..31e5fe66de 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+@@ -589,6 +589,7 @@ void eacsl_memory_init(int *argc_ref, char ***argv_ref, size_t ptr_size) {
+   if (argc_ref)
+     argv_alloca(argc_ref, argv_ref);
+   /* Tracking safe locations */
++  collect_safe_locations();
+   init_infinity_values();
+ }
+ /* }}} */
+diff --git a/plugins/e-acsl/tests/special/e-acsl-bittree-std-streams.c b/plugins/e-acsl/tests/special/e-acsl-bittree-std-streams.c
+new file mode 100644
+index 0000000000..830cfa27c5
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/e-acsl-bittree-std-streams.c
+@@ -0,0 +1,20 @@
++/* run.config
++   COMMENT: The standard streams are safe locations in every memory model
++*/
++/* run.config_dev
++   MACRO: ROOT_EACSL_GCC_OPTS_EXT --memory-model bittree
++   EXECNOW: LOG @EACSL_ERR@ @EACSL_EXEC@
++   MACRO: ROOT_EACSL_GCC_OPTS_EXT --memory-model segment
++*/
++
++#include <stdio.h>
++
++int main(int argc, char **argv) {
++  /* \valid(stdout) is resolved at instrumentation time: use copies, which
++     are checked at run time */
++  FILE *out = stdout, *err = stderr, *in = stdin;
++  //@ check out: \valid(out);
++  //@ check err: \valid(err);
++  //@ check in: \valid_read(in);
++  return 0;
++}
+diff --git a/plugins/e-acsl/tests/special/oracle/e-acsl-bittree-std-streams.0.res.oracle b/plugins/e-acsl/tests/special/oracle/e-acsl-bittree-std-streams.0.res.oracle
+new file mode 100644
+index 0000000000..e47e7dfed9
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/e-acsl-bittree-std-streams.0.res.oracle
+@@ -0,0 +1,20 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] e-acsl-bittree-std-streams.c:16: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:16: Warning: 
++  function __e_acsl_assert, behavior non_blocking: precondition got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:16: Warning: 
++  check 'out' got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:17: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:17: Warning: 
++  function __e_acsl_assert, behavior non_blocking: precondition got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:17: Warning: 
++  check 'err' got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:18: Warning: 
++  function __e_acsl_assert, behavior non_blocking: precondition got status unknown.
++[eva:alarm] e-acsl-bittree-std-streams.c:18: Warning: 
++  check 'in' got status unknown.
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-std-streams.0.c b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-std-streams.0.c
+new file mode 100644
+index 0000000000..2e0f7421fa
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-bittree-std-streams.0.c
+@@ -0,0 +1,162 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++int main(int argc, char **argv)
++{
++  int __retres;
++  __e_acsl_memory_init(& argc,& argv,8UL);
++  FILE *out = stdout;
++  __e_acsl_store_block((void *)(& out),8UL);
++  __e_acsl_full_init((void *)(& out));
++  FILE *err = stderr;
++  __e_acsl_store_block((void *)(& err),8UL);
++  __e_acsl_full_init((void *)(& err));
++  FILE *in = stdin;
++  __e_acsl_store_block((void *)(& in),8UL);
++  __e_acsl_full_init((void *)(& in));
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_valid;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)out,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"out",
++                                 (void *)out);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(out,4)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(out,4); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(out,4)";
++      __gen_e_acsl_assert_data_2.file = "e-acsl-bittree-std-streams.c";
++      __gen_e_acsl_assert_data_2.fct = "main";
++      __gen_e_acsl_assert_data_2.line = 16;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_valid = __e_acsl_valid((void *)out,sizeof(FILE),(void *)out,
++                                        (void *)(& out));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"out",
++                                 (void *)out);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,"sizeof(FILE)",
++                                   0,sizeof(FILE));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "out: \\valid(out)",0,__gen_e_acsl_valid);
++    __gen_e_acsl_assert_data.blocking = 0;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "\\valid(out)";
++    __gen_e_acsl_assert_data.file = "e-acsl-bittree-std-streams.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 16;
++    __gen_e_acsl_assert_data.name = "out";
++    __e_acsl_assert(__gen_e_acsl_valid,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ check out: \valid(out); */ ;
++  {
++    int __gen_e_acsl_aligned_2;
++    int __gen_e_acsl_valid_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)err,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"err",
++                                 (void *)err);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                 "\"pointer alignment\": \\aligned(err,4)",0,
++                                 __gen_e_acsl_aligned_2);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(err,4); */
++    {
++      __gen_e_acsl_assert_data_4.blocking = 1;
++      __gen_e_acsl_assert_data_4.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_4.pred_txt = "\\aligned(err,4)";
++      __gen_e_acsl_assert_data_4.file = "e-acsl-bittree-std-streams.c";
++      __gen_e_acsl_assert_data_4.fct = "main";
++      __gen_e_acsl_assert_data_4.line = 17;
++      __gen_e_acsl_assert_data_4.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_4);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++    }
++    __gen_e_acsl_valid_2 = __e_acsl_valid((void *)err,sizeof(FILE),
++                                          (void *)err,(void *)(& err));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"err",
++                                 (void *)err);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_3,
++                                   "sizeof(FILE)",0,sizeof(FILE));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                 "err: \\valid(err)",0,__gen_e_acsl_valid_2);
++    __gen_e_acsl_assert_data_3.blocking = 0;
++    __gen_e_acsl_assert_data_3.kind = "Assertion";
++    __gen_e_acsl_assert_data_3.pred_txt = "\\valid(err)";
++    __gen_e_acsl_assert_data_3.file = "e-acsl-bittree-std-streams.c";
++    __gen_e_acsl_assert_data_3.fct = "main";
++    __gen_e_acsl_assert_data_3.line = 17;
++    __gen_e_acsl_assert_data_3.name = "err";
++    __e_acsl_assert(__gen_e_acsl_valid_2,& __gen_e_acsl_assert_data_3);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++  }
++  /*@ check err: \valid(err); */ ;
++  {
++    int __gen_e_acsl_aligned_3;
++    int __gen_e_acsl_valid_read;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_3 = __e_acsl_aligned((void *)in,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_6,"in",
++                                 (void *)in);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,
++                                 "\"pointer alignment\": \\aligned(in,4)",0,
++                                 __gen_e_acsl_aligned_3);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(in,4); */
++    {
++      __gen_e_acsl_assert_data_6.blocking = 1;
++      __gen_e_acsl_assert_data_6.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_6.pred_txt = "\\aligned(in,4)";
++      __gen_e_acsl_assert_data_6.file = "e-acsl-bittree-std-streams.c";
++      __gen_e_acsl_assert_data_6.fct = "main";
++      __gen_e_acsl_assert_data_6.line = 18;
++      __gen_e_acsl_assert_data_6.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_3,& __gen_e_acsl_assert_data_6);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++    }
++    __gen_e_acsl_valid_read = __e_acsl_valid_read((void *)in,sizeof(FILE),
++                                                  (void *)in,(void *)(& in));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"in",
++                                 (void *)in);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_5,
++                                   "sizeof(FILE)",0,sizeof(FILE));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,
++                                 "in: \\valid_read(in)",0,
++                                 __gen_e_acsl_valid_read);
++    __gen_e_acsl_assert_data_5.blocking = 0;
++    __gen_e_acsl_assert_data_5.kind = "Assertion";
++    __gen_e_acsl_assert_data_5.pred_txt = "\\valid_read(in)";
++    __gen_e_acsl_assert_data_5.file = "e-acsl-bittree-std-streams.c";
++    __gen_e_acsl_assert_data_5.fct = "main";
++    __gen_e_acsl_assert_data_5.line = 18;
++    __gen_e_acsl_assert_data_5.name = "in";
++    __e_acsl_assert(__gen_e_acsl_valid_read,& __gen_e_acsl_assert_data_5);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
++  }
++  /*@ check in: \valid_read(in); */ ;
++  __retres = 0;
++  __e_acsl_delete_block((void *)(& in));
++  __e_acsl_delete_block((void *)(& err));
++  __e_acsl_delete_block((void *)(& out));
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+-- 
+2.47.3
+

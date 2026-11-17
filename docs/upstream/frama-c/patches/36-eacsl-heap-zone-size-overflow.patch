@@ -1,0 +1,207 @@
+From b5296eeb81ed17904711672b0b99977e0d6e0704 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Tue, 17 Nov 2026 18:30:13 +0000
+Subject: [PATCH] [e-acsl] compute the zone sizes of --zone-sizes in size_t
+
+e-acsl-gcc --zone-sizes passes each size, in MB, to the runtime as a macro
+(E_ACSL_HEAP_SIZE, E_ACSL_STACK_SIZE, E_ACSL_TLS_SIZE,
+E_ACSL_THREAD_STACK_SIZE). The segment model converted it to bytes with
+`size * MB`, where MB is the int constant 1024 * 1024, so from 2048 MB on
+the product overflowed int (gcc: "integer overflow in expression of type
+'int' results in '-2147483648'"). Converted to size_t, the result was
+either huge or wrapped modulo 4 GB: heap:2048 to heap:4095 and stack:2048
+crashed every run at start-up, heap:4096 aborted at the first malloc,
+heap:4097 gave a 1 MB heap, and thread-stack:2048 made pthread_create fail.
+
+Convert the size to size_t before the multiplication, at the places where
+it is turned into bytes.
+
+New test special/e-acsl-zone-sizes.c: a program run with
+--zone-sizes heap:2048,stack:2048 (dev configuration).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../e_acsl_segment_observation_model.c        |  2 +-
+ .../segment_model/e_acsl_shadow_concurrency.c |  4 +-
+ .../segment_model/e_acsl_shadow_layout.h      |  4 +-
+ .../e-acsl/tests/special/e-acsl-zone-sizes.c  | 16 ++++
+ .../oracle/e-acsl-zone-sizes.0.res.oracle     |  4 +
+ .../special/oracle/gen_e-acsl-zone-sizes.0.c  | 80 +++++++++++++++++++
+ 6 files changed, 105 insertions(+), 5 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/special/e-acsl-zone-sizes.c
+ create mode 100644 plugins/e-acsl/tests/special/oracle/e-acsl-zone-sizes.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/special/oracle/gen_e-acsl-zone-sizes.0.c
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+index 3176a965ec..603e999227 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+@@ -321,7 +321,7 @@ void do_eacsl_memory_init(int *argc_ref, char ***argv_ref, size_t ptr_size) {
+   /* Initialize report file with debug logs (only in debug mode). */
+   initialize_report_file(argc_ref, argv_ref);
+   /* Lift stack limit to account for extra stack memory overhead.  */
+-  increase_stack_limit(E_ACSL_STACK_SIZE * MB);
++  increase_stack_limit((size_t)E_ACSL_STACK_SIZE * MB);
+   /* Allocate and log shadow memory layout of the execution. Case of the
+        segments available after main. */
+   init_shadow_layout_main(argc_ref, argv_ref);
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c
+index 97a4875897..00d067be05 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c
+@@ -334,10 +334,10 @@ int eacsl_pthread_create(pthread_t *restrict thread,
+   // already greater than the default value of E-ACSL
+   size_t original_stack_size;
+   pthread_attr_getstacksize(pattr, &original_stack_size);
+-  if (original_stack_size >= E_ACSL_THREAD_STACK_SIZE * MB) {
++  if (original_stack_size >= (size_t)E_ACSL_THREAD_STACK_SIZE * MB) {
+     wrapped->stack_size = original_stack_size * 2;
+   } else {
+-    wrapped->stack_size = E_ACSL_THREAD_STACK_SIZE * MB;
++    wrapped->stack_size = (size_t)E_ACSL_THREAD_STACK_SIZE * MB;
+   }
+   pthread_attr_setstacksize(pattr, wrapped->stack_size);
+ 
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
+index 216139be96..9a9cae7567 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
+@@ -56,7 +56,7 @@
+ 
+ /** Hardcoded sizes of tracked program segments {{{ */
+ /*! \brief Size of a program's heap */
+-#define PGM_HEAP_SIZE (E_ACSL_HEAP_SIZE * MB)
++#define PGM_HEAP_SIZE ((size_t)E_ACSL_HEAP_SIZE * MB)
+ 
+ /*! \brief Size of a program's Thread-local storage (TLS).
+   Standard streams stdin, stdout and stderr are put here.
+@@ -66,7 +66,7 @@
+   However since the TLS is next to the VDSO segment in the program layout, the
+   default size is small enough so that both segments do not overlap. */
+ #ifndef PGM_TLS_SIZE
+-#  define PGM_TLS_SIZE (E_ACSL_TLS_SIZE * MB)
++#  define PGM_TLS_SIZE ((size_t)E_ACSL_TLS_SIZE * MB)
+ #endif
+ 
+ /*! \brief Mspace padding used by shadow segments. This is to make sure that
+diff --git a/plugins/e-acsl/tests/special/e-acsl-zone-sizes.c b/plugins/e-acsl/tests/special/e-acsl-zone-sizes.c
+new file mode 100644
+index 0000000000..0f2593c772
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/e-acsl-zone-sizes.c
+@@ -0,0 +1,16 @@
++/* run.config
++   COMMENT: Zone sizes given with --zone-sizes (in MB)
++*/
++/* run.config_dev
++   COMMENT: 2048 MB do not fit in an int once converted to bytes
++   MACRO: ROOT_EACSL_GCC_OPTS_EXT --zone-sizes heap:2048,stack:2048
++*/
++
++#include <stdlib.h>
++
++int main(void) {
++  char *p = malloc(16);
++  //@ assert \valid(p + (0 .. 15));
++  free(p);
++  return 0;
++}
+diff --git a/plugins/e-acsl/tests/special/oracle/e-acsl-zone-sizes.0.res.oracle b/plugins/e-acsl/tests/special/oracle/e-acsl-zone-sizes.0.res.oracle
+new file mode 100644
+index 0000000000..61b1d60dc8
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/e-acsl-zone-sizes.0.res.oracle
+@@ -0,0 +1,4 @@
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] e-acsl-zone-sizes.c:13: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
+diff --git a/plugins/e-acsl/tests/special/oracle/gen_e-acsl-zone-sizes.0.c b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-zone-sizes.0.c
+new file mode 100644
+index 0000000000..629affb6c8
+--- /dev/null
++++ b/plugins/e-acsl/tests/special/oracle/gen_e-acsl-zone-sizes.0.c
+@@ -0,0 +1,80 @@
++/* Generated by Frama-C */
++#include "errno.h"
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "stdlib.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++int main(void)
++{
++  int __retres;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  char *p = malloc(16UL);
++  __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_size;
++    int __gen_e_acsl_if;
++    int __gen_e_acsl_valid;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)p,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"p",(void *)p);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(p,1)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(p,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(p,1)";
++      __gen_e_acsl_assert_data_2.file = "e-acsl-zone-sizes.c";
++      __gen_e_acsl_assert_data_2.fct = "main";
++      __gen_e_acsl_assert_data_2.line = 13;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_size = 16;
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"size",0,
++                                 __gen_e_acsl_size);
++    if (__gen_e_acsl_size <= 0) __gen_e_acsl_if = 0;
++    else {
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,"size",0,
++                                   __gen_e_acsl_size);
++      __gen_e_acsl_if = __gen_e_acsl_size;
++    }
++    __gen_e_acsl_valid = __e_acsl_valid((void *)(p + 0),
++                                        (size_t)__gen_e_acsl_if,(void *)p,
++                                        (void *)(& p));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"p",(void *)p);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "sizeof(char) * 0",0,0);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "sizeof(char) * ((15 - 0) + 1)",0,16);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\\valid(p + (0 .. 15))",0,
++                                 __gen_e_acsl_valid);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "\\valid(p + (0 .. 15))";
++    __gen_e_acsl_assert_data.file = "e-acsl-zone-sizes.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 13;
++    __e_acsl_assert(__gen_e_acsl_valid,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert \valid(p + (0 .. 15)); */ ;
++  free((void *)p);
++  __retres = 0;
++  __e_acsl_delete_block((void *)(& p));
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+-- 
+2.47.3
+
