@@ -37,6 +37,9 @@ the run's named Docker volume at /framac-scratch:
      reports, without running the dynamic loader on target binaries). The headers the build generated in
      the tree (`config.h`: named in a dependency list, absent from the target) are copied to
      <run>/workspace/snapshot/generated/<tree-relative path>, with the include directories that find them.
+     The libc headers in the dependency lists that Frama-C's libc lacks (`linux-libc-dev`'s, glibc's
+     `elf.h`) are copied to <run>/workspace/snapshot/libc/<absolute path>, so Frama-C parses read the
+     build image's versions (FRAMAC_LIBC_GAP_PACKAGES, FRAMAC_LIBC_GAP_FILES).
 
 The report is workspace/reports/build_capture.json (schemas/build_capture.schema.json). A build that fails
 (or compiles no C file, or has no recipe) stops Phase 0: status `needs_build_recipe` with the first error,
@@ -1300,16 +1303,76 @@ def generated_include_dirs(headers: list[str], compiles: Iterable[dict]) -> list
     return out
 
 
+# The libc headers Frama-C's libc lacks, which a Frama-C parse (`-nostdinc`) reads from the build image's
+# copies (target_env.libc_include_flags): every header of these packages, and these files.
+FRAMAC_LIBC_GAP_PACKAGES = frozenset({"linux-libc-dev"})
+FRAMAC_LIBC_GAP_FILES = frozenset({"/usr/include/elf.h"})
+
+
+def under_system_dir(path: str, dirs: Iterable[str] = target_env.DEFAULT_SYSTEM_DIRS) -> bool:
+    return any(path.startswith(d.rstrip("/") + "/") for d in dirs)
+
+
+def system_dir_links(dirs: Iterable[str] = target_env.DEFAULT_SYSTEM_DIRS) -> dict[str, str]:
+    """
+    Real path -> include path of the symlinks (files or directories) under gcc's system directories that
+    point outside them: Debian trixie's linux-libc-dev ships `/usr/include/x86_64-linux-gnu/asm/types.h`
+    as a link to `/usr/lib/linux/uapi/x86/asm/types.h`, and `cc -M` names the real path (gcc canonicalizes
+    system header paths by default, `-fcanonical-system-headers`).
+    """
+    dirs = list(dirs)
+    out: dict[str, str] = {}
+    for top in dirs:
+        for d, subdirs, files in os.walk(top):
+            subdirs.sort()
+            for name in [*subdirs, *sorted(files)]:
+                p = posixpath.join(d, name)
+                if os.path.islink(p):
+                    real = posixpath.normpath(os.path.realpath(p))
+                    if not under_system_dir(real, dirs):
+                        out.setdefault(real, p)
+    return out
+
+
+def include_path(path: str, links: dict[str, str]) -> str:
+    """`path` as the preprocessor finds it through a system directory (`links`: system_dir_links)."""
+    if path in links:
+        return links[path]
+    for real in sorted(links, key=len, reverse=True):
+        if path.startswith(real + "/"):
+            return links[real] + path[len(real) :]
+    return path
+
+
+def framac_libc_gaps(headers: Iterable[dict], links: dict[str, str] | None = None) -> dict[str, dict]:
+    """
+    Include path -> {"path", "package", "source"} for the libc headers (`class` libc) the dependency lists
+    name that Frama-C's libc lacks: `linux-libc-dev`'s (`linux/*`, `asm/*`, `asm-generic/*`) and glibc's
+    `elf.h`. `path` is where an `#include` finds the header (`links`: system_dir_links), `source` the file
+    the dependency list named.
+    """
+    out: dict[str, dict] = {}
+    for h in headers:
+        source = posixpath.normpath(h["path"])
+        path = include_path(source, links or {})
+        if h["class"] == "libc" and (h["package"] in FRAMAC_LIBC_GAP_PACKAGES or path in FRAMAC_LIBC_GAP_FILES):
+            out.setdefault(path, {"path": path, "package": h["package"], "source": source})
+    return out
+
+
 def export_snapshot(
     snapshot: Path,
     files: dict[str, dict],
     generated: dict[str, Path] | None = None,
     generated_dirs: list[str] | None = None,
+    libc: dict[str, Path] | None = None,
 ) -> dict:
     """
-    Copy the exported files under <snapshot>/root/<absolute path> and the build's generated headers under
-    <snapshot>/generated/<tree-relative path>; digest over (path, sha256), the generated headers keyed
-    `generated/<path>` (a snapshot without one keeps the digest it always had).
+    Copy the exported files under <snapshot>/root/<absolute path>, the build's generated headers under
+    <snapshot>/generated/<tree-relative path> and the libc headers Frama-C's libc lacks (`libc`: absolute
+    path -> file to copy) under <snapshot>/libc/<absolute path>; digest over (path, sha256), the generated
+    headers keyed `generated/<path>` and the libc ones `libc/<path>` (a snapshot without either keeps the
+    digest it always had).
     """
     root = snapshot / "root"
     if snapshot.exists():
@@ -1333,14 +1396,35 @@ def export_snapshot(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dest)
         gen[rel] = sha256_file(dest)
-    material = sorted([*manifest.items(), *((f"{target_env.GENERATED_REL}/{r}", h) for r, h in gen.items())])
+    gaps: dict[str, str] = {}
+    for path in sorted(libc or {}):
+        src = (libc or {})[path]
+        rel = posixpath.normpath(path).lstrip("/")
+        if not posixpath.isabs(path) or rel.startswith("..") or not src.is_file():
+            continue
+        dest = snapshot / target_env.LIBC_REL / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dest)
+        gaps[f"/{rel}"] = sha256_file(dest)
+    material = sorted(
+        [
+            *manifest.items(),
+            *((f"{target_env.GENERATED_REL}/{r}", h) for r, h in gen.items()),
+            *((f"{target_env.LIBC_REL}{p}", h) for p, h in gaps.items()),
+        ]
+    )
     digest = hashlib.sha256("".join(f"{p}\0{h}\n" for p, h in material).encode()).hexdigest()
     data: dict[str, Any] = {"digest": digest, "files": manifest}
     if gen:
         data["generated"] = gen
         data["generated_dirs"] = list(generated_dirs or [])
+    if gaps:
+        data["libc"] = gaps
     atomic_write_json(snapshot / "manifest.json", data)
-    return {"digest": digest, "files": len(manifest) + len(gen), "generated": len(gen)}
+    summary: dict[str, Any] = {"digest": digest, "files": len(manifest) + len(gen) + len(gaps), "generated": len(gen)}
+    if gaps:
+        summary["libc"] = len(gaps)
+    return summary
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -2116,7 +2200,16 @@ def build_snapshot(
     ]
     exported = {e["path"]: e for e in headers + libraries if e["class"] in ("package", "unowned")}
     exported.update({p: {"path": p} for p in extra_files})
-    summary = export_snapshot(snapshot, exported, {h: tree / h for h in generated or []}, generated_dirs)
+    outside = any(h["class"] == "libc" and not under_system_dir(posixpath.normpath(h["path"])) for h in headers)
+    gaps = framac_libc_gaps(headers, system_dir_links() if outside else {})
+    gap_sources = {g["source"] for g in gaps.values()}
+    summary = export_snapshot(
+        snapshot,
+        exported,
+        {h: tree / h for h in generated or []},
+        generated_dirs,
+        libc={p: Path(g["source"]) for p, g in gaps.items()},
+    )
     result: dict[str, Any] = {
         "root": (snapshot / "root").as_posix(),
         "digest": summary["digest"],
@@ -2124,7 +2217,9 @@ def build_snapshot(
         "headers": [h for h in headers if h["class"] in ("package", "unowned")],
         "libraries": [lib for lib in libraries if lib["class"] in ("package", "unowned")],
         "excluded": {
-            "libc_headers": sum(1 for h in headers if h["class"] == "libc"),
+            "libc_headers": sum(
+                1 for h in headers if h["class"] == "libc" and posixpath.normpath(h["path"]) not in gap_sources
+            ),
             "toolchain_headers": sum(1 for h in headers if h["class"] == "toolchain"),
             "libc_or_toolchain_libraries": sum(1 for lib in libraries if lib["class"] in ("libc", "toolchain")),
         },
@@ -2133,6 +2228,12 @@ def build_snapshot(
     }
     if summary["generated"]:
         result["generated"] = {"headers": sorted(generated or []), "include_dirs": list(generated_dirs or [])}
+    if gaps:
+        result["framac_libc_gaps"] = [
+            {"path": p, "package": gaps[p]["package"]}
+            | ({"source": gaps[p]["source"]} if gaps[p]["source"] != p else {})
+            for p in sorted(gaps)
+        ]
     return result
 
 

@@ -13,6 +13,14 @@ them from there instead:
   - generated headers: the headers the build generated in its tree (`config.h`), which the target
     does not have, under `generated/<tree-relative path>` with the manifest's `generated_dirs`;
     `-idirafter <snapshot>/generated/<dir>` for each, before the system directories;
+  - Frama-C's libc gaps (Frama-C parses only, `nostdinc=True`): the build image's copies of the
+    libc headers Frama-C's libc lacks (`linux-libc-dev`'s `linux/*` and `asm/*`, glibc's `elf.h`),
+    under `libc/<absolute path>` with the manifest's `libc`; `-idirafter <snapshot>/libc/<dir>` for
+    gcc's default system directories, after the target's system headers. The analysis image's own
+    `/usr/include/x86_64-linux-gnu` and `/usr/include` come last, as the fallback for an older capture
+    and for the libc headers the export does not hold (what a Frama-C parse reaches beyond the build's
+    dependency lists). Directories are matched as whole `-idirafter <dir>` tokens, so a unit's
+    `-idirafter /usr/include/foo` does not stand for `/usr/include`;
   - libraries: `-L <root>/<dir>` with an RPATH (not RUNPATH: it also serves the libraries' own
     dependencies), so fuzzing, replay and the guardrail run the binaries without installed packages.
 
@@ -33,8 +41,13 @@ SNAPSHOT_REL = "workspace/snapshot"
 CONTAINER_SNAPSHOT_DIR = f"/framac-run/{SNAPSHOT_REL}"
 # The build's generated headers, by tree-relative path, inside the snapshot directory.
 GENERATED_REL = "generated"
+# The build image's copies of the libc headers Frama-C's libc lacks, by absolute path, inside the snapshot.
+LIBC_REL = "libc"
 # System include directories gcc searches by default: their target headers come from the snapshot.
 DEFAULT_SYSTEM_DIRS = ("/usr/local/include", "/usr/include/x86_64-linux-gnu", "/usr/include")
+# The analysis image's own system directories, searched last by a Frama-C parse (`-nostdinc`).
+IMAGE_SYSTEM_DIRS = ("/usr/include/x86_64-linux-gnu", "/usr/include")
+_IDIRAFTER = "-idirafter"
 _INCLUDE_DIR_OPTIONS = ("-I", "-isystem", "-idirafter", "-iquote")
 _LIBRARY_SUFFIXES = (".so", ".a")
 
@@ -127,22 +140,72 @@ def link_flags(d: Path | None = None) -> list[str]:
     return [*out, "-Wl,--disable-new-dtags"]
 
 
-def with_include_flags(cppflags: str) -> str:
+def libc_include_flags(d: Path | None = None) -> list[str]:
+    """
+    `-idirafter` options for the build image's copies of the libc headers Frama-C's libc lacks
+    (`libc/` in the snapshot): gcc's default system directories that hold one, in gcc's order. Empty
+    for a capture without the export (manifest key `libc` absent or empty).
+    """
+    d = d or snapshot_dir()
+    if d is None or not _manifest(d).get("libc"):
+        return []
+    base = d / LIBC_REL
+    out: list[str] = []
+    for sys_dir in DEFAULT_SYSTEM_DIRS:
+        path = base / sys_dir.lstrip("/")
+        if path.is_dir():
+            out += [_IDIRAFTER, path.as_posix()]
+    return out
+
+
+def image_system_dirs() -> list[str]:
+    """The analysis image's own system include directories that exist here."""
+    return [d for d in IMAGE_SYSTEM_DIRS if os.path.isdir(d)]
+
+
+def idirafter_dirs(words: Iterable[str]) -> set[str]:
+    """The directories `words` name with `-idirafter`, as whole tokens (`-idirafter DIR` or `-idirafterDIR`)."""
+    toks = list(words)
+    out: set[str] = set()
+    for i, tok in enumerate(toks):
+        if tok == _IDIRAFTER and i + 1 < len(toks):
+            out.add(toks[i + 1])
+        elif tok.startswith(_IDIRAFTER) and len(tok) > len(_IDIRAFTER):
+            out.add(tok[len(_IDIRAFTER) :])
+    return out
+
+
+def with_include_flags(cppflags: str, *, nostdinc: bool = False) -> str:
     """
     `cppflags` followed by the snapshot's `-idirafter` options for them: the build's generated headers
-    first, then the target's system headers.
+    first, then the target's system headers. With `nostdinc` (a Frama-C parse, which searches no system
+    directory of its own), then the build image's copies of the headers Frama-C's libc lacks, and last
+    the analysis image's own system directories. A directory `cppflags` already names with `-idirafter`
+    (the exact directory, not a prefix of it) is not added again.
     """
     d = snapshot_dir()
-    if d is None:
+    if d is None and not nostdinc:
         return cppflags
     try:
         words = shlex.split(cppflags or "")
     except ValueError:
         return cppflags
-    present = {words[i + 1] for i, w in enumerate(words[:-1]) if w == "-idirafter"}
-    gen = generated_include_flags(d)
-    extra = [t for i in range(0, len(gen), 2) if gen[i + 1] not in present for t in gen[i : i + 2]]
-    extra += include_flags((d / "root").as_posix(), words)
+    candidates: list[str] = []
+    if d is not None:
+        candidates += generated_include_flags(d)
+        candidates += include_flags((d / "root").as_posix(), words)
+        if nostdinc:
+            candidates += libc_include_flags(d)
+    if nostdinc:
+        for sys_dir in image_system_dirs():
+            candidates += [_IDIRAFTER, sys_dir]
+    present = idirafter_dirs(words)
+    extra: list[str] = []
+    for i in range(0, len(candidates), 2):
+        directory = candidates[i + 1]
+        if directory not in present:
+            present.add(directory)
+            extra += [_IDIRAFTER, directory]
     return f"{cppflags} {shlex.join(extra)}".strip() if extra else cppflags
 
 

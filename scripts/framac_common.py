@@ -789,14 +789,16 @@ def augment_framac_cppflags(cppflags: str) -> str:
     (Eva and WP) so third-party headers (`bsd/string.h`, `json-c/json.h`, `netinet/ip_icmp.h`)
     and glibc internal integer typedefs (`__int32_t`, etc.) resolve cleanly without
     shadowing `__fc_libc`, ensuring stubs and compatibility headers precede target headers.
-    The build's generated headers (`config.h`) and the target's system headers come last, in that order,
-    from the run's snapshot (scripts/target_env.py), then the image's own system directories for the
-    headers Frama-C's libc lacks (`elf.h`, `linux/*`). Last, `-wrapper` runs gcc's preprocessor under
-    scripts/fc_cpp_wrapper.py, which repairs `offsetof` with a non-constant index (`framac_cpp_wrapper`).
+    The `-idirafter` directories come last, from `target_env.with_include_flags(nostdinc=True)`, which
+    owns their order: the build's generated headers (`config.h`) and the target's system headers from
+    the run's snapshot, then the build image's copies of the headers Frama-C's libc lacks (`elf.h`,
+    `linux/*`), then the analysis image's own system directories as the fallback. Last, `-wrapper` runs
+    gcc's preprocessor under scripts/fc_cpp_wrapper.py, which repairs `offsetof` with a non-constant
+    index (`framac_cpp_wrapper`).
     """
     from target_env import with_include_flags
 
-    base = with_include_flags((cppflags or "-I.").strip())
+    base = with_include_flags((cppflags or "-I.").strip(), nostdinc=True)
     overlay = stub_overlay_dir()
     overlay_flag = [f"-I{overlay.as_posix()}"] if overlay is not None and f"-I{overlay.as_posix()}" not in base else []
     fc_stubs = resolve_fc_stubs_dir()
@@ -811,9 +813,6 @@ def augment_framac_cppflags(cppflags: str) -> str:
         prefix.append(f"-include {compat_hdr}")
     if base:
         prefix.append(base)
-    for d in ("/usr/include/x86_64-linux-gnu", "/usr/include"):
-        if os.path.isdir(d) and f"-idirafter {d}" not in base and f"-idirafter {d}" not in prefix:
-            prefix.append(f"-idirafter {d}")
     wrapper = framac_cpp_wrapper()
     if wrapper and "-wrapper" not in base.split():
         prefix.append(f"-wrapper {wrapper}")

@@ -146,7 +146,7 @@ run-<N>/
 ├── workspace/
 │   ├── baseline/                             # Clean read-only snapshot of original C/H files
 │   ├── work/                                 # Active shadow tree (ACSL annotations only)
-│   ├── snapshot/                             # The target's headers and libraries from the build (root/, manifest.json)
+│   ├── snapshot/                             # The target's headers and libraries from the build (root/, generated/, libc/, manifest.json)
 │   ├── harnesses/                            # Generated harness_<mod>.c, harness_<mod>.json, and E-ACSL binaries
 │   ├── build/                                # Generated Makefile, modules.mk, params.json (pipeline_make.py)
 │   ├── seed_records/                         # API calls recorded from the target's tests (calls.jsonl)

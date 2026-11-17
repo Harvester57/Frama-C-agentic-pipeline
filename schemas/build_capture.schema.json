@@ -188,6 +188,20 @@
             "headers": {"type": "array", "items": {"type": "string"}},
             "include_dirs": {"type": "array", "items": {"type": "string"}}
           }
+        },
+        "framac_libc_gaps": {
+          "$comment": "Libc headers named by cc -M that Frama-C's libc lacks (linux-libc-dev's, glibc's elf.h), copied to <snapshot>/libc/<path> for Frama-C parses (scripts/target_env.py). `path` is where an #include finds the header, `source` the real path cc -M named when a symlinked system directory differs (Debian's x86_64-linux-gnu/asm). Absent in an older capture.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "package": {"type": ["string", "null"]},
+              "source": {"type": "string", "minLength": 1}
+            },
+            "required": ["path", "package"],
+            "additionalProperties": false
+          }
         }
       },
       "required": ["root", "digest", "files", "headers", "libraries", "packages"]
