@@ -140,6 +140,48 @@ def test_brief_uses_host_paths_from_wrapper_environment(tmp_path, monkeypatch):
     assert "/framac-run" not in brief.split("-RunDir", 1)[1].split("\n", 1)[0]
 
 
+_BRIEF_ROLE = {
+    "prover_brief.md": "prover",
+    "breaker_brief.md": "breaker",
+    "crash_verifier_brief.md": "verifier",
+    "header_architect_brief.md": "architect",
+}
+_WP_SKILL = Path(__file__).resolve().parent.parent / "skills" / "framac-wp"
+
+
+def test_every_wp_brief_template_has_a_role():
+    assert sorted(p.name for p in _WP_SKILL.glob("*_brief.md")) == sorted(_BRIEF_ROLE)
+
+
+@pytest.mark.parametrize("template", sorted(_BRIEF_ROLE))
+def test_brief_gives_concrete_wrapper_invocation_on_the_host(tmp_path, monkeypatch, template):
+    """mpack run-4 (S15): only the prover brief named -TargetDir/-RunDir; the other three said "through the
+    wrapper" with no wrapper path, target or run dir, so the subagents (host processes) had no way to run."""
+    import wp_scheduler
+
+    run_dir = _overlay(tmp_path)
+    monkeypatch.setenv("FRAMAC_TARGET_HOST", "C:/src/target")
+    monkeypatch.setenv("FRAMAC_RUN_HOST", "C:/Users/u/framac-pipeline/demo/run-1")
+    monkeypatch.setenv("FRAMAC_REFERENCES_HOST", "C:\\pipe\\frama-c/docs/references")
+    role = _BRIEF_ROLE[template]
+    kwargs: dict = {"function": "f", "c_file": "a.c"}
+    if role == "architect":
+        kwargs = {"module": "m", "header_file": "a.h"}
+    elif role == "verifier":
+        kwargs = {"module": "m", "candidate_fp": "fp-1"}
+    res = workspace_overlay.prepare_agent(run_dir, f"{role}-1", role, **kwargs)
+    brief = (run_dir / res["brief_file"]).read_text(encoding="utf-8")
+    if "through the wrapper" not in brief.lower():
+        pytest.skip(f"{template} never asks for the wrapper")
+    ps1 = 'C:\\pipe\\frama-c/wrappers/framac-docker.ps1" -TargetDir "C:/src/target" -RunDir "C:/Users/u/framac-pipeline/demo/run-1"'
+    sh = 'C:\\pipe\\frama-c/wrappers/framac-docker.sh" --target "C:/src/target" --run-dir "C:/Users/u/framac-pipeline/demo/run-1"'
+    assert ps1 in brief, f"{template}: no PowerShell wrapper invocation with host paths"
+    assert sh in brief, f"{template}: no POSIX wrapper invocation with host paths"
+    container = next((line for line in brief.splitlines() if "container path" in line), "")
+    assert "/framac-run" in container and "/opt/framac-pipeline" in container, template
+    assert not wp_scheduler._PLACEHOLDER_RE.search(brief), template
+
+
 def test_brief_scopes_same_named_statics_by_file_and_renders_scheduler_context(tmp_path, capsys):
     run_dir = _overlay(tmp_path)
     (run_dir / "workspace/work/b.c").write_text("static int f(int y) {\n    return y;\n}\n", encoding="utf-8")

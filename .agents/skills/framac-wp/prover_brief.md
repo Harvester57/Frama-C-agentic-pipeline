@@ -6,7 +6,7 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 
 ## Input Context
 
-- **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
+- **Run directory:** `{run_dir}` on the host, `/framac-run` (the working directory) in the container; the target `{target_dir}` is read-only at `/target`. Run every command through the wrapper, as **How to run commands** below says.
 - **Isolated Scratch C File:** `agents/{agent_id}/scratch/work/{c_file}`
 - **Isolated Scratch Header File:** `agents/{agent_id}/scratch/work/{header_file}`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
@@ -22,6 +22,8 @@ Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any 
 A `Known Dead Ends` section, when present, lists clauses already refuted on this function or rejected by a callee; never re-add them.
 
 <!-- spec-kb -->
+
+<!-- run-commands -->
 
 ## Strict Rules
 
@@ -235,7 +237,7 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 
 ## The Dual-Oracle Verification Loop (Run on Every Iteration)
 
-Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_id}/scratch/work/{header_file}`, run **both** oracles against your scratch work tree through the wrapper (`-TargetDir "{target_dir}" -RunDir "{run_dir}"`):
+Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_id}/scratch/work/{header_file}`, run **both** oracles against your scratch work tree through the wrapper (**How to run commands**):
 
 1. **Oracle 1 — Dynamic Anti-Hallucination Guardrail (`E-ACSL`):**
    ```text

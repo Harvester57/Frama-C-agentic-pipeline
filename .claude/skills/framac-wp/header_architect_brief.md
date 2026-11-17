@@ -6,13 +6,15 @@ Your task is to write clean, sound baseline ACSL function contracts (`requires`,
 
 ## Input Context
 
-- **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
+- **Run directory:** `{run_dir}` on the host, `/framac-run` (the working directory) in the container; the target `{target_dir}` is read-only at `/target`. Run every command through the wrapper, as **How to run commands** below says.
 - **Isolated Scratch Header Path:** `agents/{agent_id}/scratch/work/{header_file}`
 - **Isolated Scratch Module Sources:** `{scratch_module_sources}`
 - **Module Harness & Fuzzer Corpus:** `workspace/harnesses/harness_{harness_module_name}.c` and `workspace/corpus/{harness_module_name}/` (read-only for you)
 - **Security Properties (Layer 2 from `callgraph_dag.json`; Layers 3–6 generated from the threat model as MetAcsl meta-properties, `workspace/reports/security_props.json`):** `{security_properties_json}`
 - **Untrusted entry functions in this header:** `{untrusted_entry_functions_json}`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
+
+<!-- run-commands -->
 
 ## Strict Rules
 

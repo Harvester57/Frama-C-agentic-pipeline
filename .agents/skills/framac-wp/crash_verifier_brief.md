@@ -6,11 +6,13 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
 
 ## Input Context
 
-- **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
+- **Run directory:** `{run_dir}` on the host, `/framac-run` (the working directory) in the container; the target `{target_dir}` is read-only at `/target`. Run every command through the wrapper, as **How to run commands** below says.
 - **Candidate Record (from `candidates.json`):** `{candidate_json}`
 - **Module Harness & Metadata:** `workspace/harnesses/harness_{module_name}.c` and `workspace/harnesses/harness_{module_name}.json`
 - **Target C Sources (read-only for you):** `workspace/work/`
 - **Your scratch directory (the only place you may write):** `agents/{agent_id}/scratch/`
+
+<!-- run-commands -->
 
 ## Strict Rules
 

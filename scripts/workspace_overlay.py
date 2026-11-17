@@ -2597,12 +2597,25 @@ def _brief_path(value: str) -> str:
     return str(value).replace('"', "")
 
 
+# Every brief carries one shared "How to run commands" section (skills/framac-wp/run_commands.md): the
+# subagents run on the host and reach the container only through the wrapper, with host paths.
+RUN_COMMANDS_SENTINEL = "<!-- run-commands -->"
+RUN_COMMANDS_FRAGMENT = "run_commands.md"
+
+
+def _pipeline_host_dir(references_host: str) -> str:
+    """Host path of the pipeline checkout, from the host path of its docs/references (mixed separators on Windows)."""
+    root = re.sub(r"[\\/]+docs[\\/]+references[\\/]*$", "", references_host)
+    return root if root != references_host else str(Path(__file__).resolve().parent.parent)
+
+
 def _resolve_brief_template(role: str) -> str:
     filename_map = {
         "architect": "header_architect_brief.md",
         "prover": "prover_brief.md",
         "breaker": "breaker_brief.md",
         "verifier": "crash_verifier_brief.md",
+        "run_commands": RUN_COMMANDS_FRAGMENT,
     }
     fname = filename_map[role]
     here = Path(__file__).resolve().parent
@@ -3124,6 +3137,10 @@ def prepare_agent(
             _callee_names(fn_meta),
             _earlier_refutations(run_dir, agent_id, function, norm_c_file),
         )
+    tpl = tpl.replace(RUN_COMMANDS_SENTINEL, _resolve_brief_template("run_commands").rstrip("\n"))
+    references_host = _brief_path(
+        os.environ.get("FRAMAC_REFERENCES_HOST") or str(Path(__file__).resolve().parent.parent / "docs" / "references")
+    )
     replacements = {
         "{agent_id}": agent_id,
         "{module_name}": module or "unknown",
@@ -3155,10 +3172,9 @@ def prepare_agent(
         # container's /target and /framac-run. The wrapper passes them as environment.
         "{target_dir}": _brief_path(os.environ.get("FRAMAC_TARGET_HOST") or run_meta.get("target") or "/target"),
         "{run_dir}": _brief_path(os.environ.get("FRAMAC_RUN_HOST") or run_meta.get("run_dir_host") or str(run_dir)),
-        "{references_dir}": _brief_path(
-            os.environ.get("FRAMAC_REFERENCES_HOST")
-            or str(Path(__file__).resolve().parent.parent / "docs" / "references")
-        ),
+        "{references_dir}": references_host,
+        # The wrappers live in the same checkout as docs/references (both are host paths).
+        "{pipeline_dir}": _pipeline_host_dir(references_host),
     }
     rendered = tpl
     for k, v in replacements.items():

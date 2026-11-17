@@ -193,6 +193,7 @@ BRIEF_RENDER_KEYS: tuple[str, ...] = (
     "target_dir",
     "run_dir",
     "references_dir",
+    "pipeline_dir",
 )
 
 
@@ -2473,7 +2474,8 @@ def _newest_template_mtime() -> float | None:
     here = Path(__file__).resolve().parent
     for base in (here.parent / "skills" / "framac-wp", Path("/opt/framac-pipeline/skills/framac-wp")):
         if base.is_dir():
-            for tpl in base.glob("*_brief.md"):
+            # run_commands.md is spliced into every brief.
+            for tpl in [*base.glob("*_brief.md"), base / "run_commands.md"]:
                 with contextlib.suppress(OSError):
                     mtime = tpl.stat().st_mtime
                     newest = mtime if newest is None else max(newest, mtime)
