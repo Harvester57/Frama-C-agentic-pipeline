@@ -1,6 +1,6 @@
 # E-ACSL `--validate-format-strings`: `"%u"` / `"%x"` with a promoted `unsigned char` or `unsigned short` aborts on correct code
 
-Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Not filed.** Number 30
+Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Filed on 2026-11-18 as [#2819](https://git.frama-c.com/pub/frama-c/-/work_items/2819), with merge request [!48](https://git.frama-c.com/pub/frama-c/-/merge_requests/48).** Number 30
 in this folder's [index](./README.md). It was first written together with Issue 31
 ([`./frama-c-eacsl-format-fp-argument-slots.md`](./frama-c-eacsl-format-fp-argument-slots.md)), a
 second defect in the same runtime function (`validate_format`,

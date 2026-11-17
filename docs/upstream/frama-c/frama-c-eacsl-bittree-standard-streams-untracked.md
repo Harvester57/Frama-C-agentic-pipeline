@@ -1,7 +1,7 @@
 # E-ACSL: the bittree memory model never registers `stdin`, `stdout`, `stderr` and `errno` as safe locations, so every run-time check on them fails
 
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
-**Not filed.** Number 38 in this folder's index.
+**Filed on 2026-11-18 as [#2827](https://git.frama-c.com/pub/frama-c/-/work_items/2827), with merge request [!55](https://git.frama-c.com/pub/frama-c/-/merge_requests/55).** Number 38 in this folder's index.
 
 **Filing package (2026-11-17):** issue text
 [`./filing/38-eacsl-bittree-standard-streams-untracked-issue.md`](./filing/38-eacsl-bittree-standard-streams-untracked-issue.md),

@@ -11,7 +11,7 @@ Before submitting the merge request, please confirm (by adding a X in the [ ]):
 - [ ] if the size of the PR requires it, you have signed the
   [Contributor Licensing Agreement](https://git.frama-c.com/pub/frama-c/-/blob/master/CLA.md)
 
-Closes #<issue>.
+Closes #2825.
 
 ## Problem
 
@@ -20,7 +20,7 @@ Closes #<issue>.
 converts them to bytes with `size * MB`, where `MB` is the `int` constant `1024 * 1024`. From 2048 MB
 the product overflows `int`: `heap:2048` to `heap:4095` and `stack:2048` crash every run at start-up,
 larger heaps wrap to (N mod 4096) MB, larger stacks are ignored, and `thread-stack:2048` makes
-`pthread_create` fail (#<issue>).
+`pthread_create` fail (#2825).
 
 ## Change
 
@@ -43,7 +43,7 @@ Not changed here: `--zone-sizes tls:N` has no effect, because `PGM_TLS_SIZE` is 
 All on Debian 13 (gcc 14.2.0, clang 19.1.7), `master` at `95408044f7` built with dune, then the same
 tree with this patch, rebuilt and installed:
 
-- Reproducer from #<issue>, a program that allocates and writes 2 MB, built with gcc and with
+- Reproducer from #2825, a program that allocates and writes 2 MB, built with gcc and with
   `-G clang` for heap:1024, 2047, 2048, 4095, 4096, 4097 and stack:2047, 2048. Before: exit 139 for
   heap:2048, heap:4095 and stack:2048, exit 134 ("Exceeded heap allocation limit") for heap:4096 and
   heap:4097, and gcc warns `integer overflow in expression of type 'int'`; same on 34.0~beta. After:

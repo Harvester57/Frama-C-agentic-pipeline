@@ -1,7 +1,7 @@
 # E-ACSL: `e-acsl-gcc --zone-sizes heap:2048` (or `stack:2048`) makes every run of the monitored program crash: the size in MB is converted to bytes in `int`
 
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
-**Not filed.** Number 36 in this folder's index.
+**Filed on 2026-11-18 as [#2825](https://git.frama-c.com/pub/frama-c/-/work_items/2825), with merge request [!53](https://git.frama-c.com/pub/frama-c/-/merge_requests/53).** Number 36 in this folder's index.
 
 **Filing package (2026-11-17):** issue text
 [`./filing/36-eacsl-heap-zone-size-overflow-issue.md`](./filing/36-eacsl-heap-zone-size-overflow-issue.md),

@@ -1,0 +1,51 @@
+From 0992e740a2eda84aee597fd0c5ef696d7c95816b Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Tue, 17 Nov 2026 23:36:09 +0000
+Subject: [PATCH] [wp] manual: unit of "time" and meaning of "cached" in the
+ JSON report
+
+The description of the -wp-report-json output said that the "time" of a
+prover is in milliseconds, and that "cached" is the number of cached
+sub-goal verdicts, Qed-proved sub-goals included.
+
+"time" is Stats.time, a sum of VCS.prover_time values (solver_time for
+Qed), which are in seconds: a proof that the prover debug line reports
+as 15ms is 0.0154 in the report.
+
+"cached" is the number of prover results read from the cache
+(Stats.add_cached): one per prover and sub-goal, and never for Qed. A
+goal tried with three provers shows "cached": 3 on a second run.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ plugins/wp/doc/manual/wp_plugin.tex | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/plugins/wp/doc/manual/wp_plugin.tex b/plugins/wp/doc/manual/wp_plugin.tex
+index 766c23d873..15aaef3ec1 100644
+--- a/plugins/wp/doc/manual/wp_plugin.tex
++++ b/plugins/wp/doc/manual/wp_plugin.tex
+@@ -2299,7 +2299,7 @@ some of them being optional when indicated:
+   that consists of the following fields:
+   \begin{description}
+   \item[\tt "prover":<string>] prover name (with version, see option \texttt{-wp-prover});
+-  \item[\tt "time":<number>] prover time, in milliseconds. For \texttt{Qed}
++  \item[\tt "time":<number>] prover time, in seconds. For \texttt{Qed}
+     prover, includes also the total simplification time for other provers and
+     tactics that contributes to the goal;
+   \item[\tt "success":<number>] number of valid sub-goals the prover contributes to.
+@@ -2312,8 +2312,9 @@ some of them being optional when indicated:
+   (except for smoke-tests) (optional, when non-zero);
+ \item[\tt "unknown"?:<number>] number of sub-goals with unknown verdict
+   (except for smoke-tests) (optional, when non-zero);
+-\item[\tt "cached"?:<number>] number of cached sub-goals verdicts
+-  (including \texttt{Qed} proved sub-goals) (optional, when non-zero).
++\item[\tt "cached"?:<number>] number of prover results read from the cache,
++  one per prover and sub-goal; \texttt{Qed} results are not counted
++  (optional, when non-zero).
+ \end{description}
+ 
+ Notice that the JSON report file is printed in compact form without extra space nor indentation,
+-- 
+2.47.3
+

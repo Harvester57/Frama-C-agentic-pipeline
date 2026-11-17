@@ -1,7 +1,7 @@
 # E-ACSL: with `-e-acsl-full-mtracking` and `-G clang`, a string literal that is the suffix of another one splits its block, so `\valid_read` fails on correct code
 
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
-**Not filed.** Number 28 in this folder's [index](./README.md).
+**Filed on 2026-11-18 as [#2817](https://git.frama-c.com/pub/frama-c/-/work_items/2817), with merge request [!46](https://git.frama-c.com/pub/frama-c/-/merge_requests/46).** Number 28 in this folder's [index](./README.md).
 
 **Filing package:** [issue](./filing/28-eacsl-full-mtracking-tail-merged-literals-issue.md),
 [MR](./filing/28-eacsl-full-mtracking-tail-merged-literals-mr.md),

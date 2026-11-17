@@ -11,7 +11,7 @@ Before submitting the merge request, please confirm (by adding a X in the [ ]):
 - [ ] if the size of the PR requires it, you have signed the
   [Contributor Licensing Agreement](https://git.frama-c.com/pub/frama-c/-/blob/master/CLA.md)
 
-Closes #<issue>.
+Closes #2824.
 
 ## Problem
 

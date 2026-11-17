@@ -11,7 +11,7 @@ Before submitting the merge request, please confirm (by adding a X in the [ ]):
 - [ ] if the size of the PR requires it, you have signed the
   [Contributor Licensing Agreement](https://git.frama-c.com/pub/frama-c/-/blob/master/CLA.md)
 
-Closes #<issue>.
+Closes #2826.
 
 ## Problem
 
@@ -21,7 +21,7 @@ In the bittree memory model, `pt_lookup` (the exact-address lookup of the Patric
 `delete_block`, `store_block_duplicate`, `realloc` and `free` then read an indeterminate pointer:
 with `-O2`, checks fail and every `free` aborts with "Not a start of block"; without optimisation
 (`-G clang`, #2810) the program crashes. Also, `bt_clean` and `pt_lookup` dereference an empty tree:
-a program that stores no block crashes at exit (#<issue>).
+a program that stores no block crashes at exit (#2826).
 
 ## Change
 
@@ -44,7 +44,7 @@ Tests, `dev` configuration:
 All on Debian 13 (gcc 14.2.0, clang 19.1.7), `master` at `95408044f7` built with dune, then the same
 tree with this patch, rebuilt and installed:
 
-- Reproducer from #<issue>, two programs × {segment, bittree} × {gcc, `-M`, `-G clang`,
+- Reproducer from #2826, two programs × {segment, bittree} × {gcc, `-M`, `-G clang`,
   `-G clang -M`}. Before: 7 of the 8 bittree builds fail (exit 139 or 134; with gcc, the checks `RO`,
   `IN_SCOPE`, `OUT_OF_SCOPE` and `FREEABLE` fail, then "Not a start of block"); same on 34.0~beta. After:
   all 16 builds exit 0 with no failed check.

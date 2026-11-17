@@ -25,7 +25,7 @@ e-acsl-gcc -q -c -M -G gcc --validate-format-strings -o m.c -O m rec.c && ./m.e-
 ```
 
 (`-M` is `--full-mtracking`; without it every literal format string is rejected first with
-`invalid format string (unallocated or unterminated)`, which I report separately in #ISSUE-33.)
+`invalid format string (unallocated or unterminated)`, which I report separately in #2821.)
 
 ### Expected behaviour
 

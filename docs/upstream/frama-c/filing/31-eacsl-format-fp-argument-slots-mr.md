@@ -11,7 +11,7 @@ Before submitting the merge request, please confirm (by adding a X in the [ ]):
 - [ ] if the size of the PR requires it, you have signed the
   [Contributor Licensing Agreement](https://git.frama-c.com/pub/frama-c/-/blob/master/CLA.md)
 
-Closes #<issue>.
+Closes #2820.
 
 ## Problem
 
@@ -45,7 +45,7 @@ The new test includes `utils/signalled.h`, whose `signal_eval` has formals: if !
 marked initialized) lands first, `oracle/gen_printf_fp_args.0.c` needs regenerating (it gains
 `__e_acsl_full_init((void *)(& status));`, as `gen_printf.0.c` does in !28).
 
-This merge request and the one for #ISSUE-30 (promoted `unsigned char` for `"%u"`) both change
+This merge request and the one for #2819 (promoted `unsigned char` for `"%u"`) both change
 `e_acsl_stdio.c`, in different functions, and add different test files: each applies alone on
 `3dff90fc70`, and the two apply together in either order (`git am --3way`).
 
@@ -54,7 +54,7 @@ This merge request and the one for #ISSUE-30 (promoted `unsigned char` for `"%u"
 All on Debian 13 (gcc 14.2.0, x86_64), `master` at `3dff90fc70` built with dune, then the same tree
 with this patch:
 
-- Reproducer from #<issue> (`dbl.c`, `e-acsl-gcc -c -M -G gcc --validate-format-strings`) and the
+- Reproducer from #2820 (`dbl.c`, `e-acsl-gcc -c -M -G gcc --validate-format-strings`) and the
   issue's other cases. Before: `dbl.c`, `"%Lf %s"` and `"%f%n"` abort on a valid argument,
   `"%f %s %s"` with an unterminated first string aborts on directive 3, and `"%f %s"` with the
   unterminated string and a spare valid one runs. After: the first three run (`dbl.c` prints
@@ -72,20 +72,20 @@ oracles, so no existing oracle changes. Not run: the `dev` configuration of
   `sprintf.c`, and the other E-ACSL test directories (the runtime function changed is only compiled
   with `--validate-format-strings`).
 - Not tested on a 32-bit target (no 32-bit libc on my host).
-- With the patch for #ISSUE-30 applied too: the default configuration of `format/`, and the `dev`
+- With the patch for #2819 applied too: the default configuration of `format/`, and the `dev`
   configuration of both new tests and `fprintf.c`, pass; a mixed call
   `snprintf(t, n, "%f %u %s %Lf %x %s", 1.5, uc, s, 2.5L, us, s)` prints
   `1.500000 200 abc 2.500000 ea60 abc`.
 - `./dev/check-files.sh -p HEAD~1` (`make check-lint` and `make check-headers` on the changed files,
   with ocp-indent 1.10.0, headache 1.08 and clang-format 19.1.7) passes on a clone holding this
   commit; the new test is clang-formatted.
-- The patch applies with `git am` on `3dff90fc70` alone, before or after the patch for #ISSUE-30,
+- The patch applies with `git am` on `3dff90fc70` alone, before or after the patch for #2819,
   and on top of the patches of my other reports applied in sequence (!25 to !45, and the one
   proposed in #2816), with `git am --3way`.
 - Rerun on current `master` (`95408044f7`): the patch applies with `git am`; the reproducer gives the
   same results before and after; the new test fails on the unpatched sources in the `dev`
   configuration and passes with the patch; the default configuration of the whole E-ACSL suite (198
-  results) and `./dev/check-files.sh -p HEAD~1` pass. With the patch for #ISSUE-30 applied too, the
+  results) and `./dev/check-files.sh -p HEAD~1` pass. With the patch for #2819 applied too, the
   `dev` configuration of all of `format/` (`fprintf.c`, `printf.c`, `sprintf.c` and the two new
   tests) and the default configuration of the whole E-ACSL suite pass, which covers the runs listed
   as not run above (32-bit targets excepted).

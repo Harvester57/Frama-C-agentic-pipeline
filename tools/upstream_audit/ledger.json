@@ -1,0 +1,78 @@
+{
+ "28": {
+  "issue": 2817,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2817",
+  "mr": 46,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/46"
+ },
+ "29": {
+  "issue": 2818,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2818",
+  "mr": 47,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/47"
+ },
+ "30": {
+  "issue": 2819,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2819",
+  "mr": 48,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/48"
+ },
+ "31": {
+  "issue": 2820,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2820",
+  "mr": 49,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/49"
+ },
+ "32": {
+  "issue": 2822,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2822",
+  "mr": 50,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/50"
+ },
+ "33": {
+  "issue": 2821,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2821",
+  "mr": 51,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/51"
+ },
+ "34": {
+  "issue": 2823,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2823"
+ },
+ "35": {
+  "issue": 2824,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2824",
+  "mr": 52,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/52"
+ },
+ "36": {
+  "issue": 2825,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2825",
+  "mr": 53,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/53"
+ },
+ "37": {
+  "issue": 2826,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2826",
+  "mr": 54,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/54"
+ },
+ "38": {
+  "issue": 2827,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2827",
+  "mr": 55,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/55"
+ },
+ "39": {
+  "issue": 2828,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2828",
+  "mr": 56,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/56"
+ },
+ "40": {
+  "issue": 2829,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2829",
+  "mr": 57,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/57"
+ }
+}

@@ -29,7 +29,7 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   host with the core limit at 0, so the slowness described above is gone.
 - The scripts of 32, 33, 36, 37 and 38 print a table and always exit 0: compare their output with the
   "before" and "after" blocks in their headers. Their optional `EACSL_SHARE` points `e-acsl-gcc` at
-  another copy of the runtime sources. 34 and 40 have no patch, so only a "before" output.
+  another copy of the runtime sources. 34 has no patch and 40's patch only changes the manual, so both have only a "before" output.
 - Patched images `framac-master-audit:3dff90f-p28` to `-p31` held `master` with one patch each
   (the "after" runs of 28 to 31). In the master image, install a rebuilt tree with
   `dune install --release --prefix /home/opam/.opam/5.5` (plain `dune install` fails with

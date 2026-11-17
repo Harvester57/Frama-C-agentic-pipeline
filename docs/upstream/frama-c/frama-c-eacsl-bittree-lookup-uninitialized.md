@@ -1,7 +1,7 @@
 # E-ACSL: in the bittree memory model, `pt_lookup` returns an uninitialized pointer when it finds the block, so `free` aborts, `\freeable` and read-only marks are wrong, and `int main(void)` crashes at exit
 
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
-**Not filed.** Number 37 in this folder's index.
+**Filed on 2026-11-18 as [#2826](https://git.frama-c.com/pub/frama-c/-/work_items/2826), with merge request [!54](https://git.frama-c.com/pub/frama-c/-/merge_requests/54).** Number 37 in this folder's index.
 
 **Filing package (2026-11-17):** issue text
 [`./filing/37-eacsl-bittree-lookup-uninitialized-issue.md`](./filing/37-eacsl-bittree-lookup-uninitialized-issue.md),

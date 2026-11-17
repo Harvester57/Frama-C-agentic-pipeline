@@ -13,8 +13,12 @@ Paste-ready texts for [`pub/frama-c`](https://git.frama-c.com/pub/frama-c):
   - Below the comment is the description, starting with upstream's `external_contribution.md`
     checkboxes, left unticked for the owner.
 
-There is no MR text for 15, 34 or 40 (no patch) or 23 (fixed by 27's MR). The texts of 30 to 33
-cite each other's issues (`#ISSUE-30` to `#ISSUE-33`): file the four issues first. 38's texts cite
-37's issue (`#<issue-37>`): file 37 first. Replace `#<issue>`, `#<issue-37>`, `#ISSUE-NN` and
-`!<MR>` with the real numbers when filing. The texts are self-contained: they quote the reproducer
-and its output, and they link nothing in this repository.
+There is no MR text for 15 or 34 (no patch) or 23 (fixed by 27's MR). 40's MR text corrects two
+sentences of the WP manual only: it says "Related to", not "Closes", because the feature request of
+its issue stays open. The texts are self-contained: they quote the reproducer and its output, and
+they link nothing in this repository.
+
+Every text of this folder is filed (01 to 27 on 2026-11-15, 28 to 40 on 2026-11-18), and the
+placeholders now hold the real numbers. For a new package, write `#<issue>` for its own issue and
+`#ISSUE-NN` for another package's, file the issues in an order that lets each text cite the ones it
+needs, and replace the placeholders before sending: 30 to 33 cite each other, and 38 cites 37.

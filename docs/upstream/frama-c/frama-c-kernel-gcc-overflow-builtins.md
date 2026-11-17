@@ -1,7 +1,7 @@
 # Kernel/Libc: GCC's type-generic overflow builtins are modelled by first-operand `_Generic` macros (wrong result for mixed types, parse error for small types), the `_p` forms are missing, and without that header the call becomes an implicit declaration that gcc cannot link and clang rejects
 
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
-Not filed yet. Issue 34 of this folder. Issue only: no patch (see "Options").
+Filed on 2026-11-18 as [#2823](https://git.frama-c.com/pub/frama-c/-/work_items/2823). Issue 34 of this folder. Issue only: no patch (see "Options").
 
 **Filing package:** [issue](./filing/34-kernel-gcc-overflow-builtins-issue.md), [reproducer](./repro/34-kernel-gcc-overflow-builtins.sh)
 

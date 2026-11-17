@@ -1,7 +1,7 @@
 # Kernel: the GNU spelling `__restrict__` is not a keyword, so it is a syntax error unless a Frama-C libc header was included
 
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
-Not filed yet. Issue 35 of this folder.
+Filed on 2026-11-18 as [#2824](https://git.frama-c.com/pub/frama-c/-/work_items/2824), with merge request [!52](https://git.frama-c.com/pub/frama-c/-/merge_requests/52). Issue 35 of this folder.
 
 **Filing package:** [issue](./filing/35-kernel-restrict-gnu-spelling-issue.md), [MR](./filing/35-kernel-restrict-gnu-spelling-mr.md), [reproducer](./repro/35-kernel-restrict-gnu-spelling.sh), [patch](./patches/35-kernel-restrict-gnu-spelling.patch)
 

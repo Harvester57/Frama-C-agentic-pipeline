@@ -88,7 +88,7 @@ bash: line 1: 72281 Aborted                 ./rte.e-acsl
 exit 134
 ```
 
-The same with `-M`. With `-G clang`, `rte.c` aborts the same way and `streams.c` aborts earlier, for an unrelated bittree bug (#<issue-37>). `memory/errno.c` from the test suite also fails with `-m bittree` (`\valid(p)` with `p = &errno`).
+The same with `-M`. With `-G clang`, `rte.c` aborts the same way and `streams.c` aborts earlier, for an unrelated bittree bug (#2826). `memory/errno.c` from the test suite also fails with `-m bittree` (`\valid(p)` with `p = &errno`).
 
 ### Contextual information
 

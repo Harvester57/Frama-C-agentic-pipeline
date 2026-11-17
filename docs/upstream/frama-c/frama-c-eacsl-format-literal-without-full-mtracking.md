@@ -1,6 +1,6 @@
 # E-ACSL `--validate-format-strings` without `-M`: every format call aborts with "invalid format string"
 
-Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Not filed.** Number 33
+Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Filed on 2026-11-18 as [#2821](https://git.frama-c.com/pub/frama-c/-/work_items/2821), with merge request [!51](https://git.frama-c.com/pub/frama-c/-/merge_requests/51).** Number 33
 in this folder's [index](./README.md). Found while preparing Issues 30 and 31, which use `-M` to get
 past it.
 

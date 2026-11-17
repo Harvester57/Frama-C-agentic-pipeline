@@ -1,6 +1,6 @@
 # E-ACSL `--validate-format-strings`: a `"%s"`, `"%p"` or `"%n"` after a floating-point argument is checked against the wrong argument
 
-Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Not filed.** Number 31
+Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Filed on 2026-11-18 as [#2820](https://git.frama-c.com/pub/frama-c/-/work_items/2820), with merge request [!49](https://git.frama-c.com/pub/frama-c/-/merge_requests/49).** Number 31
 in this folder's [index](./README.md). It was first written together with Issue 30
 ([`./frama-c-eacsl-format-promoted-argument-signedness.md`](./frama-c-eacsl-format-promoted-argument-signedness.md)),
 a different defect in the same runtime function (`validate_format`,

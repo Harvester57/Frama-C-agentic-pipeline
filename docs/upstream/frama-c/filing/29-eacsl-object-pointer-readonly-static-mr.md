@@ -11,7 +11,7 @@ Before submitting the merge request, please confirm (by adding a X in the [ ]):
 - [ ] if the size of the PR requires it, you have signed the
   [Contributor Licensing Agreement](https://git.frama-c.com/pub/frama-c/-/blob/master/CLA.md)
 
-Closes #<issue>.
+Closes #2818.
 
 ## Problem
 
@@ -20,7 +20,7 @@ Closes #<issue>.
 `\object_pointer(p)` is false whenever `p` points into a block marked read-only: a string literal, a `const`
 global array, or `stdin` (a non-writable safe location). The ACSL definition of `\object_pointer` does not
 ask for writability. With `-warn-invalid-pointer`, the guard `\null == p || \object_pointer(p)` then fails on
-the first read through such a pointer (#<issue>).
+the first read through such a pointer (#2818).
 
 The ACSL contract of the builtin in `e_acsl_observation_model.h` uses `\valid` in its behaviours `valid`,
 `minus_one` and `invalid_pointer_ptr`, so it states the same requirement; Eva, run on the instrumented code
@@ -46,7 +46,7 @@ and that it does not hold two past the end or one before the start. It also chec
 All on Debian 13 (gcc 14.2.0, clang 19.1.7), `master` at `3dff90fc70` built with dune, then the same tree
 with this patch, rebuilt and installed:
 
-- Reproducers from #<issue>, each run on its four objects. Before: the `const` array and the string literal
+- Reproducers from #2818, each run on its four objects. Before: the `const` array and the string literal
   abort (exit 134) on `\object_pointer(p)`, and on the `invalid pointer` guard with
   `-rte -warn-invalid-pointer`, with gcc and `-G clang`, with and without `-M`, and with `--temporal`; same
   on 34.0~beta. After: every run exits 0. (`-m bittree` passes before and after, see the note below.)
@@ -71,8 +71,9 @@ with this patch, rebuilt and installed:
   `./dev/check-files.sh -p HEAD~1` pass.
 
 Note, not changed here: with `-m bittree`, the read-only mark does not take effect (`\valid(p)` holds on a
-`const` array or a string literal), and `stdin`, `stdout`, `stderr` and `errno` are not registered as safe
-locations, because the bittree `eacsl_memory_init` does not call `collect_safe_locations()`. The new test's
+`const` array or a string literal; reported as #2826), and `stdin`, `stdout`, `stderr` and `errno` are
+not registered as safe locations, because the bittree `eacsl_memory_init` does not call
+`collect_safe_locations()` (reported as #2827). The new test's
 `!\valid` and `stdin` checks fail with `-m bittree` for those reasons, before and after this patch; the test
 suite runs the segment model.
 

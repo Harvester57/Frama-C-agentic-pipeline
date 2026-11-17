@@ -136,7 +136,8 @@ prover is reported, and pointing to `-wp-status`, would already help.
   and excludes Qed (`cacheable` requires `p <> Prover.Qed`). That is why one goal shows
   `"cached": 3` above.
 
-I can send a merge request for the two manual sentences if that helps.
+I am sending a merge request for these two manual sentences only; the feature request above does
+not depend on it.
 
 Not reported as bugs, since the code shows they are intended:
 

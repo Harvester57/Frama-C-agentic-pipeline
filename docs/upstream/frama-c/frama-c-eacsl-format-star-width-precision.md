@@ -1,6 +1,6 @@
 # E-ACSL `--validate-format-strings`: a `*` field width or precision shifts every later argument
 
-Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Not filed.** Number 32
+Draft for the Frama-C tracker (https://git.frama-c.com/pub/frama-c/-/issues). **Filed on 2026-11-18 as [#2822](https://git.frama-c.com/pub/frama-c/-/work_items/2822), with merge request [!50](https://git.frama-c.com/pub/frama-c/-/merge_requests/50).** Number 32
 in this folder's [index](./README.md). Same runtime function as Issues 30
 ([`./frama-c-eacsl-format-promoted-argument-signedness.md`](./frama-c-eacsl-format-promoted-argument-signedness.md))
 and 31 ([`./frama-c-eacsl-format-fp-argument-slots.md`](./frama-c-eacsl-format-fp-argument-slots.md))

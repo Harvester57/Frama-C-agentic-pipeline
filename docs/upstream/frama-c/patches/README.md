@@ -15,8 +15,9 @@ promoted oracles, and some others update existing oracles; each MR text lists th
   text.
 - **Not run:** `make check-lint` and `make check-headers`.
 
-No patch for 15 (a design choice for the maintainers), 34 or 40 (issues only); 23 is fixed by
-`27-*`.
+No patch for 15 (a design choice for the maintainers) or 34 (issue only); 23 is fixed by `27-*`.
+`40-*` changes two sentences of the WP manual and nothing else (no test; the manual was not built):
+the feature request of its issue has no patch.
 
 **28 to 31 (2026-11-16, not filed):** same standard, and in addition each was checked with
 `git am --3way` after the 22 earlier patches, and with upstream's `./dev/check-files.sh -p HEAD~1`
@@ -39,3 +40,7 @@ reproducer before and after.
 - `35-*` and `39-*` touch the kernel and the libc (`tests/syntax` and `tests/libc` were run).
 - A patch must not change the mode of a file or create an executable one: a file copied into the
   container with `docker cp` from Windows has mode 755. `revalidate.sh` reports both.
+
+**2026-11-18:** 28 to 33 and 35 to 40 are filed as merge requests !46 to !57, one branch per patch
+from `95408044f7`. The branches were built with `git am --keep-non-patch` inside the audit
+container and pushed from a bundle, because the host clone converts line endings.

@@ -11,7 +11,7 @@ Before submitting the merge request, please confirm (by adding a X in the [ ]):
 - [ ] if the size of the PR requires it, you have signed the
   [Contributor Licensing Agreement](https://git.frama-c.com/pub/frama-c/-/blob/master/CLA.md)
 
-Closes #<issue>.
+Closes #2821.
 
 ## Problem
 
@@ -49,7 +49,7 @@ which abort. I left `--full-mtracking` in `format/test_config_dev`; removing it 
 directory without it, which I have not tried.
 
 The generated-code oracles of new `format/` tests made without this change gain the same monitoring
-code: if the merge requests for #ISSUE-30, #ISSUE-31 or #ISSUE-32 land first, their
+code: if the merge requests for #2819, #2820 or #2822 land first, their
 `gen_printf_promoted.0.c`, `gen_printf_fp_args.0.c` and `gen_printf_star.0.c` need regenerating,
 or theirs after this one. The patches apply together in any order (`git am --3way`).
 
@@ -58,7 +58,7 @@ or theirs after this one. The patches apply together in any order (`git am --3wa
 All on Debian 13 (gcc 14.2.0, x86_64), `master` at `95408044f7` built with dune, then the same tree
 with this patch:
 
-- Reproducer from #<issue> (`ip.c`, `e-acsl-gcc -q -c -G gcc --validate-format-strings`) and its
+- Reproducer from #2821 (`ip.c`, `e-acsl-gcc -q -c -G gcc --validate-format-strings`) and its
   cases. Before: every case aborts with `invalid format string (unallocated or unterminated)`.
   After: `ip.c` prints `192.168.1.200`; a local array, a pointer to it, a formal and `"%n"` run;
   the manual's example aborts with
@@ -76,7 +76,7 @@ with this patch:
   instrumented code with `-M` is identical, see above), and the other directories (only `format/`
   uses `--validate-format-strings`).
 - `./dev/check-files.sh -p HEAD~1` (ocp-indent 1.10.0, clang-format 19.1.7, headache) passes.
-- With the patches for #ISSUE-30, #ISSUE-31 and #ISSUE-32 applied too: the `dev` configuration of
+- With the patches for #2819, #2820 and #2822 applied too: the `dev` configuration of
   the four new tests and `fprintf.c` pass; the default configuration fails only on the three
   generated-code oracles named above.
 

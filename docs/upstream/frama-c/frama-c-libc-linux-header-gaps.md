@@ -1,7 +1,7 @@
 # Libc: no `<sys/epoll.h>` or `<sys/inotify.h>`, and a few smaller Linux/glibc gaps
 
 Draft feature request for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues),
-with a merge request. Not filed yet. Issue 39 of this folder.
+with a merge request. Filed on 2026-11-18 as [#2828](https://git.frama-c.com/pub/frama-c/-/work_items/2828), with merge request [!56](https://git.frama-c.com/pub/frama-c/-/merge_requests/56). Issue 39 of this folder.
 
 **Filing package:** [issue](./filing/39-libc-linux-header-gaps-issue.md), [MR](./filing/39-libc-linux-header-gaps-mr.md), [reproducer](./repro/39-libc-linux-header-gaps.sh), [patch](./patches/39-libc-linux-header-gaps.patch)
 

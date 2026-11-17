@@ -1,7 +1,7 @@
 # E-ACSL: `\object_pointer(p)` is false at run time for a pointer to read-only data (string literal, `const` global array), so every `-warn-invalid-pointer` guard on it fails
 
 Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
-**Not filed.** Number 29 in this folder's [index](./README.md).
+**Filed on 2026-11-18 as [#2818](https://git.frama-c.com/pub/frama-c/-/work_items/2818), with merge request [!47](https://git.frama-c.com/pub/frama-c/-/merge_requests/47).** Number 29 in this folder's [index](./README.md).
 
 **Filing package (2026-11-16):** issue text
 [`./filing/29-eacsl-object-pointer-readonly-static-issue.md`](./filing/29-eacsl-object-pointer-readonly-static-issue.md),

@@ -1,10 +1,11 @@
 # WP: with several provers, `-wp-report-json` keeps one prover per goal; the manual misdescribes `"time"` and `"cached"`
 
 Draft feature request for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues),
-with two documentation bugs in the same text. Not filed yet. Issue 40 of this folder. Issue only:
-no patch.
+with two documentation bugs in the same text. Filed on 2026-11-18 as [#2829](https://git.frama-c.com/pub/frama-c/-/work_items/2829), with merge request [!57](https://git.frama-c.com/pub/frama-c/-/merge_requests/57). Issue 40 of this folder.
+The feature request has no patch; the merge request corrects the two manual sentences only and
+does not close the issue.
 
-**Filing package:** [issue](./filing/40-wp-report-per-prover-results-issue.md), [reproducer](./repro/40-wp-report-per-prover-results.sh)
+**Filing package:** [issue](./filing/40-wp-report-per-prover-results-issue.md), [merge request](./filing/40-wp-report-per-prover-results-mr.md), [reproducer](./repro/40-wp-report-per-prover-results.sh), [manual patch](./patches/40-wp-report-per-prover-results.patch)
 
 ## Summary
 
