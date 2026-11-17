@@ -124,7 +124,7 @@ Parse every non-test link unit of the capture with Frama-C, on the same scratch 
 How it runs:
 - Units with the same sources and flags share one parse.
 - Each parse takes a `parse` lease from the broker (`--no-broker` skips it, `--jobs N` caps the parallel parses).
-- Target headers come from the capture's snapshot, and so do the headers the build generated (`config.h`): the capture copies them into the snapshot's `generated/` and every analysis adds that directory with `-idirafter`.
+- Target headers come from the capture's snapshot, and so do the headers the build generated (`config.h`): the capture copies them into the snapshot's `generated/` and every analysis adds that directory with `-idirafter`. The libc headers Frama-C's libc lacks (`linux/*`, `asm/*`, `elf.h`) come from the snapshot's `libc/`, the build image's copies. Every Frama-C parse searches them before the analysis image's own `/usr/include`.
 - `python3 /opt/framac-pipeline/scripts/phase0_model.py selftest` checks the dump module against the image's kernel. The image build runs it; run it again if the model fails to load its module.
 
 The result is `workspace/reports/phase0_model.json`, validated against `schemas/phase0_model.schema.json`. Every fact carries its source:

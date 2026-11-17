@@ -57,7 +57,7 @@ Frama-C needs exactly the files, include paths and macros each compilation unit 
    - the link units (libraries and executables) with their sources, the units they link, and per-file flags (`-I -D -U -include -imacros -iquote -isystem -std`);
    - test executables, marked `test` and left out of the analysis;
    - the API: exports (`nm -D`, version scripts), public headers, `main`;
-   - a snapshot of the headers and libraries the build used from outside the project, for the analysis image.
+   - a snapshot of the headers and libraries the build used from outside the project, for the analysis image. It also holds the build image's copies of the libc headers Frama-C's libc lacks (`linux-libc-dev`'s `linux/*` and `asm/*`, glibc's `elf.h`), under `libc/`. Every Frama-C parse searches them with `-idirafter`, after the target's headers and before the analysis image's own `/usr/include` directories. Those image directories stay last, as the fallback for a capture made before this export and for libc headers the build never named. `target_env.with_include_flags` owns this order.
 3. **Stop and ask.** A build that fails stops Phase 0 with `needs_build_recipe` and a diagnostic: first error, missing headers, candidate packages. The user fixes the recipe, and the capture runs again. A host that is not x86_64, or a build that produces other code than x86_64 (`-m32`, `-mx32`, a cross compiler), stops Phase 0 with `unsupported_architecture` and instructions: x86_64 Linux is the only supported platform.
 4. **Model** (`phase0_model.py run`, analysis image). Frama-C parses each unit with its own flags, once per distinct set of sources and flags. A unit Frama-C cannot parse falls back to GCC's call graph and is flagged.
 
