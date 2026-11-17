@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import fc_cpp_wrapper_eacsl as W
 import generate_report
+import phase0_gates
 import pipeline_make as pm
+import run_eacsl_fuzz as R
 import validate_artifacts
+from test_eacsl_toolchain import FakeEacslGcc, _src, modern_cli  # noqa: F401 - modern_cli is a fixture
 from test_pipeline_make import ACSL, UNION_LOG, _failed_build, _make_run
 
 CONST_UNION_REPO = Path(__file__).resolve().parent.parent
@@ -147,6 +151,14 @@ def test_build_check_sends_a_missed_const_union_to_the_rewrite_not_to_the_saniti
     assert "fc_cpp_wrapper_eacsl.py" in row["reason"] and "extend the rewrite" in row["reason"]
     assert "sanitizers" not in row["reason"]
     assert not validate_artifacts.validate_build_check(out)
+    # The gate stamp keeps the row; a refused fuzz-<mod> shows the first error, and no sanitizers command.
+    gates = json.loads((run / "workspace/reports/phase0_gates.json").read_text(encoding="utf-8"))["build_check"]
+    assert gates["modules"]["log"]["reason_code"] == "eacsl_static_const_union"
+    assert "next_step" not in gates["modules"]["log"]
+    assert not validate_artifacts.validate_phase0_gates(gates)
+    (reason,) = phase0_gates.check(run, "log", ("build_check",))
+    assert reason.startswith("build-check failed for log: build_failed (") and "implicit cast" in reason
+    assert "sanitizers" not in reason
 
     # With the switch off, the module gets the sanitizers command as before.
     _mark_rewrite(run, "log", False)
@@ -160,6 +172,45 @@ def _build_report(run: Path, mod: str, comp: dict) -> None:
     path.write_text(json.dumps({"mode": "build", "module": mod, "engine_used": comp["engine"], "compile": comp}))
 
 
+CONST_UNION_NOTE = (
+    "[fc-cpp] mod.c:{line}: static const union rewritten: static const union u z{line} -> static union u z{line}"
+    " (E-ACSL only: E-ACSL no longer checks the object as read-only)\n"
+)
+
+
+class _ConstUnionEacslGcc(FakeEacslGcc):
+    """Stage 1 reports `[fc-cpp]` rewrites on stderr, as the E-ACSL frontend's wrapper does."""
+
+    def __init__(self, stage1_errs: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self.stage1_errs = list(stage1_errs)
+
+    def __call__(self, cmd, **kwargs):
+        res = super().__call__(cmd, **kwargs)
+        if cmd[0] != "clang" and "-n" in cmd:
+            res.stderr = self.stage1_errs.pop(0) + (res.stderr or "")
+        return res
+
+
+@pytest.mark.usefixtures("modern_cli")
+def test_the_build_counts_the_rewrites_of_its_last_frontend_run(tmp_path):
+    # Two sources include the same header (`z3` twice): one declaration. The rte-select retry preprocesses
+    # again: only the last run counts.
+    first = CONST_UNION_NOTE.format(line=3) * 2 + CONST_UNION_NOTE.format(line=9)
+    retry = CONST_UNION_NOTE.format(line=3) * 2 + CONST_UNION_NOTE.format(line=9) + CONST_UNION_NOTE.format(line=12)
+    fake = _ConstUnionEacslGcc([first, retry], stage1_failures=["[kernel] User Error: no function 'ghost'\n"])
+    res = R.compile_eacsl_binary(
+        [str(_src(tmp_path))], tmp_path / "fuzz_mod", functions=["entry", "ghost"], runner=fake, use_cache=False
+    )
+    assert res["returncode"] == 0 and res["rte_select_dropped"] == ["ghost"]
+    assert res["const_union_rewrites"] == 3
+    assert isinstance(res["const_union_rewrite"], bool)  # False here: no POSIX gcc wrapper in unit tests
+    log = Path(res["compile_log"]).read_text(encoding="utf-8")
+    assert log.count("Dropped `const` from 3 `static const union` declaration(s)") == 1
+    plain = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "plain", runner=FakeEacslGcc(), use_cache=False)
+    assert "const_union_rewrites" not in plain
+
+
 def test_run_report_names_the_modules_built_with_the_rewrite(tmp_path):
     assert generate_report.const_union_rewrite_lines(tmp_path) == []
     _build_report(tmp_path, "sm4", {"engine": "eacsl", "returncode": 0, "const_union_rewrites": 1})
@@ -170,6 +221,23 @@ def test_run_report_names_the_modules_built_with_the_rewrite(tmp_path):
     lines = generate_report.const_union_rewrite_lines(tmp_path)
     assert len([ln for ln in lines if ln]) == 1
     assert "2 module(s)" in lines[0] and lines[0].endswith("`ccm` (2), `sm4` (1).")
+    meta: dict[str, Any] = {
+        "run_id": "r1",
+        "repo": "x",
+        "target": "/target",
+        "run_status": "complete",
+        "incomplete_reason": None,
+        "source_ref": {"vcs": "git", "commit": None},
+        "profile": "standard",
+        "scope_paths": [],
+        "budget": None,
+        "sandbox": {"outer": "docker", "inner": "none"},
+        "prior_runs": [],
+    }
+    data = {"meta": meta, "ledger": [], "findings": [], "candidates": [], "run_dir": tmp_path}
+    report = generate_report.render_report(data)
+    assert lines[0] in report.splitlines()
+    assert report.index(lines[0]) < report.index("## 6. Coverage gaps")
 
 
 # ---------------------------------------------------------------------------
