@@ -2958,7 +2958,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Link unit (DAG module) this harness belongs to when it is a sub-module (default: inferred)",
     )
     parser.add_argument("--sources", nargs="+", help="List of C source files in the module slice")
-    parser.add_argument("--header", default=None, help="Optional module header to include in harness (or 'none')")
+    parser.add_argument(
+        "--header",
+        default=None,
+        help=(
+            "Optional module header to include in harness (or 'none'). With --api and no --header, the "
+            "headers come from the build capture: the unit's public headers and the internal ones that "
+            "declare an entry point (api_harness.capture_headers); 'none' turns that off."
+        ),
+    )
     parser.add_argument("--entry-fn", help="Target entry function accepting (buf, len) or LLVMFuzzerTestOneInput")
     parser.add_argument(
         "--max-size",

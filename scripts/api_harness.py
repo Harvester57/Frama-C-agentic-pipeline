@@ -2806,11 +2806,13 @@ def generate(
                     scope,
                     *layouts_probed,
                     reserve=len(custom),
+                    variadic=variadic,
                     callback_stubs=False,
                 )
                 layouts_probed = None
                 if p["cases"]:
                     cases, layouts, skipped = with_custom(p)
+                    dropped = list(p["variadic_dropped"])
                     continue
             if other and more:
                 raise _HeadersBroken(other[:3])

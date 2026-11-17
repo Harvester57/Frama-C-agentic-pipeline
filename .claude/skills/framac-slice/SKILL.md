@@ -331,7 +331,7 @@ Schema problems in its own output are recorded as a `schema:` warning in the fil
 For each `Tier 1A`, `Tier 1B`, and `Tier 2` module:
 
 ```text
-python3 /opt/framac-pipeline/scripts/generate_harness.py --module <mod> [--unit <unit>] --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom|argv|dispatch> [--auto-args] [--dispatch-case '<stmts>']... [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
+python3 /opt/framac-pipeline/scripts/generate_harness.py --module <mod> [--unit <unit>] --sources <required_sources...> --header <mod.h> --entry-fn <entry_fn> --entry-style <buffer_len|c_string|global_buffer|struct_arg|void_call|auto_prototype|custom|argv|stdin|dispatch> [--auto-args] [--dispatch-case '<stmts>']... [--ldflags='<-lfoo ...>'] --max-size 1500 --out-dir workspace/harnesses
 ```
 
 Harnesses are written against link units and their API entry points (`candidate_entry_points`). A harness module is either a unit itself or a **sub-module** of one:
