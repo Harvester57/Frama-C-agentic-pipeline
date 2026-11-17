@@ -28,6 +28,9 @@ clause in a behavior) follow WP's naming scheme unchecked, and a mismatch there 
 
 A verdict kind is WP's merged verdict over the provers of the run: with several provers a timeout
 can hide another prover's unknown, so `would_be_all_proven_if_timeouts_closed` is an upper bound.
+For the same reason `unproved_by_prover` (timed out, gave up, failed, per prover) counts only the
+goals of reports whose run had exactly one prover; `unproved_without_prover_data` counts the rest.
+It changes no prover and no timeout: it is there to decide later whether a prover costs time for nothing.
 
 Fail closed: a report that cannot be read or has the wrong shape is counted and named under
 `reports.unreadable`, never dropped. A missing WP report directory is an error.
@@ -192,6 +195,36 @@ def join_by_line(goals: list[dict], costs: list[dict], function: str) -> tuple[l
     return kinds, len(costs) - len(paired)
 
 
+def prover_verdicts(report: dict) -> tuple[dict[str, dict[str, int]], int]:
+    """
+    ({prover: {timeout, gave_up, failed}}, goals without per-prover data) for the unproved WP goals of a
+    report. WP merges the verdicts of several provers into one entry per goal (a Timeout outranks an
+    Unknown), so a goal is attributed to a prover only when the run had exactly one (`wp_provers`);
+    every other unproved goal, and every row of a report without `unproven_goal_costs`, has no
+    per-prover data. `timeout` counts timeout and stepout, `gave_up` unknown, `failed` a prover error.
+    """
+    raw_costs = report.get("unproven_goal_costs")
+    if not isinstance(raw_costs, list):
+        return {}, len(report.get("unproven_goals") or [])
+    provers = report.get("wp_provers")
+    names = [p for p in provers if isinstance(p, str)] if isinstance(provers, list) else []
+    if len(names) != 1:
+        return {}, len(raw_costs)
+    counts = {"timeout": 0, "gave_up": 0, "failed": 0}
+    missing = 0
+    for cost in raw_costs:
+        kind = _verdict_kind(cost)
+        if kind in TIMEOUT_KINDS:
+            counts["timeout"] += 1
+        elif kind == "unknown":
+            counts["gave_up"] += 1
+        elif kind == "failed":
+            counts["failed"] += 1
+        else:
+            missing += 1
+    return ({names[0]: counts} if any(counts.values()) else {}), missing
+
+
 def function_record(report: dict, report_rel: str) -> tuple[dict, list[dict]]:
     """Per-function counts and the function's unproved goals (with their verdict kind)."""
     goals: list[dict] = list(report.get("unproven_goals") or [])
@@ -218,6 +251,7 @@ def function_record(report: dict, report_rel: str) -> tuple[dict, list[dict]]:
     else:
         by_verdict = {UNRECORDED: len(goals)} if goals else {}
 
+    by_prover, without_prover_data = prover_verdicts(report)
     proven = int(report.get("proven_count") or 0)
     under_hyp = int(report.get("proven_under_hyp_count") or 0)
     record: dict[str, Any] = {
@@ -241,6 +275,8 @@ def function_record(report: dict, report_rel: str) -> tuple[dict, list[dict]]:
         "provers": [p for p in report.get("wp_provers") or [] if isinstance(p, str)]
         if isinstance(report.get("wp_provers"), list)
         else [],
+        "by_prover": by_prover,
+        "without_prover_data": without_prover_data,
     }
     unproved = [
         {
@@ -388,6 +424,17 @@ def census(run_dir: Path, near_miss: int = DEFAULT_NEAR_MISS) -> dict:
             f"verdict kinds count WP goals ({verdict_total}) while classes and buckets count CSV report rows "
             f"({unproved_total}); one row can be several WP goals"
         )
+    by_prover: dict[str, Counter] = {}
+    for r in records:
+        for prover, counts in r["by_prover"].items():
+            by_prover.setdefault(prover, Counter()).update(counts)
+    without_prover_data = sum(r["without_prover_data"] for r in records)
+    if without_prover_data:
+        notes.append(
+            f"{without_prover_data} unproved goal(s) have no per-prover data: WP records one merged verdict per "
+            "goal, so a goal counts for a prover only in a report whose run had exactly one prover (wp_provers); "
+            "goals of a report without unproven_goal_costs count as rows"
+        )
     ambiguous = ambiguous_function_names(run_dir, notes)
     if ambiguous:
         notes.append(
@@ -427,6 +474,10 @@ def census(run_dir: Path, near_miss: int = DEFAULT_NEAR_MISS) -> dict:
             "unproved_by_bucket": _sum_counts(records, "by_bucket"),
             "unproved_by_verdict": _sum_counts(records, "by_verdict"),
             "unproved_rows_by_verdict": _sum_counts(records, "rows_by_verdict"),
+            "unproved_by_prover": {
+                p: {k: c[k] for k in ("timeout", "gave_up", "failed")} for p, c in sorted(by_prover.items())
+            },
+            "unproved_without_prover_data": without_prover_data,
         },
         "functions": records,
         "functions_without_decided_goals": undecided,
@@ -484,6 +535,14 @@ def render_table(data: dict) -> str:
     ):
         out += [f"### Unproved goals by {title}", ""]
         out += _table([title.capitalize(), "Goals"], [[k, v] for k, v in totals[key].items()] or [["-", 0]])
+
+    out += ["### Unproved goals by prover (single-prover runs only)", ""]
+    out += _table(
+        ["Prover", "Timed out", "Gave up", "Failed"],
+        [[p, c["timeout"], c["gave_up"], c["failed"]] for p, c in totals["unproved_by_prover"].items()]
+        or [["-", 0, 0, 0]],
+    )
+    out += [f"Goals without per-prover data: {totals['unproved_without_prover_data']}", ""]
 
     out += ["### Per function", ""]
     out += _table(
