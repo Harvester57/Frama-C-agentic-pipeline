@@ -258,7 +258,8 @@ These decide how much the new cases find. Each needs a design of its own.
 - **Now:** H1 on its branch, in parallel with S5, S6a and S7. It shares no file with them except
   `skills/framac-slice/SKILL.md`, which it edits last.
 - **After S5 is merged:** R1.
-- **After the merge to `main`:** S6b, then H1 rebased onto it.
+- **After the merge to `main`:** S6b, then H1 rebased onto it. **Changed 2026-11-17 (user):** both
+  were merged into `phase1-remediation` before the merge to `main`, S6b first, then H1.
 - **End validation (user-triggered, once):** regenerate Phase 0 for QCBOR `dev` `9bd0845` with H1
   and S6b. Expected: the header functions are entry points; `QCBORDecode_GetItemsInMap` has a case
   or is a reach gap; the E-ACSL build accepts the function list (HD8); the campaign report shows
@@ -269,7 +270,7 @@ These decide how much the new cases find. Each needs a design of its own.
 
 | Step | Size | When | Status |
 | :--- | :--- | :--- | :--- |
-| H1 | M | now, on `feat/header-entry-points`; lands after S6b | implemented 2026-11-17 on `feat/header-entry-points`, rebased onto `p1/s6b-wide-selector` (see "Review of H1"), not merged. HD3 only moves `reached`: trust and tiers stay as they were, since `trust.py` does not read `header_api`; a sub-module scoped to the sources is then not held to the header entry points (both open, see the troubleshooting entry). HD8 unverified until the end validation |
+| H1 | M | now, on `feat/header-entry-points`; lands after S6b | implemented 2026-11-17 on `feat/header-entry-points`, rebased onto `p1/s6b-wide-selector` (see "Review of H1") and merged into `phase1-remediation` the same day, after S6b. The compiled header case (`test_the_probe_sees_the_header_function_and_its_case_compiles`) passes with the analysis image's clang. HD3 only moves `reached`: trust and tiers stay as they were, since `trust.py` does not read `header_api`; a sub-module scoped to the sources is then not held to the header entry points (both open, see the troubleshooting entry). HD8 unverified until the end validation |
 | H2 | S | with H1 | open: decide whether `trust.py` counts `header_api` (see "Review of H1") |
 | R1 | S | after S5 is merged | merged 2026-11-17: the reach row and the run report list them, no gate reads them; open: on a split unit the numbers are a lower bound |
-| S6b | M | after the merge to `main` (remediation plan, D20) | written on `p1/s6b-wide-selector`, rebased onto `phase1-remediation` on 2026-11-17, not merged; tracked there |
+| S6b | M | after the merge to `main` (remediation plan, D20); moved before it by the user on 2026-11-17 | merged into `phase1-remediation` on 2026-11-17 from `p1/s6b-wide-selector`; tracked there |

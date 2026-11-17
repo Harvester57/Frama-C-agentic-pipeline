@@ -64,7 +64,7 @@ These settle choices the steps left open. Each step below applies them without r
 | D17 | How one bug seen at two sites becomes one finding (D1b). | **Through the existing `duplicate` rejection class.** S4 records the link (`related`) and the brief shows it. The verifier of the second candidate rejects it as `duplicate`, naming the first, as `crash_verifier_brief.md` already describes. No `same_root_cause_as` field and no change to `ingest-verifier`. The cost is one verifier run for the second candidate. |
 | D18 | How D2 keeps a gated module's units out of WP. | **`ledger.py gate-reach`.** Reach rows record `origin`. `phase0_gates.check` passes a row whose only failure is dynamic. `gate-reach` gives the planned units of each dynamically gated module `reach_gated` evidence and the status `blocked` with the reason `dynamic_reach_gap: <entry points>`, and returns them to `planned` when the gap is gone. `blocked`, not `deferred`: the ledger refuses `deferred` on a unit that carries evidence. `wp_scheduler.py init` and the `wp-replay` recipe call it. |
 | D19 | F6's CPU-second floor and the `stopped` names. | **`MIN_ROUND_CPU_S = 10`**, fixed. A new round needs at least that many CPU-seconds left, CPU-seconds being wall seconds times workers. `stopped` keeps the names in the code (`time_budget_spent`, `every_case_skipped`, `unskippable_case`, `rebuild_failed`, `crash_in_skipped_case`) and gains `no_new_case` and `insufficient_memory`. |
-| D20 | How S6 is cut. | **S6a** (F6 and `stopped`) and **S6b** (D7's two-byte selector). S6b comes last, after S5, because it changes `harness_reach.py`. Its selector is `identity16`: the first two input bytes, little-endian, are the case. **S6b moved after the merge** (user, 2026-11-17): F3 no longer loses cases silently, since more than 256 cases is refused, so the selector is an extension, and no validation target needs it. |
+| D20 | How S6 is cut. | **S6a** (F6 and `stopped`) and **S6b** (D7's two-byte selector). S6b comes last, after S5, because it changes `harness_reach.py`. Its selector is `identity16`: the first two input bytes, little-endian, are the case. **S6b moved after the merge** (user, 2026-11-17): F3 no longer loses cases silently, since more than 256 cases is refused, so the selector is an extension, and no validation target needs it. **Reversed the same day (user):** S6b was merged into `phase1-remediation` before the merge to `main`, together with H1 of [`./header-entry-points-plan.md`](./header-entry-points-plan.md), which needs it. V therefore runs on a tree that has both. |
 | D21 | When a coverage report is usable for F7. | **Status `ok`, or `partial` with `inputs.not_replayed` 0 or absent**, as `harness_reach.partial_coverage_reason` reads it. A function the report does not list counts as not executed, as in the dynamic reach gate. |
 
 ## Rules for every step
@@ -588,7 +588,6 @@ After the merge, on `main`:
 
 ```text
 V ─▶ S8
-S6b: any time
 S10 (user) ─▶ S12 (F13)
 S11, S13: any time, S13 before S11 if both land
 ```
@@ -600,7 +599,7 @@ S11, S13: any time, S13 before S11 if both land
 - **S5 after S4.** Both change `scripts/ledger.py`, `scripts/generate_report.py` and `templates/pipeline.mk`, and S5's coverage move imports what S4's move left in place.
 - **S6a after S3; in parallel with S4 and S5 only with care.** It owns `run_campaign_rounds`, which neither moves. But all three edit the import block of `run_eacsl_fuzz.py` and `skills/framac-fuzz/SKILL.md`, so a parallel S6a ends in a textual merge. Run it after S5 unless time matters.
 - **S7 comes last among the ledger steps**, since it touches `cmd_ingest_fuzz` after S2, S4 and S5. It also edits `merge_engine_campaigns`, next to S6a's function: after S6a.
-- **S6b after the merge (D20), and after S5 and S6a:** it changes `harness_reach.py` (S5's file) and `artifact_dispatch_case`.
+- **S6b after S5 and S6a:** it changes `harness_reach.py` (S5's file) and `artifact_dispatch_case`. D20 had moved it after the merge; it was merged before it on 2026-11-17 (user), so it is no longer in the diagram above.
 - **S12 (F14, F16) after S5:** both edit `skills/framac-verify/SKILL.md` and `docs/guides/architecture.md`.
 - **Shared files, one writer at a time:** `skills/framac-verify/SKILL.md` and `docs/guides/architecture.md` (S5, S12), `skills/framac-slice/SKILL.md` (S5, S6b), `skills/framac-fuzz/SKILL.md` (S2, S4, S5, S6a, S6b, S7), `scripts/ledger.py` (S2, S4, S5, S7), `templates/pipeline.mk` (S3, S4, S5), `tests/test_seam_guard.py` (S3, S4, S5).
 
@@ -624,7 +623,7 @@ Re-scoped on 2026-11-17 (D11). "Before merge" steps gate the merge to `main`; th
 | S4 | L | before merge | done (2026-11-17), merge `4de97ca`; replay and minimize accept a candidate's observations (`586d28d`); hypotheses without a line stay at function + kind (open entry in `ledger-and-verifier.md`) |
 | S5 | M | before merge | done (2026-11-17), merge `72db709` (in `cd4f827`) |
 | S6a | S | before merge | done (2026-11-17), merge `7e431a6`; round wall time is the time left (`cb56350`) |
-| S6b | M | after merge (D20) | written on `p1/s6b-wide-selector` (code and tests, then skills and docs), started early (user, 2026-11-17) and rebased onto `phase1-remediation` with S1 to S7 and S12 merged; the compiled wide harness test passes in the analysis image (`FRAMAC_DOCKER_TESTS=1`); lands after the merge |
+| S6b | M | before merge (user, 2026-11-17; D20 said after) | done and merged 2026-11-17 from `p1/s6b-wide-selector`, with H1 on top; the compiled wide harness test passes in the analysis image (`FRAMAC_DOCKER_TESTS=1`). Not checked: the skip of a case at or above 256 in a compiled harness, Eva on a wide harness, a real target |
 | S7 | S | before merge | done (2026-11-17), merge `9890f29` |
 | S8 | S | after merge | open, after V |
 | S9 | M | before merge | done, commit `7be8bd1` (2026-11-14); minmea's `-rte-initialized` opt-out dropped from the benchmark manifest |
@@ -633,4 +632,4 @@ Re-scoped on 2026-11-17 (D11). "Before merge" steps gate the merge to `main`; th
 | S12 | S | F14, F16 before merge; F13 after | F14 and F16 done (2026-11-17, merge `cd4f827`); F13 open |
 | S13 | S | after merge | open |
 | S14 | M | before merge | done; seeded benchmark 9/9 bugs, 0/4 decoys (run seeded-s14, s09 found by both `tf_fuzz_parse` and the imported corpus in `librcf_a`); a c-ares coverage comparison is still to do |
-| V | — | last before merge | ready: S1–S7, F14 and F16 are on the branch (implemented by Claude Haiku 5.5, reviewed per step); waits for the user |
+| V | — | last before merge | ready: S1–S7, F14 and F16 are on the branch (implemented by Claude Haiku 5.5, reviewed per step); waits for the user. Since 2026-11-17 the branch also has S6b, H1 and the open-topics steps (O4, O5, O7, O9 to O12), so V validates those too: a library whose public headers define functions gets more entry points and cases, and the counts V compares with earlier runs can move for that reason |
