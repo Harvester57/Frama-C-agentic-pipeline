@@ -4,7 +4,9 @@ The build module (fuzz_build) and the helpers it shares with the other fuzz modu
 
 from __future__ import annotations
 
+import argparse
 import ast
+import shutil
 from pathlib import Path
 
 import pytest
@@ -12,10 +14,11 @@ import pytest
 import fuzz_build
 import fuzz_common
 import run_eacsl_fuzz as R
+from test_cache import FakeToolchain, _module  # the fake E-ACSL and sanitizer toolchain of the cache tests
 
 pytestmark = pytest.mark.unit
 
-SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+BUILD_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -94,7 +97,7 @@ def test_run_eacsl_fuzz_reexports_every_moved_name():
 
 
 def test_the_moved_build_functions_are_defined_in_fuzz_build_only():
-    text = (SCRIPTS / "run_eacsl_fuzz.py").read_text(encoding="utf-8")
+    text = (BUILD_SCRIPTS / "run_eacsl_fuzz.py").read_text(encoding="utf-8")
     tree = ast.parse(text)
     defined_here = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
     for name in ("compile_eacsl_binary", "build_module_binary", "repair_sources_for_link", "framac_version"):
@@ -104,9 +107,83 @@ def test_the_moved_build_functions_are_defined_in_fuzz_build_only():
 
 @pytest.mark.parametrize("module", ["fuzz_build", "fuzz_common"])
 def test_the_new_modules_do_not_import_run_eacsl_fuzz(module):
-    imports = _imported_modules(SCRIPTS / f"{module}.py")
+    imports = _imported_modules(BUILD_SCRIPTS / f"{module}.py")
     assert "run_eacsl_fuzz" not in imports
 
 
 def test_fuzz_common_imports_nothing_from_fuzz_build():
-    assert "fuzz_build" not in _imported_modules(SCRIPTS / "fuzz_common.py")
+    assert "fuzz_build" not in _imported_modules(BUILD_SCRIPTS / "fuzz_common.py")
+
+
+def _built(returncode: int, engine: str) -> dict:
+    return {"returncode": returncode, "binary": f"{engine}.bin", "engine": engine, "cache": {"hit": False, "key": None}}
+
+
+def test_build_compiles_eacsl_without_reading_the_selftest(monkeypatch, tmp_path):
+    # D8: `build` does not apply a failed selftest; the campaign does (the next test).
+    monkeypatch.setattr(fuzz_build, "selftest_blocks_eacsl", lambda *a, **k: "eacsl_selftest_failed: canary")
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: _built(0, "eacsl"))
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", lambda *a, **k: _built(0, "sanitizers"))
+    built = fuzz_build.build_module_binary(["m.c"], tmp_path / "fuzz_m", engine="auto", apply_selftest=False)
+    assert built["engine_used"] == "eacsl" and built["engine_fallback_reason"] is None
+
+
+def test_the_campaign_still_applies_the_selftest(monkeypatch, tmp_path):
+    monkeypatch.setattr(fuzz_build, "selftest_blocks_eacsl", lambda *a, **k: "eacsl_selftest_failed: canary")
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: _built(0, "eacsl"))
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", lambda *a, **k: _built(0, "sanitizers"))
+    campaign = fuzz_build.build_module_binary(["m.c"], tmp_path / "fuzz_m", engine="auto")
+    assert campaign["engine_used"] == "sanitizers"
+    assert campaign["engine_fallback_reason"] == "eacsl_selftest_failed: canary"
+
+
+def test_build_auto_records_the_sanitizer_build_and_the_campaign_compiles_nothing(tmp_path, monkeypatch):
+    run = tmp_path / "run-1"
+    run.mkdir()
+    (run / "run-metadata.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.chdir(run)
+    monkeypatch.setenv("FRAMAC_IMAGE_ID", "sha256:test-image")
+    monkeypatch.delenv("FRAMAC_CACHE", raising=False)
+    monkeypatch.delenv("FRAMAC_SHARED_CACHE_DIR", raising=False)
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    _module(run)
+    fake = FakeToolchain(deps=["inc/mod.h"])
+    real_eacsl, real_sanitizer = fuzz_build.compile_eacsl_binary, fuzz_build.compile_sanitizer_binary
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: real_eacsl(*a, **{"runner": fake, **k}))
+    monkeypatch.setattr(
+        fuzz_build, "compile_sanitizer_binary", lambda *a, **k: real_sanitizer(*a, **{"runner": fake, **k})
+    )
+    args = argparse.Namespace(
+        module="mod",
+        sources=["mod.c"],
+        out_bin=Path("workspace/harnesses/fuzz_mod"),
+        engine="auto",
+        machdep="gcc_x86_64",
+        cppflags="-Iinc",
+        ldflags="",
+        rte="all",
+        functions=None,
+        no_variadic_translation=False,
+        warn_unsigned_downcast=False,
+        no_rte_initialized=False,
+        no_libc_checks=False,
+        selftest_json=run / "no-selftest.json",
+    )
+
+    built = R._run_build_mode(args)
+    assert built["status"] == "built" and built["engine_used"] == "eacsl"
+    assert built["sanitizer_compile"]["returncode"] == 0
+    builds = len(fake.builds())
+
+    # the campaign's two builds, with its arguments, restore from the cache
+    options = R._build_options(args)
+    campaign = fuzz_build.build_module_binary(args.sources, args.out_bin, **options)
+    second = fuzz_build.build_module_binary(args.sources, args.out_bin, **{**options, "engine": "sanitizers"})
+    assert campaign["compile"]["cache"]["hit"] and second["compile"]["cache"]["hit"]
+    assert len(fake.builds()) == builds
+
+    only_eacsl = R._run_build_mode(argparse.Namespace(**{**vars(args), "engine": "eacsl"}))
+    assert "sanitizer_compile" not in only_eacsl
+    only_sanitizers = R._run_build_mode(argparse.Namespace(**{**vars(args), "engine": "sanitizers"}))
+    assert "sanitizer_compile" not in only_sanitizers

@@ -3525,7 +3525,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_build_mode(args) -> dict:
-    build = fuzz_build.build_module_binary(args.sources, args.out_bin, **_build_options(args))
+    # D8: `build` compiles what --engine asks for and does not apply the selftest; the campaign does.
+    build = fuzz_build.build_module_binary(args.sources, args.out_bin, **_build_options(args), apply_selftest=False)
     comp = build["compile"]
     built = comp["returncode"] == 0
     res: dict = {
@@ -3546,6 +3547,13 @@ def _run_build_mode(args) -> dict:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
     if build.get("link_repair"):
         res["link_repair"] = build["link_repair"]
+    if args.engine == "auto" and build["engine_used"] == "eacsl":
+        # The campaign falls back to the sanitizers when the selftest fails: build them now, with the
+        # campaign's arguments, so that it restores them from the cache.
+        san = fuzz_build.build_module_binary(
+            args.sources, args.out_bin, **{**_build_options(args), "engine": "sanitizers"}
+        )
+        res["sanitizer_compile"] = san["compile"]
     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
 

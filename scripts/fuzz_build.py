@@ -1302,6 +1302,7 @@ def build_module_binary(
     *,
     engine: str = "auto",
     selftest_json: Path | None = DEFAULT_SELFTEST_JSON,
+    apply_selftest: bool = True,
     machdep: str = "gcc_x86_64",
     cppflags: str = "-I.",
     ldflags: str = "",
@@ -1332,6 +1333,8 @@ def build_module_binary(
     (name, file, units, reason) lists the globals no rule could define.
     Returns {compile, engine_used, engine_fallback_reason, eacsl_compile_attempt, sources}, where
     `sources` is what was compiled last (the input plus any repair).
+    With `apply_selftest` False, the selftest result is not read: `auto` tries E-ACSL as `eacsl` does
+    (D8). The campaign applies the selftest, and it restores these builds from the cache.
     """
 
     def _attempt(srcs: list[str]) -> tuple[dict, dict | None, str | None]:
@@ -1339,7 +1342,7 @@ def build_module_binary(
         fallback_reason = None
         comp = None
         if engine in ("auto", "eacsl"):
-            blocked = selftest_blocks_eacsl(selftest_json) if engine == "auto" else None
+            blocked = selftest_blocks_eacsl(selftest_json) if engine == "auto" and apply_selftest else None
             if blocked:
                 fallback_reason = blocked
             else:
