@@ -259,6 +259,47 @@ def line_text_hash(file_path: str, line: int) -> str | None:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
 
 
+def site_key(
+    file: str,
+    function: str,
+    line: int,
+    fn_range: tuple[int, int] | None = None,
+) -> str | None:
+    """
+    The statement site of a failure (D1a): `<file>#<function>@<h>`, `<h>` the line text hash, so that
+    inserting lines above keeps it. When `fn_range` (first and last line of the function) is given and
+    the same normalized text occurs more than once in that range, `#<n>` counts the occurrences from
+    the first line of the range down to `line` (so two identical lines in one function are two sites).
+    None when the line text cannot be read.
+    """
+    text = normalized_source_line(file, line)
+    if text is None:
+        return None
+    key = f"{normalize_file(file)}#{function}@{line_text_hash(file, line)}"
+    if fn_range is None:
+        return key
+    first, last = fn_range
+    source = _normalized_source_lines(file)
+    if source is None:
+        return key
+    in_range = [i for i in range(max(first, 1), min(last, len(source)) + 1) if source[i - 1] == text]
+    if len(in_range) <= 1 or line not in in_range:
+        return key
+    return f"{key}#{in_range.index(line) + 1}"
+
+
+def _normalized_source_lines(file_path: str) -> list[str] | None:
+    """Every line of the first source file `file_path` resolves to, normalized as `normalized_source_line`."""
+    candidates = _resolve_source_candidates(file_path)
+    if not candidates:
+        return None
+    try:
+        lines = candidates[0].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    return [" ".join(raw.split()) for raw in lines]
+
+
 def is_harness_fuzz_function(name: str) -> bool:
     """
     The harness's own fuzz entry, runtime dispatch-skip helper, or a target fuzzer's hook it calls

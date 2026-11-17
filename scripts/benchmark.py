@@ -1595,7 +1595,7 @@ def inner_replay() -> int:
     Replay each bug's reproducer on the binary the pipeline builds today. Reports with a required
     replay that reproduced go through normal fuzz ingestion, so a filter added there is measured.
     """
-    import run_eacsl_fuzz as fuzz
+    import crash_replay
 
     spec = _load_spec()
     # A bug replays on the harness holding its function, which for a link unit split into
@@ -1606,7 +1606,7 @@ def inner_replay() -> int:
         where = (item["module"], str(item.get("file") or ""), str(item.get("function") or ""))
         if where not in builds:
             try:
-                builds[where] = fuzz.replay_build_spec(
+                builds[where] = crash_replay.replay_build_spec(
                     item["module"], Path("workspace/harnesses"), file=where[1] or None, function=where[2] or None
                 )
             except (OSError, ValueError, RuntimeError) as exc:
@@ -1627,7 +1627,7 @@ def inner_replay() -> int:
             build = items[0]["_build"]
             if isinstance(build, str):
                 raise RuntimeError(build)
-            prepared = fuzz.prepare_replay_binary(
+            prepared = crash_replay.prepare_replay_binary(
                 module,
                 build["sources"],
                 Path("workspace/harnesses") / (f"fuzz_{module}" if engine == "eacsl" else f"replay_san_{module}"),
@@ -1638,7 +1638,7 @@ def inner_replay() -> int:
                 rte_initialized=bool(build.get("rte_initialized", True)),
                 libc_checks=bool(build.get("libc_checks", True)),
             )
-            report = fuzz.replay_report(
+            report = crash_replay.replay_report(
                 module,
                 sorted(set(inputs.values())),
                 Path(BENCH_SUBDIR) / "scratch" / f"{module}-{engine}",

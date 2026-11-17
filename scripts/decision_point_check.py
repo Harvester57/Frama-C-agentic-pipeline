@@ -391,10 +391,10 @@ def patched_build_spec(spec: dict, run_dir: Path, overlay_work: Path) -> dict:
 
 
 def build_binary(module: str, spec: dict, out_bin: Path, engine: str) -> dict:
-    """Build a module binary for replays (run_eacsl_fuzz.prepare_replay_binary; never cached in agent scratch)."""
-    import run_eacsl_fuzz
+    """Build a module binary for replays (crash_replay.prepare_replay_binary; never cached in agent scratch)."""
+    import crash_replay
 
-    return run_eacsl_fuzz.prepare_replay_binary(
+    return crash_replay.prepare_replay_binary(
         module,
         list(spec["sources"]),
         out_bin,
@@ -408,22 +408,22 @@ def build_binary(module: str, spec: dict, out_bin: Path, engine: str) -> dict:
 
 
 def replay(module: str, inputs: list[Path], scratch: Path, prepared: dict, per_input_timeout: int) -> dict:
-    """Replay `inputs` once each in the sandbox (run_eacsl_fuzz.replay_report)."""
-    import run_eacsl_fuzz
+    """Replay `inputs` once each in the sandbox (crash_replay.replay_report)."""
+    import crash_replay
 
-    return run_eacsl_fuzz.replay_report(module, inputs, scratch, prepared=prepared, per_input_timeout=per_input_timeout)
+    return crash_replay.replay_report(module, inputs, scratch, prepared=prepared, per_input_timeout=per_input_timeout)
 
 
 def build_spec(module: str, file: str | None, function: str | None) -> dict:
-    import run_eacsl_fuzz
+    import crash_replay
 
-    return run_eacsl_fuzz.replay_build_spec(module, HARNESS_DIR, file, function)
+    return crash_replay.replay_build_spec(module, HARNESS_DIR, file, function)
 
 
 def candidate_engine(cand: dict) -> str:
-    import run_eacsl_fuzz
+    import crash_replay
 
-    return run_eacsl_fuzz._candidate_engine(cand)
+    return crash_replay._candidate_engine(cand)
 
 
 def _outcome(report: dict, expected: set[str]) -> dict:

@@ -69,6 +69,7 @@ import cache  # noqa: E402
 import decision_point_check  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
+from failure_identity import site_key  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
@@ -308,6 +309,39 @@ def mark_candidate(unit: dict, fingerprint: str) -> None:
     unit["unresolved"] = []
 
 
+def _observe(cand: dict, fp: str, origin: str, engine: str | None, prop: dict, tool_output: str, reproducers) -> None:
+    """Append what one detection saw at the candidate's site (`observations`), once per fingerprint, origin and engine."""
+    observations = cand.setdefault("observations", [])
+    if any(o["fingerprint"] == fp and o["origin"] == origin and o["engine"] == engine for o in observations):
+        return
+    observations.append(
+        {
+            "fingerprint": fp,
+            "origin": origin,
+            "engine": engine,
+            "kind": str((prop or {}).get("kind") or ""),
+            "message": str((prop or {}).get("predicate") or ""),
+            "tool_output": tool_output or "",
+            "reproducer": str(reproducers[0]) if reproducers else None,
+        }
+    )
+
+
+def landing_candidate(candidates, fp, site: str | None) -> dict | None:
+    """
+    The candidate a detection with fingerprint `fp` at `site` is recorded on, by upsert_candidate's rule: the
+    candidate keyed by `fp`, else the unverified candidate at the site. None when the detection opens a new one.
+    Callers read a candidate's state through this before recording the detection.
+    """
+    cand = candidates.get(fp)
+    if cand is None and site is not None:
+        cand = next(
+            (c for c in candidates.values() if c.get("site") == site and c.get("status") == "unverified"),
+            None,
+        )
+    return cand
+
+
 def upsert_candidate(
     candidates,
     fp,
@@ -320,8 +354,16 @@ def upsert_candidate(
     tool_output,
     linked,
     note=None,
+    *,
+    site: str | None = None,
+    engine: str | None = None,
 ) -> dict:
-    cand = candidates.get(fp)
+    """
+    Record one detection and return the candidate it landed on. Its key is `cand["fingerprint"]`, which
+    is not always `fp`: a detection at the `site` of an unverified candidate that `fp` does not key takes
+    that candidate (D1, F5). Callers use the returned candidate's fingerprint for everything after this.
+    """
+    cand = landing_candidate(candidates, fp, site)
     if cand is None:
         cand = {
             "fingerprint": fp,
@@ -335,8 +377,16 @@ def upsert_candidate(
             "tool_outputs": [],
             "linked_units": [],
             "first_seen": utc_now(),
+            "observations": [],
         }
+        if site is not None:
+            cand["site"] = site
         candidates[fp] = cand
+    else:
+        first_engine = (cand.get("observations") or [{}])[0].get("engine")
+        if (origin == "eva" or engine == "eacsl") and first_engine == "sanitizers":
+            # The E-ACSL or Eva reading of a site a sanitizer saw first names the bug better.
+            cand["property"] = prop
     if proposed == "confirmed":
         cand["proposed_verdict"] = "confirmed"
     for r in reproducers:
@@ -351,6 +401,7 @@ def upsert_candidate(
         cand.setdefault("notes", [])
         if note not in cand["notes"]:
             cand["notes"].append(note)
+    _observe(cand, fp, origin, engine, prop, tool_output, reproducers)
     return cand
 
 
@@ -1155,10 +1206,12 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 elif not linked:
                     notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")
                 note = "; ".join(notes) or None
-                prior = candidates.get(fp)
+                # The state read is of the candidate this detection lands on (its key, or the site's unverified one).
+                site = _candidate_site(file, failure.get("line"), source_fn, index)
+                prior = landing_candidate(candidates, fp, site)
                 already_listed = prior is not None and artifact_rel in prior["reproducers"]
                 rejected_before = reopen and prior is not None and _rejected_resolution(prior, findings) is not None
-                upsert_candidate(
+                cand = upsert_candidate(
                     candidates,
                     fp,
                     "fuzz",
@@ -1173,7 +1226,11 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     linked,
                     note,
+                    site=site,
+                    engine=_detection_engine(art, report),
                 )
+                # A detection at a known site lands on that site's candidate: its key, not `fp`, from here on.
+                fp = cand["fingerprint"]
                 for cid in linked:
                     add_evidence(
                         units[cid],
@@ -1210,7 +1267,7 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak') else ''}".encode()
                 ).hexdigest()[:10]
                 fp = f"harness_{re.sub(r'[^A-Za-z0-9_.-]', '_', module)}.c#unknown_function::{'unparsed_' + kind if kind in ('crash', 'leak') else kind}::{digest}"
-                upsert_candidate(
+                cand = upsert_candidate(
                     candidates,
                     fp,
                     "fuzz",
@@ -1222,7 +1279,9 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     [],
                     "no E-ACSL failure report could be parsed; verifier must triage and link units",
+                    engine=_detection_engine(art, report),
                 )
+                fp = cand["fingerprint"]
             stats["candidates"] += 1
     commit(units, candidates)
     if cache.shared_mode() == "rw" and ingested_modules:
@@ -1360,6 +1419,31 @@ def _dag_line_index(dag_path: Path = DAG_REPORT, dag: dict | None = None) -> dic
                 (line, end, str(rec.get("name") or key))
             )
     return out
+
+
+def _detection_engine(art: dict, report: dict) -> str | None:
+    """The engine that found a fuzz artifact: its own `engine`, else the report's `engine_used` (None for a dual run without one)."""
+    for value in (art.get("engine"), report.get("engine_used")):
+        if value in ("eacsl", "sanitizers"):
+            return value
+    return None
+
+
+def _candidate_site(file: str, line: object, function: str, index: dict[str, list[tuple[int, int, str]]]) -> str | None:
+    """
+    The statement site (failure_identity.site_key) of a detection at `file`:`line` in `function`, the
+    DAG function the line lies in when it is known (the function's line range numbers identical lines).
+    None when the line is not positive or cannot be read: such a detection keys on its own fingerprint.
+    """
+    if not isinstance(line, int) or line <= 0 or not file or file == "unknown":
+        return None
+    norm = normalize_file(file)
+    spans = [s for s in (index or {}).get(norm, []) if s[0] <= line <= s[1]]
+    if not spans:
+        return site_key(file, function, line)
+    # The DAG's name for the line, so that every engine's report of the site names the same function.
+    span = min(spans, key=lambda s: s[1] - s[0])
+    return site_key(file, span[2], line, (span[0], span[1]))
 
 
 def _model_kernel_names(model_path: Path = MODEL_JSON) -> dict[tuple[str, str], dict[str, str]]:
@@ -1759,7 +1843,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             for alarm in unit_invalids:
                 consumed.add(id(alarm))
                 fp = make_fingerprint(u_file, fn, alarm.get("kind", ""), alarm.get("annotation", ""))
-                upsert_candidate(
+                cand = upsert_candidate(
                     candidates,
                     fp,
                     "eva",
@@ -1774,7 +1858,9 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                     "Eva Invalid status without a concrete witness input"
                     if own
                     else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
+                    site=_candidate_site(u_file, alarm.get("line"), fn, index),
                 )
+                fp = cand["fingerprint"]  # the site's candidate may be another detection's key
                 add_evidence(
                     u,
                     "eva",
@@ -1889,7 +1975,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             if id(alarm) in consumed or not isinstance(alarm, dict):
                 continue
             consumed.add(id(alarm))
-            _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output, unit_module)
+            _ingest_unscheduled_eva_invalid(units, candidates, alarm, module, tool_output, unit_module, index)
             stats["candidates"] += 1
 
     # Each touched unit's Eva status, from every module's verdict: covered only when some module's
@@ -1966,6 +2052,7 @@ def _ingest_unscheduled_eva_invalid(
     module: str,
     tool_output: str,
     unit_module: str | None = None,
+    index: dict[str, list[tuple[int, int, str]]] | None = None,
 ) -> None:
     """
     An Eva Invalid alarm no scheduled rte unit took (remediation plan H7), mirroring the fuzz path:
@@ -1975,6 +2062,7 @@ def _ingest_unscheduled_eva_invalid(
     (the candidate's), `unit_module` the DAG module it belongs to (default: the same).
     """
     unit_module = unit_module or module
+    index = _dag_line_index() if index is None else index
     fn = str(alarm.get("function") or "")
     alarm_file = _eva_alarm_path(alarm)
     linked_units = [
@@ -1991,7 +2079,7 @@ def _ingest_unscheduled_eva_invalid(
     if linked_units:
         u_file = linked_units[0]["file"]
         fp = make_fingerprint(u_file, fn, kind, annotation)
-        upsert_candidate(
+        cand = upsert_candidate(
             candidates,
             fp,
             "eva",
@@ -2007,7 +2095,9 @@ def _ingest_unscheduled_eva_invalid(
             "Eva Invalid status without a concrete witness input"
             if linked_units[0]["module"] == unit_module
             else f"Eva Invalid status in cross-module slice '{module}' without a concrete witness input",
+            site=_candidate_site(u_file, line, fn, index),
         )
+        fp = cand["fingerprint"]
         for u in linked_units:
             _unit_eva_verdicts(u)[module] = "invalid"
             add_evidence(
@@ -2037,6 +2127,7 @@ def _ingest_unscheduled_eva_invalid(
         [],
         f"Eva Invalid status without a concrete witness input; no ledger unit for {file}#{function}::rte "
         "(out of scope, not applicable, harness or unseeded code)",
+        site=_candidate_site(file, line, function, index),
     )
 
 
@@ -2406,18 +2497,76 @@ def _candidate_harness_module(mm: ModuleMap, cand: dict) -> str:
     return harness_module_for_function(mm, module, loc.get("file"), loc.get("function")) or module
 
 
+def _add_related(cand: dict, other_fp: str, reason: str) -> bool:
+    """Record a `related` link on a candidate, once per other fingerprint. True when it was added."""
+    related = cand.setdefault("related", [])
+    if any(r.get("fingerprint") == other_fp for r in related):
+        return False
+    related.append({"fingerprint": other_fp, "reason": reason})
+    return True
+
+
+@ledger_locked
+def cmd_link_related(index_path: Path) -> dict:
+    """
+    D1b: link candidates that other engines report on one reproducer. A replay index entry's
+    `cross_engine.failures` names the failures its reproducer makes on the other engine. A failure whose
+    fingerprint keys another candidate, or is one of its observations, and that lies in the same file and
+    function as the entry's candidate, gives both candidates a `related` entry, once. The verifier then sees
+    one bug (D17: the second is rejected as `duplicate`).
+    """
+    index = load_json_strict(index_path)
+    units, candidates = load_state()
+    owner: dict[str, str] = {}
+    for key, cand in candidates.items():
+        owner.setdefault(key, key)
+        for obs in cand.get("observations") or []:
+            owner.setdefault(obs["fingerprint"], key)
+    links = 0
+    for entry_fp, entry in (index.get("by_fingerprint") or {}).items():
+        cross = entry.get("cross_engine") if isinstance(entry, dict) else None
+        found = candidates.get(entry_fp)
+        if not isinstance(cross, dict) or found is None:
+            continue
+        loc = found.get("location") or {}
+        file, function = normalize_file(loc.get("file") or ""), loc.get("function")
+        for failure in cross.get("failures") or []:
+            other_key = owner.get(str(failure.get("fingerprint") or ""))
+            if other_key is None or other_key == entry_fp:
+                continue
+            if normalize_file(str(failure.get("file") or "")) != file or failure.get("function") != function:
+                continue
+            reason = (
+                f"cross-engine replay: {cross.get('engine')} fails at "
+                f"{failure.get('file')}:{failure.get('line')} on the same reproducer"
+            )
+            links += _add_related(found, other_key, reason)
+            links += _add_related(candidates[other_key], entry_fp, reason)
+    if links:
+        commit(units, candidates)
+    return {"index": str(index_path), "links_added": links}
+
+
 def _find_matching_sink_candidate(
     candidates: dict[str, dict],
     file: str,
     function: str,
     kind_or_cls: str,
     predicate: str,
+    site: str | None = None,
 ) -> dict | None:
     """
     Find an existing candidate for the same `(file, function, normalized_kind)` sink
     so a prover/breaker hypothesis or breaker crash merges with an existing fuzz/Eva
     candidate instead of inflating `candidates.json` with a second fingerprint.
+
+    With a `site` (a detection with a line, D1c), the candidate at that site wins; the function-and-kind
+    rule applies only when no candidate has the site, or when the detection has none.
     """
+    if site is not None:
+        at_site = next((c for c in candidates.values() if c.get("site") == site), None)
+        if at_site is not None:
+            return at_site
     norm_f = normalize_file(file)
     norm_k = normalize_kind(kind_or_cls, predicate)
     for cand in candidates.values():
@@ -2534,7 +2683,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             prom_res = promote_file(Path.cwd(), aid, rel(str(result_path)), kind="artifact")
             tool_out = str(prom_res["dest"])
         note = f"input_condition: {fh['input_condition']}; why_not_reproduced: {fh['why_not_reproduced']}"
-        upsert_candidate(
+        cand = upsert_candidate(
             candidates,
             fp,
             role,
@@ -2547,6 +2696,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             linked,
             note,
         )
+        fp = cand["fingerprint"]
         phase = "breaker" if role == "breaker" else "wp"
         for cid in linked:
             add_evidence(
@@ -2583,7 +2733,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         note = str(res.get("analysis") or "breaker reproduced crash")
         already_listed = existing_cand is not None and crash_rel in existing_cand["reproducers"]
         verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
-        upsert_candidate(
+        cand = upsert_candidate(
             candidates,
             fp,
             "breaker",
@@ -2596,6 +2746,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             linked,
             note,
         )
+        fp = cand["fingerprint"]
         for cid in linked:
             add_evidence(
                 units[cid],
@@ -2743,7 +2894,11 @@ def _ingest_prover_code_fault(
     kind = str(failure.get("alarm_kind") or failure.get("kind") or "assertion")
     pred = str(failure.get("predicate") or "")
     exact_fp = make_fingerprint(ffile, ffn, kind, pred)
-    existing_cand = candidates.get(exact_fp) or _find_matching_sink_candidate(candidates, ffile, ffn, kind, pred)
+    line = int(failure.get("line") or 0)
+    site = _candidate_site(ffile, line, ffn or "unknown_function", _dag_line_index())
+    existing_cand = candidates.get(exact_fp) or _find_matching_sink_candidate(
+        candidates, ffile, ffn, kind, pred, site=site
+    )
     fp = existing_cand["fingerprint"] if existing_cand is not None else exact_fp
     cls = goal_obligation_class({"kind": failure.get("kind", ""), "annotation": pred})
     fn_units = [
@@ -2764,19 +2919,23 @@ def _ingest_prover_code_fault(
         note += f"; no ledger unit for {ffile}#{ffn}::{cls} (harness or unseeded code)"
     already_listed = existing_cand is not None and crash_rel is not None and crash_rel in existing_cand["reproducers"]
     verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
-    upsert_candidate(
+    keys_before = len(candidates)
+    cand = upsert_candidate(
         candidates,
         fp,
         "prover",
         proposed,
         mod,
-        {"file": ffile or "unknown", "line": int(failure.get("line") or 0), "function": ffn or "unknown_function"},
+        {"file": ffile or "unknown", "line": line, "function": ffn or "unknown_function"},
         {"kind": kind, "predicate": pred},
         [crash_rel] if crash_rel else [],
         tool_out,
         linked,
         note,
+        site=site,
     )
+    fp = cand["fingerprint"]
+    created = len(candidates) > keys_before
     for cid in linked:
         add_evidence(
             units[cid],
@@ -2805,7 +2964,7 @@ def _ingest_prover_code_fault(
         )
         if reopen_outcomes is not None:
             reopen_outcomes.append(outcome)
-    return 1 if existing_cand is None else 0
+    return 1 if created else 0
 
 
 @ledger_locked
@@ -4264,6 +4423,10 @@ def main(argv: list[str] | None = None) -> int:
     p_mc.add_argument("--key", required=True)
     p_audit = sub.add_parser("audit-hypotheses", help="Resolve valid_under_hyp assumptions against callgraph_dag.json")
     p_audit.add_argument("--dag", type=Path, default=Path("workspace/reports/callgraph_dag.json"))
+    p_related = sub.add_parser("link-related", help="Link candidates that other engines report on one reproducer (D1b)")
+    p_related.add_argument(
+        "--index", type=Path, required=True, help="The replay index (replay-candidates --cross-engine)"
+    )
     sub.add_parser("summary")
     sub.add_parser("status", help="Alias for summary")
     args = parser.parse_args(argv)
@@ -4294,6 +4457,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_record_stub_contracts(args.report, args.check_report)
         elif args.cmd == "ingest-verifier":
             out = cmd_ingest_verifier(args.result, args.replay_report, args.harness_meta)
+        elif args.cmd == "link-related":
+            out = cmd_link_related(args.index)
         elif args.cmd == "transition":
             out = cmd_transition(args.id, args.status, args.agent_id, args.reason, args.expect or None)
         elif args.cmd == "transition-many":

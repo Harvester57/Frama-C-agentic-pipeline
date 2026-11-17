@@ -1316,6 +1316,7 @@ class TestHarnessLegitimacyAndMetadata:
         run_fuzz_campaign coordinates -jobs and -workers when either is > 1, scales CPU/wall
         timeouts, and reads worker logs (fuzz-*.log) from the scratch directory.
         """
+        import crash_replay
         import run_eacsl_fuzz as fuzz_mod
         import sandbox_exec as sb_mod
 
@@ -1359,7 +1360,7 @@ class TestHarnessLegitimacyAndMetadata:
             }
 
         monkeypatch.setattr(sb_mod, "run_sandboxed", fake_run_sandboxed)
-        monkeypatch.setattr(fuzz_mod, "replay_artifact", fake_replay)
+        monkeypatch.setattr(crash_replay, "replay_artifact", fake_replay)
 
         report = fuzz_mod.run_fuzz_campaign(
             binary=bin_path,

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import crash_replay
 import fuzz_build
 import run_eacsl_fuzz as R
 import sandbox_exec
@@ -64,6 +65,7 @@ def test_selection_without_effective_limit_keeps_all(limit):
 def _instrumented(monkeypatch, captured: list) -> None:
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
     monkeypatch.setattr(fuzz_build, "is_eacsl_instrumented", lambda b: True)
+    monkeypatch.setattr(crash_replay, "is_eacsl_instrumented", lambda b: True)
 
     def fake_run(cmd, **kw):
         captured.append(list(cmd))
@@ -531,6 +533,7 @@ def _crashing_replays(monkeypatch, crasher: bytes, calls: list, report: str = SE
     """A fake libFuzzer that stops on the first replayed file whose content is `crasher`, printing `report`."""
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
     monkeypatch.setattr(fuzz_build, "is_eacsl_instrumented", lambda b: True)
+    monkeypatch.setattr(crash_replay, "is_eacsl_instrumented", lambda b: True)
 
     def fake_run(cmd, **kw):
         calls.append(list(cmd))
@@ -786,6 +789,7 @@ def _mutation_guardrail(tmp_path: Path, monkeypatch, functions: list[str], calls
     corpus = _corpus(tmp_path)
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
     monkeypatch.setattr(fuzz_build, "is_eacsl_instrumented", lambda b: True)
+    monkeypatch.setattr(crash_replay, "is_eacsl_instrumented", lambda b: True)
 
     def fake_run(cmd, **kw):
         calls.append(list(cmd))

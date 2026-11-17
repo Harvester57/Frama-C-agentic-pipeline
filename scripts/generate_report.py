@@ -986,9 +986,27 @@ def _evidence_lines(rec: dict) -> list[str]:
     return [f"- [{e['phase']}] `{e['tool_output']}`: {md_escape(e['description'])}" for e in rec["evidence"]]
 
 
+def related_candidates_line(record: dict, candidates: list[dict]) -> str | None:
+    """
+    `Related candidates: ...` for a finding whose candidate names related candidates (D1b: another engine
+    reports the same reproducer, see ledger.py link-related). None when there are none.
+    """
+    keys = {record["fingerprint"], *(record.get("_related_fingerprints") or [])}
+    names: list[str] = []
+    for cand in candidates:
+        if cand.get("fingerprint") in keys or keys & set(cand.get("resolved_fingerprints") or []):
+            for link in cand.get("related") or []:
+                if link["fingerprint"] not in names:
+                    names.append(link["fingerprint"])
+    if not names:
+        return None
+    return "Related candidates: " + ", ".join(f"`{name}`" for name in names)
+
+
 def render_findings_detail(findings: list[dict], run_dir: Path | None = None) -> str:
     deduped = dedupe_findings_for_report(findings, run_dir=run_dir)
     by_fp = {r["fingerprint"]: r for r in findings}
+    candidates = load_json_optional(run_dir / "candidates.json", []) if run_dir is not None else []
     confirmed = sorted(
         (r for r in deduped if r["verdict"] == "confirmed"),
         key=lambda r: (SEVERITY_ORDER[r["severity"]], r["fingerprint"]),
@@ -999,10 +1017,12 @@ def render_findings_detail(findings: list[dict], run_dir: Path | None = None) ->
     for r in confirmed:
         related_fps = r.get("_related_fingerprints") or []
         fp_suffix = f" (also merged: {', '.join(f'`{f}`' for f in related_fps)})" if related_fps else ""
+        related_line = related_candidates_line(r, candidates)
         out += [
             f"## {md_escape(r['title'])}",
             "",
             f"- **Fingerprint:** `{r['fingerprint']}`{fp_suffix}",
+            *([f"- {related_line}"] if related_line else []),
             f"- **Severity:** {r['severity']} ({md_escape(r['severity_rationale'])})",
             f"- **Reachability:** `{r['reachability']}`",
             f"- **Location:** {loc(r, run_dir)}",
