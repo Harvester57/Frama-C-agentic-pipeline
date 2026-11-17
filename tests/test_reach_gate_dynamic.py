@@ -6,10 +6,15 @@ every entry point. Fixtures are synthetic: the run directory and the reports are
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 import harness_reach
+import ledger
 import phase0_gates
+from conftest import evidence, metadata, unit, write_json
 from test_harness_reach import (
     _coverage,
     _dynamic_doc,
@@ -24,6 +29,7 @@ from test_harness_reach_crash_credit import (
     _dispatch,
     _sanitizer_failure,
 )
+from test_wp_scheduler import sim  # noqa: F401  (the scheduler fixture)
 
 pytestmark = pytest.mark.unit
 
@@ -121,6 +127,107 @@ def test_campaign_and_eva_gates_let_a_dynamically_gated_module_run(tmp_path, mon
     phase0_gates.record_build_check(run, {"ok": True, "modules": {"api": {"ok": True, "status": "eacsl"}}})
     assert run_eacsl_fuzz.campaign_gate_reasons(run, "api") == []
     assert run_eva_slice.phase0_gate_reasons("api", run) == []
+
+
+def _ledger_run(tmp_path, monkeypatch, units):
+    """The dynamic-gap run (module api gated on rec_put) with the given ledger units written."""
+    run = _dynamic_gap_run(tmp_path, monkeypatch)
+    write_json(run / "run-metadata.json", metadata("in_progress"))
+    write_json(run / "candidates.json", [])
+    write_json(run / "coverage-ledger.json", units)
+    return run
+
+
+def _ledger_units(run: Path) -> dict[str, dict]:
+    return {u["coverage_id"]: u for u in json.loads((run / "coverage-ledger.json").read_text(encoding="utf-8"))}
+
+
+def _gated_unit(status="planned", **kw):
+    return unit("src/api.c", "rec_put", "rte", status=status, module="api", **kw)
+
+
+def test_gate_reach_blocks_the_planned_units_of_the_gated_module_only(tmp_path, monkeypatch):
+    other = unit("src/glue.c", "glue_fn", "rte", status="planned", module="glue")
+    run = _ledger_run(tmp_path, monkeypatch, [_gated_unit(), other])
+    out = ledger.cmd_gate_reach()
+    assert out == {"gated_modules": {"api": ["rec_put"]}, "blocked": 1, "reopened": 0}
+    gated = _ledger_units(run)["src/api.c#rec_put::rte"]
+    assert gated["status"] == "blocked" and gated["unresolved"] == ["dynamic_reach_gap: rec_put"]
+    [ev] = gated["evidence"]
+    assert ev["result"] == "reach_gated" and ev["discharging"] is False and ev["phase"] == "fuzz"
+    untouched = _ledger_units(run)["src/glue.c#glue_fn::rte"]
+    assert untouched["status"] == "planned" and untouched["evidence"] == [] and untouched["unresolved"] == []
+
+
+def test_gate_reach_reopens_the_units_when_the_gap_is_gone(tmp_path, monkeypatch):
+    run = _ledger_run(tmp_path, monkeypatch, [_gated_unit()])
+    ledger.cmd_gate_reach()
+    _coverage(run, {"rec_parse": 20, "rec_put": 3})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    assert phase0_gates.dynamic_gaps(run) == {}
+    out = ledger.cmd_gate_reach()
+    assert out == {"gated_modules": {}, "blocked": 0, "reopened": 1}
+    gated = _ledger_units(run)["src/api.c#rec_put::rte"]
+    assert gated["status"] == "planned" and gated["unresolved"] == [] and gated["evidence"] == []
+
+
+def test_gate_reach_leaves_a_unit_with_another_reason_blocked_when_the_gap_clears(tmp_path, monkeypatch):
+    run = _ledger_run(tmp_path, monkeypatch, [_gated_unit()])
+    ledger.cmd_gate_reach()
+    ledger.cmd_transition("src/api.c#rec_put::rte", "blocked", None, "eva_unknown: 2 obligations")
+    _coverage(run, {"rec_parse": 20, "rec_put": 3})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    out = ledger.cmd_gate_reach()
+    assert out["reopened"] == 1
+    gated = _ledger_units(run)["src/api.c#rec_put::rte"]
+    assert gated["status"] == "blocked" and gated["unresolved"] == ["eva_unknown: 2 obligations"]
+    assert gated["evidence"], "a blocked unit keeps the partial evidence it needs"
+
+
+def test_gate_reach_does_not_gate_a_unit_blocked_for_another_reason(tmp_path, monkeypatch):
+    fuzz_clean = {
+        "phase": "fuzz",
+        "producer": "run_eacsl_fuzz.py",
+        "result": "fuzz_clean",
+        "discharging": False,
+        "tool_output": "workspace/reports/fuzz/api.json",
+        "summary": "campaign found no failure",
+    }
+    blocked = _gated_unit(status="blocked", evidence=[fuzz_clean], unresolved=["tier_3_not_scheduled"])
+    run = _ledger_run(tmp_path, monkeypatch, [blocked])
+    out = ledger.cmd_gate_reach()
+    assert out["blocked"] == 0
+    unit_now = _ledger_units(run)["src/api.c#rec_put::rte"]
+    assert unit_now["unresolved"] == ["tier_3_not_scheduled"] and unit_now["evidence"] == [fuzz_clean]
+    # The gap clears: the other reason still blocks it, and it is not reopened.
+    _coverage(run, {"rec_parse": 20, "rec_put": 3})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    assert ledger.cmd_gate_reach()["reopened"] == 0
+    assert _ledger_units(run)["src/api.c#rec_put::rte"]["status"] == "blocked"
+
+
+def test_gate_reach_leaves_covered_and_deferred_units_alone(tmp_path, monkeypatch):
+    # Candidate units are not covered here: a candidate needs a candidates.json record, and no S5 path reads one.
+    covered = _gated_unit(status="covered", evidence=[evidence()])
+    deferred = unit("src/api.c", "rec_parse", "rte", status="deferred", module="api", unresolved=["tier_3"])
+    run = _ledger_run(tmp_path, monkeypatch, [covered, deferred])
+    before = _ledger_units(run)
+    ledger.cmd_gate_reach()
+    assert _ledger_units(run) == before
+
+
+def test_wp_scheduler_init_queues_no_task_for_a_gated_module(sim, monkeypatch, capsys):  # noqa: F811
+    import wp_scheduler
+
+    sim.build({"a": ("src/m/a.c", "m", []), "b": ("src/n/b.c", "n", [])})
+    # The Phase 0 whole-run check is not under test: the dynamic gap passes it (D2).
+    monkeypatch.setattr(phase0_gates, "check", lambda run_dir: [])
+    monkeypatch.setattr(phase0_gates, "dynamic_gaps", lambda run_dir: {"m": ["a"]})
+    assert wp_scheduler.main(["init"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["reach_gate"]["blocked"] == 1
+    queued = [q["function"] for q in json.loads(Path("workspace/reports/wp_queue.json").read_text())["queue"]]
+    assert queued == ["b"]
 
 
 @pytest.mark.parametrize("status", [None, "compile_error"])

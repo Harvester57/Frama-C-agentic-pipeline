@@ -4193,7 +4193,9 @@ def _stale_repair_evidence(ctx: Ctx, module: str) -> tuple[list[dict], list[str]
         if digest is None:
             continue  # no harness of its own: nothing was repaired here
         # The harness source (the sidecar when there is none): the sidecar is rewritten for bookkeeping.
-        files = [p for p in (HARNESS_DIR / f"harness_{harness}.c", HARNESS_DIR / f"harness_{harness}.json") if p.is_file()]
+        files = [
+            p for p in (HARNESS_DIR / f"harness_{harness}.c", HARNESS_DIR / f"harness_{harness}.json") if p.is_file()
+        ]
         harness_mtime = files[0].stat().st_mtime if files else 0.0
         fuzz, eva = _harness_run_flags(ctx, harness)
         eva_stale = False
@@ -4789,7 +4791,10 @@ def main(argv: list[str] | None = None) -> int:
             if gate_reasons:
                 print(json.dumps({"ok": False, "error": "Phase 0 gate", "reasons": gate_reasons}, indent=2))
                 return 1
+            # D2, D18: the planned units of a dynamically gated module leave the queue before init queues tasks.
+            reach_gate = ledger.cmd_gate_reach(Path("."))
             out = cmd_init(args.reconcile)
+            out["reach_gate"] = reach_gate
         elif args.cmd == "baseline":
             out = cmd_baseline(run_dir=args.run_dir, jobs=args.jobs, recheck_all=args.recheck_all)
         elif args.cmd == "next":

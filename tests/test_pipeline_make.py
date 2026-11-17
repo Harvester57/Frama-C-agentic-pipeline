@@ -1058,7 +1058,9 @@ def test_wp_replay_runs_after_the_phase3_gate_and_before_the_scheduler_init():
     mk = (REPO / "templates" / "pipeline.mk").read_text(encoding="utf-8")
     replay = [ln.strip() for ln in mk.split("\nwp-replay: ingest facts\n", 1)[1].split("\n\n", 1)[0].splitlines()]
     assert replay[0].startswith("$(GATE) --need reach,build_check")
-    assert replay[1].startswith("-$(RUN) --class wp --key wp-replay") and replay[1].endswith("$(PM) wp-replay")
+    # The dynamic gate holds its modules' units back before the proofs are replayed (D18).
+    assert replay[1] == "$(RUN) --class light --key wp-replay -- $(PY) $(S)/ledger.py gate-reach"
+    assert replay[2].startswith("-$(RUN) --class wp --key wp-replay") and replay[2].endswith("$(PM) wp-replay")
     queue = mk.split("\nwp-queue: ingest facts wp-replay\n", 1)[1].split("\n\n", 1)[0]
     assert "wp_scheduler.py init" in queue
     assert " wp-replay " in mk.split(".PHONY:", 1)[1].split("\n", 1)[0]

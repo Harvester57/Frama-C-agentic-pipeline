@@ -330,6 +330,7 @@ minimize: replay
 # Not leased per function: merges are serialized by the merge lock, so one `wp` lease covers it.
 wp-replay: ingest facts
 	$(GATE) --need reach,build_check --modules "$(MODULES)" --fuzzed "$(FUZZ_MODULES)"
+	$(RUN) --class light --key wp-replay -- $(PY) $(S)/ledger.py gate-reach
 	-$(RUN) --class wp --key wp-replay --output workspace/reports/proof-carry/summary.json -- $(PM) wp-replay
 
 # Phases 1 and 2 are done once the Phase-3 queue is built from their ingested reports: record it,
