@@ -119,6 +119,19 @@ def test_a_dynamic_gap_with_a_changed_harness_is_stale(tmp_path, monkeypatch):
     assert "the harness of api changed" in run_reason
 
 
+def test_the_report_lists_gated_modules(tmp_path, monkeypatch):
+    import generate_report
+
+    run = _dynamic_gap_run(tmp_path, monkeypatch)
+    text = "\n".join(generate_report.dynamic_gate_lines(run))
+    assert "### Modules held back from WP by the dynamic reach gate" in text
+    assert "- `api`: never executed rec_put" in text
+    # Nothing when no module is held back.
+    _coverage(run, {"rec_parse": 20, "rec_put": 3})
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    assert generate_report.dynamic_gate_lines(run) == []
+
+
 def test_campaign_and_eva_gates_let_a_dynamically_gated_module_run(tmp_path, monkeypatch):
     import run_eacsl_fuzz
     import run_eva_slice

@@ -1446,4 +1446,4 @@ def test_pipeline_mk_gates_carry_no_dynamic_gap_flag():
         "$(GATE) --module $* --need reach",
         "$$(GATE) --module $(1) --need reach",
     }
-    assert [ln for ln in gate_lines if "--allow-dynamic-gap" in ln] == []
+    assert [ln for ln in gate_lines if "--" in ln and "dynamic" in ln] == []

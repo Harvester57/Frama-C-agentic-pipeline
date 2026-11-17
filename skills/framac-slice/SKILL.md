@@ -419,7 +419,7 @@ Move on only when `check` exits 0. Its `exempt` entries are the accepted, docume
 
 The check records its result in `workspace/reports/phase0_gates.json`, together with a digest of each harness and of the DAG. Make enforces it: `seed` runs the check first (`reach-gate`), and the `build-`, `fuzz-`, `coverage-` and `eva-` targets of a module stop with the reason when the module failed it, or when its harness or the DAG changed after the check ran. After any harness repair or DAG rebuild, run `check` again.
 
-Phase 1 reopens the gate: after `coverage-<mod>`, `reach-dynamic-<mod>` fails the module when its corpus never executed an entry point the gate holds it to (`/framac-fuzz` Step 3). Repair the harness or exempt the entry point the same way. A fuzz crash counts as execution of an entry point only when it was found under the current harness (the fuzz report's `harness_digest` and `dispatch_case_count` match the harness): after a harness change, fuzz the module again. The reach report's `crash_notes` and the gate's reason say why a crash did not count.
+Phase 1 records dynamic gaps: after `coverage-<mod>`, `reach-dynamic-<mod>` records each entry point the gate holds the module to that its corpus never executed (`/framac-fuzz` Step 3). A dynamic gap holds that module's planned units out of WP (`ledger.py gate-reach`); its fuzz and Eva go on. Repair the harness or exempt the entry point the same way. A fuzz crash counts as execution of an entry point only when it was found under the current harness (the fuzz report's `harness_digest` and `dispatch_case_count` match the harness): after a harness change, fuzz the module again. The reach report's `crash_notes` say why a crash did not count.
 
 ---
 
