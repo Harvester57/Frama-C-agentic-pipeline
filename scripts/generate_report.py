@@ -470,6 +470,35 @@ def header_api_lines(run_dir: Path) -> list[str]:
     ]
 
 
+def const_union_rewrite_lines(run_dir: Path) -> list[str]:
+    """
+    O9: the modules whose E-ACSL build dropped `const` from `static const union` declarations in the E-ACSL
+    frontend's text (`compile.const_union_rewrites` of workspace/build/<mod>.build.json). One line, or nothing.
+    """
+    built: dict[str, int] = {}
+    for path in sorted((Path(run_dir) / "workspace/build").glob("*.build.json")):
+        try:
+            report = load_json_optional(path, None)
+        except (ArtifactError, OSError, ValueError):
+            continue
+        comp = report.get("compile") if isinstance(report, dict) else None
+        if not isinstance(comp, dict):
+            continue
+        n = comp.get("const_union_rewrites")
+        if isinstance(n, int) and n > 0 and comp.get("returncode") == 0 and comp.get("engine") == "eacsl":
+            built[str(report.get("module") or path.name.removesuffix(".build.json"))] = n
+    if not built:
+        return []
+    shown = ", ".join(f"`{md_escape(m)}` ({n})" for m, n in sorted(built.items()))
+    return [
+        f"- **E-ACSL `static const union` rewrite:** {len(built)} module(s) were built with `const` dropped from "
+        f"their `static const union` declarations (count in parentheses) in the E-ACSL frontend's text only, "
+        f"because of an E-ACSL bug (pub/frama-c#2795): E-ACSL did not check those objects as read-only; the "
+        f"compiled program, Eva and WP keep `const`. {shown}.",
+        "",
+    ]
+
+
 def open_work(data: dict) -> dict:
     unverified = [c for c in data["candidates"] if c["status"] == "unverified"]
     open_units = [u for u in data["ledger"] if u["status"] in ("planned", "in_progress")]
@@ -989,6 +1018,8 @@ def render_report(data: dict) -> str:
     out += verdict_limits_section(ledger)
     out += concurrency_lines(ledger)
     out += model_only_lines(ledger)
+    if run_dir:
+        out += const_union_rewrite_lines(Path(run_dir))
     out += spec_quality_section(data)
 
     out += ["## 6. Coverage gaps", ""]

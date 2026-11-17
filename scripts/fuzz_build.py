@@ -19,6 +19,7 @@ import subprocess
 from pathlib import Path
 
 import cache
+import fc_cpp_wrapper_eacsl
 import target_env
 from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code
 from eacsl_toolchain import (
@@ -515,6 +516,21 @@ def _compile_eacsl_binary_uncached(
         return _finish(2, "eacsl_argv_unsafe")
     result["frontend_flags"] = flags["frontend"]
     result["backend_flags"] = flags["backend"]
+    # The E-ACSL-only `static const union` rewrite (scripts/fc_cpp_wrapper_eacsl.py, O9): on or off for this
+    # build, and how many declarations the frontend run rewrote (counted after it below).
+    result["const_union_rewrite"] = fc_cpp_wrapper_eacsl.const_union_rewrite_active(flags["frontend"])
+
+    def _note_const_unions(out: str, err: str) -> None:
+        n = fc_cpp_wrapper_eacsl.count_const_union_rewrites(out + "\n" + err)
+        result.pop("const_union_rewrites", None)
+        if n:
+            result["const_union_rewrites"] = n
+            log_parts.append(
+                f"Dropped `const` from {n} `static const union` declaration(s) in the E-ACSL frontend's text only "
+                "(E-ACSL bug pub/frama-c#2795: it cannot mark a const union read-only); E-ACSL does not check "
+                "them as read-only, the compiler and Eva/WP read the original.\n"
+            )
+
     check_options = _check_options(is_modern, libc_checks)
     if is_modern:
         result["check_options"] = check_options
@@ -552,6 +568,7 @@ def _compile_eacsl_binary_uncached(
         cmd.extend(sources)
         rc, out, err = _run_tool(cmd, runner)
         _record(cmd, rc, out, err)
+        _note_const_unions(out, err)
         if rc != 0:
             return _finish(rc, "eacsl_compile_failed")
     else:
@@ -599,6 +616,7 @@ def _compile_eacsl_binary_uncached(
                 result["rte_select_dropped"] = missing
                 cmd1, rc, out, err = _stage1([f for f in target_fns if f not in missing])
                 _record(cmd1, rc, out, err)
+        _note_const_unions(out, err)  # the last frontend run only: a retry preprocesses the same files again
         if rc != 0:
             return _finish(rc, "eacsl_instrumentation_failed")
         if instrumented_c.is_file():

@@ -129,8 +129,10 @@ The ptests run of the Issue 27 patch is in
 None from the command line. The pipeline's `build-check` names the failure
 (`reason_code: eacsl_static_const_union`) and tells the user to switch the module to the sanitizers
 engine. Dropping `const` from the declaration in a shadow copy of the source instruments, at the cost of
-E-ACSL no longer treating the object as read-only; an automatic E-ACSL-only rewrite is open (O9 in
-[`../../plans/open-topics-remediation-plan.md`](../../plans/open-topics-remediation-plan.md)). The entry
+E-ACSL no longer treating the object as read-only. Since O9 in
+[`../../plans/open-topics-remediation-plan.md`](../../plans/open-topics-remediation-plan.md), the pipeline does
+this itself for `static const union` declarations, in the E-ACSL frontend's text only
+(`scripts/fc_cpp_wrapper_eacsl.py`, switch `REWRITE_STATIC_CONST_UNIONS`); it goes when an image carries the fix. The entry
 is in [`../../troubleshooting/harnesses-and-seeds.md`](../../troubleshooting/harnesses-and-seeds.md)
 ("implicit cast: cast from union nettle_block16 to void *").
 

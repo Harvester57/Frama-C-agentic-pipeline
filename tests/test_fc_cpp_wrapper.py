@@ -347,8 +347,12 @@ def test_only_the_eacsl_wrapper_rewrites_equivalences(tmp_path, capsys):
     assert (
         "[fc-cpp] src/f.c:3: 1 `<==>` in an annotation (E-ACSL: two implications) rewritten" in capsys.readouterr().err
     )
-    source = (ROOT / "scripts" / "fc_cpp_wrapper_eacsl.py").read_text(encoding="utf-8")
-    assert "run(sys.argv[1:], iff=True)" in source
+    # The E-ACSL wrapper's entry point (fc_cpp_wrapper_eacsl.run_eacsl) asks for the `<==>` rewrite.
+    import fc_cpp_wrapper_eacsl
+
+    call, _ = _fake_cc1(text)
+    assert fc_cpp_wrapper_eacsl.run_eacsl(cmd, call=call) == 0
+    assert "<==>" not in out.read_text(encoding="utf-8")
 
 
 @pytest.mark.unit
