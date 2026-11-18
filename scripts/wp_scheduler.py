@@ -4205,7 +4205,10 @@ def _on_merge_failed(state: dict, task: dict, aid: str, failure: dict, out: dict
         _reopen(state, task, f"merge failed: {reason}")
         entry["action"] = "requeued"
     else:
-        if report:
+        # A report that says `all_proven` here is of a contract the merge refused and rolled back (the frame
+        # refusal, a module guardrail that failed after WP): ingested, it would cover units with a proof of
+        # text the shared tree does not hold. A report of unproven goals is kept: it credits nothing.
+        if report and report.get("status") != "all_proven":
             _try(out["errors"], "ingest-wp", DEPS.ingest_wp, [rep_path])
         entry["units"] = _park_units(task, aid, f"merge_failed: {reason[:160]}")
         if task["kind"] == "negotiate":

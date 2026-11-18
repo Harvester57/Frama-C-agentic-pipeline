@@ -1,0 +1,6 @@
+directory	file	line	function	property kind	status	property
+/target/eacsl_ignored	probe.c	80	via_pred	postcondition	Valid	\result == (int)\old(n)
+/target/eacsl_ignored	probe.c	82	via_pred	postcondition	Valid	\false
+/target/eacsl_ignored	probe.c	82	via_pred	termination clause	Valid	\true
+/target/eacsl_ignored	probe.c	82	via_pred	assigns clause	Valid	assigns \nothing;
+/target/eacsl_ignored	probe.c	84	via_pred	signed_downcast	Valid	n <= 2147483647
