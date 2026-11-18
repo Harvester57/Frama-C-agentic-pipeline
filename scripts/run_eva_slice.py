@@ -39,6 +39,20 @@ After a successful run, read and write sets are taken from the saved session in 
 Frama-C process (`-load framac.sav -deps -inout -input -out-external -cg`), so they can neither
 change Eva's status nor its timing. The report carries them as `flows`, by kernel function name:
 hints about this harness, used for the provers' briefs (function_facts.py), never a verdict.
+
+MetAcsl security properties (scripts/security_props.py, docs/guides/security-properties.md):
+`--security-props PATH|none` (default: $FRAMAC_SECURITY_PROPS, else workspace/reports/security_props.json
+when it exists) names the run's security_props.json. When its `meta_engines` holds `eva`, the run
+writes the module's meta file (the properties with an instance in a function of this parse) to
+security_meta/security_meta_<module>.c next to that file, adds it and the sources its properties
+need to the parse, and puts `-meta -meta-checks -meta-warn-key unknown-func=inactive -then-last
+-set-project-as-default` before `-rte`: every later stage, the saved session included, then works on
+MetAcsl's project. The generated annotations are `check`s, so a violated one never stops the
+analysis. Their rows leave the status buckets above and are reported under `security_props`, named
+after their property and sorted by where they sit: `instances` (the ledger units' functions),
+`unplanned_instances` (a target function security_props.json does not list) and `outside_instances`
+(harness code). When Frama-C fails with the properties loaded, the run is done again without them and
+`security_props.error` says so. Without `eva` in `meta_engines` nothing changes: same command, same report.
 """
 
 from __future__ import annotations
@@ -47,10 +61,12 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -88,7 +104,7 @@ from framac_common import (  # noqa: E402
     spill_large_flows,
     stub_repair_action,
 )
-from patterns import DOMAIN_RE  # noqa: E402
+from patterns import DOMAIN_RE, KERNEL_RENAME_RE  # noqa: E402
 from resources import CLASSES  # noqa: E402
 
 _KERNEL_ERR_RE = re.compile(
@@ -438,6 +454,513 @@ def eva_domains(extra_domains: list[str] | str | None = None, precision: int | N
     return ",".join(domains)
 
 
+# ---------------------------------------------------------------------------
+# MetAcsl security properties (module docstring; docs/guides/security-properties.md)
+# ---------------------------------------------------------------------------
+
+SECURITY_PROPS_ENV = "FRAMAC_SECURITY_PROPS"
+DEFAULT_SECURITY_PROPS = Path("workspace/reports/security_props.json")
+SECURITY_META_DIR = "security_meta"
+META_ENGINE = "eva"
+# What goes between `-main <fn>` and `-rte` when the properties are loaded.
+#   -meta-checks: the generated annotations are `check`s. The default `assert`/`requires` stops Eva at
+#     the first violated instance, so one violation the harness induces (a protected function it calls
+#     directly) would turn everything behind it Dead.
+#   -then-last -set-project-as-default: MetAcsl writes its annotations into a copy of the project. A
+#     plain `-then` goes back to the original one (Eva would never see the annotations), and the saved
+#     session would hold the original as its current project, so the flows and SARIF steps that load it
+#     would run Eva again on it. Made the default, MetAcsl's project is what every later stage and the
+#     saved session use.
+META_STAGE = (
+    "-meta",
+    "-meta-checks",
+    "-meta-warn-key",
+    "unknown-func=inactive",
+    "-then-last",
+    "-set-project-as-default",
+)
+META_BUCKETS = ("valid", "unknown", "invalid", "dead", "assumed", "other")
+# The rows a reader has to look at, in the order they are listed; the others are only counted.
+META_OPEN_BUCKETS = ("invalid", "other", "unknown")
+META_OPEN_ROWS_MAX = 2000
+# The part of the report's `security_props` that does not depend on the rows (load_security_meta).
+META_STATIC_KEYS = (
+    "props",
+    "meta_file",
+    "properties",
+    "line_names",
+    "extra_sources",
+    "skipped",
+    "classes",
+    "planned",
+    "decided",
+    "functions",
+    "outside_functions",
+    "roots",
+)
+# A generated precondition keeps its name in the report: `L4_auth_required_login: meta: auth_ok != 0`.
+_META_NAMED_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[:,]\s*meta\s*[:,]\s*")
+_META_FILE_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.+-]")
+
+
+def resolve_security_props(spec: str | None) -> str | None:
+    """
+    The security_props.json a run reads, as run_wp_function.resolve_security_meta picks it: `spec`
+    (`none`/`off`: no file), else $FRAMAC_SECURITY_PROPS, else workspace/reports/security_props.json
+    when it exists. None: no file.
+    """
+    if spec is not None and spec.strip().lower() in ("none", "off", ""):
+        return None
+    if spec:
+        return spec
+    path = Path(os.environ.get(SECURITY_PROPS_ENV) or DEFAULT_SECURITY_PROPS)
+    return path.as_posix() if path.is_file() else None
+
+
+def _posix(path: str | Path) -> str:
+    return posixpath.normpath(str(path).replace("\\", "/"))
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Whether two normalized paths name one file, one of them possibly from further up (a/b/x.c, b/x.c)."""
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _row_path(row: dict) -> str:
+    directory = str(row.get("directory") or "").replace("\\", "/").rstrip("/")
+    file = str(row.get("file") or "").replace("\\", "/")
+    if not file:
+        return ""
+    return _posix(f"{directory}/{file}" if directory and directory != "." and not file.startswith("/") else file)
+
+
+def _props_function_ids(doc: dict) -> set[str]:
+    """Every `file#name` id security_props.json knows: obligations, frame, instances, decided functions."""
+    ids = {str(fid) for fid in doc.get("obligations") or {}}
+    ids |= {str(f.get("function")) for f in doc.get("frame") or [] if isinstance(f, dict) and f.get("function")}
+    for prop in doc.get("properties") or []:
+        if not isinstance(prop, dict):
+            continue
+        ids |= {str(i) for i in prop.get("instances") or []}
+        ids |= {str(d.get("function")) for d in prop.get("decided") or [] if isinstance(d, dict) and d.get("function")}
+    return {fid for fid in ids if "#" in fid}
+
+
+def _module_functions(doc: dict, paths: Iterable[str]) -> tuple[set[str], list[str], set[str]]:
+    """
+    The function ids of security_props.json that the files of one parse define: (ids, work roots, the
+    paths that matched). A path matches the id file that is its longest suffix
+    (`workspace/work/src/x.c` -> `src/x.c`), and what is left of the path is a work root.
+    """
+    by_file: dict[str, set[str]] = defaultdict(set)
+    for fid in _props_function_ids(doc):
+        by_file[_posix(fid.rpartition("#")[0])].add(fid)
+    ids: set[str] = set()
+    roots: set[str] = set()
+    matched: set[str] = set()
+    for path in paths:
+        found = [file for file in by_file if path == file or path.endswith("/" + file)]
+        if not found:
+            continue
+        best = max(found, key=len)
+        ids |= by_file[best]
+        roots.add(path[: len(path) - len(best)])
+        matched.add(path)
+    return ids, sorted(roots), matched
+
+
+def _defined_functions(path: str) -> set[str]:
+    """The functions a C file defines; empty when it cannot be read."""
+    from acsl_ast import locate_all_definition_spans  # noqa: PLC0415
+
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        return set(locate_all_definition_spans(text, path))
+    except (OSError, ValueError, RuntimeError):
+        return set()
+
+
+def _write_if_changed(path: Path, text: str) -> None:
+    """Atomic, and a no-op when the file already holds `text`: runs of one module share the file."""
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == text:
+            return
+    except (OSError, ValueError):
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A name of its own: two containers writing the same file can have the same pid.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_", suffix=".c")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def load_security_meta(props_path: str, sources: list[str], flags: list[str], module: str, main_fn: str) -> dict | None:
+    """
+    What a run loads from security_props.json. None when the file does not turn MetAcsl on for Eva
+    (`meta_engines` without `eva`): the run is then exactly the run without the option. Otherwise the
+    static part of the report's `security_props`:
+
+      {props, error, properties: []}            the file cannot be read;
+      {props, properties: [], meta_file: None}   no property has an instance in this parse;
+      {props, meta_file, properties, line_names, extra_sources, classes, planned, decided, functions,
+       outside_functions, roots[, skipped]}      the module meta file was written and is to be parsed.
+
+    The module's functions are those security_props.json knows in the sources and in every file they
+    include (the dependency manifest: a harness that `#include`s the target source lists only itself).
+    A property whose `sources` (the file defining a global it names) is neither in the parse nor under
+    a work root is left out and listed under `skipped`: MetAcsl could not type it.
+    The meta file's directory is named after its text, so runs that load different properties (shards
+    under different defines, a rung started before security_props.json changed) never share a file.
+    """
+    import security_props  # noqa: PLC0415
+
+    path = Path(props_path)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"props": path.as_posix(), "error": f"unreadable: {exc}", "properties": []}
+    if not isinstance(doc, dict) or META_ENGINE not in security_props.meta_engines(doc):
+        return None
+    manifest = cache.dependency_manifest(sources, flags)
+    source_paths = [_posix(s) for s in sources]
+    paths = sorted({_posix(dep) for dep, _ in manifest} | set(source_paths)) if manifest else source_paths
+    ids, roots, matched = _module_functions(doc, paths)
+    nothing: dict = {"props": path.as_posix(), "properties": [], "meta_file": None}
+    if not ids:
+        return nothing
+
+    kept: list[dict] = []
+    extra: list[str] = []
+    skipped: list[dict] = []
+    for prop in doc.get("properties") or []:
+        if not isinstance(prop, dict):
+            continue
+        wanted = not prop.get("code") and bool(set(prop.get("instances") or []) & ids)
+        missing = None
+        found: list[str] = []
+        for src in (prop.get("sources") or []) if wanted else []:
+            rel = _posix(str(src))
+            if any(_same_file(p, rel) for p in paths):
+                continue  # already parsed, as a source or through an #include
+            cand = next((f"{root}{rel}" for root in roots if Path(f"{root}{rel}").is_file()), None)
+            if cand is None:
+                missing = rel
+                break
+            found.append(cand)
+        if missing is not None:
+            skipped.append(
+                {
+                    "property": str(prop.get("name")),
+                    "reason": f"its source {missing} is neither in this parse nor under {', '.join(roots) or '.'}",
+                }
+            )
+            continue
+        extra += [f for f in found if f not in extra]
+        kept.append(prop)
+    built = security_props.module_meta_file_text({**doc, "properties": kept}, functions=ids)
+    if built is None:
+        return {**nothing, **({"skipped": skipped} if skipped else {})}
+    text, names, _ = built
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    stem = _META_FILE_UNSAFE_RE.sub("_", module or "") or "slice"
+    meta_file = path.parent / SECURITY_META_DIR / digest / f"security_meta_{stem}.c"
+    _write_if_changed(meta_file, text)
+
+    selected = [p for p in kept if str(p.get("name")) in names]
+    functions: dict[str, list[str]] = defaultdict(list)
+    for fid in sorted(ids):
+        functions[fid.rpartition("#")[2]].append(fid)
+    # Harness code: what the sources outside the target's work tree define, and the entry function.
+    outside = {main_fn}
+    for src in source_paths:
+        if src not in matched and not any(root and src.startswith(root) for root in roots):
+            outside |= _defined_functions(src)
+    return {
+        "props": path.as_posix(),
+        "meta_file": meta_file.as_posix(),
+        "properties": list(names),
+        "line_names": {str(line): name for line, name in security_props.meta_line_names(text).items()},
+        "extra_sources": extra,
+        **({"skipped": skipped} if skipped else {}),
+        "classes": {str(p["name"]): str(p.get("obligation_class") or "") for p in selected},
+        "planned": {str(p["name"]): sorted(set(p.get("instances") or []) & ids) for p in selected},
+        "decided": {
+            str(p["name"]): found_ids
+            for p in selected
+            if (
+                found_ids := sorted(
+                    {str(d.get("function")) for d in p.get("decided") or [] if isinstance(d, dict)} & ids
+                )
+            )
+        },
+        "functions": dict(functions),
+        "outside_functions": sorted(outside - set(functions)),
+        "roots": roots,
+    }
+
+
+def _meta_row_name(row: dict, section: dict) -> tuple[str | None, bool] | None:
+    """(property, whether the row sits in the meta file) of a row MetAcsl generated; None for any other row."""
+    meta_file = section.get("meta_file")
+    if not meta_file:
+        return None
+    text = str(row.get("property") if "property" in row else row.get("annotation") or "")
+    m = _META_NAMED_RE.match(text)
+    named = m.group(1) if m and m.group(1) in (section.get("properties") or []) else None
+    path = _row_path(row)
+    if path and _same_file(path, _posix(meta_file)):
+        return (section.get("line_names") or {}).get(str(row.get("line"))) or named, True
+    return (named, False) if named else None
+
+
+def is_meta_row(row: dict, section: dict | None) -> bool:
+    """Whether a report row is an annotation MetAcsl generated from the properties `section` loaded."""
+    return isinstance(section, dict) and _meta_row_name(row, section) is not None
+
+
+def split_meta_rows(rows: Iterable[dict], section: dict | None) -> tuple[list[dict], list[dict]]:
+    """(the other rows, MetAcsl's rows), each in report order."""
+    plain: list[dict] = []
+    meta: list[dict] = []
+    for row in rows:
+        (meta if is_meta_row(row, section) else plain).append(row)
+    return plain, meta
+
+
+def _meta_bucket(status: str) -> str:
+    if status in (STATUS_VALID, STATUS_VALID_UNDER_HYP):
+        return "valid"
+    if status in (STATUS_UNKNOWN, STATUS_NEVER_TRIED):
+        return "unknown"
+    if status in (STATUS_INVALID, STATUS_INVALID_UNDER_HYP):
+        return "invalid"
+    if status == STATUS_DEAD:
+        return "dead"
+    return "assumed" if status == STATUS_ASSUMED else "other"
+
+
+def _meta_row_place(name: str | None, row: dict, in_meta_file: bool, section: dict) -> tuple[str, str, list[str]]:
+    """
+    Where one MetAcsl row belongs: (role, function id or name, candidate ids).
+
+      instance   in a function security_props.json lists as an instance of the property: a ledger unit;
+      decided    in a function whose instance the model decided (no unit waits for it);
+      unplanned  in a target function that is not an instance: the model and MetAcsl disagree;
+      ambiguous  in a function several files define under one name (the kernel renames the copies `f_0`
+                 and a row in the meta file does not say which one it is): no instance is credited;
+      outside    harness code, or a row no property names.
+
+    A generated assertion sits in the meta file and only names its function. A generated precondition
+    is reported at each call site, in the caller's own file.
+    """
+    functions = section.get("functions") or {}
+    fn = str(row.get("function") or "")
+    cands = list(functions.get(fn) or [])
+    renamed = False
+    if not cands:
+        m = KERNEL_RENAME_RE.fullmatch(fn)
+        if m and functions.get(m.group(1)):
+            cands, renamed = list(functions[m.group(1)]), True
+    path = _row_path(row)
+    if not in_meta_file:
+        here = [fid for fid in cands if _same_file(path, _posix(fid.rpartition("#")[0]))]
+        cands = [max(here, key=len)] if here else []
+        renamed = False
+    if name is None or not fn:
+        return "outside", fn, []
+    if not cands:
+        in_target = any(root and path.startswith(root) for root in section.get("roots") or [])
+        if fn in (section.get("outside_functions") or []) or not (in_meta_file or in_target):
+            return "outside", fn, []
+        return "unplanned", fn, []
+    planned = set((section.get("planned") or {}).get(name) or [])
+    if len(cands) > 1 or renamed:
+        return ("ambiguous", fn, cands) if planned & set(cands) else ("unplanned", fn, cands)
+    fid = cands[0]
+    if fid in planned:
+        return "instance", fid, cands
+    if fid in ((section.get("decided") or {}).get(name) or []):
+        return "decided", fid, cands
+    return "unplanned", fid, cands
+
+
+def security_section(meta_rows: Iterable[dict], section: dict) -> dict:
+    """
+    The report's `security_props` from MetAcsl's rows and the static part load_security_meta returned:
+
+      instances            one entry per planned instance in this parse (property, class, instance,
+                           function) with its rows counted per status; all zeros when MetAcsl generated
+                           nothing there (decided statically, or not instantiated);
+      unplanned_instances  the same counts for target functions that are not instances;
+      outside_instances    and for harness code: a violation the harness induces is listed, never filed;
+      open_rows            the Invalid, unclassified and Unknown rows themselves, named
+                           (`<property>: meta: <predicate>`), at most META_OPEN_ROWS_MAX of them;
+      counts               all of MetAcsl's rows per status.
+
+    The consolidated row of a generated precondition (in the meta file, kind `precondition`) is left
+    out: its call sites have rows of their own, in the callers.
+    """
+    out = {key: section[key] for key in META_STATIC_KEYS if key in section}
+    classes = section.get("classes") or {}
+
+    def zero() -> dict:
+        return dict.fromkeys(META_BUCKETS, 0)
+
+    instances = {(name, fid): zero() for name, fids in sorted((section.get("planned") or {}).items()) for fid in fids}
+    unplanned: dict[tuple[str, str], dict] = {}
+    outside: dict[tuple[str, str], dict] = {}
+    totals = zero()
+    open_rows: list[dict] = []
+    for row in meta_rows:
+        info = _meta_row_name(row, section)
+        if info is None:
+            continue
+        name, in_meta_file = info
+        if in_meta_file and str(row.get("kind") or "") == "precondition":
+            continue
+        bucket = _meta_bucket(str(row.get("status") or ""))
+        role, where, cands = _meta_row_place(name, row, in_meta_file, section)
+        totals[bucket] += 1
+        if role == "decided":
+            continue
+        if role == "instance":
+            instances[(str(name), where)][bucket] += 1
+        elif role == "ambiguous":
+            # Not known to be this instance's row: counted as unclassified on each candidate.
+            for fid in cands:
+                if (str(name), fid) in instances:
+                    instances[(str(name), fid)]["other"] += 1
+        elif role == "unplanned":
+            unplanned.setdefault((str(name), where), zero())[bucket] += 1
+        else:
+            outside.setdefault((str(name or ""), where), zero())[bucket] += 1
+        if bucket in META_OPEN_BUCKETS or role == "ambiguous":
+            text = str(row.get("property") if "property" in row else row.get("annotation") or "")
+            open_rows.append(
+                {
+                    "property": name,
+                    "role": role,
+                    "instance": where if role == "instance" else None,
+                    **({"candidates": cands} if role == "ambiguous" else {}),
+                    "directory": row.get("directory"),
+                    "file": row.get("file"),
+                    "line": row.get("line"),
+                    "function": row.get("function"),
+                    "kind": row.get("kind"),
+                    "status": row.get("status_raw"),
+                    "status_bucket": bucket,
+                    "annotation": text if not name or _META_NAMED_RE.match(text) else f"{name}: meta: {text}",
+                    **({"tuning_run": row["tuning_run"]} if row.get("tuning_run") else {}),
+                }
+            )
+    order = {bucket: i for i, bucket in enumerate(META_OPEN_BUCKETS)}
+    open_rows.sort(
+        key=lambda r: (
+            order.get(r["status_bucket"], len(order)),
+            str(r["property"] or ""),
+            str(r["function"] or ""),
+            int(r["line"] or 0),
+            r["annotation"],
+        )
+    )
+    out["instances"] = [
+        {
+            "property": name,
+            "class": classes.get(name, ""),
+            "instance": fid,
+            "function": fid.rpartition("#")[2],
+            **counts,
+        }
+        for (name, fid), counts in sorted(instances.items())
+    ]
+    out["unplanned_instances"] = [
+        {"property": name, "function": where, **counts} for (name, where), counts in sorted(unplanned.items())
+    ]
+    out["outside_instances"] = [
+        {"property": name or None, "function": where, **counts} for (name, where), counts in sorted(outside.items())
+    ]
+    out["open_rows"] = open_rows[:META_OPEN_ROWS_MAX]
+    if len(open_rows) > META_OPEN_ROWS_MAX:
+        out["open_rows_truncated"] = len(open_rows) - META_OPEN_ROWS_MAX
+    out["counts"] = totals
+    return out
+
+
+def summarize_report(rows: list[dict], section: dict | None = None) -> dict:
+    """
+    summarize_rows for a run that may have loaded security properties: MetAcsl's rows leave the status
+    buckets (they are no RTE obligation of their function) and are reported under `security_props`.
+    `section` is the run's own `security_props` (or its static part); without a meta file in it this is
+    summarize_rows. Every writer of a module report goes through here (eva_tuning.py finish and
+    eva_shards.py merge through summarize_runs), so the section always describes the rows the report
+    was built from.
+    """
+    if not isinstance(section, dict) or not section.get("meta_file"):
+        return summarize_rows(rows)
+    plain, meta = split_meta_rows(rows, section)
+    out = summarize_rows(plain)
+    out["security_props"] = security_section(meta, section)
+    return out
+
+
+def summarize_runs(rows: list[dict], sections: Iterable[object]) -> dict:
+    """
+    summarize_report for rows put together from several runs of one module (eva_shards.py merge,
+    eva_tuning.py finish), given each run's `security_props`. The runs must have loaded the same meta
+    file; when one ran without the properties (its MetAcsl stage failed) or with others, no instance
+    gets a status from the merge: MetAcsl's rows are dropped and `security_props.error` says why.
+    """
+    found = [s for s in sections if isinstance(s, dict)]
+    loaded = [s for s in found if s.get("meta_file")]
+    failed = next((s for s in found if s.get("error")), None)
+    if not loaded:
+        out = summarize_rows(rows)
+        if found:
+            out["security_props"] = dict(failed or found[0])
+        return out
+    files = sorted({str(s["meta_file"]) for s in loaded})
+    if failed is None and len(files) == 1 and len(loaded) == len(found):
+        return summarize_report(rows, loaded[0])
+    plain = rows
+    for section in loaded:
+        plain, _ = split_meta_rows(plain, section)
+    out = summarize_rows(plain)
+    why = (
+        f"one of the runs ran without the properties ({failed['error']})"
+        if failed is not None
+        else "the runs did not load the same meta file (" + ", ".join(files) + ")"
+    )
+    out["security_props"] = {
+        "props": loaded[0].get("props"),
+        "error": f"{why}: no property status for this module",
+        "properties": [],
+    }
+    return out
+
+
+def _meta_digest(section: dict) -> str:
+    """Digest of what decides how MetAcsl's rows are filed (the meta file's own text is a cache input)."""
+    blob = json.dumps({k: section.get(k) for k in META_STATIC_KEYS}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _keep_meta_failed_log(out_dir: Path) -> str | None:
+    """Move the log of the run that failed with the properties loaded aside (eva.meta_failed.log)."""
+    log = out_dir / "eva.log"
+    kept = out_dir / "eva.meta_failed.log"
+    try:
+        if log.is_file():
+            os.replace(log, kept)
+            return str(kept)
+    except OSError:
+        pass
+    return None
+
+
 def run_eva_on_slice(
     sources: list[str],
     main_fn: str,
@@ -458,12 +981,16 @@ def run_eva_on_slice(
     mirror_root: str | None = None,
     timeout_fallback: bool = True,
     flamegraph: bool = True,
+    security_props: str | None = None,
+    module: str = "",
 ) -> dict:
     """
     `eva_options` are allowlisted tuning values; `loop_unroll` analyses a mirror of the sources at
     `mirror_root` instead (default: under `out_dir`), with those loops annotated. `timeout_fallback`
     False keeps a timeout a timeout (tuning trials: a less precise fallback result cannot help there).
     `flamegraph` False leaves out -eva-flamegraph (tuning trials: nobody reads their profile).
+    `security_props` is the security_props.json to load MetAcsl properties from (resolve_security_props
+    gives a command line's default; None: none), `module` names the meta file written for them.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -492,8 +1019,15 @@ def run_eva_on_slice(
             stale.unlink()
 
     original_flags = shlex.split(augment_framac_cppflags(cppflags))
+    # The MetAcsl properties this run loads: `meta` is what the report says about them whatever
+    # happens, `active` is set when a meta file is to be parsed (the command and the cache key change).
+    meta = (
+        load_security_meta(security_props, list(sources), original_flags, module, main_fn) if security_props else None
+    )
+    active = meta if meta and meta.get("meta_file") else None
+    meta_inputs: list[str] = [*active["extra_sources"], active["meta_file"]] if active else []
     # Over the sources as given, before any mirror: runs of one analysis must agree on it.
-    input_digest = _input_digest(sources, original_flags)
+    input_digest = _input_digest([*sources, *meta_inputs] if active else sources, original_flags)
     eff_sources, eff_cppflags = list(sources), cppflags
     applied: list[LoopRef] = []
     dropped: list[LoopRef] = []
@@ -508,22 +1042,29 @@ def run_eva_on_slice(
         else:
             eff_sources, eff_cppflags, path_root = mirror.sources, mirror.cppflags, mirror.root
             applied, dropped = mirror.applied, mirror.dropped
-    cmd, reduced_checks = _eva_command(
-        eff_sources,
-        main_fn,
-        out_dir,
-        machdep,
-        eff_cppflags,
-        slevel,
-        warn_invalid_pointer,
-        warn_unsigned,
-        warn_unsigned_downcast,
-        extra_domains,
-        mlevel=mlevel,
-        allow_incomplete_recursion_specs=allow_incomplete_recursion_specs,
-        eva_options=options,
-        flamegraph=flamegraph,
-    )
+
+    def _command(
+        loaded: dict | None, allow_rec: bool, opts: dict, with_flamegraph: bool
+    ) -> tuple[list[str], list[str]]:
+        return _eva_command(
+            eff_sources,
+            main_fn,
+            out_dir,
+            machdep,
+            eff_cppflags,
+            slevel,
+            warn_invalid_pointer,
+            warn_unsigned,
+            warn_unsigned_downcast,
+            extra_domains,
+            mlevel=mlevel,
+            allow_incomplete_recursion_specs=allow_rec,
+            eva_options=opts,
+            flamegraph=with_flamegraph,
+            **({"security_meta": loaded} if loaded else {}),
+        )
+
+    cmd, reduced_checks = _command(active, allow_incomplete_recursion_specs, options, flamegraph)
 
     def _finalize(res: dict) -> dict:
         # Never cached: these describe this invocation, and the digest is taken fresh each time.
@@ -532,9 +1073,32 @@ def run_eva_on_slice(
         res["loop_unroll"] = [ref.to_json() for ref in applied]
         res["loop_unroll_dropped"] = [ref.to_json() for ref in dropped]
         res["input_digest"] = input_digest
+        if meta is not None and "security_props" not in res:
+            # Asked for, and no meta file was parsed (unreadable file, no property for this module).
+            res["security_props"] = dict(meta)
         return res
 
     def _run() -> dict:
+        res = _attempt(active)
+        if active and res["status"] == "analysis_error" and res.get("reason") != "stub_assigns_without_from":
+            # Frama-C failed with the properties loaded (a property MetAcsl cannot type aborts it):
+            # the module still gets its RTE result, from the run without them, and the report says so.
+            failed_log = _keep_meta_failed_log(out_dir)
+            errors = list(res.get("error_summary") or [])[:5]
+            for name in ("alarms.csv", "red_alarms.csv", "framac.sav", "slice.sarif", "flows.log", "flows.cg.dot"):
+                (out_dir / name).unlink(missing_ok=True)
+            res = _attempt(None)
+            res["security_props"] = {
+                "props": active["props"],
+                "error": "Frama-C failed with the security properties loaded; this is the run without them",
+                "error_summary": errors,
+                "failed_log": failed_log,
+                "failed_meta_file": active["meta_file"],
+                "properties": [],
+            }
+        return res
+
+    def _attempt(loaded: dict | None) -> dict:
         budget_s = float(timeout) if timeout is not None and timeout > 0 else None
         started_all = time.monotonic()
 
@@ -554,11 +1118,24 @@ def run_eva_on_slice(
 
         def _exec(run_cmd: list[str], run_reduced: list[str], run_timeout: int | None) -> dict:
             # Every run (base, recursion retry, fallback tier) fails on a contract without \from.
-            out = _execute_eva(run_cmd, eff_sources, main_fn, out_dir, run_reduced, run_timeout, path_root=path_root)
+            out = _execute_eva(
+                run_cmd,
+                eff_sources,
+                main_fn,
+                out_dir,
+                run_reduced,
+                run_timeout,
+                path_root=path_root,
+                **({"security_meta": loaded} if loaded else {}),
+            )
             return reject_stub_from_defects(out, out_dir)
 
         cur_allow_rec = allow_incomplete_recursion_specs
-        cur_cmd, cur_reduced = cmd, reduced_checks
+        cur_cmd, cur_reduced = (
+            (cmd, reduced_checks)
+            if loaded is active
+            else _command(loaded, allow_incomplete_recursion_specs, options, flamegraph)
+        )
         res = _exec(cur_cmd, cur_reduced, timeout)
 
         # Auto-retry when Frama-C aborts on a recursive call or indirect callback cycle without an ACSL
@@ -570,22 +1147,7 @@ def run_eva_on_slice(
             and _recursion_retry_applies(out_dir / "eva.log")
         ):
             cur_allow_rec = True
-            cur_cmd, cur_reduced = _eva_command(
-                eff_sources,
-                main_fn,
-                out_dir,
-                machdep,
-                eff_cppflags,
-                slevel,
-                warn_invalid_pointer,
-                warn_unsigned,
-                warn_unsigned_downcast,
-                extra_domains,
-                mlevel=mlevel,
-                allow_incomplete_recursion_specs=True,
-                eva_options=options,
-                flamegraph=flamegraph,
-            )
+            cur_cmd, cur_reduced = _command(loaded, True, options, flamegraph)
             res = _exec(cur_cmd, cur_reduced, _remaining(int(budget_s or 300)))
             res["auto_recursion_fallback"] = True
 
@@ -601,22 +1163,7 @@ def run_eva_on_slice(
             fb_budget = min(900, max(120, int((budget_s or 600) // 4)))
             tried: list[dict] = []
             for tier_name, fb_opts in _timeout_fallback_tiers(slevel, options):
-                fb_cmd, fb_reduced = _eva_command(
-                    eff_sources,
-                    main_fn,
-                    out_dir,
-                    machdep,
-                    eff_cppflags,
-                    slevel,
-                    warn_invalid_pointer,
-                    warn_unsigned,
-                    warn_unsigned_downcast,
-                    extra_domains,
-                    mlevel=mlevel,
-                    allow_incomplete_recursion_specs=cur_allow_rec,
-                    eva_options=fb_opts,
-                    flamegraph=fb_flamegraph,
-                )
+                fb_cmd, fb_reduced = _command(loaded, cur_allow_rec, fb_opts, fb_flamegraph)
                 fb_res = _exec(fb_cmd, fb_reduced, fb_budget)
                 if (
                     fb_res["status"] == "analysis_error"
@@ -625,22 +1172,7 @@ def run_eva_on_slice(
                     and _recursion_retry_applies(out_dir / "eva.log")
                 ):
                     cur_allow_rec = True
-                    fb_cmd, fb_reduced = _eva_command(
-                        eff_sources,
-                        main_fn,
-                        out_dir,
-                        machdep,
-                        eff_cppflags,
-                        slevel,
-                        warn_invalid_pointer,
-                        warn_unsigned,
-                        warn_unsigned_downcast,
-                        extra_domains,
-                        mlevel=mlevel,
-                        allow_incomplete_recursion_specs=True,
-                        eva_options=fb_opts,
-                        flamegraph=fb_flamegraph,
-                    )
+                    fb_cmd, fb_reduced = _command(loaded, True, fb_opts, fb_flamegraph)
                     fb_res = _exec(fb_cmd, fb_reduced, fb_budget)
                     fb_res["auto_recursion_fallback"] = True
                 if fb_res["status"] == "ok":
@@ -682,19 +1214,26 @@ def run_eva_on_slice(
     }
     # The nonterm log is passed with its append prefix, so mask that spelling too.
     outputs_in_cmd[f"a:{out_dir / 'nonterm.log'}"] = "<out>/nonterm.log"
+    # With properties loaded, the meta file and the sources its properties need are inputs like any
+    # other: the meta file's text is in the dependency manifest, so a changed property is a new key, and
+    # so is turning the engine on or off (the command differs).
+    cache_sources = [*eff_sources, *meta_inputs]
     material = {
         "kind": "eva",
         "command": [outputs_in_cmd.get(token, token) for token in cmd],
-        "sources": list(eff_sources),
+        "sources": cache_sources,
         # A fallback tier's result is cached under the command that timed out: never reuse it where
         # the fallback is off. Only added when off, so existing entries keep their keys.
         **({} if timeout_fallback else {"timeout_fallback": False}),
+        # How the rows are filed (instances, decided functions) comes from security_props.json, not
+        # from the meta file: only added with properties loaded, so existing entries keep their keys.
+        **({"security_props": _meta_digest(active)} if active else {}),
     }
     return _finalize(
         cache.memoize(
             "eva",
             material,
-            sources=eff_sources,
+            sources=cache_sources,
             dep_flags=shlex.split(augment_framac_cppflags(eff_cppflags)),
             build=_run,
             outputs=lambda res: {name: out_dir / name for name in _CACHED_OUTPUTS},
@@ -1062,9 +1601,17 @@ def _eva_command(
     allow_incomplete_recursion_specs: bool = False,
     eva_options: dict | None = None,
     flamegraph: bool = True,
+    security_meta: dict | None = None,
 ) -> tuple[list[str], list[str]]:
+    """
+    `security_meta` (load_security_meta, with a `meta_file`) adds the sources its properties need and
+    the meta file after `sources`, and META_STAGE before `-rte`; without it the command is unchanged.
+    """
     if mlevel < 0:
         raise ValueError(f"mlevel must be >= 0 (got {mlevel})")
+    meta_file = (security_meta or {}).get("meta_file")
+    if meta_file:
+        sources = [*sources, *((security_meta or {}).get("extra_sources") or [])]
     options = dict(eva_options or {})
     if "alloc-functions" not in options:
         detected_allocs = detect_alloc_wrappers(sources)
@@ -1112,8 +1659,10 @@ def _eva_command(
         [
             f"-cpp-extra-args={effective_cppflags}",
             *sources,
+            *([str(meta_file)] if meta_file else []),
             "-main",
             main_fn,
+            *(META_STAGE if meta_file else ()),
             "-rte",
             "-then",
             "-eva",
@@ -1252,6 +1801,7 @@ def _execute_eva(
     reduced_checks: list[str],
     timeout: int | None,
     path_root: str | None = None,
+    security_meta: dict | None = None,
 ) -> dict:
     csv_path = out_dir / "alarms.csv"
     sav_path = out_dir / "framac.sav"
@@ -1293,7 +1843,7 @@ def _execute_eva(
             sarif_path.write_text(sarif_text.replace(f"{path_root}/", ""), encoding="utf-8")
 
     rows = read_report_rows(csv_path, path_root) if csv_path.exists() else []
-    summary = summarize_rows(rows)
+    summary = summarize_report(rows, security_meta)
 
     flamegraph_path = out_dir / "flamegraph.txt"
     nonterm_log_path = out_dir / "nonterm.log"
@@ -1454,6 +2004,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Where --loop-unroll writes its mirror (default: under --out-dir).",
     )
+    parser.add_argument(
+        "--security-props",
+        default=None,
+        metavar="PATH|none",
+        help=(
+            "security_props.json to load MetAcsl properties from, when its meta_engines holds eva "
+            f"(default: ${SECURITY_PROPS_ENV}, else {DEFAULT_SECURITY_PROPS.as_posix()} when it exists; `none`: never)."
+        ),
+    )
     raw = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(normalize_flag_args(raw, ("--cppflags",)))
     timeout = CLASSES["eva"].wall_timeout_s if args.timeout is None else args.timeout
@@ -1475,6 +2034,7 @@ def main(argv: list[str] | None = None) -> int:
     # The harness this report stands for, taken before the run (a cache hit included: the restored
     # result describes these sources, so it gets the stamp of the harness that is current now).
     harness = phase0_gates.harness_digest(Path("."), args.module, ignore_exempt=True) if args.module else None
+    props = resolve_security_props(args.security_props)
     res = run_eva_on_slice(
         sources=args.sources,
         main_fn=args.main,
@@ -1494,6 +2054,8 @@ def main(argv: list[str] | None = None) -> int:
         mirror_root=args.mirror_root,
         timeout_fallback=not args.no_timeout_fallback,
         flamegraph=not args.no_flamegraph,
+        # Only with a file to load, so a run without one is called exactly as before.
+        **({"security_props": props, "module": args.module} if props else {}),
     )
     res["module"] = args.module
     res["harness_digest"] = harness
@@ -1515,6 +2077,17 @@ def main(argv: list[str] | None = None) -> int:
                 "surviving_unknown_functions": res["surviving_unknown_functions"],
                 **({"timeout_fallback": res["timeout_fallback"]} if res.get("timeout_fallback") else {}),
                 **({"cost_profile": res["cost_profile"]} if res.get("cost_profile") else {}),
+                **(
+                    {
+                        "security_props": {
+                            key: res["security_props"][key]
+                            for key in ("properties", "error", "skipped", "counts")
+                            if key in res["security_props"]
+                        }
+                    }
+                    if isinstance(res.get("security_props"), dict)
+                    else {}
+                ),
             },
             indent=2,
         )

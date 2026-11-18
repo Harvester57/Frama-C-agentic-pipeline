@@ -181,9 +181,13 @@ $(REACH_DYNAMIC_TARGETS): reach-dynamic-%: coverage-%
 # What every Eva run of module $(1) has in common: the rest is tuning, and tuning never changes what
 # is checked, so runs differing only in that can be compared and combined (eva_tuning.py). $(2), when
 # given, replaces the module's cppflags (a shard's: the module's plus the cases it keeps).
+# EVA_SECURITY_PROPS_<mod> is set when security_props.json turns MetAcsl on for Eva (`meta_engines`):
+# the plain run, the base run, every rung, every shard and the loop trials of `finish` then load the
+# same properties (run_eva_slice.py --security-props).
 eva_args = --module $(1) --sources $(SOURCES_$(1)) --main eva_main --slevel $(EVA_SLEVEL_$(1)) \
 	$(if $(EVA_MLEVEL_$(1)),--mlevel $(EVA_MLEVEL_$(1))) \
 	$(if $(EVA_TAINT_$(1)),--extra-domains taint) \
+	$(if $(EVA_SECURITY_PROPS_$(1)),--security-props=$(EVA_SECURITY_PROPS_$(1))) \
 	$(if $(EVA_RECURSION_FALLBACK_$(1)),--allow-incomplete-recursion-specs) \
 	--no-warn-unsigned-downcast \
 	--cppflags=$(if $(2),$(2),$(CPPFLAGS_$(1)))

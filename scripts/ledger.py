@@ -1823,6 +1823,222 @@ def _taint_reopen(unit: dict) -> None:
         unit["unresolved"] = []
 
 
+# MetAcsl under Eva (docs/plans/metacsl-exploitation-plan.md, package B). With `eva` in
+# security_props.json's `meta_engines`, run_eva_slice.py loads the module's meta-properties and reports
+# the checks MetAcsl generated under `security_props`, outside the status lists the rte units read. Each
+# planned instance there (`instances`: property, `file#name`, rows per status) is one property of one
+# L4-L6 unit, filed with the rules of the rte rows: bookkeeping.eva_verdicts (module -> verdict), a cover
+# only when some module proves every check and none leaves one open, an Unknown left to WP, an Invalid a
+# candidate. Rows in harness code (`outside_instances`) and in target functions that are no instance
+# (`unplanned_instances`) are in the report only: they never reach a unit.
+_META_VERDICT_ORDER = ("invalid", "other", "unknown", "dead", "none", "valid")
+_META_ROW_RE = re.compile(r"^\s*[A-Za-z_]\w*\s*[:,]\s*meta\s*[:,]")
+_META_ROW_LISTS = ("invalid_alarms", "dead_alarms", "assumed_properties", "other_properties")
+
+
+def _eva_meta_section(report: dict) -> dict | None:
+    """The report's `security_props` when the run parsed a meta file and filed its rows; else None."""
+    section = report.get("security_props")
+    if not isinstance(section, dict) or section.get("error") or not section.get("meta_file"):
+        return None
+    return section
+
+
+def _is_eva_meta_row(row: object, meta_name: str) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return Path(str(row.get("file") or "")).name == meta_name or bool(
+        _META_ROW_RE.match(str(row.get("annotation") or ""))
+    )
+
+
+def _without_eva_meta_rows(report: dict, section: dict) -> dict:
+    """
+    The report without any MetAcsl row in its status lists. run_eva_slice.py never puts one there; a
+    report from another writer must not turn a property's check into an RTE verdict of its function.
+    """
+    meta_name = Path(str(section.get("meta_file"))).name
+    out = dict(report)
+    raw = report.get("unknown_obligations_by_function")
+    if isinstance(raw, dict):
+        kept = {
+            fn: [r for r in rows if not _is_eva_meta_row(r, meta_name)]
+            for fn, rows in raw.items()
+            if isinstance(rows, list)
+        }
+        out["unknown_obligations_by_function"] = {fn: rows for fn, rows in kept.items() if rows}
+    for key in _META_ROW_LISTS:
+        found = report.get(key)
+        if isinstance(found, list):
+            out[key] = [r for r in found if not _is_eva_meta_row(r, meta_name)]
+    return out
+
+
+def _eva_meta_instance_verdict(entry: object) -> str:
+    """One planned instance's verdict from its row counts; `none` when MetAcsl generated no row for it."""
+    if not isinstance(entry, dict):
+        return "none"
+    for bucket in ("invalid", "other", "unknown", "dead"):
+        if entry.get(bucket):
+            return bucket
+    return "valid" if entry.get("valid") else "none"
+
+
+def _eva_meta_cover_barred(unit: dict) -> bool:
+    """An L4-L6 unit Eva's checks cannot cover: decided violated from the model, or its taint check is open."""
+    return unit["obligation_class"] in METACSL_CLASSES and (_decided_violation(unit) or bool(_taint_open(unit)))
+
+
+def _ingest_eva_meta(
+    units: dict[str, dict],
+    candidates: dict[str, dict],
+    section: dict,
+    module: str,
+    report: dict,
+    tool_output: str,
+    index: dict[str, list[tuple[int, int, str]]],
+    touched: set[str],
+) -> tuple[int, int]:
+    """
+    File one Eva report's MetAcsl statuses under the L4-L6 units; returns (units given a verdict,
+    candidates opened). A unit gets a verdict when the report lists an instance of one of its
+    properties in its function; the unit's verdict is the worst of its properties':
+
+      invalid  a check is Invalid: a candidate per Invalid row, the unit becomes `candidate`;
+      other    a status Eva left unclassified, or a row that cannot be told apart from another file's
+               same-named function: not credited;
+      unknown  a check is Unknown: evidence only, WP proves the property;
+      dead     the checks are dead under this harness (a harness gap);
+      none     MetAcsl generated no check for a property here (it decided the instance statically, or
+               did not instantiate it in this parse): not credited, WP's own MetAcsl run decides;
+      valid    every property has checks and all are Valid: discharging evidence.
+
+    The caller's loop over `touched` then covers or reopens the unit from every module's verdict.
+    """
+    entries: dict[tuple[str, str, str], dict] = {}
+    for entry in section.get("instances") or []:
+        if not isinstance(entry, dict):
+            continue
+        file, _, fn = str(entry.get("instance") or "").rpartition("#")
+        entries[(str(entry.get("property")), normalize_file(file), fn)] = entry
+    invalid_rows: dict[tuple[str, str], list[dict]] = {}
+    for row in section.get("open_rows") or []:
+        if isinstance(row, dict) and row.get("role") == "instance" and row.get("status_bucket") == "invalid":
+            invalid_rows.setdefault((str(row.get("property")), str(row.get("instance"))), []).append(row)
+    reduced_checks = [str(x) for x in (report.get("reduced_checks") or []) if str(x).strip()]
+    filed = opened = 0
+    for u in units.values():
+        if u["obligation_class"] not in METACSL_CLASSES or u["status"] in NO_TOUCH or _decided_violation(u):
+            continue
+        names = [str(n) for n in (u.get("bookkeeping") or {}).get("security_properties") or []]
+        u_file, fn = u["file"], u["function"]
+        mine = {n: entries.get((n, normalize_file(u_file), fn)) for n in names}
+        if not any(e is not None for e in mine.values()):
+            continue  # this slice has no instance of the unit's properties in its function
+        filed += 1
+        touched.add(u["coverage_id"])
+        per = {n: _eva_meta_instance_verdict(e) for n, e in mine.items()}
+        verdict = min(per.values(), key=_META_VERDICT_ORDER.index)
+        _unit_eva_verdicts(u)[module] = verdict
+        listed = ", ".join(sorted(per))
+        where = f"Eva slice '{module}': "
+        if verdict == "invalid":
+            for name in sorted(n for n, v in per.items() if v == "invalid"):
+                instance = str((mine[name] or {}).get("instance"))
+                rows = invalid_rows.get((name, instance)) or [
+                    {"kind": "meta", "annotation": f"{name}: meta: (the report does not list the row)", "line": 0}
+                ]
+                for row in rows:
+                    # A generated precondition is reported at its call site, in this function's own
+                    # file; a generated assertion sits in the meta file and has no line here.
+                    line = int(row.get("line") or 0) if row.get("file") and _alarm_in_file(row, u_file) else 0
+                    kind = str(row.get("kind") or "assertion")
+                    annotation = str(row.get("annotation") or "")
+                    cand = upsert_candidate(
+                        candidates,
+                        make_fingerprint(u_file, fn, kind, annotation),
+                        "eva",
+                        "needs_validation",
+                        module,
+                        {"file": normalize_file(u_file), "line": line, "function": fn},
+                        {"kind": kind, "predicate": annotation},
+                        [],
+                        tool_output,
+                        [u["coverage_id"]],
+                        f"Eva Invalid status of a check MetAcsl generated from {name}, without a concrete witness input",
+                        site=_candidate_site(u_file, line, fn, index),
+                    )
+                    add_evidence(
+                        u,
+                        "eva",
+                        "run_eva_slice.py",
+                        "eva_meta_invalid",
+                        False,
+                        tool_output,
+                        f"{where}Invalid{f' at line {line}' if line else ''}: {annotation[:200] or name}",
+                    )
+                    mark_candidate(u, cand["fingerprint"])
+                    opened += 1
+            continue
+        count = sum(int((e or {}).get(verdict) or 0) for e in mine.values())
+        if verdict == "other":
+            add_evidence(
+                u,
+                "eva",
+                "run_eva_slice.py",
+                "eva_meta_unclassified",
+                False,
+                tool_output,
+                f"{where}{count} check(s) of {listed} have a status Eva left unclassified, or sit in a function "
+                "several files define under one name; not credited.",
+            )
+        elif verdict == "unknown":
+            add_evidence(
+                u,
+                "eva",
+                "run_eva_slice.py",
+                "eva_meta_unknown",
+                False,
+                tool_output,
+                f"{where}{count} check(s) of {listed} remain Unknown; WP proves the property.",
+            )
+        elif verdict == "dead":
+            add_evidence(
+                u,
+                "eva",
+                "run_eva_slice.py",
+                "eva_meta_dead",
+                False,
+                tool_output,
+                f"{where}the checks of {listed} are dead under the module harness: not reached from eva_main "
+                "(harness gap).",
+            )
+        elif verdict == "none":
+            missing = ", ".join(sorted(n for n, v in per.items() if v == "none"))
+            add_evidence(
+                u,
+                "eva",
+                "run_eva_slice.py",
+                "eva_meta_no_instance",
+                False,
+                tool_output,
+                f"{where}MetAcsl generated no check for {missing} in this function (decided statically, or not "
+                "instantiated in this slice); not credited, WP's own MetAcsl run decides.",
+            )
+        else:
+            summary = f"every check MetAcsl generated from {listed} in this function is Valid under Eva"
+            if reduced_checks:
+                summary += f" (reduced_checks: {', '.join(reduced_checks)})"
+            add_evidence(u, "eva", "run_eva_slice.py", "eva_meta_valid", True, tool_output, f"{where}{summary}.")
+            if reduced_checks:
+                add_assumption(
+                    u,
+                    "boundary_assumption",
+                    f"Eva slice '{module}' ran with reduced checks ({', '.join(reduced_checks)}).",
+                )
+    return filed, opened
+
+
 @ledger_locked
 def cmd_ingest_eva(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -1889,6 +2105,15 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             stats["taint_units"] = stats.get("taint_units", 0) + taint_units
         for u in taint_reset:
             _taint_reopen(u)
+        meta_section = _eva_meta_section(report)
+        if meta_section is not None:
+            report = _without_eva_meta_rows(report, meta_section)
+            meta_units, meta_candidates = _ingest_eva_meta(
+                units, candidates, meta_section, module, report, tool_output, index, touched
+            )
+            if meta_units:
+                stats["meta_units"] = stats.get("meta_units", 0) + meta_units
+            stats["candidates"] += meta_candidates
 
         def by_function(rows: object, reported: str | None = None) -> dict[str, list]:
             out: dict[str, list] = {}
@@ -2113,12 +2338,14 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
 
     # Each touched unit's Eva status, from every module's verdict: covered only when some module's
     # harness proves every RTE obligation in it and none leaves one Unknown, Invalid or unclassified.
+    # An L4-L6 unit follows the same rule over the checks MetAcsl generated for its properties
+    # (_ingest_eva_meta), unless the model decided it violated or its taint check is open.
     for cid in sorted(touched):
         u = units[cid]
         verdicts = (u.get("bookkeeping") or {}).get("eva_verdicts") or {}
         valid = sorted(m for m, v in verdicts.items() if v == "valid")
         blocking = sorted(m for m, v in verdicts.items() if v in EVA_BLOCKING)
-        established = bool(valid) and not blocking
+        established = bool(valid) and not blocking and not _eva_meta_cover_barred(u)
         u["assumptions"] = [
             a
             for a in u["assumptions"]
@@ -2154,6 +2381,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             u["agent_id"] = None
             u["unresolved"] = []
             why = ", ".join(f"'{m}'" for m in blocking) or "none proves it"
+            what = "check of this unit's properties" if u["obligation_class"] in METACSL_CLASSES else "RTE obligation"
             add_evidence(
                 u,
                 "eva",
@@ -2161,8 +2389,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 "eva_cover_withdrawn",
                 False,
                 (u["evidence"][-1] or {}).get("tool_output") if u["evidence"] else None,
-                f"Eva no longer proves every RTE obligation here (module(s) leaving obligations open: {why}); "
-                "back to planned.",
+                f"Eva no longer proves every {what} here (module(s) leaving obligations open: {why}); back to planned.",
             )
             stats["reopened"] = stats.get("reopened", 0) + 1
     commit(units, candidates)
