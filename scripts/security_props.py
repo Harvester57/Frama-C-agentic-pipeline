@@ -616,8 +616,9 @@ class _Gen:
             return None
         plan = self._handoff_refusal(item, sink, kind, declared)
         if isinstance(plan, str):
+            # "output sink ": the prefix generate_report.py lists under the threat-model items.
             self.warnings.append(
-                f"wrapper sink {sink}: `checked_at` not applied: {plan}: {name} stays checked at the calls of {sink}"
+                f"output sink {sink}: `checked_at` not applied: {plan}: {name} stays checked at the calls of {sink}"
             )
             return None
         return plan

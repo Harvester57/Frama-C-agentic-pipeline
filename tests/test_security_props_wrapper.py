@@ -64,7 +64,7 @@ def assert_kept_at_callers(doc: dict, why: str) -> None:
     assert prop["instances"] == ["prog.c#request_rtu", "prog.c#request_tcp"], prop
     assert "relocated" not in prop and "code" not in prop
     assert "\\context(\\calling)" in prop["acsl"] and "\\called == send_frame" in prop["acsl"]
-    refused = [w for w in doc["warnings"] if w.startswith("wrapper sink send_frame: `checked_at` not applied")]
+    refused = [w for w in doc["warnings"] if w.startswith("output sink send_frame: `checked_at` not applied")]
     assert len(refused) == 1 and why in refused[0], doc["warnings"]
     assert f"{WRAPPER_PROP} stays checked at the calls of send_frame" in refused[0]
     assert not sp.validate(doc)
@@ -270,7 +270,7 @@ def test_a_plain_declared_sink_is_unchanged():
 )
 def test_what_checked_at_does_not_cover_is_refused(change, why):
     doc = wrapper_doc({**CHECKED_AT_SINK, **change}, TCP_SINK, RTU_SINK)
-    assert any(w.startswith("wrapper sink send_frame: `checked_at` not applied") and why in w for w in doc["warnings"])
+    assert any(w.startswith("output sink send_frame: `checked_at` not applied") and why in w for w in doc["warnings"])
     assert "relocated" not in by_name(doc)[WRAPPER_PROP] and not sp.validate(doc)
 
 
