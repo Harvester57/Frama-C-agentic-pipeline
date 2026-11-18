@@ -2363,24 +2363,23 @@ def extract_frame_clauses(acsl_text: str) -> dict:
     for m in _SEPARATED_RE.finditer(masked):
         inner, _ = _paren_group_at(masked, m.end() - 1)
         separated.append(_split_top_level(visible[m.end() : m.end() + len(inner)], ","))
-    assigns: list[dict] = []
-    for kind, _label, clause, _span in iter_clauses(acsl_text):
-        if kind != "assigns":
-            continue
-        from_m = _FROM_RE.search(clause)
-        if from_m:
-            locs_text, from_text = clause[: from_m.start()], clause[from_m.end() :]
-        else:
-            locs_text, from_text = clause, ""
-        from_parts = _split_top_level(from_text, ",") if from_text.strip() else []
-        assigns.append(
-            {
-                "locs": _split_top_level(locs_text, ","),
-                "from": from_parts,
-                "from_nothing": bool(from_parts) and all(p == "\\nothing" for p in from_parts),
-            }
-        )
+    assigns = [_split_assigns(clause) for kind, _label, clause, _span in iter_clauses(acsl_text) if kind == "assigns"]
     return {"separated": separated, "assigns": assigns}
+
+
+def _split_assigns(clause: str) -> dict:
+    """The locations and the `\\from` sources of one `assigns` clause (its text after the keyword and label)."""
+    from_m = _FROM_RE.search(clause)
+    if from_m:
+        locs_text, from_text = clause[: from_m.start()], clause[from_m.end() :]
+    else:
+        locs_text, from_text = clause, ""
+    from_parts = _split_top_level(from_text, ",") if from_text.strip() else []
+    return {
+        "locs": _split_top_level(locs_text, ","),
+        "from": from_parts,
+        "from_nothing": bool(from_parts) and all(p == "\\nothing" for p in from_parts),
+    }
 
 
 def _norm_clause(text: str) -> str:
@@ -3124,3 +3123,317 @@ def function_returns_void(source: str, function: str, is_header: bool = False, p
         return None
     prefix = head[: m.start()]
     return "*" not in prefix and "void" in _IDENT_RE.findall(prefix)
+
+
+# ---------------------------------------------------------------------------
+# Contract comparison: which clauses of a function's contract a candidate removed
+# ---------------------------------------------------------------------------
+
+# Frama-C's own name for the behavior holding the clauses written outside every `behavior`; not an identifier,
+# so no named behavior can collide with it.
+DEFAULT_BEHAVIOR = "default!"
+# The clause kinds every behavior of a comparison reports, in this order.
+CONTRACT_CLAUSE_KINDS = (
+    "requires",
+    "assumes",
+    "assigns",
+    "ensures",
+    "terminates",
+    "exits",
+    "decreases",
+    "allocates",
+    "frees",
+)
+
+_BEHAVIOR_NAME_RE = re.compile(r"(?<![\\\w])behavior\s+([A-Za-z_][A-Za-z0-9_]*)\s*:")
+_COMPLETENESS_RE = re.compile(r"(?<![\\\w])(?:complete|disjoint)\s+behaviors\b[^;]*")
+_CLAUSE_MODIFIER_RE = re.compile(r"(?<![\\\w])(check|admit)\s+$")
+_FORMAL_REF_RE = re.compile(r"(?<![\w\\])[A-Za-z_][A-Za-z0-9_]*")
+
+
+class _NoComparison(Exception):
+    """Why `compare_function_contracts` has no comparison to give."""
+
+
+def _empty_contract_comparison(function: object) -> dict:
+    return {
+        "available": False,
+        "reason": "",
+        "function": function if isinstance(function, str) else "",
+        "declarations": {"baseline": [], "candidate": []},
+        "formals_unified": False,
+        "had_contract": False,
+        "has_contract": False,
+        "behaviors": {},
+        "completeness": {"baseline": [], "candidate": [], "removed": [], "added": []},
+        "summary": {"assigns_removed_in": [], "ensures_removed_in": [], "behaviors_removed": []},
+    }
+
+
+def _read_declaration_contract(decl: DeclSpan, path: str) -> dict:
+    """
+    The contract in front of one declaration: its clauses as `(behavior, kind, text)`, the named behaviors and
+    the `complete` / `disjoint` clauses in source order, and the declaration's C tokens. `text` is the clause
+    without keyword and label, white space collapsed; a `check` or `admit` clause keeps that word in front.
+    A contract is one annotation, so each annotation starts in the default behavior. Ghost code is skipped.
+    """
+    tokens = tokenize_c_acsl(_span_contract_part(decl, path=path), path=path)
+    clauses: list[tuple[str, str, str]] = []
+    behaviors: list[str] = []
+    completeness: list[str] = []
+    for tok in tokens:
+        if tok.kind not in ("acsl_block", "acsl_line") or _GHOST_ANNOTATION_RE.match(tok.text, 3):
+            continue
+        shape = _kernel_views(tok.text)[0]
+        heads = [(m.start(), m.group(1)) for m in _BEHAVIOR_NAME_RE.finditer(shape)]
+        behaviors.extend(name for _pos, name in heads)
+        completeness.extend(" ".join(m.group(0).split()) for m in _COMPLETENESS_RE.finditer(shape))
+        for kind, _label, pred, (start, _end) in iter_clauses(tok.text):
+            text = " ".join(pred.split())
+            if kind != "assigns":
+                text = _strip_outer_parens(text)
+            if not text:
+                continue
+            modifier = _CLAUSE_MODIFIER_RE.search(shape, 0, start)
+            if modifier is not None:
+                text = f"{modifier.group(1)} {text}"
+            behavior = DEFAULT_BEHAVIOR
+            for pos, name in heads:
+                if pos < start:
+                    behavior = name
+            clauses.append((behavior, kind, text))
+    signature = [t.text for t in tokens if t.kind not in ("whitespace", "c_comment", "acsl_block", "acsl_line")]
+    return {"clauses": clauses, "behaviors": behaviors, "completeness": completeness, "signature": signature}
+
+
+def _contract_declarations(texts: Mapping[str, str], function: str, side: str) -> list[tuple[str, DeclSpan, dict]]:
+    """`(file, declaration, its contract)` for every declaration of `function` in `texts`, in the given file order."""
+    found: list[tuple[str, DeclSpan, dict]] = []
+    for rel, text in texts.items():
+        if not isinstance(rel, str) or not isinstance(text, str):
+            raise _NoComparison(f"{rel} ({side}): a file name and its text must both be strings")
+        try:
+            for decl in function_declaration_spans(text, function, path=rel):
+                found.append((rel, decl, _read_declaration_contract(decl, rel)))
+        except AcslError as exc:
+            raise _NoComparison(f"{side} text cannot be read: {exc}") from None
+    if not found:
+        raise _NoComparison(f"no declaration of '{function}' in the {side} text of {', '.join(texts)}")
+    return found
+
+
+def _positional_formals(text: str, positions: Mapping[str, str]) -> str:
+    """`text` with each formal of `positions` replaced by its position, except where the name is a field."""
+    if not positions:
+        return text
+
+    def replace(m: re.Match[str]) -> str:
+        position = positions.get(m.group(0))
+        before = text[: m.start()].rstrip()
+        if position is None or before.endswith("->") or (before.endswith(".") and not before.endswith("..")):
+            return m.group(0)
+        return position
+
+    return _FORMAL_REF_RE.sub(replace, text)
+
+
+def _pooled_clauses(decls: list[tuple[str, DeclSpan, dict]], formals: list[dict[str, str]]) -> dict[str, dict]:
+    """
+    The clauses of every declaration, per behavior then per kind, as `(key, text, location keys)`. Frama-C
+    merges the contracts of a function's declarations behavior by behavior, so they are pooled the same way.
+    `key` is what two clauses are compared on: no white space, formals by position, and for `assigns` the
+    locations and the `\\from` sources each in sorted order.
+    """
+    pooled: dict[str, dict] = {DEFAULT_BEHAVIOR: {}}
+    for (_rel, _decl, contract), positions in zip(decls, formals, strict=True):
+        for name in contract["behaviors"]:
+            pooled.setdefault(name, {})
+        for behavior, kind, text in contract["clauses"]:
+            loc_keys: list[str] = []
+            key = _norm_clause(_positional_formals(text, positions))
+            if kind == "assigns":
+                parts = _split_assigns(text)
+                loc_keys = [_norm_clause(_positional_formals(loc, positions)) for loc in parts["locs"]]
+                from_keys = sorted(_norm_clause(_positional_formals(src, positions)) for src in parts["from"])
+                key = ",".join(sorted(loc_keys)) + ("\\from" + ",".join(from_keys) if from_keys else "")
+            pooled.setdefault(behavior, {}).setdefault(kind, []).append((key, text, loc_keys))
+    return pooled
+
+
+def _gone(left: list[tuple[str, str]], right: list[tuple[str, str]]) -> list[str]:
+    """The texts of `left` whose key no entry of `right` has, once each, in order."""
+    have = {key for key, _text in right}
+    out: dict[str, str] = {}
+    for key, text in left:
+        if key not in have:
+            out.setdefault(key, text)
+    return list(out.values())
+
+
+def _clause_delta(base: list, cand: list) -> dict:
+    base_pairs = [(key, text) for key, text, _locs in base]
+    cand_pairs = [(key, text) for key, text, _locs in cand]
+    return {
+        "baseline": [text for _key, text in base_pairs],
+        "candidate": [text for _key, text in cand_pairs],
+        "removed": _gone(base_pairs, cand_pairs),
+        "added": _gone(cand_pairs, base_pairs),
+    }
+
+
+def _assigns_delta(base: list, cand: list) -> dict:
+    delta = _clause_delta(base, cand)
+    if not base and not cand:
+        status = "none"
+    elif not cand:
+        status = "removed"
+    elif not base:
+        status = "added"
+    else:
+        status = "same" if {key for key, _t, _l in base} == {key for key, _t, _l in cand} else "changed"
+
+    def locations(clauses: list) -> list[tuple[str, str]]:
+        return [
+            (k, loc) for _key, text, keys in clauses for k, loc in zip(keys, _split_assigns(text)["locs"], strict=True)
+        ]
+
+    base_locs, cand_locs = locations(base), locations(cand)
+    return {
+        "baseline": [{"text": text, **_split_assigns(text)} for _key, text, _locs in base],
+        "candidate": [{"text": text, **_split_assigns(text)} for _key, text, _locs in cand],
+        "status": status,
+        "removed": delta["removed"],
+        "added": delta["added"],
+        "locations_removed": _gone(base_locs, cand_locs),
+        "locations_added": _gone(cand_locs, base_locs),
+    }
+
+
+def _compare_contracts(result: dict, baseline: Mapping[str, str], candidate: Mapping[str, str], function: str) -> None:
+    if not isinstance(function, str) or not function:
+        raise _NoComparison("no function name given")
+    if not isinstance(baseline, Mapping) or not isinstance(candidate, Mapping):
+        raise _NoComparison("TypeError: baseline and candidate must each map a file name to its text")
+    if set(baseline) != set(candidate):
+        only_base = sorted(str(k) for k in set(baseline) - set(candidate))
+        only_cand = sorted(str(k) for k in set(candidate) - set(baseline))
+        raise _NoComparison(
+            "baseline and candidate do not cover the same files "
+            f"(only in baseline: {only_base}; only in candidate: {only_cand})"
+        )
+    if not baseline:
+        raise _NoComparison("no file to compare")
+    base = _contract_declarations(baseline, function, "baseline")
+    cand = _contract_declarations({rel: candidate[rel] for rel in baseline}, function, "candidate")
+    if [(rel, d.kind, c["signature"]) for rel, d, c in base] != [(rel, d.kind, c["signature"]) for rel, d, c in cand]:
+        raise _NoComparison(
+            f"the declarations of '{function}' differ between baseline and candidate "
+            "(one was added or removed, or its C text changed)"
+        )
+    # The declarations of one function may name their formals differently. A clause moved from one to the
+    # other is rewritten for the other's names, so clauses are compared with formals by position. That needs
+    # every declaration to name the same number of formals; otherwise the names are compared as written.
+    names = [declaration_param_names(decl, path=rel) for rel, decl, _contract in base]
+    unified = len({len(n) for n in names}) == 1
+    formals = [{name: f"${k}" for k, name in enumerate(n)} if unified else {} for n in names]
+    pooled_base = _pooled_clauses(base, formals)
+    pooled_cand = _pooled_clauses(cand, formals)
+
+    result["formals_unified"] = unified
+    for side, decls in (("baseline", base), ("candidate", cand)):
+        result["declarations"][side] = [
+            {"file": rel, "kind": decl.kind, "clauses": len(contract["clauses"])} for rel, decl, contract in decls
+        ]
+    result["had_contract"] = any(c["clauses"] or c["behaviors"] or c["completeness"] for _r, _d, c in base)
+    result["has_contract"] = any(c["clauses"] or c["behaviors"] or c["completeness"] for _r, _d, c in cand)
+    for name in dict.fromkeys([*pooled_base, *pooled_cand]):
+        in_base, in_cand = pooled_base.get(name), pooled_cand.get(name)
+        kinds = dict.fromkeys([*CONTRACT_CLAUSE_KINDS, *sorted({*(in_base or {}), *(in_cand or {})})])
+        entry: dict = {
+            "in_baseline": bool(in_base) if name == DEFAULT_BEHAVIOR else in_base is not None,
+            "in_candidate": bool(in_cand) if name == DEFAULT_BEHAVIOR else in_cand is not None,
+        }
+        for kind in kinds:
+            delta = _assigns_delta if kind == "assigns" else _clause_delta
+            entry[kind] = delta((in_base or {}).get(kind, []), (in_cand or {}).get(kind, []))
+        result["behaviors"][name] = entry
+    completeness: list[list[tuple[str, str, list[str]]]] = [
+        [(_norm_clause(text), text, []) for _r, _d, c in decls for text in c["completeness"]] for decls in (base, cand)
+    ]
+    result["completeness"] = _clause_delta(completeness[0], completeness[1])
+    behaviors = result["behaviors"]
+    result["summary"] = {
+        "assigns_removed_in": [n for n, e in behaviors.items() if e["assigns"]["status"] == "removed"],
+        "ensures_removed_in": [n for n, e in behaviors.items() if e["ensures"]["removed"]],
+        "behaviors_removed": [n for n, e in behaviors.items() if e["in_baseline"] and not e["in_candidate"]],
+    }
+
+
+def compare_function_contracts(baseline: Mapping[str, str], candidate: Mapping[str, str], function: str) -> dict:
+    """
+    What a candidate changed in the contract of `function`, clause by clause: text in, data out.
+
+    `baseline` and `candidate` map a file name to the whole text of that file, before and after. Both must
+    hold the same files: every file that can carry the contract (the source, the declaring header), the
+    unchanged ones included, or a contract in a file left out reads as absent on both sides. The function's
+    contract is the contract in front of every declaration of it in those files, prototypes and definition
+    (`function_declaration_spans`), pooled behavior by behavior as Frama-C merges them. So a clause moved from
+    the prototype to the definition is not removed, and a clause written on both is removed only when both
+    copies go. Annotations inside the body are not part of the contract.
+
+    Never raises. The result is JSON-serialisable and always has these keys:
+
+    - `available` (bool), `reason` (str): False with the reason when there is no comparison: the two sides
+      hold different files, the function is declared in neither side's text, a text does not tokenize
+      (`reason` carries the tokenizer's `file:line: unclosed ...`), or the declarations themselves differ
+      (a declaration added or removed, or its C tokens changed). Every other key then has its empty value.
+      A function declared without any contract IS a comparison (`had_contract` False).
+    - `function`; `declarations`: `{"baseline": [...], "candidate": [...]}`, one
+      `{"file", "kind": "prototype" | "definition", "clauses": <count>}` per declaration.
+    - `had_contract`, `has_contract` (bool): the baseline / candidate has at least one contract clause.
+    - `formals_unified` (bool): True when every declaration names the same number of formals; clauses are
+      then compared with formals by position (the header may say `reg_addr` where the definition says
+      `addr`). False: an unnamed formal somewhere, names compared as written.
+    - `behaviors`: `{name: entry}`, the default behavior first under `DEFAULT_BEHAVIOR` (`"default!"`, always
+      present), then each named behavior in order of first appearance. An entry has `in_baseline` and
+      `in_candidate` (for the default behavior: it has a clause there) and one value per clause kind of
+      `CONTRACT_CLAUSE_KINDS` (plus any other kind met):
+        - every kind but `assigns`: `{"baseline": [text], "candidate": [text], "removed": [text],
+          "added": [text]}`. `removed` are the baseline clauses no candidate clause of the same behavior
+          and kind equals, `added` the reverse, once each.
+        - `assigns`: the same four keys, where `baseline` and `candidate` hold
+          `{"text", "locs": [...], "from": [...], "from_nothing": bool}` per clause, plus
+          `status`: `"none"` (no assigns clause on either side), `"removed"` (had one, has none),
+          `"added"`, `"same"` or `"changed"` (both have one and they differ: narrowed, widened or
+          rewritten), and `locations_removed` / `locations_added`: the locations listed on one side only,
+          whatever their `\\from`.
+    - `completeness`: the four keys again, for `complete behaviors ...` / `disjoint behaviors ...`.
+    - `summary`: `assigns_removed_in` (behaviors whose `assigns` status is `"removed"`),
+      `ensures_removed_in` (behaviors with a removed `ensures`), `behaviors_removed` (named behaviors the
+      candidate no longer has).
+
+    How clauses are compared. Two clauses are equal when their text is, with the clause label dropped,
+    comments and `@` left out as the kernel does (`iter_clauses`), white space ignored, outer parentheses
+    ignored (not for `assigns`), and formals by position. For `assigns`, the order of the locations and of
+    the `\\from` sources is ignored too, and the `\\from` part belongs to the clause: `assigns x \\from a;`
+    against `assigns x;` is `"changed"` with no location removed. `check` and `admit` clauses are kept apart
+    from plain ones (`ensures P;` replaced by `check ensures P;` removes `P` and adds `check P`).
+
+    What is not judged. Nothing here says whether a change weakens the contract. `requires`, `assumes`,
+    `terminates`, `exits`, `decreases`, `allocates` and `frees` are reported exactly like `ensures` (a
+    removed `requires` strengthens the contract for callers, a removed `assumes` widens its behavior; the
+    caller decides). An `assigns` clause is not matched semantically (`*ctx` against `ctx->debug` is one
+    location removed and one added), and a named behavior without `assigns` is reported `"removed"` or
+    `"none"` although the default behavior's clause still frames it.
+    """
+    result = _empty_contract_comparison(function)
+    try:
+        _compare_contracts(result, baseline, candidate, function)
+    except _NoComparison as exc:
+        reason = str(exc)
+    except Exception as exc:  # text this cannot parse must give a result, not an exception: the gate decides
+        reason = f"{type(exc).__name__}: {exc}"
+    else:
+        result["available"] = True
+        return result
+    return {**_empty_contract_comparison(function), "reason": reason}
