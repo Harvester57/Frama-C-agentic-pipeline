@@ -23,8 +23,11 @@ This section is newer than the ones below and wins where they differ.
 - **Filed: 28 to 40**, on the owner's go-ahead, from the account Harvester57. Asked which of 28 to
   40 to file first, the owner wrote "prepare doc-only patch for 40, then fill everything"; "fill"
   was read as "file".
-  Every package of this folder now has its issue filed; 22's merge request still waits for the
+  Every package up to 40 now has its issue filed; 22's merge request still waits for the
   maintainers' answer.
+- **Drafted, not filed: 41** (later on 2026-11-18, from libmodbus `run-1`): `<sys/ioctl.h>` defines
+  `TIOCMGET`/`TIOCMSET` but not the `TIOCM_*` modem-line bits. A draft and a reproducer only (no
+  filing texts, no patch); its draft asks whether it should be a note on #2828 instead.
   - **Issues:** 28 to 31 as #2817 to #2820, 33 as #2821, 32 as #2822, 34 to 40 as #2823 to #2829
     (33 went before 32 so that 32's text could cite it; 37 before 38). 34 is an issue only.
   - **Merge requests:** 28 to 33 as !46 to !51, 35 to 39 as !52 to !56, and 40's manual fix as !57.
@@ -291,6 +294,7 @@ All paths below are relative to this folder.
 | 38 | E-ACSL | bittree model: `stdin`, `stdout`, `stderr` and `errno` are not tracked | [draft](./frama-c-eacsl-bittree-standard-streams-untracked.md) | [issue](./filing/38-eacsl-bittree-standard-streams-untracked-issue.md), filed [#2827](https://git.frama-c.com/pub/frama-c/-/work_items/2827) | [MR](./filing/38-eacsl-bittree-standard-streams-untracked-mr.md), opened [!55](https://git.frama-c.com/pub/frama-c/-/merge_requests/55) | [sh](./repro/38-eacsl-bittree-standard-streams-untracked.sh) | [validated](./patches/38-eacsl-bittree-standard-streams-untracked.patch) (one line; complete under `-G clang` only with 37) |
 | 39 | Libc | Linux `<sys/epoll.h>` and `<sys/inotify.h>` are missing (feature request) | [draft](./frama-c-libc-linux-header-gaps.md) | [issue](./filing/39-libc-linux-header-gaps-issue.md), filed [#2828](https://git.frama-c.com/pub/frama-c/-/work_items/2828) | [MR](./filing/39-libc-linux-header-gaps-mr.md), opened [!56](https://git.frama-c.com/pub/frama-c/-/merge_requests/56) | [sh](./repro/39-libc-linux-header-gaps.sh) | [validated](./patches/39-libc-linux-header-gaps.patch) (two headers with contracts, 10 files) |
 | 40 | WP | `-wp-report-json` keeps one prover per goal (feature request); two errors in the manual | [draft](./frama-c-wp-report-per-prover-results.md) | [issue](./filing/40-wp-report-per-prover-results-issue.md), filed [#2829](https://git.frama-c.com/pub/frama-c/-/work_items/2829) | [MR](./filing/40-wp-report-per-prover-results-mr.md), opened [!57](https://git.frama-c.com/pub/frama-c/-/merge_requests/57) (manual only; does not close the issue) | [sh](./repro/40-wp-report-per-prover-results.sh) | [manual only](./patches/40-wp-report-per-prover-results.patch) (two sentences; lint run, manual not built) |
+| 41 | Libc | `<sys/ioctl.h>`: `TIOCMGET`/`TIOCMSET` without the `TIOCM_*` modem-line bits | [draft](./frama-c-libc-ioctl-modem-bits.md) | not filed | none | [sh](./repro/41-libc-ioctl-modem-bits.sh) | none (the draft lists the fourteen definitions) |
 
 Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11.
 

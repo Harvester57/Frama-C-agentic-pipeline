@@ -178,6 +178,13 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
 - `_IO`, `_IOR`, `_IOW`, `_IOWR` and the `_IOC_*` helpers: Linux's ioctl request encoding, which
   glibc's `<sys/ioctl.h>` provides and `__fc_libc`'s does not (a struct-type argument was a syntax
   error). Generic-layout values, as on x86_64.
+- `TIOCM_LE` to `TIOCM_LOOP`: the modem-line bits of `TIOCMGET`/`TIOCMSET`, which glibc's
+  `<sys/ioctl.h>` defines (`<bits/ioctl-types.h>`, as Linux `<asm-generic/termios.h>`) and
+  `__fc_libc`'s does not (`Cannot resolve variable TIOCM_RTS`, libmodbus). Each one
+  `#ifndef`-guarded.
+- `TCGETS2`, `TCSETS2`, `TCSETSW2`, `TCSETSF2`: Linux's termios2 requests (custom baud rates),
+  built with `_IOR`/`_IOW` above; `struct termios2` comes from the target's own
+  `<asm/termbits.h>`. `__fc_libc`'s `<sys/ioctl.h>` stops at `TCGETS`/`TCSETS`.
 - `explicit_bzero` and `memset_s`: missing from `__fc_libc`. Their postconditions state every
   written element (through `char` and `unsigned char`), so an L6 wipe through them proves without a
   loop: under WP Typed for a `char` array, under `Typed+cast` only for an `unsigned char` array.

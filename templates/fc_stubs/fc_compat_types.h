@@ -360,6 +360,72 @@ int memset_s(void *s, size_t smax, int c, size_t n);
 #define _IOC_SIZE(nr) (((nr) >> _IOC_SIZESHIFT) & ((1 << _IOC_SIZEBITS) - 1))
 #endif
 
+/* The modem-line bits of TIOCMGET / TIOCMBIS / TIOCMBIC / TIOCMSET: glibc's <sys/ioctl.h> defines
+ * TIOCM_LE to TIOCM_RI in <bits/ioctl-types.h>, Linux <asm-generic/termios.h> all of them (with
+ * TIOCM_OUT1, TIOCM_OUT2, TIOCM_LOOP), same values and spelling. __fc_libc's <sys/ioctl.h> defines
+ * the four requests but none of the bits, so `flags |= TIOCM_RTS` is "Cannot resolve variable
+ * TIOCM_RTS" (found on libmodbus, src/modbus-rtu.c). */
+#ifndef TIOCM_LE
+#define TIOCM_LE 0x001
+#endif
+#ifndef TIOCM_DTR
+#define TIOCM_DTR 0x002
+#endif
+#ifndef TIOCM_RTS
+#define TIOCM_RTS 0x004
+#endif
+#ifndef TIOCM_ST
+#define TIOCM_ST 0x008
+#endif
+#ifndef TIOCM_SR
+#define TIOCM_SR 0x010
+#endif
+#ifndef TIOCM_CTS
+#define TIOCM_CTS 0x020
+#endif
+#ifndef TIOCM_CAR
+#define TIOCM_CAR 0x040
+#endif
+#ifndef TIOCM_RNG
+#define TIOCM_RNG 0x080
+#endif
+#ifndef TIOCM_DSR
+#define TIOCM_DSR 0x100
+#endif
+#ifndef TIOCM_CD
+#define TIOCM_CD TIOCM_CAR
+#endif
+#ifndef TIOCM_RI
+#define TIOCM_RI TIOCM_RNG
+#endif
+#ifndef TIOCM_OUT1
+#define TIOCM_OUT1 0x2000
+#endif
+#ifndef TIOCM_OUT2
+#define TIOCM_OUT2 0x4000
+#endif
+#ifndef TIOCM_LOOP
+#define TIOCM_LOOP 0x8000
+#endif
+
+/* Linux <asm-generic/ioctls.h> (glibc's <sys/ioctl.h> -> <bits/ioctls.h> -> <asm/ioctls.h>): the
+ * termios2 requests, for a custom baud rate (`c_cflag |= BOTHER`). __fc_libc's <sys/ioctl.h> stops at
+ * TCGETS / TCSETS, so with HAVE_STRUCT_TERMIOS2 libmodbus's src/modbus-rtu.c stops at "Cannot resolve
+ * variable TCGETS2". `struct termios2` and BOTHER come from <asm/termbits.h>, which the target
+ * includes itself (found through -idirafter). */
+#ifndef TCGETS2
+#define TCGETS2 _IOR('T', 0x2A, struct termios2)
+#endif
+#ifndef TCSETS2
+#define TCSETS2 _IOW('T', 0x2B, struct termios2)
+#endif
+#ifndef TCSETSW2
+#define TCSETSW2 _IOW('T', 0x2C, struct termios2)
+#endif
+#ifndef TCSETSF2
+#define TCSETSF2 _IOW('T', 0x2D, struct termios2)
+#endif
+
 #ifndef __FC_COMPAT_INT_TYPES_DEFINED
 #define __FC_COMPAT_INT_TYPES_DEFINED 1
 #ifndef __GLIBC_INTERNAL_INT_TYPES_DEFINED
