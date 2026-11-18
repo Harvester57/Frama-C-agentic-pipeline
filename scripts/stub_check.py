@@ -893,6 +893,8 @@ def shipped_prototypes(text: str, path: str) -> list[str]:
 SHIPPED_EXEMPT = ("eacsl/", "fc_compat_types.h", "errno.h")
 _MEMBER_MACRO_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+[A-Za-z_]\w*\s*(?:\.\s*[A-Za-z_]\w*\s*)+$", re.M)
 _STRUCT_QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "__restrict__"})
+# How struct_members() marks a flexible array member (`char name[];` -> "name[]").
+FLEXIBLE_SUFFIX = "[]"
 
 
 def _extract_member_name_from_decl(tokens: list[Token]) -> str | None:
@@ -997,7 +999,9 @@ def _parse_stmt_members(stmt: list[Token]) -> list[str]:
     for piece in _split_decl_tokens(decl_tokens):
         name = _extract_member_name_from_decl(piece)
         if name:
-            members.append(name)
+            # `char name[];`: a flexible array member has no size, so the layout probe must not ask for one.
+            flexible = [t.text for t in piece[-2:]] == ["[", "]"]
+            members.append(name + FLEXIBLE_SUFFIX if flexible else name)
     return members
 
 
@@ -1005,7 +1009,8 @@ def struct_members(text: str) -> dict[str, list[str]]:
     """
     Struct tag -> its member designators: the members declared at the struct's own level, and the member
     macros defined inside its body (`#define icmp_ip icmp_dun.id_ip.idi_ip`), which is how code names
-    them. Bit-fields are left out (offsetof refuses them).
+    them. Bit-fields are left out (offsetof refuses them). A flexible array member (`char name[];`) is
+    listed as `name[]` (FLEXIBLE_SUFFIX): it has an offset but no size.
     """
     raw_tokens = tokenize_c_acsl(text)
     all_tokens = _without_attributes(
@@ -1084,6 +1089,15 @@ def layout_probe_source(include: str, structs: dict[str, list[str]]) -> str:
     for tag, members in sorted(structs.items()):
         lines.append(f'  printf("{tag} size %zu\\n", sizeof(struct {tag}));')
         for mem in members:
+            if mem.endswith(FLEXIBLE_SUFFIX):
+                # sizeof on a flexible array member is an error ("incomplete type 'char[]'"): print its
+                # offset and the type class of one element.
+                mem = mem[: -len(FLEXIBLE_SUFFIX)]
+                lines.append(
+                    f'  printf("{tag}.{mem} %zu flexible %d\\n", offsetof(struct {tag}, {mem}), '
+                    f"__builtin_classify_type(((struct {tag} *)0)->{mem}[0]));"
+                )
+                continue
             # A member the header does not have is a compile error, reported as a divergence.
             lines.append(
                 f'  printf("{tag}.{mem} %zu %zu %d\\n", offsetof(struct {tag}, {mem}), '

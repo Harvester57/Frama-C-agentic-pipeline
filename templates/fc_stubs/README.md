@@ -132,23 +132,52 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   and the free in `json_object_put` are not modelled.
 - `<netinet/ip_icmp.h>` follows glibc's layout and names, including the BSD ones (`struct icmp`
   with `icmp_ip` a `struct ip`, `ICMP_UNREACH`, `ICMP_TIMXCEED`, `ICMP_MASKREQ`, ...).
-- `<sys/epoll.h>` and `<sys/inotify.h>` ([`./sys/epoll.h`](./sys/epoll.h), [`./sys/inotify.h`](./sys/inotify.h))
-  are parse shims, not stubs: Frama-C's libc has neither header, so glibc's resolves through the
-  `-idirafter` host directories, and it assumes glibc's `<sys/cdefs.h>` and `<bits/types/...>` guards
-  (c-ares run-1 lost Eva and WP on its whole library: `sys/epoll.h:139: User Error: syntax error` on
-  `__attr_access`, then `__sigset_t` and a second `struct timespec`; `sys/inotify.h:34` on `__flexarr`).
-  For Eva and WP only, each defines what glibc's header needs under `#ifndef` (`__attr_access` and
-  `__flexarr` as no-op / `[]`, dropped after the header; `__sigset_t` as Frama-C's `sigset_t`, so
-  `epoll_pwait(..., &mask)` type-checks against `<signal.h>`; `_STRUCT_TIMESPEC`, so Frama-C's
-  `struct timespec` stays the only one), then `#include_next`s glibc's header. They never include
-  glibc's `<sys/cdefs.h>`, which redefines `__THROW`, `__nonnull`, ... for every later libc header.
-  E-ACSL gets glibc's header unchanged. They declare nothing: the functions stay declared in glibc's
-  header, `stub_gen.py` classifies them `host_header`, and its overlay `sys/epoll.h` (`#include_next`)
-  reaches glibc through the shim.
+- `<sys/epoll.h>` and `<sys/inotify.h>` ([`./sys/epoll.h`](./sys/epoll.h), [`./sys/inotify.h`](./sys/inotify.h)):
+  Frama-C's libc has neither header. Without these two, glibc's resolves through the `-idirafter` host
+  directories and Frama-C stops on it (c-ares run-1 lost Eva and WP on its whole library:
+  `sys/epoll.h:139: User Error: syntax error` on `__attr_access`, then `__sigset_t` and a second
+  `struct timespec`; `sys/inotify.h:34` on `__flexarr`).
+  - **Eva and WP** read the headers proposed upstream in pub/frama-c!56 (issue #2828), taken from
+    [`../../docs/upstream/frama-c/patches/39-libc-linux-header-gaps.patch`](../../docs/upstream/frama-c/patches/39-libc-linux-header-gaps.patch):
+    the Linux constants, `struct epoll_event` (packed, 12 bytes, as glibc on x86_64),
+    `struct inotify_event`, and `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait`,
+    `epoll_pwait`, `inotify_init`, `inotify_init1`, `inotify_add_watch` and `inotify_rm_watch` with
+    contracts. They never read glibc's header.
+  - **One text with the patch.** From `__BEGIN_DECLS` to `__END_DECLS` each header is the patch's text,
+    and `test_linux_event_headers_carry_the_text_of_the_upstream_patch` compares them: change the patch
+    and the header together. Outside that text the header has no licence banner, `<...>` includes, and
+    no `__PUSH_FC_STDLIB`.
+  - **One pipeline addition**, marked in the header: `ensures result_bounded: -1 <= \result <= maxevents;`
+    on `epoll_wait` and `epoll_pwait`. The patch states the result only inside the `full` and
+    `partial_timeout_or_error` behaviors, whose `assumes` read the volatile `Frama_C_entropy_source`.
+    WP gives each read of a volatile its own value, so it assumed neither behavior and a caller could
+    not prove `n <= maxevents` (the index of `events[i]` in an event loop). Not yet in the merge request.
+  - **Known Eva alarm.** In `n = epoll_wait(fd, ev, 8, t); for (i = 0; i < n; i++) use(ev[i]);` Eva
+    reports `\initialized(&ev[i].events)` as Unknown: it joins the two behaviors and loses the link
+    between `n` and the initialized prefix, as it does for `read()`. The preconditions are all valid.
+  - **Not declared:** glibc's `epoll_pwait2`, and `struct epoll_params` with `EPIOCGPARAMS`,
+    `EPIOCSPARAMS` and `EPOLL_IOC_TYPE`. Every other macro, function and struct of glibc 2.41's two
+    headers is declared (compared with `gcc -dM -E` in the analysis image, 2026-11-18). A target that
+    uses one of these gets `Calling undeclared function` or `Cannot resolve variable`; add it here,
+    with a contract for the function (rule 5).
+  - **`stub_gen.py`** classifies the nine functions `pipeline_stub`, so a run's overlay gets no block
+    for them. A run directory made before this change may still hold `workspace/stubs/sys/epoll.h` or
+    `sys/inotify.h` with its own contracts: Frama-C then prints `found two contracts ... Merging them`
+    and keeps the first `\from` of each pair. Delete those two overlay files and rerun
+    `pipeline_make.py run stubs stub-check`.
+  - **E-ACSL** (host headers) gets glibc's header unchanged, through `#include_next`: the contracts
+    name objects of Frama-C's libc (`__FC_MAX_OPEN_FILES`, `Frama_C_entropy_source`) that host headers
+    do not have. They are therefore not checked against the real library at run time.
+  - **When a release ships the headers**, these two files are no longer read: Frama-C's cpp command
+    has `-I<share>/libc` before the pipeline's `-I.../templates/fc_stubs` (`-print-cpp-commands` in the
+    analysis image). If the release ships the header as filed, `result_bounded` is lost with them:
+    check WP on an event loop when the image moves to that release.
 - `tests/test_fc_stub_repairs.py` checks these headers in the images: Eva on valid and short
   buffers, WP, E-ACSL against the real json-c, and the ABI (prototypes, constants, layouts)
   against glibc and json-c headers. libbsd is in neither image, so `strnstr`'s prototype is not
-  checked against it.
+  checked against it. For epoll and inotify the sizes, offsets and all constants of glibc become
+  `_Static_assert`s that Frama-C checks against the Eva / WP text; `stub_check.py shipped` compiles
+  with gcc, which reads glibc's header on both sides, so it says nothing about that text.
 
 ## Libc contract overrides (Eva / WP)
 
@@ -190,6 +219,54 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   written element (through `char` and `unsigned char`), so an L6 wipe through them proves without a
   loop: under WP Typed for a `char` array, under `Typed+cast` only for an `unsigned char` array.
   `FC_STUBS_NO_WIPE_DECLS` drops both declarations for a target that defines its own.
+- `pipe2`, `getservbyname_r`, `getservbyport_r` and the `IN6_IS_ADDR_*` macros: missing from
+  `__fc_libc`'s `<unistd.h>`, `<netdb.h>` and `<netinet/in.h>` (34.0~beta), which c-ares calls
+  (run-2: `Calling undeclared function`, ten names `undeclared` in `stubs.json`). They are declared
+  here and not in a header of their own, because Frama-C's `-I<share>/libc` comes before the
+  pipeline's directories: a `templates/fc_stubs/netdb.h` would never be read.
+  - **Stated twice.** Each contract gives its facts once in unconditional `ensures` (what WP uses: it
+    learns nothing from behaviors whose `assumes` read the volatile `Frama_C_entropy_source`) and once
+    in two behaviors (what lets Eva keep success apart from failure). Eva keeps them apart only with
+    slevel: the pipeline's `-eva-slevel 100` gives `{-1}` with untouched ends on one side and two
+    descriptors on the other; without slevel the two join and the idiom below gets Unknowns.
+  - **`pipe2`:** result 0 or -1; on 0 both ends are initialized and in `0 .. __FC_MAX_OPEN_FILES - 1`;
+    on -1 `pipefd` keeps its values, which a caller relies on when it presets both ends to -1 and
+    closes what is not -1 afterwards. `__fc_libc`'s `pipe` says both ends are valid descriptors
+    whatever the result, so that text was not copied. `flags` is not checked, and `errno` is not
+    assigned: most contracts of `__fc_libc`'s `<unistd.h>` leave it out the same way (`// missing: may
+    assign to errno`), so a caller that reads `errno` after a failure sees the value it had before.
+    The two netdb functions return their error number.
+  - **`getservbyname_r`, `getservbyport_r`** (glibc's six-argument form): the result is 0 or an error
+    number, `*res` is NULL or `result_buf`, and it is NULL whenever the result is not 0. Not found is
+    result 0 with a NULL `*res`, as glibc 2.41 does it. When `*res` is not NULL the four fields are
+    initialized, `s_name` and `s_proto` are valid strings and `s_aliases` is readable; the `found`
+    behavior adds that the three pointers lie inside `buf`. The last parameter is named `res` (glibc:
+    `result`) because `tools/check_generated_text.py` reads a bare `result` in a contract as a mangled
+    `\result`.
+  - **Known Eva alarm.** `strlen(se.s_name)` after a found entry is Unknown
+    (`precondition 'valid_string_s'`): Eva knows the pointer is inside `buf` but not that the bytes
+    written there hold a NUL. WP has the fact (`found_strings`). `__fc_libc`'s `getpwnam_r` avoids this
+    with static strings of its own, which a `_r` function with a caller buffer cannot use.
+  - **The macros** are the twelve of POSIX `<netinet/in.h>` (`UNSPECIFIED`, `LOOPBACK`, `MULTICAST`,
+    `LINKLOCAL`, `SITELOCAL`, `V4MAPPED`, `V4COMPAT` and the five `MC_*` scopes), five more than c-ares
+    uses, so the family is whole. They read `s6_addr` bytes (the only member `__fc_libc`'s
+    `struct in6_addr` has), evaluate their argument once, and are skipped when
+    `IN6_IS_ADDR_UNSPECIFIED` is already defined (a later libc).
+  - **Force-included headers.** Every Eva / WP parse now also reads `<netdb.h>` and
+    `<netinet/in.h>` (`<unistd.h>`, `<sys/socket.h>` and `<string.h>` were already read). Define
+    `FC_STUBS_NO_NETDB_DECLS` for a target whose own `struct servent`, `struct addrinfo` or
+    `IN6_IS_ADDR_*` clash with them (it drops the two includes, the two functions and the macros),
+    and `FC_STUBS_NO_PIPE2_DECL` for one that declares its own `pipe2`.
+  - **Checked** by `test_libc_gap_names_in_eva_wp_and_against_glibc`: Eva on the c-ares idioms and on
+    short, overlapping and NULL arguments, WP on callers, the three prototypes against glibc's with
+    gcc, the twelve macros against glibc's on the same addresses, and the two netdb
+    contracts as E-ACSL wrappers around the real glibc (found, not found, `ERANGE`), `pipe2` likewise
+    (success and `EINVAL`). E-ACSL runs neither the three `\subset` clauses of each `found` behavior
+    (the test program compares the pointers with the buffer itself) nor any `assigns`.
+  - **When a release declares them.** The macros step aside (`#ifndef IN6_IS_ADDR_UNSPECIFIED`); the
+    three functions do not. If `__fc_libc` gains `pipe2` (pub/frama-c#2828 asks for it) or the netdb
+    pair, the kernel prints `found two contracts ... Merging them`, which the test above rejects:
+    rename the libc declaration as for `getsockopt`, or drop this one.
 - All of these sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
 - The header assumes x86_64 LP64 (ioctl encoding, syscall numbers, `long` literals) and says so
   with a `_Static_assert` on `sizeof(long)` and `sizeof(void *)`: another machdep stops at parse time.

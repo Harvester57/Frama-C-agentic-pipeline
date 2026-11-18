@@ -568,6 +568,212 @@ extern int getopt(int argc, char *const argv[], const char *optstring);
 #include "fc_strlcpy.h"
 #endif /* FC_STUBS_KEEP_LIBC_STRLCPY */
 
+/*
+ * glibc names __fc_libc lacks, found on c-ares (run-2, 2026-11-18): pipe2, getservbyname_r,
+ * getservbyport_r and the IN6_IS_ADDR_* macros. Frama-C read each use as a call to an undeclared
+ * `int f()` ("Calling undeclared function pipe2. Old style K&R code?"), for the macros a function that
+ * does not exist, and stub_gen.py listed them `undeclared`, which asks no stub author for a contract.
+ * __fc_libc's directory comes before templates/fc_stubs on the include path, so <unistd.h>, <netdb.h>
+ * and <netinet/in.h> cannot be shadowed there: the names are added here, after the libc headers that
+ * define their types, and after the blocks above, which must be the first to include <sys/socket.h>,
+ * <unistd.h> and <string.h>. E-ACSL builds take all of them from glibc.
+ *
+ * Each contract states its facts twice, as the typed syscalls above do: unconditionally, which is
+ * what WP uses (it learns nothing from a split on the volatile Frama_C_entropy_source), and in two
+ * behaviors, which is what lets Eva keep the success state apart from the failure state.
+ *
+ * Define FC_STUBS_NO_PIPE2_DECL or FC_STUBS_NO_NETDB_DECLS for a target whose own declarations clash
+ * with these (the second also keeps <netdb.h> and <netinet/in.h> out of the force-include).
+ */
+#ifndef FC_STUBS_NO_PIPE2_DECL
+#include <unistd.h>
+/* pipe2(2), Linux and POSIX.1-2024. On error pipefd is left as it was, which pipe2(2) states and a
+ * caller relies on when it presets both ends to -1 and closes what is not -1 (c-ares). __fc_libc's
+ * pipe() says the opposite (both ends initialized and valid whatever the result); not copied.
+ * Any `flags` is accepted: an unknown bit is an error result (EINVAL), not undefined behaviour. */
+/*@
+  requires valid_pipefd: \valid(pipefd + (0 .. 1));
+  assigns pipefd[0 .. 1] \from indirect:flags, indirect:__fc_fds[0 ..], indirect:Frama_C_entropy_source;
+  assigns \result \from indirect:flags, indirect:__fc_fds[0 ..], indirect:Frama_C_entropy_source;
+  ensures result_ok_or_error: \result == 0 || \result == -1;
+  ensures initialization:pipefd_on_success: \result == 0 ==> \initialized(&pipefd[0 .. 1]);
+  ensures valid_fds_on_success:
+    \result == 0 ==> 0 <= pipefd[0] < __FC_MAX_OPEN_FILES && 0 <= pipefd[1] < __FC_MAX_OPEN_FILES;
+  ensures unchanged_on_error:
+    \result == -1 ==> pipefd[0] == \old(pipefd[0]) && pipefd[1] == \old(pipefd[1]);
+  behavior ok:
+    assumes nondet_ok: Frama_C_entropy_source != 0;
+    ensures result_ok: \result == 0;
+    ensures initialization:pipefd: \initialized(&pipefd[0 .. 1]);
+    ensures valid_fd0: 0 <= pipefd[0] < __FC_MAX_OPEN_FILES;
+    ensures valid_fd1: 0 <= pipefd[1] < __FC_MAX_OPEN_FILES;
+  behavior error:
+    assumes nondet_error: Frama_C_entropy_source == 0;
+    assigns \result \from indirect:flags, indirect:__fc_fds[0 ..], indirect:Frama_C_entropy_source;
+    ensures result_error: \result == -1;
+  complete behaviors;
+  disjoint behaviors;
+*/
+extern int pipe2(int pipefd[2], int flags);
+#endif /* FC_STUBS_NO_PIPE2_DECL */
+
+#ifndef FC_STUBS_NO_NETDB_DECLS
+#include <netdb.h>
+#include <netinet/in.h>
+/* getservbyname_r, getservbyport_r (glibc <netdb.h>, getservent_r(3)), the six-argument form.
+ * The last parameter is glibc's `result`, named `res` here so that no clause reads like a `\result`
+ * that lost its backslash (tools/check_generated_text.py).
+ * The result is 0 or a positive error number (ERANGE when buf is too small). `*res` is result_buf
+ * when an entry was found and NULL otherwise: not found is result 0 with a NULL `*res`, and every
+ * error leaves `*res` NULL. A found entry's strings and alias vector lie in buf.
+ * result_buf and buf may be written whatever the result (the lookup parses candidate lines into
+ * them), so nothing is said about them unless an entry was found. The fields are named one by one:
+ * the padding after s_port is not written, and with `assigns *result_buf \from buf` Eva made s_port
+ * a garbled mix of buf's address.
+ * `proto` may be NULL (any protocol). The written objects must not overlap (`restrict`).
+ * `assigns *res \from result_buf`, as __fc_libc's getgrnam_r has it: with a \from that leaves the
+ * caller's structure out (its getpwnam_r), Eva can only give a NULL `*res` and the found branch is dead. */
+/*@
+  requires valid_name: valid_read_string(name);
+  requires valid_proto_or_null: proto == \null || valid_read_string(proto);
+  requires valid_result_buf: \valid(result_buf);
+  requires valid_buf: \valid(buf + (0 .. buflen - 1));
+  requires valid_res: \valid(res);
+  requires separation: \separated(result_buf, buf + (0 .. buflen - 1), res);
+  //missing: every \from below also depends on the services database
+  assigns \result \from indirect:name[0 ..], indirect:proto, indirect:buflen,
+                        indirect:Frama_C_entropy_source;
+  assigns result_buf->s_name, result_buf->s_aliases, result_buf->s_proto
+    \from buf, indirect:name[0 ..], indirect:proto, indirect:buflen, indirect:Frama_C_entropy_source;
+  assigns result_buf->s_port \from indirect:name[0 ..], indirect:proto, indirect:buflen,
+                                   indirect:Frama_C_entropy_source;
+  assigns buf[0 .. buflen - 1] \from indirect:name[0 ..], indirect:proto, indirect:buflen,
+                                     indirect:Frama_C_entropy_source;
+  assigns *res \from result_buf, indirect:name[0 ..], indirect:proto, indirect:buflen,
+                        indirect:Frama_C_entropy_source;
+  ensures result_zero_or_error_number: \result >= 0;
+  ensures initialization:res: \initialized(res);
+  ensures result_null_or_result_buf: *res == \null || *res == result_buf;
+  ensures null_on_error: \result != 0 ==> *res == \null;
+  ensures initialization:found_entry:
+    *res != \null ==>
+      \initialized(&result_buf->s_name) && \initialized(&result_buf->s_aliases)
+      && \initialized(&result_buf->s_port) && \initialized(&result_buf->s_proto);
+  ensures found_strings:
+    *res != \null ==>
+      valid_read_string(result_buf->s_name) && valid_read_string(result_buf->s_proto)
+      && \valid_read(result_buf->s_aliases);
+  behavior found:
+    assumes nondet_found: Frama_C_entropy_source != 0;
+    ensures result_found: \result == 0 && *res == result_buf;
+    ensures initialization:entry:
+      \initialized(&result_buf->s_name) && \initialized(&result_buf->s_aliases)
+      && \initialized(&result_buf->s_port) && \initialized(&result_buf->s_proto);
+    ensures name_in_buf: \subset(result_buf->s_name, buf + (0 .. buflen - 1));
+    ensures proto_in_buf: \subset(result_buf->s_proto, buf + (0 .. buflen - 1));
+    ensures aliases_in_buf: \subset((char *)result_buf->s_aliases, buf + (0 .. buflen - 1));
+  behavior not_found_or_error:
+    assumes nondet_none: Frama_C_entropy_source == 0;
+    ensures result_none: *res == \null;
+  complete behaviors;
+  disjoint behaviors;
+*/
+extern int getservbyname_r(const char *name, const char *proto, struct servent *result_buf, char *buf,
+                           size_t buflen, struct servent **res);
+
+/* `port` is in network byte order; any value is accepted (an unknown port is "not found"). */
+/*@
+  requires valid_proto_or_null: proto == \null || valid_read_string(proto);
+  requires valid_result_buf: \valid(result_buf);
+  requires valid_buf: \valid(buf + (0 .. buflen - 1));
+  requires valid_res: \valid(res);
+  requires separation: \separated(result_buf, buf + (0 .. buflen - 1), res);
+  //missing: every \from below also depends on the services database
+  assigns \result \from indirect:port, indirect:proto, indirect:buflen, indirect:Frama_C_entropy_source;
+  assigns result_buf->s_name, result_buf->s_aliases, result_buf->s_proto
+    \from buf, indirect:port, indirect:proto, indirect:buflen, indirect:Frama_C_entropy_source;
+  assigns result_buf->s_port \from port, indirect:proto, indirect:buflen, indirect:Frama_C_entropy_source;
+  assigns buf[0 .. buflen - 1] \from indirect:port, indirect:proto, indirect:buflen,
+                                     indirect:Frama_C_entropy_source;
+  assigns *res \from result_buf, indirect:port, indirect:proto, indirect:buflen,
+                        indirect:Frama_C_entropy_source;
+  ensures result_zero_or_error_number: \result >= 0;
+  ensures initialization:res: \initialized(res);
+  ensures result_null_or_result_buf: *res == \null || *res == result_buf;
+  ensures null_on_error: \result != 0 ==> *res == \null;
+  ensures initialization:found_entry:
+    *res != \null ==>
+      \initialized(&result_buf->s_name) && \initialized(&result_buf->s_aliases)
+      && \initialized(&result_buf->s_port) && \initialized(&result_buf->s_proto);
+  ensures found_strings:
+    *res != \null ==>
+      valid_read_string(result_buf->s_name) && valid_read_string(result_buf->s_proto)
+      && \valid_read(result_buf->s_aliases);
+  ensures found_port: *res != \null ==> result_buf->s_port == port;
+  behavior found:
+    assumes nondet_found: Frama_C_entropy_source != 0;
+    ensures result_found: \result == 0 && *res == result_buf;
+    ensures initialization:entry:
+      \initialized(&result_buf->s_name) && \initialized(&result_buf->s_aliases)
+      && \initialized(&result_buf->s_port) && \initialized(&result_buf->s_proto);
+    ensures name_in_buf: \subset(result_buf->s_name, buf + (0 .. buflen - 1));
+    ensures proto_in_buf: \subset(result_buf->s_proto, buf + (0 .. buflen - 1));
+    ensures aliases_in_buf: \subset((char *)result_buf->s_aliases, buf + (0 .. buflen - 1));
+    ensures port_found: result_buf->s_port == port;
+  behavior not_found_or_error:
+    assumes nondet_none: Frama_C_entropy_source == 0;
+    ensures result_none: *res == \null;
+  complete behaviors;
+  disjoint behaviors;
+*/
+extern int getservbyport_r(int port, const char *proto, struct servent *result_buf, char *buf,
+                           size_t buflen, struct servent **res);
+
+/* The IN6_IS_ADDR_* macros of <netinet/in.h> (POSIX), which __fc_libc's header does not define.
+ * The whole POSIX family, not only the seven c-ares uses: one more is one more undeclared `int f()`.
+ * Same values as glibc's on every address (compared in tests/test_fc_stub_repairs.py), read through
+ * `s6_addr` bytes, the one member __fc_libc's struct in6_addr has, rather than glibc's 32-bit words,
+ * so there is no pointer cast for WP's Typed model to refuse and no byte order in the expression.
+ * The argument is evaluated once, as in glibc. */
+#ifndef IN6_IS_ADDR_UNSPECIFIED
+#define __FC_IN6_TEST(a, test)                                                                         \
+  (__extension__({                                                                                     \
+    const struct in6_addr *__fc_in6 = (const struct in6_addr *)(a);                                    \
+    (test);                                                                                            \
+  }))
+#define __FC_IN6_ZERO4(i)                                                                              \
+  (__fc_in6->s6_addr[(i)] == 0 && __fc_in6->s6_addr[(i) + 1] == 0 && __fc_in6->s6_addr[(i) + 2] == 0  \
+   && __fc_in6->s6_addr[(i) + 3] == 0)
+#define __FC_IN6_MC_SCOPE(a, scope)                                                                    \
+  __FC_IN6_TEST(a, __fc_in6->s6_addr[0] == 0xff && (__fc_in6->s6_addr[1] & 0x0f) == (scope))
+#define IN6_IS_ADDR_UNSPECIFIED(a)                                                                     \
+  __FC_IN6_TEST(a, __FC_IN6_ZERO4(0) && __FC_IN6_ZERO4(4) && __FC_IN6_ZERO4(8) && __FC_IN6_ZERO4(12))
+#define IN6_IS_ADDR_LOOPBACK(a)                                                                        \
+  __FC_IN6_TEST(a, __FC_IN6_ZERO4(0) && __FC_IN6_ZERO4(4) && __FC_IN6_ZERO4(8)                         \
+                     && __fc_in6->s6_addr[12] == 0 && __fc_in6->s6_addr[13] == 0                       \
+                     && __fc_in6->s6_addr[14] == 0 && __fc_in6->s6_addr[15] == 1)
+#define IN6_IS_ADDR_MULTICAST(a) __FC_IN6_TEST(a, __fc_in6->s6_addr[0] == 0xff)
+#define IN6_IS_ADDR_LINKLOCAL(a)                                                                       \
+  __FC_IN6_TEST(a, __fc_in6->s6_addr[0] == 0xfe && (__fc_in6->s6_addr[1] & 0xc0) == 0x80)
+#define IN6_IS_ADDR_SITELOCAL(a)                                                                       \
+  __FC_IN6_TEST(a, __fc_in6->s6_addr[0] == 0xfe && (__fc_in6->s6_addr[1] & 0xc0) == 0xc0)
+#define IN6_IS_ADDR_V4MAPPED(a)                                                                        \
+  __FC_IN6_TEST(a, __FC_IN6_ZERO4(0) && __FC_IN6_ZERO4(4) && __fc_in6->s6_addr[8] == 0                 \
+                     && __fc_in6->s6_addr[9] == 0 && __fc_in6->s6_addr[10] == 0xff                     \
+                     && __fc_in6->s6_addr[11] == 0xff)
+/* glibc: the first 96 bits are zero and the last 32, as a host-order number, are greater than 1. */
+#define IN6_IS_ADDR_V4COMPAT(a)                                                                        \
+  __FC_IN6_TEST(a, __FC_IN6_ZERO4(0) && __FC_IN6_ZERO4(4) && __FC_IN6_ZERO4(8)                         \
+                     && (__fc_in6->s6_addr[12] != 0 || __fc_in6->s6_addr[13] != 0                      \
+                         || __fc_in6->s6_addr[14] != 0 || __fc_in6->s6_addr[15] > 1))
+#define IN6_IS_ADDR_MC_NODELOCAL(a) __FC_IN6_MC_SCOPE(a, 0x1)
+#define IN6_IS_ADDR_MC_LINKLOCAL(a) __FC_IN6_MC_SCOPE(a, 0x2)
+#define IN6_IS_ADDR_MC_SITELOCAL(a) __FC_IN6_MC_SCOPE(a, 0x5)
+#define IN6_IS_ADDR_MC_ORGLOCAL(a) __FC_IN6_MC_SCOPE(a, 0x8)
+#define IN6_IS_ADDR_MC_GLOBAL(a) __FC_IN6_MC_SCOPE(a, 0xe)
+#endif /* IN6_IS_ADDR_UNSPECIFIED */
+#endif /* FC_STUBS_NO_NETDB_DECLS */
+
 #endif /* __FRAMAC_EACSL__ */
 
 /*

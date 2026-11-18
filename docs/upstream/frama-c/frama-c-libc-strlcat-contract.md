@@ -3,7 +3,8 @@
 Draft for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
 **Not filed.** Issue 44 of this folder, drafted on 2026-11-18. Filing is paused until the
 maintainers answer the overview issue #2832 (see [`./README.md`](./README.md)); no branch is
-pushed, and the MR text still holds `#<issue>`.
+pushed, and the MR text still holds `#<issue>`. The finding is listed in #2832 since the same
+day (see [Filing](#filing)).
 
 **Package:**
 [issue text](./filing/44-libc-strlcat-contract-issue.md),
@@ -34,6 +35,10 @@ ensures bounded_result: \result == strlen(dest) + strlen(src);
   `src` is short.
 - **The dependencies of the result** name `src[0..n-1]` and not `dest`. The result depends on
   the length of both strings.
+- **The `separation` precondition is too weak** (a fourth clause, above these three): it covers
+  `src+(0..strnlen(src, n-1))`, and the function reads `src` up to its NUL. Added to the patch on
+  2026-11-18 on the owner's go-ahead ("Yes, add it"), after the measurement under
+  [Related](#related-not-requested).
 
 What follows from the first two:
 
@@ -46,6 +51,7 @@ What follows from the first two:
 | WP | a caller with `ensures \result == strlen(d) + strlen(s);` and `assigns d[0 .. 16];` | **proved**, 10 / 10 | result 4, sum 6 after the call |
 | WP | the same caller with `\old(strlen(d) + strlen(s))` and `assigns d[0 .. 15];` | not proved, 8 / 10 | holds |
 | WP | a byte-loop `strlcat` against the contract | `bounded_result` not proved, 34 / 35 | |
+| Eva | `char buf[32] = "0123456789abcdefghij"; strlcat(buf + 16, buf, 8);` | every precondition valid, 0 alarms | writes over the NUL of `src`: undefined (BSD manual) |
 
 The two invalid checks are the serious part: Eva gives a single wrong value with no alarm, so
 code that depends on the real value is dead for the analysis. The WP proof of a false
@@ -72,16 +78,16 @@ upstream's clause was first noticed by reading, then reproduced.
 
 | | Result |
 | :-- | :-- |
-| `35.0~~dev (Bromine)`, `master` at `b80fcac74f` (image `framac-master-audit:b80fcac`) | **8 of 8 checks fail** |
-| `34.0~beta (Selenium)` (image `framac-analysis:latest`) | **8 of 8 fail**, the same lines |
+| `35.0~~dev (Bromine)`, `master` at `b80fcac74f` (image `framac-master-audit:b80fcac`) | **9 of 9 checks fail** |
+| `34.0~beta (Selenium)` (image `framac-analysis:latest`) | **9 of 9 fail**, the same lines |
 | `master` at `b80fcac74f` with the patch installed | `RESULT: fixed` |
-| `34.0~beta` with the three clauses written into its installed `string.h` | `RESULT: fixed` |
+| `34.0~beta` with the four clauses written into its installed `string.h` | `RESULT: fixed` |
 
 On 2026-11-18 upstream `master` was still `b80fcac74f`.
 
 ## Reproduction
 
-[`./repro/44-libc-strlcat-contract.sh`](./repro/44-libc-strlcat-contract.sh) runs eight checks:
+[`./repro/44-libc-strlcat-contract.sh`](./repro/44-libc-strlcat-contract.sh) runs nine checks:
 
 - **Five with Eva** on [`./repro/44-libc-strlcat-contract.c`](./repro/44-libc-strlcat-contract.c),
   each compared with the compiled program.
@@ -90,6 +96,10 @@ On 2026-11-18 upstream `master` was still `b80fcac74f`.
   postcondition is false at run time must not be proved, and a correct caller must be.
 - **One with WP** on the byte-loop body, which must be proved against the contract that comes
   with the declaration.
+- **One with Eva** on
+  [`./repro/44-libc-strlcat-contract-overlap.c`](./repro/44-libc-strlcat-contract-overlap.c), a
+  call that writes over the NUL of its source: `separation` must be invalid. Added with the
+  fourth clause.
 
 Before, on both versions (exit code 1):
 
@@ -102,7 +112,8 @@ next_kept: gcc holds; eva unknown
 post_state_length: gcc DOES NOT HOLD (result 4, strlen(d) + strlen(s) after the call 6); wp proved 1 / 1
 pre_state_length: gcc holds (result 4, strlen(d) + strlen(s) before the call 4); wp proved 8 / 10
 body: wp proved 34 / 35
-RESULT: bug present (8 of 8 checks fail)
+overlap: eva separation valid
+RESULT: bug present (9 of 9 checks fail)
 ```
 
 After (exit code 0):
@@ -116,6 +127,7 @@ next_kept: gcc holds; eva valid
 post_state_length: gcc DOES NOT HOLD (result 4, strlen(d) + strlen(s) after the call 6); wp proved 0 / 1
 pre_state_length: gcc holds (result 4, strlen(d) + strlen(s) before the call 4); wp proved 10 / 10
 body: wp proved 35 / 35
+overlap: eva separation invalid
 RESULT: fixed
 ```
 
@@ -125,11 +137,15 @@ messages, and the first version of the script read "not reached" for every valid
 ## Fix
 
 [`./patches/44-libc-strlcat-contract.patch`](./patches/44-libc-strlcat-contract.patch): one commit
-on `b80fcac74f`, four files, 155 added lines and 15 removed.
+on `b80fcac74f`, four files, 197 added lines and 16 removed (second version, with the
+`separation` precondition; the first had 155 and 15).
 
 - **`share/libc/string.h`:**
 
   ```
+  requires separation:
+    \separated(dest+(0..\min(n-1, strlen(dest)+strlen(src))),
+               src+(0..strlen(src)));
   assigns dest[strlen(dest)..\min(n-1, strlen(dest)+strlen(src))]
     \from indirect:n, src[0..strlen(src)];
   assigns \result \from indirect:dest[0..], indirect:src[0..], indirect:n;
@@ -137,13 +153,16 @@ on `b80fcac74f`, four files, 155 added lines and 15 removed.
     \result == \old(\min(strlen(dest), n) + strlen(src));
   ```
 
+  - The source side of `separation` goes from `strnlen(src, n-1)` to `strlen(src)` (second
+    version of the patch).
   - The upper bound of the frame is the expression the `separation` precondition of the same
     contract already uses. It is empty when `dest` has no NUL within `n` bytes and when `n` is 0
     (`n-1` is -1 in the logic).
   - The minimum with `n` covers the case without a NUL within `n` bytes.
-  - The preconditions and the name `bounded_result` are kept. No clause is added on the bytes
-    written: Eva still gives `[--..--]` for them.
-- **`tests/libc/strlcat.c`** and its oracle: the five Eva cases of the reproducer, all valid.
+  - The three other preconditions and the name `bounded_result` are kept. No clause is added on
+    the bytes written: Eva still gives `[--..--]` for them.
+- **`tests/libc/strlcat.c`** and its oracle: the five Eva cases of the reproducer, all valid, and
+  the overlapping call in a branch (`if (nondet)`), whose `separation` is invalid.
 - **`tests/libc/oracle/string_h.0.res.oracle`:** the existing test gets more precise.
   - `//@ check imprecise: strlcat_res == 6;` (`string_h.c:221`) goes from unknown to valid.
   - Two preconditions of the call on line 222 go from unknown to valid.
@@ -157,7 +176,8 @@ on `b80fcac74f`, four files, 155 added lines and 15 removed.
 
 Run on 2026-11-18 in a container of `framac-master-audit:b80fcac` with
 [`../../../tools/upstream_audit/revalidate.sh`](../../../tools/upstream_audit/revalidate.sh)
-`package 44`:
+`package 44`. The whole list was run again on the second version of the patch, in a fresh
+container, with the same results:
 
 - **`git am --keep-non-patch`** applies the patch; author and committer are the GitLab noreply
   address; no file-mode change and no executable file.
@@ -203,12 +223,25 @@ and E-ACSL reports it as not yet supported and ignores it.
   - `bounded_result` removed: exit code 0.
 - L4's entry says the clause was not identified for `stpncpy`; that part is unchanged.
 - The patch hides the E-ACSL defect for `strlcat`. It does not fix it: the cause is in E-ACSL.
-- `e-acsl-gcc` on the same file exits 0 before and after, and the instrumented program runs
-  (`34.0~beta` only; not run on `master`).
+- **`e-acsl-gcc` without `-L` never showed the failure, and that is expected.** By default the
+  wrapper passes `-no-frama-c-stdlib` (read in its `bash -x` trace), so Frama-C parses glibc's
+  `<string.h>`, where `strlcat` has no contract: the generated code calls `strlcat` directly,
+  with no `__gen_e_acsl_strlcat` wrapper. The first version of this draft said "exits 0 before
+  and after" without saying why.
+- **With `-L` (Frama-C's libc) the wrapper fails like plain Frama-C** (both versions):
+
+  | `e-acsl-gcc -L -c l4.c` | Released header | Patched header |
+  | :-- | :-- | :-- |
+  | exit code | 1 (`e-acsl-gcc: fatal error: aborted by Frama-C`) | 0 |
+  | instrumented program | none | built, runs to the end (exit code 0) |
+
+- **The pipeline is not concerned:** its E-ACSL builds use the host's headers
+  (`-no-frama-c-stdlib`), and its own stub has no such clause in its E-ACSL branch.
 
 ## Related, not requested
 
-- **The `separation` precondition is too weak.** It covers `src+(0..strnlen(src, n-1))`, and the
+- **The `separation` precondition was too weak; it is in the patch since its second version.**
+  It covered `src+(0..strnlen(src, n-1))`, and the
   function reads `src` up to its NUL.
   - `char buf[32] = "0123456789abcdefghij"; strlcat(buf + 16, buf, 8);` has its four
     preconditions valid under Eva. The call writes `buf[20..23]`, which holds the NUL of `src`.
@@ -217,8 +250,22 @@ and E-ACSL reports it as not yet supported and ignores it.
   - Eva gives `r ∈ [24..34]` before the patch and `r ∈ {24}` after.
   - WP shows the same gap: the reference body of the pipeline's stub has an assertion that `src`
     is unchanged after the copy, and WP does not prove it against upstream's contract.
-  - Both filing texts name it and offer to add `src+(0..strlen(src))` to the merge request. It is
-    left out of the patch because a stronger precondition can break existing proofs.
+  - The first version of the patch left it out, because a stronger precondition can break
+    existing proofs, and the texts offered it.
+  - **Measured on 2026-11-18** (container of `framac-master-audit:b80fcac`, the first version of
+    the patch plus that one-line change, rebuilt):
+
+    | Check | First version | With `src+(0..strlen(src))` |
+    | :-- | :-- | :-- |
+    | `tests/libc`, default configuration (123 result logs) | pass | pass, no oracle changes |
+    | `plugins/e-acsl/tests`, default configuration | pass | pass, no oracle changes |
+    | Eva on the overlapping call above | `separation` valid, `r ∈ {24}`, 0 alarms | `separation` **invalid**, the call does not terminate |
+    | WP on the byte-loop body plus an assertion that `src` is unchanged up to its NUL | 35 / 36 (the assertion times out) | 36 / 36 |
+    | Reproducer 44 and the issue's `cat.c` | fixed, 12 preconditions valid | the same |
+
+    So no upstream test depends on the weak form. Proofs of users who call `strlcat` on
+    overlapping strings would break, which is the purpose. On that result the owner said to add
+    it. Both filing texts say it is one line and can be dropped if the maintainers prefer.
 - **`strlcpy`:** its contract is consistent. WP proves a byte-loop body against it, 31 of 31
   goals, with one admitted fact (the bytes of `src` are initialized).
 - **No clause on the bytes written,** for `strlcat` and `strlcpy` alike. The pipeline's stub
@@ -243,8 +290,19 @@ Searched live on 2026-11-18 through the read-only API (`glab api`, issues and me
   after checking that the container's `master` is the head upstream has that day, then
   `file_upstream.py issue 44`, `subst`, `mr 44`. If `share/libc/string.h` or `tests/libc` moved
   upstream, regenerate the two oracles.
-- **The overview issue #2832 does not list it.** Adding a line there is an edit of a public
-  text, so it needs the owner's go-ahead.
+- **The overview issue #2832 lists it** since 2026-11-18, 21:56 UTC, on the owner's request
+  ("update the main discussion but don't fill a unitary issue for this yet"). Four additions
+  to its description, the same in
+  [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md):
+  - a dated note at the top of "Findings I have not filed";
+  - a Libc row in the table of wrong-answer findings, which says a patch exists;
+  - a row `44` in the Libc table of the annex;
+  - one sentence in the annex row L4: for `strlcat`, the E-ACSL failure comes from this clause.
+  - The issue was open with no comment just before; the stored description was read back and is
+    identical to the file.
+  - **Second edit, 22:23 UTC, on the owner's request ("update 2832"):** the annex row `44` also
+    describes the weak `separation` precondition, with the overlapping call, and its kind gains
+    "lost alarm". Read back identical; still no comment on the issue.
 
 ## Pipeline workaround
 

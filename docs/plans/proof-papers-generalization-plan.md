@@ -179,6 +179,22 @@ The requirements of [`./formal-discovery-plan.md`](./formal-discovery-plan.md) (
 
 **Later, only with data.** If the report shows that `safety_only` callees are a frequent source of strengthening requests, feed the shape to the candidate rank or to the Header Architect brief. Not before.
 
+*Measured on 2026-11-18 (Tier 2, Step 0 of [`./harness-and-spec-papers-generalization-plan.md`](./harness-and-spec-papers-generalization-plan.md), counts in its Section 6): the data cannot answer yet, so this stays "not before".*
+
+- Six finished runs hold 305 strengthening requests: 273 filed by the scheduler (`caller needs a contract`) and 32 by provers, of which 5 are structural rejections. That leaves 27.
+- None of the 27 has a callee contract shape from before the request. 26 come from QCBOR runs that predate `limits.contract_shape`, and the one from libmodbus run-1 names a callee with no WP report.
+- Only libmodbus run-1 has the field: 41 proved functions, 24 `functional` and 17 `safety_only`; of the 18 that have a caller, 12 and 6.
+- By content, 24 of the 27 ask for a first contract on a callee that has none, and none asks to strengthen a proved contract.
+- This is not evidence that `safety_only` callees cost nothing: in libmodbus run-1, 53 provers ended `stalled_after_k_retries` and one filed a request.
+
+*Second measurement on 2026-11-18 (Section 7 of the same plan): the 53 stalled provers of libmodbus run-1 were read. Still "not before".*
+
+- None was held up by a postcondition missing from a proved contract. 29 call no function of the target, so they had no callee to ask. At most 14 had a callee with a proved contract at dispatch, at most 35 pairs in all (23 `functional`, 12 `safety_only`).
+- All but 2 of those pairs are calls through the backend function-pointer table, where WP never applies the callee's contract, so this run could hardly have shown the effect. A target whose stalled callers call proved callees directly is still needed.
+- The 17 stalled provers of QCBOR run-6 were read with the same rule: none either. Two had a proved callee at dispatch, and their gaps are casts and shifts under the Typed model.
+- Over both runs, 8 of 129 dispatched provers had a directly called callee with a proved contract, and 38 of the 44 provers that merged are leaves. This is partly by design: a caller is released as soon as its callee has a contract, proved or not (`_compute_deps`), so the contract a caller meets is usually the initial one. A shape recorded on `all_proven` reports therefore rarely describes what a caller saw.
+- One observation on the shape itself: `_modbus_tcp_build_request_basis` is `safety_only` by this tier's definition, and its contract states the constant result length that its callers need. The label is a coarse proxy for what a caller lacks.
+
 ### Decision D1: functional oracles in Phase 1
 
 **The gap.** Phase 1 reports an input only when it triggers a runtime error, a contract violation, a sanitizer report or a crash. A decoder that returns a wrong value without undefined behaviour is invisible. Paper 1.5 argues that metamorphic and differential oracles are what let fuzzing find such bugs. The manual differential test in [`../bugs-found/minmea/README.md`](../bugs-found/minmea/README.md) is the only precedent in the repository.

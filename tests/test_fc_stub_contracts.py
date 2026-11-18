@@ -255,6 +255,11 @@ def test_parser_finds_the_known_shipped_prototypes() -> None:
         ("fc_compat_types.h", "getopt"),
         ("json-c/json.h", "json_tokener_parse_ex"),
         ("json-c/json.h", "json_tokener_parse"),
+        ("sys/epoll.h", "epoll_wait"),
+        ("sys/inotify.h", "inotify_add_watch"),
+        ("fc_compat_types.h", "pipe2"),
+        ("fc_compat_types.h", "getservbyname_r"),
+        ("fc_compat_types.h", "getservbyport_r"),
     ):
         assert key in seen, f"parser lost {key}"
     # errno.h declares an object, ip_icmp.h only types and macros.
