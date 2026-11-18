@@ -1,0 +1,5 @@
+directory	file	line	function	property kind	status	property
+workspace/work/src	modbus.c	1747	modbus_write_register	precondition of write_single	Valid	\separated(ctx + (..), &__fc_errno)
+workspace/work/src	modbus.h	399	modbus_write_register	termination clause	Valid	\true
+workspace/work/src	modbus.h	400	modbus_write_register	postcondition	Valid	\false
+workspace/work/src	modbus.h	401	modbus_write_register	postcondition	Valid	null_status: \old(ctx) == \null ==> \result == -1

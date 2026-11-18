@@ -1,0 +1,204 @@
+directory	file	line	function	property kind	status	property
+/cap/local/target	prog.c	2	fill	precondition	Valid	\valid(b + (0 .. 15))
+/cap/local/target	prog.c	3	fill	assigns clause	Considered valid	assigns *(b + (0 .. 15));
+/cap/local/target	prog.c	4	fill	postcondition	Unknown	\false
+/cap/local/target	prog.c	4	fill	termination clause	Unknown	\true
+/cap/local/target	prog.c	7	consume	postcondition	Unknown	\false
+/cap/local/target	prog.c	7	consume	termination clause	Unknown	\true
+/cap/local/target	prog.c	7	consume	assigns clause	Considered valid	assigns \nothing;
+/cap/local/target	prog.c	9	derive	postcondition	Valid	\false
+/cap/local/target	prog.c	9	derive	termination clause	Unknown	\true
+/cap/local/target	prog.c	15	derive	precondition of fill	Valid	\valid(b + (0 .. 15))
+/cap/local/target	prog.c	17	derive	loop invariant	Valid	0 <= i <= 16
+/cap/local/target	prog.c	18	derive	loop invariant	Valid	\forall integer k; 0 <= k < i ==> buf[k] == 0
+/cap/local/target	prog.c	19	derive	assigns clause	Valid	assigns i, buf[0 .. 15];
+/cap/local/target	prog.c	20	derive	signed_overflow	Valid	i + 1 <= 2147483647
+/cap/local/target	prog.c	21	derive	index_bound	Valid	0 <= i
+/cap/local/target	prog.c	21	derive	index_bound	Valid	i < 16
+/cap/local/target	prog.c	26	derive	user check	Valid	\forall integer i; 0 <= i < sizeof(buf) / sizeof(buf[0]) ==> buf[i] == 0
+/cap/local/target	prog.c	27	derive	user check	Valid	\forall integer i; 0 <= i < sizeof(buf) / sizeof(buf[0]) ==> buf[i] == 0
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	227	syscall	from clause	Considered valid	assigns \result \from number;
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	228	syscall	assigns clause	Considered valid	assigns \nothing;
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	245	__fc_syscall_read	assigns clause	Considered valid	assigns \result, *((char *)buf + (0 .. count - 1));
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	245	__fc_syscall_read	from clause	Considered valid	assigns \result \from (indirect: fd), (indirect: count), (indirect: Frama_C_entropy_source);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	245	__fc_syscall_read	from clause	Considered valid	assigns *((char *)buf + (0 .. count - 1)) \from (indirect: fd), (indirect: count), (indirect: Frama_C_entropy_source);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	247	__fc_syscall_read	postcondition	Considered valid	result_error_or_read_length: -1 <= \result <= \old(count)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	248	__fc_syscall_read	postcondition	Considered valid	initialization: \initialized((char *)\old(buf) + (0 .. \result - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	251	__fc_syscall_read	postcondition	Considered valid	result_full: \result == \old(count)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	254	__fc_syscall_read	postcondition	Considered valid	result_short: \result < \old(count)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	266	__fc_syscall_recvfrom	assigns clause	Considered valid	assigns \result, *((char *)buf + (0 .. len - 1)), *addrlen, *((char *)src_addr + (0 .. *addrlen - 1));
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	266	__fc_syscall_recvfrom	from clause	Considered valid	assigns \result \from (indirect: sockfd), (indirect: len), (indirect: flags), (indirect: Frama_C_entropy_source);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	266	__fc_syscall_recvfrom	from clause	Considered valid	assigns *((char *)buf + (0 .. len - 1)) \from (indirect: sockfd), (indirect: len), (indirect: flags), (indirect: Frama_C_entropy_source);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	268	__fc_syscall_recvfrom	from clause	Considered valid	assigns *addrlen \from (indirect: sockfd), (indirect: src_addr);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	269	__fc_syscall_recvfrom	from clause	Considered valid	assigns *((char *)src_addr + (0 .. *addrlen - 1)) \from (indirect: sockfd);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	270	__fc_syscall_recvfrom	postcondition	Considered valid	result_error_or_received_length: -1 <= \result <= \old(len)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	271	__fc_syscall_recvfrom	postcondition	Considered valid	initialization: buf: \initialized((char *)\old(buf) + (0 .. \result - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	273	__fc_syscall_recvfrom	postcondition	Considered valid	initialization: addrbuf: \old(src_addr) != \null ==> \initialized((char *)\old(src_addr) + (0 .. \old(*addrlen) - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	276	__fc_syscall_recvfrom	postcondition	Considered valid	result_full: \result == \old(len)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	279	__fc_syscall_recvfrom	postcondition	Considered valid	result_short: \result < \old(len)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	288	__fc_syscall_getrandom	assigns clause	Considered valid	assigns \result, *((char *)buf + (0 .. buflen - 1));
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	288	__fc_syscall_getrandom	from clause	Considered valid	assigns \result \from (indirect: buflen), (indirect: flags), (indirect: Frama_C_entropy_source);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	288	__fc_syscall_getrandom	from clause	Considered valid	assigns *((char *)buf + (0 .. buflen - 1)) \from (indirect: buflen), (indirect: flags), (indirect: Frama_C_entropy_source);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	290	__fc_syscall_getrandom	postcondition	Considered valid	result_error_or_length: -1 <= \result <= \old(buflen)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	291	__fc_syscall_getrandom	postcondition	Considered valid	initialization: \initialized((char *)\old(buf) + (0 .. \result - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	294	__fc_syscall_getrandom	postcondition	Considered valid	result_full: \result == \old(buflen)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	297	__fc_syscall_getrandom	postcondition	Considered valid	result_short: \result < \old(buflen)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	312	explicit_bzero	assigns clause	Considered valid	assigns *((char *)s + (0 .. n - 1));
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	312	explicit_bzero	from clause	Considered valid	assigns *((char *)s + (0 .. n - 1)) \from \nothing;
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	313	explicit_bzero	postcondition	Considered valid	zeroed: \forall integer k; 0 <= k < \old(n) ==> *((char *)\old(s) + k) == 0
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	314	explicit_bzero	postcondition	Considered valid	zeroed_bytes: \forall integer k; 0 <= k < \old(n) ==> *((unsigned char *)\old(s) + k) == 0
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	315	explicit_bzero	postcondition	Considered valid	zeroed_values: \subset(*((char *)\old(s) + (0 .. \old(n) - 1)), {0})
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	316	explicit_bzero	postcondition	Considered valid	initialization: \initialized((char *)\old(s) + (0 .. \old(n) - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	323	memset_s	assigns clause	Considered valid	assigns *((char *)s + (0 .. (n <= smax ? n : smax) - 1)), \result;
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	323	memset_s	from clause	Considered valid	assigns *((char *)s + (0 .. (n <= smax ? n : smax) - 1)) \from c, (indirect: n), (indirect: smax);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	324	memset_s	from clause	Considered valid	assigns \result \from (indirect: n), (indirect: smax);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	325	memset_s	postcondition	Considered valid	set: \forall integer k; 0 <= k < (\old(n) <= \old(smax) ? \old(n) : \old(smax)) ==> *((char *)\old(s) + k) == (char)\old(c)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	327	memset_s	postcondition	Considered valid	set_bytes: \forall integer k; 0 <= k < (\old(n) <= \old(smax) ? \old(n) : \old(smax)) ==> *((unsigned char *)\old(s) + k) == (unsigned char)\old(c)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	328	memset_s	postcondition	Considered valid	set_values: \subset(*((char *)\old(s) + (0 .. (\old(n) <= \old(smax) ? \old(n) : \old(smax)) - 1)), {(char)\old(c)})
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	329	memset_s	postcondition	Considered valid	initialization: \initialized((char *)\old(s) + (0 .. (\old(n) <= \old(smax) ? \old(n) : \old(smax)) - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	330	memset_s	postcondition	Considered valid	result: \old(n) <= \old(smax) ? \result == 0 : \result != 0
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	415	getsockopt	assigns clause	Considered valid	assigns *((char *)optval + (0 .. *optlen - 1)), *optlen, \result;
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	415	getsockopt	from clause	Considered valid	assigns *((char *)optval + (0 .. *optlen - 1)) \from (indirect: sockfd), (indirect: level), (indirect: optname), (indirect: *optlen), (indirect: __fc_sockfds[sockfd]);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	415	getsockopt	from clause	Considered valid	assigns *optlen \from (indirect: sockfd), (indirect: level), (indirect: optname), (indirect: *optlen), (indirect: __fc_sockfds[sockfd]);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	415	getsockopt	from clause	Considered valid	assigns \result \from (indirect: sockfd), (indirect: level), (indirect: optname), (indirect: *optlen), (indirect: __fc_sockfds[sockfd]);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	418	getsockopt	postcondition	Considered valid	result_ok_or_error: \result == 0 || \result == -1
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	450	getopt	assigns clause	Considered valid	assigns \result, optind, optopt, optarg;
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	450	getopt	from clause	Considered valid	assigns \result \from (indirect: argc), (indirect: *(*(argv + (0 .. argc - 1)) + (0 ..))), (indirect: *(optstring + (0 ..))), (indirect: optind);
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	452	getopt	from clause	Considered valid	assigns optind \from optind, (indirect: argc), (indirect: *(*(argv + (0 .. argc - 1)) + (0 ..))), (indirect: *(optstring + (0 ..)));
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	454	getopt	from clause	Considered valid	assigns optopt \from *(*(argv + (0 .. argc - 1)) + (0 ..)), (indirect: argc), (indirect: optind), (indirect: *(optstring + (0 ..)));
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	456	getopt	from clause	Considered valid	assigns optarg \from *(argv + (0 .. argc - 1)), (indirect: argc), (indirect: optind), (indirect: *(*(argv + (0 .. argc - 1)) + (0 ..))), (indirect: *(optstring + (0 ..)));
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	458	getopt	postcondition	Considered valid	result_range: -128 <= \result <= 255
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	459	getopt	postcondition	Considered valid	optind_range: 1 <= optind <= \max(\old(argc), 1)
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	460	getopt	postcondition	Considered valid	optarg_in_argv: optarg == \null || \subset(optarg, *(\old(argv) + (0 .. \old(argc) - 1)) + (0 ..))
+/opt/framac-pipeline/templates/fc_stubs	fc_compat_types.h	461	getopt	postcondition	Considered valid	optarg_string: optarg == \null || valid_read_string(optarg)
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	99	strlcpy	termination clause	Considered valid	\true
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	100	strlcpy	postcondition	Considered valid	\false
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	101	strlcpy	assigns clause	Considered valid	assigns *(dst + (0 .. strlen{Old}(src) < size ? strlen{Old}(src) : size - 1)), \result;
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	101	strlcpy	from clause	Considered valid	assigns *(dst + (0 .. strlen{Old}(src) < size ? strlen{Old}(src) : size - 1)) \from *(src + (0 .. strlen{Old}(src))), (indirect: size);
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	103	strlcpy	from clause	Considered valid	assigns \result \from (indirect: *(src + (0 .. strlen{Old}(src))));
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	104	strlcpy	postcondition	Considered valid	result_is_src_length: \result == strlen(\old(src))
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	105	strlcpy	postcondition	Considered valid	copied: \old(size) > 0 ==> (\forall integer i; 0 <= i < (strlen(\old(src)) < \old(size) ? strlen(\old(src)) : \old(size) - 1) ==> *(\old(dst) + i) == *(\old(src) + i))
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	108	strlcpy	postcondition	Considered valid	initialized: \old(size) > 0 ==> \initialized(\old(dst) + (0 .. strlen(\old(src)) < \old(size) ? strlen(\old(src)) : \old(size) - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	110	strlcpy	postcondition	Considered valid	nul_terminated: \old(size) > 0 ==> *(\old(dst) + (strlen(\old(src)) < \old(size) ? strlen(\old(src)) : \old(size) - 1)) == '\000'
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	120	strlcat	termination clause	Considered valid	\true
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	121	strlcat	postcondition	Considered valid	\false
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	122	strlcat	assigns clause	Considered valid	assigns *(dst + (strlen{Old}(dst) .. strlen{Old}(dst) + strlen{Old}(src) < size ? strlen{Old}(dst) + strlen{Old}(src) : size - 1)), \result;
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	122	strlcat	from clause	Considered valid	assigns *(dst + (strlen{Old}(dst) .. strlen{Old}(dst) + strlen{Old}(src) < size ? strlen{Old}(dst) + strlen{Old}(src) : size - 1)) \from *(src + (0 .. strlen{Old}(src))), (indirect: *(dst + (0 .. strlen{Old}(dst)))), (indirect: size);
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	125	strlcat	from clause	Considered valid	assigns \result \from (indirect: *(dst + (0 .. strlen{Old}(dst)))), (indirect: *(src + (0 .. strlen{Old}(src))));
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	126	strlcat	postcondition	Considered valid	result_is_total_length: \result == \old(strlen(dst)) + strlen(\old(src))
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	128	strlcat	postcondition	Considered valid	initialized: \initialized(\old(dst) + (0 .. \old(strlen(dst)) + strlen(\old(src)) < \old(size) ? \old(strlen(dst)) + strlen(\old(src)) : \old(size) - 1))
+/opt/framac-pipeline/templates/fc_stubs	fc_strlcpy.h	131	strlcat	postcondition	Considered valid	nul_terminated: *(\old(dst) + (\old(strlen(dst)) + strlen(\old(src)) < \old(size) ? \old(strlen(dst)) + strlen(\old(src)) : \old(size) - 1)) == '\000'
+FRAMAC_SHARE/libc	__fc_builtin.h	23	Frama_C_make_unknown	assigns clause	Considered valid	assigns *(p + (0 .. l - 1)), Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	23	Frama_C_make_unknown	from clause	Considered valid	assigns *(p + (0 .. l - 1)) \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	24	Frama_C_make_unknown	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	25	Frama_C_make_unknown	postcondition	Considered valid	initialization: \initialized(\old(p) + (0 .. \old(l) - 1))
+FRAMAC_SHARE/libc	__fc_builtin.h	30	Frama_C_make_unknown_wchar	assigns clause	Considered valid	assigns *(p + (0 .. l - 1)), Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	30	Frama_C_make_unknown_wchar	from clause	Considered valid	assigns *(p + (0 .. l - 1)) \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	31	Frama_C_make_unknown_wchar	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	32	Frama_C_make_unknown_wchar	postcondition	Considered valid	initialization: \initialized(\old(p) + (0 .. \old(l) - 1))
+FRAMAC_SHARE/libc	__fc_builtin.h	36	Frama_C_nondet	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	36	Frama_C_nondet	from clause	Considered valid	assigns \result \from a, b, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	37	Frama_C_nondet	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	38	Frama_C_nondet	postcondition	Considered valid	result_a_or_b: \result == \old(a) || \result == \old(b)
+FRAMAC_SHARE/libc	__fc_builtin.h	42	Frama_C_nondet_ptr	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	42	Frama_C_nondet_ptr	from clause	Considered valid	assigns \result \from a, b, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	43	Frama_C_nondet_ptr	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	44	Frama_C_nondet_ptr	postcondition	Considered valid	result_a_or_b: \result == \old(a) || \result == \old(b)
+FRAMAC_SHARE/libc	__fc_builtin.h	49	Frama_C_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	49	Frama_C_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	50	Frama_C_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	51	Frama_C_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	56	Frama_C_interval_split	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	56	Frama_C_interval_split	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	57	Frama_C_interval_split	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	58	Frama_C_interval_split	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	63	Frama_C_unsigned_char_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	63	Frama_C_unsigned_char_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	64	Frama_C_unsigned_char_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	65	Frama_C_unsigned_char_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	72	Frama_C_char_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	72	Frama_C_char_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	73	Frama_C_char_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	74	Frama_C_char_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	80	Frama_C_unsigned_short_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	80	Frama_C_unsigned_short_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	81	Frama_C_unsigned_short_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	82	Frama_C_unsigned_short_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	89	Frama_C_short_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	89	Frama_C_short_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	90	Frama_C_short_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	91	Frama_C_short_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	97	Frama_C_unsigned_int_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	97	Frama_C_unsigned_int_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	98	Frama_C_unsigned_int_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	99	Frama_C_unsigned_int_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	106	Frama_C_int_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	106	Frama_C_int_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	107	Frama_C_int_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	108	Frama_C_int_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	113	Frama_C_unsigned_long_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	113	Frama_C_unsigned_long_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	114	Frama_C_unsigned_long_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	115	Frama_C_unsigned_long_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	122	Frama_C_long_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	122	Frama_C_long_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	123	Frama_C_long_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	124	Frama_C_long_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	130	Frama_C_unsigned_long_long_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	130	Frama_C_unsigned_long_long_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	131	Frama_C_unsigned_long_long_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	132	Frama_C_unsigned_long_long_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	138	Frama_C_long_long_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	138	Frama_C_long_long_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	139	Frama_C_long_long_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	140	Frama_C_long_long_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	146	Frama_C_size_t_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	146	Frama_C_size_t_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	147	Frama_C_size_t_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	148	Frama_C_size_t_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	154	Frama_C_intmax_t_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	154	Frama_C_intmax_t_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	155	Frama_C_intmax_t_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	156	Frama_C_intmax_t_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	162	Frama_C_uintmax_t_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	162	Frama_C_uintmax_t_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	163	Frama_C_uintmax_t_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	164	Frama_C_uintmax_t_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	170	Frama_C_ptrdiff_t_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	170	Frama_C_ptrdiff_t_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	171	Frama_C_ptrdiff_t_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	172	Frama_C_ptrdiff_t_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	178	Frama_C_wint_t_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	178	Frama_C_wint_t_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	179	Frama_C_wint_t_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	180	Frama_C_wint_t_interval	postcondition	Considered valid	result_bounded: \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	186	Frama_C_float_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	186	Frama_C_float_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	187	Frama_C_float_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	191	Frama_C_float_interval	postcondition	Considered valid	result_bounded: \is_finite(\result) && \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	196	Frama_C_float_interval	postcondition	Considered valid	result_bounded: !\is_NaN(\result) && \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	203	Frama_C_double_interval	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	203	Frama_C_double_interval	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	204	Frama_C_double_interval	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	208	Frama_C_double_interval	postcondition	Considered valid	result_bounded: \is_finite(\result) && \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	213	Frama_C_double_interval	postcondition	Considered valid	result_bounded: !\is_NaN(\result) && \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	221	Frama_C_real_interval_as_double	assigns clause	Considered valid	assigns \result, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	221	Frama_C_real_interval_as_double	from clause	Considered valid	assigns \result \from min, max, Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	222	Frama_C_real_interval_as_double	from clause	Considered valid	assigns Frama_C_entropy_source \from Frama_C_entropy_source;
+FRAMAC_SHARE/libc	__fc_builtin.h	223	Frama_C_real_interval_as_double	postcondition	Considered valid	result_bounded: \is_finite(\result) && \old(min) <= \result <= \old(max)
+FRAMAC_SHARE/libc	__fc_builtin.h	229	Frama_C_abort	termination clause	Considered valid	\false
+FRAMAC_SHARE/libc	__fc_builtin.h	231	Frama_C_abort	postcondition	Considered valid	never_terminates: \false
+FRAMAC_SHARE/libc	__fc_builtin.h	233	Frama_C_abort	assigns clause	Considered valid	assigns \nothing;
+FRAMAC_SHARE/libc	__fc_builtin.h	236	Frama_C_offset	from clause	Considered valid	assigns \result \from p;
+FRAMAC_SHARE/libc	__fc_builtin.h	237	Frama_C_offset	assigns clause	Considered valid	assigns \nothing;
+FRAMAC_SHARE/libc	__fc_builtin.h	241	Frama_C_malloc_fresh	assigns clause	Considered valid	assigns __fc_heap_status, \result;
+FRAMAC_SHARE/libc	__fc_builtin.h	241	Frama_C_malloc_fresh	from clause	Considered valid	assigns __fc_heap_status \from size, __fc_heap_status;
+FRAMAC_SHARE/libc	__fc_builtin.h	242	Frama_C_malloc_fresh	from clause	Considered valid	assigns \result \from (indirect: size), (indirect: __fc_heap_status);
+FRAMAC_SHARE/libc	__fc_builtin.h	246	Frama_C_abstract_cardinal	from clause	Considered valid	assigns \result \from i;
+FRAMAC_SHARE/libc	__fc_builtin.h	247	Frama_C_abstract_cardinal	assigns clause	Considered valid	assigns \nothing;
+FRAMAC_SHARE/libc	__fc_builtin.h	250	Frama_C_abstract_max	from clause	Considered valid	assigns \result \from i;
+FRAMAC_SHARE/libc	__fc_builtin.h	251	Frama_C_abstract_max	assigns clause	Considered valid	assigns \nothing;
+FRAMAC_SHARE/libc	__fc_builtin.h	253	Frama_C_abstract_min	from clause	Considered valid	assigns \result \from i;
+FRAMAC_SHARE/libc	__fc_builtin.h	254	Frama_C_abstract_min	assigns clause	Considered valid	assigns \nothing;
+FRAMAC_SHARE/libc	__fc_builtin.h	257	Frama_C_watch_value	assigns clause	Considered valid	assigns \nothing;
+FRAMAC_SHARE/libc	__fc_builtin.h	261	Frama_C_watch_cardinal	assigns clause	Considered valid	assigns \nothing;

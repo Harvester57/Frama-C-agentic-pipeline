@@ -35,7 +35,14 @@ from framac_common import (  # noqa: E402
     load_json_optional,
     load_json_strict,
 )
-from ledger import INDUCTIVE_LEMMA_GAP  # noqa: E402
+from ledger import (  # noqa: E402
+    GUARDRAIL_PASSED_STATUS,
+    IDENTITY_NOT_COMPARED,
+    INDUCTIVE_LEMMA_GAP,
+    PROPERTY_RELOCATED,
+    relocated_properties,
+    unchecked_clause_text,
+)
 from mutation_check import classify_open_unit  # noqa: E402
 from phase0_gates import dynamic_gaps  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
@@ -357,7 +364,148 @@ def load_inputs(run_dir: Path) -> dict:
         "mutation": load_json_optional(run_dir / "workspace/reports/mutation.json", None),
         "model": load_json_optional(run_dir / "workspace/reports/phase0_model.json", None),
         "security_props": load_json_optional(run_dir / "workspace/reports/security_props.json", None),
+        "merge_notes": load_merge_notes(run_dir),
     }
+
+
+# Where wp_scheduler.py keeps its tasks; a merged task carries `merge_notes` when its merge was not clean.
+WP_SCHEDULE = Path("state/wp_schedule.json")
+MERGE_NOTE_ROWS_MAX = 40
+MERGE_NOTE_REMOVALS = (
+    ("assigns_removed", "`assigns` removed"),
+    ("ensures_removed", "`ensures` removed"),
+)
+
+
+def load_merge_notes(run_dir: Path) -> list[dict]:
+    """
+    What the merges of the run's provers left to say, one item per task of `state/wp_schedule.json` that
+    carries `merge_notes` (wp_scheduler.py: `contract_changes` when the merged contract lost a clause or
+    could not be compared with the one it replaced, `frame_state` when WP proved the function without a
+    frame, `guardrail` when none passed). Read defensively: the file is the scheduler's own state, and
+    a run without it, or a task without the key, has nothing to list.
+    """
+    try:
+        state = load_json_optional(run_dir / WP_SCHEDULE, None)
+    except ArtifactError:
+        return []
+    tasks = state.get("tasks") if isinstance(state, dict) else None
+    items = tasks.items() if isinstance(tasks, dict) else enumerate(tasks if isinstance(tasks, list) else [])
+    out: list[dict] = []
+    for tid, task in items:
+        notes = task.get("merge_notes") if isinstance(task, dict) else None
+        if isinstance(notes, dict) and notes:
+            out.append(
+                {
+                    "task": str(task.get("id") or tid),
+                    "function": str(task.get("function") or ""),
+                    "notes": notes,
+                    "state": task.get("state"),
+                    "outcome": task.get("outcome"),
+                }
+            )
+    return sorted(out, key=lambda n: (n["function"], n["task"]))
+
+
+def _removed_clauses(items: object) -> str:
+    """`default: ensures a; ensures b | behavior x: ...` for a `{behavior, clauses}` list of a contract change."""
+    parts: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        behavior = str(item.get("behavior") or "")
+        where = "the contract outside named behaviors" if behavior in ("", "default!") else f"behavior `{behavior}`"
+        clauses = [" ".join(str(c).split())[:160] for c in item.get("clauses") or []]
+        parts.append(f"{where}: " + ("; ".join(f"`{md_escape(c)}`" for c in clauses) or "clause text not recorded"))
+    return " | ".join(parts)
+
+
+def merge_notes_lines(notes: list[dict] | None) -> list[str]:
+    """
+    The merges that were accepted but not clean: a merged contract that lost an `ensures`, an `assigns`,
+    a behavior or a completeness clause against the contract it replaced (or could not be compared with
+    it), a function proved without a frame, a merge no guardrail passed for. A proof of a weaker
+    contract is still a proof; the report says what the contract no longer states.
+    """
+    rows: list[str] = []
+    for item in notes or []:
+        said: list[str] = []
+        raw = item.get("notes")
+        note: dict = raw if isinstance(raw, dict) else {}
+        changes = note.get("contract_changes")
+        if isinstance(changes, dict):
+            if changes.get("available") is False:
+                said.append(
+                    "the merged contract could not be compared with the one it replaced "
+                    f"({md_escape(str(changes.get('reason') or 'no reason recorded'))[:200]})"
+                )
+            for key, label in MERGE_NOTE_REMOVALS:
+                if text := _removed_clauses(changes.get(key)):
+                    said.append(f"{label} in {text}")
+            for key, label in (("behaviors_removed", "behaviors removed"), ("completeness_removed", "removed")):
+                gone = [str(x) for x in changes.get(key) or []] if isinstance(changes.get(key), list) else []
+                if gone:
+                    said.append(f"{label}: " + ", ".join(f"`{md_escape(' '.join(g.split())[:120])}`" for g in gone))
+        frame = note.get("frame_state")
+        if isinstance(frame, dict):
+            had = " (the contract it replaced had one)" if frame.get("baseline_had_assigns") else ""
+            said.append(
+                "the WP report of the merge does not show a frame for the whole function (`assigns` clause: "
+                f"`{md_escape(str(frame.get('assigns_clause')))}`){had}"
+            )
+        guard = note.get("guardrail")
+        if isinstance(guard, dict):
+            said.append(
+                f"no guardrail pass (`{md_escape(str(guard.get('status')))}`: "
+                f"{md_escape(' '.join(str(guard.get('reason') or 'no reason recorded').split()))[:200]})"
+            )
+        if said:
+            # The note is of the last merge of the task; the task may have been queued again or parked since.
+            state, outcome = item.get("state"), item.get("outcome")
+            if (state is not None and state != "done") or (outcome is not None and outcome != "merged"):
+                said.append(
+                    f"the task is not a finished merge now (state `{md_escape(str(state))}`, outcome "
+                    f"`{md_escape(str(outcome))}`)"
+                )
+            rows.append(f"- `{md_escape(item.get('function') or item.get('task') or '?')}`: " + "; ".join(said) + ".")
+    if not rows:
+        return []
+    out = [
+        f"Merges accepted with a note ({len(rows)}; `merge_notes` of the tasks in `{WP_SCHEDULE.as_posix()}`). "
+        "Whatever is credited for these functions is for the contract as merged, which states less than the one "
+        "it replaced where a clause is listed as removed:",
+        "",
+        *rows[:MERGE_NOTE_ROWS_MAX],
+    ]
+    if len(rows) > MERGE_NOTE_ROWS_MAX:
+        out.append(f"- ... and {len(rows) - MERGE_NOTE_ROWS_MAX} more")
+    return [*out, ""]
+
+
+def identity_not_compared(rec: dict) -> list[str]:
+    """
+    The evidence entries of a finding that say the parent's replay of a counted reproducer could not be
+    compared with the candidate's failure (`ledger.py ingest-verifier`, `IDENTITY_NOT_COMPARED`): the
+    input failed, but not on a failure that names a statement.
+    """
+    return [
+        str(e.get("description"))
+        for e in rec.get("evidence") or []
+        if isinstance(e, dict) and str(e.get("description") or "").startswith(IDENTITY_NOT_COMPARED)
+    ]
+
+
+def identity_not_compared_text(rec: dict) -> str | None:
+    """One sentence for a finding with such entries: how many of its reproducers, and what that means."""
+    notes = identity_not_compared(rec)
+    if not notes:
+        return None
+    return (
+        f"for {len(notes)} reproducer(s) the parent's replay failed, but not on a failure that could be compared "
+        "with this finding's (no failure report parsed, or one that names no statement), so the replay does not "
+        "show that the failure is this finding's; they count because the inputs were recorded on the candidate "
+        "before verification (see the evidence in `FINDINGS-DETAIL.md`)"
+    )
 
 
 def load_coverage_reports(run_dir: Path) -> list[dict]:
@@ -538,6 +686,7 @@ def assurance_table(ledger: list[dict]) -> list[str]:
 CONTRACT_SHAPE_NOT_RECORDED = "not recorded"
 # acsl_ast.CONTRACT_SHAPES, then the proofs whose report predates the field.
 CONTRACT_SHAPE_ORDER = ("functional", "safety_only", "not_applicable", "unknown", CONTRACT_SHAPE_NOT_RECORDED)
+UNCHECKED_CLAUSE_ROWS_MAX = 40
 
 
 def verdict_limits_section(ledger: list[dict]) -> list[str]:
@@ -548,16 +697,40 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     trivial: set[str] = set()
     # Per function, not per ledger unit: one proof is the evidence of several obligation classes.
     shapes: dict[str, str] = {}
+    never_run: dict[str, dict[str, str]] = {}
+    unattributed: dict[str, int] = {}
+    # `limits.guardrail` of each unit's latest credited WP result: `not_run` is never a pass.
+    no_guardrail: dict[str, str] = {}
+    clauses_unreported: set[str] = set()
     credited = 0
     for u in ledger:
+        guard_passed = False
+        latest_guard: dict | None = None
         for e in u["evidence"]:
             limits = (e.get("details") or {}).get("limits")
             if e["phase"] != "wp" or not isinstance(limits, dict):
                 continue
             credited += 1
             name = f"{u['file']}#{u['function']}"
-            if (limits.get("dynamic_oracle") or {}).get("exercised") is False:
+            guard = limits.get("guardrail")
+            if isinstance(guard, dict):
+                guard_passed = guard_passed or (latest_guard or {}).get("status") == GUARDRAIL_PASSED_STATUS
+                latest_guard = guard
+            oracle = limits.get("dynamic_oracle")
+            oracle = oracle if isinstance(oracle, dict) else {}
+            if oracle.get("exercised") is False:
                 unexercised.add(name)
+            if "unchecked_clauses" in oracle and not isinstance(oracle["unchecked_clauses"], list):
+                clauses_unreported.add(name)
+            # The clauses E-ACSL generated no check for: the guardrail passed without executing them.
+            clauses = oracle.get("unchecked_clauses")
+            for clause in clauses if isinstance(clauses, list) else []:
+                if isinstance(clause, dict):
+                    reason = " ".join(str(clause.get("reason") or "no reason recorded").split())
+                    never_run.setdefault(name, {})[unchecked_clause_text(clause)] = reason
+            loose = oracle.get("unattributed")
+            if isinstance(loose, list) and loose:
+                unattributed[name] = max(unattributed.get(name, 0), len(loose))
             if (limits.get("vacuity") or {}).get("status") == "inconclusive":
                 inconclusive.add(name)
             unchecked.update(f"{name} ({c})" for c in limits.get("unchecked_layer_clauses") or [])
@@ -568,6 +741,13 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
                 shapes[name] = shape
             else:
                 shapes.setdefault(name, CONTRACT_SHAPE_NOT_RECORDED)
+        if latest_guard is not None and latest_guard.get("status") != GUARDRAIL_PASSED_STATUS:
+            why = " ".join(str(latest_guard.get("reason") or "no reason recorded").split())[:200]
+            if latest_guard.get("status") != "not_run":
+                why = f"status `{latest_guard.get('status')}`, {why}"
+            if guard_passed:
+                why += "; an earlier result's guardrail passed, on the contract as it was then"
+            no_guardrail[f"{u['file']}#{u['function']}"] = why
     if not credited:
         return []
     out = [
@@ -592,6 +772,7 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     for label, names in (
         ("Proven with a safety-only contract", safety_only),
         ("Proven, but no guardrail input reached the function", unexercised),
+        ("Proven, but the guardrail did not report which clauses E-ACSL generated no check for", clauses_unreported),
         ("Contract consistency check inconclusive", inconclusive),
         ("Layer clauses that say nothing about the function", trivial),
         ("Layer clauses whose source could not be read", unchecked),
@@ -600,6 +781,37 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
             shown = ", ".join(f"`{n}`" for n in sorted(names)[:20])
             more = f" and {len(names) - 20} more" if len(names) > 20 else ""
             out.append(f"- {label} ({len(names)}): {shown}{more}")
+    if no_guardrail:
+        out.append(
+            f"- Proven, but the latest credited WP result had no E-ACSL guardrail pass ({len(no_guardrail)}): "
+            "these proofs stand on WP alone, not exercised at runtime."
+        )
+        out += [
+            f"  - `{name}`: {md_escape(why)}" for name, why in sorted(no_guardrail.items())[:UNCHECKED_CLAUSE_ROWS_MAX]
+        ]
+        if len(no_guardrail) > UNCHECKED_CLAUSE_ROWS_MAX:
+            out.append(f"  - ... and {len(no_guardrail) - UNCHECKED_CLAUSE_ROWS_MAX} more (`limits.guardrail`)")
+    if never_run:
+        total = sum(len(c) for c in never_run.values())
+        out.append(
+            f"- Proven, and the guardrail passed, but the dynamic oracle never executed {total} clause(s) of "
+            f"{len(never_run)} function(s): E-ACSL generated no check for them, so they rest on the WP proof alone."
+        )
+        rows = [(name, text, reason) for name in sorted(never_run) for text, reason in sorted(never_run[name].items())]
+        for name, text, reason in rows[:UNCHECKED_CLAUSE_ROWS_MAX]:
+            out.append(f"  - `{name}`: {md_escape(text)} ({md_escape(reason[:200])})")
+        if len(rows) > UNCHECKED_CLAUSE_ROWS_MAX:
+            out.append(
+                f"  - ... and {len(rows) - UNCHECKED_CLAUSE_ROWS_MAX} more (`limits.dynamic_oracle.unchecked_clauses` "
+                "of the WP evidence in `coverage-ledger.json`)"
+            )
+    if unattributed:
+        shown = ", ".join(f"`{n}` ({unattributed[n]})" for n in sorted(unattributed)[:20])
+        more = f" and {len(unattributed) - 20} more" if len(unattributed) > 20 else ""
+        out.append(
+            "- E-ACSL ignored annotations in the guardrail build that could not be tied to a function, so whether a "
+            f"clause of the proven function was among them is not known ({len(unattributed)}): {shown}{more}"
+        )
     out.append("")
     return out
 
@@ -607,23 +819,114 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
 TRUST_ROWS_MAX = 60
 
 
-def security_props_lines(props: dict | None) -> list[str]:
+RELOCATED_NAMES_MAX = 12
+
+
+def _code_names(names: list, limit: int = RELOCATED_NAMES_MAX) -> str:
+    shown = ", ".join(f"`{md_escape(str(n))}`" for n in names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def relocated_props_lines(props: dict, ledger: list[dict] | None = None) -> list[str]:
+    """
+    The properties security_props.py checks somewhere else than where the threat model declares the
+    sink (`properties[*].relocated`, a wrapper sink with `checked_at`): where the property is no longer
+    generated, where it is checked instead and through which call, the properties that check stands
+    for, and what the model does not show. With the ledger, the units still keyed on a property moved
+    away from their function (no `seed --refresh` since) are listed: their status is about a property
+    no run generates any more.
+    """
+    moved = [p for p in props.get("properties") or [] if isinstance(p, dict) and isinstance(p.get("relocated"), dict)]
+    if not moved:
+        return []
+    out = ["### Properties checked somewhere else than at the calls of their sink", ""]
+    for prop in moved:
+        rec = prop["relocated"]
+        name, wrapper = str(prop.get("name")), str(rec.get("wrapper"))
+        callers = [str(c) for c in rec.get("not_generated_at") or []]
+        out.append(
+            f"- `{md_escape(name)}`: not generated at the {len(callers)} caller(s) of `{md_escape(wrapper)}`"
+            + (f" ({_code_names(callers)})" if callers else "")
+            + f"; checked inside `{md_escape(wrapper)}` instead, before it hands the buffer over."
+        )
+        for site in rec.get("checked_at") or []:
+            if not isinstance(site, dict):
+                continue
+            targets = site.get("candidates") or site.get("inner_sinks") or []
+            out.append(
+                f"  - Checked before the {md_escape(str(site.get('kind') or 'direct'))} call "
+                f"`{md_escape(str(site.get('call')))}` at `{md_escape(str(site.get('loc')))}`"
+                + (f", which can dispatch to {_code_names(targets)}" if site.get("kind") == "indirect" else "")
+                + "."
+            )
+        stands_for = [
+            f"{s.get('property')} in {s.get('function')}" for s in rec.get("superseded") or [] if isinstance(s, dict)
+        ]
+        if stands_for:
+            out.append(f"  - That check stands for {_code_names(stands_for)}, which MetAcsl is not given there.")
+        others = [
+            f"{o.get('call')} at {o.get('loc')}" for o in rec.get("other_indirect_calls") or [] if isinstance(o, dict)
+        ]
+        if others:
+            out.append(f"  - Other calls through a pointer in the wrapper, which get no check: {_code_names(others)}.")
+        out += [
+            f"  - {md_escape(str(e)[:1].upper() + str(e)[1:])}."
+            for e in rec.get("evidence") or []
+            if str(e).startswith("not shown")
+        ]
+    if ledger:
+        retired = sorted(
+            str(u.get("coverage_id"))
+            for u in ledger
+            if any(str(r).startswith(f"{PROPERTY_RELOCATED}:") for r in u.get("unresolved") or [])
+        )
+        if retired:
+            out.append(
+                f"- {len(retired)} unit(s) had results on a property before it moved and are retired "
+                f"({_code_names(retired)}): no property of their class is generated at these functions any more. "
+                "They read `blocked` in the ledger, which keeps their earlier evidence; nothing is left to prove there."
+            )
+        where = relocated_properties(props)
+        stale = sorted(
+            f"{u.get('coverage_id')} ({', '.join(names)})"
+            for u in ledger
+            if u.get("status") != "out_of_scope"
+            and (
+                names := sorted(
+                    n
+                    for n in (u.get("bookkeeping") or {}).get("security_properties") or []
+                    if n in where.get(f"{u.get('file')}#{u.get('function')}", {})
+                )
+            )
+        )
+        if stale:
+            out.append(
+                f"- **{len(stale)} ledger unit(s) are still keyed on a property that is no longer generated at their "
+                f"function** ({_code_names(stale)}): their status says nothing about the check that replaced it. "
+                "`ledger.py seed --refresh` retires them or plans them again."
+            )
+    return [*out, ""]
+
+
+def security_props_lines(props: dict | None, ledger: list[dict] | None = None) -> list[str]:
     """
     Threat-model items security_props.py turned into no property (a returned secret, a name the build
-    lacks, an unusable sink parameter), from its warnings, so the report says what was not checked.
+    lacks, an unusable sink parameter), from its warnings, so the report says what was not checked;
+    then the properties it moved (`relocated_props_lines`).
     """
     if not isinstance(props, dict):
         return []
     items = [
         str(w) for w in props.get("warnings") or [] if str(w).startswith(("secret ", "auth gate ", "output sink "))
     ]
-    if not items:
-        return []
-    out = ["### Threat-model items without a property", ""]
-    out += [f"- {md_escape(w)}" for w in items[:30]]
-    if len(items) > 30:
-        out.append(f"- ... and {len(items) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
-    return [*out, ""]
+    out: list[str] = []
+    if items:
+        out = ["### Threat-model items without a property", ""]
+        out += [f"- {md_escape(w)}" for w in items[:30]]
+        if len(items) > 30:
+            out.append(f"- ... and {len(items) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
+        out.append("")
+    return out + relocated_props_lines(props, ledger)
 
 
 def trust_lines(model: dict | None) -> list[str]:
@@ -903,7 +1206,7 @@ def render_report(data: dict) -> str:
         out.append(f"**{len(work['open_units'])} coverage unit(s) are still planned or in progress.**")
         out.append("")
     out += trust_lines(data.get("model"))
-    out += security_props_lines(data.get("security_props"))
+    out += security_props_lines(data.get("security_props"), ledger)
     out += fallback_lines(data.get("model"), ledger)
 
     out += ["## 2. Summary", ""]
@@ -970,6 +1273,17 @@ def render_report(data: dict) -> str:
                 f"| {r['severity']} | {md_escape(r['title'])} | {loc(r, run_dir)} | `{r['reachability']}` | {md_escape(r['reproducers'][0]['observed_result'])[:160]} |"
             )
         out.append("")
+        blind = [r for r in confirmed if identity_not_compared(r)]
+        if blind:
+            out += [
+                f"**{len(blind)} of {len(confirmed)} confirmed finding(s) count a reproducer whose failure identity "
+                "was not compared**: the parent's replay of the input failed, but not on a failure that could be "
+                "compared with the finding's (no failure report parsed, or one that names no statement), so the "
+                "replay does not show that the failure is the finding's. Each is marked below: "
+                + ", ".join(f"`{r['fingerprint']}`" for r in blind)
+                + ".",
+                "",
+            ]
         for r in confirmed:
             related_fps = r.get("_related_fingerprints") or []
             fp_suffix = f" (also merged: {', '.join(f'`{f}`' for f in related_fps)})" if related_fps else ""
@@ -982,6 +1296,7 @@ def render_report(data: dict) -> str:
                 *([f"- **Decision point:** {dp}"] if (dp := decision_point_text(r)) else []),
                 *([f"- **Earlier verdict:** {pv}"] if (pv := prior_verdict_text(r)) else []),
                 *([f"- **Conflicting verdict:** {cv}"] if (cv := conflict_text(r, by_fp)) else []),
+                *([f"- **Failure identity not compared:** {ni}"] if (ni := identity_not_compared_text(r)) else []),
                 f"- **Reproduce:** `{md_escape(r['reproducers'][0]['command'])}` with `{r['reproducers'][0]['input']}`",
                 f"- **Severity rationale:** {md_escape(r['severity_rationale'])}",
                 f"- **Fix:** {md_escape(r['remediation']['summary'])} (invariant: {md_escape(r['remediation']['invariant'])})",
@@ -1017,6 +1332,7 @@ def render_report(data: dict) -> str:
             out.append(f"- of these, {experimental} unit(s) {WP_EXPERIMENTAL_MODEL_ASSUMPTION}")
         out.append("")
     out += verdict_limits_section(ledger)
+    out += merge_notes_lines(data.get("merge_notes"))
     out += concurrency_lines(ledger)
     out += model_only_lines(ledger)
     if run_dir:
@@ -1129,6 +1445,11 @@ def render_findings_detail(findings: list[dict], run_dir: Path | None = None) ->
             "",
             *([f"**Decision point.** {dp}", ""] if (dp := decision_point_text(r)) else []),
             *([f"**Conflicting verdict.** {cv}", ""] if (cv := conflict_text(r, by_fp)) else []),
+            *(
+                [f"**Failure identity not compared.** {ni[0].upper()}{ni[1:]}.", ""]
+                if (ni := identity_not_compared_text(r))
+                else []
+            ),
             f"**Intended behavior.** {md_escape(r['intended_behavior'])}",
             "",
             "**Trace.**",
@@ -1223,6 +1544,9 @@ def render_sarif(findings: list[dict], run_dir: Path | None = None) -> dict:
             rule_id, {"id": rule_id, "shortDescription": {"text": f"Frama-C property kind: {r['property']['kind']}"}}
         )
         props = {"verdict": r["verdict"], "reachability": r["reachability"]}
+        if not_compared := identity_not_compared(r):
+            # Reproducers counted although the parent's replay could not be compared with the candidate's failure.
+            props["failureIdentityNotCompared"] = len(not_compared)
         if r["verdict"] == "confirmed":
             props["severity"] = r["severity"]
             sev = r["severity"].lower()

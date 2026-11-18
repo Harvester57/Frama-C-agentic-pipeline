@@ -432,6 +432,72 @@ def _accepted_fingerprints(cand: dict) -> list[str]:
     return out
 
 
+IDENTITY_RULE = (
+    "ledger.py ingest-verifier (_judge_reproducer) for a `confirmed` record that keeps the candidate's "
+    "fingerprint and location: the replay failed on the candidate's fingerprint, an observation's, its "
+    "statement site, a related candidate's, or (one side without a statement) its function and kind"
+)
+
+
+def replay_identity(
+    report: dict, cand: dict, candidates: list, report_path: str, run_dir: Path = Path(".")
+) -> dict[str, Any]:
+    """
+    Whether each input this report saw fail failed on the candidate's defect, by the rule the ledger
+    applies when a verifier lists it as a reproducer (`IDENTITY_RULE`), as the report's `identity`:
+
+      {rule, compared, reason, inputs: [{sha256, artifact, outcome, counts, ...}], match, mismatch, uncompared}
+
+    `outcome` is `match` (with `basis`), `mismatch` (the replay failed at another statement: the
+    ledger refuses the reproducer) or `uncompared` (no replay of the input names a statement, `what`
+    says why: it counts only for an input recorded on the candidate before verification, `own_input`).
+    `counts` is what the ledger would do with the input for such a record. A record the verifier
+    refingerprints or an additional record is judged against its own failure, which is not known here.
+
+    `fingerprint_matches` beside it compares fingerprints only, and over all artifacts at once: it is
+    false for a replay by the other engine at the candidate's statement, which the ledger accepts.
+    Without the run's DAG or module map, or on any error, nothing is compared (`compared: false`,
+    `reason`) and nothing is raised: the replay report is still written.
+    """
+    out: dict[str, Any] = {"rule": IDENTITY_RULE, "compared": False, "reason": None, "inputs": []}
+    counts = {"match": 0, "mismatch": 0, "uncompared": 0}
+    try:
+        import ledger
+        from module_map import ModuleMap
+
+        mm = ModuleMap.load(run_dir)
+        placer = ledger._FailurePlacer(mm, ledger._candidate_harness_module(mm, cand), run_dir)
+        by_fp = {str(c.get("fingerprint")): c for c in candidates if isinstance(c, dict)}
+        rec = {"fingerprint": cand.get("fingerprint"), "location": cand.get("location")}
+        accepted = ledger._accepted_failures(cand, by_fp, rec, placer)
+        grouped: dict[str, list[tuple[str, dict]]] = {}
+        for art in report.get("artifacts") or []:
+            if isinstance(art, dict) and art.get("reproducible") is True and art.get("sha256"):
+                grouped.setdefault(str(art["sha256"]), []).append((report_path, art))
+        own = ledger._candidate_input_shas(run_dir, cand, grouped)
+        for sha, arts in grouped.items():
+            outcome, seen = ledger._judge_reproducer(arts, accepted, placer)
+            item: dict[str, Any] = {
+                "sha256": sha,
+                "artifact": arts[0][1].get("artifact"),
+                "outcome": outcome,
+                "own_input": sha in own,
+                "counts": outcome == "match" or (outcome == "uncompared" and sha in own),
+                "failure": seen.get("fingerprint") or None,
+            }
+            if outcome == "match":
+                item["basis"] = seen.get("basis")
+            elif outcome == "mismatch":
+                item["failed_at"] = f"{seen.get('file')}:{seen.get('line')} in {seen.get('function') or 'unknown'}"
+            else:
+                item["what"] = seen.get("what")
+            counts[outcome] += 1
+            out["inputs"].append(item)
+    except Exception as exc:  # noqa: BLE001  (the comparison is an addition to the report, never its failure)
+        return {**out, "inputs": [], "reason": f"not compared: {type(exc).__name__}: {exc}"[:300]}
+    return {**out, "compared": True, **counts}
+
+
 def _reproducers_by_engine(cand: dict, default: str, *, use_observations: bool) -> dict[str, list[Path]]:
     """
     The candidate's reproducers grouped by the engine to replay them on. A reproducer named by an
@@ -657,10 +723,12 @@ def replay_candidates(
             )
         report = _merged_replay_report(replays)
         report["candidate_fingerprint"] = fingerprint
-        # Any failure that is this candidate: its key or one of its observations' fingerprints (D1).
+        # Fingerprints only: some artifact's fingerprint is the candidate's key or an observation's (D1).
+        # Not the ledger's rule for a reproducer (statement site, related candidates): that is `identity`.
         accepted = _accepted_fingerprints(cand)
         report["fingerprint_matches"] = any(a.get("fingerprint") in accepted for a in report["artifacts"])
         report_path = Path(out_json) if out_json is not None else out_dir / f"{_candidate_slug(fingerprint)}.json"
+        report["identity"] = replay_identity(report, cand, candidates, report_path.as_posix())
         atomic_write_json(report_path, report)
         entry: dict[str, Any] = {"report": report_path.as_posix(), "module": module, "status": report["status"]}
         harness_module = module if isinstance(spec, str) else str(spec.get("harness_module") or module)

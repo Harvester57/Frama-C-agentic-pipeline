@@ -1,0 +1,243 @@
+{
+ "schema_version": 1,
+ "generated_at": "2026-11-18T22:28:48.632236+00:00",
+ "threat_model": {
+  "status": "ok",
+  "path": null,
+  "sha256": null,
+  "reason": null
+ },
+ "preamble": "/*@\n  predicate no_crlf_string(char *s) =\n    \\forall integer i; 0 <= i < strlen(s) ==> (s[i] != '\\r' && s[i] != '\\n');\n*/",
+ "properties": [
+  {
+   "name": "L5_sanitized_send_frame",
+   "layer": 5,
+   "kind": "sanitized",
+   "obligation_class": "l5_sanitized",
+   "acsl": "/*@ check L5_sanitized_send_frame: ${predicate}; */",
+   "instances": [
+    "prog.c#send_frame"
+   ],
+   "sources": [],
+   "notes": [
+    "a wrapper sink (threat model `checked_at`): not generated at the 2 caller(s) of send_frame; written into the work tree before each call in send_frame that hands the buffer to rtu_send, tcp_send, on that call's arguments (see `relocated`)"
+   ],
+   "threat_model": {
+    "output_sink": "send_frame",
+    "kind": "network",
+    "params": [
+     "msg"
+    ],
+    "checked_at": [
+     "tcp_send",
+     "rtu_send"
+    ]
+   },
+   "targets": "send_frame",
+   "code": {
+    "handoff": [
+     {
+      "callee": "send",
+      "member": true,
+      "args": [
+       [
+        1,
+        2
+       ]
+      ],
+      "sites": 1
+     }
+    ],
+    "check": "/*@ check L5_sanitized_send_frame: ${predicate}; */",
+    "bytes": "\\initialized((${arg}) + (0 .. (${length}) - 1))",
+    "object": "\\initialized(${arg})"
+   },
+   "relocated": {
+    "wrapper": "prog.c#send_frame",
+    "declared": [
+     "tcp_send",
+     "rtu_send"
+    ],
+    "not_generated_at": [
+     "prog.c#request_rtu",
+     "prog.c#request_tcp"
+    ],
+    "checked_at": [
+     {
+      "function": "prog.c#send_frame",
+      "call": "(ctx->backend)->send",
+      "loc": "prog.c:67",
+      "kind": "indirect",
+      "inner_sinks": [
+       "rtu_send",
+       "tcp_send"
+      ],
+      "candidates": [
+       "prog.c#rtu_recv",
+       "prog.c#rtu_send",
+       "prog.c#tcp_recv",
+       "prog.c#tcp_send"
+      ]
+     }
+    ],
+    "superseded": [
+     {
+      "property": "L5_sanitized_rtu_send",
+      "function": "prog.c#send_frame"
+     },
+     {
+      "property": "L5_sanitized_tcp_send",
+      "function": "prog.c#send_frame"
+     }
+    ],
+    "other_indirect_calls": [
+     {
+      "call": "(ctx->backend)->frame_pre",
+      "loc": "prog.c:66",
+      "candidates": [
+       "prog.c#rtu_frame_pre",
+       "prog.c#tcp_frame_pre"
+      ]
+     }
+    ],
+    "evidence": [
+     "threat model: send_frame is a wrapper sink, `checked_at` tcp_send, rtu_send",
+     "model: prog.c#send_frame is defined in the build, and each sink named is a declared output sink it calls",
+     "model: (ctx->backend)->send at prog.c:67 can dispatch to rtu_recv, rtu_send, tcp_recv, tcp_send (type match); the check before it does not depend on the callee, so it holds for every function the call can dispatch to",
+     "model: no function-pointer call in send_frame is unresolved",
+     "not shown by the model, which records no call arguments: which calls receive the buffer. That it leaves send_frame only through the sinks named is the threat model's statement"
+    ]
+   }
+  },
+  {
+   "name": "L5_sanitized_tcp_send",
+   "layer": 5,
+   "kind": "sanitized",
+   "obligation_class": "l5_sanitized",
+   "acsl": "/*@ meta \\prop, \\name(L5_sanitized_tcp_send), \\targets(\\ALL), \\context(\\calling),\n      \\tguard(\\called == tcp_send ==> (\\fguard(\\initialized(\\called_arg(req) + (0 .. \\called_arg(req_length) - 1)))));\n*/",
+   "instances": [
+    "prog.c#ping",
+    "prog.c#poll_tcp"
+   ],
+   "sources": [],
+   "notes": [
+    "send_frame reaches tcp_send through a function pointer only: checked by L5_sanitized_send_frame before that call instead (MetAcsl cannot state \\called_arg at an indirect call)"
+   ],
+   "threat_model": {
+    "output_sink": "tcp_send",
+    "kind": "network",
+    "params": [
+     "req"
+    ]
+   },
+   "targets": "tcp_send"
+  },
+  {
+   "name": "L5_sanitized_rtu_send",
+   "layer": 5,
+   "kind": "sanitized",
+   "obligation_class": "l5_sanitized",
+   "acsl": "/*@ meta \\prop, \\name(L5_sanitized_rtu_send), \\targets(\\ALL), \\context(\\calling),\n      \\tguard(\\called == rtu_send ==> (\\fguard(\\initialized(\\called_arg(req) + (0 .. \\called_arg(req_length) - 1)))));\n*/",
+   "instances": [
+    "prog.c#poll_tcp"
+   ],
+   "sources": [],
+   "notes": [
+    "send_frame reaches rtu_send through a function pointer only: checked by L5_sanitized_send_frame before that call instead (MetAcsl cannot state \\called_arg at an indirect call)"
+   ],
+   "threat_model": {
+    "output_sink": "rtu_send",
+    "kind": "network",
+    "params": [
+     "req"
+    ]
+   },
+   "targets": "rtu_send"
+  }
+ ],
+ "frame": [
+  {
+   "function": "prog.c#link_open",
+   "reason": "writes through parameter(s) ctx"
+  },
+  {
+   "function": "prog.c#rtu_frame_pre",
+   "reason": "writes through parameter(s) req"
+  },
+  {
+   "function": "prog.c#tcp_frame_pre",
+   "reason": "writes through parameter(s) req"
+  }
+ ],
+ "obligations": {
+  "prog.c#link_open": [
+   {
+    "class": "l3_frame",
+    "property": "L3_frame",
+    "reason": "writes through parameter(s) ctx"
+   }
+  ],
+  "prog.c#ping": [
+   {
+    "class": "l5_sanitized",
+    "property": "L5_sanitized_tcp_send",
+    "reason": "L5_sanitized_tcp_send (sanitized, layer 5)"
+   }
+  ],
+  "prog.c#poll_tcp": [
+   {
+    "class": "l5_sanitized",
+    "property": "L5_sanitized_tcp_send",
+    "reason": "L5_sanitized_tcp_send (sanitized, layer 5)"
+   },
+   {
+    "class": "l5_sanitized",
+    "property": "L5_sanitized_rtu_send",
+    "reason": "L5_sanitized_rtu_send (sanitized, layer 5)"
+   }
+  ],
+  "prog.c#rtu_frame_pre": [
+   {
+    "class": "l3_frame",
+    "property": "L3_frame",
+    "reason": "writes through parameter(s) req"
+   }
+  ],
+  "prog.c#send_frame": [
+   {
+    "class": "l5_sanitized",
+    "property": "L5_sanitized_send_frame",
+    "reason": "L5_sanitized_send_frame (sanitized, layer 5)"
+   }
+  ],
+  "prog.c#tcp_frame_pre": [
+   {
+    "class": "l3_frame",
+    "property": "L3_frame",
+    "reason": "writes through parameter(s) req"
+   }
+  ]
+ },
+ "summary": {
+  "properties": 3,
+  "by_kind": {
+   "sanitized": 3
+  },
+  "functions_by_class": {
+   "l3_frame": 3,
+   "l5_sanitized": 3
+  },
+  "relocated": [
+   "L5_sanitized_send_frame"
+  ]
+ },
+ "warnings": [],
+ "code_checks": [
+  {
+   "file": "prog.c",
+   "line": 67,
+   "function": "prog.c#send_frame",
+   "property": "L5_sanitized_send_frame"
+  }
+ ]
+}

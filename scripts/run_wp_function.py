@@ -416,6 +416,12 @@ def goal_obligation_class(item: dict) -> str:
     assigns/separated/frees/allocates -> l3_frame; everything else -> rte. A hand-named
     L4_*/L5_*/L6_* clause is a supporting contract clause: no ledger unit has a class of its own
     for it (the pre-I9 classes l4_auth, l5_output, l6_secret are gone), so it falls through.
+
+    A `\\separated` in the predicate of a precondition or a postcondition (the report kinds
+    `precondition`, `precondition of <callee>`, `postcondition`) is not a frame goal: it says nothing
+    about what the function writes. libmodbus run-1: the one "proven l3_frame goal" of
+    `modbus_write_register`, whose contract had no `assigns` clause, was WP's memory-model hypothesis of
+    its callee, `precondition of write_single: \\separated(ctx + (..), &__fc_errno)`.
     """
     text = f"{item.get('kind', '')} {item.get('annotation', '')}"
     meta = _META_NAME_RE.search(text)
@@ -424,9 +430,16 @@ def goal_obligation_class(item: dict) -> str:
     low = text.lower()
     if "variant" in low or "decreases" in low:
         return "l2_termination"
-    if "assigns" in low or "\\separated" in low or "frees" in low or "allocates" in low:
+    if "assigns" in low or "frees" in low or "allocates" in low:
+        return "l3_frame"
+    kind = str(item.get("kind") or "").strip().lower()
+    if "\\separated" in low and not kind.startswith(_PREDICATE_CLAUSE_KINDS):
         return "l3_frame"
     return "rte"
+
+
+# The report kinds of a contract's predicates: `precondition`, `precondition of <callee>`, `postcondition`.
+_PREDICATE_CLAUSE_KINDS = ("precondition", "postcondition")
 
 
 _BITWISE_GOAL_RE = re.compile(
@@ -2151,6 +2164,7 @@ def run_wp_on_function(
                 "annotation": row["property"],
             }
             name_meta_goal(item, security_meta)
+            name_code_goal(item, security_meta, c_file)
             cls = goal_obligation_class(item)
             item["obligation_class"] = cls
             counts = by_class.setdefault(cls, {"proven": 0, "proven_under_hyp": 0, "unproven": 0})
@@ -2460,7 +2474,8 @@ def run_wp_on_function(
         "sizing": sizing,
     }
     if security_meta:
-        res["security_props"] = {k: v for k, v in security_meta.items() if k not in ("meta_file", "line_names")}
+        hidden = ("meta_file", "line_names", "code_line_names")
+        res["security_props"] = {k: v for k, v in security_meta.items() if k not in hidden}
     if prop:
         # Counted as proven above, but pending on some other property (check_declared_wraps needs them).
         res["partially_proven_goals"] = [
@@ -2732,6 +2747,10 @@ def layer_clause_limits(goals: list[dict], c_file: Path) -> dict:
         by_class.setdefault(goal["obligation_class"], set()).add(name)
         source = _read_goal_source(goal, c_file)
         predicate = find_named_clause(source, name) if source is not None else None
+        annotation = str(goal.get("annotation") or "")
+        if predicate is None and "check" in str(goal.get("kind") or "").lower() and annotation.startswith(f"{name}:"):
+            # An in-code check (name_code_goal): the report row itself carries the predicate WP proved.
+            predicate = annotation[len(name) + 1 :].strip()
         if predicate is None:
             unchecked.add(name)
         elif is_trivial_predicate(predicate):
@@ -2978,12 +2997,100 @@ def check_declared_wraps(
     return res
 
 
+_ANNOTATION_WORD_RE = re.compile(r"\b(?:check|assert|admit)\b")
+_CALLED_TARGET_RE = re.compile(r"\\called\s*==\s*([A-Za-z_]\w*)")
+
+
+def code_check_names(props: dict, fid: str, c_file: Path) -> tuple[dict[str, str], list[dict]]:
+    """
+    The in-code checks security_props.py wrote into this function's file (`code` properties, plan steps
+    M6/M7 and the wrapper hand-off), as (line -> property name, checks left unnamed with the reason).
+
+    Frama-C's report gives such a check as a `user check` row with its predicate only. The name is read
+    back from the source at the row's line, never from the line `code_checks` recorded: a prover's
+    annotations move the check. A name is accepted only when it is a `code` property with an instance in
+    this function, the file holds as many `check <name>:` as security_props.py placed for this function
+    (a deleted or an added one makes every row of the property unnamed), a property whose check text
+    is fixed has that text, and the line holds no other annotation. An unnamed row stays an `rte` goal:
+    it credits no L4-L6 unit. The predicate of a check built from a call's arguments (hand-off, return)
+    is not compared.
+    """
+    import security_props
+
+    wanted = {str(p["name"]): p for p in security_props.properties_for(props, fid) if p.get("code")}
+    if not wanted:
+        return {}, []
+    placed: dict[str, int] = dict.fromkeys(wanted, 0)
+    for c in props.get("code_checks") or []:
+        if isinstance(c, dict) and c.get("function") == fid and str(c.get("property")) in placed:
+            placed[str(c.get("property"))] += 1
+    try:
+        lines = c_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        return {}, [{"property": n, "reason": f"source not read: {exc}"} for n in sorted(wanted)]
+    names: dict[str, str] = {}
+    unnamed: list[dict] = []
+    for name, prop in sorted(wanted.items()):
+        mark = re.compile(rf"\bcheck\s+{re.escape(name)}\s*:")
+        found = [(i, line) for i, line in enumerate(lines, start=1) for _ in mark.findall(line)]
+        fixed = str((prop.get("code") or {}).get("check") or "")
+        reason = None
+        if not placed[name]:
+            reason = "security_props.json records no placed check of it in this function (`code_checks`)"
+        elif len(found) != placed[name]:
+            reason = f"{placed[name]} check(s) placed, {len(found)} `check {name}:` in the source"
+        elif fixed and "${" not in fixed and any(" ".join(fixed.split()) not in " ".join(t.split()) for _, t in found):
+            reason = "the check in the source is not the text security_props.py placed"
+        if reason:
+            unnamed.append({"property": name, "reason": reason})
+            continue
+        for i, line in found:
+            if len(_ANNOTATION_WORD_RE.findall(line)) != len(mark.findall(line)) or names.get(str(i), name) != name:
+                unnamed.append({"property": name, "line": i, "reason": "the line holds another annotation"})
+                names.pop(str(i), None)
+            else:
+                names[str(i)] = name
+    return names, unnamed
+
+
+def call_targets(props: dict, names: list[str], sources: list[Path]) -> dict[str, dict]:
+    """
+    For each loaded property stated on a call (`\\called == f`): {function: f, seen: whether the name
+    `f` occurs in the code of a file handed to Frama-C (comments and literals aside)}.
+
+    MetAcsl says nothing when `f` is not in the parse: it translates the property, generates no
+    instance and reports success, exactly as when it decided every instance statically (Frama-C
+    34.0~beta, with `-meta-warn-key unknown-func` inactive or active). libmodbus run-1: `send_msg`
+    reaches `_modbus_tcp_send` through `ctx->backend->send`, and modbus.c does not declare it. `seen`
+    is read from the text, not from the parse: a name declared only in an included header is not seen,
+    and a use in a disabled `#if` branch is.
+    """
+    from acsl_ast import mask_comments_and_literals
+
+    code = ""
+    for src in sources:
+        with contextlib.suppress(OSError):
+            text = src.read_text(encoding="utf-8", errors="replace")
+            code += mask_comments_and_literals(text, acsl="blank", literals=True, on_error="mask") + "\n"
+    out: dict[str, dict] = {}
+    for p in props.get("properties") or []:
+        m = _CALLED_TARGET_RE.search(str(p.get("acsl") or ""))
+        if m and str(p.get("name")) in names:
+            seen = re.search(rf"(?<![\w.>]){re.escape(m.group(1))}\b", code) is not None
+            out[str(p["name"])] = {"function": m.group(1), "seen": seen}
+    return out
+
+
 def resolve_security_meta(spec: str | None, c_file: Path, fn_name: str, out_dir: Path) -> dict | None:
     """
     The MetAcsl properties (scripts/security_props.py) with an instance in this function: writes their
-    meta file under `out_dir` and returns {props, function_id, properties, meta_file, extra_sources}, or
-    None when there are none. `spec` is a path, `none`/`off`, or None for $FRAMAC_SECURITY_PROPS, else
-    workspace/reports/security_props.json when it exists.
+    meta file under `out_dir` and returns {props, function_id, properties, meta_file, extra_sources,
+    call_targets}, or None when there are none. `spec` is a path, `none`/`off`, or None for
+    $FRAMAC_SECURITY_PROPS, else workspace/reports/security_props.json when it exists.
+
+    The in-code checks of the function (`code` properties) are no MetAcsl property: they are listed
+    apart (`code_properties`, `code_checks`, `code_checks_unnamed`), never in `properties`, and a
+    function that has only those gets no meta file and no `-meta` stage.
     """
     import security_props
 
@@ -3002,9 +3109,18 @@ def resolve_security_meta(spec: str | None, c_file: Path, fn_name: str, out_dir:
     if match is None:
         return None
     fid, root = match
+    code_names, code_unnamed = code_check_names(props, fid, c_file)
+    code: dict[str, Any] = {}
+    if code_names or code_unnamed:
+        code = {
+            "code_properties": sorted(set(code_names.values())),
+            "code_checks": [{"line": int(line), "property": name} for line, name in sorted(code_names.items())],
+            "code_checks_unnamed": code_unnamed,
+            "code_line_names": code_names,
+        }
     found = security_props.meta_file_text(props, fid)
     if found is None:
-        return None
+        return {"props": str(path), "function_id": fid, "properties": [], **code} if code else None
     text, names, sources = found
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_file = out_dir / f"security_meta_{fn_name}.c"
@@ -3021,7 +3137,25 @@ def resolve_security_meta(spec: str | None, c_file: Path, fn_name: str, out_dir:
         "meta_file": str(meta_file),
         "extra_sources": extra,
         "line_names": {str(k): v for k, v in security_props.meta_line_names(text).items()},
+        "call_targets": call_targets(props, names, [c_file, *map(Path, extra)]),
+        **code,
     }
+
+
+def name_code_goal(item: dict, security_meta: dict | None, c_file: Path) -> None:
+    """
+    Put the property name back on the `user check` row of an in-code check security_props.py placed
+    (`<property>: <predicate>`), so the goal maps to the property's class. Only the lines
+    `code_check_names` accepted are named.
+    """
+    names = (security_meta or {}).get("code_line_names")
+    if not names or "check" not in str(item.get("kind") or "").lower():
+        return
+    if Path(str(item.get("file") or "")).name != c_file.name:
+        return
+    name = names.get(str(item.get("line")))
+    if name and name not in str(item.get("annotation") or ""):
+        item["annotation"] = f"{name}: {item.get('annotation') or ''}"
 
 
 def name_meta_goal(item: dict, security_meta: dict | None) -> None:

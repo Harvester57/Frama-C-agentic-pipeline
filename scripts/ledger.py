@@ -298,6 +298,104 @@ def add_wp_limit_assumptions(unit: dict, limits: dict, function: str, model_assu
             "other",
             f"No guardrail input reached {function}: its contract was proven but not exercised at runtime.",
         )
+    guardrail = guardrail_limit_note(limits, function)
+    if guardrail:
+        add_assumption(unit, "other", guardrail)
+    for text in unchecked_clause_notes(limits, function):
+        add_assumption(unit, "other", text)
+
+
+# `limits.guardrail.status` of a parent WP report (workspace_overlay.py): the E-ACSL guardrail ran and passed.
+GUARDRAIL_PASSED_STATUS = "passed_dynamic_oracle"
+
+
+def guardrail_limit_note(limits: dict, function: str) -> str | None:
+    """
+    The assumption text for a credited WP result whose limits say its guardrail did not pass
+    (`limits.guardrail`: {status: `not_run`, reason} when the parent re-check ran none, a contract
+    re-check included), or None when it passed or the report does not record the key (written before
+    it existed). `not_run` is never a pass. An earlier result of the same unit whose guardrail passed
+    keeps its evidence entry; this note is about the result credited now, and says so.
+    """
+    record = limits.get("guardrail")
+    status = record.get("status") if isinstance(record, dict) else None
+    if not isinstance(record, dict) or status == GUARDRAIL_PASSED_STATUS:
+        return None
+    reason = _one_line(record.get("reason"), 200) or "no reason recorded"
+    if status != "not_run":
+        return (
+            f"The E-ACSL guardrail of the WP result credited for {function} did not pass (status "
+            f"`{_one_line(status, 60) or 'not recorded'}`, {reason}): the proof stands on WP alone."
+        )
+    return (
+        f"No E-ACSL guardrail ran for the WP result credited for {function} ({reason}): this proof was not "
+        "exercised at runtime. A guardrail that passed for an earlier result of the unit, if any, is in its "
+        "evidence and checked the contract as it was then."
+    )
+
+
+# Clauses named one by one on a unit; the rest are counted (the evidence's `details.limits` has them all).
+UNCHECKED_CLAUSES_NAMED = 20
+
+
+def _one_line(text: object, limit: int) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def unchecked_clause_text(clause: dict) -> str:
+    """`requires `label: predicate` at file:line` for one record of `limits.dynamic_oracle.unchecked_clauses`."""
+    label, body = _one_line(clause.get("label"), 60), _one_line(clause.get("clause"), 160)
+    shown = f"{label}: {body}" if label and body else label or body
+    where = f"{clause.get('file') or 'an unknown file'}:{clause.get('line') or '?'}"
+    via = f", through `{_one_line(clause.get('via'), 60)}`" if clause.get("via") else ""
+    return f"{clause.get('kind') or 'clause'}" + (f" `{shown}`" if shown else "") + f" at {where}{via}"
+
+
+def unchecked_clause_notes(limits: dict, function: str) -> list[str]:
+    """
+    What the parent guardrail of a credited proof did not execute, as assumption texts: one per clause
+    of `limits.dynamic_oracle.unchecked_clauses` ({function, kind, label, clause, file, line, reason,
+    via}: E-ACSL warned `Ignoring annotation` and generated no check, run_eacsl_fuzz.py
+    dynamic_oracle_fields), and one for the ignored annotations no function could be read for
+    (`unattributed`). A guardrail that `passed` says nothing about these clauses: WP alone stands for
+    them. `unchecked_clauses: None` means the guardrail had no build report to read them from: not
+    known, which is not "none", and an assumption of its own. A report without the key (written before
+    it existed) adds nothing.
+    """
+    oracle = limits.get("dynamic_oracle")
+    if not isinstance(oracle, dict):
+        return []
+    notes: list[str] = []
+    raw = oracle.get("unchecked_clauses")
+    if "unchecked_clauses" in oracle and not isinstance(raw, list):
+        notes.append(
+            f"The guardrail of {function} did not report which clauses E-ACSL generated no check for: whether "
+            f"the dynamic oracle executed every clause of {function} is not known."
+        )
+    clauses = [c for c in raw if isinstance(c, dict)] if isinstance(raw, list) else []
+    for clause in clauses[:UNCHECKED_CLAUSES_NAMED]:
+        owner = str(clause.get("function") or function)
+        notes.append(
+            f"The dynamic oracle never executed the {unchecked_clause_text(clause)} of {owner}: E-ACSL generated "
+            f"no check for it ({_one_line(clause.get('reason'), 200) or 'no reason recorded'}). The guardrail "
+            f"that passed for {function} says nothing about this clause; it rests on the WP proof alone."
+        )
+    if len(clauses) > UNCHECKED_CLAUSES_NAMED:
+        notes.append(
+            f"The dynamic oracle never executed {len(clauses) - UNCHECKED_CLAUSES_NAMED} more clause(s) of "
+            f"{function}'s guardrail build (E-ACSL generated no check; see the limits of the WP evidence)."
+        )
+    loose = oracle.get("unattributed")
+    if isinstance(loose, list) and loose:
+        first = loose[0] if isinstance(loose[0], dict) else {}
+        where = f"{first.get('file') or 'an unknown file'}:{first.get('line') or '?'}"
+        notes.append(
+            f"E-ACSL ignored {len(loose)} annotation(s) in {function}'s guardrail build that could not be tied to "
+            f"a function (first: {where}, {_one_line(first.get('reason'), 160) or 'no reason recorded'}): whether "
+            f"a clause of {function} was among them is not known."
+        )
+    return notes
 
 
 def mark_candidate(unit: dict, fingerprint: str) -> None:
@@ -713,6 +811,80 @@ def _meta_decided_statically(unit: dict, report: dict) -> bool:
     return names <= {str(n) for n in sp.get("properties") or []}
 
 
+def _meta_not_evaluated(unit: dict, report: dict, has_goals: bool) -> str | None:
+    """
+    Why a WP report does not show that MetAcsl evaluated the properties of an L4-L6 unit, or None.
+
+    A property stated on a call (`\\called == f`) generates no instance, and no message, when `f` is
+    not in the files WP parsed: the run looks exactly like one whose every instance MetAcsl decided
+    statically. libmodbus run-1: `send_msg` and `_modbus_receive_msg` (modbus.c) carry
+    `L5_sanitized__modbus_tcp_send`, whose sink is a static function of modbus-tcp.c reached through
+    `ctx->backend->send` only. run_wp_function.py records, per such property, whether the function's name
+    occurs in the parsed files (`security_props.call_targets`); a unit naming a property whose function
+    was not seen is not credited, with or without goals of its class. Without goals, a report that does
+    not record the field (written before it existed) shows nothing either.
+    """
+    sp = report.get("security_props")
+    names = set((unit.get("bookkeeping") or {}).get("security_properties") or [])
+    if not isinstance(sp, dict) or sp.get("error") or not names:
+        return None
+    targets = sp.get("call_targets")
+    if not isinstance(targets, dict):
+        if has_goals or not names <= {str(n) for n in sp.get("properties") or []}:
+            return None
+        return (
+            "the report does not say whether the functions its properties are stated on are in the files WP "
+            "parsed (security_props.call_targets: not recorded; a report written before the field existed)"
+        )
+    unseen = [
+        f"{n} (on the calls of {t.get('function')})"
+        for n in sorted(names)
+        if isinstance(t := targets.get(n), dict) and t.get("seen") is not True
+    ]
+    if not unseen:
+        return None
+    return (
+        f"MetAcsl generated no instance of {', '.join(unseen)}: the files WP parsed do not name that function, "
+        "so a call that reaches it through a function pointer was not checked"
+    )
+
+
+def wp_frame_problem(report: dict) -> tuple[str, str] | None:
+    """
+    Why an `all_proven` WP report does not show a proven frame for its function, as (evidence result,
+    reason), or None when it does: the report says the contract has an `assigns` clause
+    (`frame_summary.assigns_clause: present`, read by run_wp_function.py from Frama-C's own output) and
+    that no assigns goal is unproven. A contract without the clause has no assigns goal that could
+    fail, so zero unproven frame goals prove nothing there (libmodbus run-1, modbus_write_register).
+    `unknown` is never a frame: the report CSV does not say which behavior an `assigns clause` row
+    belongs to, so a proven row may be one named behavior's. A report written before the field
+    existed reads as `unknown`.
+    """
+    raw = report.get("frame_summary")
+    frame: dict = raw if isinstance(raw, dict) else {}
+    state = frame.get("assigns_clause")
+    function = report.get("function")
+    if state == "absent":
+        return "wp_no_frame_clause", f"the contract WP proved for {function} has no `assigns` clause"
+    if state == "behaviors_only":
+        named = ", ".join(str(b) for b in frame.get("assigns_behaviors") or []) or "some"
+        return (
+            "wp_no_frame_clause",
+            f"the contract WP proved for {function} has an `assigns` clause in named behaviors only ({named}), "
+            "which do not cover the function: it has no `assigns` clause of its own",
+        )
+    if state != "present":
+        return (
+            "wp_frame_not_shown",
+            f"the report does not show that the contract of {function} has an `assigns` clause "
+            f"(frame_summary.assigns_clause: {state if isinstance(state, str) else 'not recorded'}; a run limited "
+            "with --prop, a log without a property report, or a report written before the field existed)",
+        )
+    if frame.get("assigns_vcs_proven") is not True or report.get("assigns_vcs_proven") is False:
+        return "wp_frame_not_shown", f"the report does not say that the assigns goals of {function} are proven"
+    return None
+
+
 def _load_security_obligations(path: Path | None) -> tuple[dict[str, list[dict]] | None, str]:
     """security_props.py's obligations per `file#name`, and a status (`ok`, `absent`, `invalid`)."""
     path = path or DEFAULT_SECURITY_PROPS
@@ -983,6 +1155,94 @@ def _refresh_units(
     }
 
 
+PROPERTY_RELOCATED = "property_relocated"
+
+
+def relocated_properties(doc: object) -> dict[str, dict[str, str]]:
+    """
+    `file#name` -> {property: where it is checked instead}, from the `relocated` records of a
+    security_props.json (a wrapper sink, threat-model field `checked_at`): the functions the wrapper's
+    property is no longer generated at (`not_generated_at`), and the inner sinks' properties its in-code
+    check stands for inside the wrapper (`superseded`). Empty for a report without relocations.
+    """
+    moved: dict[str, dict[str, str]] = {}
+    props = doc.get("properties") if isinstance(doc, dict) else None
+    for prop in props if isinstance(props, list) else []:
+        rel_rec = prop.get("relocated") if isinstance(prop, dict) else None
+        if not isinstance(rel_rec, dict):
+            continue
+        name, wrapper = str(prop.get("name")), str(rel_rec.get("wrapper"))
+        for fid in rel_rec.get("not_generated_at") or []:
+            moved.setdefault(str(fid), {})[name] = f"{name} is checked inside {wrapper}, where it hands the buffer over"
+        for item in rel_rec.get("superseded") or []:
+            if isinstance(item, dict) and item.get("function") and item.get("property"):
+                moved.setdefault(str(item["function"]), {})[str(item["property"])] = (
+                    f"{name}, written before the call in {wrapper}, is checked in its place"
+                )
+    return moved
+
+
+def _refresh_relocated(units: dict[str, dict], derived: dict[str, dict], doc: object, tool_output: str | None) -> dict:
+    """
+    `seed --refresh` after security_props.py moved a property (`relocated_properties`): a unit that a
+    phase already worked on is never re-derived by `_refresh_units`, so it would stay keyed on a
+    property no run generates any more (libmodbus run-1: twelve callers of `send_msg` blocked on
+    `L5_sanitized_send_msg`). Such a unit keeps its evidence and gets a note; its
+    `bookkeeping.security_properties` follow the report; it is retired when the report derives no
+    property of its class for the function any more, and planned again otherwise: no earlier result on
+    the moved property says anything about the one that replaces it. A retired unit is `blocked` with
+    the reason `property_relocated: ...`, not `out_of_scope`: the ledger refuses an `out_of_scope` unit
+    that carries evidence (validate_artifacts.py), and the evidence is kept. A unit with an open
+    candidate is left as it is and listed.
+    """
+    moved = relocated_properties(doc)
+    out: dict[str, list[str]] = {"retired": [], "replanned": [], "kept_candidate": []}
+    for cid in sorted(units):
+        unit = units[cid]
+        bk = unit.get("bookkeeping") or {}
+        new = derived.get(cid)
+        kept = set((new or {}).get("bookkeeping", {}).get("security_properties") or [])
+        here = moved.get(f"{normalize_file(unit['file'])}#{unit['function']}") or {}
+        stale = sorted(n for n in bk.get("security_properties") or [] if n in here and n not in kept)
+        if not stale or not _has_evidence(unit):
+            continue
+        if unit["status"] == "candidate":
+            out["kept_candidate"].append(cid)
+            continue
+        why = "; ".join(here[n] for n in stale)
+        add_evidence(
+            unit,
+            STATIC_PHASE,
+            "security_props.py",
+            PROPERTY_RELOCATED,
+            False,
+            tool_output,
+            f"No longer generated at this function: {why}. Earlier results on {', '.join(stale)} do not decide the unit."[
+                :400
+            ],
+        )
+        unit["agent_id"] = None
+        if new is None:
+            unit["status"] = "blocked"
+            unit["unresolved"] = [f"{PROPERTY_RELOCATED}: {why}"[:240]]
+            unit["bookkeeping"] = {k: v for k, v in bk.items() if k != "security_properties"}
+            if not unit["bookkeeping"]:
+                unit.pop("bookkeeping")
+            out["retired"].append(cid)
+        else:
+            unit["status"] = new["status"]
+            unit["unresolved"] = copy.deepcopy(new["unresolved"])
+            unit["bookkeeping"] = {
+                k: v for k, v in bk.items() if k not in ("security_properties", "decided_properties")
+            }
+            for key in ("security_properties", "decided_properties"):
+                if key in (new.get("bookkeeping") or {}):
+                    unit["bookkeeping"][key] = copy.deepcopy(new["bookkeeping"][key])
+            unit["evidence"] += copy.deepcopy(new.get("evidence") or [])
+            out["replanned"].append(cid)
+    return {k: v[:REFRESH_LIST_MAX] for k, v in out.items()} | {"count": sum(len(v) for v in out.values())}
+
+
 @ledger_locked
 def cmd_seed(
     dag_path: Path,
@@ -997,7 +1257,9 @@ def cmd_seed(
     """
     Add the units the DAG derives that the ledger lacks; an existing unit is never rewound. With
     `refresh` (a Phase 0 re-run on a changed target), the units without evidence also follow the
-    current DAG (`_refresh_units`), and the result reports what changed. The stub overlay's active
+    current DAG (`_refresh_units`), the units keyed on a property security_props.py moved elsewhere
+    are retired or planned again (`_refresh_relocated`), and the result reports what changed
+    (`refresh`, `refresh.relocated`). The stub overlay's active
     contracts (`stub_report`, when present) are recorded as `stub_contract` assumptions as
     `record-stub-contracts` does, so a seed run by hand records them too.
     """
@@ -1011,6 +1273,11 @@ def cmd_seed(
     for cid in added:
         units[cid] = derived[cid]
     changes = _refresh_units(units, derived, set(added), dag_fns) if refresh else None
+    if changes is not None and sec_status == "ok":
+        props_path = security_props or DEFAULT_SECURITY_PROPS
+        changes["relocated"] = _refresh_relocated(
+            units, derived, load_json_optional(props_path, None), rel(str(props_path))
+        )
     stubs = _apply_stub_contracts(units, stub_report, stub_check)
     commit(units, candidates)
     out: dict[str, Any] = {
@@ -2365,6 +2632,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
         # Every branch that reads the limits is guarded by `all_proven` after the `limits_problem` branch,
         # so it only runs on a dict; the fallback just keeps that visible to the type checker.
         limits: dict = raw_limits if isinstance(raw_limits, dict) else {}
+        frame_problem = wp_frame_problem(report) if all_proven else None
         unproven_by_class: dict[str, list[dict]] = {}
         for g in report.get("unproven_goals", []):
             unproven_by_class.setdefault(g.get("obligation_class", "rte"), []).append(g)
@@ -2450,6 +2718,33 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     tool_output,
                     f"Every {cls} clause holds whatever the function does "
                     f"({', '.join(limits.get('trivial_layer_clauses', []))}); not credited.",
+                )
+            elif all_proven and cls == "l3_frame" and frame_problem:
+                # Both credits below (proven goals of the class, and none left by Qed) need a frame to be about.
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    frame_problem[0],
+                    False,
+                    tool_output,
+                    f"Frame not credited: {frame_problem[1]}. The unit stays open until WP proves an `assigns` "
+                    "clause of the function's own contract.",
+                )
+            elif (
+                all_proven
+                and cls in METACSL_CLASSES
+                and (not_evaluated := _meta_not_evaluated(u, report, bool(counts)))
+            ):
+                # Before both credits below: proven goals of the class, and none left by MetAcsl's simplification.
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_meta_not_evaluated",
+                    False,
+                    tool_output,
+                    f"Not credited: {not_evaluated}."[:400],
                 )
             elif counts and (counts.get("proven", 0) + counts.get("proven_under_hyp", 0)) > 0 and all_proven:
                 add_evidence(
@@ -3304,6 +3599,9 @@ def _collect_reproducible_artifacts(
 # statement (a hypothesis without a line, a failure a runtime reports without one), function and kind
 # stand for it, as hypotheses merge (D1c).
 UNLOCATED_FUNCTION = "unknown_function"
+# How the evidence entry of a counted reproducer whose failure could not be compared starts (ingest-verifier);
+# generate_report.py finds such findings by it.
+IDENTITY_NOT_COMPARED = "Failure identity not compared:"
 
 
 class _FailurePlacer:
@@ -4025,7 +4323,7 @@ def cmd_ingest_verifier(
                         "phase": "fuzz",
                         "tool_output": report if is_safe_relative_path(report) else rec["evidence"][0]["tool_output"],
                         "description": (
-                            f"Failure identity not compared: the parent's replay of {rep['input']} (sha256 "
+                            f"{IDENTITY_NOT_COMPARED} the parent's replay of {rep['input']} (sha256 "
                             f"{rep['sha256']}) failed, but {seen.get('what')} (report {report}). It is not shown to "
                             f"be {wanted}. It counts because the input was recorded on the candidate before "
                             "verification."

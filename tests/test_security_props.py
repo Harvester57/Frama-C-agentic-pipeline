@@ -489,11 +489,16 @@ def test_an_instance_metacsl_decides_statically_is_credited(run_dir, loaded, err
     """
     The M1 bug: MetAcsl's -meta-simpl drops an instance it decides statically, so the WP run of an
     instance function that loaded the property ends all_proven with no goal of the class. Credited when
-    the report says the property was loaded without error.
+    the report says the property was loaded without error and that the function it is stated on is in
+    the files WP parsed (`call_targets`, tests/test_wp_code_checks.py).
     """
     _seed_sinks(run_dir)
     report = json.loads((FIX / "wp_close_wiped.json").read_text(encoding="utf-8"))
-    sp_block = {"props": "workspace/reports/security_props.json", "properties": loaded}
+    sp_block = {
+        "props": "workspace/reports/security_props.json",
+        "properties": loaded,
+        "call_targets": {name: {"function": "log_line", "seen": True} for name in loaded},
+    }
     if error:
         sp_block["error"] = error
     report.update(
