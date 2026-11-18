@@ -57,6 +57,9 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 04:25-04:26 | `pipeline_make.py run ingest` ok; `phase_done` 2; the session moves to candidates and the WP queue |
 | 04:28-04:40 | Replay and WP queue ok. The crash gate has 26 verifier tasks plus breakers, dispatched 15 at a time. The first 7 verdicts are all `rejected` (harness-induced): the 4 `get_float_*`, `set_bits_from_byte`, and `free` from `modbus_mapping_free`. The scheduler opens `repair:libmodbus_so_5_1_0` |
 | 04:45 | Fix 8 merged (`5a9ff81`); repair guidance queued for the session's next idle window |
+| 04:43 | Repair guidance delivered while the session was idle; it acknowledges and will regenerate once every verifier has reported |
+| 04:43-04:48 | 14 gate verdicts in. 12 are `rejected` `harness_induced` (float helpers, bit helpers, `modbus_mapping_free` from two fingerprints). 1 is `rejected` `contract_overconstraint` (`close`: Frama-C's arbitrary fd bound). Breakers `modbus_new_rtu` and `modbus_new_tcp_pi` are clean; `modbus_mapping_new_start_address` files a signed-downcast hypothesis that goes to the gate. **1 is `confirmed`**: the libFuzzer timeout, as an "unbounded link-recovery retry loop in `send_msg`, medium DoS" |
+| 04:49 | Supervisor finds the confirmed `send_msg` loop documented in `docs/modbus_set_error_recovery.md` ("an infinite close/connect loop until success on send call" under `MODBUS_ERROR_RECOVERY_LINK`). The harness had enabled LINK on a context with no peer, so the verdict is a false positive. Guidance prepared: keep the record, report it as documented behaviour, and mask LINK in the regenerated harness |
 
 ## Pipeline issues and fixes
 
@@ -89,6 +92,7 @@ Tests added:
 - 02:24: the model removed the build scratch volume right after seed recording, so re-recording seeds needs a rebuild.
 - 02:25: the model passed a Python file to `-ScriptFile`, which runs it with bash (`import: command not found`), then rewrote it as bash with a heredoc. The wrapper's `-ScriptFile` help could say it must be a shell script.
 - 02:28: the run brief asks the model to send its progress report with SendUserFile, a tool opencode does not have; the model said so and left the report on disk (`docs/runs/2026-11-18-libmodbus-run1.md`, uncommitted, not indexed).
+- 04:47: the timeout crash verifier confirmed an infinite retry in `send_msg` as a medium DoS. That loop is documented behaviour of `MODBUS_ERROR_RECOVERY_LINK`, and the brief already requires the harness to respect "the entry function's declared or documented contract". The verifier did not read the function's doc page (`docs/modbus_set_error_recovery.md`), although the target ships one per API function. Suggested brief change (not applied): for a hang or timeout, check the documentation of every mode-setting call in the witness's call sequence, and reject as harness-induced a hang the documentation promises.
 - 04:24: the model killed a computing `eva-tune` under CLAUDE.md's "no progress for 15 minutes" rule, although the frama-c rung was at 100 % CPU within its limit. A defensible call given an 11 h worst case, but the rule is about stalls, not slow steps. The skill could say how long `eva-tune` may take, and whether skipping it is acceptable in a `standard` run.
 - 01:56-02:00: on `no_unit_parsed` the model investigated pipeline code for several minutes instead of stopping and reporting as framac-slice Step 1c says. It reached the right diagnosis and did not edit pipeline files.
 
