@@ -53,7 +53,8 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 03:07-03:10 | Phase 1: build cached; fuzz (E-ACSL + sanitizers, 9 workers, 1200 CPU-s budget) ends after 165 s with `crash_found`, 63 artifacts. Most are harness-induced: ASan stack overflows in `modbus_get_float_*` (one `uint16_t` passed, two read), SEGVs in `modbus_set_bits_from_bytes`/`modbus_get_byte_from_bits` (unbounded `nb_bits`), direct leaks from `modbus_new_tcp`/`modbus_mapping_new_start_address` (handle released with `modbus_close`, never `modbus_free`). The session saw the same and sends them to the crash verification gate rather than reporting them |
 | 03:11 | Coverage and reach-dynamic ok; fixer dispatched for fix 8 (`sup/libmodbus-harness-contracts`) |
 | 03:12-03:22 | Phase 2 Eva `ok` in 638 s: 3707 properties, 92.9 % discharged, 250 unknown, 13 invalid, 2499 dead, 562 assumed; 51 functions with unknowns |
-| 03:23-03:48+ | `eva-tune` slevel variant running (frama-c at 100 % CPU, lease lock refreshed); no transcript output meanwhile, not a stall. `phase_done` still 0 |
+| 03:23-04:24 | `eva-tune` runs its rungs serially. The first (`slevel` 1000) runs at 100 % CPU against a 4957 s limit, with 7 rungs queued. At 04:23 the session's 1 h tool timeout fires; at 04:24 the session kills `eva-tune` under the 15-minute rule and keeps the base Eva report. The existing open gap in `eva.md` gets a "seen again" |
+| 04:25-04:26 | `pipeline_make.py run ingest` ok; `phase_done` 2; the session moves to candidates and the WP queue |
 
 ## Pipeline issues and fixes
 
@@ -86,6 +87,7 @@ Tests added:
 - 02:24: the model removed the build scratch volume right after seed recording, so re-recording seeds needs a rebuild.
 - 02:25: the model passed a Python file to `-ScriptFile`, which runs it with bash (`import: command not found`), then rewrote it as bash with a heredoc. The wrapper's `-ScriptFile` help could say it must be a shell script.
 - 02:28: the run brief asks the model to send its progress report with SendUserFile, a tool opencode does not have; the model said so and left the report on disk (`docs/runs/2026-11-18-libmodbus-run1.md`, uncommitted, not indexed).
+- 04:24: the model killed a computing `eva-tune` under CLAUDE.md's "no progress for 15 minutes" rule, although the frama-c rung was at 100 % CPU within its limit. A defensible call given an 11 h worst case, but the rule is about stalls, not slow steps. The skill could say how long `eva-tune` may take, and whether skipping it is acceptable in a `standard` run.
 - 01:56-02:00: on `no_unit_parsed` the model investigated pipeline code for several minutes instead of stopping and reporting as framac-slice Step 1c says. It reached the right diagnosis and did not edit pipeline files.
 
 ## Decisions taken for the user
