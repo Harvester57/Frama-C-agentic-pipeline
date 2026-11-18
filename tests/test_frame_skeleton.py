@@ -68,8 +68,9 @@ def test_parse_value_projects_separation_and_from_footprint() -> None:
     assert len(skel["assigns"]) == 1
     a = skel["assigns"][0]
     assert a["loc"] == "*eaten"
-    assert a["from"] == ["buf + (0 .. 1)", "len"]
-    assert a["clause"] == "assigns *eaten \\from buf + (0 .. 1), len;"
+    # The cells of the window: the kernel refuses the address set `buf + (0 .. 1)` after `\from`.
+    assert a["from"] == ["*(buf + (0 .. 1))", "len"]
+    assert a["clause"] == "assigns *eaten \\from *(buf + (0 .. 1)), len;"
 
 
 def _copy_loop_record():
@@ -77,6 +78,7 @@ def _copy_loop_record():
         "index": 0,
         "parent": None,
         "line": 4,
+        "header": "for (i = 0; i < n; i++)",
         "guard": "i < n",
         "scalars": [{"var": "i", "updates": ["i + 1"]}],
         "memory_writes": [{"lval": "*(dst + i)", "root": "dst", "root_kind": "formal", "values": ["*(src + i)"]}],
@@ -102,11 +104,14 @@ def test_copy_loop_normalizes_loop_write_to_range_and_lifts_read_to_region() -> 
     assert skel["status"] == "ok"
     assert [s["clause"] for s in skel["separated"]] == ["requires \\separated(dst + (0 .. n - 1), src + (0 .. n - 1));"]
     by_loc = {a["loc"]: a for a in skel["assigns"]}
-    assert by_loc["dst + (0 .. n - 1)"]["from"] == ["n", "src + (0 .. n - 1)"]
-    assert by_loc["dst + (0 .. n - 1)"]["clause"] == ("assigns dst + (0 .. n - 1) \\from n, src + (0 .. n - 1);")
+    # The written cells, `*(dst + (lo .. hi))`: the kernel refuses `dst + (lo .. hi)` in `assigns`.
+    assert by_loc["*(dst + (0 .. n - 1))"]["from"] == ["*(src + (0 .. n - 1))", "n"]
+    assert by_loc["*(dst + (0 .. n - 1))"]["clause"] == (
+        "assigns *(dst + (0 .. n - 1)) \\from *(src + (0 .. n - 1)), n;"
+    )
     # The global write has no AST value flow: sound superset of the read roots.
     assert by_loc["g"]["source"] == "ast-superset"
-    assert by_loc["g"]["from"] == ["n", "src + (0 .. n - 1)"]
+    assert by_loc["g"]["from"] == ["*(src + (0 .. n - 1))", "n"]
 
 
 def test_no_separation_when_the_other_pointer_is_never_read() -> None:
@@ -147,6 +152,7 @@ def test_pure_function_projects_assigns_nothing() -> None:
 def test_inclusive_guard_gives_inclusive_range() -> None:
     loop = {
         "index": 0,
+        "header": "for (i = 0; i <= n; i++)",
         "guard": "i <= n",
         "scalars": [{"var": "i", "updates": ["i + 1"]}],
         "memory_writes": [{"lval": "*(a + i)", "root": "a", "root_kind": "formal", "values": ["0"]}],
@@ -158,10 +164,12 @@ def test_inclusive_guard_gives_inclusive_range() -> None:
         writes=[_access("*(a + i)", "a")],
     )
     skel = fs.compute(rec)
-    assert skel["assigns"][0]["loc"] == "a + (0 .. n)"
+    assert skel["assigns"][0]["loc"] == "*(a + (0 .. n))"
 
 
-def test_non_entry_expressible_index_is_kept_and_marked_partial() -> None:
+def test_non_entry_expressible_index_is_not_required_and_marked_partial() -> None:
+    # Was "kept as written": `assigns *(a + 2 * i)` names the loop index, which the kernel refuses in
+    # a function contract (`unbound logic variable i`), so no contract could satisfy the merge check.
     loop = {
         "index": 0,
         "guard": "i < n",
@@ -176,8 +184,9 @@ def test_non_entry_expressible_index_is_kept_and_marked_partial() -> None:
     )
     skel = fs.compute(rec)
     assert skel["status"] == "partial"
-    assert skel["assigns"][0]["loc"] == "*(a + 2 * i)"
-    assert any("non-entry-expressible" in n for n in skel["notes"])
+    assert skel["assigns"] == []
+    assert [u["lval"] for u in skel["unprojected"]] == ["*(a + 2 * i)"]
+    assert any("not required" in n and "`*(a + 2 * i)`" in n for n in skel["notes"])
 
 
 def test_straight_line_write_with_rhs_values_gets_a_precise_from() -> None:
@@ -200,7 +209,7 @@ def test_straight_line_write_with_rhs_values_gets_a_precise_from() -> None:
     a = skel["assigns"][0]
     assert a["loc"] == "*eaten"
     assert a["source"] == "ast"
-    assert a["from"] == ["buf + (0 .. 1)", "len"]
+    assert a["from"] == ["*(buf + (0 .. 1))", "len"]
     assert not any("other" in f for f in a["from"])
 
 

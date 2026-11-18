@@ -1,0 +1,11 @@
+# frama-c 34.0~beta (Selenium) (image framac-analysis:latest), 2026-11-18
+# frama-c -kernel-warn-key annot-error=active /probe/clause_forms.c
+[kernel] Parsing /probe/clause_forms.c (with preprocessing)
+[kernel:annot-error] /probe/clause_forms.c:8: Warning: 
+  not an assignable left value: dst + (0 .. n - 1). Ignoring logic specification of function refused_address_set_in_assigns
+[kernel:annot-error] /probe/clause_forms.c:15: Warning: 
+  not a valid dependency: buf + (0 .. 1). Ignoring logic specification of function refused_address_set_after_from
+[kernel:annot-error] /probe/clause_forms.c:21: Warning: 
+  unbound logic variable i. Ignoring logic specification of function refused_loop_index
+[kernel:annot-error] /probe/clause_forms.c:28: Warning: 
+  unbound logic variable ctx_tcp. Ignoring logic specification of function refused_local_alias

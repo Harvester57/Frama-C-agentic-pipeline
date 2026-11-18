@@ -1,0 +1,3908 @@
+{
+ "provenance": {
+  "run": "libmodbus run-1 (2026-11-18)",
+  "file": "workspace/reports/facts/libmodbus_so_5_1_0.json",
+  "schema": 4,
+  "generated_at": "2026-11-18T04:59:06.870571+00:00",
+  "note": "records copied unchanged, each with the frame_skeleton the run computed; write_free_callees is function_facts.write_free_functions over the run's 120 records"
+ },
+ "write_free_callees": [
+  "_modbus_rtu_get_response_tid",
+  "_modbus_rtu_is_connected",
+  "_modbus_tcp_check_integrity",
+  "_modbus_tcp_get_response_tid",
+  "_modbus_tcp_is_connected",
+  "compute_data_length_after_meta",
+  "compute_meta_length_after_function",
+  "compute_response_length_from_request",
+  "crc16",
+  "modbus_get_byte_from_bits"
+ ],
+ "functions": {
+  "src/modbus-tcp.c#_modbus_tcp_build_request_basis": {
+   "name": "_modbus_tcp_build_request_basis",
+   "file": "src/modbus-tcp.c",
+   "kernel_name": "_modbus_tcp_build_request_basis",
+   "line": 107,
+   "code_lines": [
+    107,
+    108,
+    109,
+    110,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    121,
+    122,
+    127,
+    128,
+    129,
+    130,
+    131,
+    132,
+    134,
+    135
+   ],
+   "static": true,
+   "variadic": false,
+   "return_type": "int",
+   "formals": [
+    {
+     "name": "ctx",
+     "type": "modbus_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "modbus_t",
+     "pointee_canon": "struct _modbus",
+     "pointee_const": false,
+     "char_like": false
+    },
+    {
+     "name": "function",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "addr",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "nb",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "req",
+     "type": "uint8_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint8_t",
+     "pointee_canon": "unsigned char",
+     "pointee_const": false,
+     "char_like": true
+    }
+   ],
+   "loops": [],
+   "writes": [
+    {
+     "lval": "ctx_tcp->t_id",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 114,
+     "values": [
+      "(uint16_t)((int)ctx_tcp->t_id + 1)",
+      "(uint16_t)0"
+     ]
+    },
+    {
+     "lval": "*(req + 0)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 117,
+     "values": [
+      "(uint8_t)((int)ctx_tcp->t_id >> 8)"
+     ]
+    },
+    {
+     "lval": "*(req + 1)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 118,
+     "values": [
+      "(uint8_t)((int)ctx_tcp->t_id & 0x00ff)"
+     ]
+    },
+    {
+     "lval": "*(req + 2)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 121,
+     "values": [
+      "(uint8_t)0"
+     ]
+    },
+    {
+     "lval": "*(req + 3)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 122,
+     "values": [
+      "(uint8_t)0"
+     ]
+    },
+    {
+     "lval": "*(req + 6)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 127,
+     "values": [
+      "(uint8_t)ctx->slave"
+     ]
+    },
+    {
+     "lval": "*(req + 7)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 128,
+     "values": [
+      "(uint8_t)function"
+     ]
+    },
+    {
+     "lval": "*(req + 8)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 129,
+     "values": [
+      "(uint8_t)(addr >> 8)"
+     ]
+    },
+    {
+     "lval": "*(req + 9)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 130,
+     "values": [
+      "(uint8_t)(addr & 0x00ff)"
+     ]
+    },
+    {
+     "lval": "*(req + 10)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 131,
+     "values": [
+      "(uint8_t)(nb >> 8)"
+     ]
+    },
+    {
+     "lval": "*(req + 11)",
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 132,
+     "values": [
+      "(uint8_t)(nb & 0x00ff)"
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "lval": "ctx->backend_data",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 110
+    },
+    {
+     "lval": "ctx_tcp->t_id",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 113
+    },
+    {
+     "lval": "ctx->slave",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 127
+    }
+   ],
+   "calls": [],
+   "called_by": [],
+   "may_alias": [
+    {
+     "a": "ctx",
+     "b": "req",
+     "written": [
+      "ctx",
+      "req"
+     ],
+     "reason": "a char-like pointer can alias anything"
+    }
+   ],
+   "recursion": null,
+   "derived_pointers": {
+    "ctx_tcp": "ctx"
+   },
+   "return_paths": [
+    {
+     "value": "12",
+     "conditions": [],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 134
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "req[0..1]",
+      "from": [
+       "ctx",
+       "req",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "req[2..3]",
+      "from": [
+       "req"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "req[6]",
+      "from": [
+       "ctx",
+       "req",
+       "__malloc_modbus_new_tcp_l1002_21.slave",
+       "__malloc_modbus_new_tcp_l1002_22.slave",
+       "__malloc_modbus_new_tcp_l1002_23.slave",
+       "__malloc_modbus_new_tcp_l1002_24.slave",
+       "__malloc_modbus_new_tcp_l1002_25.slave",
+       "__malloc_modbus_new_tcp_l1002_30.slave"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "req[7]",
+      "from": [
+       "function",
+       "req"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "req[8..9]",
+      "from": [
+       "addr",
+       "req"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "req[10..11]",
+      "from": [
+       "nb",
+       "req"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_21[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_22[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_23[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_24[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_25[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_30[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_40[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_41[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_42[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_43[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_44[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_45[0..1]",
+      "from": [
+       "ctx",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data",
+       "__malloc_modbus_new_tcp_l1013_23[0..1]",
+       "__malloc_modbus_new_tcp_l1002_24.backend_data"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [
+     "__malloc_modbus_new_tcp_l1002_21{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_21[0..1]",
+     "__malloc_modbus_new_tcp_l1002_22{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_22[0..1]",
+     "__malloc_modbus_new_tcp_l1002_23{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_23[0..1]",
+     "__malloc_modbus_new_tcp_l1002_24{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_24[0..1]",
+     "__malloc_modbus_new_tcp_l1002_25{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_25[0..1]",
+     "__malloc_modbus_new_tcp_l1002_30{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_30[0..1]",
+     "__malloc_modbus_new_tcp_l1002_40{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_40[0..1]",
+     "__malloc_modbus_new_tcp_l1002_41{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_41[0..1]",
+     "__malloc_modbus_new_tcp_l1002_42{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_42[0..1]",
+     "__malloc_modbus_new_tcp_l1002_43{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_43[0..1]",
+     "__malloc_modbus_new_tcp_l1002_44{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_44[0..1]",
+     "__malloc_modbus_new_tcp_l1002_45{.slave; .backend_data}",
+     "__malloc_modbus_new_tcp_l1013_45[0..1]"
+    ],
+    "no_effects": false,
+    "truncated": false
+   },
+   "features": {
+    "loops": false,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": true,
+    "arrays": true,
+    "division": false,
+    "bitwise": true,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": false,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [
+    "__retres"
+   ],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "partial",
+    "separated": [
+     {
+      "roots": [
+       "ctx",
+       "req"
+      ],
+      "regions": [
+       "ctx",
+       "req + (0 .. 11)"
+      ],
+      "clause": "requires \\separated(ctx, req + (0 .. 11));",
+      "reason": "writes through `ctx, req` may overlap reads through the other pointer (a char-like pointer can alias anything)"
+     }
+    ],
+    "assigns": [
+     {
+      "loc": "*(req + 0)",
+      "from": [],
+      "clause": "assigns *(req + 0) \\from \\nothing;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 1)",
+      "from": [],
+      "clause": "assigns *(req + 1) \\from \\nothing;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 10)",
+      "from": [
+       "nb"
+      ],
+      "clause": "assigns *(req + 10) \\from nb;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 11)",
+      "from": [
+       "nb"
+      ],
+      "clause": "assigns *(req + 11) \\from nb;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 2)",
+      "from": [],
+      "clause": "assigns *(req + 2) \\from \\nothing;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 3)",
+      "from": [],
+      "clause": "assigns *(req + 3) \\from \\nothing;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 6)",
+      "from": [
+       "ctx"
+      ],
+      "clause": "assigns *(req + 6) \\from ctx;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 7)",
+      "from": [
+       "function"
+      ],
+      "clause": "assigns *(req + 7) \\from function;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 8)",
+      "from": [
+       "addr"
+      ],
+      "clause": "assigns *(req + 8) \\from addr;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(req + 9)",
+      "from": [
+       "addr"
+      ],
+      "clause": "assigns *(req + 9) \\from addr;",
+      "source": "ast"
+     },
+     {
+      "loc": "ctx_tcp->t_id",
+      "from": [],
+      "clause": "assigns ctx_tcp->t_id \\from \\nothing;",
+      "source": "ast"
+     }
+    ],
+    "notes": [
+     "access window of `ctx` is not fully entry-expressible; `ctx` alone is an approximation"
+    ]
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit"
+    ],
+    "edges": []
+   }
+  },
+  "src/modbus-data.c#modbus_set_bits_from_bytes": {
+   "name": "modbus_set_bits_from_bytes",
+   "file": "src/modbus-data.c",
+   "kernel_name": "modbus_set_bits_from_bytes",
+   "line": 43,
+   "code_lines": [
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    51,
+    52,
+    54,
+    55,
+    56,
+    57
+   ],
+   "static": false,
+   "variadic": false,
+   "return_type": "void",
+   "formals": [
+    {
+     "name": "dest",
+     "type": "uint8_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint8_t",
+     "pointee_canon": "unsigned char",
+     "pointee_const": false,
+     "char_like": true
+    },
+    {
+     "name": "idx",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "nb_bits",
+     "type": "unsigned int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "tab_byte",
+     "type": "uint8_t const *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint8_t const",
+     "pointee_canon": "unsigned char",
+     "pointee_const": true,
+     "char_like": true
+    }
+   ],
+   "loops": [
+    {
+     "index": 0,
+     "parent": null,
+     "line": 51,
+     "header": "for (i = idx; i < idx + nb_bits; i++)",
+     "macro_expanded": false,
+     "guard": "i < (unsigned int)idx + nb_bits",
+     "unconditional": false,
+     "scalars": [
+      {
+       "var": "i",
+       "updates": [
+        "i + 1U"
+       ]
+      },
+      {
+       "var": "shift",
+       "updates": [
+        "shift + 1",
+        "shift % 8"
+       ]
+      }
+     ],
+     "memory_writes": [
+      {
+       "lval": "*(dest + i)",
+       "root": "dest",
+       "root_kind": "formal",
+       "values": [
+        "(uint8_t)1",
+        "(uint8_t)0"
+       ]
+      }
+     ],
+     "reads": [
+      {
+       "lval": "*(tab_byte + (i - (unsigned int)idx) / (unsigned int)8)",
+       "root": "tab_byte",
+       "root_kind": "formal"
+      }
+     ],
+     "calls": [],
+     "exits": [],
+     "pointer_walkers": [],
+     "strided_writes": [],
+     "read_only": false,
+     "in_place": [],
+     "prior_writers": [],
+     "var_classes": {
+      "unchanged": [
+       "*(tab_byte + (i - (unsigned int)idx) / (unsigned int)8)"
+      ],
+      "non_inductive": [
+       "*(dest + i)"
+      ],
+      "inductive": [
+       "i",
+       "shift"
+      ]
+     },
+     "assumption_context": {
+      "predecessors": [
+       "entry"
+      ],
+      "facts_from_predecessors": []
+     },
+     "obligation_context": {
+      "successors": [
+       "exit"
+      ],
+      "inner_loops": [],
+      "written": [
+       "dest",
+       "i",
+       "shift"
+      ]
+     }
+    }
+   ],
+   "writes": [
+    {
+     "lval": "*(dest + i)",
+     "root": "dest",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 52,
+     "values": [
+      "(uint8_t)1",
+      "(uint8_t)0"
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "lval": "*(tab_byte + (i - (unsigned int)idx) / (unsigned int)8)",
+     "root": "tab_byte",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 52
+    }
+   ],
+   "calls": [],
+   "called_by": [
+    {
+     "caller": "modbus_reply",
+     "args": [
+      "mb_mapping->tab_bits",
+      "mapping_address_3",
+      "(unsigned int)nb_1",
+      "req + (offset + (unsigned int)6)"
+     ],
+     "conditions": [],
+     "in_loop": false
+    }
+   ],
+   "may_alias": [
+    {
+     "a": "dest",
+     "b": "tab_byte",
+     "written": [
+      "dest"
+     ],
+     "reason": "same pointee type"
+    }
+   ],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": null,
+     "conditions": [],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 57
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "eva_main_c0a0_1[0..4023]",
+      "from": [
+       "dest",
+       "idx",
+       "nb_bits",
+       "tab_byte",
+       "eva_main_c0a3[0..4023]"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [
+     "eva_main_c0a3[0..4023]"
+    ],
+    "no_effects": false,
+    "truncated": false
+   },
+   "features": {
+    "loops": true,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": false,
+    "arrays": true,
+    "division": false,
+    "bitwise": true,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": false,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "partial",
+    "separated": [
+     {
+      "roots": [
+       "dest",
+       "tab_byte"
+      ],
+      "regions": [
+       "dest",
+       "tab_byte"
+      ],
+      "clause": "requires \\separated(dest, tab_byte);",
+      "reason": "writes through `dest` may overlap reads through the other pointer (same pointee type)"
+     }
+    ],
+    "assigns": [
+     {
+      "loc": "*(dest + i)",
+      "from": [
+       "idx",
+       "nb_bits"
+      ],
+      "clause": "assigns *(dest + i) \\from idx, nb_bits;",
+      "source": "ast"
+     }
+    ],
+    "notes": [
+     "access window of `dest` is not fully entry-expressible; `dest` alone is an approximation",
+     "access window of `tab_byte` is not fully entry-expressible; `tab_byte` alone is an approximation",
+     "write `*(dest + i)` has a non-entry-expressible index; kept as written"
+    ]
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit",
+     "L0"
+    ],
+    "edges": [
+     {
+      "from": "entry",
+      "to": "L0",
+      "kind": "st"
+     },
+     {
+      "from": "L0",
+      "to": "exit",
+      "kind": "st"
+     }
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_bits_from_byte": {
+   "name": "modbus_set_bits_from_byte",
+   "file": "src/modbus-data.c",
+   "kernel_name": "modbus_set_bits_from_byte",
+   "line": 32,
+   "code_lines": [
+    32,
+    33,
+    34,
+    36,
+    37,
+    38,
+    39
+   ],
+   "static": false,
+   "variadic": false,
+   "return_type": "void",
+   "formals": [
+    {
+     "name": "dest",
+     "type": "uint8_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint8_t",
+     "pointee_canon": "unsigned char",
+     "pointee_const": false,
+     "char_like": true
+    },
+    {
+     "name": "idx",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "value",
+     "type": "uint8_t const",
+     "kind": "scalar",
+     "restrict": false
+    }
+   ],
+   "loops": [
+    {
+     "index": 0,
+     "parent": null,
+     "line": 36,
+     "header": "for (i = 0; i < 8; i++)",
+     "macro_expanded": false,
+     "guard": "i < 8",
+     "unconditional": false,
+     "scalars": [
+      {
+       "var": "i",
+       "updates": [
+        "i + 1"
+       ]
+      }
+     ],
+     "memory_writes": [
+      {
+       "lval": "*(dest + (idx + i))",
+       "root": "dest",
+       "root_kind": "formal",
+       "values": [
+        "(uint8_t)1",
+        "(uint8_t)0"
+       ]
+      }
+     ],
+     "reads": [],
+     "calls": [],
+     "exits": [],
+     "pointer_walkers": [],
+     "strided_writes": [],
+     "read_only": false,
+     "in_place": [],
+     "prior_writers": [],
+     "var_classes": {
+      "unchanged": [],
+      "non_inductive": [
+       "*(dest + (idx + i))"
+      ],
+      "inductive": [
+       "i"
+      ]
+     },
+     "assumption_context": {
+      "predecessors": [
+       "entry"
+      ],
+      "facts_from_predecessors": []
+     },
+     "obligation_context": {
+      "successors": [
+       "exit"
+      ],
+      "inner_loops": [],
+      "written": [
+       "dest",
+       "i"
+      ]
+     }
+    }
+   ],
+   "writes": [
+    {
+     "lval": "*(dest + (idx + i))",
+     "root": "dest",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 37,
+     "values": [
+      "(uint8_t)1",
+      "(uint8_t)0"
+     ]
+    }
+   ],
+   "reads": [],
+   "calls": [],
+   "called_by": [],
+   "may_alias": [],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": null,
+     "conditions": [],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 39
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "eva_main_c0a0_0[0..4023]",
+      "from": [
+       "dest",
+       "idx",
+       "value"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [],
+    "no_effects": false,
+    "truncated": false
+   },
+   "features": {
+    "loops": true,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": false,
+    "arrays": true,
+    "division": false,
+    "bitwise": true,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": false,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "partial",
+    "separated": [],
+    "assigns": [
+     {
+      "loc": "*(dest + (idx + i))",
+      "from": [
+       "idx"
+      ],
+      "clause": "assigns *(dest + (idx + i)) \\from idx;",
+      "source": "ast"
+     }
+    ],
+    "notes": [
+     "write `*(dest + (idx + i))` has a non-entry-expressible index; kept as written"
+    ]
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit",
+     "L0"
+    ],
+    "edges": [
+     {
+      "from": "entry",
+      "to": "L0",
+      "kind": "st"
+     },
+     {
+      "from": "L0",
+      "to": "exit",
+      "kind": "st"
+     }
+    ]
+   }
+  },
+  "src/modbus.c#read_registers": {
+   "name": "read_registers",
+   "file": "src/modbus.c",
+   "kernel_name": "read_registers",
+   "line": 1550,
+   "code_lines": [
+    1550,
+    1551,
+    1552,
+    1553,
+    1554,
+    1555,
+    1557,
+    1558,
+    1559,
+    1560,
+    1561,
+    1562,
+    1563,
+    1564,
+    1565,
+    1566,
+    1568,
+    1570,
+    1571,
+    1572,
+    1573,
+    1575,
+    1576,
+    1577,
+    1579,
+    1580,
+    1581,
+    1583,
+    1585,
+    1587,
+    1588,
+    1589,
+    1591,
+    1592
+   ],
+   "static": true,
+   "variadic": false,
+   "return_type": "int",
+   "formals": [
+    {
+     "name": "ctx",
+     "type": "modbus_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "modbus_t",
+     "pointee_canon": "struct _modbus",
+     "pointee_const": false,
+     "char_like": false
+    },
+    {
+     "name": "function",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "addr",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "nb",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "dest",
+     "type": "uint16_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint16_t",
+     "pointee_canon": "unsigned short",
+     "pointee_const": false,
+     "char_like": false
+    }
+   ],
+   "loops": [
+    {
+     "index": 0,
+     "parent": null,
+     "line": 1585,
+     "header": "for (i = 0; i < rc; i++)",
+     "macro_expanded": false,
+     "guard": "i < rc",
+     "unconditional": false,
+     "scalars": [
+      {
+       "var": "i",
+       "updates": [
+        "i + 1"
+       ]
+      }
+     ],
+     "memory_writes": [
+      {
+       "lval": "*(dest + i)",
+       "root": "dest",
+       "root_kind": "formal",
+       "values": [
+        "(uint16_t)(((int)rsp[(offset + (unsigned int)2) + (unsigned int)(i << 1)] << 8) | (int)rsp[(offset + (unsigned int)3) + (unsigned int)(i << 1)])"
+       ]
+      }
+     ],
+     "reads": [
+      {
+       "lval": "rsp[(offset + (unsigned int)2) + (unsigned int)(i << 1)]",
+       "root": "rsp",
+       "root_kind": "local"
+      },
+      {
+       "lval": "rsp[(offset + (unsigned int)3) + (unsigned int)(i << 1)]",
+       "root": "rsp",
+       "root_kind": "local"
+      }
+     ],
+     "calls": [],
+     "exits": [],
+     "pointer_walkers": [],
+     "strided_writes": [],
+     "read_only": false,
+     "in_place": [],
+     "prior_writers": [],
+     "var_classes": {
+      "unchanged": [
+       "rsp[(offset + (unsigned int)2) + (unsigned int)(i << 1)]",
+       "rsp[(offset + (unsigned int)3) + (unsigned int)(i << 1)]"
+      ],
+      "non_inductive": [
+       "*(dest + i)"
+      ],
+      "inductive": [
+       "i"
+      ]
+     },
+     "assumption_context": {
+      "predecessors": [
+       "entry"
+      ],
+      "facts_from_predecessors": []
+     },
+     "obligation_context": {
+      "successors": [
+       "exit"
+      ],
+      "inner_loops": [],
+      "written": [
+       "dest",
+       "i"
+      ]
+     }
+    }
+   ],
+   "writes": [
+    {
+     "lval": "errno",
+     "root": "__fc_errno",
+     "root_kind": "global",
+     "through_pointer": false,
+     "line": 1564,
+     "values": [
+      "(int)((unsigned int)112345678 + MODBUS_EXCEPTION_ILLEGAL_DATA_VALUE)"
+     ]
+    },
+    {
+     "lval": "*(dest + i)",
+     "root": "dest",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 1587,
+     "values": [
+      "(uint16_t)(((int)rsp[(offset + (unsigned int)2) + (unsigned int)(i << 1)] << 8) | (int)rsp[(offset + (unsigned int)3) + (unsigned int)(i << 1)])"
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "lval": "ctx->debug",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 1558
+    },
+    {
+     "lval": "stderr",
+     "root": "__fc_stderr",
+     "root_kind": "global",
+     "through_pointer": false,
+     "line": 1559
+    },
+    {
+     "lval": "(ctx->backend)->header_length",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 1583
+    },
+    {
+     "lval": "ctx->backend",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 1583
+    }
+   ],
+   "calls": [
+    {
+     "line": 1559,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "stderr",
+      "\"ERROR Too many registers requested (%d > %d)\\n\"",
+      "nb",
+      "125"
+     ],
+     "callee": "fprintf",
+     "kernel_name": "fprintf_va_40"
+    },
+    {
+     "line": 1568,
+     "indirect": true,
+     "in_loop": false,
+     "args": [
+      "ctx",
+      "function",
+      "addr",
+      "nb",
+      "req"
+     ],
+     "expr": "(ctx->backend)->build_request_basis",
+     "eva_targets": [
+      "_modbus_tcp_build_request_basis"
+     ]
+    },
+    {
+     "line": 1570,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "ctx",
+      "req",
+      "req_length"
+     ],
+     "callee": "send_msg",
+     "kernel_name": "send_msg"
+    },
+    {
+     "line": 1575,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "ctx",
+      "rsp",
+      "MSG_CONFIRMATION"
+     ],
+     "callee": "_modbus_receive_msg",
+     "kernel_name": "_modbus_receive_msg"
+    },
+    {
+     "line": 1579,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "ctx",
+      "req",
+      "rsp",
+      "rc"
+     ],
+     "callee": "check_confirmation",
+     "kernel_name": "check_confirmation"
+    }
+   ],
+   "called_by": [
+    {
+     "caller": "modbus_read_input_registers",
+     "args": [
+      "ctx",
+      "0x04",
+      "addr",
+      "nb",
+      "dest"
+     ],
+     "conditions": [
+      "!(ctx == (modbus_t *)0)",
+      "!(nb < 1)"
+     ],
+     "in_loop": false
+    },
+    {
+     "caller": "modbus_read_registers",
+     "args": [
+      "ctx",
+      "0x03",
+      "addr",
+      "nb",
+      "dest"
+     ],
+     "conditions": [
+      "!(ctx == (modbus_t *)0)",
+      "!(nb < 1)"
+     ],
+     "in_loop": false
+    }
+   ],
+   "may_alias": [],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": "-1",
+     "conditions": [
+      "nb > 125"
+     ],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 1565
+    },
+    {
+     "value": "-1",
+     "conditions": [
+      "!(nb > 125)",
+      "rc > 0",
+      "rc == -1"
+     ],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 1577
+    },
+    {
+     "value": "-1",
+     "conditions": [
+      "!(nb > 125)",
+      "rc > 0",
+      "!(rc == -1)",
+      "rc == -1"
+     ],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 1581
+    },
+    {
+     "value": "rc",
+     "conditions": [
+      "!(nb > 125)"
+     ],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 1591
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "errno",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "eva_main_c0a1_2[7]"
+      ],
+      "and_self": false
+     },
+     {
+      "loc": "__fc_sockfds[0..1023]",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "eva_main_c0a1_2[7]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__fc_fds_state",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "eva_main_c0a1_2[7]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "eva_main_c14a3[0..124]",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "dest"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "eva_main_c15a3[0..124]",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "dest"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "eva_main_c16a1[0..4023]",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "eva_main_c0a1_2[7]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "eva_main_c17a1[0..4023]",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "eva_main_c0a1_2[7]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "S___fc_stderr[0].__fc_FILE_data",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_strerror[0..63]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "S___fc_stdout[0].__fc_FILE_data",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "__fc_fds_state",
+       "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+       "ctx",
+       "function",
+       "addr",
+       "nb",
+       "eva_main_c0a1_2[7]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_21[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_22[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_23[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_24[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_25[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_30[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_40[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_41[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_42[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_43[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_44[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1013_45[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_request_basis",
+       "ctx",
+       "nb",
+       "__malloc_modbus_new_tcp_l1002_21.backend_data",
+       "__malloc_modbus_new_tcp_l1013_21[0..1]",
+       "__malloc_modbus_new_tcp_l1002_22.backend_data",
+       "__malloc_modbus_new_tcp_l1013_22[0..1]",
+       "__malloc_modbus_new_tcp_l1002_23.backend_data"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [
+     "errno",
+     "__fc_sockfds[0..1023]",
+     "__fc_strerror[0..63]",
+     "stderr",
+     "__fc_time",
+     "__fc_fds_state",
+     "_modbus_tcp_backend{{.header_length; .checksum_length; .max_adu_length}; .build_request_basis; {.send_msg_pre; .send}; ...",
+     "eva_main_c0a1_2[7]",
+     "eva_main_c16a1[0..4023]",
+     "eva_main_c17a1[0..4023]",
+     "eva_main_c18a1{[7]; [12]; [16]}",
+     "S___fc_stderr[0]",
+     "S___fc_stdout[0]",
+     "__malloc_modbus_new_tcp_l1002_13{.s; .backend}",
+     "__malloc_modbus_new_tcp_l1002_21{{.slave; .s; .debug}; {.backend; .backend_data}}",
+     "__malloc_modbus_new_tcp_l1013_21[0..1]",
+     "__malloc_modbus_new_tcp_l1002_22{{.slave; .s; .debug}; {.backend; .backend_data}}",
+     "__malloc_modbus_new_tcp_l1013_22[0..1]",
+     "__malloc_modbus_new_tcp_l1002_23{{.slave; .s; .debug}; {.backend; .backend_data}}",
+     "__malloc_modbus_new_tcp_l1013_23[0..1]",
+     "__malloc_modbus_new_tcp_l1002_24{{.slave; .s; .debug}; {.backend; .backend_data}}",
+     "__malloc_modbus_new_tcp_l1013_24[0..1]",
+     "__malloc_modbus_new_tcp_l1002_25{{.slave; .s; .debug}; {.backend; .backend_data}}",
+     "__malloc_modbus_new_tcp_l1013_25[0..1]"
+    ],
+    "no_effects": false,
+    "truncated": true
+   },
+   "features": {
+    "loops": true,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": true,
+    "arrays": true,
+    "division": false,
+    "bitwise": true,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": true,
+    "recursion": false,
+    "alloc": false,
+    "callees": true,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [
+    "__retres"
+   ],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "ok",
+    "separated": [],
+    "assigns": [
+     {
+      "loc": "dest + (0 .. rc - 1)",
+      "from": [],
+      "clause": "assigns dest + (0 .. rc - 1) \\from \\nothing;",
+      "source": "ast"
+     },
+     {
+      "loc": "errno",
+      "from": [
+       "nb"
+      ],
+      "clause": "assigns errno \\from nb;",
+      "source": "ast"
+     }
+    ],
+    "notes": []
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit",
+     "L0"
+    ],
+    "edges": [
+     {
+      "from": "entry",
+      "to": "L0",
+      "kind": "st"
+     },
+     {
+      "from": "L0",
+      "to": "exit",
+      "kind": "st"
+     }
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_send_msg_pre": {
+   "name": "_modbus_rtu_send_msg_pre",
+   "file": "src/modbus-rtu.c",
+   "kernel_name": "_modbus_rtu_send_msg_pre",
+   "line": 141,
+   "code_lines": [
+    141,
+    142,
+    143,
+    147,
+    148,
+    150,
+    151
+   ],
+   "static": true,
+   "variadic": false,
+   "return_type": "int",
+   "formals": [
+    {
+     "name": "req",
+     "type": "uint8_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint8_t",
+     "pointee_canon": "unsigned char",
+     "pointee_const": false,
+     "char_like": true
+    },
+    {
+     "name": "req_length",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    }
+   ],
+   "loops": [],
+   "writes": [
+    {
+     "lval": null,
+     "root": "req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 147,
+     "values": [
+      "(uint8_t)((int)crc & 0x00FF)"
+     ]
+    }
+   ],
+   "reads": [],
+   "calls": [
+    {
+     "line": 143,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "req",
+      "(uint16_t)req_length"
+     ],
+     "callee": "crc16",
+     "kernel_name": "crc16"
+    }
+   ],
+   "called_by": [],
+   "may_alias": [],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": "req_length",
+     "conditions": [],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 150
+    }
+   ],
+   "eva": {
+    "status": "not_reached"
+   },
+   "features": {
+    "loops": false,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": false,
+    "arrays": true,
+    "division": false,
+    "bitwise": true,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": true,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [
+    "tmp_0",
+    "tmp_1"
+   ],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "ok",
+    "separated": [],
+    "assigns": [
+     {
+      "loc": "req",
+      "from": [],
+      "clause": "assigns req \\from \\nothing;",
+      "source": "ast"
+     }
+    ],
+    "notes": []
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit"
+    ],
+    "edges": []
+   }
+  },
+  "src/modbus.h#modbus_enable_quirks": {
+   "name": "modbus_enable_quirks",
+   "file": "src/modbus.h",
+   "kernel_name": "modbus_enable_quirks",
+   "line": 284,
+   "code_lines": [],
+   "static": false,
+   "variadic": false,
+   "return_type": "int",
+   "formals": [
+    {
+     "name": "ctx",
+     "type": "modbus_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "modbus_t",
+     "pointee_canon": "struct _modbus",
+     "pointee_const": false,
+     "char_like": false
+    },
+    {
+     "name": "quirks_mask",
+     "type": "unsigned int",
+     "kind": "scalar",
+     "restrict": false
+    }
+   ],
+   "loops": [],
+   "writes": [
+    {
+     "lval": "errno",
+     "root": "__fc_errno",
+     "root_kind": "global",
+     "through_pointer": false,
+     "line": 2145,
+     "values": [
+      "22"
+     ]
+    },
+    {
+     "lval": "ctx->quirks",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 2150,
+     "values": [
+      "(int)((unsigned int)ctx->quirks | quirks_mask)"
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "lval": "ctx->quirks",
+     "root": "ctx",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 2150
+    }
+   ],
+   "calls": [],
+   "called_by": [],
+   "may_alias": [],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": "-1",
+     "conditions": [
+      "ctx == (modbus_t *)0"
+     ],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 2146
+    },
+    {
+     "value": "0",
+     "conditions": [
+      "!(ctx == (modbus_t *)0)"
+     ],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 2151
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "errno",
+      "from": [
+       "ctx"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1002_12.quirks",
+      "from": [
+       "ctx",
+       "quirks_mask",
+       "__malloc_modbus_new_tcp_l1002_12.quirks",
+       "__malloc_modbus_new_tcp_l1002_45.quirks"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "__malloc_modbus_new_tcp_l1002_45.quirks",
+      "from": [
+       "ctx",
+       "quirks_mask",
+       "__malloc_modbus_new_tcp_l1002_12.quirks",
+       "__malloc_modbus_new_tcp_l1002_45.quirks"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [
+     "__malloc_modbus_new_tcp_l1002_12.quirks",
+     "__malloc_modbus_new_tcp_l1002_45.quirks"
+    ],
+    "no_effects": false,
+    "truncated": false
+   },
+   "features": {
+    "loops": false,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": true,
+    "arrays": false,
+    "division": false,
+    "bitwise": true,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": false,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [
+    "__retres"
+   ],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "ok",
+    "separated": [],
+    "assigns": [
+     {
+      "loc": "ctx->quirks",
+      "from": [
+       "quirks_mask"
+      ],
+      "clause": "assigns ctx->quirks \\from quirks_mask;",
+      "source": "ast"
+     },
+     {
+      "loc": "errno",
+      "from": [
+       "ctx"
+      ],
+      "clause": "assigns errno \\from ctx;",
+      "source": "ast"
+     }
+    ],
+    "notes": []
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit"
+    ],
+    "edges": []
+   }
+  },
+  "src/modbus.h#modbus_send_raw_request_tid": {
+   "name": "modbus_send_raw_request_tid",
+   "file": "src/modbus.h",
+   "kernel_name": "modbus_send_raw_request_tid",
+   "line": 264,
+   "code_lines": [],
+   "static": false,
+   "variadic": false,
+   "return_type": "int",
+   "formals": [
+    {
+     "name": "ctx",
+     "type": "modbus_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "modbus_t",
+     "pointee_canon": "struct _modbus",
+     "pointee_const": false,
+     "char_like": false
+    },
+    {
+     "name": "raw_req",
+     "type": "uint8_t const *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint8_t const",
+     "pointee_canon": "unsigned char",
+     "pointee_const": true,
+     "char_like": true
+    },
+    {
+     "name": "raw_req_length",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "tid",
+     "type": "int",
+     "kind": "scalar",
+     "restrict": false
+    }
+   ],
+   "loops": [],
+   "writes": [
+    {
+     "lval": "errno",
+     "root": "__fc_errno",
+     "root_kind": "global",
+     "through_pointer": false,
+     "line": 240,
+     "values": [
+      "22"
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "lval": "*(raw_req + 0)",
+     "root": "raw_req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 252
+    },
+    {
+     "lval": "*(raw_req + 1)",
+     "root": "raw_req",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 253
+    }
+   ],
+   "calls": [
+    {
+     "line": 257,
+     "indirect": true,
+     "in_loop": false,
+     "args": [
+      "& sft",
+      "req"
+     ],
+     "expr": "(ctx->backend)->build_response_basis",
+     "eva_targets": [
+      "_modbus_tcp_build_response_basis"
+     ]
+    },
+    {
+     "line": 261,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "(void *)(& req[req_length])",
+      "(void const *)(raw_req + 2)",
+      "(size_t)(raw_req_length - 2)"
+     ],
+     "callee": "memcpy",
+     "kernel_name": "memcpy"
+    },
+    {
+     "line": 265,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "ctx",
+      "req",
+      "req_length"
+     ],
+     "callee": "send_msg",
+     "kernel_name": "send_msg"
+    }
+   ],
+   "called_by": [
+    {
+     "caller": "modbus_proxy",
+     "args": [
+      "backend_ctx",
+      "(uint8_t const *)(backend_req)",
+      "backend_req_length",
+      "0"
+     ],
+     "conditions": [
+      "!(frontend_ctx == (modbus_t *)0)",
+      "!(req == (uint8_t const *)0)",
+      "!(pdu_length < 1)",
+      "!(rc == -1)"
+     ],
+     "in_loop": false
+    },
+    {
+     "caller": "modbus_send_raw_request",
+     "args": [
+      "ctx",
+      "raw_req",
+      "raw_req_length",
+      "0"
+     ],
+     "conditions": [],
+     "in_loop": false
+    }
+   ],
+   "may_alias": [],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": "-1",
+     "conditions": [
+      "!(ctx == (modbus_t *)0)",
+      "raw_req == (uint8_t const *)0"
+     ],
+     "conditions_partial": true,
+     "in_loop": false,
+     "line": 241
+    },
+    {
+     "value": "-1",
+     "conditions": [
+      "!(ctx == (modbus_t *)0)",
+      "!(raw_req_length < 2)",
+      "raw_req_length > 253 + 1"
+     ],
+     "conditions_partial": true,
+     "in_loop": false,
+     "line": 249
+    },
+    {
+     "value": "send_msg(ctx, req, req_length)",
+     "conditions": [
+      "!(ctx == (modbus_t *)0)",
+      "!(raw_req_length < 2)"
+     ],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 265
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "errno",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "_modbus_tcp_backend{.build_response_basis; {.send_msg_pre; .send}}",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "tid",
+       "backend_req[0..259]",
+       "backend_rsp[8..259]"
+      ],
+      "and_self": false
+     },
+     {
+      "loc": "__fc_sockfds[0..1023]",
+      "from": [
+       "__fc_sockfds[0..1023]",
+       "_modbus_tcp_backend{.build_response_basis; {.send_msg_pre; .send}}",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "tid",
+       "backend_req[0..259]",
+       "backend_rsp[8..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "backend_req[0..259]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "frontend_rsp[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "tid",
+       "sft.t_id",
+       "check_sft.t_id",
+       "__malloc_modbus_new_tcp_l1002_31.backend"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "frontend_rsp[2..3]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "__malloc_modbus_new_tcp_l1002_31.backend",
+       "__malloc_modbus_new_tcp_l1002_32.backend",
+       "__malloc_modbus_new_tcp_l1002_45.backend",
+       "__malloc_modbus_new_tcp_l1002_47.backend"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "frontend_rsp[4..5]",
+      "from": [
+       "_modbus_tcp_backend{.build_response_basis; .send_msg_pre}",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "__malloc_modbus_new_tcp_l1002_21.backend",
+       "__malloc_modbus_new_tcp_l1002_22.backend",
+       "__malloc_modbus_new_tcp_l1002_23.backend",
+       "__malloc_modbus_new_tcp_l1002_24.backend"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "frontend_rsp[6]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[0]",
+       "sft.slave",
+       "check_sft.slave",
+       "input_buf[18..1499]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "frontend_rsp[7]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[1]",
+       "sft.function",
+       "check_sft.function",
+       "input_buf[19..1499]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "frontend_rsp[8..259]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "check_req[0..1]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "tid",
+       "sft.t_id",
+       "check_sft.t_id",
+       "__malloc_modbus_new_tcp_l1002_31.backend"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "check_req[2..3]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "__malloc_modbus_new_tcp_l1002_31.backend",
+       "__malloc_modbus_new_tcp_l1002_32.backend",
+       "__malloc_modbus_new_tcp_l1002_45.backend",
+       "__malloc_modbus_new_tcp_l1002_47.backend"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "check_req[6]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[0]",
+       "sft.slave",
+       "check_sft.slave",
+       "input_buf[18..1499]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "check_req[7]",
+      "from": [
+       "_modbus_tcp_backend.build_response_basis",
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[1]",
+       "sft.function",
+       "check_sft.function",
+       "input_buf[19..1499]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "check_req[8..259]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0[0..3]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_0[0..3]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_1[0..3]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_2[0..3]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_3[0..3]",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_0",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2_0",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_1",
+      "from": [
+       "ctx",
+       "raw_req",
+       "raw_req_length",
+       "backend_req[2..259]",
+       "backend_rsp[8..259]",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [
+     "errno",
+     "__fc_sockfds[0..1023]",
+     "__fc_strerror[0..63]",
+     "stderr",
+     "_modbus_tcp_backend{.build_response_basis; {.send_msg_pre; .send}}",
+     "backend_req[0..253]",
+     "frontend_rsp[0..259]",
+     "sft",
+     "check_sft",
+     "input_buf[18..1499]",
+     "c0a1_29[0..253]",
+     "c29a1[0..253]",
+     "eva_main_c0a1_4[0..253]",
+     "S___fc_stderr[0]",
+     "S___fc_stdout[0]",
+     "__malloc_modbus_new_tcp_l1002_21{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_22{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_23{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_24{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_25{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_29{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_30{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_31{{.s; .debug}; .backend}",
+     "__malloc_modbus_new_tcp_l1002_32{{.s; .debug}; .backend}"
+    ],
+    "no_effects": false,
+    "truncated": true
+   },
+   "features": {
+    "loops": false,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": true,
+    "arrays": true,
+    "division": false,
+    "bitwise": false,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": true,
+    "recursion": false,
+    "alloc": false,
+    "callees": true,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [
+    "__retres",
+    "tmp"
+   ],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "ok",
+    "separated": [],
+    "assigns": [
+     {
+      "loc": "errno",
+      "from": [
+       "ctx",
+       "raw_req + (0 .. 1)",
+       "raw_req_length"
+      ],
+      "clause": "assigns errno \\from ctx, raw_req + (0 .. 1), raw_req_length;",
+      "source": "ast"
+     }
+    ],
+    "notes": []
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit"
+    ],
+    "edges": []
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_build_response_basis": {
+   "name": "_modbus_rtu_build_response_basis",
+   "file": "src/modbus-rtu.c",
+   "kernel_name": "_modbus_rtu_build_response_basis",
+   "line": 109,
+   "code_lines": [
+    109,
+    110,
+    113,
+    114,
+    116,
+    117
+   ],
+   "static": true,
+   "variadic": false,
+   "return_type": "int",
+   "formals": [
+    {
+     "name": "sft",
+     "type": "sft_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "sft_t",
+     "pointee_canon": "struct _sft",
+     "pointee_const": false,
+     "char_like": false
+    },
+    {
+     "name": "rsp",
+     "type": "uint8_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint8_t",
+     "pointee_canon": "unsigned char",
+     "pointee_const": false,
+     "char_like": true
+    }
+   ],
+   "loops": [],
+   "writes": [
+    {
+     "lval": "*(rsp + 0)",
+     "root": "rsp",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 113,
+     "values": [
+      "(uint8_t)sft->slave"
+     ]
+    },
+    {
+     "lval": "*(rsp + 1)",
+     "root": "rsp",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 114,
+     "values": [
+      "(uint8_t)sft->function"
+     ]
+    }
+   ],
+   "reads": [
+    {
+     "lval": "sft->slave",
+     "root": "sft",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 113
+    },
+    {
+     "lval": "sft->function",
+     "root": "sft",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 114
+    }
+   ],
+   "calls": [],
+   "called_by": [],
+   "may_alias": [
+    {
+     "a": "sft",
+     "b": "rsp",
+     "written": [
+      "rsp"
+     ],
+     "reason": "a char-like pointer can alias anything"
+    }
+   ],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": "2",
+     "conditions": [],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 116
+    }
+   ],
+   "eva": {
+    "status": "not_reached"
+   },
+   "features": {
+    "loops": false,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": false,
+    "unions": false,
+    "structs": true,
+    "arrays": true,
+    "division": false,
+    "bitwise": false,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": false,
+    "pointer_params": true,
+    "pointer_len_params": false,
+    "assert_literal": false
+   },
+   "kernel_temps": [
+    "__retres"
+   ],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "ok",
+    "separated": [
+     {
+      "roots": [
+       "rsp",
+       "sft"
+      ],
+      "regions": [
+       "rsp + (0 .. 1)",
+       "sft"
+      ],
+      "clause": "requires \\separated(rsp + (0 .. 1), sft);",
+      "reason": "writes through `rsp` may overlap reads through the other pointer (a char-like pointer can alias anything)"
+     }
+    ],
+    "assigns": [
+     {
+      "loc": "*(rsp + 0)",
+      "from": [
+       "sft"
+      ],
+      "clause": "assigns *(rsp + 0) \\from sft;",
+      "source": "ast"
+     },
+     {
+      "loc": "*(rsp + 1)",
+      "from": [
+       "sft"
+      ],
+      "clause": "assigns *(rsp + 1) \\from sft;",
+      "source": "ast"
+     }
+    ],
+    "notes": []
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit"
+    ],
+    "edges": []
+   }
+  },
+  "src/modbus-data.c#modbus_set_float": {
+   "name": "modbus_set_float",
+   "file": "src/modbus-data.c",
+   "kernel_name": "modbus_set_float",
+   "line": 242,
+   "code_lines": [
+    242,
+    243,
+    244,
+    245
+   ],
+   "static": false,
+   "variadic": false,
+   "return_type": "void",
+   "formals": [
+    {
+     "name": "f",
+     "type": "float",
+     "kind": "scalar",
+     "restrict": false
+    },
+    {
+     "name": "dest",
+     "type": "uint16_t *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint16_t",
+     "pointee_canon": "unsigned short",
+     "pointee_const": false,
+     "char_like": false
+    }
+   ],
+   "loops": [],
+   "writes": [],
+   "reads": [],
+   "calls": [
+    {
+     "line": 244,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "f",
+      "dest"
+     ],
+     "callee": "modbus_set_float_cdab",
+     "kernel_name": "modbus_set_float_cdab"
+    }
+   ],
+   "called_by": [],
+   "may_alias": [],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": null,
+     "conditions": [],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 245
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "c0a1",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0[0..3]",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_0[0..3]",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_1[0..3]",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_2[0..3]",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_3[0..3]",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_0",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2_0",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_1",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2_1",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_4",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_2[0..1]",
+      "from": [
+       "f",
+       "dest",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_5",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_6",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_7",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_5[0..1]",
+      "from": [
+       "f",
+       "dest",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_8",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_7",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2_2",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a3",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a4",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c1a1",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c1a1_0",
+      "from": [
+       "f",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [],
+    "no_effects": false,
+    "truncated": true
+   },
+   "features": {
+    "loops": false,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": true,
+    "unions": false,
+    "structs": false,
+    "arrays": false,
+    "division": false,
+    "bitwise": false,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": true,
+    "pointer_params": true,
+    "pointer_len_params": true,
+    "assert_literal": false
+   },
+   "kernel_temps": [],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "partial",
+    "separated": [],
+    "assigns": [],
+    "notes": [
+     "no `assigns \\nothing` projected: the function may write through `modbus_set_float_cdab` (a callee of this module that writes, possibly transitively, an indirect call, or a function outside the module); state what those calls assign"
+    ]
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit"
+    ],
+    "edges": []
+   }
+  },
+  "src/modbus-data.c#modbus_get_float_abcd": {
+   "name": "modbus_get_float_abcd",
+   "file": "src/modbus-data.c",
+   "kernel_name": "modbus_get_float_abcd",
+   "line": 79,
+   "code_lines": [
+    79,
+    80,
+    81,
+    82,
+    83,
+    87,
+    88,
+    89,
+    90,
+    97,
+    98,
+    100,
+    101
+   ],
+   "static": false,
+   "variadic": false,
+   "return_type": "float",
+   "formals": [
+    {
+     "name": "src",
+     "type": "uint16_t const *",
+     "kind": "pointer",
+     "restrict": false,
+     "pointee": "uint16_t const",
+     "pointee_canon": "unsigned short",
+     "pointee_const": true,
+     "char_like": false
+    }
+   ],
+   "loops": [],
+   "writes": [],
+   "reads": [
+    {
+     "lval": "*(src + 0)",
+     "root": "src",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 87
+    },
+    {
+     "lval": "*(src + 1)",
+     "root": "src",
+     "root_kind": "formal",
+     "through_pointer": true,
+     "line": 89
+    }
+   ],
+   "calls": [
+    {
+     "line": 98,
+     "indirect": false,
+     "in_loop": false,
+     "args": [
+      "(void *)(& f)",
+      "(void const *)(& i)",
+      "(size_t)4"
+     ],
+     "callee": "memcpy",
+     "kernel_name": "memcpy"
+    }
+   ],
+   "called_by": [],
+   "may_alias": [],
+   "recursion": null,
+   "derived_pointers": {},
+   "return_paths": [
+    {
+     "value": "f",
+     "conditions": [],
+     "conditions_partial": false,
+     "in_loop": false,
+     "line": 100
+    }
+   ],
+   "eva": {
+    "status": "reached",
+    "writes": [
+     {
+      "loc": "c0a1",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0[0..3]",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_0[0..3]",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_1[0..3]",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_2[0..3]",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_3[0..3]",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_0",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2_0",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_1",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2_1",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_4",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_5",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_6",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_7",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a0_8",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a1_7",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a2_2",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a3",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c0a4",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c1a1",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c1a1_0",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c1a1_1",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     },
+     {
+      "loc": "c1a1_2",
+      "from": [
+       "src",
+       "input_buf[1..1499]",
+       "framac_input_init[0..1499]",
+       "c0a0_0[0..1]",
+       "c0a1_29[2..259]",
+       "c29a1[2..259]",
+       "req[6..259]",
+       "eva_main_c0a1_4[2..1500]"
+      ],
+      "and_self": true
+     }
+    ],
+    "reads": [
+     "c0a0_0[0..1]"
+    ],
+    "no_effects": false,
+    "truncated": true
+   },
+   "features": {
+    "loops": false,
+    "loop_reads_earlier_writes": false,
+    "in_place_loop": false,
+    "strided_writes": false,
+    "read_only_loop": false,
+    "macro_loops": false,
+    "pointer_walk": false,
+    "strings": false,
+    "floats": true,
+    "unions": false,
+    "structs": false,
+    "arrays": true,
+    "division": false,
+    "bitwise": true,
+    "nonlinear": false,
+    "switch": false,
+    "goto": false,
+    "indirect_calls": false,
+    "recursion": false,
+    "alloc": false,
+    "callees": true,
+    "pointer_params": true,
+    "pointer_len_params": false,
+    "assert_literal": false
+   },
+   "kernel_temps": [],
+   "truncated": false,
+   "frame_skeleton": {
+    "status": "partial",
+    "separated": [],
+    "assigns": [],
+    "notes": [
+     "no `assigns \\nothing` projected: the function may write through `memcpy` (a callee of this module that writes, possibly transitively, an indirect call, or a function outside the module); state what those calls assign"
+    ]
+   },
+   "loop_graph": {
+    "nodes": [
+     "entry",
+     "exit"
+    ],
+    "edges": []
+   }
+  }
+ }
+}

@@ -1,0 +1,27 @@
+void modbus_set_bits_from_bytes(uint8_t *dest,
+                                int idx,
+                                unsigned int nb_bits,
+                                const uint8_t *tab_byte)
+{
+    unsigned int i;
+    int shift = 0;
+
+    /*@ loop invariant idx_lower: (integer)idx <= (integer)i;
+      @ loop invariant i_upper: (integer)i <= (integer)idx + (integer)nb_bits;
+      @ loop invariant shift_range: 0 <= shift <= 7;
+      @ loop invariant shift_values: shift == 0 || shift == 1 || shift == 2 ||
+      @   shift == 3 || shift == 4 || shift == 5 || shift == 6 || shift == 7;
+      @ loop invariant shift_pow: 1 << shift <= 2147483647;
+      @ loop invariant written_bits: \forall integer k;
+      @   0 <= k < (integer)i - (integer)idx ==>
+      @     dest[idx + k] == 0 || dest[idx + k] == 1;
+      @ loop assigns i, shift, dest[idx .. idx + (integer)nb_bits - 1];
+      @ loop variant (integer)idx + (integer)nb_bits - (integer)i;
+      @*/
+    for (i = idx; i < idx + nb_bits; i++) {
+        dest[i] = tab_byte[(i - idx) / 8] & (1 << shift) ? 1 : 0;
+        /* gcc doesn't like: shift = (++shift) % 8; */
+        shift++;
+        shift %= 8;
+    }
+}
