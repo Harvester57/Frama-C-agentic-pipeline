@@ -44,6 +44,10 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 02:43 | Fix 6 merged; session told to regenerate the harness, pass the reach gate, finish Phase 0 and stop before Phase 1 |
 | 02:44-02:45 | Harness: 67 of 71 entry points with a case (68 cases incl. one `modbus_t` lifecycle case); reach gate: 3 internals exempted, `modbus_proxy` the only gap; session asks |
 | 02:47 | Supervisor approves a hand-written `modbus_proxy` case (with changes) |
+| 02:47-02:49 | Harness regenerated (69 cases incl. the custom `modbus_proxy`), reach gate passes (0 gaps, 3 exemptions), ledger seeded (215 units), stubs and stub-check ok |
+| 02:49 | `pipeline_make.py run seed`: `validate_artifacts.py` rejects the sidecar (`$.api_cases[67].rest: expected type null`); session stops and asks |
+| 02:52 | Fixer dispatched for fix 7 (`sup/libmodbus-lifecycle-rest`) |
+| 03:03 | Fix 7 merged; session told to regenerate the harness, rerun the reach gate, seed, gen, build-check and validate, then stop before Phase 1 |
 
 ## Pipeline issues and fixes
 
@@ -52,10 +56,10 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 1 | `build_capture.py run`: shell `Syntax error` from a CRLF `autogen.sh`, and `configure` syntax error from a CRLF `configure.ac`, with no CRLF hint in `build_capture.json` | pipeline gap (the CRLF checkout itself is target-side) | `sup/libmodbus-crlf-dash-hint` `41c20e9`, `3738ea6` | verified, held until the run ends (the run no longer needs it) |
 | 2 | `phase0_model.py run`: `unlinked:/tmp/<cgXXXXXX>` unit, `source file '/tmp/.../dummy.c' does not exist` (GNU `config.guess` libc probe captured as a product unit) | pipeline bug | `sup/libmodbus-config-guess-probe` `0b3b43b` | merged live into `phase1-remediation` (fast-forward) |
 | 3 | `phase0_model.py run`: `Cannot resolve variable TIOCM_RTS` (`__fc_libc` `<sys/ioctl.h>` has `TIOCMGET` but not the `TIOCM_*` modem bits) | pipeline gap + upstream Frama-C libc gap | `sup/libmodbus-tiocm-bits` `f0bea19` (+ docs `a6e33f8`, `47fb030`), merged live as `34f8747`; also adds `TCGETS2`..`TCSETSF2`, the next missing macros; upstream draft 41 (not filed) |
-
 | 4 | `generate_harness.py --api`: `the harness does not compile outside its cases: <built-in>:1:10: fatal error: 'workspace/work/config.h' file not found` (DAG roots a generated force-include at the work tree) | pipeline bug | `sup/libmodbus-generated-force-include` `9f7b123`, merged live as `222d1d3` | fixed; the run reruns the DAG and the harness |
 | 5 | `seed_harvest.py`: `not_relinked`, every test executable `no_api_function` (the recorder wraps only API functions the executable defines; libmodbus tests call them from the shared library) | pipeline gap | `sup/libmodbus-seed-shared-lib` `6212e3b` (+ skill wording `041048f`), merged live as `5ef9ea4` | fixed: 0 -> 321 calls over 46 API functions in the fixer's repro; two narrower libtool sub-gaps stay open (see the entry) |
 | 6 | `generate_harness.py --api`: 51 of 71 entry points `no constructor for opaque handle struct _modbus *`, reach gate 51 gaps (`_INIT_NAME_RE` accepts `new`/`create` only as a suffix, so `modbus_new_tcp` is no constructor) | pipeline bug | `sup/libmodbus-new-ctor-name` `08bec6c`, merged live as `c8484c6` | fixed; a `char *device` constructor parameter is not treated as a path (open, narrow) |
+| 7 | `pipeline_make.py run seed` -> `validate_artifacts.py`: `harness_<module>.json: $.api_cases[N].rest: expected type null` (the lifecycle case's constructor `modbus_new_tcp` binds its `const char *ip` to the rest of the input, which the method loop also reads; the generator only records a schema warning) | pipeline bug, exposed by fix 6 | `sup/libmodbus-lifecycle-rest` `8e0472b`, `f40993b`, fast-forwarded live | fixed; the run regenerates the harness. Narrow leftovers stay open (see the entry) |
 
 Tests added:
 
@@ -64,6 +68,7 @@ Tests added:
 - `tests/test_unit_view.py::test_generated_force_include_resolves_to_its_snapshot_copy` (merged).
 - `tests/test_seed_harvest.py::test_record_wraps_api_functions_the_executable_calls_from_a_shared_library`, `::test_undefined_functions_reads_the_dynamic_symbol_table`, `tests/test_seed_harvest_shared_lib.py::test_recorder_wraps_calls_into_a_shared_library` (merged; the last is Linux-only and skips on the Windows host).
 - `tests/test_api_harness_lifecycle.py::test_a_lib_new_kind_constructor_builds_the_handle` (merged).
+- `tests/test_api_harness_lifecycle.py::test_a_lifecycle_constructor_string_is_a_bounded_slot_never_the_rest`, `::test_an_out_parameter_lifecycle_constructor_string_is_a_bounded_slot_never_the_rest`, `::test_a_lifecycle_constructor_byte_pair_never_takes_the_rest`, `::test_an_out_parameter_constructor_string_in_a_single_case_is_a_slot_and_the_call_keeps_the_rest` (merged).
 
 ## Model struggles (not pipeline bugs)
 
@@ -81,6 +86,7 @@ Tests added:
 - Overnight, the supervisor answers the session's questions on the user's behalf; each answer is listed here.
 - 02:36, "how to recover the 51 functions skipped for `modbus_t *`": pipeline fix (the session's option 1), not 51 hand-written dispatch cases. The session's diagnosis (constructors with parameters refused) was wrong: the code accepts them, and the name rule is what fails.
 - 02:46, "may I hand-write a dispatch case for `modbus_proxy`?" (the one gap left: two `modbus_t` handles, the documented same-type skip): yes, with three changes to the proposed case. Close the preload end of the `socketpair` before the call, or every short input waits the 0.5 s response timeout. Close the backend end after the call, or each execution leaks a descriptor. Set short response and byte timeouts as a backstop. The three internal entry points (`_modbus_init_common`, `_modbus_receive_msg`, `_error_print`) were exempted by the session with a structural reason (they need `modbus-private.h`; reached through public callers).
+- 02:49, "how should the lifecycle case carry a string constructor argument?": a pipeline fix close to the session's option 1. The constructor never takes the rest of the input, and the string is a 16-byte NUL-terminated `bytes` slot. A literal or an empty string were rejected: an empty IP makes `modbus_new_tcp` return NULL.
 - ~02:50, seeds: the session redoes the build capture on a fresh scratch volume, the model, threat model checks, DAG and security properties, then re-records seeds with the fixed recorder before any harness is regenerated.
 
 Also added by fix 3: `tests/test_fc_compat_contracts.py::test_modem_line_bits_and_termios2_requests_are_defined_for_frama_c_libc_only` and `::test_modem_line_bits_and_termios2_requests_parse_with_frama_c_libc_as_gcc_reads_them` (`FRAMAC_DOCKER_TESTS=1`, rerun green by the supervisor).
