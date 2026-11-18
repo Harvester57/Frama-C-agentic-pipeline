@@ -1770,9 +1770,10 @@ def run_guardrail_check(
     failures of other code but never a failed annotation.
 
     `ignored_annotations` is the build's list of the annotations E-ACSL ignored (the build result's
-    `ignored_annotations`). The verdict says which clauses of `functions` were therefore not executed
-    (dynamic_oracle_fields: `unchecked_clauses`, `dynamic_oracle_incomplete`), on every status, and
-    the status itself keeps its meaning. Without the list those fields are None: the run cannot tell.
+    `ignored_annotations`). The verdict says which clauses of `functions` and `contract_functions`
+    were therefore not executed (dynamic_oracle_fields: `unchecked_clauses`,
+    `dynamic_oracle_incomplete`), on every status, and the status itself keeps its meaning. Without
+    the list those fields are None: the run cannot tell.
 
     When caching is enabled (`scripts/cache.py`), deterministic passing verdicts
     (`passed_dynamic_oracle`) are cached in the run-local `guardrail` namespace
@@ -1783,7 +1784,9 @@ def run_guardrail_check(
     binary = Path(binary)
     corpus_dir = Path(corpus_dir)
     scratch_dir = Path(scratch_dir)
-    oracle_fields = dynamic_oracle_fields(ignored_annotations, functions)
+    # The functions whose reach is measured and the ones the build's annotations are limited to: with
+    # both named, a clause of either that E-ACSL ignored was not executed.
+    oracle_fields = dynamic_oracle_fields(ignored_annotations, [*(functions or []), *(contract_functions or [])])
     if not is_eacsl_instrumented(binary):
         err_verdict: dict[str, object] = {
             "status": "guardrail_error",
@@ -2732,7 +2735,7 @@ def main(argv: list[str] | None = None) -> int:
         # What E-ACSL did not execute, on every status: run_guardrail_check set the same fields from the
         # same list; a build that failed and a replay that could not start get them here.
         built = guard_build or {}
-        checked = args.reach_functions if args.reach_functions else args.functions
+        checked = [*(args.reach_functions or []), *(args.functions or [])]
         res.update(dynamic_oracle_fields(built.get("ignored_annotations"), checked))
         res["ignored_frame_clauses"] = built.get("ignored_frame_clauses")
         hints = list(res.get("diagnostic_hints") or [])

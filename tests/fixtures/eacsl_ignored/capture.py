@@ -84,4 +84,5 @@ def main() -> None:
     print("CAPTURE done", flush=True)
 
 
-main()
+if __name__ == "__main__":
+    main()

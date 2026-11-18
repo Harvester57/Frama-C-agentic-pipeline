@@ -396,6 +396,16 @@ def test_ignored_annotations_of_other_functions_do_not_touch_a_checked_function(
     assert {c["function"] for c in rep["unchecked_clauses"]} == {"unb_requires"}
 
 
+def test_reach_functions_do_not_hide_the_ignored_clause_of_the_contract_function(probe_run, monkeypatch):
+    """`--functions f --reach-functions g`: the build holds f's annotations, and f's ignored clause still counts."""
+    _clean_replay(monkeypatch)
+    rep = _guardrail_report(monkeypatch, "unb_requires", ["--functions", "unb_requires", "--reach-functions", "plain"])
+    assert rep["status"] == "passed_dynamic_oracle"
+    assert rep["dynamic_oracle_incomplete"] is True
+    assert rep["dynamic_oracle_incomplete_functions"] == ["unb_requires"]
+    assert [c["label"] for c in rep["unchecked_clauses"]] == ["", "unb_pre"]
+
+
 def test_an_ignored_header_definition_counts_only_against_the_function_that_uses_it(probe_run):
     """
     The nearest real case to an ignored annotation in a prelude: a `predicate` of a header that
