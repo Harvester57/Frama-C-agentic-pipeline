@@ -360,6 +360,7 @@ def load_inputs(run_dir: Path) -> dict:
         "mutation": load_json_optional(run_dir / "workspace/reports/mutation.json", None),
         "model": load_json_optional(run_dir / "workspace/reports/phase0_model.json", None),
         "security_props": load_json_optional(run_dir / "workspace/reports/security_props.json", None),
+        "fuzz_security_props": load_fuzz_security_props(run_dir),
     }
 
 
@@ -501,6 +502,97 @@ def const_union_rewrite_lines(run_dir: Path) -> list[str]:
         f"`const`. {shown}.",
         "",
     ]
+
+
+def load_fuzz_security_props(run_dir: Path) -> list[dict]:
+    """
+    What each fuzzed module's E-ACSL build did with the run's MetAcsl properties, one row per module
+    whose report says anything: {module, report, record, warnings, harness_induced}. Read from the
+    campaign report workspace/reports/fuzz/<mod>.json (`security_props`, `security_props_warnings`,
+    `security_props_harness_induced`, written by run_eacsl_fuzz.py), and from the build report
+    workspace/build/<mod>.build.json for a module without a campaign report. The other reports of
+    the fuzz directory (replays) are not a module's campaign and are not read. Empty for a run
+    without `eacsl` in `meta_engines`: no report has those fields then.
+    """
+    run_dir = Path(run_dir)
+    found: dict[str, tuple[Path, dict]] = {}
+    for directory, suffix, mode in (
+        ("workspace/reports/fuzz", ".json", "campaign"),
+        ("workspace/build", ".build.json", "build"),
+    ):
+        for path in sorted((run_dir / directory).glob("*" + suffix)):
+            module = path.name.removesuffix(suffix)
+            if module in found:
+                continue  # the campaign's build is the one that was fuzzed
+            try:
+                report = load_json_optional(path, None)
+            except (ArtifactError, OSError, ValueError):
+                report = None
+            if not isinstance(report, dict):
+                report = {}  # unreadable: nothing to print, and a campaign report still hides the build's
+            if report.get("mode") in (None, mode):
+                found[module] = (path, report)
+    rows: list[dict] = []
+    for module, (path, report) in sorted(found.items()):
+        record = report.get("security_props")
+        warnings = report.get("security_props_warnings")
+        induced = report.get("security_props_harness_induced")
+        row = {
+            "module": str(report.get("module") or module),
+            "report": path.relative_to(run_dir).as_posix(),
+            "record": record if isinstance(record, dict) else {},
+            "warnings": [str(w) for w in warnings] if isinstance(warnings, list) else [],
+            "harness_induced": [i for i in induced if isinstance(i, dict)] if isinstance(induced, list) else [],
+        }
+        if row["record"] or row["warnings"] or row["harness_induced"]:
+            rows.append(row)
+    return rows
+
+
+# `security_props.status` of a build that checks none of the properties it was given (fuzz_build.py).
+FUZZ_META_LOST = ("dropped", "error")
+
+
+def fuzz_meta_inactive_lines(rows: list[dict]) -> list[str]:
+    """
+    A warning per module whose fuzz binary lost the MetAcsl properties (`dropped`: the build failed
+    with them and was redone without; `error`: the properties file could not be loaded): fuzzing
+    checked no security property there, which the absence of a candidate must not hide.
+    """
+    out: list[str] = []
+    for row in rows:
+        record = row["record"]
+        if record.get("status") not in FUZZ_META_LOST:
+            continue
+        reason = md_escape(str(record.get("reason") or "no reason recorded"))
+        log = md_escape(str(record.get("log") or row["report"]))
+        out += [
+            "> [!WARNING]",
+            f"> MetAcsl run-time checks: NOT ACTIVE for module {md_escape(row['module'])} ({reason}). "
+            f"No Layer 3-6 property was checked by fuzzing; see {log}.",
+            "",
+        ]
+    return out
+
+
+def fuzz_meta_note_lines(rows: list[dict]) -> list[str]:
+    """
+    The properties a fuzz binary does not check, or checks elsewhere than planned (one line per
+    warning of a build that kept its properties), and the precondition failures the harness caused
+    itself (`ledger.py ingest-fuzz` makes no candidate of them).
+    """
+    lines: list[str] = []
+    for row in rows:
+        if row["record"].get("status") not in FUZZ_META_LOST:
+            lines += [f"- MetAcsl run-time checks, {md_escape(row['module'])}: {md_escape(w)}" for w in row["warnings"]]
+        lines += [
+            f"- {md_escape(str(i.get('property')))} failed in {md_escape(str(i.get('function')))}, called by harness "
+            f"function {md_escape(str(i.get('caller')))}: not a finding against the target."
+            for i in row["harness_induced"]
+        ]
+    if not lines:
+        return []
+    return ["### MetAcsl run-time checks in the fuzz builds", "", *lines, ""]
 
 
 def open_work(data: dict) -> dict:
@@ -917,6 +1009,8 @@ def render_report(data: dict) -> str:
             + "do not read the absence of findings outside the covered units as evidence of safety."
         )
         out.append("")
+    fuzz_meta = data.get("fuzz_security_props") or []
+    out += fuzz_meta_inactive_lines(fuzz_meta)
     if work["unverified"]:
         out.append(
             f"**{len(work['unverified'])} candidate(s) have not been independently verified.** They are not findings and are listed here only so the gap is visible:"
@@ -932,6 +1026,7 @@ def render_report(data: dict) -> str:
         out.append("")
     out += trust_lines(data.get("model"))
     out += security_props_lines(data.get("security_props"))
+    out += fuzz_meta_note_lines(fuzz_meta)
     out += fallback_lines(data.get("model"), ledger)
 
     out += ["## 2. Summary", ""]

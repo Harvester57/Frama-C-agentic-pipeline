@@ -89,7 +89,8 @@ def replay_artifact(
         extra_env=SANITIZER_RUNTIME_ENV,
     )
     out = res.stdout + "\n" + res.stderr
-    failure = parse_runtime_failure(out)
+    # The binary: a MetAcsl violation is mapped to its file through the sidecar its build wrote next to it.
+    failure = parse_runtime_failure(out, binary=binary)
     return {
         "reproduced": res.returncode != 0 or res.timed_out,
         "returncode": res.returncode,
