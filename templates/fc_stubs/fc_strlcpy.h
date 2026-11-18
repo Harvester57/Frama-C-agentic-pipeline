@@ -29,6 +29,16 @@
  *       bounded by the source's own block (`\block_length - \offset`), which also keeps a huge
  *       `size` (SIZE_MAX after an underflow) from looping.
  *   Postconditions are Eva / WP only.
+ *
+ * What backs the Eva / WP postconditions (tests/test_fc_strlcpy_reference.py): WP proves both
+ * contracts for the reference bodies of tests/fixtures/fc_strlcpy_reference/reference.c, which
+ * return the same result and leave the same bytes as glibc's functions for every small length and
+ * size. The proof needs three facts the contracts do not state, admitted by name in that file:
+ *   - src_initialized, dst_initialized: the strings the call reads are initialized.
+ *     valid_read_string does not say so under WP (Frama-C's libc has the same convention), so
+ *     `ensures initialized` holds for a WP caller only if its strings are initialized.
+ *   - no_wrap (strlcat): strlen(dst) + strlen(src) fits in size_t. True for two separate objects
+ *     in one address space; WP's memory model cannot derive it.
  */
 
 #ifndef FRAMAC_FC_STRLCPY_H
@@ -124,6 +134,11 @@ size_t strlcpy(char *dst, const char *src, size_t size);
     \from src[0 .. strlen(src)], indirect:dst[0 .. strlen(dst)], indirect:size;
   assigns \result \from indirect:dst[0 .. strlen(dst)], indirect:src[0 .. strlen(src)];
   ensures result_is_total_length: \result == \old(strlen(dst)) + strlen(src);
+  ensures copied:
+    \forall integer i;
+      0 <= i < (\old(strlen(dst)) + strlen(src) < size ? strlen(src)
+                                                        : size - 1 - \old(strlen(dst))) ==>
+      dst[\old(strlen(dst)) + i] == src[i];
   ensures initialized:
     \initialized(dst + (0 .. (\old(strlen(dst)) + strlen(src) < size
                               ? \old(strlen(dst)) + strlen(src) : size - 1)));
