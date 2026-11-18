@@ -1,0 +1,78 @@
+{
+  "mode": "replay",
+  "module": "libmodbus_so_5_1_0",
+  "status": "reproduced",
+  "binary": "workspace/harnesses/fuzz_libmodbus_so_5_1_0",
+  "inputs": [
+    "workspace/crashes/libmodbus_so_5_1_0/crash-5892157a052cb477987072a6e488afa69278758e",
+    "workspace/crashes/libmodbus_so_5_1_0/crash-e56747dcd8347b17060d506f4f32179e93c35ba9"
+  ],
+  "missing_inputs": [],
+  "per_input_timeout": 10,
+  "rss_limit_mb": 2048,
+  "artifacts": [
+    {
+      "artifact": "workspace/crashes/libmodbus_so_5_1_0/crash-5892157a052cb477987072a6e488afa69278758e",
+      "kind": "crash",
+      "sha256": "145b22cafe82e257d5c0b897791f9928961e00afb4cd3f468f241f2a4ba17926",
+      "size_bytes": 3,
+      "reproducible": true,
+      "failure": {
+        "file": "/framac-run/workspace/work/src/modbus-data.c",
+        "line": 133,
+        "function": "modbus_get_float_badc",
+        "kind": "asan_stack_buffer_overflow",
+        "alarm_kind": "mem_access",
+        "is_rte": true,
+        "predicate": "rte: mem_access: AddressSanitizer: stack-buffer-overflow (READ) [line 58e4e7135b]"
+      },
+      "fingerprint": "src/modbus-data.c#modbus_get_float_badc::mem_access::8caef6cae1",
+      "failure_source": "primary",
+      "returncode": -6,
+      "timed_out": false,
+      "seed": 484574938,
+      "replay_log_tail": " 'c0a1252' (line 460)\n    [128, 130) 'c0a1273' (line 463)\n    [144, 146) 'c0a1294' (line 466)\n    [160, 162) 'c0a1315' (line 469)\n    [176, 178) 'c0a1336' (line 472)\n    [192, 196) 'c0a1902' (line 505)\n    [208, 212) 'c0a11015' (line 511)\n    [224, 228) 'c0a11432' (line 535)\n    [240, 244) 'c0a21435' (line 535)\n    [256, 260) 'c0a11532' (line 541)\n    [272, 276) 'c0a21535' (line 541)\n    [288, 292) 'c0a11585' (line 544)\n    [304, 308) 'c0a21588' (line 544)\n    [320, 384) 'c0a01714' (line 553)\n    [416, 418) 'c0a32221' (line 571)\n    [432, 434) 'c0a32303' (line 574)\n    [448, 708) 'c0a12728' (line 595)\n    [784, 786) 'c0a33391' (line 622)\n    [800, 802) 'c0a63439' (line 622)\n    [816, 818) 'c0a33760' (line 634)\n    [832, 848) 'c0a03805' (line 637)\n    [864, 868) 'c5a1' (line 637)\n    [880, 884) 'c5a2' (line 637)\n    [896, 900) 'c7a1' (line 637)\n    [912, 916) 'c7a2' (line 637)\n    [928, 932) 'c8a1' (line 637)\n    [944, 948) 'c8a2' (line 637)\n    [960, 962) 'c14a3' (line 637)\n    [976, 978) 'c15a3' (line 637)\n    [992, 1252) 'c29a1' (line 637)\n    [1328, 1332) 'c37a1' (line 637)\n    [1344, 1348) 'c39a1' (line 637)\n    [1360, 1362) 'c41a3' (line 637)\n    [1376, 1378) 'c41a6' (line 637)\n    [1392, 1394) 'c45a3' (line 637)\n    [1408, 1668) 'req' (line 640)\n    [1744, 1752) 'sv' (line 640)\nHINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork\n      (longjmp and C++ exceptions *are* supported)\nSUMMARY: AddressSanitizer: stack-buffer-overflow /framac-run/workspace/work/src/modbus-data.c:133:10 in modbus_get_float_badc\nShadow bytes around the buggy address:\n  0x7ac151fffd80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ac151fffe00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ac151fffe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ac151ffff00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x7ac151ffff80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n=>0x7ac152000000: f1 f1 f1 f1 f8 f2 f8 f2[02]f2 f8 f2 f8 f2 f8 f2\n  0x7ac152000080: f8 f2 f8 f2 f8 f2 f8 f2 f8 f2 f8 f2 f8 f2 f8 f2\n  0x7ac152000100: f8 f2 f8 f2 f8 f2 f8 f2 f8 f8 f8 f8 f8 f8 f8 f8\n  0x7ac152000180: f2 f2 f2 f2 f8 f2 f8 f2 f8 f8 f8 f8 f8 f8 f8 f8\n  0x7ac152000200: f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8\n  0x7ac152000280: f8 f8 f8 f8 f8 f8 f8 f8 f8 f2 f2 f2 f2 f2 f2 f2\nShadow byte legend (one shadow byte represents 8 application bytes):\n  Addressable:           00\n  Partially addressable: 01 02 03 04 05 06 07 \n  Heap left redzone:       fa\n  Freed heap region:       fd\n  Stack left redzone:      f1\n  Stack mid redzone:       f2\n  Stack right redzone:     f3\n  Stack after return:      f5\n  Stack use after scope:   f8\n  Global redzone:          f9\n  Global init order:       f6\n  Poisoned by user:        f7\n  Container overflow:      fc\n  Array cookie:            ac\n  Intra object redzone:    bb\n  ASan internal:           fe\n  Left alloca redzone:     ca\n  Right alloca redzone:    cb\n==363==ABORTING\n"
+    },
+    {
+      "artifact": "workspace/crashes/libmodbus_so_5_1_0/crash-e56747dcd8347b17060d506f4f32179e93c35ba9",
+      "kind": "crash",
+      "sha256": "edbaa56f6225f418c58370c202e316290c041e206df2969026bc4e49b75b2598",
+      "size_bytes": 3,
+      "reproducible": true,
+      "failure": {
+        "file": "/framac-run/workspace/work/src/modbus-data.c",
+        "line": 133,
+        "function": "modbus_get_float_badc",
+        "kind": "asan_stack_buffer_overflow",
+        "alarm_kind": "mem_access",
+        "is_rte": true,
+        "predicate": "rte: mem_access: AddressSanitizer: stack-buffer-overflow (READ) [line 58e4e7135b]"
+      },
+      "fingerprint": "src/modbus-data.c#modbus_get_float_badc::mem_access::8caef6cae1",
+      "failure_source": "primary",
+      "returncode": -6,
+      "timed_out": false,
+      "seed": 484574938,
+      "replay_log_tail": " 'c0a1252' (line 460)\n    [128, 130) 'c0a1273' (line 463)\n    [144, 146) 'c0a1294' (line 466)\n    [160, 162) 'c0a1315' (line 469)\n    [176, 178) 'c0a1336' (line 472)\n    [192, 196) 'c0a1902' (line 505)\n    [208, 212) 'c0a11015' (line 511)\n    [224, 228) 'c0a11432' (line 535)\n    [240, 244) 'c0a21435' (line 535)\n    [256, 260) 'c0a11532' (line 541)\n    [272, 276) 'c0a21535' (line 541)\n    [288, 292) 'c0a11585' (line 544)\n    [304, 308) 'c0a21588' (line 544)\n    [320, 384) 'c0a01714' (line 553)\n    [416, 418) 'c0a32221' (line 571)\n    [432, 434) 'c0a32303' (line 574)\n    [448, 708) 'c0a12728' (line 595)\n    [784, 786) 'c0a33391' (line 622)\n    [800, 802) 'c0a63439' (line 622)\n    [816, 818) 'c0a33760' (line 634)\n    [832, 848) 'c0a03805' (line 637)\n    [864, 868) 'c5a1' (line 637)\n    [880, 884) 'c5a2' (line 637)\n    [896, 900) 'c7a1' (line 637)\n    [912, 916) 'c7a2' (line 637)\n    [928, 932) 'c8a1' (line 637)\n    [944, 948) 'c8a2' (line 637)\n    [960, 962) 'c14a3' (line 637)\n    [976, 978) 'c15a3' (line 637)\n    [992, 1252) 'c29a1' (line 637)\n    [1328, 1332) 'c37a1' (line 637)\n    [1344, 1348) 'c39a1' (line 637)\n    [1360, 1362) 'c41a3' (line 637)\n    [1376, 1378) 'c41a6' (line 637)\n    [1392, 1394) 'c45a3' (line 637)\n    [1408, 1668) 'req' (line 640)\n    [1744, 1752) 'sv' (line 640)\nHINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork\n      (longjmp and C++ exceptions *are* supported)\nSUMMARY: AddressSanitizer: stack-buffer-overflow /framac-run/workspace/work/src/modbus-data.c:133:10 in modbus_get_float_badc\nShadow bytes around the buggy address:\n  0x79db225ffd80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x79db225ffe00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x79db225ffe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x79db225fff00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n  0x79db225fff80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n=>0x79db22600000: f1 f1 f1 f1 f8 f2 f8 f2[02]f2 f8 f2 f8 f2 f8 f2\n  0x79db22600080: f8 f2 f8 f2 f8 f2 f8 f2 f8 f2 f8 f2 f8 f2 f8 f2\n  0x79db22600100: f8 f2 f8 f2 f8 f2 f8 f2 f8 f8 f8 f8 f8 f8 f8 f8\n  0x79db22600180: f2 f2 f2 f2 f8 f2 f8 f2 f8 f8 f8 f8 f8 f8 f8 f8\n  0x79db22600200: f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8 f8\n  0x79db22600280: f8 f8 f8 f8 f8 f8 f8 f8 f8 f2 f2 f2 f2 f2 f2 f2\nShadow byte legend (one shadow byte represents 8 application bytes):\n  Addressable:           00\n  Partially addressable: 01 02 03 04 05 06 07 \n  Heap left redzone:       fa\n  Freed heap region:       fd\n  Stack left redzone:      f1\n  Stack mid redzone:       f2\n  Stack right redzone:     f3\n  Stack after return:      f5\n  Stack use after scope:   f8\n  Global redzone:          f9\n  Global init order:       f6\n  Poisoned by user:        f7\n  Container overflow:      fc\n  Array cookie:            ac\n  Intra object redzone:    bb\n  ASan internal:           fe\n  Left alloca redzone:     ca\n  Right alloca redzone:    cb\n==368==ABORTING\n"
+    }
+  ],
+  "engine_used": "sanitizers",
+  "compile": {
+    "engine": "sanitizers",
+    "returncode": 0,
+    "reason": null,
+    "binary": "workspace/harnesses/fuzz_libmodbus_so_5_1_0",
+    "compile_log": "workspace/harnesses/fuzz_libmodbus_so_5_1_0.sanitizer_compile.log",
+    "cache": {
+      "hit": true,
+      "key": "e766e7631761cf7956278da9187953ecb1f3b4d01e7066032bd29307c067addb"
+    }
+  },
+  "cache": {
+    "hit": true,
+    "key": "e766e7631761cf7956278da9187953ecb1f3b4d01e7066032bd29307c067addb"
+  },
+  "seed": 484574938,
+  "candidate_fingerprint": "src/modbus-data.c#modbus_get_float_badc::mem_access::8caef6cae1",
+  "fingerprint_matches": true
+}

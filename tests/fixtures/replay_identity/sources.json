@@ -1,0 +1,52 @@
+{
+  "libmodbus_run1": {
+    "lines": {
+      "src/modbus-data.c": {
+        "89": "    c = (src[1] >> 8) & 0xFF; // high byte of second word",
+        "133": "    d = (src[1] >> 8) & 0xFF;"
+      }
+    },
+    "functions": {
+      "modbus_get_float_abcd": {
+        "file": "src/modbus-data.c",
+        "line": 79,
+        "end_line": 101,
+        "module": "libmodbus_so_5_1_0"
+      },
+      "modbus_get_float_badc": {
+        "file": "src/modbus-data.c",
+        "line": 124,
+        "end_line": 141,
+        "module": "libmodbus_so_5_1_0"
+      },
+      "modbus_rtu_set_rts": {
+        "file": "src/modbus-rtu.c",
+        "line": 1052,
+        "end_line": 1086,
+        "module": "libmodbus_so_5_1_0"
+      },
+      "modbus_rtu_set_serial_mode": {
+        "file": "src/modbus-rtu.c",
+        "line": 950,
+        "end_line": 1002,
+        "module": "libmodbus_so_5_1_0"
+      }
+    }
+  },
+  "mpack_run4": {
+    "lines": {
+      "src/mpack/mpack-writer.c": {
+        "1791": "    mpack_assert(builder->current_build != NULL, \"no build in progress!\");",
+        "1793": "    mpack_assert(builder->current_build->type == type, \"completing wrong type!\");"
+      }
+    },
+    "functions": {
+      "mpack_builder_complete": {
+        "file": "src/mpack/mpack-writer.c",
+        "line": 1785,
+        "end_line": 1822,
+        "module": "libmpack_a"
+      }
+    }
+  }
+}

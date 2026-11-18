@@ -1,0 +1,54 @@
+{
+  "mode": "replay",
+  "module": "libmodbus_so_5_1_0",
+  "status": "reproduced",
+  "binary": "workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl",
+  "inputs": [
+    "workspace/crashes/libmodbus_so_5_1_0/timeout-246633d057b6f4f9f8b086114e28a13ec0017dd6"
+  ],
+  "missing_inputs": [],
+  "per_input_timeout": 10,
+  "rss_limit_mb": 2048,
+  "artifacts": [
+    {
+      "artifact": "workspace/crashes/libmodbus_so_5_1_0/timeout-246633d057b6f4f9f8b086114e28a13ec0017dd6",
+      "kind": "timeout",
+      "sha256": "cb55484d0b34bde7a61f1bf490d3702ac512d6342d9e17fea6ec34505c3383b4",
+      "size_bytes": 71,
+      "reproducible": true,
+      "failure": null,
+      "fingerprint": null,
+      "failure_source": null,
+      "returncode": 70,
+      "timed_out": false,
+      "seed": 820972472,
+      "replay_log_tail": "  #1 0x5a4ba33f44ec in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x5b4ec) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n    #2 0x5a4ba33d93db in fuzzer::Fuzzer::AlarmCallback() (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x403db) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n    #3 0x7161fea13d6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #4 0x7161fea6e72d  (/lib/x86_64-linux-gnu/libc.so.6+0x9a72d) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #5 0x7161fea63387  (/lib/x86_64-linux-gnu/libc.so.6+0x8f387) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #6 0x7161feaafcf9 in clock_nanosleep (/lib/x86_64-linux-gnu/libc.so.6+0xdbcf9) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #7 0x7161feabb112 in __nanosleep (/lib/x86_64-linux-gnu/libc.so.6+0xe7112) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #8 0x5a4ba35f4bbd in __wrap_nanosleep (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x25bbbd) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n    #9 0x5a4ba34cdd5f in _sleep_response_timeout /framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.instrumented.c:99952:11\n    #10 0x5a4ba34ba1e4 in send_msg /framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.instrumented.c:109929:19\n    #11 0x5a4ba35ac4df in modbus_mask_write_register /framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.instrumented.c:288590:8\n    #12 0x5a4ba35d2c6c in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.instrumented.c:319995:41\n    #13 0x5a4ba33dab6a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x41b6a) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n    #14 0x5a4ba33c2a63 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x29a63) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n    #15 0x5a4ba33c8ba1 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x2fba1) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n    #16 0x5a4ba33f5056 in main (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x5c056) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n    #17 0x7161fe9fdca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #18 0x7161fe9fdd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #19 0x5a4ba33bd050 in _start (/framac-run/workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl+0x24050) (BuildId: 895129df04cf5e5f7b1624aeccccaf0741bbf562)\n\nSUMMARY: libFuzzer: timeout\n",
+      "attribution": {
+        "source": "sanitizer_replay",
+        "binary": "workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.sanreplay",
+        "reproduced": true,
+        "failure": null,
+        "out_of_memory": false
+      }
+    }
+  ],
+  "engine_used": "eacsl",
+  "compile": {
+    "engine": "eacsl",
+    "returncode": 0,
+    "reason": null,
+    "binary": "workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.e-acsl",
+    "compile_log": "workspace/harnesses/cross_eacsl_libmodbus_so_5_1_0.compile.log",
+    "cache": {
+      "hit": false,
+      "key": "bebaaeaf535659498ac0abb195af7b7a025db4daaaf9349b8d24139c0203303f"
+    }
+  },
+  "cache": {
+    "hit": false,
+    "key": "bebaaeaf535659498ac0abb195af7b7a025db4daaaf9349b8d24139c0203303f"
+  },
+  "seed": 820972472,
+  "candidate_fingerprint": "harness_libmodbus_so_5_1_0.c#unknown_function::timeout::c2aa56485a",
+  "fingerprint_matches": false
+}

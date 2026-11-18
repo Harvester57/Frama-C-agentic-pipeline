@@ -1,0 +1,80 @@
+{
+  "mode": "replay",
+  "module": "libmpack_a__mpack_writer_2",
+  "status": "reproduced",
+  "binary": "workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl",
+  "inputs": [
+    "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92",
+    "workspace/crashes/libmpack_a__mpack_writer_2/crash-ebfbdf62234fefb756649dbe99ef66f9d24cf9c8"
+  ],
+  "missing_inputs": [],
+  "per_input_timeout": 10,
+  "rss_limit_mb": 2048,
+  "artifacts": [
+    {
+      "artifact": "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92",
+      "kind": "crash",
+      "sha256": "1fe7fd895f286fcc06a5afa8ef05a77ccfb8db89915cd7b8232b92fa842cb7d5",
+      "size_bytes": 9,
+      "reproducible": true,
+      "failure": {
+        "file": "workspace/work/src/mpack/mpack-writer.c",
+        "line": 1793,
+        "function": "mpack_builder_complete",
+        "kind": "assertion",
+        "alarm_kind": "initialization",
+        "is_rte": true,
+        "label": "rte/initialization",
+        "predicate": "\\initialized(&(builder->current_build)->type)"
+      },
+      "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::initialization::0f273bdef1",
+      "failure_source": "primary",
+      "returncode": 77,
+      "timed_out": false,
+      "seed": 283247170,
+      "replay_log_tail": "ialized(&(builder->current_build)->type): 0\n\t- sizeof(mpack_type_t): 4\n\t- &(builder->current_build)->type: 0x14\n==4226== ERROR: libFuzzer: deadly signal\n    #0 0x634a7689a7d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x907d8) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #1 0x634a7686d3ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x633ac) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #2 0x634a76852327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x48327) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #3 0x756faa726d6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #4 0x756faa77b69b  (/lib/x86_64-linux-gnu/libc.so.6+0x9469b) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #5 0x756faa726c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #6 0x634a76911683 in mpack_builder_complete /framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.instrumented.c:120601:5\n    #7 0x634a7690fb63 in mpack_complete_map /framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.instrumented.c:127336:3\n    #8 0x634a76a373ab in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.instrumented.c:396404:11\n    #9 0x634a76853a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x49a2a) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #10 0x634a7683b923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x31923) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #11 0x634a76841a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x37a61) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #12 0x634a7686df16 in main (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x63f16) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #13 0x756faa710ca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #14 0x756faa710d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #15 0x634a76835f10 in _start (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x2bf10) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n\nNOTE: libFuzzer has rudimentary signal handlers.\n      Combine libFuzzer with AddressSanitizer or similar for better crash reports.\nSUMMARY: libFuzzer: deadly signal\n"
+    },
+    {
+      "artifact": "workspace/crashes/libmpack_a__mpack_writer_2/crash-ebfbdf62234fefb756649dbe99ef66f9d24cf9c8",
+      "kind": "crash",
+      "sha256": "06cebb47290ed3556de3a4120c37c8aa739b3a7277b752563932d3137ede147c",
+      "size_bytes": 9,
+      "reproducible": true,
+      "failure": {
+        "file": "workspace/work/src/mpack/mpack-writer.c",
+        "line": 1793,
+        "function": "mpack_builder_complete",
+        "kind": "assertion",
+        "alarm_kind": "initialization",
+        "is_rte": true,
+        "label": "rte/initialization",
+        "predicate": "\\initialized(&(builder->current_build)->type)"
+      },
+      "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::initialization::0f273bdef1",
+      "failure_source": "primary",
+      "returncode": 77,
+      "timed_out": false,
+      "seed": 283247170,
+      "replay_log_tail": "lized(&(builder->current_build)->type): 0\n\t- sizeof(mpack_type_t): 4\n\t- &(builder->current_build)->type: 0x14\n==4231== ERROR: libFuzzer: deadly signal\n    #0 0x57d24e2007d8 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x907d8) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #1 0x57d24e1d33ac in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x633ac) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #2 0x57d24e1b8327 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x48327) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #3 0x78e067715d6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #4 0x78e06776a69b  (/lib/x86_64-linux-gnu/libc.so.6+0x9469b) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #5 0x78e067715c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #6 0x57d24e277683 in mpack_builder_complete /framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.instrumented.c:120601:5\n    #7 0x57d24e27f3e3 in mpack_complete_array /framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.instrumented.c:127349:3\n    #8 0x57d24e39f28d in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.instrumented.c:396367:11\n    #9 0x57d24e1b9a2a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x49a2a) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #10 0x57d24e1a1923 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x31923) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #11 0x57d24e1a7a61 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x37a61) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #12 0x57d24e1d3f16 in main (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x63f16) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n    #13 0x78e0676ffca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #14 0x78e0676ffd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #15 0x57d24e19bf10 in _start (/framac-run/workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl+0x2bf10) (BuildId: 132d1f9fe5ad20ab34836b114d0545bdf45d4045)\n\nNOTE: libFuzzer has rudimentary signal handlers.\n      Combine libFuzzer with AddressSanitizer or similar for better crash reports.\nSUMMARY: libFuzzer: deadly signal\n"
+    }
+  ],
+  "engine_used": "eacsl",
+  "compile": {
+    "engine": "eacsl",
+    "returncode": 0,
+    "reason": null,
+    "binary": "workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.e-acsl",
+    "compile_log": "workspace/harnesses/cross_eacsl_libmpack_a__mpack_writer_2.compile.log",
+    "cache": {
+      "hit": false,
+      "key": "9565a2cd8b85b18c026c463f92e4c3f29e7e04c94292fcd71ec2413889eb87ec"
+    }
+  },
+  "cache": {
+    "hit": false,
+    "key": "9565a2cd8b85b18c026c463f92e4c3f29e7e04c94292fcd71ec2413889eb87ec"
+  },
+  "seed": 283247170,
+  "candidate_fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::initialization::0f273bdef1",
+  "fingerprint_matches": true
+}

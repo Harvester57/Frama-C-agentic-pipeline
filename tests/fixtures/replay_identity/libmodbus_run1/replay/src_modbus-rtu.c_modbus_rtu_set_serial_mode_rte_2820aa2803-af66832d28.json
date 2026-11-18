@@ -1,0 +1,56 @@
+{
+  "mode": "replay",
+  "module": "libmodbus_so_5_1_0",
+  "status": "reproduced",
+  "binary": "workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl",
+  "inputs": [
+    "workspace/crashes/libmodbus_so_5_1_0/crash-83891d7fe85c33e5"
+  ],
+  "missing_inputs": [],
+  "per_input_timeout": 10,
+  "rss_limit_mb": 2048,
+  "artifacts": [
+    {
+      "artifact": "workspace/crashes/libmodbus_so_5_1_0/crash-83891d7fe85c33e5",
+      "kind": "crash",
+      "sha256": "83891d7fe85c33e52c8b4e5814c92fb6a3b9467299200538a6babaa8b452d879",
+      "size_bytes": 1,
+      "reproducible": true,
+      "failure": {
+        "file": "workspace/work/src/modbus-rtu.c",
+        "line": 1053,
+        "function": "modbus_rtu_set_serial_mode",
+        "kind": "e-acsl_rte",
+        "alarm_kind": null,
+        "is_rte": false,
+        "label": "uninitialized",
+        "predicate": "\\initialized(&ctx->debug)"
+      },
+      "fingerprint": "src/modbus-rtu.c#modbus_rtu_set_serial_mode::e_acsl_rte::2820aa2803",
+      "failure_source": "primary",
+      "returncode": 77,
+      "timed_out": false,
+      "seed": 1326569101,
+      "replay_log_tail": "dbus_so_5_1_0/crash-83891d7fe85c33e5\nThe IP string is empty\nworkspace/work/src/modbus-rtu.c: In function 'modbus_rtu_set_serial_mode'\nworkspace/work/src/modbus-rtu.c:1053: Error: E-ACSL RTE failed:\n\tThe failing predicate is:\n\tuninitialized:\n\t\t\\initialized(&ctx->debug).\n\tWith values at failure point:\n\t- uninitialized: \\initialized(&ctx->debug): 0\n\t- sizeof(int): 4\n\t- &ctx->debug: 0x8\n==138== ERROR: libFuzzer: deadly signal\n    #0 0x5a43d9468918 in __sanitizer_print_stack_trace (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x8c918) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n    #1 0x5a43d943b4ec in fuzzer::PrintStackTrace() (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x5f4ec) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n    #2 0x5a43d9420467 in fuzzer::Fuzzer::CrashCallback() (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x44467) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n    #3 0x7a7b62887d6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #4 0x7a7b628dc69b  (/lib/x86_64-linux-gnu/libc.so.6+0x9469b) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #5 0x7a7b62887c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #6 0x5a43d96363f2 in __gen_e_acsl_modbus_rtu_set_serial_mode /framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.instrumented.c:341736:7\n    #7 0x5a43d961ed04 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.instrumented.c:314321:11\n    #8 0x5a43d9421b6a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x45b6a) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n    #9 0x5a43d9409a63 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x2da63) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n    #10 0x5a43d940fba1 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x33ba1) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n    #11 0x5a43d943c056 in main (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x60056) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n    #12 0x7a7b62871ca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #13 0x7a7b62871d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #14 0x5a43d9404050 in _start (/framac-run/workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl+0x28050) (BuildId: d72a34e9a7c26cab38fa8226c03296c40622a9f4)\n\nNOTE: libFuzzer has rudimentary signal handlers.\n      Combine libFuzzer with AddressSanitizer or similar for better crash reports.\nSUMMARY: libFuzzer: deadly signal\n"
+    }
+  ],
+  "engine_used": "eacsl",
+  "compile": {
+    "engine": "eacsl",
+    "returncode": 0,
+    "reason": null,
+    "binary": "workspace/harnesses/fuzz_libmodbus_so_5_1_0.e-acsl",
+    "compile_log": "workspace/harnesses/fuzz_libmodbus_so_5_1_0.compile.log",
+    "cache": {
+      "hit": false,
+      "key": "2da251117c8edc43ee7346190120900bd26594cd7c6fd646d73dd86ca83f83c3"
+    }
+  },
+  "cache": {
+    "hit": false,
+    "key": "2da251117c8edc43ee7346190120900bd26594cd7c6fd646d73dd86ca83f83c3"
+  },
+  "seed": 1326569101,
+  "candidate_fingerprint": "src/modbus-rtu.c#modbus_rtu_set_serial_mode::rte::2820aa2803",
+  "fingerprint_matches": false
+}
