@@ -93,6 +93,7 @@ Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wa
 | 11:22 | Four of the five negotiations are applied. `_modbus_rtu_pre_check_confirmation` ended `done/rejected` on the old scripts |
 | 11:33 | `requeue --frame-refused` merged live as `1302bdc`; the recovery of that negotiation is queued for the session's next idle moment |
 | 12:02 | Supervisor finds 7 of 15 `running` tasks with no live agent, holding their slots for up to 163 minutes (issue 17) |
+| 13:22 | All six requeued prove tasks merged (33 prove tasks done), and the serial-mode crash verifier closed `done/rejected`. Two results written at 12:18 (`breaker-modbus_set_float_abcd-2`, `prove-modbus_rtu_send_msg_pre`) were never completed by the session, so it was given the `step --complete` command |
 | 12:06 | Requeue commands for the 7 tasks sent to the session. **Supervisor error:** three of the six unprepared tasks came from my 09:35 instruction to run `step` without `--prepare` |
 | 04:49 | Supervisor finds the confirmed `send_msg` loop documented in `docs/modbus_set_error_recovery.md` ("an infinite close/connect loop until success on send call" under `MODBUS_ERROR_RECOVERY_LINK`). The harness had enabled LINK on a context with no peer, so the verdict is a false positive. Guidance prepared: keep the record, report it as documented behaviour, and mask LINK in the regenerated harness |
 
