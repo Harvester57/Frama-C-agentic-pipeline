@@ -143,7 +143,7 @@ def _ingest(
     more: list[dict] | None = None,
 ) -> dict:
     result = run_dir / "agents" / "verifier-1" / "scratch" / "verifier_result.json"
-    data = {
+    data: dict[str, object] = {
         "role": "crash_verifier",
         "agent_id": "verifier-1",
         "candidate_fingerprint": cand_fp,
@@ -297,6 +297,29 @@ def test_a_record_that_keeps_the_fingerprint_cannot_move_the_statement(run_dir):
         _ingest(run_dir, MPACK_EACSL, rec, [MPACK_SAN_REPORT])
     assert f"the candidate's failure: {MPACK_EACSL} at src/mpack/mpack-writer.c:1793" in str(refused.value)
     assert _findings(run_dir) == {}
+
+
+def test_a_refingerprinted_record_counts_a_replay_on_the_failure_it_names(run_dir):
+    """What the refusal above leaves open: a record that says, with a reason, that the defect is the other statement."""
+    candidates = _stage(run_dir, MPACK)
+    del candidates[MPACK_EACSL]["related"]
+    _write_candidates(run_dir, candidates)
+    renamed = make_fingerprint(
+        "src/mpack/mpack-writer.c", "mpack_builder_complete", "mem_access", "no build in progress"
+    )
+    rec = _record(
+        run_dir,
+        candidates[MPACK_EACSL],
+        MPACK_SAN_REPORT,
+        MPACK_INPUT,
+        fingerprint=renamed,
+        location={**candidates[MPACK_EACSL]["location"], "line": 1791},
+    )
+    out = _ingest(
+        run_dir, MPACK_EACSL, rec, [MPACK_SAN_REPORT], reason="The defect is the missing build, two lines up."
+    )
+    assert out["decision"] == "confirmed" and "reproducers_not_compared" not in out
+    assert _findings(run_dir)[renamed]["verdict"] == "confirmed"
 
 
 def _split_off_record(run_dir: Path, candidates: dict[str, dict], input_path: str) -> dict:
