@@ -585,6 +585,14 @@ SEAM_WAS_SAME_FRAME = "the same assigns clauses"
 #   refused_contract  the contract comparison refuses it (an `assigns` clause is gone)
 #   refused_frame     the parent WP report shows no frame and the replaced contract had `assigns`
 #   refused_status    WP did not prove every goal
+#
+# Three of these refusals are of a result that weakened no frame. They are what the gate does today, written
+# down so that a change shows here, not what it should do (open; none occurred in libmodbus run-1):
+#   - guarded_all over a default `assigns`: the result frames every case (complete behaviors, each with a
+#     clause; WP says `present`, the ledger would credit it), the contract comparison still reads the default
+#     behavior's clause as deleted;
+#   - guarded_some and guarded_gap over the same clauses: the replaced contract had `assigns` in a named
+#     behavior only, so it had no frame either, and the refusal asks to "put back" a clause that never was.
 SEAM_MERGE_CASES = {
     ("pure_ok", SEAM_WAS_NONE): "merged",
     ("pure_ok", SEAM_WAS_DEFAULT): "merged",
@@ -741,6 +749,11 @@ def test_a_merge_refused_for_its_frame_credits_nothing(run_dir, monkeypatch) -> 
         credited = _unit_of(fn, cls)
         assert credited["status"] != "covered", (cls, credited["status"], credited["evidence"][-1:])
         assert not any(e.get("discharging") for e in credited["evidence"]), cls
+        # Where a merge refused before WP leaves them (wp_scheduler._park_units): a unit without evidence
+        # cannot be blocked, so it is planned again and owned by no agent. The task keeps the reason.
+        assert (credited["status"], credited["evidence"], credited.get("agent_id")) == ("planned", [], None)
+    L.load_state()  # the ledger still validates
+    assert "frame_summary.assigns_clause='behaviors_only'" in tasks()[f"prove:{SEAM_SRC_FRAME}#{fn}"]["last_reason"]
 
 
 def test_a_merge_refused_for_unproven_goals_still_records_them(run_dir, monkeypatch) -> None:
