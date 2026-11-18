@@ -178,6 +178,11 @@ ARRAY_ELEMENTS = 4
 # The elements of an array of byte strings: distinct, NUL-terminated, the empty string included.
 ARRAY_STRINGS = ("", "a", "bc", "def")
 ARRAY_STRING_BYTES = 16  # the storage of each element of an array of `const` strings
+# An input string of no known size whose call may not take the rest of the input (a constructor
+# that builds a handle: libmodbus's `modbus_new_tcp(const char *ip, int port)`): a slot of this many
+# input bytes, its last byte 0. Small, since the slot is read whole or not at all; room for a dotted
+# IPv4 address or `/dev/ttyUSB0` and its NUL.
+STRING_SLOT_BYTES = 16
 # The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`.
 _ARRAY_COUNT_RE = re.compile(r"[Cc]ount|[Cc]nt|^n(?:[A-Z_0-9]|$)|^num|^N$|[Nn]memb|[Nn]elem|[Nn]items")
 # `len` and `size` count elements too, except after a struct pointer: `(struct ctx *c, size_t size)`
@@ -778,7 +783,8 @@ def _construct(
     An out-parameter constructor gets `&var` (`H var = 0;`), and the call runs only when it wrote a
     handle (`var != 0`); a child handle's parent is built first, the child's constructor runs only on
     a built parent, and the parent is released after the call: it owns the child. An out-parameter
-    constructor never takes the rest of the input: it stays for the call under test.
+    constructor never takes the rest of the input: it stays for the call under test (an unsized
+    input string of it is a `STRING_SLOT_BYTES` slot, NUL-terminated, `_bind_call`).
     """
     api = case.api
     if htype in api.ctors:
@@ -1160,6 +1166,24 @@ def _bind_call(
                     args.append(ln)
                     pairs.append((i, ln, False))
                 i += 2
+                continue
+            if charlike and size is None and is_input and pointee in ("char", "signed char") and (
+                case.rest is _RESERVED_REST
+            ):
+                # A string of a call that may not take the rest (a constructor, `_construct`, or a
+                # lifecycle case's): a bounded input slot, NUL-terminated. A zeroed buffer would be the
+                # empty string, which a constructor may refuse (modbus_new_tcp returns NULL on it).
+                case.decls.append(_byte_buffer(_storage(STRING_SLOT_BYTES), case.declare(v), STRING_SLOT_BYTES))
+                case.slot(v, STRING_SLOT_BYTES, call, i, "bytes", addr=False)
+                case.post.append(f"{v}[sizeof({v}) - 1] = 0;")
+                case.note(
+                    call,
+                    i,
+                    f"string of no known size: a {STRING_SLOT_BYTES}-byte input slot, NUL-terminated "
+                    "(the rest of the input stays for the calls after it)",
+                )
+                args.append(f"({p['type']}){v}")
+                i += 1
                 continue
             if charlike:
                 buf = size or case.spare
@@ -2002,7 +2026,9 @@ def lifecycle_case(
 ) -> tuple[str | None, dict | None, str | None]:
     """
     A synthesized call sequence on one handle (H2): the constructor builds it (call 0, its arguments
-    from the input as in any case), then while the input lasts, up to `max_calls` times, one input
+    from the input as in any case, except that it never takes the rest of the input: an unsized input
+    string is a `STRING_SLOT_BYTES` slot, NUL-terminated, and an unsized byte pair a spare buffer with
+    a clamped length), then while the input lasts, up to `max_calls` times, one input
     byte picks one of `methods` (call k + 1 for methods[k]), called on the handle with its other
     arguments read from the input at that point, then the destructor releases the handle. Only the
     constructor's slots are fixed, so they are the layout's slots (seeds start from the constructor's
@@ -2034,14 +2060,20 @@ def _lifecycle_case(
     ncalls = len(methods) + 2
     case = _Case(spare, api, calls=ncalls)
     formals = list(crec.get("formals") or [])
-    if out is None:
-        make = _bind_call(case, 0, ctor, cparams, formals, crec, allow_init=False)
-        # Without initializers the statement is the call alone: keep its result instead of dropping it.
-        make = make.replace("(void)", f"{htype} {case.declare('fc_h')} = ", 1)
-    else:
-        # An out-parameter constructor writes the handle; one that fails leaves it NULL.
-        make = _bind_call(case, 0, ctor, cparams, formals, crec, {out: "&fc_h"}, allow_init=False)
-        make = f"{htype} {case.declare('fc_h')} = 0; {make}"
+    # The method loop reads its op bytes and arguments after the constructor's slots: the constructor
+    # never takes the rest of the input (the layout's `rest` is null), as in `_construct`.
+    case.rest = _RESERVED_REST
+    try:
+        if out is None:
+            make = _bind_call(case, 0, ctor, cparams, formals, crec, allow_init=False)
+            # Without initializers the statement is the call alone: keep its result instead of dropping it.
+            make = make.replace("(void)", f"{htype} {case.declare('fc_h')} = ", 1)
+        else:
+            # An out-parameter constructor writes the handle; one that fails leaves it NULL.
+            make = _bind_call(case, 0, ctor, cparams, formals, crec, {out: "&fc_h"}, allow_init=False)
+            make = f"{htype} {case.declare('fc_h')} = 0; {make}"
+    finally:
+        case.rest = None
     branches: list[str] = []
     for k, name in enumerate(methods):
         rec = records[name]

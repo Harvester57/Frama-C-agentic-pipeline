@@ -75,7 +75,7 @@
       "additionalProperties": false
     },
     "lifecycle_case": {
-      "$comment": "A synthesized call sequence on one opaque handle (api_harness.lifecycle_case): `calls` are its constructor (call 0, whose arguments are the slots) and destructor; up to `max_calls` calls of `methods`, each picked by one input byte, run on the handle in between, their arguments read from the input in the loop.",
+      "$comment": "A synthesized call sequence on one opaque handle (api_harness.lifecycle_case): `calls` are its constructor (call 0, whose arguments are the slots; it never takes the rest of the input, so `rest` is null: an unsized input string is a `bytes` slot of api_harness.STRING_SLOT_BYTES, its last byte forced to 0) and destructor; up to `max_calls` calls of `methods`, each picked by one input byte, run on the handle in between, their arguments read from the input in the loop.",
       "type": "object",
       "properties": {
         "selector": {"type": "integer", "minimum": 0, "maximum": 254},

@@ -227,6 +227,114 @@ def test_a_lib_new_kind_constructor_builds_the_handle():
     assert "modbus_new_tcp(" in flush and "modbus_flush(" in flush and "modbus_free(" in flush
 
 
+def _lifecycle_sidecar(stmt: str, layout: dict, entry_fn: str) -> dict:
+    layout["selector"] = 0
+    return {
+        "module": "lib",
+        "harness_file": "harness_lib.c",
+        "sources": ["lib.c"],
+        "cppflags": "",
+        "entry_fn": entry_fn,
+        "entry_style": "dispatch",
+        "dispatch_cases": [stmt],
+        "api_harness": True,
+        "api_cases": [layout],
+    }
+
+
+@pytest.mark.unit
+def test_a_lifecycle_constructor_string_is_a_bounded_slot_never_the_rest():
+    """
+    libmodbus run-1: `modbus_new_tcp(const char *ip, int port)` as a lifecycle constructor bound its
+    unsized string to the rest of the input (`rest: {kind: string}`), which the schema forbids (the
+    method loop reads its op bytes after the constructor): `$.api_cases[67].rest: expected type null`.
+    The string is a bounded input slot, NUL-terminated, and the rest stays null.
+    """
+    recs = {
+        "modbus_new_tcp": _rec("modbus_new_tcp", "struct _modbus *(char const *,int)", "const_pointer", "value"),
+        "modbus_free": _rec("modbus_free", "void(struct _modbus *)", "pointer"),
+        "modbus_flush": _rec("modbus_flush", "int(struct _modbus *)", "pointer"),
+    }
+    api = ah.ApiInfo(
+        probed=True,
+        records={"modbus_new_tcp": recs["modbus_new_tcp"]},
+        handles={"modbus_free": {0: MODBUS}, "modbus_flush": {0: MODBUS}},
+        ctors={MODBUS: "modbus_new_tcp"},
+        dtors={MODBUS: "modbus_free"},
+        dtor_names={MODBUS: {"modbus_free"}},
+        returns={"modbus_new_tcp": MODBUS},
+    )
+    stmt, layout, why = ah.lifecycle_case(MODBUS, ["modbus_flush"], recs, SPARE, api)
+    assert stmt is not None and layout is not None, why
+    n = ah.STRING_SLOT_BYTES
+    assert layout["rest"] is None
+    assert layout["slots"] == [
+        {"call": 0, "param": 0, "size": n, "kind": "bytes"},
+        {"call": 0, "param": 1, "size": 4, "kind": "int"},
+    ]
+    # A stack buffer of the slot's size, read from the input (fuzz_off advances), its last byte 0.
+    assert f"unsigned char c0a0[{n}]; memset(c0a0, 0, sizeof(c0a0));" in stmt
+    assert "memcpy(c0a0, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), sizeof(c0a0)); fuzz_off += sizeof(c0a0);" in stmt
+    assert "c0a0[sizeof(c0a0) - 1] = 0;" in stmt
+    assert "rest_n" not in stmt and "static _Alignas" not in stmt.split("fc_h =")[0]
+    assert f"{MODBUS} fc_h = modbus_new_tcp((char const *)c0a0, c0a1);" in stmt
+    assert any("NUL-terminated" in note for note in layout.get("notes") or [])
+    assert list(va.validate_sidecar(_lifecycle_sidecar(stmt, layout, "modbus_new_tcp"), "lib")) == []
+    # A recorded string seeds the slot (padded to its size), then the port.
+    calls = [{"fn": "modbus_new_tcp", "args": {"0": [["s", 0, b"127.0.0.1".hex()]], "1": [["i", 0, "f6010000"]]}}]
+    seed = b"\x00" + b"127.0.0.1".ljust(n, b"\0") + b"\xf6\x01\x00\x00"
+    assert sh.layout_seeds([layout], calls, [])[0] == [seed]
+
+
+@pytest.mark.unit
+def test_an_out_parameter_lifecycle_constructor_string_is_a_bounded_slot_never_the_rest():
+    """The out-parameter form (`int ctx_open(struct ctx **out, const char *path)`) gets the same slot."""
+    recs = {
+        "ctx_open": _rec("ctx_open", "int(struct ctx **,char const *)", "pointer", "const_pointer"),
+        "ctx_free": RECORDS["ctx_free"],
+        "ctx_sum": RECORDS["ctx_sum"],
+    }
+    api = ah.ApiInfo(
+        probed=True,
+        records={"ctx_open": recs["ctx_open"]},
+        handles={"ctx_free": {0: CTX}, "ctx_sum": {0: CTX}},
+        dtors={CTX: "ctx_free"},
+        dtor_names={CTX: {"ctx_free"}},
+        out_ctors={CTX: ("ctx_open", 0)},
+    )
+    stmt, layout, why = ah.lifecycle_case(CTX, ["ctx_sum"], recs, SPARE, api)
+    assert stmt is not None and layout is not None, why
+    assert layout["rest"] is None
+    assert layout["slots"] == [{"call": 0, "param": 1, "size": ah.STRING_SLOT_BYTES, "kind": "bytes"}]
+    assert "c0a1[sizeof(c0a1) - 1] = 0;" in stmt and "ctx_open((struct ctx **)&fc_h, (char const *)c0a1);" in stmt
+    assert list(va.validate_sidecar(_lifecycle_sidecar(stmt, layout, "ctx_open"), "lib")) == []
+
+
+@pytest.mark.unit
+def test_a_lifecycle_constructor_byte_pair_never_takes_the_rest():
+    """An unsized (buffer, length) input pair of the constructor: a spare buffer and a clamped length slot."""
+    recs = {
+        "ctx_from": _rec("ctx_from", "struct ctx *(unsigned char const *,size_t)", "const_pointer", "value"),
+        "ctx_free": RECORDS["ctx_free"],
+        "ctx_sum": RECORDS["ctx_sum"],
+    }
+    api = ah.ApiInfo(
+        probed=True,
+        records={"ctx_from": recs["ctx_from"]},
+        handles={"ctx_free": {0: CTX}, "ctx_sum": {0: CTX}},
+        ctors={CTX: "ctx_from"},
+        dtors={CTX: "ctx_free"},
+        dtor_names={CTX: {"ctx_free"}},
+        returns={"ctx_from": CTX},
+    )
+    stmt, layout, why = ah.lifecycle_case(CTX, ["ctx_sum"], recs, SPARE, api)
+    assert stmt is not None and layout is not None, why
+    assert layout["rest"] is None
+    assert layout["slots"] == [{"call": 0, "param": 1, "size": 8, "kind": "int"}]
+    assert "fuzz_len - fuzz_off)" not in stmt.split("fc_h =")[1].split(";")[0]
+    assert list(va.validate_sidecar(_lifecycle_sidecar(stmt, layout, "ctx_from"), "lib")) == []
+
+
 # --- end to end: a use after free only a sequence of calls reaches ----------------------------------
 
 LIB_H = """#include <stddef.h>
