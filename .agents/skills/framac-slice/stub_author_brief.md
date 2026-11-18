@@ -11,7 +11,7 @@ Your task is to write the ACSL contracts of the external library functions in `{
 - **Your header (the only run file you may change):** `{header}`, a path relative to the run directory. Edit it on the host as `{run_dir}/{header}`; commands name it `{header}`. Your scratch directory `{run_dir}/agents/{agent_id}/scratch/` is for the script files of your commands.
 - **Functions to contract (state `draft` or `incomplete` in `workspace/reports/stubs.json`):** {functions}
 - **Their callers in the target (`file#function`):** {callers}
-- **The real header, for the types, macros and comments:** `{real_header}`, a path on the build's system. Read it on the host in the run's snapshot, `{run_dir}/workspace/snapshot/root{real_header}`; when the snapshot has no copy, read it in the container through the wrapper (`cat {real_header}`)
+- **The real header, for the types, macros and comments:** `{real_header}`, a path on the build's system. Read it on the host in the run's snapshot, `{run_dir}/workspace/snapshot/root{real_header}` (a libc header the build image adds is under `snapshot/libc` instead); when the snapshot has no copy, read it in the container through the wrapper (`cat {real_header}`)
 - **The library's documentation:** its man pages, the comments of the real header, its project documentation. Cite what you rely on in a C comment above the contract (`/* man 3 foo: "..." */`).
 
 <!-- run-commands -->

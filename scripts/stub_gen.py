@@ -512,7 +512,7 @@ def run_command_values(run_dir: Path, agent_id: str) -> dict[str, str]:
     return {
         "agent_id": agent_id,
         "target_dir": path(os.environ.get("FRAMAC_TARGET_HOST") or run_meta.get("target") or "/target"),
-        "run_dir": path(os.environ.get("FRAMAC_RUN_HOST") or run_meta.get("run_dir_host") or str(run_dir)),
+        "run_dir": path(os.environ.get("FRAMAC_RUN_HOST") or run_meta.get("run_dir_host") or str(run_dir.resolve())),
         "pipeline_dir": workspace_overlay._pipeline_host_dir(references_host),
     }
 
