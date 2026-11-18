@@ -771,6 +771,30 @@ def test_a_class_the_name_does_not_spell_is_written_in_the_kind(built_meta):
     )
 
 
+@pytest.mark.unit
+def test_a_failed_guard_of_a_property_names_the_property(built_meta):
+    # E-ACSL guards what a property's predicate reads; such a guard has the property's line, no label of it.
+    sidecar = json.loads(failure_identity.meta_sidecar_path(built_meta).read_text(encoding="utf-8"))
+    line = next(int(k) for k, v in sidecar["line_names"].items() if v == "L5_sanitized_logmsg")
+    args = (built_meta, "process", line, "E-ACSL RTE", "memory access", r"\valid_read(s + i)", "")
+    failure = failure_identity.parse_runtime_failure(eacsl_report(*args))
+    assert failure["meta_property"] == "L5_sanitized_logmsg" and failure["meta_guard"] == "memory access"
+    assert (failure["file"], failure["line"], failure["function"]) == ("src/prog.c", 0, "process")
+    assert failure["predicate"] == r"L5_sanitized_logmsg: meta: guard memory access: \valid_read(s + i)"
+    fp = failure_identity.failure_fingerprint(failure)
+    assert fp.startswith("src/prog.c#process::meta_l5_sanitized_logmsg::") and fingerprint.is_valid_fingerprint(fp)
+    violated = failure_identity.parse_runtime_failure(
+        eacsl_report(built_meta, "process", line, "Assertion", "L5_sanitized_logmsg/meta", "no_crlf_string(line)", "")
+    )
+    assert fp != failure_identity.failure_fingerprint(violated)
+    # A line of the meta file that holds no property, or a meta file without its sidecar: as before.
+    for report in (
+        eacsl_report(built_meta, "process", 1, "E-ACSL RTE", "memory access", "P", ""),
+        eacsl_report("elsewhere/fuzz_m.security_meta.c", "process", line, "E-ACSL RTE", "memory access", "P", ""),
+    ):
+        assert "meta_property" not in failure_identity.parse_runtime_failure(report)
+
+
 RTE_REPORT = (
     "prog.c: In function 'mix'\n"
     "prog.c:48: Error: Assertion failed:\n"

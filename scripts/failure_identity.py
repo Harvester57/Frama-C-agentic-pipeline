@@ -618,6 +618,13 @@ def _meta_sidecar(meta_file: str) -> dict:
     return data
 
 
+def _meta_guarded_property(file_: str, line_: int) -> str:
+    """The property written at `line_` of meta file `file_` (the sidecar's `line_names`), '' when unknown."""
+    names = _meta_sidecar(file_).get("line_names")
+    name = names.get(str(line_)) if isinstance(names, dict) else None
+    return name if isinstance(name, str) else ""
+
+
 def _meta_class(name: str) -> str | None:
     """The obligation class a property's name spells (run_wp_function.goal_obligation_class), or None."""
     from run_wp_function import goal_obligation_class  # here: run_wp_function is not needed to parse anything else
@@ -718,6 +725,15 @@ def parse_eacsl_failure(text: str) -> dict | None:
         return _meta_failure(
             text, meta.group("name"), file_ or "unknown", line_, function or "unknown_function", kind, predicate
         )
+    guarded = _meta_guarded_property(file_, line_)
+    if guarded:
+        # A guard E-ACSL puts on the evaluation of a property's predicate (`\valid_read` of what it
+        # reads, an index of its quantifier) failed: it has the property's line and no `/meta` label.
+        guard = _meta_failure(
+            text, guarded, file_, line_, function or "unknown_function", kind, f"guard {label}: {predicate}"
+        )
+        guard["meta_guard"] = label
+        return guard
     # A label names the alarm; inside the predicate only a label-like use counts, never an identifier.
     alarm = detect_alarm_kind(label) or detect_predicate_alarm_kind(predicate)
     explicit_rte_prefix = label.lower().startswith("rte") or predicate.lower().startswith("rte")
