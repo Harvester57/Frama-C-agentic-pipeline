@@ -130,6 +130,22 @@ def test_unit_cppflags_are_single_tokens() -> None:
     assert forced == ["workspace/work/config.h"]
 
 
+def test_generated_force_include_resolves_to_its_snapshot_copy() -> None:
+    """libmodbus run-1: `-include config.h` names ./configure's output, absent from workspace/work."""
+    flags = ["-DHAVE_CONFIG_H", "-I", "src", "-include", "config.h", "-include", "./src/own.h"]
+    _, forced = bcd.unit_cppflags(flags, ["src"], "workspace/work", generated=["config.h", "src/modbus-version.h"])
+    assert forced == ["workspace/snapshot/generated/config.h", "workspace/work/src/own.h"]
+    # Through unit_view: the capture's exported generated headers decide.
+    model = _model()
+    model["units"]["lib/libkv.a"]["cppflags"] = ["-include", "config.h"]
+    capture = {"snapshot": {"generated": {"headers": ["config.h"], "include_dirs": ["."]}}}
+    dag = bcd.unit_view(bcd.model_view(model), model, root="workspace/work", capture=capture)
+    assert dag["modules"]["libkv_a"]["force_includes"] == ["workspace/snapshot/generated/config.h"]
+    # Without a capture listing it, a force-include stays in the tree.
+    dag = bcd.unit_view(bcd.model_view(model), model, root="workspace/work")
+    assert dag["modules"]["libkv_a"]["force_includes"] == ["workspace/work/config.h"]
+
+
 def test_harness_sources_follow_the_callees_lexer_module(tmp_path: Path) -> None:
     import generate_harness
 
