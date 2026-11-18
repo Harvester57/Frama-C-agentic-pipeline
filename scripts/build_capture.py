@@ -16,7 +16,8 @@ the run's named Docker volume at /framac-scratch:
   1. copy the read-only target to <scratch>/tree (without .git and pipeline output) and run the recipe's
      command there, under `bear intercept`, through sandbox_exec.py (rlimits, env allowlist, timeout);
   2. read compile, link and archive steps from the intercepted executions, drop build-system probes
-     (CMake try-compiles and compiler identification, autoconf conftest, meson-private);
+     (CMake try-compiles and compiler identification, autoconf conftest, meson-private, and compiles
+     outside the tree in a temp dir such as config.guess's `$TMPDIR/cgXXXXXX/dummy.c`);
   3. link units: every executable, shared and static library; its files are the sources of its own
      objects, `links` the project libraries it links (`.a` members followed through `ar`, `-l` resolved
      against the produced artifacts). Objects linked into nothing form one `unlinked:<dir>` unit per dir.
@@ -590,6 +591,19 @@ def is_probe_path(path: str) -> bool:
     return bool(parts) and parts[-1].startswith("conftest")
 
 
+def is_temp_probe(path: str) -> bool:
+    """A compile outside the tree in a temp dir (GNU config.guess's `$TMPDIR/cgXXXXXX/dummy.c` libc probe).
+
+    `path` comes from norm_in_tree: in-tree paths are relative, so only an absolute one can match; an
+    out-of-tree source elsewhere (a sibling checkout, a shared dir) is kept.
+    """
+    if not posixpath.isabs(path):
+        return False
+    p = posixpath.normpath(path)
+    temps = {"/tmp", "/var/tmp", posixpath.normpath(os.environ.get("TMPDIR") or "/tmp")}
+    return any(p.startswith(t.rstrip("/") + "/") for t in temps if posixpath.isabs(t) and t != "/")
+
+
 def parse_driver(args: list[str]) -> dict:
     """Split a compiler driver command line into its parts."""
     res: dict[str, Any] = {
@@ -782,7 +796,11 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
         rel_cwd = norm_in_tree(".", cwd, tree)
         srcs = [norm_in_tree(s, cwd, tree) for s in d["sources"]]
         out_rel = norm_in_tree(d["output"], cwd, tree) if d["output"] else None
-        if is_probe_path(rel_cwd) or any(is_probe_path(s) for s in srcs) or (out_rel and is_probe_path(out_rel)):
+        if (
+            is_probe_path(rel_cwd)
+            or any(is_probe_path(s) or is_temp_probe(s) for s in srcs)
+            or (out_rel and (is_probe_path(out_rel) or is_temp_probe(out_rel)))
+        ):
             probes += 1
             continue
         flags, system = split_flags(d["pp"], cwd, tree)

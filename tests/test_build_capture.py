@@ -136,6 +136,29 @@ class TestRecordedEvents:
         for p in ("build/CMakeFiles/foo.dir/foo.c.o", "src/a.c", ".", "contest.c"):
             assert not bc.is_probe_path(p), p
 
+    def test_config_guess_temp_dir_probe_is_dropped(self):
+        # libmodbus run-1: GNU config.guess compiles $TMPDIR/cgXXXXXX/dummy.c to detect the libc; it became
+        # a product unit `unlinked:/tmp/cg7zzCGG` whose source phase0_model could not find.
+        execs = [
+            {
+                "exe": "/usr/bin/cc",
+                "args": ["cc", "-c", "-o", "/tmp/cg7zzCGG/dummy.o", "/tmp/cg7zzCGG/dummy.c"],
+                "cwd": TREE,
+            },
+            {"exe": "/usr/bin/cc", "args": ["cc", "-c", "/var/tmp/cgAbCdEf/dummy.c"], "cwd": TREE},
+            {"exe": "/usr/bin/cc", "args": ["cc", "-c", "-o", "src/a.o", "src/a.c"], "cwd": TREE},
+            # an out-of-tree source that is not in a temp dir stays
+            {"exe": "/usr/bin/cc", "args": ["cc", "-c", "-o", "src/b.o", "/s/shared/b.c"], "cwd": TREE},
+        ]
+        cap = bc.classify_executions(execs, TREE)
+        assert sorted(cap["compiles"]) == ["src/a.o", "src/b.o"]
+        assert cap["probes_dropped"] == 2
+        units = bc.derive_units(cap, TREE)
+        assert not [n for n in units if "/tmp/" in n], units
+        assert bc.is_temp_probe("/tmp/cg7zzCGG/dummy.c")
+        for p in ("src/a.c", "/s/shared/b.c", "/tmpfoo/x.c", "tmp/x.c"):
+            assert not bc.is_temp_probe(p), p
+
     def test_joined_and_separate_flags(self):
         cap = capture_of("flags")
         f = cap["compiles"]["src/f.o"]
