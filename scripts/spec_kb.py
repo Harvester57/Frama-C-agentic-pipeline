@@ -59,6 +59,8 @@ MAX_NOTE_CHARS = 160
 # wp_scheduler._emit_negotiations: a request the scheduler never sent to a callee prover (callee not found,
 # self-request, caps, callee not provable). It says nothing about the clause itself.
 STRUCTURAL_REJECTION_PREFIX = "not dispatched:"
+# A parent WP re-check refused for memory (run_wp_function.py): WP never ran, so it says nothing about the clause either.
+MEMORY_REFUSAL_NOTE = "insufficient_memory"
 
 _STOPWORDS = frozenset(
     """the a an and or not if else for while do return int char void long short unsigned signed const
@@ -433,6 +435,8 @@ def _request_obstruction(req: dict) -> dict | None:
     callee = str(req.get("callee_function") or "")
     if note.startswith(STRUCTURAL_REJECTION_PREFIX) or not clause or not callee or not req.get("id"):
         return None
+    if MEMORY_REFUSAL_NOTE in note:  # WP never started: nothing was learned about this clause
+        return None
     return {
         "id": f"req:{req['id']}",
         "kind": "rejected_strengthening",
@@ -510,6 +514,21 @@ def mine_obstructions(run_dir: Path, out_path: Path | None = None) -> dict:
     except OSError:
         pass
     return out
+
+
+def forget_memory_refusals(run_dir: Path) -> int:
+    """Drop stored dead ends that only record a WP run refused for memory; returns how many were dropped."""
+    run_dir = Path(run_dir)
+    path = kb_dir_of(run_dir / "workspace") / OBSTRUCTIONS_FILE
+    with run_lock("spec-kb", run_dir=run_dir):
+        doc = _load_quiet(path, {})
+        items = doc.get("items")
+        if not isinstance(items, list):
+            return 0
+        kept = [i for i in items if not (isinstance(i, dict) and MEMORY_REFUSAL_NOTE in str(i.get("resolution_note")))]
+        if len(kept) != len(items):
+            atomic_write_json(path, {**doc, "items": kept, "updated_at": utc_now()})
+    return len(items) - len(kept)
 
 
 def _plain_name(name: str) -> str:

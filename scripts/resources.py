@@ -1539,7 +1539,7 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"(?:^|[\s;&|(/])e-acsl-gcc(?:\.sh)?(?:\s|$)", "build"),
     (r"(?:^|[\s;&|(/])(?:clang|gcc)\b[^;&|]*-fsanitize=[^\s;&|]*fuzzer", "build"),
     (r"workspace_overlay\.py\s+merge-(?:agent|batch)\b", "verify"),
-    (r"wp_scheduler\.py\s+(?:complete|merge-pending)\b", "verify"),
+    (r"wp_scheduler\.py\s+(?:step|complete|merge-pending)\b", "verify"),
     # A direct Frama-C call (parse or annotation check): one single-threaded kernel, like Eva.
     (r"(?:^|[\s;&|(/])frama-c(?:\s|$)", "eva"),
 )

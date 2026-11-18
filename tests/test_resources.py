@@ -1796,6 +1796,12 @@ def test_infer_class_run_eacsl_fuzz_subcommand_precedes_build_module_name():
     assert R.infer_class("python3 $S/run_eacsl_fuzz.py build --module build") == "build"
 
 
+def test_infer_class_scheduler_commands_that_merge_run_in_the_verify_class():
+    for sub in ("step --complete prove-a --slots auto --prepare", "complete --agent-id prove-a", "merge-pending"):
+        assert R.infer_class(f"python3 $S/wp_scheduler.py {sub}") == "verify", sub
+    assert R.infer_class("python3 $S/wp_scheduler.py status") == "light"
+
+
 def test_infer_class_sizes_build_check_like_run_build():
     # build-check runs `run build`; as `light` (1 GiB) Frama-C was killed instrumenting CryptoLib's crypto.
     for cmd in ("python3 $S/pipeline_make.py build-check", "python3 $S/pipeline_make.py --run-dir . build-check"):
