@@ -46,8 +46,11 @@ CLASSES = [
     "rte",
     "l2_termination",
     "l3_frame",
+    "l3_isolation",
     "l4_auth_state",
     "l4_auth_required",
+    "l4_invariant",
+    "l4_call_rule",
     "l5_sanitized",
     "l6_wiped",
     "l6_no_leak",
@@ -611,19 +614,44 @@ def security_props_lines(props: dict | None) -> list[str]:
     """
     Threat-model items security_props.py turned into no property (a returned secret, a name the build
     lacks, an unusable sink parameter), from its warnings, so the report says what was not checked.
+    A forwarding sink whose property was kept (`output sink <name>: it forwards to ...`) has its
+    property: it is listed apart, as a property checked at a weaker place than the threat model allows.
     """
     if not isinstance(props, dict):
         return []
-    items = [
-        str(w) for w in props.get("warnings") or [] if str(w).startswith(("secret ", "auth gate ", "output sink "))
-    ]
-    if not items:
-        return []
-    out = ["### Threat-model items without a property", ""]
-    out += [f"- {md_escape(w)}" for w in items[:30]]
-    if len(items) > 30:
-        out.append(f"- ... and {len(items) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
-    return [*out, ""]
+    items: list[str] = []
+    kept: list[str] = []
+    for raw in props.get("warnings") or []:
+        w = str(raw)
+        if not w.startswith(("secret ", "auth gate ", "output sink ")):
+            continue
+        (kept if _is_kept_forwarding_sink(w) else items).append(w)
+    out: list[str] = []
+    for heading, intro, found in (
+        ("### Threat-model items without a property", None, items),
+        (
+            "### Output sinks whose property is checked before their buffer is complete",
+            "Each of these sinks has its property, checked at its own calls: it forwards to a declared sink, "
+            "and one of its calls through a pointer also reaches a function that reaches no declared sink.",
+            kept,
+        ),
+    ):
+        if not found:
+            continue
+        out += [heading, ""]
+        if intro:
+            out += [intro, ""]
+        out += [f"- {md_escape(w)}" for w in found[:30]]
+        if len(found) > 30:
+            out.append(f"- ... and {len(found) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
+        out.append("")
+    return out
+
+
+def _is_kept_forwarding_sink(warning: str) -> bool:
+    """security_props.py's warning for a forwarding sink it could not move to the innermost sinks."""
+    head, sep, rest = warning.partition(": ")
+    return bool(sep) and head.startswith("output sink ") and rest.startswith("it forwards to ")
 
 
 def trust_lines(model: dict | None) -> list[str]:

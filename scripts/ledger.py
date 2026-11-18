@@ -32,13 +32,15 @@ Subcommands (run with the run directory as working directory):
 
 Units are function x obligation class (docs/guides/v2-design.md, Section 5). The security classes come
 from scripts/security_props.py (step I9) when its report exists: l3_frame for every function writing
-through a pointer, and one class per MetAcsl property kind (l4_auth_state, l4_auth_required,
-l5_sanitized, l6_wiped, l6_no_leak) on the functions holding its generated annotations; each such unit
+through a pointer, and one class per MetAcsl property kind (l3_isolation, l4_auth_state,
+l4_auth_required, l4_invariant, l4_call_rule, l5_sanitized, l6_wiped, l6_no_leak) on the functions
+holding its generated annotations; each such unit
 names the properties it must discharge under `bookkeeping.security_properties`. An obligation
 security_props.py decided from the model (plan step M2) is recorded under
 `bookkeeping.decided_properties` at seed time: a violation blocks the unit, and a unit whose every
-property was decided satisfied is covered by evidence of phase `static`. `ingest-wp` also credits an
-L4-L6 unit whose properties MetAcsl loaded and decided statically (no goal left). Every write
+property was decided satisfied is covered by evidence of phase `static`. `ingest-wp` also credits a
+MetAcsl-class unit whose properties MetAcsl loaded and decided statically (no goal left), unless an
+Eva module left a check of them open (`bookkeeping.eva_verdicts`). Every write
 is validated against schemas/ before it is committed atomically; an invalid
 result is never written. Every read-modify-write holds the run-wide `ledger` lock
 (framac_common.run_lock), so concurrent containers of one run never lose updates.
@@ -106,15 +108,28 @@ LEDGER = Path("coverage-ledger.json")
 CANDIDATES = Path("candidates.json")
 FINDINGS = Path("findings.json")
 
-# The DAG's own layer facts (build_callgraph_dag.py). Layers 4-6 are the MetAcsl classes below.
+# The DAG's own layer facts (build_callgraph_dag.py). Layers 4-6, and the isolation of an asset in
+# Layer 3, are the MetAcsl classes below.
 LAYER_TO_CLASS = {2: "l2_termination", 3: "l3_frame"}
-# Step I9: classes keyed to the MetAcsl properties of scripts/security_props.py.
-SECURITY_CLASSES = ("l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
+# Step I9: classes keyed to the MetAcsl properties of scripts/security_props.py. l3_isolation (asset
+# writers and readers), l4_invariant and l4_call_rule are the kinds of
+# docs/plans/metacsl-exploitation-plan.md, section 3.3; l3_frame is the plain assigns obligation, which
+# WP's own goals credit, and is no MetAcsl class.
+METACSL_CLASSES = (
+    "l3_isolation",
+    "l4_auth_state",
+    "l4_auth_required",
+    "l4_invariant",
+    "l4_call_rule",
+    "l5_sanitized",
+    "l6_wiped",
+    "l6_no_leak",
+)
+SECURITY_CLASSES = ("l3_frame", *METACSL_CLASSES)
 DEFAULT_SECURITY_PROPS = Path("workspace/reports/security_props.json")
 # The stub overlay's report (scripts/stub_gen.py) and its stub-check (scripts/stub_check.py).
 DEFAULT_STUB_REPORT = Path(STUB_REPORT_REL)
 DEFAULT_STUB_CHECK = Path("workspace/reports/stub_check.json")
-METACSL_CLASSES = ("l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak")
 # Plan step M2: obligations security_props.py decided from the model, recorded at seed time as
 # evidence of this phase. A seed refresh re-derives a unit whose only evidence is of this phase.
 DECIDED_VERDICTS = ("satisfied", "violated")
@@ -698,9 +713,33 @@ def _decided_only(unit: dict) -> bool:
     return bool(bk.get("decided_properties")) and not bk.get("security_properties")
 
 
+def _meta_no_goal_credit_barred(unit: dict) -> str | None:
+    """
+    Why a MetAcsl-class unit WP has no goal for must not be credited as decided statically
+    (`wp_meta_simplified`), or None. The no-goal credit rests on MetAcsl having dropped every instance
+    as obviously true in the per-function parse; it has no proof behind it, so anything that says an
+    instance exists and is open outweighs it:
+
+      - an Eva module left a check of the unit's properties Unknown, Invalid or unclassified
+        (`bookkeeping.eva_verdicts`, the verdicts of EVA_BLOCKING that keep `ingest-eva` from covering
+        the unit): the module parse generated a check the per-function parse did not.
+
+    A goal WP proves is not concerned: it credits the unit whatever Eva left open.
+    """
+    verdicts = (unit.get("bookkeeping") or {}).get("eva_verdicts") or {}
+    blocking = sorted(m for m, v in verdicts.items() if v in EVA_BLOCKING)
+    if blocking:
+        return (
+            "Eva left a check of them open in module(s) "
+            + ", ".join(f"'{m}' ({verdicts[m]})" for m in blocking)
+            + ", so an instance exists that this run did not prove"
+        )
+    return None
+
+
 def _meta_decided_statically(unit: dict, report: dict) -> bool:
     """
-    Whether a WP run that ended `all_proven` with no goal of an L4-L6 unit's class decided it: MetAcsl
+    Whether a WP run that ended `all_proven` with no goal of a MetAcsl unit's class decided it: MetAcsl
     loaded every property the unit must discharge (`security_props.properties` of the report) and its
     simplification (-meta-simpl, the default) dropped each instance in the function as obviously true
     (a global separated from the secret, a write of a local). Without a loaded property, an error
@@ -2740,6 +2779,26 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 u["unresolved"] = []
                 credited.add(u["coverage_id"])
                 stats["covered"] += 1
+            elif (
+                cls in METACSL_CLASSES
+                and all_proven
+                and not counts
+                and _meta_decided_statically(u, report)
+                and _meta_no_goal_credit_barred(u)
+            ):
+                # No goal, and something says an instance is open (docs/troubleshooting/eva.md): the
+                # unit keeps its status, and the next Eva report or a WP run with a goal decides.
+                names = ", ".join(sorted((u.get("bookkeeping") or {}).get("security_properties") or []))
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_meta_simplified_eva_open",
+                    False,
+                    tool_output,
+                    f"MetAcsl loaded {names} and left no {cls} goal in this function, but "
+                    f"{_meta_no_goal_credit_barred(u)}; not credited."[:400],
+                )
             elif cls in METACSL_CLASSES and all_proven and not counts and _meta_decided_statically(u, report):
                 # MetAcsl's -meta-simpl drops an instance it decides statically: no goal is left, the
                 # property still holds in this function (docs/troubleshooting/security-properties.md, M1).
