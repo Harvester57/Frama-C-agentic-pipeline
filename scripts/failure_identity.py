@@ -596,14 +596,26 @@ def meta_sidecar_path(meta_file: str | Path) -> Path:
 _META_SIDECARS: dict[str, tuple[int, dict]] = {}
 
 
-def _meta_sidecar(meta_file: str) -> dict:
-    """The sidecar of a meta file, {} when there is none to read (a report parsed away from its build)."""
+def _meta_sidecar(meta_file: str, binary: str | Path | None = None) -> dict:
+    """
+    The sidecar of a meta file, {} when there is none to read (a report parsed away from its build).
+    The binary prints the meta file's path as its build was given it, relative to the build's working
+    directory. With `binary`, the binary that printed it, the sidecar is first looked for next to that
+    binary, where its build wrote it: a replay started in another directory (`replay --binary
+    <run>/workspace/harnesses/fuzz_m.e-acsl`) finds it there and nowhere else. The path as printed is
+    the fallback (a binary copied away from its build).
+    """
     if not meta_file.endswith(SECURITY_META_SUFFIX):
         return {}
-    path = meta_sidecar_path(meta_file)
-    try:
-        stamp = path.stat().st_mtime_ns
-    except OSError:
+    printed = meta_sidecar_path(meta_file)
+    places = [Path(binary).parent / printed.name, printed] if binary is not None else [printed]
+    for path in places:
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        break
+    else:
         return {}
     cached = _META_SIDECARS.get(str(path))
     if cached is not None and cached[0] == stamp:
@@ -618,9 +630,9 @@ def _meta_sidecar(meta_file: str) -> dict:
     return data
 
 
-def _meta_guarded_property(file_: str, line_: int) -> str:
+def _meta_guarded_property(file_: str, line_: int, binary: str | Path | None = None) -> str:
     """The property written at `line_` of meta file `file_` (the sidecar's `line_names`), '' when unknown."""
-    names = _meta_sidecar(file_).get("line_names")
+    names = _meta_sidecar(file_, binary).get("line_names")
     name = names.get(str(line_)) if isinstance(names, dict) else None
     return name if isinstance(name, str) else ""
 
@@ -646,7 +658,14 @@ def _wrapper_caller(text: str, function: str) -> str:
 
 
 def _meta_failure(
-    text: str, name: str, meta_file: str, meta_line: int, function: str, kind: str, predicate: str
+    text: str,
+    name: str,
+    meta_file: str,
+    meta_line: int,
+    function: str,
+    kind: str,
+    predicate: str,
+    binary: str | Path | None = None,
 ) -> dict:
     """
     The failure of a run-time check of meta-property `name`. Its identity is the property and the
@@ -664,8 +683,9 @@ def _meta_failure(
     called it, and `harness_induced` says the caller is harness code: the harness reached a
     protected function without what its callers in the target establish, which is no defect of the
     target (the build leaves such a property out when it can tell: fuzz_build.resolve_security_meta).
+    `binary` is the binary whose output `text` is, when the caller knows it (`_meta_sidecar`).
     """
-    side = _meta_sidecar(meta_file)
+    side = _meta_sidecar(meta_file, binary)
     props = side.get("properties")
     prop = props.get(name) if isinstance(props, dict) else None
     cls = (prop.get("obligation_class") if isinstance(prop, dict) else None) or _meta_class(name)
@@ -696,10 +716,12 @@ def _meta_failure(
     return res
 
 
-def parse_eacsl_failure(text: str) -> dict | None:
+def parse_eacsl_failure(text: str, *, binary: str | Path | None = None) -> dict | None:
     """
     Extract the first E-ACSL failure (file, line, function, kind, label, predicate) from runtime output.
-    A failed check of a MetAcsl property is described by `_meta_failure`.
+    A failed check of a MetAcsl property is described by `_meta_failure`; `binary`, the binary that
+    printed `text`, lets it find the build's sidecar when the output is parsed in another directory
+    than the build's.
     """
     if not text:
         return None
@@ -723,14 +745,14 @@ def parse_eacsl_failure(text: str) -> dict | None:
     meta = _META_LABEL_RE.match(label)
     if meta:
         return _meta_failure(
-            text, meta.group("name"), file_ or "unknown", line_, function or "unknown_function", kind, predicate
+            text, meta.group("name"), file_ or "unknown", line_, function or "unknown_function", kind, predicate, binary
         )
-    guarded = _meta_guarded_property(file_, line_)
+    guarded = _meta_guarded_property(file_, line_, binary)
     if guarded:
         # A guard E-ACSL puts on the evaluation of a property's predicate (`\valid_read` of what it
         # reads, an index of its quantifier) failed: it has the property's line and no `/meta` label.
         guard = _meta_failure(
-            text, guarded, file_, line_, function or "unknown_function", kind, f"guard {label}: {predicate}"
+            text, guarded, file_, line_, function or "unknown_function", kind, f"guard {label}: {predicate}", binary
         )
         guard["meta_guard"] = label
         return guard
@@ -915,9 +937,12 @@ def parse_sanitizer_failure(text: str) -> dict | None:
     return _parse_leak_failure(text)
 
 
-def parse_runtime_failure(text: str) -> dict | None:
-    """Parse an E-ACSL failure report, falling back to ASan/UBSan runtime failure parsing."""
-    return parse_eacsl_failure(text) or parse_sanitizer_failure(text)
+def parse_runtime_failure(text: str, *, binary: str | Path | None = None) -> dict | None:
+    """
+    Parse an E-ACSL failure report, falling back to ASan/UBSan runtime failure parsing. `binary` is
+    the binary that printed `text`, when the caller ran it (parse_eacsl_failure).
+    """
+    return parse_eacsl_failure(text, binary=binary) or parse_sanitizer_failure(text)
 
 
 # E-ACSL runtime aborts on its own resource limits, not on a target check (share/e-acsl/observation_model/

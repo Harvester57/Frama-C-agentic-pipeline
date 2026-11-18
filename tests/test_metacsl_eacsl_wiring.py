@@ -1136,6 +1136,11 @@ def test_in_the_image_a_replay_from_another_directory_reproduces(wiring_result):
     assert built["cache"]["hit"] is False
     here = result["replays"]["binary_here"]
     assert here["status"] == "reproduced" and here["fingerprints"] == [found], here
+    # The campaign's binary by its absolute path, from the other directory: the sidecar is next to it
+    # (package F; before it the file part of the fingerprint was `unknown`).
+    given = result["replays"]["binary_elsewhere"]
+    assert given["status"] == "reproduced" and given["fingerprints"] == [found], given
+    assert given["files"] == [WIRING_FILE] and found.startswith(f"{WIRING_FILE}#backdoor::"), given
 
 
 @pytest.mark.integration

@@ -121,6 +121,9 @@ _ACSL_CLAUSE_LINE_RE = re.compile(
 _SH_NEWLINE_RE = re.compile(r"(?<!\\)(?:\\\\)*\\n")
 # Lines where a backslash-n is the intended spelling.
 _SH_NEWLINE_OK_RE = re.compile(r"\bprintf\b|\becho\s+-[a-zA-Z]*e|\$'|\b(?:sed|awk|gawk|tr|grep|perl)\b")
+# What follows the backslash-n of an ACSL keyword in an annotation the script embeds: \nothing, \null,
+# \numof, and MetAcsl's \name(...). Whole words only (`\nullify`, `\nameless` are a newline and a word).
+_SH_ACSL_N_KEYWORD_RE = re.compile(r"(?:othing|ull|umof)\b|ame\s*\(")
 
 _CONSTANT_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -202,9 +205,8 @@ def _sh_literal_newlines(rel: str, text: str) -> list[Violation]:
         if is_comment or _SH_NEWLINE_OK_RE.search(line):
             continue
         for match in _SH_NEWLINE_RE.finditer(line):
-            after = line[match.end() : match.end() + 6]
-            if re.match(r"othing\b|ull\b|umof\b", after):
-                continue  # an ACSL \nothing / \null in an embedded annotation
+            if _SH_ACSL_N_KEYWORD_RE.match(line, match.end()):
+                continue  # an ACSL \nothing / \null / \name(...) in an embedded annotation
             out.append(
                 Violation(
                     rel,
