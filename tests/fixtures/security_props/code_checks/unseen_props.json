@@ -1,0 +1,56 @@
+{
+ "schema_version": 1,
+ "generated_at": "2026-11-18T22:28:48.650608+00:00",
+ "threat_model": {
+  "status": "ok",
+  "path": null,
+  "sha256": null,
+  "reason": null
+ },
+ "preamble": "/*@\n  predicate no_crlf_string(char *s) =\n    \\forall integer i; 0 <= i < strlen(s) ==> (s[i] != '\\r' && s[i] != '\\n');\n*/",
+ "properties": [
+  {
+   "name": "L5_sanitized_tcp_send",
+   "layer": 5,
+   "kind": "sanitized",
+   "obligation_class": "l5_sanitized",
+   "acsl": "/*@ meta \\prop, \\name(L5_sanitized_tcp_send), \\targets(\\ALL), \\context(\\calling),\n      \\tguard(\\called == tcp_send ==> (\\fguard(\\initialized(\\called_arg(req) + (0 .. \\called_arg(req_length) - 1)))));\n*/",
+   "instances": [
+    "relay.c#relay"
+   ],
+   "sources": [],
+   "notes": [],
+   "threat_model": {
+    "output_sink": "tcp_send",
+    "kind": "network",
+    "params": [
+     "req"
+    ]
+   },
+   "targets": "tcp_send"
+  }
+ ],
+ "frame": [],
+ "obligations": {
+  "relay.c#relay": [
+   {
+    "class": "l5_sanitized",
+    "property": "L5_sanitized_tcp_send",
+    "reason": "L5_sanitized_tcp_send (sanitized, layer 5)"
+   }
+  ]
+ },
+ "summary": {
+  "properties": 1,
+  "by_kind": {
+   "sanitized": 1
+  },
+  "functions_by_class": {
+   "l5_sanitized": 1
+  }
+ },
+ "warnings": [
+  "the model has no write facts (dump before schema 3): Layer 3 frames fall back to pointer parameters, Layer 4 state writers are unknown"
+ ],
+ "code_checks": []
+}

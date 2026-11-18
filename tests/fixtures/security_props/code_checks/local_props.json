@@ -1,0 +1,76 @@
+{
+ "schema_version": 1,
+ "generated_at": "2026-11-18T22:28:48.601528+00:00",
+ "threat_model": {
+  "status": "ok",
+  "path": null,
+  "sha256": null,
+  "reason": null
+ },
+ "preamble": "/*@\n  predicate no_crlf_string(char *s) =\n    \\forall integer i; 0 <= i < strlen(s) ==> (s[i] != '\\r' && s[i] != '\\n');\n*/",
+ "properties": [
+  {
+   "name": "L6_wiped_buf",
+   "layer": 6,
+   "kind": "wiped",
+   "obligation_class": "l6_wiped",
+   "acsl": "/*@ check L6_wiped_buf: \\forall integer i; 0 <= i < sizeof(buf) / sizeof(buf[0]) ==> buf[i] == 0; */",
+   "instances": [
+    "prog.c#derive"
+   ],
+   "sources": [],
+   "notes": [
+    "a local array: the check is written into the work tree, not the meta file",
+    "no `size`: sizeof of the local (an array; a pointer local needs `size`)"
+   ],
+   "threat_model": {
+    "secret": "buf",
+    "kind": "local",
+    "release": "derive"
+   },
+   "targets": "derive",
+   "code": {
+    "local": "buf",
+    "check": "/*@ check L6_wiped_buf: \\forall integer i; 0 <= i < sizeof(buf) / sizeof(buf[0]) ==> buf[i] == 0; */"
+   }
+  }
+ ],
+ "frame": [],
+ "obligations": {
+  "prog.c#derive": [
+   {
+    "class": "l6_wiped",
+    "property": "L6_wiped_buf",
+    "reason": "L6_wiped_buf (wiped, layer 6)"
+   }
+  ]
+ },
+ "summary": {
+  "properties": 1,
+  "by_kind": {
+   "wiped": 1
+  },
+  "functions_by_class": {
+   "l6_wiped": 1
+  }
+ },
+ "warnings": [
+  "the model has no write facts (dump before schema 3): Layer 3 frames fall back to pointer parameters, Layer 4 state writers are unknown",
+  "output sink: log_line is neither a function of the build nor called by one",
+  "secret buf: a local: no no-leak property (MetAcsl cannot name a local, and the taint annotations follow globals and parameters only)"
+ ],
+ "code_checks": [
+  {
+   "file": "prog.c",
+   "line": 26,
+   "function": "prog.c#derive",
+   "property": "L6_wiped_buf"
+  },
+  {
+   "file": "prog.c",
+   "line": 27,
+   "function": "prog.c#derive",
+   "property": "L6_wiped_buf"
+  }
+ ]
+}

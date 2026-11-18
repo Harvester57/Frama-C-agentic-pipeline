@@ -1,0 +1,458 @@
+[kernel] Parsing /cap/local/target/prog.c (with preprocessing)
+[wp] Running WP plugin...
+[wp] Warning: Skipped RTE guards: unaligned pointers (\aligned not supported)
+[wp] Warning: Skipped RTE guards: invalid function pointer calls (\valid_function not supported)
+[rte:annot] annotating function derive
+[kernel:annot:missing-spec] /cap/local/target/prog.c:4: Warning: 
+  Neither code nor explicit exits and terminates for function fill, generating
+  default clauses. See -generated-spec-* options for more info.
+[kernel:annot:missing-spec] /cap/local/target/prog.c:7: Warning: 
+  Neither code nor explicit exits and terminates for function consume,
+  generating default clauses. See -generated-spec-* options for more info.
+[wp:pedantic-assigns] /cap/local/target/prog.c:9: Warning: 
+  No 'assigns' specification for function 'derive'.
+  Callers assumptions might be imprecise.
+[wp] 14 goals scheduled
+[wp] [Timeout] typed_derive_terminates_part2 (Qed 3ms) (Alt-Ergo)
+[wp] Proved goals:   13 / 14
+  Qed:              10 (3ms-2ms-7ms)
+  Alt-Ergo 2.4.3:    3 (5ms-7ms-11ms)
+  Timeout:           1
+[report] Computing properties status...
+--------------------------------------------------------------------------------
+--- Global Properties
+--------------------------------------------------------------------------------
+
+[  Valid  ] Axiomatic 'MemChr'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'MemCmp'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'MemSet'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'StrChr'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'StrCmp'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'StrLen'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'StrNCmp'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'WMemChr'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'WcsChr'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'WcsCmp'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'WcsLen'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'WcsNCmp'
+            by Frama-C kernel.
+[  Valid  ] Axiomatic 'dynamic_allocation'
+            by Frama-C kernel.
+[ Extern  ] Axiom 'memchr_def'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'memcmp_strlen_left'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'memcmp_strlen_right'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'memcmp_strlen_shift_left'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'memcmp_strlen_shift_right'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'memcmp_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'memset_def'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'never_allocable'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strchr_def'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strcmp_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_at_null'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_before_null'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_create'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_create_shift'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_neg'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_not_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_pos_or_null'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_shift'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_sup'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strlen_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'strncmp_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcschr_def'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcscmp_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_at_null'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_before_null'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_create'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_create_shift'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_neg'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_not_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_pos_or_null'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_shift'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_sup'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcslen_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wcsncmp_zero'
+            Unverifiable but considered Valid.
+[ Extern  ] Axiom 'wmemchr_def'
+            Unverifiable but considered Valid.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'syscall'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Assigns nothing
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 227)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function '__fc_syscall_read'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Post-condition 'result_error_or_read_length'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialization'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition for 'full_read' 'result_full'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition for 'partial_or_error' 'result_short'
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns for 'full_read' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full_read' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full_read' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 245)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+[  Valid  ] Behavior 'full_read'
+            by Frama-C kernel.
+[  Valid  ] Behavior 'partial_or_error'
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function '__fc_syscall_recvfrom'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Post-condition 'result_error_or_received_length'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialization,buf'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialization,addrbuf'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition for 'full_receive' 'result_full'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition for 'partial_or_error' 'result_short'
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns for 'full_receive' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 268)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 269)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full_receive' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full_receive' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full_receive' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 268)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full_receive' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 269)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 266)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 268)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 269)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+[  Valid  ] Behavior 'full_receive'
+            by Frama-C kernel.
+[  Valid  ] Behavior 'partial_or_error'
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function '__fc_syscall_getrandom'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Post-condition 'result_error_or_length'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialization'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition for 'full' 'result_full'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition for 'partial_or_error' 'result_short'
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns for 'full' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'full' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms for 'partial_or_error' ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 288)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+[  Valid  ] Behavior 'full'
+            by Frama-C kernel.
+[  Valid  ] Behavior 'partial_or_error'
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'explicit_bzero'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Post-condition 'zeroed'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'zeroed_bytes'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'zeroed_values'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialization'
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 312)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 312)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'memset_s'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Post-condition 'set'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'set_bytes'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'set_values'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialization'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'result'
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 323)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 323)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 324)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'getsockopt'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Post-condition 'result_ok_or_error'
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 415)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 415)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 415)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 415)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'getopt'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Post-condition 'result_range'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'optind_range'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'optarg_in_argv'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'optarg_string'
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 450)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 450)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 452)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 454)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h", line 456)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'strlcpy'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Exit-condition ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 100)
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'result_is_src_length'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'copied'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialized'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'nul_terminated'
+            Unverifiable but considered Valid.
+[ Extern  ] Termination-condition ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 99)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 101)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 101)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 103)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'strlcat'
+--------------------------------------------------------------------------------
+
+[ Extern  ] Exit-condition ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 121)
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'result_is_total_length'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'initialized'
+            Unverifiable but considered Valid.
+[ Extern  ] Post-condition 'nul_terminated'
+            Unverifiable but considered Valid.
+[ Extern  ] Termination-condition ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 120)
+            Unverifiable but considered Valid.
+[ Extern  ] Assigns ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", lines 122-123)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", lines 122-123)
+            Unverifiable but considered Valid.
+[ Extern  ] Froms ("/opt/framac-pipeline/templates/fc_stubs/fc_strlcpy.h", line 125)
+            Unverifiable but considered Valid.
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'fill'
+--------------------------------------------------------------------------------
+
+[  Valid  ] Pre-condition ("/cap/local/target/prog.c", line 2)
+            by Call Preconditions.
+[    -    ] Exit-condition (generated by Frama-C kernel from "/cap/local/target/prog.c", line 4)
+            tried with Populated status.
+[    -    ] Termination-condition (generated by Frama-C kernel from "/cap/local/target/prog.c", line 4)
+            tried with Populated status.
+[ Extern  ] Assigns ("/cap/local/target/prog.c", line 3)
+            Unverifiable but considered Valid.
+[    -    ] Default behavior
+            tried with Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'consume'
+--------------------------------------------------------------------------------
+
+[    -    ] Exit-condition (generated by Frama-C kernel from "/cap/local/target/prog.c", line 7)
+            tried with Populated status.
+[    -    ] Termination-condition (generated by Frama-C kernel from "/cap/local/target/prog.c", line 7)
+            tried with Populated status.
+[ Extern  ] Assigns nothing
+            Unverifiable but considered Valid.
+[    -    ] Default behavior
+            tried with Frama-C kernel.
+
+--------------------------------------------------------------------------------
+--- Properties of Function 'derive'
+--------------------------------------------------------------------------------
+
+[  Valid  ] Exit-condition (generated by Frama-C kernel from "/cap/local/target/prog.c", lines 9-29)
+            by Wp.typed (v1).
+[    -    ] Termination-condition (generated by Frama-C kernel from "/cap/local/target/prog.c", lines 9-29)
+            tried with Wp.typed (v1).
+[  Valid  ] Loop assigns ("/cap/local/target/prog.c", line 19)
+            by Wp.typed (v1).
+[  Valid  ] Invariant ("/cap/local/target/prog.c", line 17)
+            by Wp.typed (v1).
+[  Valid  ] Invariant ("/cap/local/target/prog.c", line 18)
+            by Wp.typed (v1).
+[  Valid  ] Check 'L6_wiped_buf' ("/cap/local/target/prog.c", line 26)
+            by Wp.typed (v1).
+[  Valid  ] Check 'L6_wiped_buf' ("/cap/local/target/prog.c", line 27)
+            by Wp.typed (v1).
+[  Valid  ] Assertion 'rte,index_bound' ("/cap/local/target/prog.c", line 21)
+            by Wp.typed (v1).
+[  Valid  ] Assertion 'rte,index_bound' ("/cap/local/target/prog.c", line 21)
+            by Wp.typed (v1).
+[  Valid  ] Assertion 'rte,signed_overflow' ("/cap/local/target/prog.c", line 20)
+            by Wp.typed (v1).
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+[  Valid  ] Instance of 'Pre-condition ("/cap/local/target/prog.c", line 2)' at call 'fill' ("/cap/local/target/prog.c", line 15)
+
+            by Wp.typed (v1).
+
+--------------------------------------------------------------------------------
+--- Status Report Summary
+--------------------------------------------------------------------------------
+    41 Completely validated
+   130 Considered valid
+     7 To be validated
+   178 Total
+--------------------------------------------------------------------------------
+[report] Dumping properties in 'workspace/wp/wp_derive.csv'
+

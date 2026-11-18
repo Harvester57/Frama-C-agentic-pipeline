@@ -35,7 +35,12 @@ from framac_common import (  # noqa: E402
     load_json_optional,
     load_json_strict,
 )
-from ledger import INDUCTIVE_LEMMA_GAP, unchecked_clause_text  # noqa: E402
+from ledger import (  # noqa: E402
+    INDUCTIVE_LEMMA_GAP,
+    PROPERTY_RELOCATED,
+    relocated_properties,
+    unchecked_clause_text,
+)
 from mutation_check import classify_open_unit  # noqa: E402
 from phase0_gates import dynamic_gaps  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
@@ -642,23 +647,114 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
 TRUST_ROWS_MAX = 60
 
 
-def security_props_lines(props: dict | None) -> list[str]:
+RELOCATED_NAMES_MAX = 12
+
+
+def _code_names(names: list, limit: int = RELOCATED_NAMES_MAX) -> str:
+    shown = ", ".join(f"`{md_escape(str(n))}`" for n in names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def relocated_props_lines(props: dict, ledger: list[dict] | None = None) -> list[str]:
+    """
+    The properties security_props.py checks somewhere else than where the threat model declares the
+    sink (`properties[*].relocated`, a wrapper sink with `checked_at`): where the property is no longer
+    generated, where it is checked instead and through which call, the properties that check stands
+    for, and what the model does not show. With the ledger, the units still keyed on a property moved
+    away from their function (no `seed --refresh` since) are listed: their status is about a property
+    no run generates any more.
+    """
+    moved = [p for p in props.get("properties") or [] if isinstance(p, dict) and isinstance(p.get("relocated"), dict)]
+    if not moved:
+        return []
+    out = ["### Properties checked somewhere else than at the calls of their sink", ""]
+    for prop in moved:
+        rec = prop["relocated"]
+        name, wrapper = str(prop.get("name")), str(rec.get("wrapper"))
+        callers = [str(c) for c in rec.get("not_generated_at") or []]
+        out.append(
+            f"- `{md_escape(name)}`: not generated at the {len(callers)} caller(s) of `{md_escape(wrapper)}`"
+            + (f" ({_code_names(callers)})" if callers else "")
+            + f"; checked inside `{md_escape(wrapper)}` instead, before it hands the buffer over."
+        )
+        for site in rec.get("checked_at") or []:
+            if not isinstance(site, dict):
+                continue
+            targets = site.get("candidates") or site.get("inner_sinks") or []
+            out.append(
+                f"  - Checked before the {md_escape(str(site.get('kind') or 'direct'))} call "
+                f"`{md_escape(str(site.get('call')))}` at `{md_escape(str(site.get('loc')))}`"
+                + (f", which can dispatch to {_code_names(targets)}" if site.get("kind") == "indirect" else "")
+                + "."
+            )
+        stands_for = [
+            f"{s.get('property')} in {s.get('function')}" for s in rec.get("superseded") or [] if isinstance(s, dict)
+        ]
+        if stands_for:
+            out.append(f"  - That check stands for {_code_names(stands_for)}, which MetAcsl is not given there.")
+        others = [
+            f"{o.get('call')} at {o.get('loc')}" for o in rec.get("other_indirect_calls") or [] if isinstance(o, dict)
+        ]
+        if others:
+            out.append(f"  - Other calls through a pointer in the wrapper, which get no check: {_code_names(others)}.")
+        out += [
+            f"  - {md_escape(str(e)[:1].upper() + str(e)[1:])}."
+            for e in rec.get("evidence") or []
+            if str(e).startswith("not shown")
+        ]
+    if ledger:
+        retired = sorted(
+            str(u.get("coverage_id"))
+            for u in ledger
+            if any(str(r).startswith(f"{PROPERTY_RELOCATED}:") for r in u.get("unresolved") or [])
+        )
+        if retired:
+            out.append(
+                f"- {len(retired)} unit(s) had results on a property before it moved and are retired "
+                f"({_code_names(retired)}): no property of their class is generated at these functions any more. "
+                "They read `blocked` in the ledger, which keeps their earlier evidence; nothing is left to prove there."
+            )
+        where = relocated_properties(props)
+        stale = sorted(
+            f"{u.get('coverage_id')} ({', '.join(names)})"
+            for u in ledger
+            if u.get("status") != "out_of_scope"
+            and (
+                names := sorted(
+                    n
+                    for n in (u.get("bookkeeping") or {}).get("security_properties") or []
+                    if n in where.get(f"{u.get('file')}#{u.get('function')}", {})
+                )
+            )
+        )
+        if stale:
+            out.append(
+                f"- **{len(stale)} ledger unit(s) are still keyed on a property that is no longer generated at their "
+                f"function** ({_code_names(stale)}): their status says nothing about the check that replaced it. "
+                "`ledger.py seed --refresh` retires them or plans them again."
+            )
+    return [*out, ""]
+
+
+def security_props_lines(props: dict | None, ledger: list[dict] | None = None) -> list[str]:
     """
     Threat-model items security_props.py turned into no property (a returned secret, a name the build
-    lacks, an unusable sink parameter), from its warnings, so the report says what was not checked.
+    lacks, an unusable sink parameter), from its warnings, so the report says what was not checked;
+    then the properties it moved (`relocated_props_lines`).
     """
     if not isinstance(props, dict):
         return []
     items = [
         str(w) for w in props.get("warnings") or [] if str(w).startswith(("secret ", "auth gate ", "output sink "))
     ]
-    if not items:
-        return []
-    out = ["### Threat-model items without a property", ""]
-    out += [f"- {md_escape(w)}" for w in items[:30]]
-    if len(items) > 30:
-        out.append(f"- ... and {len(items) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
-    return [*out, ""]
+    out: list[str] = []
+    if items:
+        out = ["### Threat-model items without a property", ""]
+        out += [f"- {md_escape(w)}" for w in items[:30]]
+        if len(items) > 30:
+            out.append(f"- ... and {len(items) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
+        out.append("")
+    return out + relocated_props_lines(props, ledger)
 
 
 def trust_lines(model: dict | None) -> list[str]:
@@ -938,7 +1034,7 @@ def render_report(data: dict) -> str:
         out.append(f"**{len(work['open_units'])} coverage unit(s) are still planned or in progress.**")
         out.append("")
     out += trust_lines(data.get("model"))
-    out += security_props_lines(data.get("security_props"))
+    out += security_props_lines(data.get("security_props"), ledger)
     out += fallback_lines(data.get("model"), ledger)
 
     out += ["## 2. Summary", ""]

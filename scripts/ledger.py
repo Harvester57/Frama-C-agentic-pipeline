@@ -772,6 +772,44 @@ def _meta_decided_statically(unit: dict, report: dict) -> bool:
     return names <= {str(n) for n in sp.get("properties") or []}
 
 
+def _meta_not_evaluated(unit: dict, report: dict, has_goals: bool) -> str | None:
+    """
+    Why a WP report does not show that MetAcsl evaluated the properties of an L4-L6 unit, or None.
+
+    A property stated on a call (`\\called == f`) generates no instance, and no message, when `f` is
+    not in the files WP parsed: the run looks exactly like one whose every instance MetAcsl decided
+    statically. libmodbus run-1: `send_msg` and `_modbus_receive_msg` (modbus.c) carry
+    `L5_sanitized__modbus_tcp_send`, whose sink is a static function of modbus-tcp.c reached through
+    `ctx->backend->send` only. run_wp_function.py records, per such property, whether the function's name
+    occurs in the parsed files (`security_props.call_targets`); a unit naming a property whose function
+    was not seen is not credited, with or without goals of its class. Without goals, a report that does
+    not record the field (written before it existed) shows nothing either.
+    """
+    sp = report.get("security_props")
+    names = set((unit.get("bookkeeping") or {}).get("security_properties") or [])
+    if not isinstance(sp, dict) or sp.get("error") or not names:
+        return None
+    targets = sp.get("call_targets")
+    if not isinstance(targets, dict):
+        if has_goals or not names <= {str(n) for n in sp.get("properties") or []}:
+            return None
+        return (
+            "the report does not say whether the functions its properties are stated on are in the files WP "
+            "parsed (security_props.call_targets: not recorded; a report written before the field existed)"
+        )
+    unseen = [
+        f"{n} (on the calls of {t.get('function')})"
+        for n in sorted(names)
+        if isinstance(t := targets.get(n), dict) and t.get("seen") is not True
+    ]
+    if not unseen:
+        return None
+    return (
+        f"MetAcsl generated no instance of {', '.join(unseen)}: the files WP parsed do not name that function, "
+        "so a call that reaches it through a function pointer was not checked"
+    )
+
+
 def wp_frame_problem(report: dict) -> tuple[str, str] | None:
     """
     Why an `all_proven` WP report does not show a proven frame for its function, as (evidence result,
@@ -1078,6 +1116,94 @@ def _refresh_units(
     }
 
 
+PROPERTY_RELOCATED = "property_relocated"
+
+
+def relocated_properties(doc: object) -> dict[str, dict[str, str]]:
+    """
+    `file#name` -> {property: where it is checked instead}, from the `relocated` records of a
+    security_props.json (a wrapper sink, threat-model field `checked_at`): the functions the wrapper's
+    property is no longer generated at (`not_generated_at`), and the inner sinks' properties its in-code
+    check stands for inside the wrapper (`superseded`). Empty for a report without relocations.
+    """
+    moved: dict[str, dict[str, str]] = {}
+    props = doc.get("properties") if isinstance(doc, dict) else None
+    for prop in props if isinstance(props, list) else []:
+        rel_rec = prop.get("relocated") if isinstance(prop, dict) else None
+        if not isinstance(rel_rec, dict):
+            continue
+        name, wrapper = str(prop.get("name")), str(rel_rec.get("wrapper"))
+        for fid in rel_rec.get("not_generated_at") or []:
+            moved.setdefault(str(fid), {})[name] = f"{name} is checked inside {wrapper}, where it hands the buffer over"
+        for item in rel_rec.get("superseded") or []:
+            if isinstance(item, dict) and item.get("function") and item.get("property"):
+                moved.setdefault(str(item["function"]), {})[str(item["property"])] = (
+                    f"{name}, written before the call in {wrapper}, is checked in its place"
+                )
+    return moved
+
+
+def _refresh_relocated(units: dict[str, dict], derived: dict[str, dict], doc: object, tool_output: str | None) -> dict:
+    """
+    `seed --refresh` after security_props.py moved a property (`relocated_properties`): a unit that a
+    phase already worked on is never re-derived by `_refresh_units`, so it would stay keyed on a
+    property no run generates any more (libmodbus run-1: twelve callers of `send_msg` blocked on
+    `L5_sanitized_send_msg`). Such a unit keeps its evidence and gets a note; its
+    `bookkeeping.security_properties` follow the report; it is retired when the report derives no
+    property of its class for the function any more, and planned again otherwise: no earlier result on
+    the moved property says anything about the one that replaces it. A retired unit is `blocked` with
+    the reason `property_relocated: ...`, not `out_of_scope`: the ledger refuses an `out_of_scope` unit
+    that carries evidence (validate_artifacts.py), and the evidence is kept. A unit with an open
+    candidate is left as it is and listed.
+    """
+    moved = relocated_properties(doc)
+    out: dict[str, list[str]] = {"retired": [], "replanned": [], "kept_candidate": []}
+    for cid in sorted(units):
+        unit = units[cid]
+        bk = unit.get("bookkeeping") or {}
+        new = derived.get(cid)
+        kept = set((new or {}).get("bookkeeping", {}).get("security_properties") or [])
+        here = moved.get(f"{normalize_file(unit['file'])}#{unit['function']}") or {}
+        stale = sorted(n for n in bk.get("security_properties") or [] if n in here and n not in kept)
+        if not stale or not _has_evidence(unit):
+            continue
+        if unit["status"] == "candidate":
+            out["kept_candidate"].append(cid)
+            continue
+        why = "; ".join(here[n] for n in stale)
+        add_evidence(
+            unit,
+            STATIC_PHASE,
+            "security_props.py",
+            PROPERTY_RELOCATED,
+            False,
+            tool_output,
+            f"No longer generated at this function: {why}. Earlier results on {', '.join(stale)} do not decide the unit."[
+                :400
+            ],
+        )
+        unit["agent_id"] = None
+        if new is None:
+            unit["status"] = "blocked"
+            unit["unresolved"] = [f"{PROPERTY_RELOCATED}: {why}"[:240]]
+            unit["bookkeeping"] = {k: v for k, v in bk.items() if k != "security_properties"}
+            if not unit["bookkeeping"]:
+                unit.pop("bookkeeping")
+            out["retired"].append(cid)
+        else:
+            unit["status"] = new["status"]
+            unit["unresolved"] = copy.deepcopy(new["unresolved"])
+            unit["bookkeeping"] = {
+                k: v for k, v in bk.items() if k not in ("security_properties", "decided_properties")
+            }
+            for key in ("security_properties", "decided_properties"):
+                if key in (new.get("bookkeeping") or {}):
+                    unit["bookkeeping"][key] = copy.deepcopy(new["bookkeeping"][key])
+            unit["evidence"] += copy.deepcopy(new.get("evidence") or [])
+            out["replanned"].append(cid)
+    return {k: v[:REFRESH_LIST_MAX] for k, v in out.items()} | {"count": sum(len(v) for v in out.values())}
+
+
 @ledger_locked
 def cmd_seed(
     dag_path: Path,
@@ -1092,7 +1218,9 @@ def cmd_seed(
     """
     Add the units the DAG derives that the ledger lacks; an existing unit is never rewound. With
     `refresh` (a Phase 0 re-run on a changed target), the units without evidence also follow the
-    current DAG (`_refresh_units`), and the result reports what changed. The stub overlay's active
+    current DAG (`_refresh_units`), the units keyed on a property security_props.py moved elsewhere
+    are retired or planned again (`_refresh_relocated`), and the result reports what changed
+    (`refresh`, `refresh.relocated`). The stub overlay's active
     contracts (`stub_report`, when present) are recorded as `stub_contract` assumptions as
     `record-stub-contracts` does, so a seed run by hand records them too.
     """
@@ -1106,6 +1234,11 @@ def cmd_seed(
     for cid in added:
         units[cid] = derived[cid]
     changes = _refresh_units(units, derived, set(added), dag_fns) if refresh else None
+    if changes is not None and sec_status == "ok":
+        props_path = security_props or DEFAULT_SECURITY_PROPS
+        changes["relocated"] = _refresh_relocated(
+            units, derived, load_json_optional(props_path, None), rel(str(props_path))
+        )
     stubs = _apply_stub_contracts(units, stub_report, stub_check)
     commit(units, candidates)
     out: dict[str, Any] = {
@@ -2558,6 +2691,21 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     tool_output,
                     f"Frame not credited: {frame_problem[1]}. The unit stays open until WP proves an `assigns` "
                     "clause of the function's own contract.",
+                )
+            elif (
+                all_proven
+                and cls in METACSL_CLASSES
+                and (not_evaluated := _meta_not_evaluated(u, report, bool(counts)))
+            ):
+                # Before both credits below: proven goals of the class, and none left by MetAcsl's simplification.
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_meta_not_evaluated",
+                    False,
+                    tool_output,
+                    f"Not credited: {not_evaluated}."[:400],
                 )
             elif counts and (counts.get("proven", 0) + counts.get("proven_under_hyp", 0)) > 0 and all_proven:
                 add_evidence(
