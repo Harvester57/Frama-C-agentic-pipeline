@@ -456,6 +456,22 @@ def test_a_proven_goal_credits_the_unit_whatever_eva_left_open(run_dir):
 
 
 @pytest.mark.unit
+def test_the_sweep_blocks_a_no_goal_credit_given_before_eva_left_the_check_open(run_dir):
+    """The order WP then Eva: the plain ingest leaves the earlier credit, the end-of-run re-proof does not."""
+    seed(run_dir, new_kinds_doc())
+    L.cmd_ingest_wp([wp_report("flush", {}, loaded=[NK_CALL])])
+    assert units()[cid("flush")]["status"] == "covered"
+    set_unit(cid("flush"), bookkeeping={"eva_verdicts": {NK_MODULE: "unknown"}})
+    L.cmd_ingest_wp([wp_report("flush", {}, loaded=[NK_CALL])])
+    unit = units()[cid("flush")]
+    assert unit["status"] == "covered" and unit["evidence"][-1]["result"] == "wp_meta_simplified_eva_open"
+    stats = L.cmd_ingest_wp([wp_report("flush", {}, loaded=[NK_CALL])], sweep=True)
+    unit = units()[cid("flush")]
+    assert unit["status"] == "blocked" and unit["evidence"][-1]["result"] == "wp_sweep_not_reproven"
+    assert stats["blocked"] == 1 and units()["prog.c#flush::rte"]["status"] == "covered"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("status", ["wp_aborted", "unsound_proof"])
 def test_a_rejected_wp_run_blocks_an_eva_covered_unit_it_has_no_goal_for_as_it_does_an_rte_unit(run_dir, status):
     """
