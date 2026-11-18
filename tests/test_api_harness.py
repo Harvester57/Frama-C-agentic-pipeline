@@ -103,8 +103,10 @@ def test_scalars_structs_and_pointers_to_objects():
     }
     stmt, layout, _ = ah.single_case("run", rec, SPARE)
     assert stmt is not None and layout is not None
-    assert "struct cfg c0a1;" in stmt and "struct ctx c0a2;" in stmt and "unsigned long c0a3;" in stmt
-    assert "(void)run(c0a0, c0a1, &c0a2, &c0a3, 0);" in stmt
+    # A pointer to a struct is one object; a pointer to a scalar a small array (`_scalar_array`).
+    assert "struct cfg c0a1;" in stmt and "struct ctx c0a2;" in stmt
+    assert f"unsigned long c0a3[{ah.ARRAY_ELEMENTS}];" in stmt
+    assert "(void)run(c0a0, c0a1, &c0a2, (unsigned long *)c0a3, 0);" in stmt
     # Without a layout the struct by value may hold pointers: zeroed, with the reason in the notes.
     assert [(s["param"], s["kind"], s["size"]) for s in layout["slots"]] == [(0, "int", 4)]
     assert "struct cfg" in layout["notes"][0] and "zeroed" in layout["notes"][0]

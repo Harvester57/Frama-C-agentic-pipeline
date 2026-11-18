@@ -227,6 +227,118 @@ def test_a_lib_new_kind_constructor_builds_the_handle():
     assert "modbus_new_tcp(" in flush and "modbus_flush(" in flush and "modbus_free(" in flush
 
 
+def _modbus_plan(recs: dict[str, dict], protos: dict[str, dict[str, Any]], layouts: dict | None = None) -> dict:
+    functions = {f"modbus.c#{n}": {"name": n, "file": "modbus.c"} for n in recs}
+    dag = {
+        "warnings": [],
+        "modules": {"lib": {"functions": list(functions), "candidate_entry_points": list(functions)}},
+        "functions": functions,
+    }
+    model = {"status": "ok", "functions": {f"modbus.c#{n}": r for n, r in recs.items()}}
+    return ah.plan(dag, model, "lib", "lib", 64, [], None, layouts or {}, ah.Declared(set(recs), protos))
+
+
+def _entry_case(p: dict, name: str) -> str:
+    return next(t for t, lay in zip(p["cases"], p["layouts"], strict=True) if lay.get("entry") == f"modbus.c#{name}")
+
+
+@pytest.mark.unit
+def test_the_destructor_that_frees_wins_over_close_and_close_runs_first():
+    """
+    libmodbus run-1: `modbus_close(modbus_t *)` only closes the socket, `modbus_free(modbus_t *)`
+    frees the context. The first name (`modbus_close`) was the destructor, so `modbus_free` never ran
+    and every execution leaked the context (LeakSanitizer: direct leaks in `modbus_new_tcp`). The
+    destructor that releases memory wins; a `close` of the same handle runs before it, as libmodbus's
+    own tests do (`modbus_close(ctx); modbus_free(ctx);`).
+    """
+    recs = {
+        "modbus_new_tcp": _rec("modbus_new_tcp", "struct _modbus *(char const *,int)", "const_pointer", "value"),
+        "modbus_close": _rec("modbus_close", "void(struct _modbus *)", "pointer"),
+        "modbus_free": _rec("modbus_free", "void(struct _modbus *)", "pointer"),
+        "modbus_flush": _rec("modbus_flush", "int(struct _modbus *)", "pointer"),
+    }
+    protos: dict[str, dict[str, Any]] = {
+        "modbus_new_tcp": {"ret": MODBUS, "params": [None, None]},
+        "modbus_close": {"ret": None, "params": [MODBUS]},
+        "modbus_free": {"ret": None, "params": [MODBUS]},
+        "modbus_flush": {"ret": None, "params": [MODBUS]},
+    }
+    _, _, dtors, dtor_names, _, _ = ah.handle_functions(recs, ah.Declared(set(recs), protos))
+    assert dtors == {MODBUS: "modbus_free"} and dtor_names == {MODBUS: {"modbus_close", "modbus_free"}}
+    p = _modbus_plan(recs, protos)
+    both = "if (c0a0 != 0) { (void)modbus_close(c0a0); (void)modbus_free(c0a0); }"
+    assert both in _entry_case(p, "modbus_flush")
+    # The closer's own case: the context is still freed afterwards, and not closed twice.
+    close = _entry_case(p, "modbus_close")
+    assert "if (c0a0 != 0) { (void)modbus_free(c0a0); }" in close and close.count("modbus_close(") == 1, close
+    # The destructor's own case releases nothing after it (no double free).
+    free = _entry_case(p, "modbus_free")
+    assert free.count("modbus_free(") == 1 and "modbus_close(" not in free, free
+    life = next(lay for lay in p["layouts"] if lay["kind"] == "lifecycle")
+    stmt = p["cases"][p["layouts"].index(life)]
+    assert life["calls"] == ["modbus_new_tcp", "modbus_free"]
+    # Neither is a method: a free inside the loop would be a use after free the harness makes.
+    assert life["methods"] == ["modbus_flush"]
+    assert stmt.endswith("(void)modbus_close(fc_h); (void)modbus_free(fc_h); } (void)fuzz_off;"), stmt
+    for name in ("modbus_free", "ctx_destroy", "foo_release", "x_unref", "FooFree", "ctx_delete"):
+        assert ah._FREEING_DTOR_RE.search(name), name
+    for name in ("modbus_close", "ctx_cleanup", "ctx_deinit", "ctx_fini"):
+        assert not ah._FREEING_DTOR_RE.search(name), name
+
+
+@pytest.mark.unit
+def test_a_close_that_frees_the_handle_is_no_closer():
+    """
+    A `close` that reaches `free` through its direct call sites frees the handle itself (sqlite3_close
+    style): running the freeing destructor after it would be a double free the harness makes.
+    """
+    dtors = {CTX: "ctx_free"}
+    names = {CTX: {"ctx_close", "ctx_free"}}
+    model = {"lib.c#ctx_close": {"name": "ctx_close", "call_sites": [{"callee": "ctx_release_all"}]}}
+    model["lib.c#ctx_release_all"] = {"name": "ctx_release_all", "external_calls": ["free"]}
+    assert ah.handle_closers(dtors, names, model) == {}
+    model.pop("lib.c#ctx_release_all")
+    assert ah.handle_closers(dtors, names, model) == {CTX: "ctx_close"}
+    # Only a destructor named for freeing gets a closer; a lone `close` destructor is the release itself.
+    assert ah.handle_closers({CTX: "ctx_close"}, names, model) == {}
+    assert ah.handle_closers(dtors, {CTX: {"ctx_cleanup", "ctx_free"}}, model) == {}
+
+
+MAPPING = "struct _modbus_mapping_t"
+MAPPING_LAYOUT = {"what": "struct", "size": 64, "align": 8, "pointers": True, "fields": []}
+
+
+@pytest.mark.unit
+def test_a_struct_made_by_a_constructor_is_released_by_its_freeing_destructor():
+    """
+    libmodbus run-1: `modbus_mapping_t *modbus_mapping_new_start_address(...)` returns a malloc'ed
+    complete struct (no handle), and its case dropped the result: a leak per execution. The result is
+    released with the struct's freeing destructor (`modbus_mapping_free`). That destructor's own case
+    passed a zeroed stack object to `free` (ASan: attempting free on address which was not
+    malloc()-ed): a struct with no initializer and a destructor that frees gets no such case, the
+    constructor's case calls it.
+    """
+    ints = ",".join(["unsigned int"] * 8)
+    recs = {
+        "modbus_mapping_new_start_address": {
+            **_rec("modbus_mapping_new_start_address", f"{MAPPING} *({ints})", *["value"] * 8),
+            "call_sites": [{"callee": "malloc", "line": 1}],
+        },
+        "modbus_mapping_free": _rec("modbus_mapping_free", f"void({MAPPING} *)", "pointer"),
+        "modbus_mapping_peek": _rec("modbus_mapping_peek", f"int({MAPPING} *)", "pointer"),
+    }
+    protos: dict[str, dict[str, Any]] = {n: {"ret": None, "params": [None] * 8} for n in recs}
+    p = _modbus_plan(recs, protos, {MAPPING: MAPPING_LAYOUT})
+    make = _entry_case(p, "modbus_mapping_new_start_address")
+    assert f"{{ {MAPPING} * c0r = modbus_mapping_new_start_address(" in make, make
+    assert "if (c0r != 0) { (void)modbus_mapping_free(c0r); } }" in make, make
+    assert p["skipped"].get("modbus.c#modbus_mapping_free", "").startswith("frees its argument"), p["skipped"]
+    # Not allocating (no allocator reached): the result is not known to be the caller's, left alone.
+    recs["modbus_mapping_new_start_address"].pop("call_sites")
+    make = _entry_case(_modbus_plan(recs, protos, {MAPPING: MAPPING_LAYOUT}), "modbus_mapping_new_start_address")
+    assert "modbus_mapping_free(" not in make, make
+
+
 def _lifecycle_sidecar(stmt: str, layout: dict, entry_fn: str) -> dict:
     layout["selector"] = 0
     return {

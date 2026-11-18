@@ -38,6 +38,13 @@ byte selects it), with arguments built from the model's signature of each functi
   - a byte pointer without a known size: a zeroed spare buffer (`2 * MAX_INPUT_SIZE + 1024` bytes), so
     an unknown contract does not read as a target bug; a `const char *` alone takes the rest of the
     input as a NUL-terminated string;
+  - a pointer to a non-byte scalar without a known size or count (`_scalar_array`): ARRAY_ELEMENTS
+    zeroed elements, element 0 read from the input as one object would be (libmodbus run-1:
+    `modbus_get_float_abcd(const uint16_t *src)` reads `src[0]` and `src[1]`). A call that also takes a
+    count or an index of such buffers (`_indexed_scalars`: named like a count, `nb` included, or
+    `idx`/`index`/`offset`/`pos`) and no (buffer, length) pair gets spare buffers' worth of elements,
+    and each count or index is kept within half of the smallest such buffer (`_index_rules`:
+    `modbus_set_bits_from_bytes(dest, idx, nb_bits, tab_byte)`, `modbus_read_bits(ctx, addr, nb, dest)`);
   - a pointer to a struct the unit has an initializer for (a function of the unit, also from another
     cluster than the module's, named like `*_Init`, `*_init`, `*Init*`, `*_new`, `*_create` whose
     first parameter is a non-const pointer to that struct; never an error or `FILE *` one, else first
@@ -183,8 +190,13 @@ ARRAY_STRING_BYTES = 16  # the storage of each element of an array of `const` st
 # input bytes, its last byte 0. Small, since the slot is read whole or not at all; room for a dotted
 # IPv4 address or `/dev/ttyUSB0` and its NUL.
 STRING_SLOT_BYTES = 16
-# The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`.
-_ARRAY_COUNT_RE = re.compile(r"[Cc]ount|[Cc]nt|^n(?:[A-Z_0-9]|$)|^num|^N$|[Nn]memb|[Nn]elem|[Nn]items")
+# The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`,
+# and `nb` as a word (libmodbus's `nb`, `nb_bits`, `write_nb`, `read_nb`).
+_ARRAY_COUNT_RE = re.compile(
+    r"[Cc]ount|[Cc]nt|^n(?:[A-Z_0-9]|$)|^num|^N$|[Nn]memb|[Nn]elem|[Nn]items|(?:^|_)nb(?:[A-Z_0-9]|$)"
+)
+# The formal name of an index into a buffer: libmodbus's `modbus_set_bits_from_bytes(dest, idx, ...)`.
+_INDEX_WORDS = frozenset({"idx", "index", "offset", "pos", "position"})
 # `len` and `size` count elements too, except after a struct pointer: `(struct ctx *c, size_t size)`
 # is far more often a context and some size than an array of contexts.
 _ARRAY_LEN_RE = re.compile(r"[Ll]en|[Ss]ize")
@@ -207,6 +219,15 @@ _DTOR_NAME_RE = re.compile(
     r"(?:^|_)(?:release|free|destroy|delete|close|cleanup|deinit|fini|unref)(?:$|_)|"
     r"(?:^|(?<=[a-z0-9_]))(?:Free|Destroy|Release)(?=[A-Z0-9_]|$)"
 )
+# Destructor names that release memory, chosen over the others (`close`, `cleanup`, `deinit`, `fini`):
+# libmodbus's `modbus_close` only closes the socket, `modbus_free` frees the context (run-1 leaked
+# one context per execution while `modbus_close` was the destructor).
+_FREEING_DTOR_RE = re.compile(
+    r"(?:^|_)(?:release|free|destroy|delete|unref)(?:$|_)|"
+    r"(?:^|(?<=[a-z0-9_]))(?:Free|Destroy|Release)(?=[A-Z0-9_]|$)"
+)
+# A destructor-named function that closes the handle (`modbus_close`): run before the freeing one.
+_CLOSE_DTOR_RE = re.compile(r"(?:^|_)close(?:$|_)|(?:^|(?<=[a-z0-9_]))Close(?=[A-Z0-9_]|$)")
 # File-system path parameter names, as words of the formal's name (`filename`, `file_name`, `filePath`).
 _PATH_WORDS = frozenset({"filename", "fname", "path", "pathname", "filepath", "dirname", "dirpath"})
 _PATH_WORD_PAIRS = frozenset({("file", "name"), ("file", "path"), ("dir", "name"), ("dir", "path"), ("path", "name")})
@@ -402,6 +423,9 @@ class ApiInfo:
     ctors: dict[str, str] = field(default_factory=dict)
     dtors: dict[str, str] = field(default_factory=dict)
     dtor_names: dict[str, set[str]] = field(default_factory=dict)
+    # Per handle type whose destructor frees it, the destructor-named `close` that runs first
+    # (`handle_closers`: libmodbus's `modbus_close(ctx); modbus_free(ctx);`).
+    closers: dict[str, str] = field(default_factory=dict)
     returns: dict[str, str] = field(default_factory=dict)  # function -> the handle type it returns
     # Out-parameter handles (`outparam_constructors`): per function, parameter index -> the handle type
     # it writes through `H **`; per handle type, the out-parameter constructor chosen (when no
@@ -427,6 +451,9 @@ class ApiInfo:
     # initializer set up in it, and every function named like a destructor of it.
     struct_dtors: dict[str, str] = field(default_factory=dict)
     struct_dtor_names: dict[str, set[str]] = field(default_factory=dict)
+    # Per struct type, the destructor that frees an object a constructor returned (`struct_freers`:
+    # libmodbus's `modbus_mapping_free` for `modbus_mapping_new*`).
+    struct_freers: dict[str, str] = field(default_factory=dict)
     # Argument domains (`_domain_rules`): per function, enum parameter index -> the enum's declared
     # constants (`param_enums`); the functions whose header returns a `const` pointee
     # (`const_returns`); the functions that reach an allocator through the model's call sites
@@ -534,8 +561,8 @@ def _array_count(params: list[dict], i: int, formals: list[dict]) -> int | None:
     length or size when no array of the group points to a struct. Only the last array of a group
     may point to a struct, and only with a count-named count: `(struct ctx *c, size_t size)` is far
     more often a context and some size than an array of contexts. Without the count's name nothing
-    says it counts elements: a pointer and a value (`int *dst, unsigned value`) stay one object and
-    a scalar.
+    says it counts elements: a pointer and a value (`int *dst, unsigned value`) are no group (the
+    pointer is a small array, `_scalar_array`, and the value stays as read).
     """
     j = i
     while j < len(params) and _array_element(params[j]):
@@ -788,8 +815,7 @@ def _construct(
     """
     api = case.api
     if htype in api.ctors:
-        release = f"if ({var} != 0) {{ (void){api.dtors[htype]}({var}); }}" if htype in api.dtors else None
-        return [_handle_call(case, htype, var, call, param)], release, [], None
+        return [_handle_call(case, htype, var, call, param)], _handle_release(api, htype, var), [], None
     fn, out = api.out_ctors[htype]
     rec = api.records.get(fn) or {}
     params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
@@ -824,8 +850,44 @@ def _construct(
     if parent_guard:
         stmt = f"if ({parent_guard}) {{ {stmt} }}"
     before.append(f"{htype} {case.declare(var)} = 0; {stmt}")
-    release = f"if ({var} != 0) {{ (void){api.dtors[htype]}({var}); }}" if htype in api.dtors else None
-    return before, release, later, f"{var} != 0"
+    return before, _handle_release(api, htype, var), later, f"{var} != 0"
+
+
+def _handle_release(api: ApiInfo, htype: str, var: str, called: str | None = None) -> str | None:
+    """
+    The release of handle `var` of `htype` after call `called`, or None: no destructor, or `called`
+    is itself named like a destructor of the handle. The handle's `close` (`api.closers`) runs before
+    its freeing destructor; when `called` is that `close`, only the destructor follows it.
+    """
+    dtor = api.dtors.get(htype)
+    if dtor is None:
+        return None
+    closer = api.closers.get(htype)
+    if called is not None and called in api.dtor_names.get(htype, set()) and called != closer:
+        return None
+    calls = [f"(void){f}({var});" for f in (closer, dtor) if f and f != called]
+    return f"if ({var} != 0) {{ {' '.join(calls)} }}"
+
+
+def _made_struct(name: str, rec: dict, params: list[dict], api: ApiInfo) -> str | None:
+    """
+    The struct type whose object call `name` makes and hands to its caller, or None: named like an
+    initializer (`modbus_mapping_new_start_address`), returning `struct S *` (a complete struct, so no
+    handle), taking no `struct S *`, reaching an allocator, its header not returning a `const`
+    pointee, and `S` has a destructor named for freeing (`api.struct_freers`: `modbus_mapping_free`).
+    A wrong release would be a crash only the harness makes, so every condition must hold.
+    """
+    ret = _return_type(rec)
+    if not ret.endswith("*") or not _INIT_NAME_RE.search(name):
+        return None
+    pointee = ret[:-1].strip()
+    if not _is_record(pointee) or "*" in pointee or pointee not in api.struct_freers:
+        return None
+    if name not in api.allocating or name in api.const_returns:
+        return None
+    if any(p["kind"] == "ptr" and str(p.get("pointee") or "") == pointee for p in params):
+        return None
+    return pointee
 
 
 def _struct_release(api: ApiInfo, pointee: str, name: str, expr: str) -> str | None:
@@ -999,6 +1061,65 @@ def _realloc_rules(
         case.note(call, k, f"used size of a realloc-like call: within the {REALLOC_OLD_BYTES}-byte old allocation and the new size")
 
 
+def _scalar_array(p: dict) -> bool:
+    """A pointer to a non-byte arithmetic scalar (`uint16_t *`, `int *`, `float *`): no struct, enum, `_Bool` or pointer."""
+    pointee = str(p.get("pointee") or "")
+    return (
+        p["kind"] == "ptr"
+        and not _charlike(p)
+        and pointee in SCALAR_BYTES
+        and pointee != "_Bool"
+        and not p.get("anon_enum")
+    )
+
+
+def _indexed_scalars(params: list[dict], formals: list[dict]) -> set[int]:
+    """
+    The integer parameters that index a buffer the call gets with no length beside it (libmodbus's
+    `modbus_set_bits_from_bytes(uint8_t *dest, int idx, unsigned int nb_bits, const uint8_t *tab_byte)`,
+    `modbus_read_bits(ctx, int addr, int nb, uint8_t *dest)`): named as an element count
+    (`_ARRAY_COUNT_RE`) or an index (`_INDEX_WORDS`), at least two bytes wide, not an enum. None when
+    the call takes a (buffer, length) pair or an array and its count: the callee can check an index
+    against that length, and a missing check is its bug, not the harness's.
+    """
+    if any(_is_pair(params, i, formals) or _array_count(params, i, formals) is not None for i in range(len(params))):
+        return set()
+    out: set[int] = set()
+    for i, p in enumerate(params):
+        if p["kind"] != "int" or p.get("enum") or p.get("anon_enum") or SCALAR_BYTES.get(p.get("ctype") or "", 0) < 2:
+            continue
+        name = _name(formals, i)
+        if name and (_ARRAY_COUNT_RE.search(name) or set(_words(name)) & _INDEX_WORDS):
+            out.add(i)
+    return out
+
+
+def _index_rules(
+    case: _Case, call: int, params: list[dict], scalars: dict[int, str], indexed: set[int], bare: list[str]
+) -> None:
+    """
+    Keep each count or index of a call (`_indexed_scalars`) within half of the smallest buffer the
+    harness made for it with no length (`bare`: element counts as C expressions), so an index plus a
+    count stays inside every buffer. With no length the callee cannot check them: the caller's
+    contract says they fit, and a value past the buffer is a crash only the harness makes (libmodbus
+    run-1: `modbus_get_byte_from_bits(src, idx, nb_bits)` read `src[idx + i]` for any `idx`). A value
+    within the bound is passed as read and a negative one becomes the bound; no slot moves.
+    """
+    if not bare:
+        return
+    m = bare[0]
+    for x in bare[1:]:
+        m = f"({m} < {x} ? {m} : {x})"
+    limit = f"{m} / 2ULL"
+    for k in sorted(indexed):
+        v = scalars.get(k)
+        if v is None:
+            continue
+        ct = params[k]["ctype"]
+        case.decls.append(f"if ((unsigned long long){v} > {limit}) {{ {v} = ({ct})({limit}); }}")
+        case.note(call, k, "count or index into a buffer of no length: within half of its elements")
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -1032,6 +1153,10 @@ def _bind_call(
     owned_outs: list[str] = []
     realloc = _realloc_like(name, params, formals, rec, api) if allow_init and 0 not in shared else None
     realloc_old: str | None = None
+    # `_index_rules`: the element counts of the buffers the harness made with no length beside them,
+    # and the count- and index-named scalars that index them.
+    bare: list[str] = []
+    indexed = _indexed_scalars(params, formals)
     i = 0
     n = len(params)
     while i < n:
@@ -1061,7 +1186,11 @@ def _bind_call(
                 before += made_here
                 if guard:
                     guards.append(guard)
-                if release and name not in api.dtor_names.get(htype, set()):
+                if release and name in api.dtor_names.get(htype, set()):
+                    # The call under test is a destructor: nothing after it, or only the freeing
+                    # destructor after the handle's `close`.
+                    release = _handle_release(api, htype, v, name)
+                if release:
                     after.append(release)
                 after += parents_release
                 args.append(f"({p['type']}){v}")
@@ -1074,8 +1203,9 @@ def _bind_call(
             # parent owns it, so neither is released.
             case.decls.append(f"{out_h} {case.declare(v)} = 0;")
             args.append(f"({p['type']})&{v}")
-            if allow_init and name in api.out_ctor_names.get(out_h, set()) and out_h in api.dtors:
-                after.append(f"if ({v} != 0) {{ (void){api.dtors[out_h]}({v}); }}")
+            out_release = _handle_release(api, out_h, v)
+            if allow_init and name in api.out_ctor_names.get(out_h, set()) and out_release:
+                after.append(out_release)
             i += 1
             continue
         if i in shared:
@@ -1127,6 +1257,20 @@ def _bind_call(
             charlike = _charlike(p)
             pair = _is_pair(params, i, formals)
             own_init = i == 0 and name in case.api.candidates.get(pointee, set())
+            if (
+                allow_init
+                and i not in shared
+                and pointee not in case.api.inits
+                and name in case.api.struct_dtor_names.get(pointee, set())
+                and _FREEING_DTOR_RE.search(name)
+            ):
+                # libmodbus run-1: `modbus_mapping_free(&c0a0)` on a zeroed stack object, an invalid
+                # free only the harness made. With no initializer nothing sets up an object on the
+                # stack; the case of a constructor that returns one releases it (`_made_struct`).
+                raise _CaseError(
+                    f"frees its argument: a zeroed {pointee} on the stack would be an invalid free only the "
+                    "harness makes (no initializer of the struct); a constructor's case releases what it returns"
+                )
             if allow_init and pointee in case.api.inits and not own_init:
                 # A context object: its initializer runs first, never a zeroed or input-filled object.
                 case.decls.append(f"{pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
@@ -1207,6 +1351,7 @@ def _bind_call(
                         f"{{ size_t rest_n = fuzz_len - fuzz_off; if (rest_n > sizeof({v}) - 1) "
                         f"{{ rest_n = sizeof({v}) - 1; }} memcpy({v}, {FUZZ_COPY}, rest_n); {v}[rest_n] = 0; }}"
                     )
+                bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
                 i += 1
                 continue
@@ -1239,9 +1384,32 @@ def _bind_call(
                         )
                 elif is_input and lay is not None and lay.get("what") == "struct":
                     _fill_fields(case, call, i, f"{v}[0]", lay, 0)
+                if not _is_record(pointee):
+                    bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
             elif varlen and _lone_output(params, formals, i):
                 case.decls.append(_byte_buffer("static ", case.declare(v), case.spare))
+                args.append(f"({p['type']}){v}")
+            elif _scalar_array(p):
+                # A pointer to a non-byte scalar of no known size (libmodbus run-1: `modbus_get_float_abcd(
+                # const uint16_t *src)` reads src[0] and src[1]): zeroed elements, element 0 read from the
+                # input as the one object was, so the layout does not move. A larger buffer never makes a
+                # crash; a smaller one does. A call indexing it by a count or an index
+                # (`_indexed_scalars`) gets a spare buffer's worth of elements, which bounds them.
+                if indexed:
+                    case.decls.append(
+                        f"static {elem} {case.declare(v)}[({case.spare} + sizeof({elem}) - 1) / sizeof({elem})]; "
+                        f"memset({v}, 0, sizeof({v}));"
+                    )
+                    what = f"{case.spare} bytes of elements"
+                else:
+                    case.decls.append(f"{elem} {case.declare(v)}[{ARRAY_ELEMENTS}]; memset({v}, 0, sizeof({v}));")
+                    what = f"{ARRAY_ELEMENTS} elements"
+                if is_input:
+                    case.slot(f"{v}[0]", SCALAR_BYTES.get(pointee), call, i, "pointee")
+                case.note(call, i, f"{pointee} of no known size: an array of {what}, zeroed"
+                          + (", element 0 read from the input" if is_input else ""))
+                bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
             else:
                 case.decls.append(f"{elem} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
@@ -1281,6 +1449,7 @@ def _bind_call(
     if realloc is not None:
         _realloc_rules(case, call, scalars, params, *realloc)
     _domain_rules(case, call, name, params, formals, scalars, pairs)
+    _index_rules(case, call, params, scalars, indexed, bare)
     args += extra_args or []
     if allow_init and params and 0 not in shared and 0 not in bound_handles and params[0]["kind"] == "ptr":
         # An initializer's own case: what it set up in its (unshared) object is released after it. A
@@ -1291,10 +1460,17 @@ def _bind_call(
             if release:
                 after.append(release)
     made = case.api.returns.get(name) if allow_init else None
+    made_struct = _made_struct(name, rec, params, api) if allow_init else None
     if made is not None and made in case.api.dtors:
         # The call under test makes a handle: release it, or every run of the case leaks one.
         r = f"c{call}r"
-        own = f"{{ {made} {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){case.api.dtors[made]}({r}); }} }}"
+        own = f"{{ {made} {r} = {name}({', '.join(args)}); {_handle_release(api, made, r)} }}"
+    elif made_struct is not None:
+        # The call under test makes a struct object its caller frees (libmodbus's modbus_mapping_new*).
+        r = f"c{call}r"
+        freer = api.struct_freers[made_struct]
+        own = f"{{ {made_struct} * {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){freer}({r}); }} }}"
+        case.notes.append(f"call {call} result: a {made_struct} the caller owns, released with {freer}")
     elif realloc_old is not None:
         # Rule E: the result is freed; on failure (a new size of at least 1) the old pointer still is the caller's.
         r = f"c{call}r"
@@ -1747,7 +1923,10 @@ def handle_functions(
     A constructor is named like an initializer (`_INIT_NAME_RE`: `*_new`, `*_new_<kind>`, `*_create`,
     `*_init`, ...), returns the handle type, takes no handle parameter and no file-system path
     (`path_parameter`); other parameters are allowed (the harness fills them from the input). The fewest
-    parameters win, then the name. A destructor is named like one and takes the handle alone.
+    parameters win, then the name. A destructor is named like one and takes the handle alone; one
+    named for freeing (`_FREEING_DTOR_RE`: libmodbus's `modbus_free`) wins over `close`, `cleanup`,
+    `deinit` or `fini` (`modbus_close` only closes the socket), then the name. A `close` of a handle
+    whose destructor frees runs before it (`handle_closers`).
     """
     protos = getattr(visible, "prototypes", None) or {}
     by_name: dict[str, dict] = {}
@@ -1778,8 +1957,48 @@ def handle_functions(
         if len(params) == 1 and mine and _DTOR_NAME_RE.search(name):
             dtor_cands.setdefault(mine[0], set()).add(name)
     ctors = {t: min(names, key=lambda n: (len(protos[n]["params"]), n)) for t, names in ctor_cands.items()}
-    dtors = {t: min(names) for t, names in dtor_cands.items()}
+    dtors = {t: min(names, key=_dtor_rank) for t, names in dtor_cands.items()}
     return handles, ctors, dtors, dtor_cands, {n: by_name[n] for n in ctors.values()}, returns
+
+
+def _dtor_rank(name: str) -> tuple[bool, str]:
+    """A destructor named for freeing first (`modbus_free` over `modbus_close`), then the name."""
+    return (not _FREEING_DTOR_RE.search(name), name)
+
+
+def handle_closers(
+    dtors: dict[str, str], dtor_names: dict[str, set[str]], model_functions: dict
+) -> dict[str, str]:
+    """
+    Per handle type whose destructor is named for freeing, the other destructor-named function named
+    `close` that runs before it (libmodbus: `modbus_close(ctx); modbus_free(ctx);`, else the socket a
+    connect or listen opened leaks once per execution). Name-only: one that reaches `free` through the
+    model's direct call sites frees the handle itself and is no closer (a double free the harness
+    would make); an indirect call (libmodbus's `ctx->backend->close`) is not followed.
+    """
+    freeing = _reaching(model_functions, frozenset({"free"}))
+    out: dict[str, str] = {}
+    for t, d in dtors.items():
+        if not _FREEING_DTOR_RE.search(d):
+            continue
+        cands = sorted(
+            n
+            for n in dtor_names.get(t, set())
+            if n != d and _CLOSE_DTOR_RE.search(n) and not _FREEING_DTOR_RE.search(n) and n not in freeing
+        )
+        if cands:
+            out[t] = cands[0]
+    return out
+
+
+def struct_freers(struct_dtor_names: dict[str, set[str]]) -> dict[str, str]:
+    """Per struct type, its destructor named for freeing (`modbus_mapping_free`), the first name; others have none."""
+    out: dict[str, str] = {}
+    for t, names in struct_dtor_names.items():
+        freeing = sorted(n for n in names if _FREEING_DTOR_RE.search(n))
+        if freeing:
+            out[t] = freeing[0]
+    return out
 
 
 @dataclass
@@ -2030,7 +2249,9 @@ def lifecycle_case(
     string is a `STRING_SLOT_BYTES` slot, NUL-terminated, and an unsized byte pair a zeroed spare
     buffer with a length read from the input and clamped to it), then while the input lasts, up to `max_calls` times, one input
     byte picks one of `methods` (call k + 1 for methods[k]), called on the handle with its other
-    arguments read from the input at that point, then the destructor releases the handle. Only the
+    arguments read from the input at that point, then the destructor releases the handle (after its
+    `close`, `handle_closers`; neither is a method, a release inside the loop would be a use after
+    free the harness makes). Only the
     constructor's slots are fixed, so they are the layout's slots (seeds start from the constructor's
     recorded arguments); the method calls read their bytes in the loop. A NULL handle runs no method.
     """
@@ -2085,11 +2306,13 @@ def _lifecycle_case(
         call = _bind_call(sub, k + 1, name, params, list(rec.get("formals") or []), rec, {idx: "fc_h"})
         case.notes.extend(sub.notes)
         branches.append(f"if (fc_k == {k}U) {{ {' '.join([*sub.decls, *sub.post, call])} }}")
+    closer = api.closers.get(htype)
+    release = f"(void){closer}(fc_h); (void){dtor}(fc_h);" if closer else f"(void){dtor}(fc_h);"
     loop = (
         f"if (fc_h != 0) {{ for (unsigned int fc_i = 0; fc_i < {max_calls}U; fc_i++) {{ unsigned char fc_op = 0;"
         f" if (fuzz_len < fuzz_off + 1) {{ break; }} memcpy(&fc_op, {FUZZ_COPY}, 1); fuzz_off += 1;"
         f" unsigned int fc_k = (unsigned int)fc_op % {len(methods)}U; {' else '.join(branches)} }}"
-        f" (void){dtor}(fc_h); }}"
+        f" {release} }}"
     )
     layout = case.layout("lifecycle", [ctor, dtor])
     layout.update(handle=htype, methods=list(methods), max_calls=max_calls)
@@ -2180,7 +2403,8 @@ def plan(
     }
     inits, candidates, init_records = initializers(unit_pool, traces, visible)
     struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible)
-    helper_pool = (set(inits.values()) | set(struct_dtors.values())) - entry_names
+    freers = struct_freers(struct_dtor_names)
+    helper_pool = (set(inits.values()) | set(struct_dtors.values()) | set(freers.values())) - entry_names
     # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
     out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
     api = ApiInfo(
@@ -2193,6 +2417,7 @@ def plan(
         ctors=ctors,
         dtors=dtors,
         dtor_names=dtor_names,
+        closers=handle_closers(dtors, dtor_names, model.get("functions") or {}),
         returns=returns,
         outs=outp.outs,
         out_ctors=out_ctors,
@@ -2203,6 +2428,7 @@ def plan(
         qual_ptrs=dict(getattr(visible, "qualified_pointers", None) or {}),
         struct_dtors=struct_dtors,
         struct_dtor_names=struct_dtor_names,
+        struct_freers=freers,
         enum_params=dict(getattr(visible, "enum_params", None) or {}),
         const_returns=set(getattr(visible, "const_returns", None) or ()),
         allocating=allocating_functions(model.get("functions") or {}),
@@ -2883,13 +3109,18 @@ def allocating_functions(model_functions: dict) -> set[str]:
     name: `mpack_expect_cstr_alloc` -> `mpack_expect_cstr_alloc_unchecked` ->
     `mpack_read_bytes_alloc_impl` -> `malloc`. Indirect calls are not followed.
     """
+    return _reaching(model_functions, ALLOCATORS)
+
+
+def _reaching(model_functions: dict, targets: frozenset[str]) -> set[str]:
+    """The model's functions that reach one of `targets` through their direct call sites, by name."""
     callees = _callee_names(model_functions)
     out: set[str] = set()
     changed = True
     while changed:
         changed = False
         for name, cs in callees.items():
-            if name not in out and cs & (ALLOCATORS | out):
+            if name not in out and cs & (targets | out):
                 out.add(name)
                 changed = True
     return out
