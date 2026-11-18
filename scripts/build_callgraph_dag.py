@@ -49,10 +49,12 @@ import os
 import re
 import sys
 from collections import defaultdict
+from collections.abc import Collection
 from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import target_env  # noqa: E402
 import tiers  # noqa: E402
 import unit_split  # noqa: E402
 from framac_common import VA_PARAMS, is_pipeline_output_dir  # noqa: E402
@@ -513,7 +515,18 @@ def _rooted(path: str, root: str) -> str:
     return root.rstrip("/") if path in ("", ".") else f"{root.rstrip('/')}/{path}"
 
 
-def unit_cppflags(unit_flags: list[str], include_dirs: list[str], root: str = "") -> tuple[list[str], list[str]]:
+def generated_root(root: str) -> str:
+    """
+    The snapshot's generated-header directory next to the DAG's target directory `root`
+    (`workspace/work` -> `workspace/snapshot/generated`, scripts/target_env.py).
+    """
+    base = PurePosixPath(root.rstrip("/")).parent
+    return (base / PurePosixPath(target_env.SNAPSHOT_REL).name / target_env.GENERATED_REL).as_posix()
+
+
+def unit_cppflags(
+    unit_flags: list[str], include_dirs: list[str], root: str = "", generated: Collection[str] = ()
+) -> tuple[list[str], list[str]]:
     """
     A unit's compile flags, one token each, and its force-included files (`-include f` / `-imacros f`,
     which take two tokens and so are kept apart). Flags are the build's own (`-I inc` joined to `-Iinc`;
@@ -521,17 +534,21 @@ def unit_cppflags(unit_flags: list[str], include_dirs: list[str], root: str = ""
     of the unit's sources and of the project headers they include, which the compiler finds next to the
     including file but a harness elsewhere does not. The model's paths are relative to the project root;
     with `root` (the DAG's target directory, e.g. `workspace/work`) relative directories and files are
-    made relative to the run directory.
+    made relative to the run directory. A force-included file the build generated (`generated`, the
+    capture's exported headers: `config.h` from ./configure) is not in the target tree: with `root` it
+    names its snapshot copy (`generated_root`).
     """
     out: list[str] = []
     forced: list[str] = []
+    generated = {g[2:] if g.startswith("./") else g for g in generated}
     tokens = [str(t) for t in unit_flags]
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         nxt = tokens[i + 1] if i + 1 < len(tokens) else None
         if tok in _FORCE_INCLUDE_FLAGS and nxt is not None:
-            forced.append(_rooted(nxt, root))
+            rel = nxt[2:] if nxt.startswith("./") else nxt
+            forced.append(f"{generated_root(root)}/{rel}" if root and rel in generated else _rooted(nxt, root))
             i += 2
             continue
         if tok in _DIR_FLAGS and nxt is not None:
@@ -1268,6 +1285,8 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
     modules: dict[str, dict] = {}
     folded: list[str] = []
     link_options = unit_link_options(capture)
+    gen = ((capture or {}).get("snapshot") or {}).get("generated") or {}
+    generated_headers = [str(h) for h in (gen.get("headers") if isinstance(gen, dict) else None) or [] if h]
     for u in order:
         rec = units[u]
         name = names[u]
@@ -1293,7 +1312,9 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
         header = [key_of[e] for e in rec.get("header_api") or [] if e in key_of]
         entries += [k for k in dict.fromkeys(header) if k in fn_set and k not in entries]
         sources = compiled.map(sources)
-        flags, forced = unit_cppflags(list(rec.get("cppflags") or []), include_dirs(sources, capture), root)
+        flags, forced = unit_cppflags(
+            list(rec.get("cppflags") or []), include_dirs(sources, capture), root, generated_headers
+        )
         modules[name] = {
             "module": name,
             "unit": u,
