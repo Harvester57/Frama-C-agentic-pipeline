@@ -1,10 +1,12 @@
 {
-  "$comment": "The structured block of a target's THREAT_MODEL.md (plan step I7): a fenced code block whose info string is `framac-threat-model` (or `json framac-threat-model`) holding one JSON object. scripts/trust.py reads it. A function is named `name` or `file#name` (file relative to the target root); `unit` is a link unit of the build capture, by its full name or its file name (`build/libfoo.a` or `libfoo.a`). The four lists are required and may be empty: an empty list states that the target has none.",
+  "$comment": "The structured block of a target's THREAT_MODEL.md (plan step I7): a fenced code block whose info string is `framac-threat-model` (or `json framac-threat-model`) holding one JSON object. scripts/trust.py reads it. A function is named `name` or `file#name` (file relative to the target root); `unit` is a link unit of the build capture, by its full name or its file name (`build/libfoo.a` or `libfoo.a`). The four lists are required and may be empty: an empty list states that the target has none. `assets`, `invariants` and `call_rules` are optional.",
   "type": "object",
   "definitions": {
     "identifier": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
     "function_ref": {"type": "string", "pattern": "^(?:[A-Za-z0-9_./+-]+\\.[A-Za-z0-9]+#)?[A-Za-z_][A-Za-z0-9_]*$"},
-    "description": {"type": "string", "minLength": 1, "visibleContent": true}
+    "description": {"type": "string", "minLength": 1, "visibleContent": true},
+    "lvalue": {"$comment": "a C lvalue: a global (`config`, `session.mode`) or a field reached from a parameter (`ctx->mode`)", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:(?:\\.|->)[A-Za-z_][A-Za-z0-9_]*)*$"},
+    "predicate": {"$comment": "an ACSL predicate written into a generated annotation, like secrets[].size: no comment delimiter (`/*`, `*/`, `//`), no `;`, and none of `\\result` (MetAcsl refuses it in a postcondition and turns it into a silent \\true under \\tguard), `\\flags`, `proof:` (proof:deduce and proof:axiom assume the property instead of checking it), `\\tguard`, `\\inter`, `\\in_file`", "type": "string", "maxLength": 400, "pattern": "^(?!.*(?:/[*/]|\\*/|\\\\result|\\\\flags|proof:|\\\\tguard|\\\\inter|\\\\in_file))[A-Za-z0-9_ ()\\[\\]*+/.<>=!&|%^~?:,\\\\-]+$"}
   },
   "properties": {
     "schema_version": {"const": 1},
@@ -87,6 +89,55 @@
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "kind", "description"],
+        "additionalProperties": false
+      }
+    },
+    "assets": {
+      "$comment": "Optional (docs/plans/metacsl-exploitation-plan.md, package D1). Data only some functions may write, and optionally only some may read (security layer L3, class l3_isolation): properties L3_writers_<name> and L3_readers_<name>. An absent list states nothing.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"$comment": "names the properties", "$ref": "#/definitions/identifier"},
+          "lvalue": {"$ref": "#/definitions/lvalue"},
+          "params": {"$comment": "for an lvalue reached from a parameter: the other parameter names the object is passed as (`s` when helpers take `struct conf *s`). A function that takes it under a name not listed here is not checked", "type": "array", "items": {"$ref": "#/definitions/identifier"}},
+          "writers": {"$comment": "the functions allowed to write it; empty: nothing in the target writes it", "type": "array", "items": {"$ref": "#/definitions/function_ref"}},
+          "readers": {"$comment": "the functions allowed to read it; absent: reads are not restricted", "type": "array", "items": {"$ref": "#/definitions/function_ref"}},
+          "description": {"$ref": "#/definitions/description"}
+        },
+        "required": ["name", "lvalue", "writers", "description"],
+        "additionalProperties": false
+      }
+    },
+    "invariants": {
+      "$comment": "Optional (package D1). A predicate over globals that the functions in `scope` keep (security layer L4, class l4_invariant): property L4_invariant_<name>. variant `weak`: at their boundaries (their callers must establish it at each call); `strong`: also after each write; `conditional`: kept when it holds on entry, nothing asked of the callers (entry points; `scope` required); `monotonic`: `lvalue` only moves `direction` (up: never decreases), at every write, and takes no `predicate`.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"$ref": "#/definitions/identifier"},
+          "variant": {"type": "string", "enum": ["weak", "strong", "conditional", "monotonic"]},
+          "predicate": {"$ref": "#/definitions/predicate"},
+          "lvalue": {"$comment": "variant monotonic: the state", "$ref": "#/definitions/lvalue"},
+          "direction": {"$comment": "variant monotonic: `up` (default) or `down`", "type": "string", "enum": ["up", "down"]},
+          "scope": {"$comment": "the functions that keep it; absent: every function of the build (not for `conditional`)", "type": "array", "minItems": 1, "items": {"$ref": "#/definitions/function_ref"}},
+          "description": {"$ref": "#/definitions/description"}
+        },
+        "required": ["name", "variant", "description"],
+        "additionalProperties": false
+      }
+    },
+    "call_rules": {
+      "$comment": "Optional (package D1). A predicate that holds at every call of `function`, defined or only declared (security layer L4, class l4_call_rule): property L4_call_<function>. The predicate names globals and the callee's parameters (the arguments of each call).",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "function": {"$ref": "#/definitions/function_ref"},
+          "predicate": {"$ref": "#/definitions/predicate"},
+          "description": {"$ref": "#/definitions/description"}
+        },
+        "required": ["function", "predicate", "description"],
         "additionalProperties": false
       }
     }

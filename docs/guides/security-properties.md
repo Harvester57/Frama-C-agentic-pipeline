@@ -22,7 +22,7 @@ Layers 3 to 6 come from what the structured threat model (the `framac-threat-mod
 How it runs:
 
 1. `/framac-slice` Step 3 runs `scripts/security_props.py run`. It reads the Phase 0 model (`workspace/reports/phase0_model.json`) and the threat model, and writes `workspace/reports/security_props.json`.
-2. Each property is rendered from [`templates/metacsl/`](../../templates/metacsl/) as a MetAcsl meta-property, and lists its `instances`: the functions where its generated annotations land. Those are the ledger units (`l3_frame`, `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped`, `l6_no_leak`), seeded by `ledger.py seed`.
+2. Each property is rendered from [`templates/metacsl/`](../../templates/metacsl/) as a MetAcsl meta-property, and lists its `instances`: the functions where its generated annotations land. Those are the ledger units (`l3_frame`, `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped`, `l6_no_leak`), seeded by `ledger.py seed`. The classes of the asset, invariant and call-rule properties (`l3_isolation`, `l4_invariant`, `l4_call_rule`) are generated but not seeded yet.
 3. `run_wp_function.py` loads the properties of the function under proof (`--security-props`, default the run's file; `none` turns it off) and runs `-meta -then-last -wp`. A prover discharges the generated `assert`, `requires` and `ensures` named `<property>: meta:` like any other goal, and the prover brief lists what to discharge.
 
 Without a threat model only Layer 3 is generated.
@@ -34,7 +34,7 @@ WP is the only engine that checks the properties today. Two pieces are in place 
 - **The switch.** `security_props.json` has `meta_engines`, a list within `eva` and `eacsl`. `security_props.py run --meta-engines eva,eacsl` sets it, `--meta-engines none` clears it, and a plain run keeps the previous choice, so the Makefile's `security-props` target does not undo it. `security_props.meta_engines(props)` reads it. Absent or empty means WP only, which is the default.
 - **The module meta file.** `security_props.module_meta_file_text(props, functions=None)` returns `(text, names, sources)`, or `None` when there is nothing to load: the meta file of a whole-module run, where MetAcsl instantiates each property in every function of the parse. `functions` is a list of `file#name` ids and selects the properties with an instance among them; `None` selects every property with an instance. A property without instances (decided from the model, or a forwarding sink) and a property written into the work tree (`code`) are left out. The layout is the one of a function's meta file (`meta_file_text`), so `security_props.meta_line_names(text)` maps the line of a report row back to its property.
 
-A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`, `success`; `output_sinks` `function`, `kind`, `params`, `length`, `format`):
+A threat model block looks like this (fields per kind: `input_sources` `function`, `role`, `params`; `trusted_callers` `unit`, `except`, `functions`, `reason`; `secrets` `name`, `kind` (`global`, `parameter`, `field`, `local`, `return`), `function`, `size`, `object`; `auth_gates` `function`, `state`, `protects`, `success`; `output_sinks` `function`, `kind`, `params`, `length`, `format`; the optional `assets`, `invariants` and `call_rules` are described under "Assets, Invariants and Call Rules" below):
 
 ````markdown
 ```json framac-threat-model
@@ -162,7 +162,75 @@ It sets `eva_taint` in `params.json` (`EVA_TAINT_<mod>`, `taint` added to Eva's 
 
 ---
 
+## Assets, Invariants and Call Rules
+
+Three optional lists of the threat model state properties that are not tied to a gate, a sink or a secret (package D1 of [`../plans/metacsl-exploitation-plan.md`](../plans/metacsl-exploitation-plan.md)). A threat model without them generates what it did before.
+
+```json
+"assets": [
+  {"name": "config", "lvalue": "config", "writers": ["set_config"], "readers": ["get_config"], "description": "..."},
+  {"name": "mode", "lvalue": "c->mode", "params": ["conf"], "writers": ["conf_set_mode"], "description": "..."}
+],
+"invariants": [
+  {"name": "count_bound", "variant": "weak", "predicate": "count <= limit", "scope": ["add", "remove"], "description": "..."},
+  {"name": "phase_up", "variant": "monotonic", "lvalue": "phase", "direction": "up", "description": "..."}
+],
+"call_rules": [
+  {"function": "write_reg", "predicate": "idx < 8 && ready != 0", "description": "..."}
+]
+```
+
+| List | Property | Class | MetAcsl context | Template |
+| :--- | :--- | :--- | :--- | :--- |
+| `assets` | `L3_writers_<name>`: only the `writers` write `lvalue` | `l3_isolation` | `\writing` over every other function | [`l3_asset.acsl`](../../templates/metacsl/l3_asset.acsl) |
+| `assets` with `readers` | `L3_readers_<name>`: only the `readers` read it | `l3_isolation` | `\reading` over every other function | same |
+| `invariants` | `L4_invariant_<name>` | `l4_invariant` | `\weak_invariant`, `\strong_invariant`, `\conditional_invariant`, or `\writing` (monotonic) | [`l4_invariant.acsl`](../../templates/metacsl/l4_invariant.acsl) |
+| `call_rules` | `L4_call_<callee>`: `predicate` holds at every call of the callee | `l4_call_rule` | `\calling`, or `\precond` on a callee called through a pointer | [`l4_call_rule.acsl`](../../templates/metacsl/l4_call_rule.acsl) |
+
+Each property has a `variant` in `security_props.json`:
+
+- **Assets: `global` or `formal`.** An `lvalue` that starts at a global (`config`, `session.mode`) is named as it is. One that starts at a parameter (`c->mode`) is checked in the functions that have a parameter of that name, through `\tguard(... \formal(c)->mode ...)`; `params` lists the other names the object is passed under, one clause each. A function that takes the object under a name the threat model does not list is not checked, and a name no function has is left out with a warning (its clause would be true everywhere).
+- **Invariants.** `weak`: the predicate holds at the entry and exit of each function in `scope` (a `requires` and an `ensures`; the `requires` is proved in the callers, which are instances too). `strong`: it also holds after every statement. `conditional`: a function that is entered with it keeps it (a behavior named after the property; nothing is asked of the callers). A conditional invariant needs a `scope`. `monotonic` takes an `lvalue` and a `direction` (`up` by default) instead of a predicate: at every write, either the write is separated from the lvalue or `\at(x, Before) <= \at(x, After)`; `monotonic_formal` is the same for an lvalue reached from a parameter.
+- **Call rules: `global`, `formal` or `entry`.** A name in the predicate that is a parameter of the callee stands for the argument of the call (`\called_arg`, variant `formal`); any other name is a global (`global`). A callee the target defines and calls through a function pointer gets the rule as its precondition (`entry`), like a Layer 5 sink: a pointer call then needs `/*@ calls callee; */`.
+
+**The instance count is bounded by `scope`.** Without a `scope` an invariant targets every function of the build, and each is a ledger unit to prove. Above 50 instances the generator warns and names the count. An `L3_readers_*` property has every function but the readers as instances (any function may read the asset through a pointer) and warns the same way.
+
+**What goes into an annotation is validated.** `lvalue` is a name followed by `.field` or `->field` steps. A `predicate` is at most 400 characters of ACSL expression text: no `;`, no comment markers, no `\result`, no `\flags`, `proof:`, `\tguard`, `\inter` or `\in_file` ([`../../schemas/threat_model.schema.json`](../../schemas/threat_model.schema.json), and `security_props.predicate_problem` for a block that did not go through the schema). `trust.py check-threat-model` also says which fields go with which invariant variant, and checks the new names against the model: writers, readers and scope functions the build does not define, an lvalue that starts at neither a global nor a parameter, and predicate names that are neither globals nor parameters of the callee. A parameter name that is misspelt in a call rule would otherwise be read as a global that does not exist, and the `\fguard` would turn the property into `\false`.
+
+**Generated text is guarded.** `security_props.meta_text_problems` refuses a property whose text holds `\inter` or `\in_file` in `\targets` (the scope is computed in Python and listed by name), a `proof:deduce` or `proof:axiom` flag, or `\result` under `\tguard` (it would be silently true). Such a property is not generated and the warning names it. The findings behind these rules are in package R of the plan.
+
+**Engines.** A monotonic invariant has `engines: ["eacsl"]`: Eva does not evaluate `\at(x, Before)`. `security_props.for_engine(props, "eva")` returns the document without the properties an engine may not load; pass its result to `module_meta_file_text`. A property without `engines` is for every engine. WP always loads them all.
+
+### Declared callees and `\writing` properties
+
+At a call, MetAcsl's `\writing` context takes what is written from the callee's `assigns`. For a function the target only declares, that has three consequences, which the generator handles for every `\writing` property (`L4_auth_state_*`, `L3_writers_*`, monotonic invariants). It reads the `assigns` of each declared callee textually at its first declaration (`external_decls` of the model, resolved under the work tree, the model's tree, or Frama-C's share directory), because the Phase 0 parse runs with `-no-annot` and the model holds no contract.
+
+- **An `assigns` that holds a set** (`\union(*a, *b)` or `{*a, *b}`) stops MetAcsl 0.12 (`meta_annotate.ml`, line 675). The callers of such a callee are left out of the property's `\targets` and listed under the property's `unchecked`, each with an obligation entry that carries `unchecked`, and a warning names the callees. Nothing checks those callers until the contract is rewritten with one term per location.
+- **No `assigns` at all:** MetAcsl generates nothing for what the callee writes and prints no warning. The property lists the callee and its callers under `declared_callees.no_assigns`, with a warning.
+- **A declaration that cannot be read** (no `external_decls` entry, a file outside the roots): `declared_callees.unknown`.
+
+A caller of a declared callee that assigns something is an instance of the property. A contract written later (by a Phase 3 prover, or on a second declaration) is not seen by the generator: re-run `security_props.py run` after such a change.
+
+### Calls placed in initializers
+
+MetAcsl 0.12 generates no `\calling` instance, no `\writing` instance from the callee's `assigns` and (with its default simplification) no `\strong_invariant` assertion at a call placed in an initializer (`int n = net_send(fd, buf, 16);`). The Phase 0 dump (`phase0_dump.ml`, dump schema 5) marks each direct call site with `initializer`, and for every property whose context is skipped there the generator lists the site under `init_checks`. `security_props.py run` writes an ordinary `check`, named after the property, on the line of the declaration (before it, or after it for a strong invariant), with the argument texts in place of the parameters:
+
+```c
+/*@ check L5_sanitized_net_send: \initialized((buf) + (0 .. (16) - 1)); */ /*@ check L6_no_leak_key: \separated((buf), &key); */ int n = net_send(fd, buf, 16);
+```
+
+The placed checks are in `code_checks`; WP proves them with the function and E-ACSL executes them. The property keeps its MetAcsl text for the statement calls. A site whose check cannot be written (the call is not the whole initializer of a one-declarator declaration, an argument holds a call or an assignment, a macro hides the call, the sink's parameters or the callee's `assigns` are unknown, or the property is a transition) moves to the property's `unchecked`, with the reason. `\precond`, `\postcond`, `\reading`, weak and conditional invariants need no such check: MetAcsl handles them at initializers.
+
+A model whose call sites carry no `initializer` flag gives a warning (`call sites do not say which calls are initializers`) and no `init_checks`.
+
+---
+
 ## Known Limits
+
+- **Initializer flags reach the generator only when the model carries them.** The dump writes `initializer`, but `phase0_model.py` does not copy it into `call_sites` yet (see [`../troubleshooting/security-properties.md`](../troubleshooting/security-properties.md)). Until it does, no in-code check is written in a real run and the generator warns.
+- **The ledger does not know the classes `l3_isolation`, `l4_invariant` and `l4_call_rule` yet** (package D2 of the plan), and does not read `unchecked`. `run_wp_function.py` loads the new properties and WP proves their goals, but its report does not file them under a class.
+- **Parameter-held assets** are checked only under the listed parameter names.
+- **Readers properties are broad:** every function but the readers carries a unit.
 
 - **Pipeline integration:** `security_props.py run` is a `/framac-slice` step. The generated Makefile runs it as the `security-props` target, which `seed` depends on, and `benchmark.py` and `benchmark_seeded.py` run it as the `security_props` stage before the ledger seed.
 - **L3 over-approximation:** a call to a libc memory writer counts as a pointer write even when its destination is local.

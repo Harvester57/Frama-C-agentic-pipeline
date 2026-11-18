@@ -3,7 +3,35 @@
   "type": "object",
   "definitions": {
     "function_id": {"$comment": "A function id, `file#name`: the file relative to the target root (any character but `#`), then one symbol name. The name may carry what nm prints for a compiler clone or a versioned symbol (`parse.constprop.0`, `f@@VERS_1`).", "type": "string", "pattern": "^(?:[^#\\s]+|[^#\\s][^#\\r\\n]*\\/[^#/\\s]+)#[A-Za-z_$][A-Za-z0-9_$.@]*$"},
-    "class": {"type": "string", "enum": ["l3_frame", "l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak"]}
+    "class": {"type": "string", "enum": ["l3_frame", "l3_isolation", "l4_auth_state", "l4_auth_required", "l4_invariant", "l4_call_rule", "l5_sanitized", "l6_wiped", "l6_no_leak"]},
+    "site": {
+      "$comment": "a call site in a function: `callee` called at `line` of the function's file",
+      "type": "object",
+      "properties": {
+        "function": {"$ref": "#/definitions/function_id"},
+        "callee": {"type": "string", "minLength": 1},
+        "line": {"type": "integer", "minimum": 0},
+        "at": {"$comment": "where the check goes: before the declaration that holds the call, or after it", "type": "string", "enum": ["before", "after"]},
+        "check": {"$comment": "the annotation written into the work tree; `${argN}` stands for the text of the call's N-th argument (0-based)", "type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1}
+      },
+      "required": ["function"],
+      "additionalProperties": false
+    },
+    "callee_list": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "callee": {"type": "string", "minLength": 1},
+          "callers": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
+          "decl": {"$comment": "where its first declaration is, when the model knows", "type": "string"},
+          "assigns": {"$comment": "the assigns terms read at that declaration", "type": "array", "items": {"type": "string"}}
+        },
+        "required": ["callee", "callers"],
+        "additionalProperties": false
+      }
+    }
   },
   "properties": {
     "schema_version": {"const": 1},
@@ -24,9 +52,31 @@
       "items": {
         "type": "object",
         "properties": {
-          "name": {"type": "string", "pattern": "^L[4-6]_(auth_state|auth_required|sanitized|wiped|no_leak)_[A-Za-z0-9_]+$"},
-          "layer": {"type": "integer", "minimum": 4, "maximum": 6},
-          "kind": {"type": "string", "enum": ["auth_state", "auth_required", "sanitized", "wiped", "no_leak"]},
+          "name": {"type": "string", "pattern": "^L[3-6]_(auth_state|auth_required|sanitized|wiped|no_leak|writers|readers|invariant|call)_[A-Za-z0-9_]+$"},
+          "layer": {"type": "integer", "minimum": 3, "maximum": 6},
+          "kind": {"type": "string", "enum": ["auth_state", "auth_required", "sanitized", "wiped", "no_leak", "asset_writers", "asset_readers", "invariant", "call_rule"]},
+          "variant": {"$comment": "the template variant of an asset, invariant or call-rule property (templates/metacsl/l3_asset.acsl, l4_invariant.acsl, l4_call_rule.acsl)", "type": "string", "enum": ["global", "formal", "entry", "weak", "strong", "conditional", "monotonic", "monotonic_formal"]},
+          "engines": {"$comment": "present when not every engine of `meta_engines` may load the property: the ones that may (WP always does). A monotonic invariant lists `eacsl` only: Eva does not evaluate \\at(x, Before). security_props.for_engine filters on it", "type": "array", "items": {"type": "string", "enum": ["eva", "eacsl"]}, "uniqueItems": true},
+          "init_checks": {
+            "$comment": "package E: the calls placed in initializers (`int n = f(x);`) in the property's instances, where MetAcsl 0.12 generates no instance of its context. `run` writes each `check`, named after the property, into the work tree (`code_checks` lists the ones placed). A site whose check could not be written moves to `unchecked`",
+            "type": "array",
+            "items": {"$ref": "#/definitions/site"}
+          },
+          "unchecked": {
+            "$comment": "what the property does not check although its targets hold it: an initializer call no check could be written for (`callee`, `line`), or a function left out of the targets (a callee whose `assigns` would stop MetAcsl). The ledger must not credit the function's unit of this property's class from a run without a goal",
+            "type": "array",
+            "items": {"$ref": "#/definitions/site"}
+          },
+          "declared_callees": {
+            "$comment": "a \\writing property (asset writers, auth state, monotonic invariant) takes what a declared callee writes from its `assigns`. Per property, the declared functions its targets call: `set_assigns` (an `assigns` holding \\union(...) or {a, b}, which stops MetAcsl: their callers are left out of the targets and listed under `unchecked`), `no_assigns` (no `assigns` at the first declaration: MetAcsl generates nothing for what they write, silently), `unknown` (the declaration could not be read)",
+            "type": "object",
+            "properties": {
+              "set_assigns": {"$ref": "#/definitions/callee_list"},
+              "no_assigns": {"$ref": "#/definitions/callee_list"},
+              "unknown": {"$ref": "#/definitions/callee_list"}
+            },
+            "additionalProperties": false
+          },
           "obligation_class": {"$ref": "#/definitions/class"},
           "acsl": {"$comment": "the meta-property annotation(s), ready to parse", "type": "string", "minLength": 1},
           "instances": {"$comment": "functions whose WP proof holds the generated annotations: the ledger units", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
@@ -128,7 +178,8 @@
             "property": {"type": "string"},
             "reason": {"type": "string"},
             "decided": {"$comment": "decided from the model, no WP goal (plan step M2)", "type": "string", "enum": ["satisfied", "violated"]},
-            "decided_reason": {"type": "string", "minLength": 1}
+            "decided_reason": {"type": "string", "minLength": 1},
+            "unchecked": {"$comment": "the function is held by the property but left out of its targets (a callee whose `assigns` stops MetAcsl): why. No WP run has a goal for it, and none may credit the unit", "type": "string", "minLength": 1}
           },
           "required": ["class", "property", "reason"],
           "additionalProperties": false
@@ -145,7 +196,8 @@
           "file": {"type": "string"},
           "line": {"type": "integer"},
           "function": {"$ref": "#/definitions/function_id"},
-          "property": {"type": "string"}
+          "property": {"type": "string"},
+          "index": {"$comment": "package E, a check at an initializer call: its 0-based position among the generated checks of that line, in source order. A Frama-C report gives a check's file and line but not its name, and one declaration can carry the checks of several properties", "type": "integer", "minimum": 0}
         },
         "required": ["file", "line", "function", "property"],
         "additionalProperties": false

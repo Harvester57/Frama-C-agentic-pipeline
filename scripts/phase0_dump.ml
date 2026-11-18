@@ -6,8 +6,8 @@
    - every defined function: kernel name, source name, definition location and line span, storage,
      signature, loops and cyclomatic complexity;
    - its direct calls (with the project functions passed as arguments: thread start routines,
-     callbacks, and the string literals passed: schema 4) and its indirect call sites, with the
-     called signature;
+     callbacks, the string literals passed: schema 4, and whether the call is the initializer of a
+     local: schema 5) and its indirect call sites, with the called signature;
    - every function whose address is taken (in code or in a global initializer): the only possible
      targets of an indirect call.
 
@@ -219,14 +219,18 @@ object
     (match i with
      | Set (lv, _, _) | Call (Some lv, _, _, _) -> record_write w lv
      | _ -> ());
+    (* `initializer` (schema 5): the call is the initializer of a local (`int n = f(x);`, a
+       Local_init with ConsInit). MetAcsl 0.12 gives such a call no \calling instance, no \writing
+       instance from the callee's assigns and no \strong_invariant instance, so
+       scripts/security_props.py writes an in-code check there instead. *)
     let site =
       match i with
-      | Call (_, lhost, args, loc) -> Some (lhost, args, loc)
-      | Local_init (_, ConsInit (f, args, _), loc) -> Some (Var f, args, loc)
+      | Call (_, lhost, args, loc) -> Some (lhost, args, loc, false)
+      | Local_init (_, ConsInit (f, args, _), loc) -> Some (Var f, args, loc, true)
       | _ -> None
     in
     (match site with
-     | Some (lhost, args, loc) ->
+     | Some (lhost, args, loc, init) ->
        (match lhost with
         | Var f ->
           let fn_args =
@@ -240,7 +244,7 @@ object
           calls :=
             O [ ("kernel_name", S f.vname); ("name", S f.vorig_name); ("indirect", B false);
                 ("function_args", L fn_args); ("arg_sizes", arg_sizes args);
-                ("literal_args", literal_args args); ("loc", S (loc_s loc)) ]
+                ("literal_args", literal_args args); ("initializer", B init); ("loc", S (loc_s loc)) ]
             :: !calls
         | Mem e ->
           let called = Cil.typeOfLval (Mem e, NoOffset) in
@@ -307,7 +311,7 @@ let run () =
         (Ast.get ()).globals
     in
     let doc =
-      O [ ("schema", I 4); ("functions", L (List.rev !functions)); ("declared", L !declared);
+      O [ ("schema", I 5); ("functions", L (List.rev !functions)); ("declared", L !declared);
           ("address_taken", L taken); ("globals", L globals) ]
     in
     let b = Buffer.create 65536 in

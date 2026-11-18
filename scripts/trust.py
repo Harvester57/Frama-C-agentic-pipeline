@@ -175,11 +175,7 @@ def _schema_path() -> Path | None:
 
 def extract_block(text: str) -> tuple[dict | None, list[str]]:
     """The structured block of THREAT_MODEL.md: (object or None, errors). No block is (None, [])."""
-    blocks = [
-        body
-        for info, body in _scan_code_fences(text)
-        if BLOCK_INFO in (w.strip("{}.") for w in info.split())
-    ]
+    blocks = [body for info, body in _scan_code_fences(text) if BLOCK_INFO in (w.strip("{}.") for w in info.split())]
     if not blocks:
         if _BLOCK_OPENER_RE.search(text):
             # A fence names the block but does not parse as one: an error, not "no threat model", so the
@@ -216,6 +212,25 @@ def validate_block(block: dict) -> list[str]:
             errors.append(f"trusted_callers[{i}]: give either `unit` or `functions`")
         if "except" in item and not has_unit:
             errors.append(f"trusted_callers[{i}]: `except` goes with `unit`")
+    # Which fields go with which invariant variant (the schema lists them all as optional).
+    for i, item in enumerate(block.get("invariants") or []):
+        if not isinstance(item, dict):
+            continue
+        variant = item.get("variant")
+        if variant == "monotonic":
+            if "lvalue" not in item:
+                errors.append(f"invariants[{i}]: the monotonic variant needs an `lvalue`")
+            if "predicate" in item:
+                errors.append(
+                    f"invariants[{i}]: the monotonic variant takes no `predicate` (it is built from `lvalue`)"
+                )
+        elif variant in ("weak", "strong", "conditional"):
+            if "predicate" not in item:
+                errors.append(f"invariants[{i}]: the {variant} variant needs a `predicate`")
+            if "lvalue" in item or "direction" in item:
+                errors.append(f"invariants[{i}]: `lvalue` and `direction` go with the monotonic variant")
+            if variant == "conditional" and not item.get("scope"):
+                errors.append(f"invariants[{i}]: the conditional variant needs a `scope` (the functions it holds in)")
     return errors
 
 
@@ -426,6 +441,93 @@ def _threat_rules(idx: _Index, block: dict, marks: _Marks, roots: dict[str, str]
                 if ref and not idx.resolve(str(ref)) and str(ref).split("#")[-1] not in idx.externals:
                     warnings.append(f"threat model: {kind} names {ref}, which is not a function of the build")
     return trusted
+
+
+_LVALUE_ROOT_RE = re.compile(r"[A-Za-z_]\w*")
+_PREDICATE_NAME_RE = re.compile(r"[A-Za-z_]\w*")
+_LOGIC_WORDS = frozenset(
+    "integer real boolean sizeof int char long short unsigned signed float double void struct union enum const "
+    "NULL true false".split()
+)
+
+
+def _predicate_names(predicate: str) -> list[str]:
+    """The C identifiers of a predicate: no ACSL builtin (`\\valid`), no field name, no logic type."""
+    out: dict[str, None] = {}
+    for m in _PREDICATE_NAME_RE.finditer(predicate):
+        before = predicate[: m.start()]
+        if before.endswith("\\") or before.rstrip().endswith((".", "->")) or before[-1:].isdigit():
+            continue
+        if m.group(0) not in _LOGIC_WORDS:
+            out[m.group(0)] = None
+    return list(out)
+
+
+def kind_rules(model: dict, block: dict, warnings: list[str]) -> None:
+    """
+    The names of `assets`, `invariants` and `call_rules` against the model: functions, globals and
+    parameters the build does not have. security_props.py generates nothing (or a weaker property)
+    for them; `check-threat-model` says so before a run.
+    """
+    idx = _Index(model)
+    global_names = {
+        str(g.get("name") or key.split("#")[-1]) for key, g in (model.get("global_variables") or {}).items()
+    }
+    formal_names = {str(p.get("name")) for f in idx.functions.values() for p in f.get("formals") or []}
+    external_formals = model.get("external_formals") or {}
+    called = {str(c) for f in idx.functions.values() for c in f.get("external_calls") or []}
+
+    def functions(what: str, refs: list) -> None:
+        for ref in refs:
+            if ref and not idx.resolve(str(ref)):
+                warnings.append(f"threat model: {what} names {ref}, which is not a function of the build")
+
+    def lvalue(what: str, text: object) -> None:
+        m = _LVALUE_ROOT_RE.match(str(text or ""))
+        if m and m.group(0) not in global_names and m.group(0) not in formal_names:
+            warnings.append(
+                f"threat model: {what}: lvalue {text} starts at {m.group(0)}, which is neither a global of the build "
+                "nor a parameter of one of its functions"
+            )
+
+    for item in block.get("assets") or []:
+        what = f"assets {item.get('name')}"
+        lvalue(what, item.get("lvalue"))
+        for name in item.get("params") or []:
+            if name not in formal_names:
+                warnings.append(
+                    f"threat model: {what}: params names {name}, which is not a parameter of any function of the build"
+                )
+        functions(what, list(item.get("writers") or []) + list(item.get("readers") or []))
+    for item in block.get("invariants") or []:
+        what = f"invariants {item.get('name')}"
+        if "lvalue" in item:
+            lvalue(what, item.get("lvalue"))
+        unknown = [n for n in _predicate_names(str(item.get("predicate") or "")) if n not in global_names]
+        if unknown:
+            warnings.append(
+                f"threat model: {what}: the predicate names {', '.join(unknown)}, which is not a global of the build"
+            )
+        functions(what, list(item.get("scope") or []))
+    for item in block.get("call_rules") or []:
+        ref = str(item.get("function") or "")
+        name = ref.split("#")[-1]
+        fids = idx.resolve(ref)
+        if not fids and name not in idx.externals and name not in called:
+            warnings.append(
+                f"threat model: call_rules names {ref}, which is neither a function of the build nor called by one"
+            )
+            continue
+        params = {str(p.get("name")) for f in fids for p in idx.functions[f].get("formals") or []}
+        params |= {str(p.get("name")) for p in external_formals.get(name) or []}
+        unknown = [
+            n for n in _predicate_names(str(item.get("predicate") or "")) if n not in params and n not in global_names
+        ]
+        if unknown:
+            warnings.append(
+                f"threat model: call_rules {name}: the predicate names {', '.join(unknown)}, which is neither a "
+                f"parameter of {name} nor a global of the build"
+            )
 
 
 def _codeql_marks(idx: _Index, codeql: dict, marks: _Marks, warnings: list[str]) -> tuple[int, list[str]]:
@@ -705,6 +807,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     if threat["status"] == STATUS_OK and isinstance(model, dict) and model.get("status") == "ok":
         warnings: list[str] = []
         _threat_rules(_Index(model), threat["block"], _Marks(), {}, warnings)
+        kind_rules(model, threat["block"], warnings)
         out["warnings"] = warnings
     print(json.dumps(out, indent=1))
     return 0 if threat["status"] == STATUS_OK else (2 if threat["status"] == STATUS_INVALID else 1)
