@@ -1208,6 +1208,103 @@ def _eacsl_resource_abort(art: dict) -> dict | None:
     return {**found, "sanitizer_replay": "unavailable" if not attribution else "no_failure"}
 
 
+def _fuzz_meta_route(units: dict[str, dict], failure: dict, file: str, function: str, report: dict) -> dict | None:
+    """
+    Where the failed run-time check of a MetAcsl property lands (a failure with `meta_property`,
+    failure_identity._meta_failure), None for any other failure. `file` and `function` are the
+    failure's, as the campaign located them. Returns {harness_induced} or {cls, linked, notes}:
+
+      a guard (`meta_guard`)   E-ACSL could not evaluate the property's predicate there (an invalid
+                               read, an uninitialized value): class `rte` at the function, never a
+                               violation of the property. Read first: a guard carries the property's
+                               class too.
+      `harness_induced`        a `requires` the harness broke by calling the protected function
+                               itself: no candidate against the target, no unit.
+      a precondition           the unit is the caller's (`caller`), in which a WP or Eva run places
+                               the same obligation; without a known caller it links nothing.
+      any other check          the unit `file#function::class` of the property's class.
+    The class is the failure's `obligation_class` when the ledger knows it (METACSL_CLASSES), else the
+    one its predicate spells. A function the build reports as an unplanned instance of the property
+    (the report's `security_props.unplanned_instances`: MetAcsl instantiated it where
+    security_props.json lists no instance) links nothing, even when it has a unit of the class for
+    another property. Units are looked up as for any other failure (`units_for_function`).
+    """
+    name = failure.get("meta_property")
+    if not isinstance(name, str) or not name:
+        return None
+
+    def _linked(fn: str, cls: str) -> list[str]:
+        return [
+            u["coverage_id"]
+            for u in units_for_function(units, file, fn)
+            if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
+        ]
+
+    guard = failure.get("meta_guard")
+    if guard:
+        return {
+            "cls": "rte",
+            "linked": _linked(function, "rte"),
+            "notes": [
+                f"a guard ({guard}) of the run-time check of {name} failed: E-ACSL could not evaluate the "
+                "property there, which is an alarm of its own (class rte), not a violation of the property"
+            ],
+        }
+    if failure.get("harness_induced") is True:
+        return {"harness_induced": True}
+    own = failure.get("obligation_class")
+    cls = (
+        own
+        if isinstance(own, str) and own in METACSL_CLASSES
+        else goal_obligation_class({"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")})
+    )
+    notes: list[str] = []
+    where = function
+    if failure.get("kind") == "precondition":
+        caller = failure.get("caller")
+        if not isinstance(caller, str) or not caller:
+            return {
+                "cls": cls,
+                "linked": [],
+                "notes": [
+                    f"the precondition {name} of {function} failed and the report names no caller: "
+                    "no unit is linked (the obligation is its callers')"
+                ],
+            }
+        where = caller
+        notes.append(f"the precondition {name} of {function} failed at its call in {caller}: the unit is the caller's")
+    section = report.get("security_props")
+    unplanned = section.get("unplanned_instances") if isinstance(section, dict) else None
+    listed = unplanned.get(name) if isinstance(unplanned, dict) else None
+    if isinstance(listed, list) and where in listed:
+        notes.append(
+            f"{where} is not an instance of {name} in security_props.json (an unplanned instance: MetAcsl "
+            "checks the property there, the plan seeded no unit for it): no unit is linked"
+        )
+        return {"cls": cls, "linked": [], "notes": notes}
+    linked = _linked(where, cls)
+    if not linked:
+        notes.append(f"no ledger unit for {where}::{cls} of {name} (harness, unplanned or unseeded code)")
+    return {"cls": cls, "linked": linked, "notes": notes}
+
+
+def _fuzz_security_props_lost(report: dict) -> str | None:
+    """
+    Why the campaign's E-ACSL binary checked none of the run's MetAcsl properties although the engine
+    is on (the report's `security_props`: a build the properties broke, an unreadable file, a
+    toolchain that cannot take them), or None. A module no property has an instance in is not that.
+    """
+    section = report.get("security_props")
+    if not isinstance(section, dict):
+        return None
+    status, reason = section.get("status"), str(section.get("reason") or "no reason recorded")
+    if status in ("dropped", "error"):
+        return f"{status}: {reason}"
+    if status == "skipped" and not reason.startswith("no property has an instance"):
+        return f"skipped: {reason}"
+    return None
+
+
 @ledger_locked
 def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     units, candidates = load_state()
@@ -1244,6 +1341,26 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     f"{engine} campaign did not run to completion ({reason}); the other engine's results are ingested.",
                 )
+        # The run's MetAcsl properties and this campaign's build (the report's `security_props`, only
+        # with `eacsl` in meta_engines): what the user must see goes to the command's output, and a
+        # build that lost every property is recorded on the units those properties stand for.
+        meta_warnings = report.get("security_props_warnings")
+        if isinstance(meta_warnings, list) and meta_warnings:
+            stats.setdefault("security_props_warnings", {})[module] = [str(w) for w in meta_warnings]
+        meta_lost = _fuzz_security_props_lost(report)
+        if meta_lost and status not in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run"):
+            for u in mod_units:
+                if u["obligation_class"] in METACSL_CLASSES:
+                    add_evidence(
+                        u,
+                        "fuzz",
+                        "run_eacsl_fuzz.py",
+                        "fuzz_meta_not_checked",
+                        False,
+                        tool_output,
+                        f"The campaign's E-ACSL binary checked no MetAcsl property at run time ({meta_lost}): "
+                        "its result says nothing about this unit's property.",
+                    )
 
         if status == "clean":
             ingested_modules.append(module)
@@ -1323,25 +1440,49 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 function = failure["function"]
                 link_unit = str((mm.modules.get(mm.unit_of(module)) or {}).get("unit") or mm.unit_of(module))
                 source_fn = _located_function(file, failure.get("line"), function, index, kernel, link_unit)
-                cls = goal_obligation_class(
-                    {"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")}
+                # A failed run-time check of a MetAcsl property goes by its own rules (_fuzz_meta_route).
+                meta = _fuzz_meta_route(units, failure, file, source_fn, report)
+                if meta is not None and meta.get("harness_induced"):
+                    # The harness called a protected function itself: listed, never a candidate, no unit.
+                    stats.setdefault("meta_harness_induced", []).append(
+                        {
+                            "module": module,
+                            "property": failure.get("meta_property"),
+                            "function": function,
+                            "caller": failure.get("caller"),
+                            "artifact": artifact_rel,
+                            "fingerprint": fp,
+                        }
+                    )
+                    continue
+                cls = (
+                    meta["cls"]
+                    if meta is not None
+                    else goal_obligation_class(
+                        {"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")}
+                    )
                 )
                 # A leak has no obligation class (D5): it links no unit, whatever the units of its function are.
                 leak = failure.get("alarm_kind") == "memory_leak"
-                linked = (
-                    []
-                    if leak
-                    else [
-                        u["coverage_id"]
-                        for u in units_for_function(units, file, source_fn)
-                        if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
-                    ]
-                )
+                if meta is not None:
+                    linked = list(meta["linked"])
+                else:
+                    linked = (
+                        []
+                        if leak
+                        else [
+                            u["coverage_id"]
+                            for u in units_for_function(units, file, source_fn)
+                            if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
+                        ]
+                    )
                 proposed = "confirmed" if art.get("reproducible") else "needs_validation"
                 notes = [] if art.get("reproducible") else ["crash did not reproduce on replay"]
                 if source_fn != function:
                     notes.append(f"reported in {function}, which is {source_fn} in the source")
-                if leak:
+                if meta is not None:
+                    notes.extend(meta["notes"])
+                elif leak:
                     notes.append("a memory leak has no obligation class: no unit is linked (D5)")
                 elif not linked:
                     notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")

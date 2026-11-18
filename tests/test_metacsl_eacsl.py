@@ -455,9 +455,8 @@ def test_with_the_eacsl_engine_stage_1_runs_metacsl_before_rte(run_dir, monkeypa
     fake = FakeToolchain()
     plain = build(monkeypatch, fake)["compile"]
     write_props(DEFAULT_PROPS, fixture_props(["eacsl"]))
-    # A build with the properties must not read or fill the cache, even with caching asked for.
-    monkeypatch.setattr(fuzz_build.cache, "memoize", lambda *a, **k: pytest.fail("the cache was used"))
-    comp = build(monkeypatch, fake, use_cache=True)["compile"]
+    # The cache of a build with the properties: tests/test_metacsl_eacsl_wiring.py (package C2).
+    comp = build(monkeypatch, fake)["compile"]
     assert comp["returncode"] == 0 and comp["cache"] == {"hit": False, "key": None}
     base, meta = fake.stage1_cmds
     meta_file = OUT_BIN.with_suffix(failure_identity.SECURITY_META_SUFFIX)

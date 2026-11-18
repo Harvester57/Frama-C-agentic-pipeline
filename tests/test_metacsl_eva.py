@@ -732,10 +732,19 @@ def test_modules_mk_names_the_file_only_with_the_engine_on(tmp_path):
     assert "EVA_SECURITY_PROPS" not in without
 
     # The file is there and Eva is not among its engines: modules.mk and the settings digest do not move.
-    for doc in (props_doc(()), props_doc(None), props_doc(("eacsl",))):
+    for doc in (props_doc(()), props_doc(None)):
         _plan_run(run, doc)
         assert pm.eva_security_props(run) is None
         assert pm.generate(run, templates_dir=MB_TEMPLATES)["changed"] is False
+        plan = pm.build_plan(run, templates_dir=MB_TEMPLATES)
+        assert plan.modules["prog"].settings_digest == digest_without
+        assert "eva_security_props" not in plan.modules["prog"].to_json()
+    # The E-ACSL engine alone moves the fuzz variable only (tests/test_metacsl_eacsl_wiring.py), not Eva's.
+    for doc in (props_doc(("eacsl",)),):
+        _plan_run(run, doc)
+        assert pm.eva_security_props(run) is None
+        pm.generate(run, templates_dir=MB_TEMPLATES)
+        assert "EVA_SECURITY_PROPS" not in (run / pm.MODULES_MK).read_text(encoding="utf-8")
         plan = pm.build_plan(run, templates_dir=MB_TEMPLATES)
         assert plan.modules["prog"].settings_digest == digest_without
         assert "eva_security_props" not in plan.modules["prog"].to_json()
