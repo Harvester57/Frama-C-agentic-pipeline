@@ -1260,15 +1260,33 @@ DEFAULT_CONTRACT_CLAUSE = "a function contract with a sound assigns clause"
 
 
 def _callee_frame_clause(ctx: Ctx, cfile: str, cname: str, cmod: str | None) -> str:
-    """The callee's projected frame skeleton (its `assigns` clauses, from the module's facts), else a generic ask."""
+    """
+    The callee's projected frame skeleton (its `assigns` clauses, from the module's facts), else a generic ask.
+
+    The skeleton lists under `unprojected` the writes it could not state as a clause. They are named after
+    the clauses, so that a frame that leaves a write out is not read as the callee's whole frame.
+    """
     try:
         skel = workspace_overlay._function_frame_skeleton(
             Path("workspace"), cmod or ctx.file_module.get(cfile), cfile, cname
         )
     except Exception:  # the clause only guides the negotiator: never block the scheduler on the facts
         skel = None
-    clauses = [str(a["clause"]) for a in (skel or {}).get("assigns") or [] if isinstance(a, dict) and a.get("clause")]
-    return " ".join(clauses) or DEFAULT_CONTRACT_CLAUSE
+    skel = skel if isinstance(skel, dict) else {}
+    clauses = [str(a["clause"]) for a in skel.get("assigns") or [] if isinstance(a, dict) and a.get("clause")]
+    text = " ".join(clauses) or DEFAULT_CONTRACT_CLAUSE
+    writes = []
+    for item in skel.get("unprojected") or []:
+        if not isinstance(item, dict):
+            continue
+        what = f"`{item['lval']}`" if item.get("lval") else f"memory reached from `{item.get('root') or '?'}`"
+        writes.append(what + (f" (L{item['line']})" if item.get("line") else ""))
+    if writes:
+        text += (
+            f" [INCOMPLETE: the function also writes {', '.join(writes)}, which the facts could not state as a "
+            "clause; its `assigns` must cover these writes too]"
+        )
+    return text
 
 
 def _callee_header(cfile: str) -> str:
@@ -3791,6 +3809,9 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
     if ing.get("sink_conflicts"):
         # Opposite verdicts at one sink (ledger.py): shown to the parent now, not only in the final report.
         out["sink_conflicts"] = ing["sink_conflicts"]
+    if ing.get("reproducers_not_compared"):
+        # Reproducers the ledger counted although the parent's replay named no failure to compare them with.
+        out["reproducers_not_compared"] = ing["reproducers_not_compared"]
 
 
 def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path: Path, out: dict) -> None:

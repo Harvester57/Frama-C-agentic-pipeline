@@ -1180,10 +1180,19 @@ def _render_skeleton(record: dict, lines: list[str]) -> None:
         return
     seps = skel.get("separated") or []
     assigns = skel.get("assigns") or []
+    # Writes the projection could not state as a clause: the listed clauses are then not the whole frame.
+    missing = len(skel.get("unprojected") or [])
+    incomplete = (
+        f"this minimum is INCOMPLETE: {missing} write{'s' if missing != 1 else ''} of the function could not be "
+        "stated as a clause (the notes below name them), and the contract's `assigns` must also cover them"
+    )
     if not seps and not assigns:
         # Nothing required; say why there is no `assigns \nothing` (a callee may write) as a hint.
         notes = skel.get("notes") or []
-        if notes:
+        if missing:
+            lines.append(f"\n**Projected frame skeleton:** no clause could be projected, and {incomplete}.")
+            lines.extend(f"- note: {note}" for note in notes)
+        elif notes:
             lines.append("\n**Projected frame skeleton:** no clause is required for this function.")
             lines.extend(f"- note: {note}" for note in notes)
         return
@@ -1191,7 +1200,7 @@ def _render_skeleton(record: dict, lines: list[str]) -> None:
         "\n**Projected frame skeleton** (deterministic projection of the AST and Eva dependence sets above into "
         "ACSL frame clauses — a REQUIRED minimum for the contract: include each clause verbatim or stronger, never "
         "delete or weaken one; the parent's merge check rejects a candidate that drops a clause. WP still judges "
-        "whether each clause holds):"
+        "whether each clause holds" + (f"; {incomplete}" if missing else "") + "):"
     )
     for sep in seps:
         lines.append(f"- `{sep['clause']}` — {sep.get('reason', '')}")
