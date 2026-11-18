@@ -54,6 +54,7 @@ import re
 import string
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -1049,7 +1050,53 @@ def properties_for(props: dict, function: str) -> list[dict]:
 def meta_file_text(props: dict, function: str) -> tuple[str, list[str], list[str]] | None:
     """(meta C file, property names, extra sources) for one function's WP run; None without properties."""
     # A property written into the work tree (`code`, plan step M6) is not MetAcsl: the source holds it.
-    selected = [p for p in properties_for(props, function) if not p.get("code")]
+    return _meta_text(props, [p for p in properties_for(props, function) if not p.get("code")])
+
+
+def module_meta_file_text(
+    props: dict, functions: Iterable[str] | None = None
+) -> tuple[str, list[str], list[str]] | None:
+    """
+    (meta C file, property names, extra sources) for a whole-module run (Eva, E-ACSL), where MetAcsl
+    instantiates each property in every function of the parse: the properties with an instance among
+    `functions` (`file#name` ids), or every property with an instance when `functions` is None. A
+    property without instances (decided from the model, or naming no live function) has no MetAcsl
+    goal and is left out, like one written into the work tree (`code`). None without properties.
+    The text has the same layout as meta_file_text's, so meta_line_names maps its lines to names.
+    """
+    wanted = None if functions is None else set(functions)
+    selected = []
+    for p in props.get("properties") or []:
+        instances = set(p.get("instances") or [])
+        if p.get("code") or not instances or (wanted is not None and not wanted & instances):
+            continue
+        selected.append(p)
+    return _meta_text(props, selected)
+
+
+# The engines that can check the MetAcsl properties besides WP: Eva on each harness module (Phase 2)
+# and E-ACSL in the fuzz build (Phase 1). WP always loads them (run_wp_function.py --security-props).
+META_ENGINES = ("eva", "eacsl")
+
+
+def meta_engines(props: dict | None) -> frozenset[str]:
+    """The engines `security_props.json` turns on (`meta_engines`); none for a report without the key."""
+    chosen = (props or {}).get("meta_engines")
+    return frozenset(e for e in chosen if e in META_ENGINES) if isinstance(chosen, list) else frozenset()
+
+
+def _engine_list(text: str) -> list[str]:
+    """`eva,eacsl` -> ["eva", "eacsl"]; `none` -> []."""
+    names = [t.strip().lower() for t in text.split(",") if t.strip()]
+    if names == ["none"]:
+        return []
+    unknown = [n for n in names if n not in META_ENGINES]
+    if unknown or not names:
+        raise argparse.ArgumentTypeError(f"expected `none` or a list of {', '.join(META_ENGINES)}: {text!r}")
+    return names
+
+
+def _meta_text(props: dict, selected: list[dict]) -> tuple[str, list[str], list[str]] | None:
     if not selected:
         return None
     # libc's `strlen` for the vocabulary's no_crlf_string the preamble repeats (plan step S8), and the
@@ -1625,6 +1672,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         doc["warnings"].append(
             f"work tree: {len(applied['skipped'])} annotation(s) not placed: {applied['skipped'][:3]}"
         )
+    # The engines that check the MetAcsl properties besides WP (docs/plans/metacsl-exploitation-plan.md):
+    # opt in and sticky like --eva-taint, so the Makefile's plain `security-props` run keeps the choice.
+    previous_engines = previous.get("meta_engines") if isinstance(previous, dict) else None
+    chosen = args.meta_engines if args.meta_engines is not None else previous_engines
+    doc["meta_engines"] = sorted(meta_engines({"meta_engines": chosen}))
     # Own schema problems are warnings in the artifact (validate_artifacts.py run-dir fails on them).
     problems = validate(doc)
     if problems:
@@ -1636,6 +1688,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "threat_model": doc["threat_model"]["status"],
         "summary": doc["summary"],
         "eva_taint": {k: v for k, v in doc["eva_taint"].items() if k not in ("functions", "checks")},
+        "meta_engines": doc["meta_engines"],
         "warnings": doc["warnings"][:10],
     }
     if problems:
@@ -1675,6 +1728,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     taint.add_argument("--no-eva-taint", dest="eva_taint", action="store_false", help="Remove them again")
     r.set_defaults(eva_taint=None)
+    r.add_argument(
+        "--meta-engines",
+        type=_engine_list,
+        default=None,
+        help=f"Engines that check the MetAcsl properties besides WP: a comma-separated list of "
+        f"{', '.join(META_ENGINES)}, or `none` (sticky; default: the previous run's choice, else none)",
+    )
     r.add_argument("--work", type=Path, default=DEFAULT_WORK, help=f"The work tree (default {DEFAULT_WORK})")
     r.add_argument("--run-dir", type=Path, default=Path("."), help="The run directory (params.json)")
     m = sub.add_parser("meta-file", help="The MetAcsl file of one function's WP run")

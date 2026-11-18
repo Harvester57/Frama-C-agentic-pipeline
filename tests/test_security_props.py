@@ -320,6 +320,30 @@ def test_meta_file_lines_and_function_match(tmp_path):
     assert "L6_wiped_session_key" in out.read_text(encoding="utf-8")
 
 
+@pytest.mark.unit
+def test_module_meta_file_holds_every_property_with_an_instance():
+    """The whole-module meta file (Eva, E-ACSL): same layout as a function's, all MetAcsl properties."""
+    doc = session_props()
+    meta = sp.module_meta_file_text(doc)
+    assert meta is not None
+    text, names, sources = meta
+    with_instances = [p["name"] for p in doc["properties"] if p["instances"] and not p.get("code")]
+    assert names == with_instances and len(names) > 2
+    guard_open, guard_close = sp.META_PREAMBLE_GUARD
+    assert text.startswith(f"{sp.META_INCLUDE}\n{guard_open}\n{doc['preamble']}\n{guard_close}\n")
+    assert set(sp.meta_line_names(text).values()) == set(names)
+    assert sources == sorted({s for p in doc["properties"] if p["name"] in names for s in p["sources"]})
+    # Restricted to some functions, it is those functions' properties; one function gives its WP file.
+    one = sp.module_meta_file_text(doc, ["session.c#session_status"])
+    assert one == sp.meta_file_text(doc, "session.c#session_status")
+    assert sp.module_meta_file_text(doc, ["session.c#session_login"]) is None
+    # A property without an instance (decided from the model) or written into the work tree has no goal.
+    bare = {"preamble": "", "properties": [{"name": "A", "acsl": "/* a */", "instances": []}]}
+    assert sp.module_meta_file_text(bare) is None
+    in_code = {"name": "B", "acsl": "", "code": {"op": "local"}, "instances": ["f.c#f"]}
+    assert sp.module_meta_file_text({"preamble": "", "properties": [in_code]}) is None
+
+
 def _write(path: Path, data: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
@@ -1070,6 +1094,38 @@ def test_run_turns_taint_on_and_off(run_dir):
         trust.recorded_threat_model = real  # type: ignore[assignment]
 
 
+@pytest.mark.unit
+def test_run_keeps_the_chosen_meta_engines(run_dir):
+    """`--meta-engines` is sticky like `--eva-taint`: WP only until asked, and `none` turns it off."""
+    model_path = run_dir / "workspace/reports/phase0_model.json"
+    m = session_model()
+    m["threat_model"] = {"status": "ok"}
+    write_json(model_path, m)
+    (run_dir / "workspace/work").mkdir(parents=True)
+    out = run_dir / "workspace/reports/security_props.json"
+    tm = FIX / "secret_unwiped" / "THREAT_MODEL.md"
+    real = trust.recorded_threat_model
+
+    def engines() -> list[str]:
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        assert not sp.validate(doc)
+        assert sp.meta_engines(doc) == frozenset(doc["meta_engines"])
+        return doc["meta_engines"]
+
+    try:
+        trust.recorded_threat_model = lambda _m: (trust.load_threat_model(tm), None)  # type: ignore[assignment]
+        assert sp.main(["run"]) == 0 and engines() == []
+        assert sp.main(["run", "--meta-engines", "eva"]) == 0 and engines() == ["eva"]
+        assert sp.main(["run"]) == 0 and engines() == ["eva"]
+        assert sp.main(["run", "--meta-engines", "eacsl,eva"]) == 0 and engines() == ["eacsl", "eva"]
+        assert sp.main(["run", "--meta-engines", "none"]) == 0 and engines() == []
+        with pytest.raises(SystemExit):
+            sp.main(["run", "--meta-engines", "wp"])
+    finally:
+        trust.recorded_threat_model = real  # type: ignore[assignment]
+    assert sp.meta_engines(None) == frozenset() and sp.meta_engines({"meta_engines": ["eva", "x"]}) == {"eva"}
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.parametrize("violate", [False, True], ids=["no_copy", "copy"])
@@ -1212,7 +1268,11 @@ def test_wp_summary_helper_reads_every_line_and_refuses_an_empty_run():
     # Every summary line: a second run that leaves a goal open is not hidden by the first.
     assert wp_proved_goals("[wp] Proved goals:   5 / 5\n...\n[wp] Proved goals:   1 / 2\n") == [(5, 5), (1, 2)]
     # `0 / 0` has proved == total and proves nothing; a log without a summary proves nothing either.
-    for log in ("[wp] Proved goals:    0 / 0\n", "[wp] Proved goals:  3 / 3\n[wp] Proved goals:  0 / 0\n", "[wp] 3 goals\n"):
+    for log in (
+        "[wp] Proved goals:    0 / 0\n",
+        "[wp] Proved goals:  3 / 3\n[wp] Proved goals:  0 / 0\n",
+        "[wp] 3 goals\n",
+    ):
         with pytest.raises(AssertionError):
             wp_proved_goals(log)
 
