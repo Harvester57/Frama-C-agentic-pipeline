@@ -3778,6 +3778,16 @@ def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path:
     out["hypothesis"] = _try(
         out["errors"], "ingest-agent-hypothesis", DEPS.ingest_agent_hypothesis, result_path, task["module"]
     )
+    # Failures the campaign hit outside the assigned function became unverified candidates in the ingest
+    # above (each gets its verify task from the next sync, and its input is replayed by the parent). They
+    # are not promoted as corpus seeds: every later guardrail would spend an exclusion slot on each.
+    ingested = out["hypothesis"] if isinstance(out["hypothesis"], dict) else {}
+    if res.get("other_function_crashes"):
+        out["other_function_crashes"] = {
+            "listed": len(res["other_function_crashes"]),
+            "recorded": int(ingested.get("other_function_crashes_recorded") or 0),
+            "skipped": ingested.get("other_function_crashes_skipped") or [],
+        }
     if res["status"] == "crash_found":
         artifact = res.get("crash_artifact")
         # A `timeout-` artifact hangs: in the corpus it would cost every later guardrail a whole per-input timeout.

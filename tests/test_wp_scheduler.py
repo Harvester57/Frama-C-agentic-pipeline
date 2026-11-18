@@ -289,7 +289,6 @@ class Sim:
                 "crash_artifact": f"agents/{aid}/scratch/crash-1" if crash else None,
                 "failing_predicate": "p != 0" if crash else None,
                 "analysis": "Probed the length field.",
-                "suggested_requires": None,
                 "fault_hypothesis": hypothesis,
             },
         )

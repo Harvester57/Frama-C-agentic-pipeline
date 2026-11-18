@@ -85,11 +85,28 @@
         "crash_artifact": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/relpath"}]},
         "failing_predicate": {"type": ["string", "null"]},
         "analysis": {"$ref": "#/definitions/text"},
-        "suggested_requires": {"type": ["string", "null"]},
+        "line": {"$comment": "Source line in `file` of failing_predicate (crash_found) or of fault_hypothesis.predicate; gives the candidate a statement site.", "type": ["integer", "null"], "minimum": 1},
         "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]},
-        "proof_gap": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/proof_gap"}]}
+        "proof_gap": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/proof_gap"}]},
+        "other_function_crashes": {
+          "$comment": "Campaign failures located outside the assigned function; each becomes an unverified candidate that the parent replays.",
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "properties": {
+              "crash_artifact": {"$ref": "#/definitions/relpath"},
+              "file": {"$ref": "#/definitions/relpath"},
+              "function": {"$ref": "#/definitions/text"},
+              "line": {"type": ["integer", "null"], "minimum": 1},
+              "failing_predicate": {"$ref": "#/definitions/text"}
+            },
+            "required": ["crash_artifact", "file", "function", "failing_predicate"],
+            "additionalProperties": false
+          }
+        }
       },
-      "required": ["role", "agent_id", "file", "function", "status", "seeds", "crash_artifact", "failing_predicate", "analysis", "suggested_requires", "fault_hypothesis"],
+      "required": ["role", "agent_id", "file", "function", "status", "seeds", "crash_artifact", "failing_predicate", "analysis", "fault_hypothesis"],
       "additionalProperties": false
     },
     "architect": {

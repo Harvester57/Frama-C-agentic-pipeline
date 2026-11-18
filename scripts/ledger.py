@@ -2713,6 +2713,165 @@ def _find_matching_sink_candidate(
     return None
 
 
+def _breaker_campaign_failures(aid: str) -> dict[str, dict]:
+    """
+    sha256 -> artifact record (with a parsed `failure`) of every campaign report directly under the
+    breaker's scratch (`run_eacsl_fuzz.py campaign --out-json`, `"mode": "campaign"`). The location of a
+    breaker crash is taken from these tool records when one matches the crash file, never from the
+    agent's own words. Replay and driver reports are not campaign reports and are ignored.
+    """
+    found: dict[str, dict] = {}
+    scratch = Path("agents") / aid / "scratch"
+    try:
+        paths = sorted(p for p in scratch.glob("*.json") if p.name != "result.json")
+    except OSError:
+        return found
+    for p in paths:
+        report = _read_scratch_json(aid, p.as_posix())
+        if not isinstance(report, dict) or report.get("mode") != "campaign":
+            continue
+        for art in report.get("artifacts") or []:
+            if isinstance(art, dict) and isinstance(art.get("failure"), dict) and art.get("sha256"):
+                found.setdefault(str(art["sha256"]), art)
+    return found
+
+
+class _BreakerCrashContext:
+    """What every crash of one breaker result is recorded with (`_ingest_breaker_crash`)."""
+
+    def __init__(
+        self,
+        units: dict[str, dict],
+        candidates: dict[str, dict],
+        aid: str,
+        mod: str,
+        result_path: Path,
+        campaign: dict[str, dict],
+        findings: dict[str, dict] | None,
+        reopen_outcomes: list[str],
+    ) -> None:
+        self.units = units
+        self.candidates = candidates
+        self.aid = aid
+        self.mod = mod
+        self.result_path = result_path
+        self.campaign = campaign
+        self.findings = findings
+        self.reopen_outcomes = reopen_outcomes
+
+
+def _ingest_breaker_crash(
+    ctx: _BreakerCrashContext, crash_src: str, claimed: dict, *, note: str, assigned: bool
+) -> int:
+    """
+    Record one crashing input of a breaker as an unverified candidate; 1 when a new candidate was created.
+
+    `assigned` is the breaker's own `crash_found` (located in the assigned function, as before);
+    otherwise an `other_function_crashes` entry, located by the campaign's own failure record for the
+    same input when the breaker's scratch has one (`_breaker_campaign_failures`), else by what the
+    breaker copied from it. The input is promoted to workspace/crashes/<harness module>/ and listed as
+    the reproducer: the scheduler replays it on that module's binary before a verifier's verdict is
+    ingested, so the agent's claim is never a finding by itself. Deduplicated like a guardrail
+    `code_fault`: the exact fingerprint first, then the candidate at the same statement site, then the
+    same function and kind (`_find_matching_sink_candidate`).
+    """
+    crash_rel = rel(crash_src)
+    record: dict | None = None
+    if crash_rel.startswith(f"agents/{ctx.aid}/scratch/"):
+        prom_crash = promote_file(Path.cwd(), ctx.aid, crash_rel, kind="crash", module=ctx.mod)
+        crash_rel = str(prom_crash["dest"])
+        record = ctx.campaign.get(str(prom_crash["sha256"]))
+    failure = (record or {}).get("failure") or {}
+    tool_fn = str(failure.get("function") or "").removeprefix("__gen_e_acsl_")
+    tool_file = normalize_file(str(failure.get("file") or ""))
+    claimed_line = claimed.get("line") if isinstance(claimed.get("line"), int) else 0
+    if assigned:
+        ffile, ffn = normalize_file(str(claimed["file"])), str(claimed["function"])
+        pred = str(claimed["failing_predicate"])
+        kind = goal_obligation_class({"kind": "assertion", "annotation": pred})
+        same_place = bool(failure) and tool_fn == ffn and (not tool_file or tool_file == ffile)
+        line = int(failure.get("line") or 0) if same_place else claimed_line
+        proposed = "confirmed"
+    elif failure and tool_fn and tool_file:
+        ffile, ffn = tool_file, tool_fn
+        pred = str(failure.get("predicate") or claimed.get("failing_predicate") or "")
+        kind = str(failure.get("alarm_kind") or failure.get("kind") or "assertion")
+        line = int(failure.get("line") or 0)
+        proposed = "confirmed" if (record or {}).get("reproducible") is True else "needs_validation"
+    else:
+        ffile = normalize_file(str(claimed.get("file") or "")) or "unknown"
+        ffn = str(claimed.get("function") or "") or "unknown_function"
+        pred = str(claimed.get("failing_predicate") or "")
+        kind = goal_obligation_class({"kind": "assertion", "annotation": pred})
+        line = claimed_line
+        proposed = "needs_validation"
+        note += "; location as the breaker reported it (no campaign record of this input in its scratch)"
+    cls = goal_obligation_class({"kind": "assertion", "annotation": pred})
+    exact_fp = make_fingerprint(ffile, ffn, kind, pred)
+    site = _candidate_site(ffile, line, ffn, _dag_line_index())
+    existing_cand = ctx.candidates.get(exact_fp) or _find_matching_sink_candidate(
+        ctx.candidates, ffile, ffn, kind, pred, site=site
+    )
+    fp = existing_cand["fingerprint"] if existing_cand is not None else exact_fp
+    fn_units = [
+        u for u in units_for_function(ctx.units, ffile, ffn) if u["status"] not in ("out_of_scope", "not_applicable")
+    ]
+    linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [
+        u["coverage_id"] for u in fn_units
+    ]
+    if not linked:
+        note += f"; no ledger unit for {ffile}#{ffn}::{cls}"
+    tool_out = str(promote_file(Path.cwd(), ctx.aid, rel(str(ctx.result_path)), kind="artifact")["dest"])
+    already_listed = existing_cand is not None and crash_rel in existing_cand["reproducers"]
+    verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
+    keys_before = len(ctx.candidates)
+    cand = upsert_candidate(
+        ctx.candidates,
+        fp,
+        "breaker",
+        proposed,
+        ctx.mod,
+        {"file": ffile, "line": line, "function": ffn},
+        {"kind": normalize_kind(kind, pred), "predicate": pred},
+        [crash_rel],
+        tool_out,
+        linked,
+        note,
+        site=site,
+    )
+    fp = cand["fingerprint"]
+    evidence_kind = "breaker_crash_found" if assigned else "breaker_other_function_crash"
+    for cid in linked:
+        add_evidence(
+            ctx.units[cid],
+            "breaker",
+            ctx.aid,
+            evidence_kind,
+            False,
+            tool_out,
+            f"Breaker reproduced failure on {pred[:120]}",
+            {"artifact": crash_rel},
+        )
+        if existing_cand is None or existing_cand.get("status") == "unverified":
+            mark_candidate(ctx.units[cid], fp)
+    if ctx.findings is not None and existing_cand is not None and verified_before:
+        ctx.reopen_outcomes.append(
+            tool_evidence_on_verified_candidate(
+                ctx.units,
+                ctx.findings,
+                existing_cand,
+                source="breaker_crash_found",
+                phase="breaker",
+                producer=ctx.aid,
+                artifact=crash_rel,
+                tool_output=tool_out,
+                linked=linked,
+                already_listed=already_listed,
+            )
+        )
+    return 1 if len(ctx.candidates) > keys_before else 0
+
+
 @ledger_locked
 def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) -> dict:
     """
@@ -2800,7 +2959,10 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
 
     if fh is not None:
         cls = goal_obligation_class({"kind": "assertion", "annotation": fh["predicate"]})
-        existing_cand = _find_matching_sink_candidate(candidates, file, fn, cls, fh["predicate"])
+        # A breaker may name the line of its hypothesis (`line`): the candidate then has a statement site.
+        fh_line = res.get("line") if role == "breaker" and isinstance(res.get("line"), int) else 0
+        fh_site = _candidate_site(file, fh_line, fn, _dag_line_index()) if fh_line else None
+        existing_cand = _find_matching_sink_candidate(candidates, file, fn, cls, fh["predicate"], site=fh_site)
         fp = (
             existing_cand["fingerprint"]
             if existing_cand is not None
@@ -2824,12 +2986,13 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
             role,
             "needs_validation",
             mod,
-            {"file": file, "line": 0, "function": fn},
+            {"file": file, "line": fh_line, "function": fn},
             {"kind": cls, "predicate": fh["predicate"]},
             [],
             tool_out,
             linked,
             note,
+            site=fh_site,
         )
         fp = cand["fingerprint"]
         phase = "breaker" if role == "breaker" else "wp"
@@ -2848,70 +3011,42 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         if existing_cand is None:
             candidates_added += 1
 
-    if role == "breaker" and res.get("status") == "crash_found" and res.get("crash_artifact"):
-        pred = str(res.get("failing_predicate") or (fh["predicate"] if fh else "") or "crash_found")
-        cls = goal_obligation_class({"kind": "assertion", "annotation": pred})
-        existing_cand = _find_matching_sink_candidate(candidates, file, fn, cls, pred)
-        fp = existing_cand["fingerprint"] if existing_cand is not None else make_fingerprint(file, fn, cls, pred)
-        fn_units = [
-            u for u in units_for_function(units, file, fn) if u["status"] not in ("out_of_scope", "not_applicable")
-        ]
-        linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [
-            u["coverage_id"] for u in fn_units
-        ]
-        crash_rel = rel(str(res["crash_artifact"]))
-        if crash_rel.startswith(f"agents/{aid}/scratch/"):
-            prom_crash = promote_file(Path.cwd(), aid, crash_rel, kind="crash", module=mod)
-            crash_rel = str(prom_crash["dest"])
-        prom_res = promote_file(Path.cwd(), aid, rel(str(result_path)), kind="artifact")
-        tool_out = str(prom_res["dest"])
-        note = str(res.get("analysis") or "breaker reproduced crash")
-        already_listed = existing_cand is not None and crash_rel in existing_cand["reproducers"]
-        verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
-        cand = upsert_candidate(
-            candidates,
-            fp,
-            "breaker",
-            "confirmed",
-            mod,
-            {"file": file, "line": 0, "function": fn},
-            {"kind": normalize_kind(cls, pred), "predicate": pred},
-            [crash_rel],
-            tool_out,
-            linked,
-            note,
+    other_crashes_recorded = 0
+    other_crashes_skipped: list[dict] = []
+    if role == "breaker":
+        campaign = _breaker_campaign_failures(aid)
+        ctx = _BreakerCrashContext(
+            units, candidates, aid, mod, result_path, campaign, findings if reopen else None, reopen_outcomes
         )
-        fp = cand["fingerprint"]
-        for cid in linked:
-            add_evidence(
-                units[cid],
-                "breaker",
-                aid,
-                "breaker_crash_found",
-                False,
-                tool_out,
-                f"Breaker reproduced failure on {pred[:120]}",
-                {"artifact": crash_rel},
+        if res.get("status") == "crash_found" and res.get("crash_artifact"):
+            pred = str(res.get("failing_predicate") or (fh["predicate"] if fh else "") or "crash_found")
+            candidates_added += _ingest_breaker_crash(
+                ctx,
+                str(res["crash_artifact"]),
+                {"file": file, "function": fn, "line": res.get("line"), "failing_predicate": pred},
+                note=str(res.get("analysis") or "breaker reproduced crash"),
+                assigned=True,
             )
-            if existing_cand is None or existing_cand.get("status") == "unverified":
-                mark_candidate(units[cid], fp)
-        if existing_cand is None:
-            candidates_added += 1
-        elif reopen and verified_before:
-            reopen_outcomes.append(
-                tool_evidence_on_verified_candidate(
-                    units,
-                    findings,
-                    existing_cand,
-                    source="breaker_crash_found",
-                    phase="breaker",
-                    producer=aid,
-                    artifact=crash_rel,
-                    tool_output=tool_out,
-                    linked=linked,
-                    already_listed=already_listed,
+        main_crash = rel(str(res.get("crash_artifact") or ""))
+        for idx, entry in enumerate(res.get("other_function_crashes") or []):
+            src = rel(str(entry.get("crash_artifact") or ""))
+            if not src or src == main_crash:
+                continue
+            try:
+                candidates_added += _ingest_breaker_crash(
+                    ctx,
+                    src,
+                    entry,
+                    note=(
+                        f"breaker {aid} (assigned {file}#{fn}): its campaign failed in another function; "
+                        "the parent replays the input before any verdict"
+                    ),
+                    assigned=False,
                 )
-            )
+                other_crashes_recorded += 1
+            except (PromotionError, ArtifactError, OSError, ValueError) as exc:
+                # One unreadable entry must not cost the main crash, the seeds or the other entries.
+                other_crashes_skipped.append({"index": idx, "crash_artifact": src, "reason": f"{exc}"[:300]})
 
     code_faults_recorded = 0
     if role == "prover":
@@ -2932,6 +3067,8 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         "strengthening_requests_added": strengthening_requests_added,
         "proof_gaps_recorded": 1 if pg is not None else 0,
         "code_faults_recorded": code_faults_recorded,
+        **({"other_function_crashes_recorded": other_crashes_recorded} if other_crashes_recorded else {}),
+        **({"other_function_crashes_skipped": other_crashes_skipped} if other_crashes_skipped else {}),
         **({"candidates_reopened": reopen_outcomes.count("reopened")} if "reopened" in reopen_outcomes else {}),
         **(
             {"rejections_contradicted": reopen_outcomes.count("contradicted")}

@@ -154,7 +154,6 @@ class TestVerifierIngestionAndHypotheses:
             "crash_artifact": None,
             "failing_predicate": None,
             "analysis": "Requires multi-packet session state not set up by single-shot harness.",
-            "suggested_requires": None,
             "fault_hypothesis": {
                 "input_condition": "Long-form length byte 0x84 with 2-byte payload",
                 "predicate": r"\valid_read(buf + off)",
