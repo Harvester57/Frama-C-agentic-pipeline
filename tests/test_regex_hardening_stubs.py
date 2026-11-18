@@ -652,6 +652,7 @@ def test_a_reversed_guard_gives_a_region_not_an_operator():
         "reads": [],
         "loops": [
             {
+                "header": "for (i = 0; n > i; i++)",
                 "guard": "n > i",
                 "scalars": [{"var": "i", "updates": ["i + 1"]}],
                 "memory_writes": [{"lval": "*(dst + i)", "root": "dst", "root_kind": "formal", "values": ["0"]}],
@@ -660,7 +661,7 @@ def test_a_reversed_guard_gives_a_region_not_an_operator():
         ],
     }
     out = frame_skeleton._compute(record)
-    assert [a["loc"] for a in out["assigns"]] == ["dst + (0 .. n - 1)"]
+    assert [a["loc"] for a in out["assigns"]] == ["*(dst + (0 .. n - 1))"]
     assert out["status"] == "ok"
 
 

@@ -1003,7 +1003,7 @@ def test_record_carries_a_frame_skeleton() -> None:
     skel = rec["frame_skeleton"]
     assert skel["status"] == "ok"
     assert skel["separated"][0]["clause"] == "requires \\separated(buf + (0 .. 1), eaten);"
-    assert skel["assigns"][0]["clause"] == "assigns *eaten \\from buf + (0 .. 1), len;"
+    assert skel["assigns"][0]["clause"] == "assigns *eaten \\from *(buf + (0 .. 1)), len;"
 
 
 def test_section_renders_the_projected_skeleton_as_a_required_minimum() -> None:
@@ -1023,7 +1023,7 @@ def test_section_renders_the_projected_skeleton_as_a_required_minimum() -> None:
     section = ff.render_section(rec, function="parse_value")
     assert "**Projected frame skeleton**" in section
     assert "`requires \\separated(buf + (0 .. 1), eaten);`" in section
-    assert "`assigns *eaten \\from buf + (0 .. 1), len;`" in section
+    assert "`assigns *eaten \\from *(buf + (0 .. 1)), len;`" in section
     assert "REQUIRED minimum" in section
     assert "merge check rejects" in section
 
@@ -1188,7 +1188,7 @@ def test_function_level_writes_carry_their_rhs_values() -> None:
     assert rec["writes"][0]["values"] == ["*(buf + 0) + *(buf + 1)"]
     # ... and the skeleton uses them for a precise \from instead of the read-root superset.
     assert rec["frame_skeleton"]["assigns"][0]["source"] == "ast"
-    assert rec["frame_skeleton"]["assigns"][0]["from"] == ["buf + (0 .. 1)"]
+    assert rec["frame_skeleton"]["assigns"][0]["from"] == ["*(buf + (0 .. 1))"]
 
 
 # ---------------------------------------------------------------------------

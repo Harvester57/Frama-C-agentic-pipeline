@@ -1,0 +1,19 @@
+/*@
+  requires idx_nonneg: 0 <= idx;
+  requires dest_writable: nb_bits > 0 ==> dest != \null &&
+    \valid(dest + (idx .. idx + (integer)nb_bits - 1));
+  requires source_readable: nb_bits > 0 ==>
+    \valid_read(tab_byte + (0 .. ((integer)nb_bits - 1) / 8));
+  requires separated_buffers: \separated(dest, tab_byte);
+  requires dest_capacity: nb_bits > 0 ==> \block_length(dest) <= 4294967295;
+  terminates \true;
+  exits \false;
+  assigns dest[idx .. idx + (integer)nb_bits - 1]
+    \from tab_byte[0 .. ((integer)nb_bits - 1) / 8], nb_bits, idx;
+  ensures L5_bits_range: \forall integer k; 0 <= k < (integer)nb_bits ==>
+    dest[idx + k] == 0 || dest[idx + k] == 1;
+*/
+MODBUS_API void modbus_set_bits_from_bytes(uint8_t *dest,
+                                           int idx,
+                                           unsigned int nb_bits,
+                                           const uint8_t *tab_byte);

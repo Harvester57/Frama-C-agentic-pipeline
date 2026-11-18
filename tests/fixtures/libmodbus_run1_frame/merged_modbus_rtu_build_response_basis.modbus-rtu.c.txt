@@ -1,0 +1,21 @@
+/*@ requires valid_sft: \valid_read(sft);
+  @ requires valid_rsp: \valid(rsp + (0 .. 1));
+  @ requires sep_rsp_sft: \separated(rsp + (0 .. 1), sft);
+  @ terminates \true;
+  @ exits \false;
+  @ assigns *(rsp + 0) \from sft;
+  @ assigns *(rsp + 1) \from sft;
+  @ ensures result_length: \result == _MODBUS_RTU_PRESET_RSP_LENGTH;
+  @ ensures slave_byte: *(rsp + 0) == (uint8_t)\old(sft->slave);
+  @ ensures function_byte: *(rsp + 1) == (uint8_t)\old(sft->function);
+  @ ensures keeps_sft: sft->slave == \old(sft->slave) && sft->function == \old(sft->function) && sft->t_id == \old(sft->t_id);
+  @*/
+static int _modbus_rtu_build_response_basis(sft_t *sft, uint8_t *rsp)
+{
+    /* In this case, the slave is certainly valid because a check is already
+     * done in _modbus_rtu_listen */
+    rsp[0] = sft->slave;
+    rsp[1] = sft->function;
+
+    return _MODBUS_RTU_PRESET_RSP_LENGTH;
+}
