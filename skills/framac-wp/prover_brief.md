@@ -2,7 +2,7 @@
 
 You are the **Function Prover Subagent** `{agent_id}` assigned to verify C function **`{function_name}`** in `agents/{agent_id}/scratch/work/{c_file}` (Module: `{module_name}`, Topological Wave: `{wave_index}`).
 
-Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any assigned Layer 2–6 security properties) for `{function_name}` using the **Iterative Dual-Oracle Synthesis Loop**, and to return_only a single JSON result.
+Your goal is to discharge **100% of the Frama-C WP + RTE obligations** (and any assigned Layer 2–6 security properties) for `{function_name}` using the **Iterative Dual-Oracle Synthesis Loop**, and to return only a single JSON result.
 
 ## Input Context
 
@@ -150,6 +150,9 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 <!-- if: division or pointer_params -->
    | **Partial terms (`/`, `%`, `*p`)** | `ensures x % y == 0;` or `ensures *p == 0;` (when `y == 0` or `p == \null` is possible) | Guard partial terms on the left of `==>` / `&&` (`y != 0 ==> x % y == 0`, `\valid_read(p) ==> *p == 0`); WP logic is 2-valued total, but E-ACSL uses 3-valued partial logic and aborts on undefined annotation terms |
 <!-- endif -->
+<!-- if: pointer_params -->
+   | **`void *` size and arithmetic** | `\block_length(p) >= n` or `p + n` on a `void *p` | Cast to `char *` first: `\block_length((char *)p) >= n`, `(char *)p + n`. WP sizes a `void` object as an `int` (it prints `Warning: void object`), so on a `void *` it counts lengths and steps in units of 4 bytes and can prove a false clause |
+<!-- endif -->
 <!-- if: structs or unions -->
    | **Struct / union equality & `\with`** | `ensures *out == \old(*in);` or `{ s \with .x = 1 }` | Compare scalar fields individually (`ensures out->x == \old(in->x) && out->y == \old(in->y);`); whole-struct/union `==` and `\with` fail in E-ACSL, and cross-field union equality fails in WP `Typed` |
    | **Padded-struct / union `\initialized`** | `ensures \initialized(out_struct);` or `ensures \initialized(u);` | Assert field-level initialization (`ensures \initialized(&out_struct->field);`); E-ACSL checks all `sizeof(*p)` bytes in flat shadow memory and fails on uninitialized struct padding or smaller union members |
@@ -248,6 +251,9 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
    - The run uses a fixed seed and fixed limits, so the same inputs give the same verdict.
    - `rejected_overconstrained`: one of your annotations is FALSE on a real input. Read `runtime_trace` and `failure`, and fix it.
    - `code_fault`: an RTE assertion failed on a real input. This is a code defect, not a contract problem. Stop and return it (status `blocked`, include the guardrail report in `evidence`).
+   - A check that fails outside `{function_name}` (in other code of the module, with no checked function on the stack) is not held against your contract. The guardrail drops the corpus input that hit it, lists it in `excluded_inputs` with its `failure` and replays the rest. When the failing input was a mutation, it replays the corpus without the mutation burst and records the crash in `mutations_skipped`. Neither is a refutation. Do not change your contract for them, and do not report them as your `code_fault`.
+   - `guardrail_error` with `outside_checked_functions`: a check failed outside `{function_name}` on an input the guardrail could not drop (libFuzzer's empty input on an empty corpus, or more failing inputs than it drops). Your contract was neither refuted nor tested. Do not change it for this: the input and the seed are fixed, so your next candidate stops on the same input, and the parent's re-check after the merge would too. Such a candidate is never kept as your best. Stop and return status `blocked`. Put the guardrail report in `evidence` with a `result` that says `untested: failure outside {function_name}` and names the failure (`outside_checked_functions.crash`). `guardrail_error` with `replay_hang` (an input that hangs) says nothing about your contract either: handle it the same way.
+   - `passed_dynamic_oracle` on no real input: `corpus_empty: true`, `corpus_replayed: 0` (every corpus input was dropped into `excluded_inputs`), or `{function_name}` in `reach.unreached`. The candidate still counts as passing and can finish `all_proven`. No input tested your contract, so keep every `requires` as weak as the proof allows: no runtime check will catch an over-constrained one. In the guardrail's `evidence` entry, write `result` as `passed on no real input: corpus empty`, `... all inputs excluded` or `... {function_name} unreached`, not a bare `passed_dynamic_oracle`. The parent re-checks the merged tree the same way, and the ledger records a contract no input exercised as an open assumption. `reach.functions.{function_name}: null` means the reach is unknown (the function was inlined or not instrumented), not that it was reached.
 
 2. **Oracle 2 — Deductive Verification (`Frama-C WP + RTE`):**
    ```text
@@ -321,7 +327,7 @@ Each `strengthening_requests` entry has exactly the keys below (`callee_file` ma
 
 **Validate before you return.** Run `python3 /opt/framac-pipeline/scripts/validate_artifacts.py agent-result agents/{agent_id}/scratch/result.json` through the wrapper. It must print `"ok": true`. Otherwise correct `result.json` for every listed error (an `unexpected property` is a key the result schema does not have: remove it, in nested objects too) and run the check again. Do this even when your budget is exhausted: it runs no proof, and the parent discards a result that fails it and reruns the whole task.
 
-A `blocked` result (a guardrail `code_fault`, a repeated `analysis_error`) may leave `unproven_goals` empty, but its `evidence` must name the report that blocked it.
+A `blocked` result (a guardrail `code_fault` or `guardrail_error`, a repeated `analysis_error`) may leave `unproven_goals` empty, but its `evidence` must name the report that blocked it.
 
 Every `evidence[].tool_output` is a report in the run directory, given relative to it (your `agents/{agent_id}/scratch/` or `workspace/`). Reference manuals and repository docs are not evidence files: name them in prose.
 
