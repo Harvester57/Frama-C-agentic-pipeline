@@ -2825,6 +2825,49 @@ def test_requeue_locate_failed_restores_a_negotiation_and_its_request(sim, monke
     assert (task["state"], task["outcome"], task["merge_attempts"]) == ("merge_queued", None, 0)
     assert S.cmd_requeue_locate_failed()["requests_restored"] == []  # idempotent
     assert tasks()["negotiate:src/m/g.c#g"]["state"] == "merge_queued"
+    assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "negotiate-g"
+    assert tasks()["negotiate:src/m/g.c#g"]["outcome"] == "applied"
+    assert request_status(sim, rid) == "verified_and_applied"
+
+
+SPLICE_BASE = "int g(int a)\n{\n#ifdef W\n    if (a) {\n#else\n    if (a > 1) {\n#endif\n        a = 0;\n    }\n    return a;\n}\n"
+SPLICE_TARGET = "int f(void)\n{\n    return 0;\n}\n"
+
+
+def splice_scratch(run_dir, current):
+    """An agent's scratch and the shared tree on disk: the agent added a contract to `f`, after the conditional."""
+    base = SPLICE_BASE + SPLICE_TARGET
+    write_text(run_dir / "agents/prove-f/scratch/result.json", json.dumps({"status": "all_proven"}))
+    write_text(run_dir / "agents/prove-f/scratch/base/src/m/f.c", base)
+    write_text(run_dir / "agents/prove-f/scratch/work/src/m/f.c", base.replace("int f(void)", "/*@ assigns \\nothing; */\nint f(void)"))
+    write_text(run_dir / "workspace/work/src/m/f.c", current)
+    return {"id": "prove:src/m/f.c#f", "function": "f", "file": "src/m/f.c"}
+
+
+def write_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def test_splice_refusal_accepts_a_result_the_tree_can_still_take(run_dir):
+    assert S._splice_refusal(splice_scratch(run_dir, SPLICE_BASE + SPLICE_TARGET), "prove-f") is None
+
+
+def test_splice_refusal_names_a_function_that_diverged_from_the_base(run_dir):
+    current = SPLICE_BASE + SPLICE_TARGET.replace("return 0;", "return 0; /* moved on */")
+    assert "diverged from agent base snapshot" in str(S._splice_refusal(splice_scratch(run_dir, current), "prove-f"))
+
+
+def test_splice_refusal_reports_a_function_the_locator_cannot_find(run_dir):
+    assert S.LOCATE_FAILURE in str(S._splice_refusal(splice_scratch(run_dir, SPLICE_BASE), "prove-f"))
+
+
+def test_splice_refusal_needs_a_proved_result(run_dir):
+    task = splice_scratch(run_dir, SPLICE_BASE + SPLICE_TARGET)
+    write_text(run_dir / "agents/prove-f/scratch/result.json", json.dumps({"status": "stalled_after_k_retries"}))
+    assert "stalled_after_k_retries" in str(S._splice_refusal(task, "prove-f"))
+    (run_dir / "agents/prove-f/scratch/result.json").unlink()
+    assert "FileNotFoundError" in str(S._splice_refusal(task, "prove-f"))
 
 
 def test_requeue_locate_failed_reruns_a_negotiation_whose_base_has_diverged(sim, monkeypatch):

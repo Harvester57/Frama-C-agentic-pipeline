@@ -4557,21 +4557,15 @@ def _requeue_refused_merge(state: dict, task: dict, aid: str, reason: str = MEMO
     _event(state, "merge_requeued", task["id"], agent_id=aid, reason=reason)
 
 
-def _reclaim_parked_units(
-    task: dict, aid: str, errors: list, reason: str = MEMORY_REFUSAL, only_reason: bool = True
-) -> list[str]:
-    """
-    Undo `_park_units` for a refused merge: the units it parked go back to the agent whose result is queued.
-    `only_reason=False` also takes a unit with older notes beside the parking reason.
-    """
+def _reclaim_parked_units(task: dict, aid: str, errors: list, reason: str = MEMORY_REFUSAL) -> list[str]:
+    """Undo `_park_units` for a refused merge: the units it parked go back to the agent whose result is queued."""
     units, _ = ledger.load_state()
     owned = set(task.get("units") or [])
     specs = []
     for cid in _unit_ids(task, units):
         u = units[cid]
         notes = u.get("unresolved") or []
-        said = [reason in str(n) for n in notes]
-        parked = u["status"] == "blocked" and notes and (all(said) if only_reason else any(said))
+        parked = u["status"] == "blocked" and notes and all(reason in str(n) for n in notes)
         if parked or (u["status"] == "planned" and cid in owned):
             specs.append(
                 {"id": cid, "status": "in_progress", "agent_id": aid, "reason": None, "expected": [u["status"]]}
@@ -4806,7 +4800,7 @@ def cmd_requeue_locate_failed() -> dict:
                 continue
             task["merge_attempts"] = 0
             if why:  # blocked, and its result cannot merge any more: a new prover, from the units it had
-                units = _reclaim_parked_units(task, str(aid), out["errors"], LOCATE_FAILURE, only_reason=False)
+                units = _reclaim_parked_units(task, str(aid), out["errors"], LOCATE_FAILURE)
                 released = _release_units(task)
                 task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
                 _reopen(state, task, f"the merge never saw this function, and the result cannot merge now: {why}")
@@ -4816,7 +4810,7 @@ def cmd_requeue_locate_failed() -> dict:
                 now = {"queued_at": utc_now(), "queued_ts": DEPS.now(), "analysis_retries": 0}
                 task.update(agent_id=aid, merge={"agent_id": aid, **now})
                 task["reopened"] = max(0, int(task.get("reopened") or 0) - 1)
-            reclaimed = _reclaim_parked_units(task, str(aid), out["errors"], LOCATE_FAILURE, only_reason=False)
+            reclaimed = _reclaim_parked_units(task, str(aid), out["errors"], LOCATE_FAILURE)
             _requeue_refused_merge(state, task, str(aid), LOCATE_FAILURE)
             entry = {"task": task["id"], "agent_id": aid, "units": reclaimed}
             out["restored" if ended else "pending_restored"].append(entry)
