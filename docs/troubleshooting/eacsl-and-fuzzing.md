@@ -483,3 +483,44 @@ Issues encountered in E-ACSL instrumentation (`e-acsl-gcc`, `eacsl_toolchain.py`
   - Run-4's empty-input `oom-` would now be replayed, recorded as not reproduced, and stay a candidate keyed by its input, with the note "did not reproduce on replay"; it is not dropped automatically. Re-ingesting run-4's reports would add new fingerprints beside the rejected ones.
   - Tests: 11 new in `tests/test_eacsl_resource_abort.py`, 8 of which failed on `edb5c34`. The fixer's full suite passed (6058). The supervisor reran the file (28 passed), ran `ruff` and `mypy` (clean), and dry-ran the merge against `phase1-remediation`, S14 and S15 (clean).
   - **Still open:** campaign worker logs (`fuzz-*.log`) are deleted, so an `oom-`'s libFuzzer headline (`used:` or `malloc(N)`) is lost when it falls outside the stored tail; unattributed timeouts still share one `module:timeout:` fingerprint per module.
+
+---
+
+## MetAcsl Properties in the E-ACSL Build
+
+Entries from package C of [`../plans/metacsl-exploitation-plan.md`](../plans/metacsl-exploitation-plan.md), 2026-11-18, on the fixture `tests/fixtures/metacsl_eacsl/` in `framac-analysis:latest` (Frama-C 34.0~beta, MetAcsl 0.12~beta). They apply only when `security_props.json` lists `eacsl` in `meta_engines`.
+
+### Symptom: `fatal error: __fc_string_axiomatic.h: No such file or directory` in Stage 1 of an E-ACSL Build With the Meta File
+- **Cause:** the generated meta file includes a Frama-C libc header, which is not on the include path of an `e-acsl-gcc` build (`-no-frama-c-stdlib`).
+- **Fix (fixed, commit `fd13c04`, [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py)):** `eacsl_meta_file_text` replaces that line with a comment, so the line numbers of the properties are kept.
+
+### Symptom: An E-ACSL Build With `-meta` Returns 0 but the Instrumented File Has No `__e_acsl_assert` Call for the Properties
+- **Cause:** MetAcsl ran in the same Frama-C stage as RTE and E-ACSL, which then see the untranslated project. `-then` inside `-F` gives `no input file`. The build is silently blind.
+- **Fix (fixed, commit `fd13c04`):** MetAcsl runs in a stage of its own: `-F "<non-RTE flags> -meta -meta-warn-key unknown-func=inactive"` plus `--then-last --e-acsl-extra "<RTE flags>"` (`meta_stage_flags`). On the fixture: 100 assertion calls without the properties, 112 with them, none lost.
+
+### Symptom: An Out-of-Bounds Write Is Reported as `<unknown>:0: Error: E-ACSL RTE failed` and Its Fingerprint Changes Once the Properties Are On
+- **Cause:** every Frama-C flag had been moved after `--then-last`, the non-RTE ones included.
+- **Fix (fixed, commit `fd13c04`):** only the RTE flags go to `--e-acsl-extra`. The fixture's ordinary bug keeps the fingerprint `src/prog.c#mix::mem_access::60975404fe` with and without the properties.
+
+### Symptom: `[meta] User Error: Error during the typing of a HILARE!` With `What: the HILARE named '<property>'` During a Fuzz Build
+- **Cause:** a property names a global or a term unknown in this module's sources.
+- **Fix (fixed, commit `fd13c04`, [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py)):** the named property is dropped and stage 1 retried, three times at most; after that the build is redone without any property, with `security_props.status = "dropped"` and the log kept as `<out>.security_meta.log`.
+- **Open pipeline bug:** nothing shows `rejected` or `dropped` to the user yet, so the engine can be lost for a module without a visible message. Assigned to package C2.
+
+### Symptom: A `requires` Property Fails on Every Input That Makes the Harness Call the Protected Function
+- **Cause:** the harness calls the function without the state its callers establish. Not a target defect.
+- **Fix (fixed for the case the build can see, commit `fd13c04`):** a `\precond` property whose target a harness source names is left out of the build and listed under `security_props.left_out`. Any other precondition failure carries `caller` and `harness_induced`.
+- **Open pipeline bug:** `ledger.py ingest-fuzz` does not read `caller` or `harness_induced`, and a precondition failure is located at the callee. Assigned to package C2.
+
+### Symptom: A Failure Located in `<out>.security_meta.c` With the Label `memory access` or `uninitialized` and No Property Name
+- **Cause:** E-ACSL guards the evaluation of a property's predicate (for example `\valid_read(dst + i)` before `\separated(dst + i, &auth_ok)`), and such a guard failed.
+- **Fix (fixed, commit `54098ac`, [`../../scripts/failure_identity.py`](../../scripts/failure_identity.py)):** the guard is mapped to its property through the line map of the sidecar `<out>.security_meta.json`; its predicate reads `<name>: meta: guard <label>: <pred>` and it carries `meta_guard`, so its fingerprint differs from a violation's. Unit-tested on a synthetic report only; no guard failure was provoked in the image.
+- **Open pipeline bug:** a guard reported at `<unknown>:0` or inside `templates/acsl/acsl_vocabulary.h` (an unterminated string reaching `no_crlf_string`) is not mapped and keeps an ordinary identity.
+
+### Symptom: Builds With the Properties Are Never Served From the Build Cache
+- **Cause:** `fuzz_build.py` bypasses the E-ACSL build cache when properties are loaded, because the cache key does not cover the meta file yet.
+- **Open pipeline gap:** add the meta text and the meta flags to `_eacsl_cache_material` and the meta file and sidecar to the cached outputs, then remove the bypass. Assigned to package C2. Until then every such build, link-repair rounds and replays included, is a full build.
+
+### Symptom: `tools/check_generated_text.py` Reports a Literal `\n` in a `.sh` File That Contains `\name(`
+- **Cause:** the hook's pattern for a literal backslash-n in shell files also matches the start of the ACSL keyword `\name`.
+- **Open pipeline bug:** in [`../../tools/check_generated_text.py`](../../tools/check_generated_text.py). Not fixed; package C avoided the form in its files.
