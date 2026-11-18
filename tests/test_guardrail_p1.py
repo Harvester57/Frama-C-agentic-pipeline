@@ -167,7 +167,9 @@ def _guard(reach_fns: dict, empty: bool = False) -> dict:
 def test_apply_guard_limits_records_reach_and_corpus():
     rep: dict = {}
     assert workspace_overlay._apply_guard_limits(rep, "f", _guard({"f": 3}))
-    assert rep["limits"]["dynamic_oracle"] == {"exercised": True, "hits": 3, "executed_inputs": 7}
+    # `unchecked_clauses` None: this fake guardrail report does not say what E-ACSL ignored.
+    oracle = {"exercised": True, "hits": 3, "executed_inputs": 7, "unchecked_clauses": None}
+    assert rep["limits"]["dynamic_oracle"] == oracle
     assert rep["limits"]["guardrail_corpus"] == {"total": 100, "replayed": 64, "sampled": True, "empty": False}
 
 
@@ -255,7 +257,8 @@ def test_batch_merge_measures_reach_of_its_provers(tmp_path, monkeypatch):
         rep = json.loads(
             (run_dir / workspace_overlay._parent_wp_report_rel(f"prover-{fn}", fn)).read_text(encoding="utf-8")
         )
-        assert rep["limits"]["dynamic_oracle"] == {"exercised": exercised, "hits": hits, "executed_inputs": 7}
+        oracle = {"exercised": exercised, "hits": hits, "executed_inputs": 7, "unchecked_clauses": None}
+        assert rep["limits"]["dynamic_oracle"] == oracle
         assert rep["limits"]["guardrail_corpus"]["sampled"] is True
         canonical = json.loads((overlay / "reports" / "wp" / f"{fn}.json").read_text(encoding="utf-8"))
         assert canonical["limits"]["dynamic_oracle"]["exercised"] is exercised

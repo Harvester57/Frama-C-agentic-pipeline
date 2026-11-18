@@ -3465,6 +3465,13 @@ def _partial_contract_merge_job(task: dict, aid: str, report: dict | None, ctx: 
         reach = guard_data.get("reach") or {}
         if not reach.get("measured") or int((reach.get("functions") or {}).get(fn) or 0) <= 0:
             return None
+        # Nor does one whose build generated no check for a clause of the function (E-ACSL `Ignoring
+        # annotation`), or that cannot say which clauses it executed: the pass is not about them.
+        unchecked = guard_data.get("unchecked_clauses")
+        if not isinstance(unchecked, list):
+            return None
+        if any(isinstance(c, dict) and c.get("function") == fn for c in unchecked):
+            return None
     elif guard_path.is_file():
         guard_data = load_json_optional(guard_path, {}) or {}
         if isinstance(guard_data, dict) and guard_data.get("status") not in (None, "passed_dynamic_oracle"):

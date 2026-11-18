@@ -623,7 +623,9 @@ def test_parent_recheck_argv_is_accepted_by_the_real_clis(tmp_path, monkeypatch)
     assert wp_script == "run_wp_function.py" and "--cppflags=-I." in wp_argv and "--sarif" in wp_argv
     assert wp_argv[wp_argv.index("--wp-par") + 1] == "3"
     report = json.loads((run_dir / "agents/prover-1/scratch/parent_wp/callee.json").read_text(encoding="utf-8"))
-    assert report["limits"]["dynamic_oracle"] == {"exercised": False, "hits": 0, "executed_inputs": 3}
+    # `unchecked_clauses` None: this fake guardrail report does not say what E-ACSL ignored.
+    oracle = {"exercised": False, "hits": 0, "executed_inputs": 3, "unchecked_clauses": None}
+    assert report["limits"]["dynamic_oracle"] == oracle
     assert report["status"] == "all_proven" and report["sizing"]["wp_par"] == 3 and report["sarif_file"]
 
 

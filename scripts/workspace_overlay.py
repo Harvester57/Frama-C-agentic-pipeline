@@ -1585,7 +1585,9 @@ def _apply_guard_limits(wp_report: dict, function: str, guard_report: dict) -> b
     {total, replayed, sampled, empty}. A pass on an empty corpus replayed no real input, so it is
     recorded as not exercised (an open assumption in the ledger), never as a pass on inputs.
     `guardrail` {status} says that this guardrail ran (`_run_parent_reverify` writes `not_run` there
-    when none did). Returns whether anything was recorded (always, since `guardrail` is).
+    when none did). `dynamic_oracle` also gets `unchecked_clauses` (list, or None when not known) and,
+    when there are any, `unattributed`. Returns whether anything was recorded (always, since
+    `guardrail` is).
     """
     limits = wp_report.setdefault("limits", {})
     limits["guardrail"] = {"status": guard_report.get("status")}
@@ -1614,6 +1616,20 @@ def _apply_guard_limits(wp_report: dict, function: str, guard_report: dict) -> b
             "executed_inputs": reach.get("executed_inputs") if isinstance(reach, dict) else None,
         }
         changed = True
+    # What E-ACSL generated no check for (run_eacsl_fuzz.dynamic_oracle_fields): a pass says nothing
+    # about those clauses. `unchecked_clauses` is this function's items; None when the guardrail had no
+    # build report to read them from (not known, which is not "none"). `unattributed` lists the
+    # ignored annotations no function could be read for, whichever function they belong to.
+    oracle = limits.setdefault("dynamic_oracle", {})
+    unchecked = guard_report.get("unchecked_clauses")
+    oracle["unchecked_clauses"] = (
+        [c for c in unchecked if isinstance(c, dict) and c.get("function") == function]
+        if isinstance(unchecked, list)
+        else None
+    )
+    unattributed = guard_report.get("unattributed_ignored_annotations")
+    if isinstance(unattributed, list) and unattributed:
+        oracle["unattributed"] = unattributed
     return changed
 
 

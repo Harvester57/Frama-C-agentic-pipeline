@@ -778,6 +778,45 @@ def _input_evidence(crash_input: str | None, corpus_dir: Path | None) -> dict:
     return {"input": name, "input_sha256": digest, "input_size": len(data)}
 
 
+NO_CHECK = "E-ACSL generated no check for this clause"
+NO_CHECK_UNKNOWN = "the replay does not say which clauses E-ACSL generated no check for"
+
+
+def _unexecuted_seeds(guard: dict, function: str, copy: Path, testing: list[Candidate], lines: dict[str, int]) -> dict:
+    """
+    The seeds a passing replay did not execute, with the reason: {seed name: reason}.
+
+    E-ACSL warns `Ignoring annotation` and builds no check for a clause it cannot translate; the
+    guardrail lists those (`unchecked_clauses`, and `unattributed_ignored_annotations` for the ones it
+    could tie to no function). A seed is matched by its name (the clause label) or by its line in the
+    seeded copy. With no list (a build that reported none) no seed is known to have run.
+    """
+    unchecked = guard.get("unchecked_clauses")
+    if not isinstance(unchecked, list):
+        return {s.name: NO_CHECK_UNKNOWN for s in testing}
+
+    def _here(entry: dict) -> bool:
+        return Path(str(entry.get("file") or copy.name).replace("\\", "/")).name == copy.name
+
+    out: dict[str, str] = {}
+    mine = [
+        c
+        for c in unchecked
+        if isinstance(c, dict) and c.get("function") == function and c.get("kind") == "loop invariant"
+    ]
+    loose = [u for u in guard.get("unattributed_ignored_annotations") or [] if isinstance(u, dict) and _here(u)]
+    for seed in testing:
+        line = lines.get(seed.name)
+        hit = next((c for c in mine if c.get("label") == seed.name or (_here(c) and c.get("line") == line)), None)
+        if hit is None:
+            # An ignored annotation with no line could be this seed: nothing is guessed in its favour.
+            hit = next((u for u in loose if u.get("line") in (None, line)), None)
+        if hit is not None:
+            detail = str(hit.get("reason") or "").strip()
+            out[seed.name] = f"{NO_CHECK} ({detail})" if detail else NO_CHECK
+    return out
+
+
 def corpus_filter(
     text: str,
     function: str,
@@ -832,8 +871,15 @@ def corpus_filter(
             replay = {k: guard.get(k) for k in ("corpus_total", "corpus_replayed", "corpus_sampled")}
             summary.update(replay)
             summary["function_reached"] = reached
+            ran = isinstance(reached, int) and reached > 0
+            unexecuted = _unexecuted_seeds(guard, function, copy, testing, lines) if ran else {}
+            if unexecuted:
+                summary["not_executed"] = [s.name for s in testing if s.name in unexecuted]
             for seed in testing:
-                if isinstance(reached, int) and reached > 0:
+                if seed.name in unexecuted:
+                    # No check of this clause is known to have run: the replay did not evaluate it.
+                    seed.corpus = {"verdict": "not_executed", "reason": unexecuted[seed.name], **replay}
+                elif ran:
                     seed.corpus = {"verdict": "held", **replay}
                 else:
                     # No replayed input ran the function (or its reach is unknown): nothing was tested.
@@ -969,6 +1015,8 @@ def default_guard_runner(
                 module=module,
                 use_cache=False,
                 functions=[function],
+                # What this build's E-ACSL ignored: a seed among them was not replayed (corpus_filter).
+                ignored_annotations=comp.get("ignored_annotations"),
             )
         except SandboxUnavailable as exc:
             return {"status": "sandbox_unavailable", "reason": str(exc)}
@@ -1185,6 +1233,10 @@ def render(report: dict) -> str:
                     why += f"; false on corpus input `{name}`"
                 elif corpus.get("verdict") == "not_reached":
                     why += "; no replayed corpus input reaches this function"
+                elif corpus.get("verdict") == "not_executed":
+                    known = str(corpus.get("reason") or "").startswith(NO_CHECK)
+                    detail = "E-ACSL generated no check for it" if known else NO_CHECK_UNKNOWN
+                    why += f"; not checked on the corpus ({detail})"
                 lines.append(f"- `{c['predicate']}`: {why}.")
             lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"

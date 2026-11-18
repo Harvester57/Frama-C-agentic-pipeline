@@ -416,6 +416,9 @@ def _passed(reached=3):
         "corpus_total": 5,
         "corpus_replayed": 5,
         "corpus_sampled": False,
+        # The build reported what E-ACSL ignored, and it ignored nothing (tests/test_unchecked_clauses_wiring.py).
+        "unchecked_clauses": [],
+        "unattributed_ignored_annotations": [],
     }
 
 
