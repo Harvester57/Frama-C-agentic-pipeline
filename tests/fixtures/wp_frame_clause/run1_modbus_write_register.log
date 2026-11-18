@@ -1,0 +1,126 @@
+[kernel] Parsing workspace/work/src/modbus.c (with preprocessing)
+[kernel] workspace/work/src/modbus.c:2098: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:207-212). Merging them
+[kernel] workspace/work/src/modbus.c:2099: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2098: Warning: 
+  found two different terminates clauses for function specification (old location: workspace/work/src/modbus.h:207-212). Keeping only the first one
+[kernel] workspace/work/src/modbus.c:2117: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:216-221). Merging them
+[kernel] workspace/work/src/modbus.c:2118: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2117: Warning: 
+  found two different terminates clauses for function specification (old location: workspace/work/src/modbus.h:216-221). Keeping only the first one
+[kernel] workspace/work/src/modbus.c:2144: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:233-240). Merging them
+[kernel] workspace/work/src/modbus.c:2145: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2144: Warning: 
+  found two different terminates clauses for function specification (old location: workspace/work/src/modbus.h:233-240). Keeping only the first one
+[kernel] workspace/work/src/modbus.c:2159: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:244-249). Merging them
+[kernel] workspace/work/src/modbus.c:2162: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.h:248: Warning: 
+  location *ctx is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2178: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:254-261). Merging them
+[kernel] workspace/work/src/modbus.c:2184: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2199: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:265-270). Merging them
+[kernel] workspace/work/src/modbus.c:2202: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.h:269: Warning: 
+  location *ctx is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2220: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:274-281). Merging them
+[kernel] workspace/work/src/modbus.c:2221: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2220: Warning: 
+  found two different terminates clauses for function specification (old location: workspace/work/src/modbus.h:274-281). Keeping only the first one
+[kernel] workspace/work/src/modbus.c:2235: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:285-290). Merging them
+[kernel] workspace/work/src/modbus.c:2239: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2268: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:607-612). Merging them
+[kernel] workspace/work/src/modbus.c:2269: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2268: Warning: 
+  found two different terminates clauses for function specification (old location: workspace/work/src/modbus.h:607-612). Keeping only the first one
+[kernel] workspace/work/src/modbus.c:2284: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:615-620). Merging them
+[kernel] workspace/work/src/modbus.c:2285: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2284: Warning: 
+  found two different terminates clauses for function specification (old location: workspace/work/src/modbus.h:615-620). Keeping only the first one
+[kernel] workspace/work/src/modbus.c:2326: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:336-341). Merging them
+[kernel] workspace/work/src/modbus.c:2327: Warning: 
+  location __fc_errno is not present in all assigns clauses
+[kernel] workspace/work/src/modbus.c:2326: Warning: 
+  found two different terminates clauses for function specification (old location: workspace/work/src/modbus.h:336-341). Keeping only the first one
+[kernel] workspace/work/src/modbus.c:2442: Warning: 
+  found two contracts (old location: workspace/work/src/modbus.h:490-493). Merging them
+[kernel:typing:variadic] workspace/work/src/modbus.c:178: Warning: 
+  Incorrect type for argument 2. The argument will be cast from int to unsigned int.
+[kernel:typing:variadic] workspace/work/src/modbus.c:550: Warning: 
+  Incorrect type for argument 2. The argument will be cast from int to unsigned int.
+[kernel:typing:variadic] workspace/work/src/modbus.c:683: Warning: 
+  Incorrect type for argument 3. The argument will be cast from int to unsigned int.
+[kernel:typing:variadic] workspace/work/src/modbus.c:683: Warning: 
+  Incorrect type for argument 4. The argument will be cast from int to unsigned int.
+[wp] Running WP plugin...
+[wp] Warning: Skipped RTE guards: unaligned pointers (\aligned not supported)
+[wp] Warning: Skipped RTE guards: invalid function pointer calls (\valid_function not supported)
+[rte:annot] annotating function modbus_write_register
+[wp:pedantic-assigns] workspace/work/src/modbus.c:1740: Warning: 
+  No 'assigns' specification for function 'modbus_write_register'.
+  Callers assumptions might be imprecise.
+[wp:pedantic-assigns] workspace/work/src/modbus.c:1700: Warning: 
+  No 'assigns' specification for function 'write_single'.
+  Callers assumptions might be imprecise.
+[wp] 5 goals scheduled
+[wp] [Cache] not used
+[wp] Proved goals:    5 / 5
+  Qed:             5
+[wp] workspace/work/src/modbus.c:1740: Warning: 
+  Memory model hypotheses for function 'modbus_write_register':
+  /*@ behavior wp_typed:
+        requires \separated(ctx + (..), &__fc_errno); */
+  int modbus_write_register(modbus_t *ctx, int addr, uint16_t const value);
+[wp] workspace/work/src/modbus.c:1700: Warning: 
+  Memory model hypotheses for function 'write_single':
+  /*@ behavior wp_typed:
+        requires \separated(ctx + (..), &__fc_errno); */
+  static int write_single(modbus_t *ctx, int function, int addr,
+                          uint16_t const value);
+[report] Computing properties status...
+--------------------------------------------------------------------------------
+--- Properties of Function 'modbus_write_register'
+--------------------------------------------------------------------------------
+
+[  Valid  ] Exit-condition ("workspace/work/src/modbus.h", line 400)
+            by Wp.typed (v1).
+[  Valid  ] Post-condition 'null_status'
+            by Wp.typed (v1).
+[  Valid  ] Termination-condition ("workspace/work/src/modbus.h", line 399)
+            by Wp.typed (v1).
+[  Valid  ] Default behavior
+            by Frama-C kernel.
+[  Valid  ] Behavior 'wp_typed'
+            by Frama-C kernel.
+[  Valid  ] Instance of 'Pre-condition for 'wp_typed' ("workspace/work/src/modbus.c", lines 1700-1726)' at call 'write_single' ("workspace/work/src/modbus.c", line 1747)
+
+            by Wp.typed (v1).
+
+--------------------------------------------------------------------------------
+--- Status Report Summary
+--------------------------------------------------------------------------------
+    96 Completely validated
+   336 Considered valid
+     1 To be validated
+   433 Total
+--------------------------------------------------------------------------------
+[report] Dumping properties in 'agents/prove-modbus_write_register/scratch/parent_wp/wp_modbus_write_register.csv'

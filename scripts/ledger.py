@@ -713,6 +713,42 @@ def _meta_decided_statically(unit: dict, report: dict) -> bool:
     return names <= {str(n) for n in sp.get("properties") or []}
 
 
+def wp_frame_problem(report: dict) -> tuple[str, str] | None:
+    """
+    Why an `all_proven` WP report does not show a proven frame for its function, as (evidence result,
+    reason), or None when it does: the report says the contract has an `assigns` clause
+    (`frame_summary.assigns_clause: present`, read by run_wp_function.py from Frama-C's own output) and
+    that no assigns goal is unproven. A contract without the clause has no assigns goal that could
+    fail, so zero unproven frame goals prove nothing there (libmodbus run-1, modbus_write_register).
+    `unknown` is never a frame: the report CSV does not say which behavior an `assigns clause` row
+    belongs to, so a proven row may be one named behavior's. A report written before the field
+    existed reads as `unknown`.
+    """
+    raw = report.get("frame_summary")
+    frame: dict = raw if isinstance(raw, dict) else {}
+    state = frame.get("assigns_clause")
+    function = report.get("function")
+    if state == "absent":
+        return "wp_no_frame_clause", f"the contract WP proved for {function} has no `assigns` clause"
+    if state == "behaviors_only":
+        named = ", ".join(str(b) for b in frame.get("assigns_behaviors") or []) or "some"
+        return (
+            "wp_no_frame_clause",
+            f"the contract WP proved for {function} has an `assigns` clause in named behaviors only ({named}), "
+            "which do not cover the function: it has no `assigns` clause of its own",
+        )
+    if state != "present":
+        return (
+            "wp_frame_not_shown",
+            f"the report does not show that the contract of {function} has an `assigns` clause "
+            f"(frame_summary.assigns_clause: {state if isinstance(state, str) else 'not recorded'}; a run limited "
+            "with --prop, a log without a property report, or a report written before the field existed)",
+        )
+    if frame.get("assigns_vcs_proven") is not True or report.get("assigns_vcs_proven") is False:
+        return "wp_frame_not_shown", f"the report does not say that the assigns goals of {function} are proven"
+    return None
+
+
 def _load_security_obligations(path: Path | None) -> tuple[dict[str, list[dict]] | None, str]:
     """security_props.py's obligations per `file#name`, and a status (`ok`, `absent`, `invalid`)."""
     path = path or DEFAULT_SECURITY_PROPS
@@ -2365,6 +2401,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
         # Every branch that reads the limits is guarded by `all_proven` after the `limits_problem` branch,
         # so it only runs on a dict; the fallback just keeps that visible to the type checker.
         limits: dict = raw_limits if isinstance(raw_limits, dict) else {}
+        frame_problem = wp_frame_problem(report) if all_proven else None
         unproven_by_class: dict[str, list[dict]] = {}
         for g in report.get("unproven_goals", []):
             unproven_by_class.setdefault(g.get("obligation_class", "rte"), []).append(g)
@@ -2450,6 +2487,18 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     tool_output,
                     f"Every {cls} clause holds whatever the function does "
                     f"({', '.join(limits.get('trivial_layer_clauses', []))}); not credited.",
+                )
+            elif all_proven and cls == "l3_frame" and frame_problem:
+                # Both credits below (proven goals of the class, and none left by Qed) need a frame to be about.
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    frame_problem[0],
+                    False,
+                    tool_output,
+                    f"Frame not credited: {frame_problem[1]}. The unit stays open until WP proves an `assigns` "
+                    "clause of the function's own contract.",
                 )
             elif counts and (counts.get("proven", 0) + counts.get("proven_under_hyp", 0)) > 0 and all_proven:
                 add_evidence(

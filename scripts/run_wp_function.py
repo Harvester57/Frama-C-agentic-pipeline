@@ -416,6 +416,12 @@ def goal_obligation_class(item: dict) -> str:
     assigns/separated/frees/allocates -> l3_frame; everything else -> rte. A hand-named
     L4_*/L5_*/L6_* clause is a supporting contract clause: no ledger unit has a class of its own
     for it (the pre-I9 classes l4_auth, l5_output, l6_secret are gone), so it falls through.
+
+    A `\\separated` in the predicate of a precondition or a postcondition (the report kinds
+    `precondition`, `precondition of <callee>`, `postcondition`) is not a frame goal: it says nothing
+    about what the function writes. libmodbus run-1: the one "proven l3_frame goal" of
+    `modbus_write_register`, whose contract had no `assigns` clause, was WP's memory-model hypothesis of
+    its callee, `precondition of write_single: \\separated(ctx + (..), &__fc_errno)`.
     """
     text = f"{item.get('kind', '')} {item.get('annotation', '')}"
     meta = _META_NAME_RE.search(text)
@@ -424,9 +430,16 @@ def goal_obligation_class(item: dict) -> str:
     low = text.lower()
     if "variant" in low or "decreases" in low:
         return "l2_termination"
-    if "assigns" in low or "\\separated" in low or "frees" in low or "allocates" in low:
+    if "assigns" in low or "frees" in low or "allocates" in low:
+        return "l3_frame"
+    kind = str(item.get("kind") or "").strip().lower()
+    if "\\separated" in low and not kind.startswith(_PREDICATE_CLAUSE_KINDS):
         return "l3_frame"
     return "rte"
+
+
+# The report kinds of a contract's predicates: `precondition`, `precondition of <callee>`, `postcondition`.
+_PREDICATE_CLAUSE_KINDS = ("precondition", "postcondition")
 
 
 _BITWISE_GOAL_RE = re.compile(
