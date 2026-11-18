@@ -40,6 +40,12 @@ the same red statuses: both are unions over completed runs, so it can only leave
 The one case that can differ is a red status only an unfinished rung would have found, on an obligation
 another run proves. Under the argument above that statement is unreachable unless an earlier alarm
 fails, so verification of the candidate finds no witness and the final verdict is the same.
+
+MetAcsl security properties (`finish --security-props`, run_eva_slice.py): every trial loads the same
+meta file, and the checks MetAcsl generates are rows like any other in the guards and the combination.
+They do not drive the search: an Unknown check belongs to its property's unit, which WP proves, so
+selection, loop trials and "no Unknown left" count the RTE rows only. The report's `security_props` is
+rebuilt from the combined rows (run_eva_slice.summarize_runs).
 """
 
 from __future__ import annotations
@@ -87,7 +93,13 @@ from framac_common import (  # noqa: E402
     resolve_flows,
     spill_large_flows,
 )
-from run_eva_slice import read_report_rows, run_eva_on_slice, summarize_rows  # noqa: E402
+from run_eva_slice import (  # noqa: E402
+    is_meta_row,
+    read_report_rows,
+    resolve_security_props,
+    run_eva_on_slice,
+    summarize_runs,
+)
 
 # Loop trials per module: each one is a whole Eva run, and one-by-one analysis is what Loupe measured
 # as 137x slower than its model, so the search stops here whatever the machine.
@@ -239,6 +251,18 @@ def target_unknown_rows(rows: Iterable[dict]) -> list[dict]:
     return [r for r in rows if _bucket(r) == "unknown" and "FRAMAC_SHARE" not in row_path(r)]
 
 
+def tuning_unknown_rows(rows: Iterable[dict], report: dict) -> list[dict]:
+    """
+    The Unknown rows tuning works on: target_unknown_rows without the checks MetAcsl generated from the
+    security properties the run loaded (`report["security_props"]`); those are left to WP.
+    """
+    found = target_unknown_rows(rows)
+    section = report.get("security_props")
+    if not isinstance(section, dict) or not section.get("meta_file"):
+        return found
+    return [r for r in found if not is_meta_row(r, section)]
+
+
 def obligation_key(row: dict) -> tuple[str, int]:
     """
     The fingerprint names a property in a function; the line tells apart two statements checking the
@@ -282,7 +306,7 @@ class EvaRun:
 
     @property
     def unknown_rows(self) -> list[dict]:
-        return target_unknown_rows(self.rows)
+        return tuning_unknown_rows(self.rows, self.report)
 
     @property
     def unknown_count(self) -> int:
@@ -591,6 +615,8 @@ class Tuner:
     def run_trial(self, name: str, options: dict, refs: Iterable[LoopRef], timeout: int | None = None) -> EvaRun:
         a = self.args
         refs = sorted(set(refs))
+        # The same properties as the Make-run trials (eva_args passes --security-props to both).
+        props = resolve_security_props(getattr(a, "security_props", None))
         result = run_eva_on_slice(
             sources=a.sources,
             main_fn=a.main,
@@ -610,6 +636,7 @@ class Tuner:
             timeout_fallback=False,
             # Nobody reads a trial's profile; the base run's is the one published.
             flamegraph=False,
+            **({"security_props": props, "module": a.module} if props else {}),
         )
         result["module"] = a.module
         path = self.report_dir / f"{name}.json"
@@ -836,8 +863,16 @@ def finish(args: argparse.Namespace) -> dict:
     ]
     unfinished = [run for run in all_runs if not run.completed]
     decision = build_record(args, base, rung if rung in admissible else base, selected, contributors, unfinished)
-    summary = summarize_rows(combination.rows)
-    remaining = target_unknown_rows(combination.rows)
+    # With security properties loaded, the section is rebuilt from the combined rows: an instance one
+    # run proves, or one another run refutes, shows as that in the module's report. The combination
+    # draws on every complete run, so all of them must have loaded the same properties.
+    sections = [run.report.get("security_props") for run in all_runs if run.completed]
+    summary = summarize_runs(combination.rows, sections)
+    remaining = [
+        r
+        for r in target_unknown_rows(combination.rows)
+        if not any(is_meta_row(r, s) for s in sections if isinstance(s, dict))
+    ]
     report = {**selected.report, **summary, **selected.reach}
     report["tuning"] = {
         "mode": "replay" if replay else "ladder",
@@ -888,6 +923,12 @@ def main(argv: list[str] | None = None) -> int:
     p_finish.add_argument("--extra-domains", default="")
     p_finish.add_argument("--allow-incomplete-recursion-specs", action="store_true")
     p_finish.add_argument("--no-warn-unsigned-downcast", action="store_true")
+    p_finish.add_argument(
+        "--security-props",
+        default=None,
+        metavar="PATH|none",
+        help="As run_eva_slice.py --security-props: the loop trials load the same MetAcsl properties",
+    )
     p_finish.add_argument("--timeout", type=int, default=None, help="Seconds for each loop trial")
     p_finish.add_argument("--settings-digest", required=True, help="Digest of the module settings (pipeline_make.py)")
     p_finish.add_argument("--rungs", nargs="*", default=[], help="Names of the finished rung trials, in ladder order")
