@@ -1614,7 +1614,8 @@ EACSL_LIBC_EFFECTS: dict[str, tuple[str, tuple[str, ...], str, str, str, str | N
 # Functions a supported libc may not declare (glibc has strlcpy/strlcat from 2.38 only; Debian
 # bookworm's 2.36 lacks them). The shim declares them itself, a compatible redeclaration where the
 # header has them, so an older libc does not fail the -Werror shim and drop every other effect.
-# The symbol then resolves to the target's own fallback, if it is called at all.
+# Their `__real_` is weak: when libc lacks the symbol and the target's fallback is static (its calls
+# are then never wrapped), the unused wrapper must not fail the link on an undefined `__real_`.
 EACSL_SHIM_OWN_PROTOTYPES = frozenset({"strlcpy", "strlcat"})
 
 
@@ -1716,10 +1717,11 @@ def generate_errno_shim_source(names: Sequence[str], effects: Sequence[str] = ()
         else:
             lines.append("return r;")
         body = "".join(f"    {line}\n" for line in lines)
-        proto = f"{ret} {name}({', '.join(params)});\n" if name in EACSL_SHIM_OWN_PROTOTYPES else ""
+        own = name in EACSL_SHIM_OWN_PROTOTYPES
+        proto = f"{ret} {name}({', '.join(params)});\n" if own else ""
         bodies.append(
             proto
-            + f"extern __typeof__({name}) __real_{name};\n"
+            + f"extern __typeof__({name}) __real_{name}{' __attribute__((weak))' if own else ''};\n"
             + storage
             + f"{ret} __wrap_{name}({decls})\n{{\n{body}}}\n"
             f"static __typeof__({name}) *const fc_errno_shim_check_{name} __attribute__((unused)) = __wrap_{name};\n"

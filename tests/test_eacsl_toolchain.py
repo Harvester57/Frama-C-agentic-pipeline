@@ -1001,8 +1001,10 @@ def test_strlcpy_and_strlcat_shim_compiles_where_libc_does_not_declare_them():
     src = T.generate_errno_shim_source([], ["strlcpy", "strlcat"])
     for name in ("strlcpy", "strlcat"):
         proto = f"size_t {name}(char *, const char *, size_t);"
-        assert src.index(proto) < src.index(f"extern __typeof__({name}) __real_{name};"), name
-    assert "size_t strtol(" not in T.generate_errno_shim_source([], ["strtol"])
+        # Weak: a libc without the symbol and a static target fallback leave __real_ undefined.
+        assert src.index(proto) < src.index(f"extern __typeof__({name}) __real_{name} __attribute__((weak));"), name
+    other = T.generate_errno_shim_source([], ["strtol"])
+    assert "long strtol(" not in other and "extern __typeof__(strtol) __real_strtol;" in other
 
 
 def test_effects_only_shim_is_built_and_linked(tmp_path, modern_cli):
