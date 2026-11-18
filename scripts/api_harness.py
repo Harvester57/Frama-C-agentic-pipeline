@@ -188,9 +188,10 @@ POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
 # The source of a copy the harness makes itself: the input, or in eva_main an initialized shadow of it
 # (templates/harness_dual.c.template defines the macro for both entries).
 FUZZ_COPY = "FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off)"
-# Initializer names: QCBORDecode_Init, UsefulOutBuf_Init, ctx_init, foo_new, bar_create.
+# Initializer names: QCBORDecode_Init, UsefulOutBuf_Init, ctx_init, foo_new, bar_create, and
+# `<lib>_new_<kind>` (libmodbus's modbus_new_tcp, modbus_new_rtu): `new`/`create` as a whole word.
 _INIT_NAME_RE = re.compile(
-    r"(?:^|(?<=[a-z0-9_]))Init(?=[A-Z0-9_]|$)|(?:^|_)init(?:$|_)|_new$|_create$"
+    r"(?:^|(?<=[a-z0-9_]))Init(?=[A-Z0-9_]|$)|(?:^|_)(?:init|new|create)(?:$|_)"
 )
 # Out-parameter constructor names (`H **` written by the call): the initializer names, and parsers and
 # adders (c-ares's ares_dns_record_create, ares_init, ares_dns_parse, ares_dns_record_rr_add).
@@ -1719,7 +1720,9 @@ def handle_functions(
     (`visible`, a `Declared`): the model's signatures have typedefs expanded, so `scmp_filter_ctx` and
     any other `void *` look alike there. Without a probe nothing is a handle.
 
-    A constructor is named like an initializer, returns the handle type and takes none; the fewest
+    A constructor is named like an initializer (`_INIT_NAME_RE`: `*_new`, `*_new_<kind>`, `*_create`,
+    `*_init`, ...), returns the handle type, takes no handle parameter and no file-system path
+    (`path_parameter`); other parameters are allowed (the harness fills them from the input). The fewest
     parameters win, then the name. A destructor is named like one and takes the handle alone.
     """
     protos = getattr(visible, "prototypes", None) or {}

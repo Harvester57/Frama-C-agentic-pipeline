@@ -174,6 +174,59 @@ def test_lifecycle_layout_validates_and_seeds_from_the_constructor_calls():
     assert sh.layout_seeds([layout], calls, [])[0] == [b"\x00\x07\x00\x00\x00"]
 
 
+MODBUS = "struct _modbus *"
+
+
+@pytest.mark.unit
+def test_a_lib_new_kind_constructor_builds_the_handle():
+    """libmodbus run-1: `modbus_new_tcp` / `modbus_new_rtu` (`<lib>_new_<kind>`) build `modbus_t`."""
+    recs = {
+        "modbus_new_tcp": _rec("modbus_new_tcp", "struct _modbus *(char const *,int)", "const_pointer", "value"),
+        "modbus_new_rtu": _rec(
+            "modbus_new_rtu",
+            "struct _modbus *(char const *,int,char,int,int)",
+            "const_pointer",
+            "value",
+            "value",
+            "value",
+            "value",
+        ),
+        "modbus_new_tcp_pi": _rec(
+            "modbus_new_tcp_pi", "struct _modbus *(char const *,char const *)", "const_pointer", "const_pointer"
+        ),
+        "modbus_free": _rec("modbus_free", "void(struct _modbus *)", "pointer"),
+        "modbus_flush": _rec("modbus_flush", "int(struct _modbus *)", "pointer"),
+    }
+    protos: dict[str, dict[str, Any]] = {
+        "modbus_new_tcp": {"ret": MODBUS, "params": [None, None]},
+        "modbus_new_rtu": {"ret": MODBUS, "params": [None, None, None, None, None]},
+        "modbus_new_tcp_pi": {"ret": MODBUS, "params": [None, None]},
+        "modbus_free": {"ret": None, "params": [MODBUS]},
+        "modbus_flush": {"ret": None, "params": [MODBUS]},
+    }
+    declared = ah.Declared(set(recs), protos)
+    handles, ctors, dtors, _, ctor_records, _ = ah.handle_functions(recs, declared)
+    # All three are constructors; the fewest parameters win, then the name (tcp before tcp_pi).
+    assert ctors == {MODBUS: "modbus_new_tcp"} and dtors == {MODBUS: "modbus_free"}
+    assert set(ctor_records) == {"modbus_new_tcp"} and handles["modbus_flush"] == {0: MODBUS}
+    for name in ("modbus_new_tcp", "modbus_new_rtu", "foo_create_bar", "new_foo", "foo_new", "ctx_init"):
+        assert ah._INIT_NAME_RE.search(name), name
+    for name in ("modbus_renew", "newline_count", "foo_news", "recreate_x"):
+        assert not ah._INIT_NAME_RE.search(name), name
+    # The plan builds the handle with the constructor (a string argument) instead of skipping its users.
+    functions = {f"modbus.c#{n}": {"name": n, "file": "modbus.c"} for n in recs}
+    dag = {
+        "warnings": [],
+        "modules": {"lib": {"functions": list(functions), "candidate_entry_points": list(functions)}},
+        "functions": functions,
+    }
+    model = {"status": "ok", "functions": {f"modbus.c#{n}": r for n, r in recs.items()}}
+    p = ah.plan(dag, model, "lib", "lib", 64, [], None, {}, declared)
+    assert p["skipped"] == {}
+    flush = next(t for t, lay in zip(p["cases"], p["layouts"], strict=True) if lay.get("entry") == "modbus.c#modbus_flush")
+    assert "modbus_new_tcp(" in flush and "modbus_flush(" in flush and "modbus_free(" in flush
+
+
 # --- end to end: a use after free only a sequence of calls reaches ----------------------------------
 
 LIB_H = """#include <stddef.h>
