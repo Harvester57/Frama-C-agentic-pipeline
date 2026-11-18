@@ -2658,6 +2658,186 @@ def test_a_stale_refusal_report_does_not_turn_a_later_splice_failure_into_an_ana
     assert "merge_deferred" not in out and out["failed"][0]["action"] == "requeued"
 
 
+LOCATE_FAILURE_REASON = "src/m/a.c: could not locate definition of function 'a'"
+
+
+def lose_merge_to_the_locator(sim, monkeypatch, aid, attempts=2):
+    """The merge of `aid` fails `attempts` times on the locator; afterwards the fixed locator accepts every result."""
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, agent: None)
+    sim.merge_fail[aid] = LOCATE_FAILURE_REASON
+    for _ in range(attempts):
+        S.cmd_merge_pending(force=True)
+    allow_merge(sim, aid)
+
+
+def test_requeue_locate_failed_restores_a_blocked_merge_and_nothing_else(sim, monkeypatch, capsys):
+    blocked_on_the_locator(sim, monkeypatch, also=("b",))
+    state = S.load_schedule()  # blocked for another reason: a verdict that stays
+    S._finish(state, state["tasks"]["prove:src/m/b.c#b"], "blocked", "merge_failed", reason="diverged from base")
+    S.save_schedule(state)
+    task = tasks()["prove:src/m/a.c#a"]
+    assert (task["state"], task["outcome"], task["merge_attempts"]) == ("blocked", "merge_failed", 2)
+    assert units()["src/m/a.c#a::rte"]["status"] == "blocked"
+    other = tasks()["prove:src/m/b.c#b"]
+
+    out = S.cmd_requeue_locate_failed()
+    assert [(r["task"], r["agent_id"]) for r in out["restored"]] == [("prove:src/m/a.c#a", "prove-a")]
+    assert out["restored"][0]["units"] == ["src/m/a.c#a::rte"]
+    task = tasks()["prove:src/m/a.c#a"]
+    assert (task["state"], task["outcome"], task["last_reason"], task["merge_attempts"]) == (
+        "merge_queued",
+        None,
+        None,
+        0,
+    )
+    assert (units()["src/m/a.c#a::rte"]["status"], units()["src/m/a.c#a::rte"]["agent_id"]) == (
+        "in_progress",
+        "prove-a",
+    )
+    assert tasks()["prove:src/m/b.c#b"] == other
+
+    before = tasks()
+    again = S.cmd_requeue_locate_failed()  # idempotent
+    assert again["restored"] == again["left"] == again["pending_restored"] == [] and tasks() == before
+
+    assert S.main(["requeue", "--locate-failed"]) == 0
+    capsys.readouterr()
+    assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "prove-a"
+    assert (tasks()["prove:src/m/a.c#a"]["outcome"], units()["src/m/a.c#a::rte"]["status"]) == ("merged", "covered")
+
+
+def test_requeue_locate_failed_merges_the_result_of_a_task_reopened_by_the_error(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    lose_merge_to_the_locator(sim, monkeypatch, "prove-a", attempts=1)
+    task = tasks()["prove:src/m/a.c#a"]
+    assert (task["state"], task["agent_id"], units()["src/m/a.c#a::rte"]["status"]) == ("pending", None, "planned")
+
+    out = S.cmd_requeue_locate_failed()
+    assert [(r["task"], r["agent_id"]) for r in out["pending_restored"]] == [("prove:src/m/a.c#a", "prove-a")]
+    task = tasks()["prove:src/m/a.c#a"]
+    assert (task["state"], task["agent_id"], task["merge"]["agent_id"]) == ("merge_queued", "prove-a", "prove-a")
+    assert (task["merge_attempts"], task["dispatches"], task["reopened"]) == (0, 1, 0)
+    assert units()["src/m/a.c#a::rte"]["status"] == "in_progress"
+    assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "prove-a"
+    assert (tasks()["prove:src/m/a.c#a"]["outcome"], units()["src/m/a.c#a::rte"]["status"]) == ("merged", "covered")
+
+
+def test_requeue_locate_failed_leaves_a_reopened_task_whose_result_cannot_merge_pending(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    lose_merge_to_the_locator(sim, monkeypatch, "prove-a", attempts=1)
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, agent: "ScopeViolationError: diverged")
+    before = tasks()
+    out = S.cmd_requeue_locate_failed()
+    assert out["pending_restored"] == [] and [e["task"] for e in out["left"]] == ["prove:src/m/a.c#a"]
+    assert tasks() == before
+
+
+def test_requeue_locate_failed_leaves_a_task_redispatched_since(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    lose_merge_to_the_locator(sim, monkeypatch, "prove-a", attempts=1)
+    S.cmd_next("auto", prepare=True)  # the run gave it to a new prover before the recovery ran
+    before = tasks()["prove:src/m/a.c#a"]
+    assert before["state"] == "running"
+    out = S.cmd_requeue_locate_failed()
+    assert out["pending_restored"] == out["restored"] == []
+    assert [e["task"] for e in out["left"]] == ["prove:src/m/a.c#a"] and "running" in out["left"][0]["reason"]
+    assert tasks()["prove:src/m/a.c#a"] == before
+
+
+def test_requeue_locate_failed_restores_nothing_while_the_locator_is_still_blind(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    lose_merge_to_the_locator(sim, monkeypatch, "prove-a", attempts=1)
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, agent: f"ScopeViolationError: {LOCATE_FAILURE_REASON}")
+    before = tasks()
+    out = S.cmd_requeue_locate_failed()
+    assert [e["task"] for e in out["left"]] == ["prove:src/m/a.c#a"] and tasks() == before
+
+
+def blocked_on_the_locator(sim, monkeypatch, also=()):
+    """prove-a's merge ended on the locator; its unit holds WP evidence, so `_park_units` really blocks it."""
+    sim.build({n: (f"src/m/{n}.c", "m", []) for n in ("a", *also)})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, agent: None)
+    rel = "agents/prove-a/scratch/parent_wp/a.json"
+    write_json(sim.run_dir / rel, wp_report("a", "workspace/work/src/m/a.c", "analysis_error", "oom_killed"))
+    S.DEPS.ingest_wp([Path(rel)])
+    state = S.load_schedule()
+    task = state["tasks"]["prove:src/m/a.c#a"]
+    task["merge_attempts"] = 2
+    S._park_units(task, "prove-a", f"merge_failed: {LOCATE_FAILURE_REASON}")
+    S._finish(state, task, "blocked", "merge_failed", reason=LOCATE_FAILURE_REASON)
+    S.save_schedule(state)
+
+
+def test_requeue_locate_failed_reopens_a_blocked_task_whose_base_has_diverged(sim, monkeypatch):
+    blocked_on_the_locator(sim, monkeypatch)
+    why = "ScopeViolationError: src/m/a.c: function 'a' in workspace/work/ diverged from agent base snapshot"
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, agent: why)
+    out = S.cmd_requeue_locate_failed()
+    assert [r["task"] for r in out["reopened"]] == ["prove:src/m/a.c#a"] and out["restored"] == []
+    task = tasks()["prove:src/m/a.c#a"]
+    assert (task["state"], task["merge_attempts"], task["dispatches"]) == ("pending", 0, 0)
+    assert (units()["src/m/a.c#a::rte"]["status"], units()["src/m/a.c#a::rte"]["agent_id"]) == ("planned", None)
+    assert S.cmd_requeue_locate_failed()["reopened"] == []  # idempotent
+
+
+def request_status(sim, rid):
+    return next(r["status"] for r in request_store() if r["id"] == rid)
+
+
+def negotiation_lost_to_the_locator(sim, monkeypatch):
+    negotiation_waiting_to_merge(sim)
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, agent: None)
+    state = S.load_schedule()
+    task = state["tasks"]["negotiate:src/m/g.c#g"]
+    task["merge_attempts"] = 2
+    S._resolve_negotiation(state, task, False, f"merge failed: {LOCATE_FAILURE_REASON}", {"errors": []})
+    S.save_schedule(state)
+    return task["requests"][0]
+
+
+def test_requeue_locate_failed_restores_a_negotiation_and_its_request(sim, monkeypatch):
+    rid = negotiation_lost_to_the_locator(sim, monkeypatch)
+    assert request_status(sim, rid) == "rejected_by_callee"
+    out = S.cmd_requeue_locate_failed()
+    assert [n["task"] for n in out["negotiations_restored"]] == ["negotiate:src/m/g.c#g"]
+    assert out["requests_restored"] == [rid] and request_status(sim, rid) == "pending"
+    task = tasks()["negotiate:src/m/g.c#g"]
+    assert (task["state"], task["outcome"], task["merge_attempts"]) == ("merge_queued", None, 0)
+    assert S.cmd_requeue_locate_failed()["requests_restored"] == []  # idempotent
+    assert tasks()["negotiate:src/m/g.c#g"]["state"] == "merge_queued"
+
+
+def test_requeue_locate_failed_reruns_a_negotiation_whose_base_has_diverged(sim, monkeypatch):
+    rid = negotiation_lost_to_the_locator(sim, monkeypatch)
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, agent: "ScopeViolationError: diverged")
+    dispatches = tasks()["negotiate:src/m/g.c#g"]["dispatches"]
+    out = S.cmd_requeue_locate_failed()
+    assert [n["task"] for n in out["negotiations_rerun"]] == ["negotiate:src/m/g.c#g"]
+    task = tasks()["negotiate:src/m/g.c#g"]
+    assert (task["state"], task["dispatches"]) == ("pending", dispatches - 1)
+    assert request_status(sim, rid) == "pending"
+
+
 def test_requeue_memory_refused_restores_the_merge_and_nothing_else(sim, capsys):
     sim.build({n: (f"src/m/{n}.c", "m", []) for n in "abc"})
     S.cmd_init()

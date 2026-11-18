@@ -15,7 +15,7 @@ Subcommands (run with the run directory as working directory; each prints one JS
   complete       --agent-id ID                  validate one agent result and dispatch it by role
   merge-pending  [--module M] [--force]         merge finished provers in micro-batches, run re-checks
   refresh        [--module M]                   re-sync after a harness repair or a module re-run
-  requeue        --agent-id ID | --stale-minutes N | --memory-refused
+  requeue        --agent-id ID | --stale-minutes N | --memory-refused | --locate-failed
   status
 
 Tasks: verify:<fingerprint>, repair:<module> (parent work), arch:<module> (one per harness header:
@@ -133,6 +133,8 @@ MAX_MERGE_ATTEMPTS = 2  # a prover whose merge fails twice is blocked
 MAX_ANALYSIS_ERRORS = 2  # a WP analysis_error is retried once, then the units are blocked
 # run_wp_function.py refuses to start WP below this: nothing ran, so the refusal says nothing about the proof.
 MEMORY_REFUSAL = "insufficient_memory"
+# The splice could not find the function: said of the locator, never of the agent's proof.
+LOCATE_FAILURE = "could not locate definition of function"
 WP_MIN_MEMORY_MB = resources.FRAMAC_KERNEL_RESERVE_MB + resources.WP_MEMLIMIT_MB
 MAX_INVALID_RESULTS = 2  # a malformed result is re-run once with a fresh agent
 MAX_PREPARE_ERRORS = 3
@@ -289,6 +291,7 @@ class Deps:
         self.merge_agent_batch: Callable[..., dict] = workspace_overlay.merge_agent_batch
         self.merge_agent_overlay: Callable[..., dict] = workspace_overlay.merge_agent_overlay
         self.recheck_function: Callable[..., dict] = _default_recheck
+        self.splice_refusal: Callable[[dict, str], str | None] = lambda task, aid: _splice_refusal(task, aid)
         self.recommend: Callable[..., dict] = resources.recommend
         self.enforced_memory_mb: Callable[[], int | None] = resources.enforced_memory_mb
         self.transition: Callable[..., dict] = ledger.cmd_transition
@@ -4545,24 +4548,30 @@ def _refused_result(task: dict) -> tuple[str | None, str | None]:
     return str(aid), None
 
 
-def _requeue_refused_merge(state: dict, task: dict, aid: str) -> None:
+def _requeue_refused_merge(state: dict, task: dict, aid: str, reason: str = MEMORY_REFUSAL) -> None:
     """Back to the merge queue, at its old place: `queued_ts` keeps a callee's proof ahead of later results."""
     task["merge"]["analysis_retries"] = 0
     task["merge"].pop("started_at", None)
     task["merge"].pop("started_ts", None)
     task.update(state="merge_queued", outcome=None, completed_at=None, last_reason=None)
-    _event(state, "merge_requeued", task["id"], agent_id=aid, reason=MEMORY_REFUSAL)
+    _event(state, "merge_requeued", task["id"], agent_id=aid, reason=reason)
 
 
-def _reclaim_parked_units(task: dict, aid: str, errors: list) -> list[str]:
-    """Undo `_park_units` for a refused merge: the units it parked go back to the agent whose result is queued."""
+def _reclaim_parked_units(
+    task: dict, aid: str, errors: list, reason: str = MEMORY_REFUSAL, only_reason: bool = True
+) -> list[str]:
+    """
+    Undo `_park_units` for a refused merge: the units it parked go back to the agent whose result is queued.
+    `only_reason=False` also takes a unit with older notes beside the parking reason.
+    """
     units, _ = ledger.load_state()
     owned = set(task.get("units") or [])
     specs = []
     for cid in _unit_ids(task, units):
         u = units[cid]
         notes = u.get("unresolved") or []
-        parked = u["status"] == "blocked" and notes and all(MEMORY_REFUSAL in str(n) for n in notes)
+        said = [reason in str(n) for n in notes]
+        parked = u["status"] == "blocked" and notes and (all(said) if only_reason else any(said))
         if parked or (u["status"] == "planned" and cid in owned):
             specs.append(
                 {"id": cid, "status": "in_progress", "agent_id": aid, "reason": None, "expected": [u["status"]]}
@@ -4570,13 +4579,18 @@ def _reclaim_parked_units(task: dict, aid: str, errors: list) -> list[str]:
     return _batch_or_individual_transitions(specs, errors=errors, tag=f"reclaim units of {task['id']}")
 
 
-def _rerun_negotiation(state: dict, ctx: Ctx, task: dict) -> None:
+def _rerun_negotiation(
+    state: dict,
+    ctx: Ctx,
+    task: dict,
+    reason: str = "the callee's own proof merges first: the negotiation runs again on its contract",
+) -> None:
     """
     The callee's own proof merges first, and this result was proved from the tree without it: its splice would be
     refused as diverged. The round is run again on the merged contract, and does not count against the round cap.
     """
     task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
-    _reopen(state, task, "the callee's own proof merges first: the negotiation runs again on its contract")
+    _reopen(state, task, reason)
     task["deps"] = _negotiate_deps(state, ctx, task)
 
 
@@ -4713,6 +4727,152 @@ def cmd_requeue_memory_refused() -> dict:
     out["obstructions_forgotten"] = (
         _try(out["errors"], "forget refused obstructions", spec_kb.forget_memory_refusals, Path.cwd()) or 0
     )
+    out["ok"] = not out["errors"]
+    return out
+
+
+def _splice_refusal(task: dict, aid: str) -> str | None:
+    """Why the merge would refuse this agent's result on the current tree, or None: the splice itself, run dry."""
+    scratch = Path("agents") / aid / "scratch"
+    try:
+        result = json.loads((scratch / "result.json").read_text(encoding="utf-8"))
+        if result.get("status") != "all_proven":
+            return f"agents/{aid}/scratch/result.json has status {result.get('status')!r}: there is no proof to merge"
+        for rel in workspace_overlay._collect_changed_files(scratch / "base", scratch / "work"):
+            acsl_ast.splice_prover_changes(
+                (scratch / "base" / rel).read_text(encoding="utf-8"),
+                (scratch / "work" / rel).read_text(encoding="utf-8"),
+                (Path("workspace/work") / rel).read_text(encoding="utf-8"),
+                task["function"],
+                is_header=rel.endswith(".h"),
+                path=rel,
+            )
+    except (acsl_ast.AcslError, ArtifactError, OSError, ValueError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def cmd_requeue_locate_failed() -> dict:
+    """
+    Repair what the locator's blindness to conditionals did: results whose merge ended in "could not locate
+    definition" go back to the merge queue with their units and strengthening requests. A result the tree has moved
+    past is proved again instead. Idempotent. Tasks ended for any other reason are not touched, and nothing is
+    restored while this checkout's locator still fails on the function.
+    """
+    out: dict[str, Any] = {
+        "ok": True,
+        "restored": [],
+        "pending_restored": [],
+        "reopened": [],
+        "negotiations_restored": [],
+        "negotiations_rerun": [],
+        "requests_restored": [],
+        "left": [],
+        "requests_left": [],
+        "blocked_callers_to_review": [],
+        "errors": [],
+    }
+    with run_lock("ledger"):
+        state = load_schedule()
+        tasks = state["tasks"]
+        ctx = Ctx()
+        store = {str(r.get("id")): r for r in _requests()}
+        failed = [t for _, t in sorted(tasks.items()) if LOCATE_FAILURE in str(t.get("last_reason") or "")]
+        why: str | None
+
+        def refusal_of(task: dict, aid: str) -> tuple[str | None, bool]:
+            """(why the result cannot merge, whether this checkout still has the locator bug)."""
+            why = DEPS.splice_refusal(task, aid)
+            return why, why is not None and LOCATE_FAILURE in why
+
+        for task in failed:
+            if task["kind"] != "prove":
+                continue
+            ended = (task["state"], task.get("outcome")) == ("blocked", "merge_failed")
+            if task["state"] in LIVE:
+                why = f"{task['state']} as {task.get('agent_id')}: the run has given it to a new agent since"
+                out["left"].append({"task": task["id"], "reason": why})
+            if not ended and task["state"] != "pending":
+                continue
+            aid = (task.get("merge") or {}).get("agent_id") if ended else (task.get("agents") or [None])[-1]
+            negotiation = tasks.get(f"negotiate:{_key(task)}") or {}
+            if not aid or negotiation.get("outcome") == "applied":
+                why = f"{negotiation.get('id')} has merged a proved contract" if aid else "no agent result on record"
+                out["left"].append({"task": task["id"], "reason": why})
+                continue
+            why, unfixed = refusal_of(task, str(aid))
+            if unfixed or (why and not ended):
+                out["left"].append({"task": task["id"], "agent_id": aid, "reason": why})
+                continue
+            task["merge_attempts"] = 0
+            if why:  # blocked, and its result cannot merge any more: a new prover, from the units it had
+                units = _reclaim_parked_units(task, str(aid), out["errors"], LOCATE_FAILURE, only_reason=False)
+                released = _release_units(task)
+                task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+                _reopen(state, task, f"the merge never saw this function, and the result cannot merge now: {why}")
+                out["reopened"].append({"task": task["id"], "agent_id": aid, "reason": why, "units": units or released})
+                continue
+            if not ended:  # `_reopen` dropped the queue entry: rebuild what `_complete_prover` left
+                now = {"queued_at": utc_now(), "queued_ts": DEPS.now(), "analysis_retries": 0}
+                task.update(agent_id=aid, merge={"agent_id": aid, **now})
+                task["reopened"] = max(0, int(task.get("reopened") or 0) - 1)
+            reclaimed = _reclaim_parked_units(task, str(aid), out["errors"], LOCATE_FAILURE, only_reason=False)
+            _requeue_refused_merge(state, task, str(aid), LOCATE_FAILURE)
+            entry = {"task": task["id"], "agent_id": aid, "units": reclaimed}
+            out["restored" if ended else "pending_restored"].append(entry)
+
+        for task in failed:
+            if task["kind"] != "negotiate" or (task["state"], task.get("outcome")) != ("done", "rejected"):
+                continue
+            aid = (task.get("merge") or {}).get("agent_id")
+            why, unfixed = refusal_of(task, str(aid)) if aid else ("no agent result on record", False)
+            if unfixed:
+                out["left"].append({"task": task["id"], "agent_id": aid, "reason": why})
+                continue
+            reopened = [
+                rid
+                for rid in map(str, task.get("requests") or [])
+                if (store.get(rid) or {}).get("status") == "rejected_by_callee"
+                and LOCATE_FAILURE in str((store.get(rid) or {}).get("resolution_note"))
+            ]
+            for rid in reopened:
+                _try(out["errors"], f"reopen {rid}", DEPS.resolve_request, REQUESTS, rid, "pending", "")
+            out["requests_restored"].extend(reopened)
+            task["merge_attempts"] = 0
+            entry = {"task": task["id"], "agent_id": aid, "requests": reopened}
+            callee = tasks.get(f"prove:{_key(task)}")
+            if callee is not None and callee["state"] in ("merge_queued", "merging"):
+                why = "the callee's own proof merges first"
+            if why:
+                _rerun_negotiation(state, ctx, task, f"the negotiation runs again: {why}")
+                entry["reason"] = why
+                out["negotiations_rerun"].append(entry)
+            else:
+                _requeue_refused_merge(state, task, str(aid), LOCATE_FAILURE)
+                out["negotiations_restored"].append(entry)
+            entry["callers"] = _hold_callers(state, task)
+
+        for rid, req in sorted(store.items()):
+            if (
+                rid not in out["requests_restored"]
+                and req.get("status") == "rejected_by_callee"
+                and LOCATE_FAILURE in str(req.get("resolution_note"))
+            ):
+                reason = "its negotiate task moved on or holds no result to merge: the caller has to ask again"
+                out["requests_left"].append({"request": rid, "reason": reason})
+
+        restored_keys = {_key(tasks[r["task"]]) for r in out["restored"] + out["pending_restored"] + out["reopened"]}
+        held = {c for n in out["negotiations_restored"] + out["negotiations_rerun"] for c in n.get("callers") or {}}
+        out["blocked_callers_to_review"] = [
+            {"task": tid, "callees": sorted(restored_keys & set(t.get("callees") or []))}
+            for tid, t in sorted(tasks.items())
+            if t["kind"] == "prove"
+            and t["state"] == "blocked"
+            and tid not in held
+            and restored_keys & set(t.get("callees") or [])
+        ]
+        out["sync"] = _sync(state, Ctx())
+        save_schedule(state)
     out["ok"] = not out["errors"]
     return out
 
@@ -5175,6 +5335,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Restore merges and negotiations ended by a parent WP re-check that was refused for memory",
     )
+    group.add_argument(
+        "--locate-failed",
+        action="store_true",
+        help="Restore merges and negotiations ended by 'could not locate definition of function'",
+    )
     sub.add_parser("status", help="Counts, ready/running tasks, gates and the remaining critical path")
     args = parser.parse_args(argv)
 
@@ -5216,9 +5381,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "refresh":
             out = cmd_refresh(args.module)
         elif args.cmd == "requeue":
-            out = (
-                cmd_requeue_memory_refused() if args.memory_refused else cmd_requeue(args.agent_id, args.stale_minutes)
-            )
+            if args.locate_failed:
+                out = cmd_requeue_locate_failed()
+            elif args.memory_refused:
+                out = cmd_requeue_memory_refused()
+            else:
+                out = cmd_requeue(args.agent_id, args.stale_minutes)
         else:
             out = cmd_status()
     except (SchedulerError, ledger.LedgerError, ArtifactError, RunLockTimeout) as exc:
