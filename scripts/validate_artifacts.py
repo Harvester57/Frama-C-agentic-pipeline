@@ -691,8 +691,22 @@ PHASE0_ARTIFACTS: tuple[tuple[str, Any], ...] = (
 )
 
 
-MODEL_REL = f"{REPORTS}/phase0_model.json"
-DAG_REL = f"{REPORTS}/callgraph_dag.json"
+MODEL_ARTIFACT = f"{REPORTS}/phase0_model.json"
+DAG_ARTIFACT = f"{REPORTS}/callgraph_dag.json"
+
+
+def _same_codeql_facts(a: Any, b: Any) -> bool:
+    """
+    Whether two `trust.codeql` blocks stand for the same CodeQL marks. Only an `ok` block has marks, so
+    `off`, `not_run` and a failed run are the same; two `ok` blocks are compared on the facts file's
+    sha256, or on their counts when either predates the digest.
+    """
+    a, b = (x if isinstance(x, dict) else {} for x in (a, b))
+    if a.get("status") != "ok" or b.get("status") != "ok":
+        return (a.get("status") == "ok") == (b.get("status") == "ok")
+    if a.get("sha256") and b.get("sha256"):
+        return bool(a["sha256"] == b["sha256"])
+    return (a.get("facts"), a.get("unmatched")) == (b.get("facts"), b.get("unmatched"))
 
 
 def validate_codeql_trust(run_dir: Path, model: Any, dag: Any = None) -> Errors:
@@ -703,7 +717,8 @@ def validate_codeql_trust(run_dir: Path, model: Any, dag: Any = None) -> Errors:
       `trust.codeql` must be `ok` and come from that file (trust.codeql_merge_problem). Not enabled, no
       facts file, or one whose status is not `ok`: nothing to merge, no error;
     - the DAG copies the model's trust (the tiers, the harness reachability and the contract
-      trust-boundary check read the copy): its `trust.codeql` must be the model's.
+      trust-boundary check read the copy): its `trust.codeql` must stand for the same facts as the
+      model's (_same_codeql_facts).
     """
     errors = Errors()
     if not isinstance(model, dict) or model.get("status") != "ok":
@@ -717,18 +732,22 @@ def validate_codeql_trust(run_dir: Path, model: Any, dag: Any = None) -> Errors:
     if isinstance(metadata, dict) and trust.codeql_enabled(metadata):
         try:
             problem = trust.codeql_merge_problem(model, metadata, run_dir / trust.DEFAULT_CODEQL)
-        except (ArtifactError, OSError, ValueError) as exc:
+        except (ArtifactError, OSError, ValueError, LookupError, AttributeError, TypeError) as exc:
             problem = f"CodeQL is enabled for the run and its facts cannot be read: {exc}"
         if problem:
-            errors.add(f"{MODEL_REL}: {problem}")
+            errors.add(f"{MODEL_ARTIFACT}: {problem}")
     block = model.get("trust")
     dag_block = dag.get("trust") if isinstance(dag, dict) else None
-    if isinstance(block, dict) and isinstance(dag_block, dict) and dag_block.get("codeql") != block.get("codeql"):
+    if (
+        isinstance(block, dict)
+        and isinstance(dag_block, dict)
+        and not _same_codeql_facts(dag_block.get("codeql"), block.get("codeql"))
+    ):
         errors.add(
-            f"{DAG_REL}: its trust marks were copied from a model whose trust.codeql was "
+            f"{DAG_ARTIFACT}: its trust marks were copied from a model whose trust.codeql was "
             f"{json.dumps(dag_block.get('codeql'), sort_keys=True)}, the model now records "
             f"{json.dumps(block.get('codeql'), sort_keys=True)}: rebuild the DAG (build_callgraph_dag.py), "
-            "then run the reach gate and the ledger seed again"
+            "then run the reach gate again (a rebuilt DAG fails it until then)"
         )
     return errors
 
@@ -749,10 +768,12 @@ def validate_phase0_artifacts(run_dir: Path) -> Errors:
         except ArtifactError as exc:
             errors.add(f"{rel}: {exc}")
             continue
-        loaded[rel] = data
-        for e in fn(data):
+        own = fn(data)
+        for e in own:
             errors.add(f"{rel}: {e}")
-    for e in validate_codeql_trust(run_dir, loaded.get(MODEL_REL), loaded.get(DAG_REL)):
+        if not own:
+            loaded[rel] = data  # the cross-file checks read only artifacts of the right shape
+    for e in validate_codeql_trust(run_dir, loaded.get(MODEL_ARTIFACT), loaded.get(DAG_ARTIFACT)):
         errors.add(e)
     harness_dir = run_dir / HARNESS_DIR
     for path in sorted(harness_dir.glob("harness_*.json")) if harness_dir.is_dir() else []:

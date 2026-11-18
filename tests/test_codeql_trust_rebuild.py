@@ -105,6 +105,11 @@ def _with_codeql(model: dict) -> set[str]:
     return {fid for fid, rec in model["functions"].items() if "codeql" in rec["trust"]["sources"]}
 
 
+def _dag_of(tree: Path, model: dict) -> dict:
+    """A DAG carrying `model`'s trust block: build_callgraph_dag.py copies the block of the model it reads."""
+    return bcd.build_dag(tree, {**_view_model(), "trust": copy.deepcopy(model["trust"])})
+
+
 def _cli_run_dir(run: Path, capsys) -> tuple[int, list[str]]:
     capsys.readouterr()
     rc = V.main(["run-dir", str(run)])
@@ -217,21 +222,47 @@ def test_a_failed_codeql_run_gives_no_fact_and_validates(run1, capsys):
     assert V.validate_phase0_artifacts(run1) == []
 
 
-@pytest.mark.parametrize("broken", ["run-metadata.json", str(FACTS_FILE)])
-def test_unreadable_codeql_inputs_cost_the_facts_not_the_annotation(run1, capsys, broken):
-    (run1 / broken).write_text("{not json", encoding="utf-8")
+@pytest.mark.parametrize(
+    ("broken", "text", "error_start"),
+    [
+        ("run-metadata.json", "{not json", None),
+        (str(FACTS_FILE), "{not json", "CodeQL is enabled for the run and its facts cannot be read"),
+        # Readable, `ok`, and its facts are not fact objects: `trust.py run` stops on it.
+        (
+            str(FACTS_FILE),
+            '{"status": "ok", "facts": ["src/modbus.c#modbus_reply"]}',
+            "CodeQL is enabled for the run and ",
+        ),
+    ],
+)
+def test_unusable_codeql_inputs_cost_the_facts_not_the_annotation(run1, capsys, broken, text, error_start):
+    (run1 / broken).write_text(text, encoding="utf-8")
     model, _ = _model_step(capsys)
     assert all(rec["trust"]["value"] == "untrusted" for rec in model["functions"].values())
     assert model["trust"]["codeql"]["status"] == "off" and not _with_codeql(model)
     (warning,) = model["warnings"]
     assert warning.startswith("trust: annotated without the CodeQL facts (") and "trust.py run" in warning
     errors = V.validate_phase0_artifacts(run1)
-    if broken == "run-metadata.json":
+    if error_start is None:
         assert errors == []  # the run-dir check reports the metadata itself
         assert any(e.startswith("run-metadata.json: ") for e in V.validate_run_dir(run1))
     else:
-        (error,) = errors
-        assert error.startswith(f"{MODEL_FILE.as_posix()}: CodeQL is enabled for the run and its facts cannot be read")
+        (error,) = errors  # the facts are there to see, and not merged: never silent
+        assert error.startswith(f"{MODEL_FILE.as_posix()}: {error_start}")
+
+
+@pytest.mark.parametrize("facts_status", ["not_run", "database_failed"])
+def test_a_dag_built_without_facts_stays_valid_while_there_is_none_to_merge(run1, capsys, target, facts_status):  # noqa: F811
+    _write(run1 / DAG_FILE, _dag_of(target, _recorded("phase0_model.json")))  # its trust.codeql: off
+    if facts_status == "not_run":
+        (run1 / FACTS_FILE).unlink()
+    else:
+        _write(run1 / FACTS_FILE, {**_recorded("codeql_trust.json"), "status": facts_status, "facts": []})
+    model, _ = _model_step(capsys)
+    # The model's block is relabelled, no mark changes: the DAG's copy still stands.
+    assert model["trust"]["codeql"]["status"] == facts_status and not _with_codeql(model)
+    assert V.validate_phase0_artifacts(run1) == []
+    assert _cli_run_dir(run1, capsys) == (0, [])
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -285,16 +316,20 @@ def test_run_dir_fails_when_the_merged_facts_are_not_the_files(run1, capsys):
 
 
 def test_run_dir_fails_on_a_dag_built_before_the_facts_were_merged(run1, capsys, target):  # noqa: F811
-    def dag_of(model: dict) -> dict:
-        # build_callgraph_dag.py copies the model's trust block into the DAG.
-        return bcd.build_dag(target, {**_view_model(), "trust": copy.deepcopy(model["trust"])})
-
     lost = _recorded("phase0_model.json")
-    _write(run1 / DAG_FILE, dag_of(lost))  # the DAG run-1 rebuilt at 02:41: CodeQL off
+    _write(run1 / DAG_FILE, _dag_of(target, lost))  # the DAG run-1 rebuilt at 02:41: CodeQL off
     merged, _ = _model_step(capsys)
     (error,) = V.validate_phase0_artifacts(run1)
     assert error.startswith(f"{DAG_FILE.as_posix()}: its trust marks were copied from a model whose trust.codeql was ")
     assert '{"status": "off"}' in error and "rebuild the DAG (build_callgraph_dag.py)" in error
-    _write(run1 / DAG_FILE, dag_of(merged))
+    _write(run1 / DAG_FILE, _dag_of(target, merged))
     assert V.validate_phase0_artifacts(run1) == []
     assert _cli_run_dir(run1, capsys) == (0, [])
+    # A DAG built from a merge made before the digest was recorded holds the same facts.
+    older = copy.deepcopy(merged)
+    older["trust"]["codeql"].pop("sha256")
+    _write(run1 / DAG_FILE, _dag_of(target, older))
+    assert V.validate_phase0_artifacts(run1) == []
+    older["trust"]["codeql"]["facts"] = 12
+    _write(run1 / DAG_FILE, _dag_of(target, older))
+    assert len(V.validate_phase0_artifacts(run1)) == 1

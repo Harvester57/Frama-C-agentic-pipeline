@@ -1212,7 +1212,8 @@ def annotate_trust(
     `trust.py run` merges them (trust.load_codeql: the run's metadata must enable CodeQL; a missing
     facts file is `not_run`, one whose status is not `ok` gives no fact). A model rebuilt after the
     CodeQL run therefore keeps its facts (libmodbus run-1 lost them: this annotation left CodeQL out).
-    Metadata or facts that cannot be read cost the facts, not the annotation: a warning names them.
+    Metadata or facts that cannot be used (where `trust.py run` stops) cost the facts, not the
+    annotation: the model is annotated without CodeQL and a warning says why.
     """
     try:
         import trust
@@ -1220,11 +1221,15 @@ def annotate_trust(
         meta, problem = None, None
         try:
             meta = load_json_optional(metadata or trust.DEFAULT_METADATA, None)
-            if isinstance(meta, dict):
-                trust.load_codeql(meta, codeql)
-        except Exception as exc:  # noqa: BLE001 - the trust annotation stands without the CodeQL facts
-            meta, problem = None, f"{type(exc).__name__}: {exc}"
-        trust.annotate_model(model, threat_model, codeql, meta if isinstance(meta, dict) else None)
+        except Exception as exc:  # noqa: BLE001 - annotated without CodeQL below
+            problem = f"{type(exc).__name__}: {exc}"
+        if isinstance(meta, dict) and trust.codeql_enabled(meta):
+            try:
+                trust.annotate_model(model, threat_model, codeql, meta)
+                return
+            except Exception as exc:  # noqa: BLE001 - annotated without CodeQL below, where any other cause shows again
+                problem = f"{type(exc).__name__}: {exc}"
+        trust.annotate_model(model, threat_model, codeql)
         if problem:
             model["warnings"].append(
                 f"trust: annotated without the CodeQL facts ({problem}): fix the file, then run trust.py run"
