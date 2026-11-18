@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ import fuzz_build
 import promote_artifact as P
 import run_eacsl_fuzz as R
 import sandbox_exec
+import workspace_overlay
 from sandbox_exec import SandboxResult
 from test_guardrail_p1 import EACSL_RTE_ELSEWHERE
 
@@ -217,6 +219,50 @@ def test_a_hang_in_the_checked_function_is_named(run, monkeypatch):
     verdict = run()
     assert verdict["status"] == "passed_dynamic_oracle"
     assert verdict["excluded_inputs"][0]["in_checked_function"] is True
+    hint = next(h for h in verdict["diagnostic_hints"] if "hung" in h)
+    assert "says nothing about this contract" not in hint and "inside a checked function" in hint
+
+
+def test_a_hang_elsewhere_says_it_tells_nothing_about_the_contract(run, monkeypatch):
+    FakeFuzzer(monkeypatch, {HANG_A})
+    hint = next(h for h in run()["diagnostic_hints"] if "hung" in h)
+    assert "says nothing about this contract" in hint
+
+
+def test_the_parent_guardrail_at_merge_time_drops_a_hang(run, tmp_path, monkeypatch):
+    """`_run_parent_reverify` runs the same `guardrail` command, on a binary under `state/parent_guard/`."""
+    FakeFuzzer(monkeypatch, {HANG_A, HANG_B})
+    overlay = tmp_path / "workspace"
+    (overlay / "harnesses").mkdir(parents=True)
+    (overlay / "work").mkdir()
+    commands: list[list[str]] = []
+
+    def guardrail_command(cmd, **kw):
+        commands.append(list(cmd))
+        binary = Path(cmd[cmd.index("--out-bin") + 1])
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"bin")
+        verdict = R.run_guardrail_check(
+            binary, run.corpus, Path(cmd[cmd.index("--scratch-dir") + 1]), 50, module="m", seed=1
+        )
+        out = Path(cmd[cmd.index("--out-json") + 1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(verdict), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(workspace_overlay.subprocess, "run", guardrail_command)
+    ok, why = workspace_overlay._run_parent_reverify(
+        tmp_path, "prove-a", "architect", overlay, None, None, "m", ["workspace/work/m.c"], "-I."
+    )
+    assert ok, why
+    cmd = commands[0]
+    assert Path(cmd[1]).name == "run_eacsl_fuzz.py" and cmd[2] == "guardrail"
+    assert "parent_guard" in Path(cmd[cmd.index("--out-bin") + 1]).parts
+    report = json.loads(
+        workspace_overlay._parent_guard_json(tmp_path, "prove-a", None, "m").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "passed_dynamic_oracle"
+    assert sorted(e["input"] for e in report["excluded_inputs"]) == ["seed-hang-a", "seed-hang-b"]
 
 
 def test_a_real_failure_behind_a_hanging_seed_is_still_reported(run, monkeypatch):

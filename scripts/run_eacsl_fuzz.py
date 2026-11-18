@@ -1156,11 +1156,17 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "It is not evidence that the contract holds on real inputs; the merged proof records it as an "
                 "open assumption."
             )
-        hung = [str(e.get("input")) for e in res.get("excluded_inputs") or [] if e.get("kind") == "timeout"]
+        hangs = [e for e in res.get("excluded_inputs") or [] if e.get("kind") == "timeout"]
+        hung = [str(e.get("input")) for e in hangs]
         if hung:
+            meaning = (
+                "At least one hang was inside a checked function, so the contract was not tested on that input"
+                if any(e.get("in_checked_function") for e in hangs)
+                else "A hang outside the checked functions says nothing about this contract"
+            )
             passed_hints.append(
                 f"{len(hung)} replayed input(s) hung until libFuzzer's per-input timeout and were dropped "
-                f"({', '.join(hung)}). A hang says nothing about this contract; the verdict comes from the "
+                f"({', '.join(hung)}). {meaning}; the verdict comes from the "
                 f"{res.get('corpus_replayed')} input(s) that ran to the end."
             )
         dropped = [e for e in res.get("excluded_inputs") or [] if e.get("failure")]

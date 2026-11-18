@@ -250,3 +250,239 @@ def test_blocked_callers_of_a_reopened_prover_are_listed(sim):
     out = S.cmd_requeue_guardrail_hung()
     assert [r["task"] for r in out["reopened"]] == ["prove:src/m/g.c#g"]
     assert [e["task"] for e in out["blocked_callers_to_review"]] == ["prove:src/m/f.c#f"]
+
+
+def test_a_prover_that_ended_blocked_on_a_hang_is_reopened(sim):
+    """Five of the provers of libmodbus run-1 returned `blocked`, not `stalled_after_k_retries`."""
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c", status="blocked")
+    hung_guard(sim, "prove-a", "a")
+    S.cmd_complete("prove-a")
+    tid = "prove:src/m/a.c#a"
+    assert (tasks()[tid]["state"], tasks()[tid]["outcome"]) == ("blocked", "blocked")
+    assert [r["task"] for r in S.cmd_requeue_guardrail_hung()["reopened"]] == [tid]
+    assert tasks()[tid]["state"] == "pending"
+
+
+def test_any_other_ending_on_a_hang_is_listed_and_not_reopened(sim):
+    tid = stalled_on_a_hang(sim)
+    state = S.load_schedule()
+    state["tasks"][tid]["outcome"] = "merge_failed"
+    S.save_schedule(state)
+    out = S.cmd_requeue_guardrail_hung()
+    assert out["reopened"] == [] and [e["task"] for e in out["left"]] == [tid]
+    assert "merge_failed" in out["left"][0]["reason"] and tasks()[tid]["state"] == "blocked"
+
+
+def test_the_step_the_session_calls_for_a_reopened_agent_is_harmless(sim):
+    tid = running_with_a_finished_hung_result(sim)
+    S.cmd_requeue_guardrail_hung()
+    out = S.cmd_step(complete_ids=["prove-a"], slots=1, prepare=True)
+    assert out["ok"] is True and out["errors"] == []
+    assert out["completed"][0]["action"] == "stale_agent"
+    assert tasks()[tid]["state"] == "running" and tasks()[tid]["agent_id"] != "prove-a"
+
+
+@pytest.mark.parametrize(("artifact", "promoted_as_seed"), [("timeout-0123", False), ("crash-0123", True)])
+def test_a_breaker_timeout_artifact_is_not_promoted_as_a_seed(sim, monkeypatch, artifact, promoted_as_seed):
+    seeds: list = []
+    monkeypatch.setattr(S, "promote_file", lambda *a, **kw: seeds.append(a[2]) if kw.get("kind") == "seed" else None)
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c", status="stalled_after_k_retries")
+    S.cmd_complete("prove-a")
+    S.cmd_next("auto", prepare=True)
+    sim.breaker("breaker-a", "a", "src/m/a.c", crash=True)
+    result = load("agents/breaker-a/scratch/result.json")
+    result.update(crash_artifact=f"agents/breaker-a/scratch/{artifact}", seeds=[])
+    write_json(sim.run_dir / "agents/breaker-a/scratch/result.json", result)
+    (sim.run_dir / f"agents/breaker-a/scratch/{artifact}").write_bytes(b"input")
+    S.cmd_complete("breaker-a")
+    assert seeds == ([f"agents/breaker-a/scratch/{artifact}"] if promoted_as_seed else [])
+
+
+# ---------------------------------------------------------------------------
+# A proved result the parent guardrail hung on at merge time
+# ---------------------------------------------------------------------------
+
+PARENT_HUNG = "parent guardrail returned status='guardrail_error'"
+
+
+def hung_parent_guard(sim, aid, name, **changes):
+    report = {
+        "status": "guardrail_error",
+        "returncode": 70,
+        "crash_input": f"agents/{aid}/scratch/parent_guard/timeout-fff6050c11a5852f44e8a5c3af1d2ae1ee74ec4e",
+        **changes,
+    }
+    write_json(sim.run_dir / f"agents/{aid}/scratch/parent_guard_{name}.json", report)
+
+
+def fail_the_merge(sim, aid, reason=PARENT_HUNG):
+    sim.merge_fail[aid] = reason
+    S.cmd_merge_pending(force=True)
+    del sim.merge_fail[aid]
+
+
+@pytest.fixture
+def splice(monkeypatch):
+    """What the dry splice answers, per agent: the result merges unless a refusal is set."""
+    refusals: dict[str, str] = {}
+    monkeypatch.setattr(S.DEPS, "splice_refusal", lambda task, aid: refusals.get(aid))
+    return refusals
+
+
+def merge_hung(sim, name="a"):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    assert S.cmd_complete("prove-a")["action"] == "queued_for_merge"
+    fail_the_merge(sim, "prove-a")
+    hung_parent_guard(sim, "prove-a", name)
+    tid = "prove:src/m/a.c#a"
+    assert (tasks()[tid]["state"], tasks()[tid]["merge_attempts"]) == ("pending", 1)
+    assert units()["src/m/a.c#a::rte"]["status"] == "planned"
+    return tid
+
+
+def negotiation_merge_hung(sim):
+    """The negotiator of g proved the clause f asked for; the parent guardrail hung on its merge."""
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-f", "f", "src/m/f.c", status="stalled_after_k_retries", requests=[request("g", 1)])
+    S.cmd_complete("prove-f")
+    S.cmd_next("auto", prepare=True)
+    sim.prover("negotiate-g", "g", "src/m/g.c")
+    assert S.cmd_complete("negotiate-g")["action"] == "queued_for_merge"
+    fail_the_merge(sim, "negotiate-g")
+    hung_parent_guard(sim, "negotiate-g", "g")
+    assert tasks()["negotiate:src/m/g.c#g"]["state"] == "pending"
+    return "negotiate:src/m/g.c#g"
+
+
+def test_a_proved_result_goes_back_to_the_merge_queue_without_a_new_agent(sim, splice):
+    tid = merge_hung(sim)
+    before = tasks()[tid]
+    out = S.cmd_requeue_guardrail_hung()
+    assert out["ok"] is True and out["reopened"] == []
+    assert out["merge_restored"] == [
+        {
+            "task": tid,
+            "agent_id": "prove-a",
+            "crash_input": out["merge_restored"][0]["crash_input"],
+            "units": ["src/m/a.c#a::rte"],
+        }
+    ]
+    task = tasks()[tid]
+    assert (task["state"], task["agent_id"], task["merge"]["agent_id"]) == ("merge_queued", "prove-a", "prove-a")
+    assert (task["dispatches"], task["merge_attempts"]) == (before["dispatches"], 0)
+    assert task["reopened"] == before["reopened"] - 1 and task["last_reason"] is None
+    assert units()["src/m/a.c#a::rte"]["status"] == "in_progress"
+
+
+def test_the_restored_result_merges_and_no_prover_runs_again(sim, splice):
+    tid = merge_hung(sim)
+    S.cmd_requeue_guardrail_hung()
+    prepared = len(sim.prepared)
+    merged = S.cmd_merge_pending(force=True)
+    assert [m["agent_id"] for m in merged["merged"]] == ["prove-a"]
+    assert (tasks()[tid]["state"], tasks()[tid]["outcome"]) == ("done", "merged")
+    assert len(sim.prepared) == prepared
+
+
+def test_restoring_a_merge_is_idempotent(sim, splice):
+    merge_hung(sim)
+    S.cmd_requeue_guardrail_hung()
+    before = tasks()
+    again = S.cmd_requeue_guardrail_hung()
+    assert again["merge_restored"] == [] and again["reopened"] == [] and tasks() == before
+
+
+def test_a_result_that_no_longer_splices_gets_a_fresh_agent(sim, splice):
+    tid = merge_hung(sim)
+    splice["prove-a"] = "AcslError: the function diverged from the agent's base"
+    out = S.cmd_requeue_guardrail_hung()
+    assert out["merge_restored"] == [] and [r["task"] for r in out["reopened"]] == [tid]
+    assert "diverged" in out["reopened"][0]["reason"]
+    task = tasks()[tid]
+    assert (task["state"], task["agent_id"], task["dispatches"], task["merge_attempts"]) == ("pending", None, 0, 0)
+    assert units()["src/m/a.c#a::rte"]["status"] == "planned"
+    before = tasks()
+    assert S.cmd_requeue_guardrail_hung()["reopened"] == [] and tasks() == before
+    handed = {t["task"]: t["agent_id"] for t in S.cmd_next("auto", prepare=True)["tasks"]}
+    assert handed[tid] != "prove-a"
+
+
+def test_the_module_wide_parent_guardrail_counts_too(sim, splice):
+    tid = merge_hung(sim, name="m")
+    assert [r["task"] for r in S.cmd_requeue_guardrail_hung()["merge_restored"]] == [tid]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "code_fault"},
+        {"returncode": 77},
+        {"crash_input": "agents/prove-a/scratch/parent_guard/crash-0123"},
+    ],
+)
+def test_a_parent_guardrail_that_gave_a_verdict_is_not_undone(sim, splice, changes):
+    tid = merge_hung(sim)
+    hung_parent_guard(sim, "prove-a", "a", **changes)
+    before = tasks()
+    out = S.cmd_requeue_guardrail_hung()
+    assert out["merge_restored"] == [] and out["reopened"] == [] and tasks() == before
+    assert tasks()[tid]["state"] == "pending"
+
+
+def test_a_task_a_new_agent_has_taken_is_listed_and_untouched(sim, splice):
+    tid = merge_hung(sim)
+    S.cmd_next("auto", prepare=True)
+    assert tasks()[tid]["state"] == "running"
+    before = tasks()
+    out = S.cmd_requeue_guardrail_hung()
+    assert out["merge_restored"] == [] and [e["task"] for e in out["left"]] == [tid]
+    assert tasks() == before
+
+
+def test_a_merge_that_ended_for_good_is_listed_and_untouched(sim, splice):
+    tid = merge_hung(sim)
+    state = S.load_schedule()
+    state["tasks"][tid].update(state="blocked", outcome="merge_failed")
+    S.save_schedule(state)
+    out = S.cmd_requeue_guardrail_hung()
+    assert out["merge_restored"] == [] and [e["task"] for e in out["left"]] == [tid]
+    assert tasks()[tid]["state"] == "blocked"
+
+
+def test_a_negotiation_goes_back_to_the_queue_with_its_request_open(sim, splice):
+    tid = negotiation_merge_hung(sim)
+    rid = request_store()[0]["id"]
+    status = request_store()[0]["status"]
+    counts = load("state/wp_schedule.json")["negotiation_counts"]
+    out = S.cmd_requeue_guardrail_hung()
+    assert [r["task"] for r in out["merge_restored"]] == [tid] and out["merge_restored"][0]["requests"] == [rid]
+    assert tasks()[tid]["state"] == "merge_queued" and request_store()[0]["status"] == status
+    assert load("state/wp_schedule.json")["negotiation_counts"] == counts
+    S.cmd_merge_pending(force=True)
+    assert (tasks()[tid]["state"], tasks()[tid]["outcome"]) == ("done", "applied")
+    assert request_store()[0]["status"] == "verified_and_applied"
+
+
+def test_a_negotiation_behind_the_callees_own_proof_runs_again(sim, splice):
+    tid = negotiation_merge_hung(sim)
+    state = S.load_schedule()
+    state["tasks"]["prove:src/m/g.c#g"].update(state="merge_queued", merge={"agent_id": "prove-g"})
+    S.save_schedule(state)
+    rounds = tasks()[tid]["dispatches"]
+    out = S.cmd_requeue_guardrail_hung()
+    assert out["merge_restored"] == [] and [r["task"] for r in out["reopened"]] == [tid]
+    assert "merges first" in out["reopened"][0]["reason"]
+    assert (tasks()[tid]["state"], tasks()[tid]["dispatches"]) == ("pending", rounds - 1)
