@@ -36,7 +36,7 @@ the whole library. See the `TIOCM_RTS` entry of
 |---|---|
 | `35.0~~dev (Bromine)`, `master` at `95408044f7` (image `framac-master-audit:9540804`) | **all six cases fail** (`Cannot resolve variable TIOCM_*`) |
 | `34.0~beta (Selenium)` (image `framac-analysis:latest`) | **all six fail**, identical output |
-| `master` with the fourteen bits defined before the parse (the pipeline's workaround header, force-included) | `RESULT: fixed` |
+| `master`, the reproducer with `-include` of the pipeline's workaround header (which defines the fourteen bits) added to its `-cpp-extra-args` | `RESULT: fixed` |
 
 ## Reproduction
 
@@ -83,7 +83,8 @@ reproducer's `CHECK_rts` file.
 ## Related, not requested
 
 - **termios2 requests** (`TCGETS2`, `TCSETS2`, `TCSETSW2`, `TCSETSF2`, from Linux
-  `<asm-generic/ioctls.h>`): the same header stops at `TCGETS`/`TCSETS`. libmodbus built with
+  `<asm-generic/ioctls.h>`): the same header stops at `TCGETS`/`TCSETS` (checked on both
+  versions). libmodbus built with
   `HAVE_STRUCT_TERMIOS2` stops next at `Cannot resolve variable TCGETS2`. They encode
   `sizeof(struct termios2)`, a Linux UAPI type from `<asm/termbits.h>` that Frama-C's libc does not
   have, so they are left out: #2828 already asks which Linux headers are wanted.
