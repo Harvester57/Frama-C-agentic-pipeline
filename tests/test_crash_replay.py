@@ -186,6 +186,9 @@ def test_replay_runs_an_observation_reproducer_on_its_engine(tmp_path, monkeypat
     assert {a["fingerprint"] for a in report["artifacts"]} == {XB_FP_EAC}
     # An observation's fingerprint is this candidate's failure too.
     assert report["fingerprint_matches"] is True
+    # Beside it, the per-input comparison by the ledger's rule (tests/test_replay_identity_field.py); these
+    # fake artifacts name no input.
+    assert report["identity"]["rule"] == crash_replay.IDENTITY_RULE and report["identity"]["inputs"] == []
 
 
 def test_minimize_interest_accepts_any_of_the_given_fingerprints(tmp_path, monkeypatch):
