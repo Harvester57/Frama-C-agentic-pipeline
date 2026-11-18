@@ -11,8 +11,15 @@ data, decided by a stated rule, the target's threat model and, optionally, CodeQ
 model; run it again after a CodeQL run, then rebuild the DAG). It takes the threat model the model
 recorded (path and sha256) and stops when that file changed, went missing or appeared since: re-run
 the model, or give `--threat-model PATH` to annotate it with that file, which the model then records.
-It validates the model it rewrites; schema problems become the model's `schema:` warning. The rules,
-in this order:
+It validates the model it rewrites; schema problems become the model's `schema:` warning.
+
+Both annotations read the CodeQL facts the same way (`load_codeql`), so a model rebuilt after a CodeQL
+run keeps its facts: the run's metadata must enable CodeQL, else `trust.codeql` is `off`; without the
+facts file it is `not_run`; a facts file whose status is not `ok` is recorded with that status and none
+of its facts is used; an `ok` one is merged and recorded with its sha256. The file is used as found (it
+records no digest of the sources it was computed from). `validate_artifacts.py run-dir` fails when
+CodeQL is enabled, the facts file is `ok` and the model's `trust.codeql` does not come from it
+(`codeql_merge_problem`). The rules, in this order:
 
   1. library API: every API function of a library unit (its exports) and an executable's embedded
      API is untrusted (`default`);
@@ -491,7 +498,8 @@ def compute_trust(model: dict, threat: dict | None = None, codeql: dict | None =
     # Rule 3: CodeQL.
     codeql_info: dict[str, Any] = {"status": "off"}
     if codeql is not None:
-        codeql_info = {k: codeql.get(k) for k in ("status", "path", "codeql_version") if codeql.get(k) is not None}
+        keys = ("status", "path", "sha256", "codeql_version")
+        codeql_info = {k: codeql.get(k) for k in keys if codeql.get(k) is not None}
         if codeql.get("status") == "ok":
             used, unmatched = _codeql_marks(idx, codeql, marks, warnings)
             codeql_info.update(facts=used, unmatched=len(unmatched))
@@ -572,6 +580,67 @@ def codeql_enabled(metadata: dict | None) -> bool:
     return bool(block.get("enabled")) and bool(block.get("open_source"))
 
 
+def load_codeql(metadata: dict | None, codeql_path: Path | None = None) -> tuple[dict | None, dict[str, Any]]:
+    """
+    The CodeQL facts an annotation uses: (the facts file with its `path` and `sha256`, or None, and the
+    `trust.codeql` block that says why there is none). None unless the run's metadata enables CodeQL
+    (`off`) and the file (default DEFAULT_CODEQL) holds an object (`not_run`). A file whose status is not
+    `ok` is returned as it is: compute_trust records its status and uses none of its facts. A file that
+    cannot be read raises. The facts are used as found: the file records no digest of the sources it was
+    computed from, so a file older than the sources cannot be told from a current one (the facts naming
+    functions the model lacks are counted under `unmatched`).
+    """
+    if not codeql_enabled(metadata):
+        if codeql_path is not None and codeql_path.is_file():
+            return None, {"status": "off", "ignored": str(codeql_path)}
+        return None, {"status": "off"}
+    path = codeql_path or DEFAULT_CODEQL
+    data = load_json_optional(path, None)
+    if not isinstance(data, dict):
+        return None, {"status": "not_run", "path": str(path)}
+    return {**data, "path": str(path), "sha256": _sha256(path.read_bytes())}, {}
+
+
+FIX_CODEQL_MERGE = "run trust.py run, then rebuild the DAG (build_callgraph_dag.py), which copies the trust marks"
+
+
+def codeql_merge_problem(model: dict, metadata: dict | None, codeql_path: Path | None = None) -> str | None:
+    """
+    Why the model's trust does not hold the run's CodeQL facts, or None. A problem only when the run's
+    metadata enables CodeQL and the facts file is `ok`: then the model's `trust.codeql` must be `ok` and
+    come from that file (its sha256; a model merged before the digest was recorded is checked on its
+    fact counts). libmodbus run-1: a model rebuilt after the merge said `off` and nothing noticed.
+    """
+    codeql, _ = load_codeql(metadata, codeql_path)
+    if codeql is None or codeql.get("status") != "ok":
+        return None
+    block = model.get("trust")
+    recorded = block.get("codeql") if isinstance(block, dict) else None
+    recorded = recorded if isinstance(recorded, dict) else {}
+    facts = len(codeql.get("facts") or [])
+    if recorded.get("status") != "ok":
+        return (
+            f"CodeQL is enabled for the run and {codeql['path']} is ok with {facts} fact(s), but the model's "
+            f"trust.codeql.status is {recorded.get('status')!r}: no trust mark holds its facts (the model was "
+            f"annotated without them, or rebuilt after the merge): {FIX_CODEQL_MERGE}"
+        )
+    if recorded.get("sha256"):
+        if recorded["sha256"] != codeql["sha256"]:
+            return (
+                f"the model's trust.codeql was merged from another {codeql['path']} (sha256 "
+                f"{str(recorded['sha256'])[:12]}, the file is now {codeql['sha256'][:12]}): {FIX_CODEQL_MERGE}"
+            )
+        return None
+    used, unmatched = _codeql_marks(_Index(model), codeql, _Marks(), [])
+    if (recorded.get("facts"), recorded.get("unmatched")) != (used, len(unmatched)):
+        return (
+            f"the model's trust.codeql records {recorded.get('facts')} fact(s) used and "
+            f"{recorded.get('unmatched')} unmatched function(s), {codeql['path']} gives {used} and "
+            f"{len(unmatched)}: {FIX_CODEQL_MERGE}"
+        )
+    return None
+
+
 def annotate_model(
     model: dict,
     threat_path: Path | None = None,
@@ -587,18 +656,13 @@ def annotate_model(
     """
     if threat is None:
         threat = load_threat_model(find_threat_model(threat_path, model))
-    codeql = None
-    codeql_state: dict[str, Any] = {"status": "off"}
-    if codeql_enabled(metadata):
-        path = codeql_path or DEFAULT_CODEQL
-        data = load_json_optional(path, None)
-        if isinstance(data, dict):
-            codeql = {**data, "path": str(path)}
-        else:
-            codeql_state = {"status": "not_run", "path": str(path)}
-    elif codeql_path is not None and codeql_path.is_file():
-        codeql_state = {"status": "off", "ignored": str(codeql_path)}
+    codeql, codeql_state = load_codeql(metadata, codeql_path)
     result = compute_trust(model, threat, codeql)
+    if codeql_state.get("status") == "not_run":
+        result["warnings"].append(
+            f"codeql: enabled for the run, but there is no report at {codeql_state['path']}: no CodeQL fact is "
+            "used (codeql_trust.py run, then trust.py run)"
+        )
     for fid, rec in result["functions"].items():
         model["functions"][fid]["trust"] = rec
     for unit, rec in result["units"].items():

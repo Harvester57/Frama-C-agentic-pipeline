@@ -16,7 +16,9 @@ Subcommands:
 
 `run-dir` also checks the Phase 0 artifacts present under workspace/ (PHASE0_ARTIFACTS, the harness
 sidecars and workspace/seed_records/traces.jsonl), and fails on the schema problems their producers
-recorded in `warnings` (schema_warning: producers write the artifact anyway).
+recorded in `warnings` (schema_warning: producers write the artifact anyway). It also fails when the run
+enables CodeQL, its facts file is `ok`, and the model's trust does not hold those facts, or the DAG's
+copy of the trust differs from the model's (validate_codeql_trust; the message names the fix).
 
 Each check runs the JSON Schema contract in schemas/ and then semantic checks
 that a schema cannot express (state table, fingerprint consistency, trace
@@ -689,9 +691,55 @@ PHASE0_ARTIFACTS: tuple[tuple[str, Any], ...] = (
 )
 
 
-def validate_phase0_artifacts(run_dir: Path) -> Errors:
-    """The Phase 0 artifacts present in a run directory, each against its schema (see PHASE0_ARTIFACTS)."""
+MODEL_REL = f"{REPORTS}/phase0_model.json"
+DAG_REL = f"{REPORTS}/callgraph_dag.json"
+
+
+def validate_codeql_trust(run_dir: Path, model: Any, dag: Any = None) -> Errors:
+    """
+    The run's CodeQL facts against the trust marks (libmodbus run-1: a model rebuilt after the merge said
+    `trust.codeql: off`, the report said `CodeQL: off`, and 13 facts were in no trust mark):
+    - when run-metadata.json enables CodeQL and workspace/reports/codeql_trust.json is `ok`, the model's
+      `trust.codeql` must be `ok` and come from that file (trust.codeql_merge_problem). Not enabled, no
+      facts file, or one whose status is not `ok`: nothing to merge, no error;
+    - the DAG copies the model's trust (the tiers, the harness reachability and the contract
+      trust-boundary check read the copy): its `trust.codeql` must be the model's.
+    """
     errors = Errors()
+    if not isinstance(model, dict) or model.get("status") != "ok":
+        return errors
+    import trust  # here: trust.py loads the model builder, which the other validators never need
+
+    try:
+        metadata = load_json_strict(run_dir / "run-metadata.json")
+    except ArtifactError:
+        metadata = None  # missing or unreadable: the run-dir check reports it
+    if isinstance(metadata, dict) and trust.codeql_enabled(metadata):
+        try:
+            problem = trust.codeql_merge_problem(model, metadata, run_dir / trust.DEFAULT_CODEQL)
+        except (ArtifactError, OSError, ValueError) as exc:
+            problem = f"CodeQL is enabled for the run and its facts cannot be read: {exc}"
+        if problem:
+            errors.add(f"{MODEL_REL}: {problem}")
+    block = model.get("trust")
+    dag_block = dag.get("trust") if isinstance(dag, dict) else None
+    if isinstance(block, dict) and isinstance(dag_block, dict) and dag_block.get("codeql") != block.get("codeql"):
+        errors.add(
+            f"{DAG_REL}: its trust marks were copied from a model whose trust.codeql was "
+            f"{json.dumps(dag_block.get('codeql'), sort_keys=True)}, the model now records "
+            f"{json.dumps(block.get('codeql'), sort_keys=True)}: rebuild the DAG (build_callgraph_dag.py), "
+            "then run the reach gate and the ledger seed again"
+        )
+    return errors
+
+
+def validate_phase0_artifacts(run_dir: Path) -> Errors:
+    """
+    The Phase 0 artifacts present in a run directory, each against its schema (see PHASE0_ARTIFACTS),
+    and the CodeQL facts against the model's and the DAG's trust (validate_codeql_trust).
+    """
+    errors = Errors()
+    loaded: dict[str, Any] = {}
     for rel, fn in PHASE0_ARTIFACTS:
         path = run_dir / rel
         if not path.is_file():
@@ -701,8 +749,11 @@ def validate_phase0_artifacts(run_dir: Path) -> Errors:
         except ArtifactError as exc:
             errors.add(f"{rel}: {exc}")
             continue
+        loaded[rel] = data
         for e in fn(data):
             errors.add(f"{rel}: {e}")
+    for e in validate_codeql_trust(run_dir, loaded.get(MODEL_REL), loaded.get(DAG_REL)):
+        errors.add(e)
     harness_dir = run_dir / HARNESS_DIR
     for path in sorted(harness_dir.glob("harness_*.json")) if harness_dir.is_dir() else []:
         rel = f"{HARNESS_DIR}/{path.name}"

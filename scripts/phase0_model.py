@@ -7,7 +7,7 @@ Stdlib only.
     phase0_model.py run [--capture workspace/reports/build_capture.json]
                         [--out workspace/reports/phase0_model.json] [--jobs N] [--no-broker]
                         [--alias | --no-alias]
-                        [--threat-model PATH] [--state state]
+                        [--threat-model PATH] [--metadata run-metadata.json] [--codeql PATH] [--state state]
     phase0_model.py selftest
 
 `run` reads the build capture (scripts/build_capture.py), the scratch tree it names and the run's
@@ -40,7 +40,11 @@ snapshot (scripts/target_env.py), so it runs in a container started with the wra
   8. trust (step I7, scripts/trust.py): each function's `trust` (untrusted or trusted, the deciding rule,
      whether it is on the trust boundary) from the library API, the input readers' call graph and the
      structured threat model (THREAT_MODEL.md, --threat-model); a missing one records `no_threat_model`.
-     `trust.py run` redoes it after a CodeQL run.
+     When the run's metadata enables CodeQL (--metadata) and its facts exist (--codeql, default
+     workspace/reports/codeql_trust.json), they are merged as `trust.py run` merges them, so a model
+     rebuilt after the CodeQL run keeps them: `trust.codeql` is `ok` with the facts used, `not_run`
+     without the file, or the file's own status when it is not `ok` (no fact used). The summary printed
+     at the end shows it under `trust`. `trust.py run` redoes the annotation after a CodeQL run.
 
 With `--alias` (plan step I4; off by default, see docs/plans/archive/phase0-redesign.md §7 "Alias narrowing"), each
 parse also loads scripts/phase0_alias.ml, which runs Frama-C's Alias plugin on the same AST and reports,
@@ -1200,12 +1204,31 @@ def build_model(
     return model, rc
 
 
-def annotate_trust(model: dict, threat_model: Path | None = None) -> None:
-    """Each function's trust (scripts/trust.py, step I7), without CodeQL: `trust.py run` adds it later."""
+def annotate_trust(
+    model: dict, threat_model: Path | None = None, metadata: Path | None = None, codeql: Path | None = None
+) -> None:
+    """
+    Each function's trust (scripts/trust.py, step I7), with the run's CodeQL facts exactly as
+    `trust.py run` merges them (trust.load_codeql: the run's metadata must enable CodeQL; a missing
+    facts file is `not_run`, one whose status is not `ok` gives no fact). A model rebuilt after the
+    CodeQL run therefore keeps its facts (libmodbus run-1 lost them: this annotation left CodeQL out).
+    Metadata or facts that cannot be read cost the facts, not the annotation: a warning names them.
+    """
     try:
         import trust
 
-        trust.annotate_model(model, threat_model)
+        meta, problem = None, None
+        try:
+            meta = load_json_optional(metadata or trust.DEFAULT_METADATA, None)
+            if isinstance(meta, dict):
+                trust.load_codeql(meta, codeql)
+        except Exception as exc:  # noqa: BLE001 - the trust annotation stands without the CodeQL facts
+            meta, problem = None, f"{type(exc).__name__}: {exc}"
+        trust.annotate_model(model, threat_model, codeql, meta if isinstance(meta, dict) else None)
+        if problem:
+            model["warnings"].append(
+                f"trust: annotated without the CodeQL facts ({problem}): fix the file, then run trust.py run"
+            )
     except Exception as exc:  # noqa: BLE001 - the inventory stands without the trust annotation
         model["warnings"].append(f"trust: not annotated ({type(exc).__name__}: {exc})")
 
@@ -1321,6 +1344,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Narrow indirect sites' type match with Frama-C's Alias plugin (default: %(default)s)",
     )
     r.add_argument("--threat-model", type=Path, default=None, help="THREAT_MODEL.md (default: trust.py's search order)")
+    r.add_argument("--metadata", type=Path, default=None, help="run metadata (default: run-metadata.json, as trust.py)")
+    r.add_argument("--codeql", type=Path, default=None, help="CodeQL facts (default: trust.py's, when enabled)")
     r.add_argument("--state", default="state", help="checkpoint directory ('' to leave it alone)")
     sub.add_parser("selftest", help="Check the dump module against this kernel")
     a = p.parse_args(argv)
@@ -1330,7 +1355,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res["ok"] else 1
     model, rc = build_model(a.capture, a.out, a.jobs, broker=not a.no_broker, alias=a.alias)
     if model.get("status") == "ok":
-        annotate_trust(model, a.threat_model)
+        annotate_trust(model, a.threat_model, a.metadata, a.codeql)
     problems = validate_model(model)
     if problems:
         model["warnings"].append(f"schema: {problems[:5]}")
@@ -1348,6 +1373,14 @@ def main(argv: list[str] | None = None) -> int:
         "seconds": model.get("seconds"),
         "warnings": model["warnings"][:10],
     }
+    trust_block = model.get("trust")
+    if isinstance(trust_block, dict):
+        # What the annotation used, CodeQL included (the facts merged, or why none was).
+        summary["trust"] = {
+            "threat_model": (trust_block.get("threat_model") or {}).get("status"),
+            "codeql": trust_block.get("codeql"),
+            "warnings": (trust_block.get("warnings") or [])[:10],
+        }
     print(json.dumps(summary, indent=1))
     return rc
 
