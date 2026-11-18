@@ -2443,18 +2443,19 @@ def _verify_batch_round(
     overlay: Path,
     items: list[dict],
     verify_hook: Callable[[dict], tuple[bool, str]] | None,
-) -> list[tuple[list[int], str]]:
+) -> list[tuple[list[int], str, bool]]:
     """
     Re-check the spliced tree: one guardrail per unique module build and one WP run per prover,
     run in parallel with workers = min(checks, CPUs) and `-wp-par` = CPUs // workers each.
-    Returns the failed checks as (indices of the implicated items, reason).
+    Returns the failed checks as (indices of the implicated items, reason, whether the check is a
+    module-wide guardrail, which can fail on code none of the implicated items changed).
     """
     if verify_hook is not None:
-        failures: list[tuple[list[int], str]] = []
+        failures: list[tuple[list[int], str, bool]] = []
         for i, item in enumerate(items):
             ok, reason = verify_hook(item)
             if not ok:
-                failures.append(([i], reason))
+                failures.append(([i], reason, False))
         return failures
 
     checks: list[tuple[list[int], dict]] = []
@@ -2563,7 +2564,11 @@ def _verify_batch_round(
         for i in prover_idxs:
             if outcomes[prover_check[i]][0]:
                 _record_batch_reach(run_dir, overlay, items[i], guard_report)
-    return [(idxs, reason) for (idxs, _), (ok, reason) in zip(checks, outcomes, strict=True) if not ok]
+    return [
+        (idxs, reason, bool(kwargs["module"]))
+        for (idxs, kwargs), (ok, reason) in zip(checks, outcomes, strict=True)
+        if not ok
+    ]
 
 
 def _is_prover_check_item(item: dict) -> bool:
@@ -2658,10 +2663,10 @@ def _merge_agent_batch_locked(
             "deduplicated_declarations": _dedup_union(merged_results),
         }
 
-    # Verify the combined tree. Failed checks reject the overlays they implicate; the snapshot is
-    # restored, the rest re-spliced and re-verified, until a round passes (a fixpoint: dropping a
-    # callee's contract can break a caller's proof). Every failing round removes at least one
-    # overlay, so this ends within len(spliced_entries) + 1 rounds.
+    # Verify the combined tree. Failed checks reject the overlays they implicate, or defer them to a
+    # retry alone; the snapshot is restored, the rest re-spliced and re-verified, until a round
+    # passes (a fixpoint: dropping a callee's contract can break a caller's proof). Every failing
+    # round removes at least one overlay, so this ends within len(spliced_entries) + 1 rounds.
     active = spliced_entries
     deferred: list[tuple[dict, str]] = []
     bisected = False
@@ -2676,9 +2681,9 @@ def _merge_agent_batch_locked(
         batch_fail_reason = batch_fail_reason or failures[0][1]
         hard: dict[int, str] = {}
         ambiguous: dict[int, str] = {}
-        for idxs, reason in failures:
+        for idxs, reason, module_wide in failures:
             for i in idxs:
-                (hard if len(idxs) == 1 else ambiguous).setdefault(i, reason)
+                (ambiguous if module_wide else hard).setdefault(i, reason)
         for i in hard:
             ambiguous.pop(i, None)
         for i, reason in hard.items():
@@ -2686,8 +2691,8 @@ def _merge_agent_batch_locked(
             failed_results.append(_rejected_result(item, res, reason))
             _drop_patch(run_dir, res)
         for i, reason in ambiguous.items():
-            # A module guardrail failed with several overlays of that module in the batch: none can
-            # be blamed yet, so each is retried alone on top of the converged tree.
+            # A module guardrail failed: it also checks code the overlays did not change, so none can
+            # be blamed yet, however many there are. Each is retried alone on the converged tree.
             deferred.append((active[i][0], reason))
             _drop_patch(run_dir, active[i][1])
         remaining = [item for i, (item, _) in enumerate(active) if i not in hard and i not in ambiguous]

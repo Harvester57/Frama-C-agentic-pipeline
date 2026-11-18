@@ -712,6 +712,98 @@ def test_merge_batch_shared_guardrail_failure_retries_overlays_one_by_one(tmp_pa
     assert len(guardrails) == 3  # the shared check, then one per overlay
 
 
+MODULE_GUARD_FAILURE = "parent guardrail returned status='rejected_overconstrained'"
+
+
+def _merge_with_failing_checks(tmp_path, monkeypatch, agents, *, module=False, scoped=False, wp=False):
+    """
+    Merge `agents` of EDITS as one batch with the named re-checks failing. Returns (result, calls), each call being
+    "module" (the module-wide guardrail), "scoped:<fn>" (the retry alone, guardrail and WP) or "wp:<fn>" (a batch WP).
+    """
+    run_dir, overlay = _batch_run(tmp_path, {k: EDITS[k] for k in agents})
+    monkeypatch.setattr(workspace_overlay, "job_budget", lambda: Budget(cpus=2, mem_mb=65536, source="test"))
+    calls = []
+
+    def fake_reverify(
+        run_dir, agent_id, role, overlay_dir, c_file, function, module, sources, cppflags, ldflags="", wp_par=None
+    ):
+        kind = "scoped" if module and function else "module" if module else "wp"
+        calls.append(kind if kind == "module" else f"{kind}:{function}")
+        if failing[kind]:
+            return False, MODULE_GUARD_FAILURE if kind == "module" else f"{kind} check failed for {function}"
+        return True, "ok"
+
+    failing = {"module": module, "scoped": scoped, "wp": wp}
+    monkeypatch.setattr(workspace_overlay, "_run_parent_reverify", fake_reverify)
+    specs = [s for s in SPECS if s["agent_id"] in agents]
+    return workspace_overlay.merge_agent_batch(run_dir, specs, overlay_dir=overlay, default_module="m"), calls
+
+
+def test_merge_single_overlay_module_guardrail_failure_is_retried_and_merges(tmp_path, monkeypatch):
+    # libmodbus run-1: a known false alarm in another function's merged contract refused an all_proven result.
+    res, calls = _merge_with_failing_checks(tmp_path, monkeypatch, ["prover-other"], module=True)
+    assert res["ok"] and res["bisected"] and res["failed"] == []
+    assert [r["agent_id"] for r in res["merged"]] == ["prover-other"]
+    assert res["merged"][0]["parent_wp_report"] == "agents/prover-other/scratch/parent_wp/other.json"
+    assert res["batch_failure_reason"] == MODULE_GUARD_FAILURE
+    assert sorted(calls) == ["module", "scoped:other", "wp:other"]
+    tree = (tmp_path / "run" / "workspace" / "work" / "m.c").read_text(encoding="utf-8")
+    assert "other_ok" in tree
+
+
+def test_merge_single_overlay_failing_its_retry_too_is_reported_with_the_batch_reason(tmp_path, monkeypatch):
+    res, calls = _merge_with_failing_checks(tmp_path, monkeypatch, ["prover-other"], module=True, scoped=True)
+    assert not res["ok"] and res["merged"] == []
+    assert [r["agent_id"] for r in res["failed"]] == ["prover-other"]
+    assert res["failed"][0]["reason"] == "scoped check failed for other"
+    assert res["failed"][0]["batch_failure_reason"] == MODULE_GUARD_FAILURE
+    assert sorted(calls) == ["module", "scoped:other", "wp:other"]
+    tree = (tmp_path / "run" / "workspace" / "work" / "m.c").read_text(encoding="utf-8")
+    assert "other_ok" not in tree
+
+
+def test_merge_single_prover_failing_its_own_wp_is_rejected_without_a_retry(tmp_path, monkeypatch):
+    res, calls = _merge_with_failing_checks(tmp_path, monkeypatch, ["prover-other"], wp=True)
+    assert not res["ok"] and res["merged"] == []
+    assert res["failed"][0]["reason"] == "wp check failed for other"
+    assert "batch_failure_reason" not in res["failed"][0]
+    assert sorted(calls) == ["module", "wp:other"]
+
+
+def test_merge_single_prover_failing_guardrail_and_wp_is_rejected_without_a_retry(tmp_path, monkeypatch):
+    res, calls = _merge_with_failing_checks(tmp_path, monkeypatch, ["prover-other"], module=True, wp=True)
+    assert not res["ok"] and res["merged"] == []
+    assert res["failed"][0]["reason"] == "wp check failed for other"
+    assert sorted(calls) == ["module", "wp:other"]
+
+
+def test_merge_two_overlays_failing_the_module_guardrail_are_each_retried(tmp_path, monkeypatch):
+    res, calls = _merge_with_failing_checks(tmp_path, monkeypatch, ["prover-callee", "prover-other"], module=True)
+    assert res["ok"] and res["bisected"] and res["rounds"] == 1
+    assert sorted(r["agent_id"] for r in res["merged"]) == ["prover-callee", "prover-other"]
+    assert sorted(calls) == ["module", "scoped:callee", "scoped:other", "wp:callee", "wp:other"]
+
+
+def test_merge_verify_hook_failure_is_rejected_without_a_retry(tmp_path, monkeypatch):
+    run_dir, overlay = _batch_run(tmp_path, {"prover-other": EDITS["prover-other"]})
+    hook_calls = []
+
+    def hook(item):
+        hook_calls.append(item["agent_id"])
+        return False, "hook refused"
+
+    def no_reverify(*a, **k):
+        raise AssertionError("the verify_hook path runs no parent re-check")
+
+    monkeypatch.setattr(workspace_overlay, "_run_parent_reverify", no_reverify)
+    specs = [s for s in SPECS if s["agent_id"] == "prover-other"]
+    res = workspace_overlay.merge_agent_batch(run_dir, specs, overlay_dir=overlay, default_module="m", verify_hook=hook)
+    assert not res["ok"] and res["merged"] == []
+    assert res["failed"][0]["reason"] == "hook refused"
+    assert "batch_failure_reason" not in res["failed"][0]
+    assert hook_calls == ["prover-other"]
+
+
 def test_fuzz_campaign_refuses_when_memory_below_minimum(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "enforced_memory_mb", lambda: 2048)
     monkeypatch.setattr(
