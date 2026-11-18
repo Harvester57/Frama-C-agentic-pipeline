@@ -29,11 +29,21 @@ Two clauses of the contract of `strlcat` in `share/libc/string.h` are wrong:
   may write, and every byte up to it whatever the length of `src`. A structure field that follows
   the buffer is considered modified.
 
+And one is too weak:
+
+- **`requires separation`** covers `src+(0..strnlen(src, n-1))`, but the function reads `src` up
+  to its NUL to compute the result. `strlcat(buf + 16, buf, 8)` on
+  `char buf[32] = "0123456789abcdefghij";` writes over the NUL of `src` with every precondition
+  valid.
+
 ## Change
 
-**`share/libc/string.h`,** three clauses of `strlcat`:
+**`share/libc/string.h`,** four clauses of `strlcat`:
 
 ```
+requires separation:
+  \separated(dest+(0..\min(n-1, strlen(dest)+strlen(src))),
+             src+(0..strlen(src)));
 assigns dest[strlen(dest)..\min(n-1, strlen(dest)+strlen(src))]
   \from indirect:n, src[0..strlen(src)];
 assigns \result \from indirect:dest[0..], indirect:src[0..], indirect:n;
@@ -48,12 +58,17 @@ ensures bounded_result:
   `n` bytes.
 - **Dependencies of the result:** they named `src[0..n-1]` and not `dest`. The result depends on
   the length of both strings.
-- **Not changed:** the four preconditions, the name `bounded_result`, and `strlcpy`, whose result
-  clause is right. No clause is added on the bytes written.
+- **Separation:** the source side goes from `strnlen(src, n-1)` to `strlen(src)`. This is a
+  stronger precondition for existing users; it is one line, and I can drop it from this merge
+  request if you prefer.
+- **Not changed:** the three other preconditions, the name `bounded_result`, and `strlcpy`, whose
+  result clause is right. No clause is added on the bytes written.
 
 **New test `tests/libc/strlcat.c`, with its oracle:** five calls under Eva, each followed by a
 check: everything fits (`r == 4`), truncation (`rt == 6`), no NUL within `n` bytes (`rf == 4`),
 `n == 0` (`r0 == 2`), and a structure field after the buffer (`v.next == 'Z'`). All five are valid.
+A sixth call, in a branch, writes over the NUL of its source: its `separation` precondition is
+invalid.
 
 **`tests/libc/oracle/string_h.0.res.oracle`:** the existing test `string_h.c` gets more precise.
 
@@ -96,10 +111,10 @@ On a build of `b80fcac74f` with the patch (Debian 13, OCaml 5.5 switch, gcc 14.2
   translation ends normally (exit code 0) and reports the postcondition as not yet supported.
   `e-acsl-gcc -L` on the same file goes from `fatal error: aborted by Frama-C` to an instrumented
   program that runs to the end.
-- **Not in this merge request:** the `separation` precondition, which covers only the first
-  `strnlen(src, n-1)` bytes of `src` (see the issue). I tried `src+(0..strlen(src))` on top of
-  this patch: `tests/libc` and `plugins/e-acsl/tests` pass with no oracle change. I can add it
-  here if you want it.
+- **The stronger precondition alone:** with it or without it, `tests/libc` and
+  `plugins/e-acsl/tests` give the same results for every existing test. With it, WP also proves
+  that the byte-loop body leaves `src` unchanged up to its NUL (36 of 36 goals; 35 of 36
+  without).
 - **Not run:** the rest of `tests/`, the default ptests of the other plugins, and the cram tests.
   Two searches of the source tree say they are not concerned:
   - `strlcat` appears only in `share/libc/string.h` and in the `tests/libc` files above;

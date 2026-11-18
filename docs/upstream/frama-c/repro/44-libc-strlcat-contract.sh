@@ -8,11 +8,13 @@
 #   docker run --rm -v "$PWD:/w" -w /w --entrypoint sh <image> \
 #     44-libc-strlcat-contract.sh
 #
-# Eight checks. The first five compare Eva with the compiled program
+# Nine checks. The first five compare Eva with the compiled program
 # (44-libc-strlcat-contract.c); the next two are WP on two callers
 # (44-libc-strlcat-contract-wp.c: the first postcondition is false at run
 # time and must not be proved, the second caller is right and must be); the
-# last one is WP on a byte-loop strlcat (44-libc-strlcat-contract-body.c).
+# eighth is WP on a byte-loop strlcat (44-libc-strlcat-contract-body.c); the
+# last one is Eva on a call that overwrites the NUL of its source
+# (44-libc-strlcat-contract-overlap.c), whose precondition must be invalid.
 #
 # Output before (master b80fcac74f; 34.0~beta prints the same), exit 1:
 #   appended: gcc holds; eva unknown
@@ -23,7 +25,8 @@
 #   post_state_length: gcc DOES NOT HOLD (result 4, strlen(d) + strlen(s) after the call 6); wp proved 1 / 1
 #   pre_state_length: gcc holds (result 4, strlen(d) + strlen(s) before the call 4); wp proved 8 / 10
 #   body: wp proved 34 / 35
-#   RESULT: bug present (8 of 8 checks fail)
+#   overlap: eva separation valid
+#   RESULT: bug present (9 of 9 checks fail)
 #
 # Output after (master b80fcac74f with patches/44-libc-strlcat-contract.patch
 # installed), exit 0:
@@ -35,6 +38,7 @@
 #   post_state_length: gcc DOES NOT HOLD (result 4, strlen(d) + strlen(s) after the call 6); wp proved 0 / 1
 #   pre_state_length: gcc holds (result 4, strlen(d) + strlen(s) before the call 4); wp proved 10 / 10
 #   body: wp proved 35 / 35
+#   overlap: eva separation invalid
 #   RESULT: fixed
 set -u
 p=44-libc-strlcat-contract
@@ -86,6 +90,14 @@ n=$((n + 1))
 w=$(wp_goals $p-body.c -wp-rte)
 [ "${w% / *}" = "${w#* / }" ] || failed=$((failed + 1))
 echo "body: wp proved $w"
+
+# 4. Eva on a call whose written bytes hold the NUL of the source
+n=$((n + 1))
+frama-c -no-unicode $p-overlap.c -eva -eva-show-progress > "$tmp/eva.log" 2>&1
+s=$(grep -m1 -o "precondition 'separation' got status [a-z]*" "$tmp/eva.log" | sed 's/.* //')
+s=${s:-not reached}
+[ "$s" = invalid ] || failed=$((failed + 1))
+echo "overlap: eva separation $s"
 
 rm -rf "$tmp"
 if [ "$failed" = 0 ]; then echo "RESULT: fixed"; exit 0

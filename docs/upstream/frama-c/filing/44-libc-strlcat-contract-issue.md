@@ -15,6 +15,10 @@ Two clauses of the contract of `strlcat` in `share/libc/string.h` are wrong:
   write, and every byte up to it whatever the length of `src`. Eva considers the object that
   follows the buffer modified, and WP cannot prove a caller that only owns `n` bytes.
 
+A third one is too weak: `requires separation` covers `src+(0..strnlen(src, n-1))`, but the
+function reads `src` up to its NUL to compute the result, so a call that writes over that NUL is
+accepted (see "Additional information").
+
 ### Steps to reproduce the issue
 
 `cat.c`:
@@ -125,6 +129,9 @@ depends on the real value 4 is seen as dead.
 - **Proposed clauses.**
 
   ```
+  requires separation:
+    \separated(dest+(0..\min(n-1, strlen(dest)+strlen(src))),
+               src+(0..strlen(src)));
   assigns dest[strlen(dest)..\min(n-1, strlen(dest)+strlen(src))]
     \from indirect:n, src[0..strlen(src)];
   assigns \result \from indirect:dest[0..], indirect:src[0..], indirect:n;
@@ -135,6 +142,12 @@ depends on the real value 4 is seen as dead.
   The upper bound of the frame is the one the `separation` precondition already uses. The
   dependencies of the result now name the bytes of `dest` and all the bytes of `src`: the result
   depends on both lengths.
+- **The `separation` precondition.** With `char buf[32] = "0123456789abcdefghij";`, the call
+  `strlcat(buf + 16, buf, 8)` has its four preconditions valid today, and it writes
+  `buf[20..23]`, which holds the NUL of `src`. The BSD manual says the behaviour is undefined
+  when the strings overlap. With `src+(0..strlen(src))`, Eva finds `separation` invalid for that
+  call. No oracle of `tests/libc` or of the E-ACSL tests changes with it. It is a stronger
+  precondition for existing users: tell me if you prefer the merge request without it.
 - **How I checked the new clauses.** WP proves a byte-loop implementation of `strlcat` against the
   patched contract, with one admitted fact (the two lengths do not add up past `SIZE_MAX`). With
   the current contract the same proof stops on `bounded_result`. That implementation returns the
@@ -142,17 +155,10 @@ depends on the real value 4 is seen as dead.
   source length from 0 to 10 and every `n` from 0 to 14 (1815 calls).
 - **Your own test.** `tests/libc/string_h.c` has `//@ check imprecise: strlcat_res == 6;` after
   appending `"cat"` to `"dog"`. It is unknown today and valid with the new clause.
-- **Not changed.** The preconditions, and the contract of `strlcpy`, whose result clause is right.
-- **Seen, not changed: the `separation` precondition.** It covers `src+(0..strnlen(src, n-1))`,
-  but the function reads `src` up to its NUL to compute the result. With
-  `char buf[32] = "0123456789abcdefghij";`, the call `strlcat(buf + 16, buf, 8)` has its four
-  preconditions valid, and it writes `buf[20..23]`, which holds the NUL of `src`. The BSD manual
-  says the behaviour is undefined when the strings overlap. Requiring
-  `src+(0..strlen(src))` to be separated rejects that call (Eva: `separation` invalid), and
-  changes no oracle of `tests/libc` or of the E-ACSL tests. It is a stronger precondition for
-  existing users, so I left it out; I can add it to the merge request if you want it.
+- **Not changed.** The three other preconditions, and the contract of `strlcpy`, whose result
+  clause is right.
 
-A merge request with the three clauses and a test follows.
+A merge request with the four clauses and a test follows.
 
 The analysis and fix were prepared with LLM assistance (Claude Code); I reviewed them and ran the
 reproducer and tests described above.
