@@ -1,0 +1,1152 @@
+{
+ "schema_version": 2,
+ "generated_at": "2026-11-18T21:23:20.621114+00:00",
+ "status": "ok",
+ "capture": "workspace/reports/build_capture.json",
+ "warnings": [],
+ "tree": "/framac-scratch/tree",
+ "snapshot": {
+  "root": "/framac-run/workspace/snapshot/root",
+  "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "capture_generated_at": "2026-11-18T21:23:19.757111+00:00",
+ "dump_module": {
+  "status": "ok"
+ },
+ "alias": {
+  "enabled": false
+ },
+ "units": {
+  "libprog.a": {
+   "kind": "static_lib",
+   "test": false,
+   "files": [
+    "prog.c"
+   ],
+   "links": [],
+   "cppflags": [
+    "-std=c99"
+   ],
+   "entry_points": [
+    "prog.c#link_open",
+    "prog.c#ping",
+    "prog.c#poll_tcp",
+    "prog.c#request_rtu",
+    "prog.c#request_tcp",
+    "prog.c#run_both"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "ok",
+    "job": "d1a036739cc03da8",
+    "seconds": 0.43
+   },
+   "concurrent": false,
+   "header_api": [],
+   "trust": {
+    "threat_model": "ok",
+    "functions": 13,
+    "untrusted": 6,
+    "boundary": 6,
+    "api": 6
+   }
+  }
+ },
+ "functions": {
+  "prog.c#link_open": {
+   "file": "prog.c",
+   "name": "link_open",
+   "line": 122,
+   "end_line": 126,
+   "lines": 5,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct link *,int,int)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "call_sites": [],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "fd",
+     "kind": "value"
+    },
+    {
+     "name": "rtu",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 3,
+    "params": [
+     "ctx"
+    ],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "link_open"
+   },
+   "external_calls": [],
+   "param_sizes": {
+    "0": {
+     "min": 16,
+     "max": 16,
+     "sites": 2
+    }
+   },
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of libprog.a"
+    ]
+   }
+  },
+  "prog.c#ping": {
+   "file": "prog.c",
+   "name": "ping",
+   "line": 106,
+   "end_line": 115,
+   "lines": 10,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct link *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "tcp_send",
+     "line": 114,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "ping"
+   },
+   "external_calls": [],
+   "param_sizes": {
+    "0": {
+     "min": 16,
+     "max": 16,
+     "sites": 1
+    }
+   },
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of libprog.a"
+    ]
+   }
+  },
+  "prog.c#poll_tcp": {
+   "file": "prog.c",
+   "name": "poll_tcp",
+   "line": 117,
+   "end_line": 120,
+   "lines": 4,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct link *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "call_sites": [],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "rsp",
+     "kind": "pointer"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "poll_tcp"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of libprog.a"
+    ]
+   }
+  },
+  "prog.c#request_rtu": {
+   "file": "prog.c",
+   "name": "request_rtu",
+   "line": 91,
+   "end_line": 103,
+   "lines": 13,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct link *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "send_frame",
+     "line": 102,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "addr",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "request_rtu"
+   },
+   "external_calls": [],
+   "param_sizes": {
+    "0": {
+     "min": 16,
+     "max": 16,
+     "sites": 1
+    }
+   },
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of libprog.a"
+    ]
+   }
+  },
+  "prog.c#request_tcp": {
+   "file": "prog.c",
+   "name": "request_tcp",
+   "line": 71,
+   "end_line": 89,
+   "lines": 19,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct link *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "send_frame",
+     "line": 88,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "addr",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "request_tcp"
+   },
+   "external_calls": [],
+   "param_sizes": {
+    "0": {
+     "min": 16,
+     "max": 16,
+     "sites": 1
+    }
+   },
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of libprog.a"
+    ]
+   }
+  },
+  "prog.c#rtu_frame_pre": {
+   "file": "prog.c",
+   "name": "rtu_frame_pre",
+   "line": 43,
+   "end_line": 47,
+   "lines": 5,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "call_sites": [],
+   "formals": [
+    {
+     "name": "req",
+     "kind": "pointer"
+    },
+    {
+     "name": "req_length",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 1,
+    "params": [
+     "req"
+    ],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "rtu_frame_pre"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "trusted",
+    "source": "default",
+    "sources": [],
+    "boundary": false,
+    "reasons": [
+     "not API and not on an input path"
+    ]
+   }
+  },
+  "prog.c#rtu_recv": {
+   "file": "prog.c",
+   "name": "rtu_recv",
+   "line": 54,
+   "end_line": 57,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct link *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "net_read",
+     "line": 56,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "rsp",
+     "kind": "pointer"
+    },
+    {
+     "name": "rsp_length",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "rtu_recv"
+   },
+   "external_calls": [
+    "net_read"
+   ],
+   "trust": {
+    "value": "trusted",
+    "source": "default",
+    "sources": [],
+    "boundary": false,
+    "reasons": [
+     "not API and not on an input path"
+    ]
+   }
+  },
+  "prog.c#rtu_send": {
+   "file": "prog.c",
+   "name": "rtu_send",
+   "line": 49,
+   "end_line": 52,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct link *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "net_write",
+     "line": 51,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "req",
+     "kind": "const_pointer"
+    },
+    {
+     "name": "req_length",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "rtu_send"
+   },
+   "external_calls": [
+    "net_write"
+   ],
+   "trust": {
+    "value": "trusted",
+    "source": "default",
+    "sources": [],
+    "boundary": false,
+    "reasons": [
+     "not API and not on an input path"
+    ]
+   }
+  },
+  "prog.c#run_both": {
+   "file": "prog.c",
+   "name": "run_both",
+   "line": 129,
+   "end_line": 137,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "link_open",
+     "line": 134,
+     "literals": {}
+    },
+    {
+     "callee": "link_open",
+     "line": 135,
+     "literals": {}
+    },
+    {
+     "callee": "request_tcp",
+     "line": 136,
+     "literals": {}
+    },
+    {
+     "callee": "request_rtu",
+     "line": 136,
+     "literals": {}
+    },
+    {
+     "callee": "ping",
+     "line": 136,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "addr",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "run_both"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of libprog.a"
+    ]
+   }
+  },
+  "prog.c#send_frame": {
+   "file": "prog.c",
+   "name": "send_frame",
+   "line": 62,
+   "end_line": 69,
+   "lines": 8,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct link *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "call_sites": [],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "msg",
+     "kind": "pointer"
+    },
+    {
+     "name": "msg_length",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "send_frame"
+   },
+   "external_calls": [],
+   "param_sizes": {
+    "1": {
+     "min": 7,
+     "max": 12,
+     "sites": 2
+    }
+   },
+   "trust": {
+    "value": "trusted",
+    "source": "default",
+    "sources": [],
+    "boundary": false,
+    "reasons": [
+     "not API and not on an input path"
+    ]
+   }
+  },
+  "prog.c#tcp_frame_pre": {
+   "file": "prog.c",
+   "name": "tcp_frame_pre",
+   "line": 26,
+   "end_line": 31,
+   "lines": 6,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "call_sites": [],
+   "formals": [
+    {
+     "name": "req",
+     "kind": "pointer"
+    },
+    {
+     "name": "req_length",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 2,
+    "params": [
+     "req"
+    ],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "tcp_frame_pre"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "trusted",
+    "source": "default",
+    "sources": [],
+    "boundary": false,
+    "reasons": [
+     "not API and not on an input path"
+    ]
+   }
+  },
+  "prog.c#tcp_recv": {
+   "file": "prog.c",
+   "name": "tcp_recv",
+   "line": 38,
+   "end_line": 41,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct link *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "net_read",
+     "line": 40,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "rsp",
+     "kind": "pointer"
+    },
+    {
+     "name": "rsp_length",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "tcp_recv"
+   },
+   "external_calls": [
+    "net_read"
+   ],
+   "trust": {
+    "value": "trusted",
+    "source": "default",
+    "sources": [],
+    "boundary": false,
+    "reasons": [
+     "not API and not on an input path"
+    ]
+   }
+  },
+  "prog.c#tcp_send": {
+   "file": "prog.c",
+   "name": "tcp_send",
+   "line": 33,
+   "end_line": 36,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct link *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "call_sites": [
+    {
+     "callee": "net_write",
+     "line": 35,
+     "literals": {}
+    }
+   ],
+   "formals": [
+    {
+     "name": "ctx",
+     "kind": "pointer"
+    },
+    {
+     "name": "req",
+     "kind": "const_pointer"
+    },
+    {
+     "name": "req_length",
+     "kind": "value"
+    }
+   ],
+   "writes": {
+    "pointer": 0,
+    "params": [],
+    "globals": []
+   },
+   "units": [
+    "libprog.a"
+   ],
+   "kernel_names": {
+    "libprog.a": "tcp_send"
+   },
+   "external_calls": [
+    "net_write"
+   ],
+   "param_sizes": {
+    "1": {
+     "min": 2,
+     "max": 2,
+     "sites": 1
+    }
+   },
+   "trust": {
+    "value": "trusted",
+    "source": "default",
+    "sources": [],
+    "boundary": false,
+    "reasons": [
+     "not API and not on an input path"
+    ]
+   }
+  }
+ },
+ "edges": [
+  {
+   "caller": "prog.c#ping",
+   "callee": "prog.c#tcp_send",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "prog.c#poll_tcp",
+   "callee": "prog.c#rtu_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#poll_tcp",
+   "callee": "prog.c#rtu_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#poll_tcp",
+   "callee": "prog.c#tcp_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#poll_tcp",
+   "callee": "prog.c#tcp_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#request_rtu",
+   "callee": "prog.c#send_frame",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "prog.c#request_tcp",
+   "callee": "prog.c#send_frame",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "prog.c#run_both",
+   "callee": "prog.c#link_open",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "prog.c#run_both",
+   "callee": "prog.c#ping",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "prog.c#run_both",
+   "callee": "prog.c#request_rtu",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "prog.c#run_both",
+   "callee": "prog.c#request_tcp",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "prog.c#send_frame",
+   "callee": "prog.c#rtu_frame_pre",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#send_frame",
+   "callee": "prog.c#rtu_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#send_frame",
+   "callee": "prog.c#rtu_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#send_frame",
+   "callee": "prog.c#tcp_frame_pre",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#send_frame",
+   "callee": "prog.c#tcp_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "prog.c#send_frame",
+   "callee": "prog.c#tcp_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  }
+ ],
+ "indirect_sites": [
+  {
+   "unit": "libprog.a",
+   "units": [
+    "libprog.a"
+   ],
+   "caller": "prog.c#poll_tcp",
+   "expr": "(ctx->backend)->recv",
+   "signature": "long(struct link *,unsigned char *,int)",
+   "loc": "prog.c:119",
+   "candidates": [
+    "prog.c#rtu_recv",
+    "prog.c#rtu_send",
+    "prog.c#tcp_recv",
+    "prog.c#tcp_send"
+   ],
+   "narrowing": "none",
+   "narrowing_reason": "disabled",
+   "dropped": []
+  },
+  {
+   "unit": "libprog.a",
+   "units": [
+    "libprog.a"
+   ],
+   "caller": "prog.c#send_frame",
+   "expr": "(ctx->backend)->frame_pre",
+   "signature": "int(unsigned char *,int)",
+   "loc": "prog.c:66",
+   "candidates": [
+    "prog.c#rtu_frame_pre",
+    "prog.c#tcp_frame_pre"
+   ],
+   "narrowing": "none",
+   "narrowing_reason": "disabled",
+   "dropped": []
+  },
+  {
+   "unit": "libprog.a",
+   "units": [
+    "libprog.a"
+   ],
+   "caller": "prog.c#send_frame",
+   "expr": "(ctx->backend)->send",
+   "signature": "long(struct link *,unsigned char *,int)",
+   "loc": "prog.c:67",
+   "candidates": [
+    "prog.c#rtu_recv",
+    "prog.c#rtu_send",
+    "prog.c#tcp_recv",
+    "prog.c#tcp_send"
+   ],
+   "narrowing": "none",
+   "narrowing_reason": "disabled",
+   "dropped": []
+  }
+ ],
+ "externals": [
+  "net_read",
+  "net_write"
+ ],
+ "external_formals": {
+  "net_read": [
+   {
+    "name": "fd",
+    "kind": "value"
+   },
+   {
+    "name": "buf",
+    "kind": "pointer"
+   },
+   {
+    "name": "n",
+    "kind": "value"
+   }
+  ],
+  "net_write": [
+   {
+    "name": "fd",
+    "kind": "value"
+   },
+   {
+    "name": "buf",
+    "kind": "const_pointer"
+   },
+   {
+    "name": "n",
+    "kind": "value"
+   }
+  ]
+ },
+ "external_decls": {
+  "net_read": {
+   "decl": "prog.c:24",
+   "proto": "long net_read(int fd, uint8_t *buf, int n)",
+   "signature": "long(int,unsigned char *,int)"
+  },
+  "net_write": {
+   "decl": "prog.c:21",
+   "proto": "long net_write(int fd, uint8_t const *buf, int n)",
+   "signature": "long(int,unsigned char *,int)"
+  }
+ },
+ "global_variables": {
+  "prog.c#rtu_backend": {
+   "name": "rtu_backend",
+   "file": "prog.c",
+   "static": true,
+   "type": "struct backend",
+   "units": [
+    "libprog.a"
+   ]
+  },
+  "prog.c#tcp_backend": {
+   "name": "tcp_backend",
+   "file": "prog.c",
+   "static": true,
+   "type": "struct backend",
+   "units": [
+    "libprog.a"
+   ]
+  }
+ },
+ "macro_aliases": {},
+ "entry_points": [
+  "prog.c#link_open",
+  "prog.c#ping",
+  "prog.c#poll_tcp",
+  "prog.c#request_rtu",
+  "prog.c#request_tcp",
+  "prog.c#run_both"
+ ],
+ "entry_points_source": "build_capture",
+ "thread_entries": [],
+ "parse_jobs": [
+  {
+   "key": "d1a036739cc03da8",
+   "units": [
+    "libprog.a"
+   ],
+   "sources": [
+    "prog.c"
+   ],
+   "status": "ok",
+   "seconds": 0.43
+  }
+ ],
+ "seconds": 0.71,
+ "trust": {
+  "generated_at": "2026-11-18T21:23:21.374463+00:00",
+  "threat_model": {
+   "status": "ok",
+   "path": "/framac-scratch/tree/THREAT_MODEL.md",
+   "sha256": "070121bb2ec6783d6abe9049f2d2ddd21afca8a1291ab2066ae5c6ebdb71be67",
+   "reason": null,
+   "errors": []
+  },
+  "codeql": {
+   "status": "off"
+  },
+  "input_readers": [
+   "__fc_syscall_read",
+   "__fc_syscall_recvfrom",
+   "fgetc",
+   "fgets",
+   "fread",
+   "fscanf",
+   "getc",
+   "getchar",
+   "getdelim",
+   "getenv",
+   "getline",
+   "pread",
+   "read",
+   "readv",
+   "recv",
+   "recvfrom",
+   "recvmsg",
+   "scanf",
+   "secure_getenv"
+  ],
+  "summary": {
+   "untrusted": 6,
+   "trusted": 7,
+   "boundary": 6,
+   "by_source": {
+    "trusted:default": 7,
+    "untrusted:default": 6
+   },
+   "with_codeql": 0,
+   "overridden": 0
+  },
+  "warnings": []
+ }
+}

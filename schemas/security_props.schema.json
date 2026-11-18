@@ -85,14 +85,86 @@
             "additionalProperties": false
           },
           "code": {
-            "$comment": "a property written into the work tree, not into the meta file: a local secret's wipe `check` (plan step M6, `local`) or an auth gate's failure `check` before each return (M7, `returns`; `${result}` stands for the returned expression)",
+            "$comment": "a property written into the work tree, not into the meta file: a local secret's wipe `check` (plan step M6, `local`), an auth gate's failure `check` before each return (M7, `returns`; `${result}` stands for the returned expression), or a wrapper sink's `check` before each call that hands its buffer on (`handoff`; `${predicate}` stands for `bytes` or `object` on that call's arguments)",
             "type": "object",
             "properties": {
               "local": {"type": "string", "minLength": 1},
               "returns": {"const": true},
+              "handoff": {
+                "$comment": "the calls to check before, in the wrapper: `callee` is the called name (a function, or with `member` the field or pointer the call goes through), `args` the [pointer argument index, length argument index or null] pairs to check, `sites` how many such calls the model records (null: unknown)",
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "callee": {"type": "string", "minLength": 1},
+                    "member": {"type": "boolean"},
+                    "args": {"type": "array", "minItems": 1, "items": {"type": "array"}},
+                    "sites": {"type": ["integer", "null"]}
+                  },
+                  "required": ["callee", "member", "args", "sites"],
+                  "additionalProperties": false
+                }
+              },
+              "bytes": {"type": "string", "minLength": 1},
+              "object": {"type": "string", "minLength": 1},
               "check": {"type": "string", "minLength": 1}
             },
             "required": ["check"],
+            "additionalProperties": false
+          },
+          "relocated": {
+            "$comment": "a wrapper sink (threat model `checked_at`): the property is not generated at the wrapper's callers but checked inside the wrapper, before each call that hands the buffer to an inner sink",
+            "type": "object",
+            "properties": {
+              "wrapper": {"$ref": "#/definitions/function_id"},
+              "declared": {"$comment": "the threat model's `checked_at`", "type": "array", "items": {"type": "string"}},
+              "not_generated_at": {"$comment": "the wrapper's callers, which no longer hold an instance", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
+              "checked_at": {
+                "$comment": "each call in the wrapper the check is written before; an indirect call lists every function the model says it can dispatch to (the check does not depend on which one)",
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "function": {"$ref": "#/definitions/function_id"},
+                    "call": {"type": "string", "minLength": 1},
+                    "loc": {"type": ["string", "null"]},
+                    "kind": {"type": "string", "enum": ["direct", "indirect"]},
+                    "inner_sinks": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                    "candidates": {"type": "array", "items": {"type": "string"}}
+                  },
+                  "required": ["function", "call", "loc", "kind", "inner_sinks"],
+                  "additionalProperties": false
+                }
+              },
+              "superseded": {
+                "$comment": "instances of the inner sinks' own properties in the wrapper that the check replaces: MetAcsl cannot state them at a call through a pointer",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {"property": {"type": "string"}, "function": {"$ref": "#/definitions/function_id"}},
+                  "required": ["property", "function"],
+                  "additionalProperties": false
+                }
+              },
+              "other_indirect_calls": {
+                "$comment": "the wrapper's other calls through a pointer (a hook that completes the buffer): not checked",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "call": {"type": "string"},
+                    "loc": {"type": ["string", "null"]},
+                    "candidates": {"type": "array", "items": {"type": "string"}}
+                  },
+                  "required": ["call", "loc", "candidates"],
+                  "additionalProperties": false
+                }
+              },
+              "evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+            },
+            "required": ["wrapper", "declared", "not_generated_at", "checked_at", "superseded", "other_indirect_calls", "evidence"],
             "additionalProperties": false
           },
           "direct_writers": {"type": "array", "items": {"type": "string"}},

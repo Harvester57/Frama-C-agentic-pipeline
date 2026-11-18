@@ -84,6 +84,7 @@
           "params": {"$comment": "step I9: the parameters carrying the output (default: the pointer parameters)", "type": "array", "items": {"$ref": "#/definitions/identifier"}},
           "length": {"$comment": "step I9: the parameter giving the number of elements `params` point to", "$ref": "#/definitions/identifier"},
           "format": {"$comment": "plan step M5: the parameter holding a printf-style format; every call must pass a string literal there (CWE-134)", "$ref": "#/definitions/identifier"},
+          "checked_at": {"$comment": "a wrapper sink: the function completes the buffer itself (a header length, a checksum) and then hands it to these sinks, each declared in this list too. L5 is then checked inside the wrapper, before each call that hands the buffer on, instead of at the wrapper's callers. Only for a sink the target defines whose property is initialized bytes (not kind log, terminal or buffer). security_props.py checks the claim against the model and keeps the property at the callers when it does not hold", "type": "array", "minItems": 1, "items": {"$ref": "#/definitions/function_ref"}},
           "description": {"$ref": "#/definitions/description"}
         },
         "required": ["function", "kind", "description"],
