@@ -396,7 +396,13 @@ def load_merge_notes(run_dir: Path) -> list[dict]:
         notes = task.get("merge_notes") if isinstance(task, dict) else None
         if isinstance(notes, dict) and notes:
             out.append(
-                {"task": str(task.get("id") or tid), "function": str(task.get("function") or ""), "notes": notes}
+                {
+                    "task": str(task.get("id") or tid),
+                    "function": str(task.get("function") or ""),
+                    "notes": notes,
+                    "state": task.get("state"),
+                    "outcome": task.get("outcome"),
+                }
             )
     return sorted(out, key=lambda n: (n["function"], n["task"]))
 
@@ -444,7 +450,7 @@ def merge_notes_lines(notes: list[dict] | None) -> list[str]:
         if isinstance(frame, dict):
             had = " (the contract it replaced had one)" if frame.get("baseline_had_assigns") else ""
             said.append(
-                "the WP report of the merge shows no frame for the whole function (`assigns` clause: "
+                "the WP report of the merge does not show a frame for the whole function (`assigns` clause: "
                 f"`{md_escape(str(frame.get('assigns_clause')))}`){had}"
             )
         guard = note.get("guardrail")
@@ -454,13 +460,20 @@ def merge_notes_lines(notes: list[dict] | None) -> list[str]:
                 f"{md_escape(' '.join(str(guard.get('reason') or 'no reason recorded').split()))[:200]})"
             )
         if said:
+            # The note is of the last merge of the task; the task may have been queued again or parked since.
+            state, outcome = item.get("state"), item.get("outcome")
+            if (state is not None and state != "done") or (outcome is not None and outcome != "merged"):
+                said.append(
+                    f"the task is not a finished merge now (state `{md_escape(str(state))}`, outcome "
+                    f"`{md_escape(str(outcome))}`)"
+                )
             rows.append(f"- `{md_escape(item.get('function') or item.get('task') or '?')}`: " + "; ".join(said) + ".")
     if not rows:
         return []
     out = [
         f"Merges accepted with a note ({len(rows)}; `merge_notes` of the tasks in `{WP_SCHEDULE.as_posix()}`). "
-        "The proof holds for the contract as merged, which states less than the one it replaced where a clause "
-        "is listed as removed:",
+        "Whatever is credited for these functions is for the contract as merged, which states less than the one "
+        "it replaced where a clause is listed as removed:",
         "",
         *rows[:MERGE_NOTE_ROWS_MAX],
     ]
@@ -1531,6 +1544,9 @@ def render_sarif(findings: list[dict], run_dir: Path | None = None) -> dict:
             rule_id, {"id": rule_id, "shortDescription": {"text": f"Frama-C property kind: {r['property']['kind']}"}}
         )
         props = {"verdict": r["verdict"], "reachability": r["reachability"]}
+        if not_compared := identity_not_compared(r):
+            # Reproducers counted although the parent's replay could not be compared with the candidate's failure.
+            props["failureIdentityNotCompared"] = len(not_compared)
         if r["verdict"] == "confirmed":
             props["severity"] = r["severity"]
             sev = r["severity"].lower()

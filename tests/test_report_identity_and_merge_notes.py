@@ -89,7 +89,10 @@ def test_the_detail_of_a_finding_says_its_reproducer_was_not_compared(run_dir):
 
 def test_the_report_counts_and_marks_the_findings_not_compared(run_dir, tmp_path_factory):
     """REPORT.md of a whole run whose confirmed finding carries the entry the ledger wrote for the hang."""
-    note = next(e for e in _hang_finding(run_dir)["evidence"] if e["description"].startswith(L.IDENTITY_NOT_COMPARED))
+    # The prefix as the ledger has written it since the entry exists, not the constant both sides now share.
+    note = next(
+        e for e in _hang_finding(run_dir)["evidence"] if e["description"].startswith("Failure identity not compared:")
+    )
     run = tmp_path_factory.mktemp("report_run")
     trep.build_run(run)
     findings = json.loads((run / "findings.json").read_text(encoding="utf-8"))
@@ -103,6 +106,10 @@ def test_the_report_counts_and_marks_the_findings_not_compared(run_dir, tmp_path
     assert f"Each is marked below: `{confirmed['fingerprint']}`." in section
     assert "- **Failure identity not compared:** for 1 reproducer(s) the parent's replay failed" in section
     assert "**Failure identity not compared.**" in (run / "FINDINGS-DETAIL.md").read_text(encoding="utf-8")
+    results = json.loads((run / "report.sarif").read_text(encoding="utf-8"))["runs"][0]["results"]
+    marked = {r["partialFingerprints"]["framacFingerprint/v1"]: r["properties"] for r in results}
+    assert marked[confirmed["fingerprint"]]["failureIdentityNotCompared"] == 1
+    assert sum("failureIdentityNotCompared" in p for p in marked.values()) == 1
 
 
 def test_a_finding_whose_reproducers_were_compared_is_not_marked(tmp_path):
@@ -112,6 +119,7 @@ def test_a_finding_whose_reproducers_were_compared_is_not_marked(tmp_path):
     for name in ("REPORT.md", "FINDINGS-DETAIL.md"):
         text = (tmp_path / name).read_text(encoding="utf-8")
         assert "identity" not in text and "not compared" not in text, name
+    assert "failureIdentityNotCompared" not in (tmp_path / "report.sarif").read_text(encoding="utf-8")
 
 
 def test_the_mark_survives_the_merge_of_findings_at_one_sink():
@@ -144,8 +152,9 @@ def test_the_report_lists_what_a_merged_contract_no_longer_states(tmp_path):
     assert "Merges accepted with a note (2; `merge_notes` of the tasks in `state/wp_schedule.json`)" in section
     line_a = next(ln for ln in section.splitlines() if ln.startswith("- `a`:"))
     assert "`ensures` removed in the contract outside named behaviors: `\\result >= -1`" in line_a
-    assert "shows no frame for the whole function (`assigns` clause: `absent`)" in line_a
-    assert "the contract it replaced had one" not in line_a
+    assert "does not show a frame for the whole function (`assigns` clause: `absent`)" in line_a
+    assert "the contract it replaced had one" not in line_a and "not a finished merge" not in line_a
+    assert "Whatever is credited for these functions is for the contract as merged" in section
     line_b = next(ln for ln in section.splitlines() if ln.startswith("- `b`:"))
     assert "no guardrail pass (`not_run`: module m has no harness sidecar with sources)" in line_b
     assert "`clean`" not in section
@@ -209,6 +218,23 @@ def test_a_schedule_that_is_not_json_is_read_as_saying_nothing(tmp_path):
     path.parent.mkdir(parents=True)
     path.write_text("{not json", encoding="utf-8", newline="\n")
     assert G.load_merge_notes(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("now", "said"),
+    [
+        ({"state": "done", "outcome": "merged"}, None),
+        ({"state": "pending", "outcome": None}, "(state `pending`, outcome `None`)"),
+        ({"state": "done", "outcome": "parked"}, "(state `done`, outcome `parked`)"),
+    ],
+)
+def test_a_note_on_a_task_that_is_no_longer_a_finished_merge_says_so(tmp_path, now, said):
+    """The scheduler drops the note only on a later clean merge: a task queued again or parked still has it."""
+    _schedule(tmp_path, {**_task("b", guardrail=MN_NOT_RUN), **now})
+    row = G.merge_notes_lines(G.load_merge_notes(tmp_path))[2]
+    assert row.startswith("- `b`: no guardrail pass")
+    assert ("not a finished merge now" in row) is (said is not None)
+    assert said is None or said in row
 
 
 def test_the_tasks_may_be_a_list(tmp_path):
