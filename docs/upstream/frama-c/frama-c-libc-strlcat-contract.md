@@ -3,7 +3,8 @@
 Draft for the Frama-C issue tracker (https://git.frama-c.com/pub/frama-c/-/issues).
 **Not filed.** Issue 44 of this folder, drafted on 2026-11-18. Filing is paused until the
 maintainers answer the overview issue #2832 (see [`./README.md`](./README.md)); no branch is
-pushed, and the MR text still holds `#<issue>`.
+pushed, and the MR text still holds `#<issue>`. The finding is listed in #2832 since the same
+day (see [Filing](#filing)).
 
 **Package:**
 [issue text](./filing/44-libc-strlcat-contract-issue.md),
@@ -243,8 +244,16 @@ Searched live on 2026-11-18 through the read-only API (`glab api`, issues and me
   after checking that the container's `master` is the head upstream has that day, then
   `file_upstream.py issue 44`, `subst`, `mr 44`. If `share/libc/string.h` or `tests/libc` moved
   upstream, regenerate the two oracles.
-- **The overview issue #2832 does not list it.** Adding a line there is an edit of a public
-  text, so it needs the owner's go-ahead.
+- **The overview issue #2832 lists it** since 2026-11-18, 21:56 UTC, on the owner's request
+  ("update the main discussion but don't fill a unitary issue for this yet"). Four additions
+  to its description, the same in
+  [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md):
+  - a dated note at the top of "Findings I have not filed";
+  - a Libc row in the table of wrong-answer findings, which says a patch exists;
+  - a row `44` in the Libc table of the annex;
+  - one sentence in the annex row L4: for `strlcat`, the E-ACSL failure comes from this clause.
+  - The issue was open with no comment just before; the stored description was read back and is
+    identical to the file.
 
 ## Pipeline workaround
 
