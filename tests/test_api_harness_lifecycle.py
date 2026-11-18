@@ -286,6 +286,24 @@ def test_the_destructor_that_frees_wins_over_close_and_close_runs_first():
         assert not ah._FREEING_DTOR_RE.search(name), name
 
 
+@pytest.mark.unit
+def test_a_close_that_frees_the_handle_is_no_closer():
+    """
+    A `close` that reaches `free` through its direct call sites frees the handle itself (sqlite3_close
+    style): running the freeing destructor after it would be a double free the harness makes.
+    """
+    dtors = {CTX: "ctx_free"}
+    names = {CTX: {"ctx_close", "ctx_free"}}
+    model = {"lib.c#ctx_close": {"name": "ctx_close", "call_sites": [{"callee": "ctx_release_all"}]}}
+    model["lib.c#ctx_release_all"] = {"name": "ctx_release_all", "external_calls": ["free"]}
+    assert ah.handle_closers(dtors, names, model) == {}
+    model.pop("lib.c#ctx_release_all")
+    assert ah.handle_closers(dtors, names, model) == {CTX: "ctx_close"}
+    # Only a destructor named for freeing gets a closer; a lone `close` destructor is the release itself.
+    assert ah.handle_closers({CTX: "ctx_close"}, names, model) == {}
+    assert ah.handle_closers(dtors, {CTX: {"ctx_cleanup", "ctx_free"}}, model) == {}
+
+
 MAPPING = "struct _modbus_mapping_t"
 MAPPING_LAYOUT = {"what": "struct", "size": 64, "align": 8, "pointers": True, "fields": []}
 

@@ -2403,7 +2403,8 @@ def plan(
     }
     inits, candidates, init_records = initializers(unit_pool, traces, visible)
     struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible)
-    helper_pool = (set(inits.values()) | set(struct_dtors.values())) - entry_names
+    freers = struct_freers(struct_dtor_names)
+    helper_pool = (set(inits.values()) | set(struct_dtors.values()) | set(freers.values())) - entry_names
     # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
     out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
     api = ApiInfo(
@@ -2427,7 +2428,7 @@ def plan(
         qual_ptrs=dict(getattr(visible, "qualified_pointers", None) or {}),
         struct_dtors=struct_dtors,
         struct_dtor_names=struct_dtor_names,
-        struct_freers=struct_freers(struct_dtor_names),
+        struct_freers=freers,
         enum_params=dict(getattr(visible, "enum_params", None) or {}),
         const_returns=set(getattr(visible, "const_returns", None) or ()),
         allocating=allocating_functions(model.get("functions") or {}),
