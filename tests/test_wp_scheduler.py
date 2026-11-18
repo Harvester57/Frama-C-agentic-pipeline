@@ -2035,8 +2035,15 @@ def _fake_verifier_replay(monkeypatch, reproducible, calls):
                 "mode": "replay",
                 "status": "reproduced" if reproducible else "not_reproduced",
                 "fingerprint_matches": reproducible,
+                # A reproduced input says what it failed on (here the candidate's failure): ingest-verifier compares it.
                 "artifacts": [
-                    {"artifact": i, "sha256": hashlib.sha256(Path(i).read_bytes()).hexdigest(), "reproducible": r}
+                    {
+                        "artifact": i,
+                        "sha256": hashlib.sha256(Path(i).read_bytes()).hexdigest(),
+                        "reproducible": r,
+                        "failure": None,
+                        "fingerprint": cmd[cmd.index("--fingerprint") + 1] if r else None,
+                    }
                     for i, r in zip(inputs, [reproducible] * len(inputs), strict=True)
                 ],
             },

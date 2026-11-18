@@ -91,6 +91,7 @@ Each item has `function`, `kind` and `description`.
 - **`params`:** optional; the parameters that carry the output. The default is the pointer parameters.
 - **`length`:** optional; the parameter that gives the number of elements `params` point to.
 - **`format`:** optional; the parameter that holds a printf-style format. Every call must then pass a string literal there.
+- **`checked_at`:** optional; for a wrapper sink only. A wrapper sink completes the buffer itself (a header length, a checksum) and then hands it to other sinks. List those sinks here; each must have its own item in `output_sinks`. The initialized-bytes property is then checked inside the wrapper, before each call that hands the buffer on, instead of at the wrapper's callers. Use it only for a sink the target defines, and not for `kind` `log`, `terminal` or `buffer`. The pipeline checks the claim against its model and keeps the property at the callers when the claim does not hold.
 - **What counts:** output that leaves the target, such as writes to sockets, files, logs or the terminal, or callbacks that hand data out. A library that writes only into structures its caller owns has no output sink.
 
 ## Example

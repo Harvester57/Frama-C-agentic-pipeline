@@ -81,10 +81,9 @@ def _seed(run_dir: Path) -> None:
     crash.parent.mkdir(parents=True, exist_ok=True)
     crash.write_bytes(b"\x04\x00\x01")
     sha = hashlib.sha256(crash.read_bytes()).hexdigest()
-    write_json(
-        run_dir / FUZZ,
-        {"status": "eacsl_violation", "artifacts": [{"artifact": CRASH, "sha256": sha, "reproducible": True}]},
-    )
+    # The artifact says what it failed on, as run_eacsl_fuzz.py writes it: ingest-verifier compares it.
+    art = {"artifact": CRASH, "sha256": sha, "reproducible": True, "failure": None, "fingerprint": FP_POS}
+    write_json(run_dir / FUZZ, {"status": "eacsl_violation", "artifacts": [art]})
     write_json(
         run_dir / "candidates.json",
         [_candidate(fp, pred) for fp, pred in sorted([(FP_POS, r"\valid_read(p + 0)"), (FP_NEG, r"\valid_read(p)")])],
