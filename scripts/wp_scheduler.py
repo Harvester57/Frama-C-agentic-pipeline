@@ -15,7 +15,7 @@ Subcommands (run with the run directory as working directory; each prints one JS
   complete       --agent-id ID                  validate one agent result and dispatch it by role
   merge-pending  [--module M] [--force]         merge finished provers in micro-batches, run re-checks
   refresh        [--module M]                   re-sync after a harness repair or a module re-run
-  requeue        --agent-id ID | --stale-minutes N | --memory-refused | --locate-failed
+  requeue        --agent-id ID | --stale-minutes N | --memory-refused | --locate-failed | --frame-refused
   requeue        --guardrail-hung               recover the tasks a hanging corpus input left without a dynamic verdict
   status
 
@@ -142,6 +142,8 @@ MAX_ANALYSIS_ERRORS = 2  # a WP analysis_error is retried once, then the units a
 MEMORY_REFUSAL = "insufficient_memory"
 # The splice could not find the function: said of the locator, never of the agent's proof.
 LOCATE_FAILURE = "could not locate definition of function"
+# How a merge the frame check refused ends its task: the ones `requeue --frame-refused` looks at again.
+FRAME_REFUSED_ENDINGS = {"prove": ("blocked", "merge_failed"), "negotiate": ("done", "rejected")}
 WP_MIN_MEMORY_MB = resources.FRAMAC_KERNEL_RESERVE_MB + resources.WP_MEMLIMIT_MB
 MAX_INVALID_RESULTS = 2  # a malformed result is re-run once with a fresh agent
 MAX_PREPARE_ERRORS = 3
@@ -4734,14 +4736,14 @@ def cmd_requeue_memory_refused() -> dict:
 
 
 def _splice_refusal(task: dict, aid: str) -> str | None:
-    """Why the merge would refuse this agent's result on the current tree, or None: the splice itself, run dry."""
+    """Why the merge would refuse this agent's result on the current tree, or None: splice and frame check, run dry."""
     scratch = Path("agents") / aid / "scratch"
     try:
         result = json.loads((scratch / "result.json").read_text(encoding="utf-8"))
         if result.get("status") != "all_proven":
             return f"agents/{aid}/scratch/result.json has status {result.get('status')!r}: there is no proof to merge"
-        for rel in workspace_overlay._collect_changed_files(scratch / "base", scratch / "work"):
-            acsl_ast.splice_prover_changes(
+        spliced = {
+            rel: acsl_ast.splice_prover_changes(
                 (scratch / "base" / rel).read_text(encoding="utf-8"),
                 (scratch / "work" / rel).read_text(encoding="utf-8"),
                 (Path("workspace/work") / rel).read_text(encoding="utf-8"),
@@ -4749,9 +4751,93 @@ def _splice_refusal(task: dict, aid: str) -> str | None:
                 is_header=rel.endswith(".h"),
                 path=rel,
             )
-    except (acsl_ast.AcslError, ArtifactError, OSError, ValueError) as exc:
+            for rel in workspace_overlay._collect_changed_files(scratch / "base", scratch / "work")
+        }
+        module = task.get("module")
+        cppflags = (_job_sidecar(module).get("cppflags") if module else None) or "-I."
+        return workspace_overlay.merged_frame_refusal(
+            Path.cwd(), task["file"], task["function"], task.get("header"), module, cppflags, spliced
+        )
+    except (acsl_ast.AcslError, ArtifactError, workspace_overlay.OverlayMergeError, OSError, ValueError) as exc:
         return f"{type(exc).__name__}: {exc}"
-    return None
+
+
+def _frame_refused_verdict(tasks: dict, task: dict, store: dict) -> tuple[str | None, str | None]:
+    """(the agent whose result the merge would take now, None), or (that agent if any, why the task is left alone)."""
+    aid, why = _refused_result(task)
+    if aid is None:
+        return None, why
+    latest = (task.get("agents") or [aid])[-1]
+    if latest != aid:
+        return aid, f"{latest} has been given the task since the merge of {aid}"
+    if task["kind"] == "negotiate":
+        requests = [str(rid) for rid in task.get("requests") or []]
+        moved = [
+            rid
+            for rid in requests
+            if (store.get(rid) or {}).get("status") != "rejected_by_callee"
+            or workspace_overlay.FRAME_REFUSAL not in str((store.get(rid) or {}).get("resolution_note"))
+        ]
+        if moved or not requests:
+            return aid, f"its requests are no longer rejected by this refusal: {moved}"
+        if (tasks.get(f"prove:{_key(task)}") or {}).get("state") in ("merge_queued", "merging"):
+            return aid, "the callee's own proof merges first"
+    why = DEPS.splice_refusal(task, aid)
+    if why:
+        return aid, why
+    negotiation = tasks.get(f"negotiate:{_key(task)}") or {}
+    if task["kind"] == "prove" and (negotiation.get("outcome") == "applied" or negotiation.get("state") in LIVE):
+        return aid, f"{negotiation['id']} ({negotiation['state']}, {negotiation.get('outcome')}) answers for this function"
+    return aid, None
+
+
+def cmd_requeue_frame_refused() -> dict:
+    """
+    Repair what the frame check refused by mistake: a result that passes the real check on the current tree goes back
+    to the merge queue with its units and strengthening requests, at no dispatch cost. Every verdict is reached before
+    anything is written. Idempotent. A result still refused, a negotiation whose requests have moved on and a task
+    running or queued are listed and left alone; tasks ended for any other reason are not looked at.
+    """
+    out: dict[str, Any] = {"ok": True, "merge_restored": [], "requests_restored": [], "left": [], "errors": []}
+    with run_lock("ledger"):
+        state = load_schedule()
+        tasks = state["tasks"]
+        store = {str(r.get("id")): r for r in _requests()}
+        restorable: list[tuple[dict, str]] = []
+        why: str | None
+        for tid, task in sorted(tasks.items()):
+            if task["kind"] not in PROVER_KINDS or workspace_overlay.FRAME_REFUSAL not in str(task.get("last_reason")):
+                continue
+            if (task["state"], task.get("outcome")) != FRAME_REFUSED_ENDINGS[task["kind"]]:
+                if task["state"] in LIVE or task["state"] == "pending":
+                    why = f"{task['state']} as {task.get('agent_id')}: the run still has this task in hand"
+                    out["left"].append({"task": tid, "agent_id": task.get("agent_id"), "reason": why})
+                continue
+            aid, why = _frame_refused_verdict(tasks, task, store)
+            if why or aid is None:
+                out["left"].append({"task": tid, "agent_id": aid, "reason": why})
+            else:
+                restorable.append((task, aid))
+
+        for task, aid in restorable:
+            entry: dict[str, Any] = {"task": task["id"], "agent_id": aid}
+            if task["kind"] == "prove":
+                entry["units"] = _reclaim_parked_units(task, aid, out["errors"], workspace_overlay.FRAME_REFUSAL)
+            else:
+                entry["requests"] = [str(rid) for rid in task.get("requests") or []]
+                for rid in entry["requests"]:
+                    _try(out["errors"], f"reopen {rid}", DEPS.resolve_request, REQUESTS, rid, "pending", "")
+                out["requests_restored"].extend(entry["requests"])
+            task["merge_attempts"] = 0
+            _requeue_refused_merge(state, task, aid, workspace_overlay.FRAME_REFUSAL)
+            if task["kind"] == "negotiate":
+                entry["callers"] = _hold_callers(state, task)
+            out["merge_restored"].append(entry)
+        out["sync"] = _sync(state, Ctx())
+        save_schedule(state)
+    _try(out["errors"], "forget reopened requests", spec_kb.forget_requests, Path.cwd(), out["requests_restored"])
+    out["ok"] = not out["errors"]
+    return out
 
 
 def cmd_requeue_locate_failed() -> dict:
@@ -5536,6 +5622,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Restore merges and reopen tasks that ended on a guardrail that hung on a corpus input",
     )
+    group.add_argument(
+        "--frame-refused",
+        action="store_true",
+        help="Restore merges the frame-preservation check refused, when the result passes that check on the tree now",
+    )
     sub.add_parser("status", help="Counts, ready/running tasks, gates and the remaining critical path")
     args = parser.parse_args(argv)
 
@@ -5578,6 +5669,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_refresh(args.module)
         elif args.cmd == "requeue" and args.guardrail_hung:
             out = cmd_requeue_guardrail_hung()
+        elif args.cmd == "requeue" and args.frame_refused:
+            out = cmd_requeue_frame_refused()
         elif args.cmd == "requeue":
             if args.locate_failed:
                 out = cmd_requeue_locate_failed()

@@ -1717,6 +1717,78 @@ def _merged_contract_acsl(shared_work: Path, rels: list[str], new_contents: dict
     return "\n".join(parts)
 
 
+FRAME_REFUSAL = "frame-preservation check failed"
+
+
+def _frame_refusal(
+    skeleton: dict,
+    run_dir: Path,
+    overlay: Path,
+    c_file: str | None,
+    function: str | None,
+    header_file: str | None,
+    module: str | None,
+    header_flags: str,
+    new_contents: dict[str, str],
+) -> str | None:
+    """
+    Why the merge refuses this result, or None. The projected frame skeleton is a required minimum: a prover
+    candidate that deletes or weakens a projected \\separated / assigns...\\from clause is rejected. The contract
+    may live in the .c or the .h, whichever of them the agent changed (possibly neither), so the function's
+    contract is checked as the merge would leave it in all of them together.
+    """
+    rels = _frame_contract_files(run_dir, overlay, c_file, function, header_file, module, header_flags, [*new_contents])
+    acsl = _merged_contract_acsl(overlay / "work", rels, new_contents, function or "")
+    errors = check_frame_preserved(skeleton, acsl, path=c_file or "<work>")
+    return f"{FRAME_REFUSAL}:\n  " + "\n  ".join(errors) if errors else None
+
+
+def _changed_prover_header(
+    run_dir: Path,
+    overlay: Path,
+    c_file: str,
+    function: str,
+    module: str | None,
+    header_flags: str,
+    changed_rels: list[str],
+) -> str | None:
+    """The header of a prover merge that names none: the one it changed beside its source, or its module's."""
+    sibling = Path(c_file).with_suffix(".h").as_posix()
+    if sibling in changed_rels:
+        return sibling
+    stem_matches = [r for r in changed_rels if r.endswith(".h") and Path(r).stem == Path(c_file).stem]
+    if len(stem_matches) == 1:
+        return stem_matches[0]
+    named = merged_sidecar(module_map_for(overlay), module).get("header") if module else None
+    header = _prover_header(run_dir, overlay / "work", c_file, function, str(named), header_flags) if named else None
+    return header if header in changed_rels else None
+
+
+def merged_frame_refusal(
+    run_dir: Path,
+    c_file: str,
+    function: str,
+    header_file: str | None,
+    module: str | None,
+    cppflags: str,
+    new_contents: dict[str, str],
+) -> str | None:
+    """The merge's own frame check, run dry on a prover result spliced into `new_contents` (work-relative paths)."""
+    run_dir = Path(run_dir).resolve()
+    overlay = run_dir / "workspace"
+    c_rel = _normalize_work_relpath(c_file)
+    skeleton = _function_frame_skeleton(overlay, module, c_rel, function)
+    if skeleton is None:
+        return None
+    flags = _module_header_flags(overlay, module, cppflags)
+    header = (
+        _prover_header(run_dir, overlay / "work", c_rel, function, _normalize_work_relpath(header_file), flags)
+        if header_file
+        else _changed_prover_header(run_dir, overlay, c_rel, function, module, flags, [*new_contents])
+    )
+    return _frame_refusal(skeleton, run_dir, overlay, c_rel, function, header, module, flags, new_contents)
+
+
 TRUST_BOUNDARY_REASON = "trust-boundary check failed"
 
 
@@ -1873,21 +1945,9 @@ def _merge_agent_overlay_locked(
         allowed_rels.add(norm_c_file)
         if not norm_header_file:
             # Auto-infer sibling or module header when the prover also updated its function prototype contract
-            sibling_h = Path(norm_c_file).with_suffix(".h").as_posix()
-            if sibling_h in changed_rels:
-                norm_header_file = sibling_h
-            else:
-                stem_matches = [r for r in changed_rels if r.endswith(".h") and Path(r).stem == Path(norm_c_file).stem]
-                if len(stem_matches) == 1:
-                    norm_header_file = stem_matches[0]
-                elif module:
-                    hmeta = merged_sidecar(module_map_for(overlay), module)
-                    if hmeta.get("header"):
-                        mod_hdr = _prover_header(
-                            run_dir, shared_work, norm_c_file, function, str(hmeta["header"]), header_flags
-                        )
-                        if mod_hdr in changed_rels:
-                            norm_header_file = mod_hdr
+            norm_header_file = _changed_prover_header(
+                run_dir, overlay, norm_c_file, function, module, header_flags, changed_rels
+            )
         if norm_header_file:
             allowed_rels.add(norm_header_file)
 
@@ -1988,17 +2048,11 @@ def _merge_agent_overlay_locked(
         texts_before[rel_str] = (agent_text, base_snap_text, baseline_text)
 
     if frame_skel is not None:
-        # The projected frame skeleton is a required minimum: a prover candidate that deletes
-        # or weakens a projected \separated / assigns...\from clause is rejected. The contract
-        # may live in the .c or the .h, whichever of them the agent changed (possibly neither),
-        # so check the function's contract as the merge would leave it in all of them together.
-        frame_rels = _frame_contract_files(
-            run_dir, overlay, norm_c_file, function, norm_header_file, module, header_flags, changed_rels
+        frame_refusal = _frame_refusal(
+            frame_skel, run_dir, overlay, norm_c_file, function, norm_header_file, module, header_flags, new_contents
         )
-        frame_acsl = _merged_contract_acsl(shared_work, frame_rels, new_contents, function or "")
-        frame_errs = check_frame_preserved(frame_skel, frame_acsl, path=norm_c_file or "<work>")
-        if frame_errs:
-            raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
+        if frame_refusal:
+            raise AcslError(frame_refusal)
 
     entry_metas = _untrusted_entry_metas(overlay, module, function, norm_c_file)
     if entry_metas:
