@@ -207,8 +207,10 @@ def prepare_replay_binary(
     Build the module binary for replays (normally a cache hit on the Make or campaign build).
     `security_props` among `build_options` (`--security-props PATH|none`) names the run's MetAcsl
     properties as for the campaign's build: the cache key holds their text, not the file's path, so
-    a replay that names the file another way, or builds elsewhere, restores the same entry, and the
-    identity of a violation does not hold the path of its meta file (failure_identity._meta_failure).
+    a replay that names the file another way restores the same entry. A replay that builds in another
+    directory is another entry (the key holds the directory, as for any build) with the same
+    fingerprints: the identity of a violation does not hold the path of its meta file
+    (failure_identity._meta_failure).
     """
     build = fuzz_build.build_module_binary(sources, Path(out_bin), **build_options)
     comp = build["compile"]

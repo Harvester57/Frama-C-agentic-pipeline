@@ -217,7 +217,7 @@ def _eacsl_cache_material(
     Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse).
     `security_meta` is the loaded plan of a build with MetAcsl properties (resolve_security_meta): the
     key `security_meta` (`_security_meta_material`) is there only then, so a build without properties
-    keeps the key it always had and is never restored for one with them, nor the reverse.
+    keeps the material it always had and is never restored for one with them, nor the reverse.
     """
     has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
     eacsl_bin, is_modern = _resolve_eacsl_gcc()

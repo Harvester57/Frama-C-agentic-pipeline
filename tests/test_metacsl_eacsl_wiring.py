@@ -501,6 +501,22 @@ def test_the_guardrail_does_not_take_the_option(tmp_path, monkeypatch, capsys):
     assert "--security-props" in capsys.readouterr().err
 
 
+@pytest.mark.unit
+def test_a_direct_eacsl_build_is_plain_with_the_engine_on(run_dir, monkeypatch):  # noqa: F811
+    # The guardrail, the loop-seed check and the selftest call compile_eacsl_binary themselves: neither
+    # the run's default file nor $FRAMAC_SECURITY_PROPS reaches them (only build_module_binary reads them).
+    write_props(DEFAULT_PROPS, wiring_props(["eacsl"]))
+    monkeypatch.setenv(fuzz_build.SECURITY_PROPS_ENV, str(DEFAULT_PROPS))
+    fake = FakeToolchain()
+    comp = fuzz_build.compile_eacsl_binary(
+        SOURCES, OUT_BIN, cppflags="", functions=list(MODULE_FUNCTIONS), ldflags_extra="", use_cache=False, runner=fake
+    )
+    assert comp["returncode"] == 0 and "security_props" not in comp
+    assert len(fake.stage1_cmds) == 1 and "-meta" not in " ".join(fake.stage1_cmds[0])
+    assert "--then-last" not in fake.stage1_cmds[0]
+    assert not OUT_BIN.with_suffix(failure_identity.SECURITY_META_SUFFIX).exists()
+
+
 # ---------------------------------------------------------------------------------------------------
 # crash_replay.py
 # ---------------------------------------------------------------------------------------------------
