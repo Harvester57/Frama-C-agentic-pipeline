@@ -300,6 +300,9 @@ Searched live on 2026-11-18 through the read-only API (`glab api`, issues and me
   - one sentence in the annex row L4: for `strlcat`, the E-ACSL failure comes from this clause.
   - The issue was open with no comment just before; the stored description was read back and is
     identical to the file.
+  - **Second edit, 22:23 UTC, on the owner's request ("update 2832"):** the annex row `44` also
+    describes the weak `separation` precondition, with the overlapping call, and its kind gains
+    "lost alarm". Read back identical; still no comment on the issue.
 
 ## Pipeline workaround
 
