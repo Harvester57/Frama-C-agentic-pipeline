@@ -1961,7 +1961,8 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
         if res.timed_out:
             report["diagnostics"]["first_error"] = f"build timed out after {args.timeout} s"
         else:
-            # A Windows checkout's CRLF script fails with a bare `not found` or `Illegal option -`.
+            # A Windows checkout's CRLF script fails with a bare `not found`, `Illegal option -` or a
+            # shell `Syntax error`; a CRLF configure.ac breaks the generated configure.
             crlf = line_endings.scan_crlf_scripts(tree)
             hint = line_endings.failure_hint("the build command", res.returncode, log, crlf, recipe["command"])
             if hint:
