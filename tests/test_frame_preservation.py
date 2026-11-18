@@ -148,7 +148,8 @@ WEAK_H = BASELINE_H.replace(
 )
 
 
-def _setup_run(tmp_path: Path, agent_h_text: str) -> tuple[Path, Path]:
+def _init_tree(tmp_path: Path, tree_c: str = BASELINE_C, tree_h: str = BASELINE_H, agents: int = 1) -> tuple[Path, Path]:
+    """A run whose shared tree already holds `tree_c` / `tree_h` when the agents' scratch overlays are cut from it."""
     target = tmp_path / "target"
     target.mkdir()
     (target / "parser.c").write_text(BASELINE_C, encoding="utf-8")
@@ -156,7 +157,10 @@ def _setup_run(tmp_path: Path, agent_h_text: str) -> tuple[Path, Path]:
     run_dir = tmp_path / "run"
     overlay = run_dir / "workspace"
     workspace_overlay.init_overlay(target, overlay)
-    workspace_overlay.init_agent_overlay(run_dir, "prover-1", overlay)
+    (overlay / "work" / "parser.c").write_text(tree_c, encoding="utf-8")
+    (overlay / "work" / "parser.h").write_text(tree_h, encoding="utf-8")
+    for n in range(1, agents + 1):
+        workspace_overlay.init_agent_overlay(run_dir, f"prover-{n}", overlay)
     # The module's facts carry the projected skeleton for parser.c#parse_payload.
     facts_dir = overlay / "reports" / "facts"
     facts_dir.mkdir(parents=True, exist_ok=True)
@@ -171,8 +175,27 @@ def _setup_run(tmp_path: Path, agent_h_text: str) -> tuple[Path, Path]:
         ),
         encoding="utf-8",
     )
+    return run_dir, overlay
+
+
+def _setup_run(tmp_path: Path, agent_h_text: str) -> tuple[Path, Path]:
+    run_dir, overlay = _init_tree(tmp_path)
     (run_dir / "agents" / "prover-1" / "scratch" / "work" / "parser.h").write_text(agent_h_text, encoding="utf-8")
     return run_dir, overlay
+
+
+def _merge(run_dir: Path, overlay: Path, **kwargs: object) -> dict:
+    return workspace_overlay.merge_agent_overlay(
+        run_dir=run_dir,
+        agent_id="prover-1",
+        role="prover",
+        overlay_dir=overlay,
+        c_file="parser.c",
+        function="parse_payload",
+        module="m",
+        skip_reverify=True,
+        **kwargs,  # type: ignore[arg-type]
+    )
 
 
 def test_merge_accepts_candidate_preserving_the_skeleton(tmp_path: Path) -> None:
@@ -225,3 +248,111 @@ def test_merge_fails_open_without_facts(tmp_path: Path) -> None:
         skip_reverify=True,
     )
     assert res["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# The contract is read from the merged tree, not only from the files the agent changed
+# (libmodbus run-1: a negotiation that proved the contract already on the tree changed nothing,
+# and every projected clause was reported missing)
+# ---------------------------------------------------------------------------
+
+DEFINITION = "int parse_payload(const uint8_t *buf, size_t len, int *out) {"
+GOOD_CONTRACT = (
+    "/*@\n"
+    "  requires len > 0 ==> \\valid_read(buf + (0 .. len - 1));\n"
+    "  requires \\valid(out);\n"
+    "  requires \\separated(buf + (0 .. len - 1), out);\n"
+    "  assigns *out \\from buf + (0 .. len - 1), len;\n"
+    "*/\n"
+)
+GOOD_C = BASELINE_C.replace(DEFINITION, GOOD_CONTRACT + DEFINITION)
+WEAK_C = BASELINE_C.replace(DEFINITION, "/*@\n  requires \\valid(out);\n  assigns *out;\n*/\n" + DEFINITION)
+# A contract on the prototype that says nothing about the frame.
+FRAMELESS_H = BASELINE_H.replace(
+    "int parse_payload(const uint8_t *buf, size_t len, int *out);",
+    "/*@ ensures \\result == 0 || \\result == -1; */\nint parse_payload(const uint8_t *buf, size_t len, int *out);",
+)
+
+
+def test_unchanged_result_with_the_contract_in_the_source_merges_as_a_no_op(tmp_path: Path) -> None:
+    run_dir, overlay = _init_tree(tmp_path, tree_c=GOOD_C)
+    res = _merge(run_dir, overlay)
+    assert res["ok"] is True
+    assert res["modified_files"] == []
+    assert (overlay / "work" / "parser.c").read_text(encoding="utf-8") == GOOD_C
+
+
+def test_unchanged_result_with_the_contract_on_an_unnamed_header_merges_as_a_no_op(tmp_path: Path) -> None:
+    # No header is named (modbus_get_float_cdab: `header_file: ''`, its contract on the prototype in modbus.h).
+    run_dir, overlay = _init_tree(tmp_path, tree_h=GOOD_H)
+    res = _merge(run_dir, overlay)
+    assert res["ok"] is True
+    assert res["modified_files"] == []
+    assert (overlay / "work" / "parser.h").read_text(encoding="utf-8") == GOOD_H
+
+
+@pytest.mark.parametrize("named_header", [None, "parser.h"])
+def test_agent_changing_only_the_header_keeps_the_contract_of_the_unchanged_source(
+    tmp_path: Path, named_header: str | None
+) -> None:
+    run_dir, overlay = _init_tree(tmp_path, tree_c=GOOD_C)
+    (run_dir / "agents" / "prover-1" / "scratch" / "work" / "parser.h").write_text(FRAMELESS_H, encoding="utf-8")
+    res = _merge(run_dir, overlay, header_file=named_header)
+    assert res["ok"] is True
+    assert res["modified_files"] == ["parser.h"]
+    assert (overlay / "work" / "parser.c").read_text(encoding="utf-8") == GOOD_C
+
+
+def test_agent_changing_only_the_source_keeps_the_contract_of_the_unchanged_header(tmp_path: Path) -> None:
+    run_dir, overlay = _init_tree(tmp_path, tree_h=GOOD_H)
+    agent_c = BASELINE_C.replace(DEFINITION, "/*@ ensures \\result <= 0; */\n" + DEFINITION)
+    (run_dir / "agents" / "prover-1" / "scratch" / "work" / "parser.c").write_text(agent_c, encoding="utf-8")
+    res = _merge(run_dir, overlay)
+    assert res["ok"] is True
+    assert res["modified_files"] == ["parser.c"]
+
+
+def test_unchanged_result_is_refused_when_the_tree_lacks_the_projected_clauses(tmp_path: Path) -> None:
+    run_dir, overlay = _init_tree(tmp_path, tree_c=WEAK_C)
+    with pytest.raises(AcslError, match="frame-preservation"):
+        _merge(run_dir, overlay)
+    assert (overlay / "work" / "parser.c").read_text(encoding="utf-8") == WEAK_C
+
+
+def test_agent_weakening_the_contract_of_the_source_is_refused(tmp_path: Path) -> None:
+    run_dir, overlay = _init_tree(tmp_path, tree_c=GOOD_C)
+    (run_dir / "agents" / "prover-1" / "scratch" / "work" / "parser.c").write_text(WEAK_C, encoding="utf-8")
+    with pytest.raises(AcslError, match="frame-preservation"):
+        _merge(run_dir, overlay)
+    assert (overlay / "work" / "parser.c").read_text(encoding="utf-8") == GOOD_C
+
+
+def test_agent_weakening_the_header_is_refused_when_the_unchanged_source_has_no_frame(tmp_path: Path) -> None:
+    run_dir, overlay = _init_tree(tmp_path, tree_c=WEAK_C, tree_h=GOOD_H)
+    (run_dir / "agents" / "prover-1" / "scratch" / "work" / "parser.h").write_text(WEAK_H, encoding="utf-8")
+    with pytest.raises(AcslError, match="frame-preservation"):
+        _merge(run_dir, overlay, header_file="parser.h")
+    assert (overlay / "work" / "parser.h").read_text(encoding="utf-8") == GOOD_H
+
+
+def test_batch_merges_an_unchanged_result_and_refuses_one_on_a_tree_without_the_clauses(tmp_path: Path) -> None:
+    entry = {"role": "prover", "file": "parser.c", "function": "parse_payload", "module": "m"}
+
+    good_dir = tmp_path / "good"
+    good_dir.mkdir()
+    run_dir, overlay = _init_tree(good_dir, tree_c=GOOD_C)
+    res = workspace_overlay.merge_agent_batch(
+        run_dir, [{**entry, "agent_id": "prover-1"}], overlay_dir=overlay, skip_reverify=True
+    )
+    assert res["ok"] is True, res["failed"]
+    assert [m["agent_id"] for m in res["merged"]] == ["prover-1"]
+
+    weak_dir = tmp_path / "weak"
+    weak_dir.mkdir()
+    run_dir, overlay = _init_tree(weak_dir, tree_c=WEAK_C)
+    res = workspace_overlay.merge_agent_batch(
+        run_dir, [{**entry, "agent_id": "prover-1"}], overlay_dir=overlay, skip_reverify=True
+    )
+    assert res["ok"] is False
+    assert res["merged"] == []
+    assert "frame-preservation" in res["failed"][0]["reason"]
