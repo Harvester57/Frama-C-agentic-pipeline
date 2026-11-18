@@ -41,7 +41,9 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 02:32-02:36 | DAG `force_includes` now the snapshot copy; harness generated with 20 cases and 51 skipped (`no constructor for opaque handle`); reach gate fails on 51 gaps; session stops and asks |
 | 02:39 | Fix 5 merged; session told to rebuild the scratch tree and re-record seeds, then wait for fix 6 |
 | 02:40-02:42 | Capture, model, threat model checks, DAG and security properties rebuilt identical; seeds `ok`: 321 calls (189 unique) over 46 API functions, 9 of 10 executables relinked |
-| ~02:50 | Fix 6 merged; session told to regenerate the harness, pass the reach gate, finish Phase 0 and stop before Phase 1 |
+| 02:43 | Fix 6 merged; session told to regenerate the harness, pass the reach gate, finish Phase 0 and stop before Phase 1 |
+| 02:44-02:45 | Harness: 67 of 71 entry points with a case (68 cases incl. one `modbus_t` lifecycle case); reach gate: 3 internals exempted, `modbus_proxy` the only gap; session asks |
+| 02:47 | Supervisor approves a hand-written `modbus_proxy` case (with changes) |
 
 ## Pipeline issues and fixes
 
@@ -78,6 +80,7 @@ Tests added:
 - Fix 2 and fix 3 are landed live (user's instruction at 02:01); fix 1 stays held.
 - Overnight, the supervisor answers the session's questions on the user's behalf; each answer is listed here.
 - 02:36, "how to recover the 51 functions skipped for `modbus_t *`": pipeline fix (the session's option 1), not 51 hand-written dispatch cases. The session's diagnosis (constructors with parameters refused) was wrong: the code accepts them, and the name rule is what fails.
+- 02:46, "may I hand-write a dispatch case for `modbus_proxy`?" (the one gap left: two `modbus_t` handles, the documented same-type skip): yes, with three changes to the proposed case. Close the preload end of the `socketpair` before the call, or every short input waits the 0.5 s response timeout. Close the backend end after the call, or each execution leaks a descriptor. Set short response and byte timeouts as a backstop. The three internal entry points (`_modbus_init_common`, `_modbus_receive_msg`, `_error_print`) were exempted by the session with a structural reason (they need `modbus-private.h`; reached through public callers).
 - ~02:50, seeds: the session redoes the build capture on a fresh scratch volume, the model, threat model checks, DAG and security properties, then re-records seeds with the fixed recorder before any harness is regenerated.
 
 Also added by fix 3: `tests/test_fc_compat_contracts.py::test_modem_line_bits_and_termios2_requests_are_defined_for_frama_c_libc_only` and `::test_modem_line_bits_and_termios2_requests_parse_with_frama_c_libc_as_gcc_reads_them` (`FRAMAC_DOCKER_TESTS=1`, rerun green by the supervisor).
