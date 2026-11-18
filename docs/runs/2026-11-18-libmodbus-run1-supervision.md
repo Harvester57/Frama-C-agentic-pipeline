@@ -19,7 +19,7 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 
 ## Status
 
-**Phase 1, running.** Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wall clock, including about 70 min of fix and wait time).
+**Phase 3, running** (07:35: 48 tasks done, 83 pending, 15 running). Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wall clock, including about 70 min of fix and wait time). Phases 1-2 and the crash verification gate ran 03:07-05:59, with two harness repairs. 12 pipeline fixes so far.
 
 ## Timeline (supervisor's observations, local time, 2026-11-18)
 
@@ -67,6 +67,12 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 05:35-05:48 | Re-fuzz candidates: `modbus_reply_exception` x2 is harness-induced (the lifecycle loop passes a short tail of the input as an unsized request; see the open item of fix 7); `tcp_pi_listen` init is `disproved_by_source` (E-ACSL and `getaddrinfo`); `tcp_pi_listen` mem (reopened) is harness-induced (TCP-PI methods in the lifecycle case) |
 | 05:48-05:59 | Repair 2 (the last allowed), by hand: the lifecycle methods get their own TCP-PI context and a copied, zero-padded request buffer. `module-<mod>` 559 s. Refresh: **no new candidates**; the gate is open |
 | 06:00 | Phase 3: the header architect and one breaker run, and provers wait for the architect's merge. Scheduler: 34 done, 101 pending, 10 skipped |
+| 06:00-06:45 | The architect takes 2742 s against its 900 s budget and merges 54 contracts; 14 provers and 1 negotiation start. The first prover, `_error_print`, proves 8 of 9 goals and asks for `valid_read_string(\result)` on `modbus_strerror` |
+| 06:51-07:11 | Most provers stall on Frama-C libc-model limits, while all their runtime-error goals are proven:<br>- frames naming `__fc_sockfds`/`__fc_fds`/`Frama_C_entropy_source` fail the E-ACSL guardrail (fix 12);<br>- the `ioctl` footprint aborts WP (`_modbus_rtu_close`, `_modbus_rtu_connect`);<br>- the `nanosleep` contract only gives a non-strict decrease (`_sleep_response_timeout` variant);<br>- `<< 8` overflow goals are left to WP's uninterpreted `lsl`.<br>The session records each in `wp-and-guardrail.md`. The overdue IPv4-options negotiation is told to finalize (06:52) |
+| 07:02 | Fixer dispatched for fix 12 (`sup/libmodbus-libc-model-ghosts`) |
+| 07:14 | `modbus_strerror` proves the requested `valid_read_string(\result)`; 36/37 goals proven |
+| 07:21 | Fix 12 merged live as `9250359`; the session is told to pass the frame note to every new socket/termios prover, negotiation and breaker, and to the ones still running |
+| 07:25-07:33 | The fix works in the run: the `_modbus_tcp_recv` negotiation proves every goal with the `__fc_fds` frame, and the guardrail passes. `compute_data_length_after_meta` proves 33/33 after its negotiation; `_modbus_tcp_is_connected` and the `_modbus_tcp_send` retry prove fully |
 | 04:49 | Supervisor finds the confirmed `send_msg` loop documented in `docs/modbus_set_error_recovery.md` ("an infinite close/connect loop until success on send call" under `MODBUS_ERROR_RECOVERY_LINK`). The harness had enabled LINK on a context with no peer, so the verdict is a false positive. Guidance prepared: keep the record, report it as documented behaviour, and mask LINK in the regenerated harness |
 
 ## Pipeline issues and fixes
@@ -84,6 +90,7 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 10 | Gate: `modbus_tcp_listen` E-ACSL `\initialized(&ctx_tcp->ip[0])` at modbus-tcp.c:632 (verifier: `disproved_by_source`). `strlcpy` resolves to glibc 2.38+ (`HAVE_STRLCPY`), and `EACSL_LIBC_EFFECTS` has no `strlcpy`/`strlcat` entry | pipeline gap (named in the existing entry's "remaining gaps") | `sup/libmodbus-strlcpy-effect` `af0b259`, `14237e9`, merged live as `99039ce` | fixed: Docker probe cases 9-12 (clean after the copy, still stops one byte past it); full suite green |
 | 11 | Gate: orchestrator idle from 04:54, waiting for 4 verify tasks prepared at 04:44-04:46 whose subagents were never spawned | model error + pipeline gap (no detection of a prepared task that was never dispatched) | none | open; entry in `wp-and-guardrail.md`; supervisor told the session to spawn them (05:08) |
 | 9 | Phase 1 fuzz: `modbus_tcp_pi_listen` SEGV at modbus-tcp.c:684 (a TCP context, built by `modbus_new_tcp`, read as a TCP-PI context) | pipeline bug (one constructor per handle type, whatever backend the method expects) | none | open; recorded |
+| 12 | Phase 3 guardrail: `eacsl_instrumentation_failed`, `modbus-tcp.c:<n>: unbound logic variable __fc_sockfds` (also `__fc_fds`, `Frama_C_entropy_source`). WP proves the frame that names the `__fc_libc` model object, but the guardrail builds with host headers that lack it | pipeline gap | `sup/libmodbus-libc-model-ghosts` `1ea83a1`, `f89ce15`, merged live as `9250359` | fixed: weak definitions with `__fc_libc`'s types in the `__FRAMAC_EACSL__` branch of `fc_compat_types.h` (an `extern` fails the link, since full memory tracking registers every global). Docker repro before/after; full suite 6245 passed. Confirmed in the run by the `_modbus_tcp_recv` negotiation (07:28) |
 
 Tests added:
 
@@ -125,6 +132,8 @@ Tests added:
 
 Also added by fix 3: `tests/test_fc_compat_contracts.py::test_modem_line_bits_and_termios2_requests_are_defined_for_frama_c_libc_only` and `::test_modem_line_bits_and_termios2_requests_parse_with_frama_c_libc_as_gcc_reads_them` (`FRAMAC_DOCKER_TESTS=1`, rerun green by the supervisor).
 
+Added by fix 12: `tests/test_fc_compat_contracts.py::test_eacsl_host_headers_define_the_libc_model_objects_weakly` and `::test_contracts_naming_libc_model_objects_prove_under_wp_and_build_under_eacsl` (`FRAMAC_DOCKER_TESTS=1`). Both fail on the original header.
+
 ## Upstream drafts
 
 - Issue 41, [`../upstream/frama-c/frama-c-libc-ioctl-modem-bits.md`](../upstream/frama-c/frama-c-libc-ioctl-modem-bits.md): `__fc_libc` `<sys/ioctl.h>` lacks the `TIOCM_*` modem bits (34.0~beta and master `95408044f7`). Not filed; the owner decides between a new issue and a note on #2828.
@@ -132,3 +141,5 @@ Also added by fix 3: `tests/test_fc_compat_contracts.py::test_modem_line_bits_an
 ## Open items
 
 - Fix 1 (CRLF hint) is held on its branch until the run ends.
+- Unverified diagnosis: the session recorded the one open `modbus_strerror` goal (`typed_modbus_strerror_assigns_normal_part17`) as an upstream WP bug with "contradictory hypotheses on the call-result temporary". Contradictory hypotheses would make the goal trivially provable, but the log shows a (cached) Alt-Ergo `Timeout`. `__fc_libc`'s `strerror` assigns only `\result`. Needs a look at the goal before any upstream report.
+- Units that stalled on the guardrail frame before fix 12 (`_modbus_rtu_flush`, `_connect`, `_modbus_tcp_close`, `_modbus_tcp_flush`, `_modbus_tcp_set_ipv4_options`) keep their weaker frames in run-1 unless the scheduler offers them another task; they should prove on a rerun.
