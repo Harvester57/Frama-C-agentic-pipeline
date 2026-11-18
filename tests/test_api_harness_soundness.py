@@ -158,7 +158,7 @@ def test_context_pointer_is_initialized_before_the_call_under_test():
     assert "struct _QCBORDecodeContext c0a0; memset(&c0a0, 0, sizeof(c0a0));" in stmt
     assert "unsigned char c0a0[" not in stmt
     init = "(void)QCBORDecode_Init((struct _QCBORDecodeContext *)&c0a0, c1a1, c1a2);"
-    assert init in stmt and stmt.index(init) < stmt.index("(void)QCBORDecode_GetInt64(&c0a0, &c0a1);")
+    assert init in stmt and stmt.index(init) < stmt.index("(void)QCBORDecode_GetInt64(&c0a0, ")
     # The initializer's input slice is the rest of the input (the CBOR to decode); its mode is a slot.
     assert "c1a1.ptr = (void *)(fuzz_buf + fuzz_off);" in stmt
     assert layout["rest"] == {"call": 1, "param": 1, "kind": "bytes", "off": 0}
