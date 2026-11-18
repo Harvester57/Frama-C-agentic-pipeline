@@ -659,3 +659,107 @@ def test_modem_line_bits_and_termios2_requests_parse_with_frama_c_libc_as_gcc_re
     # The `_Static_assert`s of TIOCM_C held under Frama-C; gcc computes the same numbers from glibc.
     gcc = log.split("==gcc==", 1)[1].split("==end==", 1)[0].split()
     assert gcc == [str(0x802C542A), str(0x402C542B)], gcc
+
+
+# ---------------------------------------------------------------------------------------------------
+# __fc_libc model objects under E-ACSL (libmodbus run-1, 2026-11-18): WP proved `assigns __fc_sockfds[s]`
+# (setsockopt), `assigns __fc_fds[fd]` (close) and `assigns Frama_C_entropy_source` (tcflush), the
+# guardrail's E-ACSL build stopped at "unbound logic variable __fc_sockfds": host glibc declares none.
+# ---------------------------------------------------------------------------------------------------
+
+# Name -> declarator in the E-ACSL branch, as __fc_libc types them (__fc_builtin.h, __fc_define_fds.h,
+# sys/socket.h, __fc_select.h).
+LIBC_MODEL_OBJECTS = {
+    "Frama_C_entropy_source": "volatile int Frama_C_entropy_source",
+    "__fc_fds": "volatile int __fc_fds[__FC_MAX_OPEN_FILES]",
+    "__fc_sockfds": "struct __fc_sockfds_type __fc_sockfds[__FC_MAX_OPEN_SOCKETS]",
+    "__fc_socket_counter": "int __fc_socket_counter",
+    "__fc_fds_state": "volatile int __fc_fds_state",
+}
+
+
+@pytest.mark.unit
+def test_eacsl_host_headers_define_the_libc_model_objects_weakly():
+    block = _eacsl_host_block()
+    for name, declarator in LIBC_MODEL_OBJECTS.items():
+        # A definition, not `extern` (full memory tracking registers the address: undefined reference)
+        # nor a ghost (printed as a comment: a clause E-ACSL executes would not compile).
+        assert f"\n{declarator} __attribute__((weak));" in block, name
+        assert f"extern {declarator}" not in block and f"ghost {declarator}" not in block, name
+    for macro in ("__FC_MAX_OPEN_FILES", "__FC_MAX_OPEN_SOCKETS"):
+        assert f"#ifndef {macro}\n#define {macro} 1024\n#endif" in block, macro
+    assert "struct __fc_sockfds_type {\n  int x;\n};" in block
+    # E-ACSL only: __fc_libc declares them itself for Eva and WP.
+    text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    assert text.count("__attribute__((weak));") == len(LIBC_MODEL_OBJECTS)
+    assert text.count("struct __fc_sockfds_type {") == 1
+
+
+LIBC_MODEL_C = r"""#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <termios.h>
+#include <unistd.h>
+
+/*@ requires valid_socket: 0 <= s < __FC_MAX_OPEN_SOCKETS;
+  @ assigns __fc_sockfds[s];
+  @*/
+int set_nodelay(int s)
+{
+  int one = 1;
+  return setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+}
+
+/*@ requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
+  @ assigns __fc_fds[fd];
+  @*/
+int do_close(int fd) { return close(fd); }
+
+/*@ assigns Frama_C_entropy_source; */
+int flush(int fd) { return tcflush(fd, TCIOFLUSH); }
+
+/*@ assigns \nothing;
+  @ ensures quiet_source: Frama_C_entropy_source == 0 ==> \result == 0;
+  @*/
+int quiet(void) { return 0; }
+
+int main(void)
+{
+  /* A descriptor no process has open: every call fails with EBADF and changes nothing. */
+  int r = set_nodelay(1000) + do_close(1000) + flush(1000) + quiet();
+  printf("ok %d\n", r);
+  return 0;
+}
+"""
+
+
+@image
+@slow
+def test_contracts_naming_libc_model_objects_prove_under_wp_and_build_under_eacsl(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    eacsl_flags = (
+        f"F=$(python3 -c '{PY}import eacsl_toolchain as T; "
+        'print(T.build_eacsl_flag_sets("-I.", fuzzer=False, full_mtracking=True)["frontend"])\'); '
+    )
+    script = (
+        FRAMAC_FLAGS + eacsl_flags + 'echo "==eacsl=="; '
+        'e-acsl-gcc -c -F -e-acsl-full-mtracking -E "$F" -o m.frama.c -O bin m.c > build.log 2>&1; echo "build=$?"; '
+        './bin.e-acsl 2>&1; echo "run=$?"; '
+        # set_nodelay under Bytes only, as on libmodbus: Typed hides `&one` cast to setsockopt's `char *`
+        # (Cast with incompatible pointers types), so its optval precondition times out there.
+        'echo "==wp=="; frama-c -no-unicode m.c -cpp-extra-args="$A" -wp -wp-model Typed '
+        "-wp-fct do_close,flush,quiet -wp-timeout 20 -wp-cache none 2>&1; "
+        'echo "==bytes=="; frama-c -no-unicode m.c -cpp-extra-args="$A" -wp -wp-model Bytes '
+        '-wp-fct set_nodelay,do_close,flush,quiet -wp-timeout 20 -wp-cache none 2>&1; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"m.c": LIBC_MODEL_C}, script, timeout=900)
+    eacsl = log.split("==eacsl==", 1)[1].split("==wp==", 1)[0]
+    build = (tmp_path / "build.log").read_text(encoding="utf-8", errors="replace")
+    assert "unbound logic variable" not in build, build
+    assert "undefined reference" not in build, build
+    assert "build=0" in eacsl, build
+    assert "ok -3" in eacsl and "run=0" in eacsl, eacsl
+    for tag in ("wp", "bytes"):
+        proved, total = _proved(log, tag)
+        assert proved == total, log.split(f"=={tag}==", 1)[1]

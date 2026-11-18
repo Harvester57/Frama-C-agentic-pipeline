@@ -213,6 +213,33 @@ long int labs(long int j);
   @*/
 long long int llabs(long long int j);
 
+/* The model objects of __fc_libc's descriptor, socket and termios contracts (libmodbus run-1,
+ * 2026-11-18). WP proves `assigns __fc_sockfds[s]` on a caller of setsockopt, `assigns __fc_fds[fd]`
+ * on a caller of close, `assigns Frama_C_entropy_source` on a caller of tcflush, because those are what
+ * the libc contracts assign. Host glibc declares none of them, so the same contract stopped the E-ACSL
+ * build with "unbound logic variable __fc_sockfds". Same names, types and sizes as __fc_libc
+ * (__fc_builtin.h, __fc_define_fds.h, __fc_define_max_open_files.h, sys/socket.h, __fc_select.h).
+ * E-ACSL does not check `assigns` / `\from`: the names only have to resolve. They are weak C definitions,
+ * not `extern` declarations nor ghosts: full memory tracking registers every global the instrumented file
+ * declares (`__e_acsl_store_block(&__fc_fds, ...)`), so an `extern` failed the link with "undefined
+ * reference to `__fc_fds'", and a ghost would be printed as a comment, so a clause E-ACSL does execute
+ * (`assumes Frama_C_entropy_source != 0`) would not compile. Weak, so a second definition (another
+ * translation unit, a target defining one) links. Clang compiles without __FRAMAC__ never see them. */
+#ifndef __FC_MAX_OPEN_FILES
+#define __FC_MAX_OPEN_FILES 1024
+#endif
+#ifndef __FC_MAX_OPEN_SOCKETS
+#define __FC_MAX_OPEN_SOCKETS 1024
+#endif
+struct __fc_sockfds_type {
+  int x;
+};
+volatile int Frama_C_entropy_source __attribute__((weak));
+volatile int __fc_fds[__FC_MAX_OPEN_FILES] __attribute__((weak));
+struct __fc_sockfds_type __fc_sockfds[__FC_MAX_OPEN_SOCKETS] __attribute__((weak));
+int __fc_socket_counter __attribute__((weak));
+volatile int __fc_fds_state __attribute__((weak));
+
 #else /* Frama-C __fc_libc */
 
 #include <stdint.h>
