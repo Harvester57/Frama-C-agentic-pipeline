@@ -134,6 +134,7 @@ Invoke the skills from your AI coding assistant:
 | [`/framac-eva`](./skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
 | [`/framac-wp`](./skills/framac-wp/SKILL.md) | **Phase 3** | Dispatches the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) via `wp_scheduler.py`, enforcing the E-ACSL Dynamic Guardrail and spawning Adversarial Breakers on stalled goals. |
 | [`/run-supervisor`](./skills/run-supervisor/SKILL.md) | **Any (host-side)** | **Read-only supervisor of a live run:** polls progress, containers and the opencode transcript, triages stalls and failures, has fixer subagents reproduce and fix pipeline bugs in isolated worktrees with a failing regression test first, records troubleshooting entries and upstream drafts, and writes a supervision report. Never steers or stops the run, never pushes. |
+| [`/paper-assessment`](./skills/paper-assessment/SKILL.md) | **None (planning)** | **Research papers to a ranked plan:** reads each paper with a stated coverage, weighs its evidence, generalizes its mechanisms, maps them onto the scripts and briefs, drops what the pipeline's rules exclude or earlier trials closed, has one independent challenger attack the rest, and writes a ranked plan under `docs/plans/` plus a row per paper in [`papers-assessed.md`](./docs/plans/papers-assessed.md). Changes no pipeline code. |
 
 ---
 
@@ -175,6 +176,8 @@ frama-c/
 │   └── framac-wp/                    # Phase 3: Dependency-driven parallel WP swarm (/framac-wp)
 │       ├── SKILL.md
 │       └── *_brief.md                # Subagent briefs (header_architect, prover, breaker, crash_verifier)
+│   ├── run-supervisor/SKILL.md       # Read-only supervisor of a live run (/run-supervisor)
+│   ├── paper-assessment/SKILL.md     # Research papers to a ranked improvement plan (/paper-assessment)
 │   ├── python-patterns/SKILL.md      # Conventions for the pipeline's Python scripts
 │   └── python-testing/SKILL.md       # Pytest conventions for tests/
 ├── scripts/                          # Stdlib-only Python 3.10+ pipeline scripts
