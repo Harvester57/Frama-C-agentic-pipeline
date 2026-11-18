@@ -179,17 +179,52 @@ def promote_file(
     }
 
 
+def _timeout_artifacts(run_dir: Path, agent_id: str) -> dict[str, str]:
+    """libFuzzer's `timeout-<sha1 of the input>` artifacts in the agent's scratch: {sha1: run-relative path}."""
+    scratch = Path(run_dir).resolve() / "agents" / agent_id / "scratch"
+    found: dict[str, str] = {}
+    for root, _, files in os.walk(scratch):
+        for name in sorted(files):
+            if name.startswith("timeout-"):
+                rel = (Path(root) / name).relative_to(Path(run_dir).resolve()).as_posix()
+                found.setdefault(name[len("timeout-") :], rel)
+    return found
+
+
+def _hang_artifact_of(run_dir: Path, agent_id: str, seed_rel: str, artifacts: dict[str, str]) -> str | None:
+    """The agent's own timeout artifact for this seed, when it saw the seed hang."""
+    if not artifacts:
+        return None
+    check_promotable(run_dir, agent_id, seed_rel, "seed")
+    blob = (Path(run_dir).resolve() / seed_rel.replace("\\", "/")).read_bytes()
+    return artifacts.get(hashlib.sha1(blob, usedforsecurity=False).hexdigest())
+
+
 def promote_seeds(
     run_dir: Path,
     agent_id: str,
     module: str,
     seed_rels: list[str],
 ) -> dict[str, Any]:
-    """Promote up to MAX_SEEDS_PER_AGENT breaker seeds into workspace/corpus/<module>/."""
+    """
+    Promote up to MAX_SEEDS_PER_AGENT breaker seeds into workspace/corpus/<module>/.
+
+    A seed the agent itself saw hang (its libFuzzer run left a `timeout-<sha1>` artifact of these bytes) is refused
+    and listed in `refused_hanging`: every later guardrail replays every promoted seed, so it would pay for the hang.
+    Only the agent's own evidence is read: a seed that hangs without having left an artifact still gets through.
+    """
     if len(seed_rels) > MAX_SEEDS_PER_AGENT:
         raise PromotionError(f"too many seeds ({len(seed_rels)}) from {agent_id}; limit is {MAX_SEEDS_PER_AGENT}")
-    promoted = [promote_file(run_dir, agent_id, s, kind="seed", module=module) for s in seed_rels]
-    return {"agent_id": agent_id, "module": module, "promoted": promoted}
+    artifacts = _timeout_artifacts(run_dir, agent_id)
+    promoted: list[dict[str, Any]] = []
+    refused: list[dict[str, str]] = []
+    for seed in seed_rels:
+        artifact = _hang_artifact_of(run_dir, agent_id, seed, artifacts)
+        if artifact is not None:
+            refused.append({"src": seed.replace("\\", "/"), "artifact": artifact})
+            continue
+        promoted.append(promote_file(run_dir, agent_id, seed, kind="seed", module=module))
+    return {"agent_id": agent_id, "module": module, "promoted": promoted, "refused_hanging": refused}
 
 
 def main(argv: list[str] | None = None) -> int:

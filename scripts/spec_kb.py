@@ -531,6 +531,22 @@ def forget_memory_refusals(run_dir: Path) -> int:
     return len(items) - len(kept)
 
 
+def forget_requests(run_dir: Path, request_ids: list[str]) -> int:
+    """Drop the stored dead ends of strengthening requests that are open again; returns how many were dropped."""
+    run_dir = Path(run_dir)
+    path = kb_dir_of(run_dir / "workspace") / OBSTRUCTIONS_FILE
+    gone = {f"req:{rid}" for rid in request_ids}
+    with run_lock("spec-kb", run_dir=run_dir):
+        doc = _load_quiet(path, {})
+        items = doc.get("items")
+        if not isinstance(items, list):
+            return 0
+        kept = [i for i in items if not (isinstance(i, dict) and i.get("id") in gone)]
+        if len(kept) != len(items):
+            atomic_write_json(path, {**doc, "items": kept, "updated_at": utc_now()})
+    return len(items) - len(kept)
+
+
 def _plain_name(name: str) -> str:
     return name.rsplit("#", 1)[-1]
 

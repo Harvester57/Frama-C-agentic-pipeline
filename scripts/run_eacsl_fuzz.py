@@ -40,6 +40,11 @@ Modes:
    corpus is replayed again without mutations and `mutations_skipped` holds the crash. When the
    input still cannot be dropped, or past the limit, the status is `guardrail_error` and
    `outside_checked_functions` holds the failure.
+   A replayed input that hangs (libFuzzer's per-input `-timeout`) says nothing about the contract either: it is
+   dropped the same way, its entry has `kind: timeout`, and a hanging mutation skips the burst. `timeout_s` bounds
+   all the replays together. When the hang cannot be dropped, every input hung, the limit or the wall budget is
+   reached, the status is `guardrail_error` and `replay_hang` holds the hang: never a pass, a `code_fault` or a
+   rejected contract. `corpus_replayed` counts the inputs left, and a pass that dropped a hang is not cached.
 3. `selftest`: builds the bundled canary through the production path (never cached).
 4. `build`: compiles a module's fuzz binary only (no target code runs). Used by Make.
 5. `replay`: replays given inputs once each on a given or built binary. The report's
@@ -1151,6 +1156,13 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "It is not evidence that the contract holds on real inputs; the merged proof records it as an "
                 "open assumption."
             )
+        hung = [str(e.get("input")) for e in res.get("excluded_inputs") or [] if e.get("kind") == "timeout"]
+        if hung:
+            passed_hints.append(
+                f"{len(hung)} replayed input(s) hung until libFuzzer's per-input timeout and were dropped "
+                f"({', '.join(hung)}). A hang says nothing about this contract; the verdict comes from the "
+                f"{res.get('corpus_replayed')} input(s) that ran to the end."
+            )
         dropped = [e for e in res.get("excluded_inputs") or [] if e.get("failure")]
         if dropped:
             passed_hints.append(
@@ -1235,6 +1247,13 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
             f"RTE assertion failed at runtime on a real input ({loc}, predicate={failure.get('predicate')!r}): "
             "this is a code defect candidate, NOT a contract error. Do NOT weaken your ACSL contracts to hide it; "
             "stop synthesis and return status 'blocked' (or 'failed' for architect) with this guardrail report in 'evidence'."
+        )
+        return hints
+
+    if status == "guardrail_error" and res.get("replay_hang"):
+        _add(
+            f"The dynamic oracle gave no verdict: {res.get('reason')} This says nothing about your contract and it is "
+            "NOT a code_fault: do not change your ACSL contracts for it."
         )
         return hints
 
@@ -1425,15 +1444,51 @@ def failure_outside_checked_functions(failure: dict | None, output: str, functio
     return re.sub(r"\s+", " ", text).strip()[:300]
 
 
-def _replayed_input_of(crash_input: str | None, entries: list[list[str | int]]) -> str | None:
-    """The replayed corpus file whose content is the crash artifact `crash_input` (run-relative), or None."""
-    if not crash_input:
+def replay_hang(output: str, crash_input: str | None) -> str | None:
+    """
+    The hang a guardrail replay stopped on, as one line, or None.
+
+    That is libFuzzer's per-input alarm with its `timeout-` artifact and no E-ACSL report: the input never finished,
+    so no check of the contract failed on it. The sandbox's wall limit is not one (no input is named).
+    """
+    if not crash_input or _artifact_kind(Path(crash_input).name) != "timeout":
         return None
+    if parse_eacsl_failure(output) is not None:
+        return None
+    headline = _REPLAY_CRASH_RE.search(output or "")
+    if headline is None or "libFuzzer: timeout" not in headline.group(0):
+        return None
+    return re.sub(r"^==\d+==\s*", "", headline.group(0)).strip()[:300]
+
+
+def _hang_entry(input_name: str, why: str, crash_input: str | None, output: str, functions: list[str] | None) -> dict:
+    """An `excluded_inputs` entry for a hang; `in_checked_function` tells whether a checked function was on the stack."""
+    headline = _REPLAY_CRASH_RE.search(output or "")
+    frames = [m.group("function") for m in _STACK_FRAME_FN_RE.finditer(output, headline.start())] if headline else []
+    checked = _checked_names(functions or [])
+    return {
+        "input": input_name,
+        "kind": "timeout",
+        "crash": why,
+        "crash_input": crash_input,
+        "in_checked_function": any(name in checked for name in frames),
+    }
+
+
+def _replayed_inputs_of(crash_input: str | None, entries: list[list[str | int]]) -> list[str]:
+    """The replayed corpus files whose content is the crash artifact `crash_input` (run-relative), sorted."""
+    if not crash_input:
+        return []
     path = Path(crash_input)
     digest = cache.file_digest(path) or (sha256_file(path) if path.is_file() else None)
     if not digest:
-        return None
-    return next((str(e[0]) for e in sorted(entries) if e[1] == digest), None)
+        return []
+    return [str(e[0]) for e in sorted(entries) if e[1] == digest]
+
+
+def _replayed_input_of(crash_input: str | None, entries: list[list[str | int]]) -> str | None:
+    """The first replayed corpus file whose content is the crash artifact `crash_input`, or None."""
+    return next(iter(_replayed_inputs_of(crash_input, entries)), None)
 
 
 def _stage_replay_corpus(scratch_dir: Path, corpus_dir: Path, names: list[str]) -> Path:
@@ -1594,6 +1649,7 @@ def run_guardrail_check(
                 cached = dict(entry.data.get("verdict") or {})
                 if cached.get("status") == "passed_dynamic_oracle":
                     cached.update(selection)
+                    cached["corpus_replayed"] = max(0, len(replay_manifest) - len(cached.get("excluded_inputs") or []))
                     cached["corpus_dir"] = str(corpus_dir)
                     cached["crash_input"] = None
                     cached["cache"] = {"hit": True, "key": g_key}
@@ -1601,11 +1657,16 @@ def run_guardrail_check(
                     return cached
 
     # A replay stops at its first crash. An input that crashes outside the checked functions says nothing about
-    # the contract: drop it and replay the rest (crash_outside_checked_functions), at most a few times.
+    # the contract: drop it and replay the rest (crash_outside_checked_functions), at most a few times. So does an
+    # input that hangs (replay_hang). Each replay starts over, so that `reach` comes from one complete run of the
+    # inputs left, and `timeout_s` is the budget of all of them: a hang costs a whole per-input timeout.
     replay_names = list(chosen_names)
     excluded: list[dict] = []
     mutation_runs = runs
     mutations_skipped: dict | None = None
+    hang_stop: str | None = None
+    deadline = time.monotonic() + timeout_s
+    wall_left = timeout_s
     while True:
         replay_dir = corpus_dir
         if sampled or excluded:
@@ -1624,7 +1685,7 @@ def run_guardrail_check(
         ]
         artifacts_before = _prefix_artifacts(scratch_dir)
         res = sandbox_exec.run_sandboxed(
-            cmd, writable=[scratch_dir], timeout_s=timeout_s, limits=Limits(cpu_seconds=timeout_s * 2)
+            cmd, writable=[scratch_dir], timeout_s=wall_left, limits=Limits(cpu_seconds=wall_left * 2)
         )
         reach, combined_out = parse_guardrail_reach(res.stdout + "\n" + res.stderr, functions)
         verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
@@ -1635,6 +1696,33 @@ def run_guardrail_check(
         )
         if verdict["status"] == "passed_dynamic_oracle" or verdict.get("unsound") or res.timed_out:
             break
+        hang = replay_hang(combined_out, crash_input)
+        if hang is not None:
+            still = set(replay_names)
+            hung = _replayed_inputs_of(crash_input, [e for e in replay_manifest if e[0] in still])
+            if not hung and mutation_runs > 0:
+                # A mutation of the burst: the seed is fixed, so the burst would hang there every time.
+                mutations_skipped = {"crash_input": crash_input, "kind": "timeout", "crash": hang}
+                mutation_runs = 0
+            elif not hung:
+                hang_stop = f"An input that is not a replayed corpus file hung ({hang})"
+                break
+            elif len(excluded) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
+                hang_stop = (
+                    f"More than {GUARDRAIL_MAX_EXCLUDED_INPUTS} replayed inputs hang or crash elsewhere ({hang})"
+                )
+                break
+            else:
+                excluded.extend(_hang_entry(name, hang, crash_input, combined_out, functions) for name in hung)
+                replay_names = [name for name in replay_names if name not in hung]
+                if not replay_names:
+                    hang_stop = f"every replayed input hung or was dropped ({hang})"
+                    break
+            wall_left = math.ceil(deadline - time.monotonic())
+            if wall_left < 1:
+                hang_stop = f"The wall budget of {timeout_s} s ran out on inputs that hang ({hang})"
+                break
+            continue
         failure = verdict.get("failure")
         if failure is not None:
             scope = functions if verdict["status"] == "code_fault" or contract_functions is None else contract_functions
@@ -1670,6 +1758,9 @@ def run_guardrail_check(
             # every time; replay the corpus alone and say so (`mutations_skipped`).
             mutations_skipped = {"crash_input": crash_input, **outside}
             mutation_runs = 0
+            wall_left = math.ceil(deadline - time.monotonic())
+            if wall_left < 1:
+                break
             continue
         if len(excluded) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
             verdict["reason"] = (
@@ -1679,6 +1770,26 @@ def run_guardrail_check(
             break
         excluded.append({"input": name, **outside})
         replay_names.remove(name)
+        wall_left = math.ceil(deadline - time.monotonic())
+        if wall_left < 1:
+            break
+    dropped_hang = any(e.get("kind") == "timeout" for e in excluded)
+    if hang_stop is not None:
+        verdict.update(
+            status="guardrail_error",
+            reason=f"{hang_stop}: the contract was not tested on the rest of the corpus.",
+            failure=None,
+            replay_hang={"crash": hang_stop, "crash_input": crash_input},
+        )
+    elif res.timed_out and verdict["status"] == "guardrail_error" and not verdict.get("unsound"):
+        verdict.update(
+            reason=(
+                f"The replay reached its wall limit of {timeout_s} s after {len(excluded)} dropped input(s): "
+                "the contract was not tested on the rest of the corpus."
+            ),
+            replay_hang={"crash": "wall limit", "crash_input": crash_input},
+        )
+    selection = corpus_selection_fields(len(corpus_entries), len(replay_names), sampled)
     verdict.update(
         {
             "excluded_inputs": excluded,
@@ -1699,7 +1810,8 @@ def run_guardrail_check(
         verdict["runtime_trace"] = combined_out[-4000:]
     verdict["diagnostic_hints"] = derive_eacsl_diagnostic_hints(verdict)
     if g_key is not None and g_material is not None:
-        if verdict["status"] == "passed_dynamic_oracle":
+        # Whether an input hangs depends on the machine: such a pass holds for this replay only.
+        if verdict["status"] == "passed_dynamic_oracle" and not dropped_hang:
             with contextlib.suppress(OSError, ValueError):
                 if in_parent_guard:
                     s_store = cache.shared_store()
