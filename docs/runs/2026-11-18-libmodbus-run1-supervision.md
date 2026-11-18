@@ -19,7 +19,9 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 
 ## Status
 
-**Phase 3, running** (07:35: 48 tasks done, 83 pending, 15 running). Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wall clock, including about 70 min of fix and wait time). Phases 1-2 and the crash verification gate ran 03:07-05:59, with two harness repairs. 12 pipeline fixes so far.
+**Phase 3, running, recovering from fix 13.** No prove task merged before 08:37: every parent WP re-check was refused for memory (fix 13). At 08:49 the schedule held 0 prove tasks done, 36 blocked, 49 pending and 8 running. **Correction:** the "48 done" and "68 done" counts reported earlier in this run held only verifiers, breakers, negotiations, the architect and the repair task, and no proof.
+
+Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wall clock, including about 70 min of fix and wait time). Phases 1-2 and the crash verification gate ran 03:07-05:59, with two harness repairs. 13 pipeline issues so far.
 
 ## Timeline (supervisor's observations, local time, 2026-11-18)
 
@@ -72,7 +74,10 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 07:02 | Fixer dispatched for fix 12 (`sup/libmodbus-libc-model-ghosts`) |
 | 07:14 | `modbus_strerror` proves the requested `valid_read_string(\result)`; 36/37 goals proven |
 | 07:21 | Fix 12 merged live as `9250359`; the session is told to pass the frame note to every new socket/termios prover, negotiation and breaker, and to the ones still running |
-| 07:25-07:33 | The fix works in the run: the `_modbus_tcp_recv` negotiation proves every goal with the `__fc_fds` frame, and the guardrail passes. `compute_data_length_after_meta` proves 33/33 after its negotiation; `_modbus_tcp_is_connected` and the `_modbus_tcp_send` retry prove fully |
+| 07:25-07:33 | The fix works in the agents' scratch overlays: the `_modbus_tcp_recv` negotiation proves every goal with the `__fc_fds` frame, and the guardrail passes. `compute_data_length_after_meta` proves 33/33 after its negotiation; `_modbus_tcp_is_connected` and the `_modbus_tcp_send` retry prove fully. None of these reached the merged tree (fix 13) |
+| 08:24 | Supervisor opens the blocked tasks: 0 prove tasks done, 34 blocked, 12 of them `insufficient_memory` on the parent WP re-check. Every scheduler call ran with `-Class light` (1 GiB) |
+| 08:37 | Session told to use `-Class verify`; the first real merge lands (`negotiate:_modbus_rtu_get_response_tid`, `done:applied`). No new refusal afterwards |
+| 08:56 | Fix 13 merged live as `0dbfddd`; the recovery command `requeue --memory-refused` is queued for the session's next idle moment |
 | 04:49 | Supervisor finds the confirmed `send_msg` loop documented in `docs/modbus_set_error_recovery.md` ("an infinite close/connect loop until success on send call" under `MODBUS_ERROR_RECOVERY_LINK`). The harness had enabled LINK on a context with no peer, so the verdict is a false positive. Guidance prepared: keep the record, report it as documented behaviour, and mask LINK in the regenerated harness |
 
 ## Pipeline issues and fixes
@@ -91,6 +96,7 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 11 | Gate: orchestrator idle from 04:54, waiting for 4 verify tasks prepared at 04:44-04:46 whose subagents were never spawned | model error + pipeline gap (no detection of a prepared task that was never dispatched) | none | open; entry in `wp-and-guardrail.md`; supervisor told the session to spawn them (05:08) |
 | 9 | Phase 1 fuzz: `modbus_tcp_pi_listen` SEGV at modbus-tcp.c:684 (a TCP context, built by `modbus_new_tcp`, read as a TCP-PI context) | pipeline bug (one constructor per handle type, whatever backend the method expects) | none | open; recorded |
 | 12 | Phase 3 guardrail: `eacsl_instrumentation_failed`, `modbus-tcp.c:<n>: unbound logic variable __fc_sockfds` (also `__fc_fds`, `Frama_C_entropy_source`). WP proves the frame that names the `__fc_libc` model object, but the guardrail builds with host headers that lack it | pipeline gap | `sup/libmodbus-libc-model-ghosts` `1ea83a1`, `f89ce15`, merged live as `9250359` | fixed: weak definitions with `__fc_libc`'s types in the `__FRAMAC_EACSL__` branch of `fc_compat_types.h` (an `extern` fails the link, since full memory tracking registers every global). Docker repro before/after; full suite 6245 passed. Confirmed in the run by the `_modbus_tcp_recv` negotiation (07:28) |
+| 13 | Phase 3 merge: `parent WP check on merged tree returned status='analysis_error': insufficient_memory` (`this job may use 1024 MiB, but WP needs at least 1768 MiB`). `step` was not inferred as `verify`, the session passed `-Class light`, and the scheduler treated the refusal as a failed proof | pipeline bug + model error | `sup/libmodbus-merge-memory` `62a54cf`, `10b1fac`, merged live as `0dbfddd` | fixed; full suite 6260 passed. Recovery `wp_scheduler.py requeue --memory-refused`, replayed on a copy: 11 provers and 2 negotiations re-merged, 7 negotiations rerun, 25 requests reopened. 5 partial contracts are not retried (open) |
 
 Tests added:
 
@@ -110,6 +116,7 @@ Tests added:
 - 02:25: the model passed a Python file to `-ScriptFile`, which runs it with bash (`import: command not found`), then rewrote it as bash with a heredoc. The wrapper's `-ScriptFile` help could say it must be a shell script.
 - 02:28: the run brief asks the model to send its progress report with SendUserFile, a tool opencode does not have; the model said so and left the report on disk (`docs/runs/2026-11-18-libmodbus-run1.md`, uncommitted, not indexed).
 - 04:47: the timeout crash verifier confirmed an infinite retry in `send_msg` as a medium DoS. That loop is documented behaviour of `MODBUS_ERROR_RECOVERY_LINK`, and the brief already requires the harness to respect "the entry function's declared or documented contract". The verifier did not read the function's doc page (`docs/modbus_set_error_recovery.md`), although the target ships one per API function. Suggested brief change (not applied): for a hang or timeout, check the documentation of every mode-setting call in the witness's call sequence, and reject as harness-induced a hang the documentation promises.
+- 06:00-08:24: the model passed `-Class light` on every scheduler call and reported "done" totals and "all proven" for work that never merged, without reading the `analysis_error` outcomes in the `step` output. The supervisor also relayed those totals until 08:24. Suggested brief change (not applied): report done counts by task kind, and treat any `blocked` prove task as something to explain.
 - 04:24: the model killed a computing `eva-tune` under CLAUDE.md's "no progress for 15 minutes" rule, although the frama-c rung was at 100 % CPU within its limit. A defensible call given an 11 h worst case, but the rule is about stalls, not slow steps. The skill could say how long `eva-tune` may take, and whether skipping it is acceptable in a `standard` run.
 - 01:56-02:00: on `no_unit_parsed` the model investigated pipeline code for several minutes instead of stopping and reporting as framac-slice Step 1c says. It reached the right diagnosis and did not edit pipeline files.
 
@@ -141,5 +148,7 @@ Added by fix 12: `tests/test_fc_compat_contracts.py::test_eacsl_host_headers_def
 ## Open items
 
 - Fix 1 (CRLF hint) is held on its branch until the run ends.
+- Fix 13 leaves 5 stalled provers' partial contracts unmerged (`compute_data_length_after_meta`, `crc16`, `_modbus_rtu_ioctl_rts`, `_modbus_tcp_get_response_tid`, `_sleep_response_timeout`). Their callers lose those contracts in run-1.
+- The session's entry "A Proven Postcondition Is Never Merged" describes the scheduler's intended rule: a partial merge needs a verified `assigns`. The real blocker there is the `modbus_strerror` `assigns` goal that timed out.
 - Unverified diagnosis: the session recorded the one open `modbus_strerror` goal (`typed_modbus_strerror_assigns_normal_part17`) as an upstream WP bug with "contradictory hypotheses on the call-result temporary". Contradictory hypotheses would make the goal trivially provable, but the log shows a (cached) Alt-Ergo `Timeout`. `__fc_libc`'s `strerror` assigns only `\result`. Needs a look at the goal before any upstream report.
 - Units that stalled on the guardrail frame before fix 12 (`_modbus_rtu_flush`, `_connect`, `_modbus_tcp_close`, `_modbus_tcp_flush`, `_modbus_tcp_set_ipv4_options`) keep their weaker frames in run-1 unless the scheduler offers them another task; they should prove on a rerun.
