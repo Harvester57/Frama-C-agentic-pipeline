@@ -1,0 +1,36 @@
+Command: /home/opam/.opam/5.5/bin/e-acsl-gcc -n --no-constfold --libc-replacements --validate-format-strings -G clang -F -rte -machdep gcc_x86_64 -e-acsl-full-mtracking -rte-initialized @all -rte-select body_assert -e-acsl-functions body_assert -E -D__FRAMAC_EACSL__ -D_Float128=double -U__SIZEOF_INT128__ -D__SUPPORT_SNAN__ -Dregister= -I/opt/framac-pipeline/templates/fc_stubs/eacsl -I/opt/framac-pipeline/templates/fc_stubs -include /opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h -wrapper /repo/scripts/fc_cpp_wrapper_eacsl.py -Iworkspace/work/src -o state/guard/body_assert/guard_body_assert.instrumented.c workspace/work/src/probe.c
+Returncode: 0
+--- STDOUT ---
+[kernel:pp:extra-args-std] Warning: 
+  Preprocessing options contain '-std='; make sure they are consistent with Frama-C's '-std' option. These arguments may come from -cpp-command, -cpp-extra-args, -cpp-extra-args-per-file, or from a compilation database. Use '-kernel-warn-key=pp:extra-args-std=inactive' to disable this warning.
+[kernel] Parsing workspace/work/src/probe.c (with preprocessing)
+[kernel:typing:gcc-mode] /usr/include/x86_64-linux-gnu/sys/types.h:164: 
+  Converting type 'int' with 'mode(__word__)' attribute into mode-less type 'long'
+[rte:annot] annotating function body_assert
+[e-acsl] beginning translation.
+[kernel:pp:extra-args-std] Warning: 
+  Preprocessing options contain '-std='; make sure they are consistent with Frama-C's '-std' option. These arguments may come from -cpp-command, -cpp-extra-args, -cpp-extra-args-per-file, or from a compilation database. Use '-kernel-warn-key=pp:extra-args-std=inactive' to disable this warning.
+[kernel] Parsing FRAMAC_SHARE/e-acsl/e_acsl.h (with preprocessing)
+[kernel:typing:gcc-mode] /usr/include/x86_64-linux-gnu/sys/types.h:164: 
+  Converting type 'int' with 'mode(__word__)' attribute into mode-less type 'long'
+[kernel:attrs] Warning: unexpected statement attribute cold
+[kernel:attrs] Warning: unexpected statement attribute cold
+[e-acsl] workspace/work/src/probe.c:115: Warning: 
+  invalid E-ACSL construct
+  `invalid guard i + r ≥ 0 in quantification
+  unb_assert: ∀ ℤ i; 0 ≤ i ⇒ i + r ≥ 0. Missing upper bound for i.
+  Only < and ≤ are allowed to guard quantifier variables'.
+  Ignoring annotation.
+[e-acsl] translation done in project "e-acsl".
+[rte:annot] annotating function body_assert
+
+--- STDERR ---
+++ /home/opam/.opam/5.5/bin/frama-c -rte -machdep gcc_x86_64 -e-acsl-full-mtracking -rte-initialized @all -rte-select body_assert -e-acsl-functions body_assert -keep-unused-functions none -no-variadic-translation -machdep gcc_x86_64 '-cpp-extra-args= -std=c99 -D_DEFAULT_SOURCE -D__NO_CTYPE -D__FC_MACHDEP_X86_64  -D__FRAMAC_EACSL__ -D_Float128=double -U__SIZEOF_INT128__ -D__SUPPORT_SNAN__ -Dregister= -I/opt/framac-pipeline/templates/fc_stubs/eacsl -I/opt/framac-pipeline/templates/fc_stubs -include /opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h -wrapper /repo/scripts/fc_cpp_wrapper_eacsl.py -Iworkspace/work/src' -no-frama-c-stdlib workspace/work/src/probe.c -e-acsl -e-acsl-replace-libc-functions -e-acsl-validate-format-strings -e-acsl-share=/home/opam/.opam/5.5/bin/../share/frama-c/share/e-acsl -then-last -print -ocode state/guard/body_assert/guard_body_assert.instrumented.c
+
+
+Marked 14 formal parameter(s) initialized at function entry (E-ACSL registers formals without marking them; uninitialized struct members passed by value are not reported).
+
+Injected 1 __e_acsl_sound_verdict = 1 reset(s) at LLVMFuzzerTestOneInput entry.
+
+Runtime patch format_runtime (format-runtime-1): the runtime is compiled from /tmp/w/state/guard/body_assert/eacsl_share/format-runtime-1-a0dcfc7c8028/e-acsl; a signed/unsigned argument of one rank passes a format directive when its value fits both types, and pointer arguments after a floating-point one are read from their own slots.
+

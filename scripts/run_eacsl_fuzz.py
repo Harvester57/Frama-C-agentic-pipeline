@@ -45,6 +45,10 @@ Modes:
    all the replays together. When the hang cannot be dropped, every input hung, the limit or the wall budget is
    reached, the status is `guardrail_error` and `replay_hang` holds the hang: never a pass, a `code_fault` or a
    rejected contract. `corpus_replayed` counts the inputs left, and a pass that dropped a hang is not cached.
+   E-ACSL does not fail on a clause it cannot translate: it warns `Ignoring annotation` and checks nothing for
+   it. The status keeps its meaning (what the executed checks did); `unchecked_clauses` names the clauses of the
+   checked functions that were not executed, `dynamic_oracle_incomplete` is true when there is one, and
+   `ignored_annotations` is the build's whole list (dynamic_oracle_fields).
 3. `selftest`: builds the bundled canary through the production path (never cached).
 4. `build`: compiles a module's fuzz binary only (no target code runs). Used by Make.
 5. `replay`: replays given inputs once each on a given or built binary. The report's
@@ -1142,10 +1146,166 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
     }
 
 
+# Part of the verdict cache key: raise it when the fields a guardrail verdict carries change, so that a
+# verdict stored without them is not returned. (2: the dynamic_oracle_fields.)
+GUARDRAIL_VERDICT_FIELDS = 2
+MAX_HINTED_UNCHECKED_CLAUSES = 5
+_UNCHECKED_HINT_STATUSES = ("passed_dynamic_oracle", "rejected_overconstrained", "compile_error", "guardrail_error")
+
+
+def dynamic_oracle_fields(ignored: list[dict] | None, checked: list[str] | None) -> dict:
+    """
+    What a guardrail run could not have executed, from its build's `ignored_annotations`
+    (eacsl_toolchain.attribute_ignored_annotations) and the functions it checks:
+
+      ignored_annotations                  the build's list, unchanged
+      unchecked_clauses                    the clauses of the checked functions E-ACSL generated no check
+                                           for: {function, kind, label, clause, file, line, reason, via}
+      dynamic_oracle_incomplete            True when `unchecked_clauses` is not empty
+      dynamic_oracle_incomplete_functions  the functions that have one, sorted
+      unattributed_ignored_annotations     the ignored annotations no function could be read for
+
+    An ignored annotation counts against a function only when E-ACSL reported it inside a declaration
+    of that function (its contract, on the definition or on a prototype, or its body), or when a
+    clause of that function uses, directly or through other logic definitions, a `predicate` or
+    `logic` E-ACSL reported at its definition; `via` is then the name the clause uses, and `file`,
+    `line` and `reason` are those of the definition. Annotations of other functions, and clause kinds
+    E-ACSL never executes (`expected_check` false: decreases, terminates, exits), do not count. With
+    no checked function named, every function of the build counts. An annotation that cannot be tied
+    to a function is listed apart and does not set the flag: nothing is guessed.
+
+    Every value is None when `ignored` is None: the caller has no build report, and the run then does
+    not know whether its oracle was complete.
+    """
+    if ignored is None:
+        return {
+            "ignored_annotations": None,
+            "unchecked_clauses": None,
+            "dynamic_oracle_incomplete": None,
+            "dynamic_oracle_incomplete_functions": None,
+            "unattributed_ignored_annotations": None,
+        }
+    names = {f.strip() for f in checked or [] if f and f.strip()}
+    unchecked: list[dict] = []
+    unattributed: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _add(function: str, clause: dict, entry: dict, via: str | None) -> None:
+        if names and function not in names:
+            return
+        item = {
+            "function": function,
+            "kind": clause.get("kind"),
+            "label": clause.get("label") or "",
+            "clause": clause.get("text"),
+            "file": entry.get("file"),
+            "line": entry.get("line"),
+            "reason": entry.get("reason"),
+            "via": via,
+        }
+        key = tuple(item[k] for k in ("function", "kind", "label", "clause", "file", "line"))
+        if key not in seen:
+            seen.add(key)
+            unchecked.append(item)
+
+    for entry in ignored:
+        if not entry.get("expected_check", True):
+            continue
+        if entry.get("function"):
+            _add(str(entry["function"]), entry.get("clause") or {}, entry, None)
+        elif entry.get("used_by"):
+            for user in entry["used_by"]:
+                _add(str(user.get("function")), user.get("clause") or {}, entry, user.get("via"))
+        else:
+            unattributed.append(entry)
+    return {
+        "ignored_annotations": ignored,
+        "unchecked_clauses": unchecked,
+        "dynamic_oracle_incomplete": bool(unchecked),
+        "dynamic_oracle_incomplete_functions": sorted({c["function"] for c in unchecked}),
+        "unattributed_ignored_annotations": unattributed,
+    }
+
+
+def _clip(text: object, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def unchecked_clause_hints(res: dict) -> list[str]:
+    """
+    Hints for the clauses E-ACSL did not execute (`unchecked_clauses`, `unattributed_ignored_annotations`):
+    which clause of which function, why, and the usual remedy. Nothing for a status that tells the
+    prover to leave its contract alone (a code fault, a hang, a failure outside the checked functions).
+    """
+    if res.get("status") not in _UNCHECKED_HINT_STATUSES:
+        return []
+    if res.get("replay_hang") or res.get("outside_checked_functions"):
+        return []
+    hints: list[str] = []
+    clauses = res.get("unchecked_clauses") or []
+    by_function: dict[str, list[dict]] = {}
+    for clause in clauses:
+        by_function.setdefault(str(clause.get("function")), []).append(clause)
+    for function in sorted(by_function):
+        items = by_function[function]
+        shown = []
+        for c in items[:MAX_HINTED_UNCHECKED_CLAUSES]:
+            name = " ".join(p for p in (c.get("kind") or "annotation", c.get("label")) if p)
+            text = f": {_clip(c['clause'], 120)}" if c.get("clause") else ""
+            where = f"{c.get('file')}:{c.get('line')}"
+            if c.get("via"):
+                shown.append(
+                    f"`{name}`{text}, through `{c['via']}`, which rests on a definition E-ACSL could not "
+                    f"translate ({where}: {_clip(c.get('reason'), 200)})"
+                )
+            else:
+                shown.append(f"`{name}`{text} ({where}: {_clip(c.get('reason'), 200)})")
+        more = len(items) - len(shown)
+        hints.append(
+            f"E-ACSL did not execute {len(items)} clause(s) of {function}: {'; '.join(shown)}"
+            f"{f'; and {more} more in `unchecked_clauses`' if more > 0 else ''}. E-ACSL warned `Ignoring annotation` "
+            "and generated no check for them, so this run is no runtime evidence for them, whatever its status "
+            "(`dynamic_oracle_incomplete`)."
+        )
+    reasons = [str(c.get("reason") or "") for c in clauses]
+    if any("quantification" in r for r in reasons):
+        hints.append(
+            "E-ACSL executes a quantifier only when each bound variable has explicit integer bounds on both sides, "
+            "written with '<' or '<=': '\\forall integer k; 0 <= k < n ==> ...'. Give the quantifier (in the clause, "
+            "or in the predicate it uses) such bounds and run the guardrail again."
+        )
+    if any("loop variant using GMP" in r for r in reasons):
+        hints.append(
+            "E-ACSL executes a loop variant only when it can compute it in a C integer type: it does with 'int' "
+            "operands, while a difference of 'size_t' values or a 'logic integer' function such as the prelude's "
+            "'strlen' needs GMP and is ignored. The termination of that loop was not checked at runtime: it rests "
+            "on the WP proof alone."
+        )
+    if any("quantification" not in r and "loop variant using GMP" not in r for r in reasons):
+        hints.append(
+            "A clause E-ACSL cannot execute is covered by the WP proof only: rewrite it with constructs E-ACSL "
+            "executes, or keep it and report it as not dynamically checked."
+        )
+    lost = res.get("unattributed_ignored_annotations") or []
+    if lost:
+        where = "; ".join(
+            f"{e.get('file')}:{e.get('line')} ({e.get('attribution')}): {_clip(e.get('reason'), 160)}"
+            for e in lost[:MAX_HINTED_UNCHECKED_CLAUSES]
+        )
+        hints.append(
+            f"E-ACSL ignored {len(lost)} annotation(s) that could not be tied to a function ({where}). "
+            "`dynamic_oracle_incomplete` does not count them: read `unattributed_ignored_annotations` and check "
+            "whether a clause of the checked function depends on one."
+        )
+    return hints
+
+
 def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
     """
     Generate concise, actionable diagnostic hints for E-ACSL guardrail rejections and
-    instrumentation compile errors. Returns [] when status == 'passed_dynamic_oracle'.
+    instrumentation compile errors, and for what a pass did not test: an empty corpus, dropped
+    inputs, unreached functions, and the clauses E-ACSL did not execute (unchecked_clause_hints).
     """
     status = res.get("status")
     if status == "passed_dynamic_oracle":
@@ -1189,6 +1349,8 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "was not challenged at runtime. The merged proof records this as an open assumption. Keep every "
                 "`requires` as weak as the proof allows, because no runtime check will catch an over-constrained one."
             )
+        # E-ACSL only warns about a clause it cannot translate: a pass is the one status that hides it.
+        passed_hints.extend(unchecked_clause_hints(res))
         return passed_hints
     if status in ("built", "no_crash"):
         return []
@@ -1244,6 +1406,8 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "Loop invariant failed at runtime: check the entry and exit bounds (use '0 <= i <= n', NOT "
                 "'0 <= i < n') and verify accumulator relationships against negative or boundary inputs."
             )
+        for hint in unchecked_clause_hints(res):
+            _add(hint)
         return hints
 
     if status == "code_fault":
@@ -1324,6 +1488,8 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 "E-ACSL instrumentation/compilation failed: inspect 'compile.stderr' and 'compile.compile_log' "
                 "for ACSL annotation or C header errors."
             )
+        for hint in unchecked_clause_hints(res):
+            _add(hint)
     return hints
 
 
@@ -1583,6 +1749,7 @@ def run_guardrail_check(
     max_corpus_inputs: int = 64,
     functions: list[str] | None = None,
     contract_functions: list[str] | None = None,
+    ignored_annotations: list[dict] | None = None,
 ) -> dict:
     """
     Replay the shared corpus (read-only) plus `runs` mutations. New units land in a scratch
@@ -1602,14 +1769,21 @@ def run_guardrail_check(
     only measures the reach of `functions` (`--reach-functions`, an empty list here) excuses RTE
     failures of other code but never a failed annotation.
 
+    `ignored_annotations` is the build's list of the annotations E-ACSL ignored (the build result's
+    `ignored_annotations`). The verdict says which clauses of `functions` were therefore not executed
+    (dynamic_oracle_fields: `unchecked_clauses`, `dynamic_oracle_incomplete`), on every status, and
+    the status itself keeps its meaning. Without the list those fields are None: the run cannot tell.
+
     When caching is enabled (`scripts/cache.py`), deterministic passing verdicts
     (`passed_dynamic_oracle`) are cached in the run-local `guardrail` namespace
-    keyed by `{binary_sha256, corpus, scratch_corpus, extra_runs, per_input_timeout, seed, module}`.
-    Transient failures (`rejected_overconstrained`, `code_fault`) are never cached.
+    keyed by `{binary_sha256, corpus, scratch_corpus, extra_runs, per_input_timeout, seed, module,
+    verdict_fields}`. The dynamic_oracle_fields of a cached verdict are computed again from the list
+    this call was given. Transient failures (`rejected_overconstrained`, `code_fault`) are never cached.
     """
     binary = Path(binary)
     corpus_dir = Path(corpus_dir)
     scratch_dir = Path(scratch_dir)
+    oracle_fields = dynamic_oracle_fields(ignored_annotations, functions)
     if not is_eacsl_instrumented(binary):
         err_verdict: dict[str, object] = {
             "status": "guardrail_error",
@@ -1617,6 +1791,7 @@ def run_guardrail_check(
             "failure": None,
             "corpus_dir": str(corpus_dir),
             "crash_input": None,
+            **oracle_fields,
         }
         err_verdict["diagnostic_hints"] = derive_eacsl_diagnostic_hints(err_verdict)
         return err_verdict
@@ -1648,6 +1823,7 @@ def run_guardrail_check(
                 "seed": int(seed),
                 "module": module,
                 "reach_functions": sorted(functions or []),
+                "verdict_fields": GUARDRAIL_VERDICT_FIELDS,
             }
             g_key = cache.make_key("guardrail", g_material)
             entry = cache.lookup("guardrail", g_key, include_run=not in_parent_guard)
@@ -1659,6 +1835,7 @@ def run_guardrail_check(
                     cached["corpus_dir"] = str(corpus_dir)
                     cached["crash_input"] = None
                     cached["cache"] = {"hit": True, "key": g_key}
+                    cached.update(oracle_fields)  # of the build this call is about, not of the stored one
                     cached["diagnostic_hints"] = derive_eacsl_diagnostic_hints(cached)
                     return cached
 
@@ -1814,6 +1991,7 @@ def run_guardrail_check(
         verdict["mutations_skipped"] = mutations_skipped
     if verdict["status"] != "passed_dynamic_oracle":
         verdict["runtime_trace"] = combined_out[-4000:]
+    verdict.update(oracle_fields)
     verdict["diagnostic_hints"] = derive_eacsl_diagnostic_hints(verdict)
     if g_key is not None and g_material is not None:
         # Whether an input hangs depends on the machine: such a pass holds for this replay only.
@@ -2063,7 +2241,16 @@ def _build_options(args) -> dict:
     }
 
 
-_SUMMARY_OMITTED = ("compile", "log_tail", "runtime_trace", "eacsl_compile_attempt", "functions", "failed_inputs")
+_SUMMARY_OMITTED = (
+    "compile",
+    "log_tail",
+    "runtime_trace",
+    "eacsl_compile_attempt",
+    "functions",
+    "failed_inputs",
+    # A module-wide build lists every function's; `unchecked_clauses` (printed) has the checked functions'.
+    "ignored_annotations",
+)
 
 
 def _summary(res: dict) -> dict:
@@ -2444,6 +2631,7 @@ def main(argv: list[str] | None = None) -> int:
             prior_report = loaded if isinstance(loaded, dict) else None
         except (OSError, ValueError):
             prior_report = None
+    guard_build: dict | None = None
     try:
         if args.mode == "selftest":
             res = run_selftest(args.work_dir, args.machdep, variadic_translation=not args.no_variadic_translation)
@@ -2505,6 +2693,7 @@ def main(argv: list[str] | None = None) -> int:
                 libc_checks=not args.no_libc_checks,
                 use_cache=use_cache,
             )
+            guard_build = comp
             if comp["returncode"] != 0:
                 res = {
                     "mode": "guardrail",
@@ -2529,6 +2718,7 @@ def main(argv: list[str] | None = None) -> int:
                     max_corpus_inputs=args.max_corpus_inputs,
                     functions=args.reach_functions if args.reach_functions else args.functions,
                     contract_functions=args.functions or [],
+                    ignored_annotations=comp.get("ignored_annotations"),
                 )
                 res = {"mode": "guardrail", "compile": comp, **guard, "reduced_checks": comp.get("reduced_checks", [])}
                 if "diagnostic_hints" not in res:
@@ -2537,6 +2727,18 @@ def main(argv: list[str] | None = None) -> int:
         res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
         if args.mode == "guardrail":
             res["crash_input"] = None
+
+    if args.mode == "guardrail":
+        # What E-ACSL did not execute, on every status: run_guardrail_check set the same fields from the
+        # same list; a build that failed and a replay that could not start get them here.
+        built = guard_build or {}
+        checked = args.reach_functions if args.reach_functions else args.functions
+        res.update(dynamic_oracle_fields(built.get("ignored_annotations"), checked))
+        res["ignored_frame_clauses"] = built.get("ignored_frame_clauses")
+        hints = list(res.get("diagnostic_hints") or [])
+        hints += [h for h in unchecked_clause_hints(res) if h not in hints]
+        if hints or "diagnostic_hints" in res:
+            res["diagnostic_hints"] = hints
 
     if args.mode == "campaign":
         import seed_harvest  # lazily: only campaigns read the seed writes' statuses
