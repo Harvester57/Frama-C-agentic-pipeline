@@ -3813,6 +3813,7 @@ def _memory_deferral(**detail: Any) -> dict:
 
 
 def _note_refused_check(out: dict, task_id: str) -> None:
+    out["ok"] = False  # exit 1: the caller has to act, or the queue never moves
     out.setdefault("merge_deferred", _memory_deferral(tasks=[]))["tasks"].append(task_id)
 
 
@@ -3854,7 +3855,7 @@ def _complete_agent(agent_id: str) -> dict:
         if (task["kind"] in PROVER_KINDS or task["kind"] == "arch") and _memory_too_small():
             # Completing may merge a contract (an architect's, a stalled prover's partial one) under the parent WP
             # re-check. The agent stays running: its result is read by the next, properly sized call.
-            out.update(action="merge_deferred", merge_deferred=_memory_deferral(tasks=[task["id"]]))
+            out.update(ok=False, action="merge_deferred", merge_deferred=_memory_deferral(tasks=[task["id"]]))
             return out
         result_path = Path("agents") / agent_id / "scratch" / "result.json"
         res, errors = _load_result(result_path, task, agent_id)
@@ -4265,7 +4266,7 @@ def cmd_merge_pending(module: str | None = None, force: bool = False) -> dict:
         )
         rechecks = sorted(rid for rid, e in (state.get("rechecks") or {}).items() if e.get("state") == "queued")
         if merges or rechecks:
-            out["merge_deferred"] = _memory_deferral(queued_merges=merges, queued_rechecks=rechecks)
+            out.update(ok=False, merge_deferred=_memory_deferral(queued_merges=merges, queued_rechecks=rechecks))
         return out
     jobs: list[tuple[str, list[dict]]] = []
     with run_lock("ledger"):
@@ -4362,7 +4363,7 @@ def cmd_step(
     }
     deferred = [d for d in [merge_out, *completed] if d.get("merge_deferred")]
     if deferred:
-        out["merge_deferred"] = deferred[0]["merge_deferred"]
+        out.update(ok=False, merge_deferred=deferred[0]["merge_deferred"])
     return out
 
 

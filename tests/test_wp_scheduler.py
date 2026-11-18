@@ -2581,7 +2581,8 @@ def test_an_undersized_container_starts_no_merge_and_says_how_to_rerun(sim, monk
     S.cmd_complete("prove-a")
     monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: 1024)
     out = S.cmd_step(force_merge=True)
-    assert sim.merge_calls == []
+    assert sim.merge_calls == [] and out["ok"] is False
+    assert S.main(["merge-pending", "--force"]) == 1  # the caller cannot miss it
     deferred = out["merge_deferred"]  # top level of `step`, not only under merge_pending
     assert (deferred["enforced_memory_mb"], deferred["required_memory_mb"]) == (1024, 1768)
     assert deferred["queued_merges"] == ["prove:src/m/a.c#a"] and "-Class verify" in deferred["action"]
@@ -2589,7 +2590,7 @@ def test_an_undersized_container_starts_no_merge_and_says_how_to_rerun(sim, monk
 
     monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: 8192)
     out = S.cmd_step(force_merge=True)
-    assert "merge_deferred" not in out and sim.merge_calls == [["prove-a"]]
+    assert "merge_deferred" not in out and out["ok"] is True and sim.merge_calls == [["prove-a"]]
 
 
 def test_an_undersized_container_leaves_a_prover_result_uncompleted(sim, monkeypatch):
