@@ -10,6 +10,11 @@
  *             object (no length) the object the parameter points to is initialized.
  *   buffer  a sink that returns its output in a buffer: the out-parameters are initialized when it
  *           returns (a postcondition of the sink, which the target must define).
+ *   handoff a wrapper sink (threat model `checked_at`): it completes the buffer itself, then hands it
+ *           to other declared sinks. Not MetAcsl: a named `check` written into the wrapper before
+ *           each call that hands the buffer on, on that call's arguments (`handoff_bytes` with a
+ *           length, `handoff_object` without). MetAcsl cannot state it there: at a call through a
+ *           function pointer \called_arg is refused, and \fguard turns the instance into \false.
  * The clauses use \fguard: a parameter of the wrong type makes the property \false (unproven), never
  * silently \true.
  */
@@ -29,3 +34,9 @@
 \fguard(\initialized(\called_arg(${param})))
 //# out_object
 \fguard(\initialized(\formal(${param})))
+//# handoff
+/*@ check ${name}: ${predicate}; */
+//# handoff_bytes
+\initialized((${arg}) + (0 .. (${length}) - 1))
+//# handoff_object
+\initialized(${arg})

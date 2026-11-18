@@ -25,7 +25,11 @@ search order, with a warning). It writes security_props.json
       in text handed to a log or terminal sink, initialized bytes handed to the others - or, for a
       `buffer` sink, initialized out-parameters when it returns (\\postcond). A caller that hands a
       text sink string literals only is decided from the model's call sites instead (plan step M2):
-      no goal, the property's `decided` and the obligation's `decided` record the verdict;
+      no goal, the property's `decided` and the obligation's `decided` record the verdict. A wrapper
+      sink (threat model `checked_at`: it completes the buffer itself, then hands it to the inner
+      sinks named) is checked before each call that hands the buffer on, by a `check` written into
+      the wrapper, instead of at its callers; the property's `relocated` records the move, and a
+      claim the model does not bear out leaves the property at the callers with a warning;
   L6  each secret:
         L6_wiped_<secret>    zero when its release function (the secret's `function`) returns;
         L6_no_leak_<secret>  never passed to a sink, never read by a sink the target defines.
@@ -183,10 +187,22 @@ class _Model:
         for fid, f in sorted(self.functions.items()):
             self.by_name[str(f.get("name") or fid.split("#")[-1])].append(fid)
         self.callers: dict[str, set[str]] = defaultdict(set)
+        # Callers by a call that names the callee (MetAcsl's \called_arg works at those only).
+        self.direct_callers: dict[str, set[str]] = defaultdict(set)
         for e in model.get("edges") or []:
             a, b = e.get("caller"), e.get("callee")
             if a in self.functions and b in self.functions and a != b:
                 self.callers[b].add(a)
+                if e.get("kind") != "indirect":
+                    self.direct_callers[b].add(a)
+        # The calls through a function pointer, per caller; None when the model records none at all.
+        sites = model.get("indirect_sites")
+        self.indirect_sites: dict[str, list[dict]] | None = None
+        if isinstance(sites, list):
+            self.indirect_sites = defaultdict(list)
+            for s in sites:
+                if isinstance(s, dict) and s.get("caller") in self.functions:
+                    self.indirect_sites[str(s["caller"])].append(s)
         self.ext_callers: dict[str, set[str]] = defaultdict(set)
         for fid, f in self.functions.items():
             for name in f.get("external_calls") or []:
@@ -284,14 +300,33 @@ def _formalize(expr: str, formals: set[str]) -> str:
     return _IDENT_RE.sub(lambda m: f"\\formal({m.group(0)})" if m.group(0) in formals else m.group(0), expr)
 
 
+_CALL_TOKEN_RE = re.compile(r"(?P<member>->|\.)?\s*(?P<name>[A-Za-z_]\w*)\s*\)*\s*$")
+
+
+def _call_token(expr: str | None) -> tuple[str, bool] | None:
+    """
+    (name, member) a call through a pointer can be found by in the source, from the model's expression:
+    `(ctx->backend)->send` -> (`send`, True), `handler` -> (`handler`, False); None for an expression
+    that does not end in a name (`table[i]`).
+    """
+    m = _CALL_TOKEN_RE.search(expr or "")
+    return (m.group("name"), bool(m.group("member"))) if m else None
+
+
 class _Gen:
-    def __init__(self, model: dict, block: dict | None, templates: _Templates):
+    def __init__(
+        self, model: dict, block: dict | None, templates: _Templates, keep_at_callers: dict[str, str] | None = None
+    ):
         self.m = _Model(model)
         self.block = block or {}
         self.t = templates
         self.properties: list[dict] = []
         self.warnings: list[str] = []
         self.names: set[str] = set()
+        # Wrapper sinks (by C name) whose `checked_at` is not applied, with why (`run`: no place for the check).
+        self.keep_at_callers = keep_at_callers or {}
+        # (property, plan) of each wrapper sink whose property moved to its hand-off calls.
+        self.handoffs: list[tuple[dict, dict]] = []
         if model.get("functions"):
             # The facts this generator reads (phase0_model.MODEL_FEATURES says what each one's absence loses).
             for feature in ("external_calls", "formals", "writes"):
@@ -513,6 +548,10 @@ class _Gen:
             notes = []
             if not buffer and kind not in TEXT_SINKS and not length:
                 notes.append("no `length`: only the first object each parameter points to is checked")
+            plan = self._handoff_plan(item, sink, kind, name)
+            if plan is not None:
+                self._add_handoff(name, sink, kind, params, plan)
+                continue
             if buffer:
                 instances = {f for f in self.m.resolve(sink) if f in self.m.live}
                 if not instances:
@@ -537,6 +576,252 @@ class _Gen:
                 threat_model={"output_sink": sink, "kind": kind, "params": params},
                 targets=sink,
             )
+        self._supersede_inner_instances()
+
+    # -- L5, wrapper sinks (threat model `checked_at`) ------------------------------------------------
+
+    def _declared_sink(self, ref: str, wrapper_item: dict) -> dict | None:
+        """The threat model's output sink naming the same function as `ref` (not the wrapper's own item)."""
+        fids = set(self.m.resolve(ref))
+        for s in self.block.get("output_sinks") or []:
+            if s is wrapper_item or not s.get("function"):
+                continue
+            other = str(s["function"])
+            if fids & set(self.m.resolve(other)) or (not fids and other.split("#")[-1] == ref.split("#")[-1]):
+                return s
+        return None
+
+    def _handoff_plan(self, item: dict, sink: str, kind: str, name: str) -> dict | None:
+        """
+        A wrapper sink (libmodbus `send_msg`): the threat model says, with `checked_at`, that the
+        function completes the buffer itself and then hands it to the inner sinks named. Its property
+        is then false at its callers on a correct target (the TCP length bytes are written by a hook
+        inside it), so it is checked before each call that hands the buffer on instead: a named `check`
+        apply_code writes into the wrapper, on that call's arguments. It is not conditional on the
+        callee, so at a call through a pointer it covers every function the call can dispatch to; the
+        inner sinks' own MetAcsl properties cannot (\\called_arg is refused at an indirect call).
+
+        The claim is checked against the model, and the property stays at the wrapper's callers (with
+        a warning) unless: the wrapper is one function the build defines, checked for initialized
+        bytes; each sink named is a declared output sink of that kind, not a wrapper itself, whose
+        buffer parameters are known and which the wrapper calls, directly or as a candidate of a call
+        through a pointer; no call through a pointer in the wrapper is unresolved; and each such call
+        can be found in the source by the name it goes through. `run` adds: the check is in the work
+        tree before every one of those calls. What the model cannot show is which calls receive the
+        buffer (it records no arguments): that it leaves the wrapper only through the sinks named is
+        the threat model's statement, recorded as such. A wrapper is never inferred.
+        """
+        declared = [str(r) for r in item.get("checked_at") or []]
+        if not declared:
+            return None
+        plan = self._handoff_refusal(item, sink, kind, declared)
+        if isinstance(plan, str):
+            # "output sink ": the prefix generate_report.py lists under the threat-model items.
+            self.warnings.append(
+                f"output sink {sink}: `checked_at` not applied: {plan}: {name} stays checked at the calls of {sink}"
+            )
+            return None
+        return plan
+
+    def _handoff_refusal(self, item: dict, sink: str, kind: str, declared: list[str]) -> dict | str:
+        """The hand-off plan of a wrapper sink, or why its property stays at its callers."""
+        if sink in self.keep_at_callers:
+            return self.keep_at_callers[sink]
+        if kind == "buffer" or kind in TEXT_SINKS:
+            return f"only a sink checked for initialized bytes can be a wrapper (kind {kind})"
+        fids = [f for f in self.m.resolve(str(item["function"])) if f in self.m.live]
+        if len(fids) != 1:
+            return f"{sink} is not defined in the build" if not fids else f"{sink} names {len(fids)} functions"
+        wrapper = fids[0]
+        if self.m.indirect_sites is None:
+            return "the model records no function-pointer call sites"
+        sites = self.m.indirect_sites.get(wrapper, [])
+        for s in sites:
+            if not s.get("candidates"):
+                return (
+                    f"{sink} has a function-pointer call the model does not resolve "
+                    f"({s.get('expr') or 'an unknown call'} at {s.get('loc') or 'an unknown line'})"
+                )
+        # Per inner sink named: the [pointer argument, length argument] pairs its property is about.
+        inner: dict[str, dict] = {}
+        for ref in declared:
+            inner_name = ref.split("#")[-1]
+            inner_fids = set(self.m.resolve(ref))
+            if wrapper in inner_fids:
+                return f"{sink} names itself"
+            found = self._declared_sink(ref, item)
+            if found is None:
+                return f"{inner_name} is not a declared output sink"
+            inner_kind = str(found.get("kind") or "other")
+            if inner_kind == "buffer" or inner_kind in TEXT_SINKS:
+                return f"{inner_name} is a {inner_kind} sink, not one checked for initialized bytes"
+            if found.get("checked_at"):
+                return f"{inner_name} is a wrapper sink itself"
+            params, formals = self._sink_params(found, inner_name, ("pointer", "const_pointer"))
+            index = {str(p.get("name")): i for i, p in enumerate(formals or [])}
+            length = found.get("length")
+            if not params or any(p not in index for p in params) or (length and str(length) not in index):
+                return f"the parameters of {inner_name} are unknown"
+            direct = any(wrapper in self.m.direct_callers.get(f, set()) for f in inner_fids) or (
+                not inner_fids and wrapper in self.m.ext_callers.get(inner_name, set())
+            )
+            through = [s for s in sites if inner_fids & set(s.get("candidates") or [])]
+            if not direct and not through:
+                return f"the model shows no call of {inner_name} in {sink}"
+            inner[inner_name] = {
+                "args": [[index[p], index[str(length)] if length else None] for p in params],
+                "direct": direct,
+                "sites": through,
+            }
+        calls: dict[tuple[str, bool], dict] = {}
+        checked: list[dict] = []
+        evidence = [
+            f"threat model: {sink} is a wrapper sink, `checked_at` {', '.join(declared)}",
+            f"model: {wrapper} is defined in the build, and each sink named is a declared output sink it calls",
+        ]
+        for inner_name, facts in sorted(inner.items()):
+            if not facts["direct"]:
+                continue
+            found_sites = self.m.call_sites(wrapper, inner_name)
+            calls[(inner_name, False)] = {
+                "callee": inner_name,
+                "member": False,
+                "args": facts["args"],
+                "sites": len(found_sites) if found_sites else None,
+            }
+            file = wrapper.rpartition("#")[0]
+            for line in sorted({int(s.get("line") or 0) for s in found_sites or []}) or [0]:
+                checked.append(
+                    {
+                        "function": wrapper,
+                        "call": inner_name,
+                        "loc": f"{file}:{line}" if line else None,
+                        "kind": "direct",
+                        "inner_sinks": [inner_name],
+                    }
+                )
+        by_name = set(calls)
+        handed: list[dict] = []
+        for s in sites:
+            names = sorted(n for n, facts in inner.items() if any(s is t for t in facts["sites"]))
+            if not names:
+                continue
+            token = _call_token(s.get("expr"))
+            if token is None:
+                return f"the call {s.get('expr')} at {s.get('loc')} cannot be found in the source by a name"
+            if token in by_name:
+                return f"the call {s.get('expr')} at {s.get('loc')} cannot be told apart from a call of {token[0]}"
+            handed.append(s)
+            spec = calls.setdefault(token, {"callee": token[0], "member": token[1], "args": [], "sites": 0})
+            spec["sites"] += 1
+            pairs = {(a[0], a[1]) for a in spec["args"]} | {(a[0], a[1]) for n in names for a in inner[n]["args"]}
+            spec["args"] = [
+                [p, length] for p, length in sorted(pairs, key=lambda a: (a[0], -1 if a[1] is None else a[1]))
+            ]
+            candidates = sorted(str(c) for c in s.get("candidates") or [])
+            checked.append(
+                {
+                    "function": wrapper,
+                    "call": str(s.get("expr")),
+                    "loc": s.get("loc"),
+                    "kind": "indirect",
+                    "inner_sinks": names,
+                    "candidates": candidates,
+                }
+            )
+            evidence.append(
+                f"model: {s.get('expr')} at {s.get('loc')} can dispatch to "
+                f"{', '.join(c.split('#')[-1] for c in candidates)} (type match); the check before it does not "
+                "depend on the callee, so it holds for every function the call can dispatch to"
+            )
+        other = [s for s in sites if not any(s is h for h in handed)]
+        for s in other:
+            if _call_token(s.get("expr")) in calls:
+                return (
+                    f"the call {s.get('expr')} at {s.get('loc')} goes through the same name as a hand-off "
+                    "and dispatches to none of the sinks named"
+                )
+        evidence.append(f"model: no function-pointer call in {sink} is unresolved")
+        evidence.append(
+            "not shown by the model, which records no call arguments: which calls receive the buffer. That it "
+            f"leaves {sink} only through the sinks named is the threat model's statement"
+        )
+        return {
+            "wrapper": wrapper,
+            "declared": declared,
+            "handoff": [calls[k] for k in sorted(calls)],
+            "checked_at": checked,
+            "direct": sorted(n for n, facts in inner.items() if facts["direct"]),
+            "inner": sorted(inner),
+            "other": [
+                {
+                    "call": str(s.get("expr")),
+                    "loc": s.get("loc"),
+                    "candidates": sorted(str(c) for c in s.get("candidates") or []),
+                }
+                for s in other
+            ],
+            "evidence": evidence,
+        }
+
+    def _add_handoff(self, name: str, sink: str, kind: str, params: list[str], plan: dict) -> None:
+        """The property of a wrapper sink, as the in-code check before its hand-off calls (`_handoff_plan`)."""
+        wrapper = plan["wrapper"]
+        check = self.t.render("l5_sanitized", "handoff", name=name, predicate="${predicate}")
+        callers = sorted(f for f in self.m.callers_of(sink) if f != wrapper)
+        prop = self._add(
+            "sanitized",
+            name,
+            check,
+            {wrapper},
+            notes=[
+                f"a wrapper sink (threat model `checked_at`): not generated at the {len(callers)} caller(s) of "
+                f"{sink}; written into the work tree before each call in {sink} that hands the buffer to "
+                f"{', '.join(plan['inner'])}, on that call's arguments (see `relocated`)"
+            ],
+            threat_model={"output_sink": sink, "kind": kind, "params": params, "checked_at": plan["declared"]},
+            targets=sink,
+            code={
+                "handoff": plan["handoff"],
+                "check": check,
+                "bytes": self.t.render("l5_sanitized", "handoff_bytes", arg="${arg}", length="${length}"),
+                "object": self.t.render("l5_sanitized", "handoff_object", arg="${arg}"),
+            },
+            relocated={
+                "wrapper": wrapper,
+                "declared": plan["declared"],
+                "not_generated_at": callers,
+                "checked_at": plan["checked_at"],
+                "superseded": [],
+                "other_indirect_calls": plan["other"],
+                "evidence": plan["evidence"],
+            },
+        )
+        self.handoffs.append((prop, plan))
+
+    def _supersede_inner_instances(self) -> None:
+        """
+        An inner sink the wrapper reaches only through a pointer: its own property has no usable
+        instance in the wrapper (MetAcsl turns it into `pointer == &sink ==> \\false`, or leaves it out
+        when the WP parse lacks the sink), and the wrapper's check stands before that very call. The
+        instance is taken out and the move says so. A direct call keeps its instance.
+        """
+        for prop, plan in self.handoffs:
+            wrapper = plan["wrapper"]
+            for other in self.properties:
+                tm = other.get("threat_model") or {}
+                inner_name = str(tm.get("output_sink"))
+                if other is prop or other.get("kind") != "sanitized" or "kind" not in tm:
+                    continue
+                if inner_name not in plan["inner"] or inner_name in plan["direct"] or wrapper not in other["instances"]:
+                    continue
+                other["instances"].remove(wrapper)
+                other["notes"].append(
+                    f"{wrapper.split('#')[-1]} reaches {inner_name} through a function pointer only: checked by "
+                    f"{prop['name']} before that call instead (MetAcsl cannot state \\called_arg at an indirect call)"
+                )
+                prop["relocated"]["superseded"].append({"property": other["name"], "function": wrapper})
+            prop["relocated"]["superseded"].sort(key=lambda s: s["property"])
 
     def _format_literal(self, item: dict, sink: str) -> None:
         """
@@ -965,11 +1250,17 @@ class _Gen:
         return {"sources": sources, "checks": checks, "notes": notes}
 
 
-def generate(model: dict, threat: dict | None, templates: _Templates | None = None) -> dict:
-    """The security properties of a model under a threat model (trust.load_threat_model's result)."""
+def generate(
+    model: dict, threat: dict | None, templates: _Templates | None = None, keep_at_callers: dict[str, str] | None = None
+) -> dict:
+    """
+    The security properties of a model under a threat model (trust.load_threat_model's result).
+    `keep_at_callers` names wrapper sinks whose `checked_at` is not applied, with why (`run`: the work
+    tree has no place for the check).
+    """
     threat = threat or {"status": "no_threat_model"}
     block = threat.get("block") if threat.get("status") == "ok" else None
-    gen = _Gen(model, block, templates or _Templates())
+    gen = _Gen(model, block, templates or _Templates(), keep_at_callers)
     frame = gen.frame()
     if block:
         gen.auth_gates()
@@ -999,6 +1290,8 @@ def generate(model: dict, threat: dict | None, templates: _Templates | None = No
     for items in obligations.values():
         for cls in {i["class"] for i in items}:
             by_class[cls] += 1
+    # Properties moved from a wrapper sink's callers to its hand-off calls: named, so no move is silent.
+    relocated = {"relocated": [p["name"] for p in gen.properties if p.get("relocated")]}
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
@@ -1011,6 +1304,7 @@ def generate(model: dict, threat: dict | None, templates: _Templates | None = No
             "properties": len(gen.properties),
             "by_kind": dict(sorted(_count(p["kind"] for p in gen.properties).items())),
             "functions_by_class": dict(sorted(by_class.items())),
+            **(relocated if relocated["relocated"] else {}),
         },
         "warnings": gen.warnings,
     }
@@ -1107,13 +1401,14 @@ DEFAULT_WORK = Path("workspace/work")
 # What apply_taint inserts, and nothing else: re-running it first removes these.
 _GENERATED_TAINT_RE = re.compile(
     r"/\*@ (?:taint [^\n]*?; |assert L6_no_leak_[A-Za-z0-9_]+: " + TAINT_TAG + r": [^\n]*?; "
-    r"|check (?:L6_wiped_|L4_auth_state_)[A-Za-z0-9_]+: [^\n]*?; )\*/ "
+    r"|check (?:L6_wiped_|L4_auth_state_|L5_sanitized_)[A-Za-z0-9_]+: [^\n]*?; )\*/ "
 )
 # Argument text an assertion may repeat: no call, assignment or increment.
 _ARG_UNSAFE_RE = re.compile(r"[A-Za-z_]\w*\s*\(|(?<![=!<>])=(?!=)|\+\+|--")
 _STATEMENT_STOP = frozenset({";", "{", "}"})
-# Code-check operations (written whatever --eva-taint says): a local's wipe (M6), a gate's failure (M7).
-CODE_OPS = frozenset({"local", "returns"})
+# Code-check operations (written whatever --eva-taint says): a local's wipe (M6), a gate's failure (M7),
+# a wrapper sink's hand-off (`checked_at`).
+CODE_OPS = frozenset({"local", "returns", "handoff"})
 
 
 def taint_annotation(lvalues: str) -> str:
@@ -1201,11 +1496,18 @@ def _statement_start(tokens: list, idx: int) -> int | None:
 
 
 def _insert_taint_in_function(
-    source: str, name: str, ops: list[dict], skipped: list[str], where: str, placed: list[dict] | None = None
+    source: str,
+    name: str,
+    ops: list[dict],
+    skipped: list[str],
+    where: str,
+    placed: list[dict] | None = None,
+    handoffs: list[dict] | None = None,
 ) -> list:
     """
-    (offset, text) insertions for one function's sources and checks; problems go to `skipped`, and each
-    check placed (file, line, function, property: where Eva reports its status) to `placed`.
+    (offset, text) insertions for one function's sources and checks; problems go to `skipped`, each
+    check placed (file, line, function, property: where Eva reports its status) to `placed`, and how
+    many hand-off checks each call name got to `handoffs`.
     """
     from acsl_ast import _find_body_brace_offset, locate_all_definition_spans, tokenize_c_acsl  # noqa: PLC0415
 
@@ -1227,6 +1529,9 @@ def _insert_taint_in_function(
             continue
         if op["kind"] == "returns":
             out += _return_check_inserts(source, tokens, op, skipped, where, name, placed)
+            continue
+        if op["kind"] == "handoff":
+            out += _handoff_check_inserts(source, tokens, op, skipped, where, name, placed, handoffs)
             continue
         if op["kind"] == "entry":
             out.append((body_start + 1, taint_annotation(op["lvalues"])))
@@ -1363,6 +1668,130 @@ def _return_check_inserts(
     return out
 
 
+def _next_code(tokens: list, idx: int, step: int = 1) -> int | None:
+    """The index of the next (step 1) or previous (step -1) C token from tokens[idx], or None."""
+    k = idx + step
+    while 0 <= k < len(tokens):
+        if tokens[k].kind == "c_token":
+            return k
+        k += step
+    return None
+
+
+def _handoff_check_inserts(
+    source: str,
+    tokens: list,
+    op: dict,
+    skipped: list[str],
+    where: str,
+    name: str,
+    placed: list[dict] | None,
+    handoffs: list[dict] | None,
+) -> list[tuple[int, str]]:
+    """
+    A wrapper sink's check (`checked_at`) before each statement of the wrapper that hands its buffer
+    on: a call of `callee` by name, or through the field or pointer of that name (`member`), with the
+    predicate on that call's own arguments. A call that is not a statement of its own, or whose
+    arguments the check cannot repeat, is skipped; `handoffs` gets how many each name got, and `run`
+    keeps the property at the wrapper's callers unless that is every call the model records.
+    """
+    out: list[tuple[int, str]] = []
+    for call in op["calls"]:
+        count = 0
+        for i, tok in enumerate(tokens):
+            if tok.kind != "c_token" or tok.text != call["callee"]:
+                continue
+            prev = _next_code(tokens, i, -1)
+            before = tokens[prev].text if prev is not None else ""
+            member = before == "." or (before == ">" and prev is not None and prev > 0 and tokens[prev - 1].text == "-")
+            if member != bool(call["member"]):
+                continue
+            nxt = _next_code(tokens, i)
+            while nxt is not None and tokens[nxt].text == ")":  # `(*handler)(...)`, `(ops->send)(...)`
+                nxt = _next_code(tokens, nxt)
+            if nxt is None or tokens[nxt].text != "(":
+                continue
+            close, depth = nxt, 0
+            for k in range(nxt, len(tokens)):
+                if tokens[k].kind == "c_token" and tokens[k].text == "(":
+                    depth += 1
+                elif tokens[k].kind == "c_token" and tokens[k].text == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close = k
+                        break
+            args = _call_args(tokens, nxt, close, source)
+            regions: list[str] = []
+            for p, length in call["args"]:
+                texts = [
+                    args[p] if p < len(args) else "",
+                    args[length] if length is not None and length < len(args) else "",
+                ]
+                if (
+                    not texts[0]
+                    or (length is not None and not texts[1])
+                    or any(_ARG_UNSAFE_RE.search(t) for t in texts)
+                ):
+                    regions = []
+                    break
+                if length is None:
+                    regions.append(op["object"].replace("${arg}", texts[0]))
+                else:
+                    regions.append(op["bytes"].replace("${arg}", texts[0]).replace("${length}", texts[1]))
+            start = _statement_start(tokens, i)
+            if not regions or start is None:
+                skipped.append(
+                    f"{where}:{tok.line}: {call['callee']} call: "
+                    + ("an argument the check cannot repeat" if not regions else "not a statement of its own")
+                )
+                continue
+            predicate = " && ".join(dict.fromkeys(regions))
+            out.append((tokens[start].start, op["check"].replace("${predicate}", predicate) + " "))
+            count += 1
+            if placed is not None:
+                placed.append(
+                    {
+                        "file": where,
+                        "line": tokens[start].line,
+                        "function": f"{where}#{name}",
+                        "property": op["property"],
+                    }
+                )
+        if handoffs is not None:
+            handoffs.append(
+                {"function": f"{where}#{name}", "property": op["property"], "callee": call["callee"], "placed": count}
+            )
+    return out
+
+
+def unplaced_handoffs(props: dict, applied: dict) -> dict[str, str]:
+    """
+    The wrapper sinks (by C name) whose check `apply_taint` did not write before every hand-off call
+    the model records, with why: `run` generates their property at their callers again.
+    """
+    placed = {(h["function"], h["property"], h["callee"]): int(h["placed"]) for h in applied.get("handoffs") or []}
+    out: dict[str, str] = {}
+    for p in props.get("properties") or []:
+        calls = (p.get("code") or {}).get("handoff")
+        if not calls:
+            continue
+        want = got = 0
+        short = False
+        for fid in p.get("instances") or []:
+            for call in calls:
+                n = placed.get((fid, p["name"], call["callee"]), 0)
+                expected = call.get("sites")
+                got += n
+                want += expected if expected is not None else max(n, 1)
+                short = short or n == 0 or (expected is not None and n != expected)
+        if short:
+            out[str((p.get("threat_model") or {}).get("output_sink"))] = (
+                f"the check could not be placed before every call that hands the buffer on ({got} of {want} in the "
+                "work tree)"
+            )
+    return out
+
+
 def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
     """
     Write the taint annotations of every property's `taint` plan into the work tree (`work`, the
@@ -1378,6 +1807,17 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
             file, _, name = str(fid).rpartition("#")
             if code.get("returns"):
                 by_file[file][name].append({"kind": "returns", "check": code["check"], "property": p["name"]})
+            elif code.get("handoff"):
+                by_file[file][name].append(
+                    {
+                        "kind": "handoff",
+                        "calls": code["handoff"],
+                        "check": code["check"],
+                        "bytes": code.get("bytes", ""),
+                        "object": code.get("object", ""),
+                        "property": p["name"],
+                    }
+                )
             else:
                 by_file[file][name].append(
                     {"kind": "local", "local": code["local"], "check": code["check"], "property": p["name"]}
@@ -1395,6 +1835,7 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
     annotated: list[str] = []
     annotated_files: list[str] = []
     placed: list[dict] = []
+    handoffs: list[dict] = []
     skipped: list[str] = []
     candidates = set(by_file)
     if work.is_dir():
@@ -1418,7 +1859,7 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
         for name, ops in sorted(by_file.get(file, {}).items()):
             local_ops = [op for op in ops if op["kind"] in CODE_OPS]
             taint_ops = [op for op in ops if op["kind"] not in CODE_OPS]
-            inserts += _insert_taint_in_function(text, name, local_ops, skipped, file, code_placed)
+            inserts += _insert_taint_in_function(text, name, local_ops, skipped, file, code_placed, handoffs)
             found = _insert_taint_in_function(text, name, taint_ops, skipped, file, placed)
             if found:
                 annotated.append(f"{file}#{name}")
@@ -1438,6 +1879,7 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
         "functions": sorted(set(annotated)),
         "checks": sorted(placed, key=lambda c: (c["file"], c["line"], c["property"])),
         "code_checks": sorted(code_placed, key=lambda c: (c["file"], c["line"], c["property"])),
+        "handoffs": sorted(handoffs, key=lambda h: (h["function"], h["property"], h["callee"])),
         "skipped": skipped,
     }
 
@@ -1502,6 +1944,12 @@ DISCHARGE = {
         "the generated `check {name}` already in the code before each return in the local's scope (do not edit or "
         "move it): the local is zero there. Wipe it with a loop whose invariants state the zeroed prefix"
     ),
+    "sanitized_handoff": (
+        "the generated `check {name}` already in the code before each call that hands the buffer to an inner sink "
+        "(do not edit or move it): every byte handed over is initialized there, after this function completed the "
+        "buffer. State what the function needs from its callers as a `requires` on the bytes it does not write "
+        "itself, and what a hook it calls writes as that hook's `ensures`"
+    ),
     "no_leak": (
         "the generated `assert {name}: meta:` before each sink call: no argument points into the secret "
         "(for a pointer parameter, `requires \\separated(...)` with the secret)"
@@ -1541,6 +1989,8 @@ def brief_entries(props: dict, file: str, name: str) -> list[dict]:
                 "discharge": (
                     DISCHARGE["gate_failure"]
                     if (p.get("code") or {}).get("returns")
+                    else DISCHARGE["sanitized_handoff"]
+                    if (p.get("code") or {}).get("handoff")
                     else DISCHARGE["wiped_local"]
                     if p.get("code")
                     else DISCHARGE.get(str(p.get("kind")), "")
@@ -1609,6 +2059,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     previous_taint = previous_taint if isinstance(previous_taint, dict) else {}
     enabled = args.eva_taint if args.eva_taint is not None else bool(previous_taint.get("enabled"))
     applied = apply_taint(doc, args.work, taint=enabled)
+    kept = unplaced_handoffs(doc, applied)
+    if kept:
+        # A wrapper sink whose hand-off no check can precede in the work tree: its property is
+        # generated at its callers again (the warning says why), and the work tree follows.
+        detail = "".join(f"; {s}" for s in applied["skipped"][:2])
+        doc = generate(model, threat, keep_at_callers={sink: why + detail for sink, why in kept.items()})
+        if note:
+            doc["warnings"].insert(0, note)
+        applied = apply_taint(doc, args.work, taint=enabled)
     doc["code_checks"] = applied["code_checks"]
     record: dict[str, Any] = {
         "enabled": enabled,
