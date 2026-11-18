@@ -1279,8 +1279,10 @@ def _callee_frame_clause(ctx: Ctx, cfile: str, cname: str, cmod: str | None) -> 
     for item in skel.get("unprojected") or []:
         if not isinstance(item, dict):
             continue
+        # No line number: it is a line of the facts' file, and the text is the request's identity.
         what = f"`{item['lval']}`" if item.get("lval") else f"memory reached from `{item.get('root') or '?'}`"
-        writes.append(what + (f" (L{item['line']})" if item.get("line") else ""))
+        if what not in writes:
+            writes.append(what)
     if writes:
         text += (
             f" [INCOMPLETE: the function also writes {', '.join(writes)}, which the facts could not state as a "

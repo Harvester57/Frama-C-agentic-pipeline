@@ -55,7 +55,8 @@ def test_a_frame_with_only_unstated_writes_is_not_the_generic_request(monkeypatc
     assert skel["assigns"] == [] and [u["lval"] for u in skel["unprojected"]] == ["*(dest + i)"]
     clause = _clause(monkeypatch, skel)
     assert clause.startswith(S.DEFAULT_CONTRACT_CLAUSE) and clause != S.DEFAULT_CONTRACT_CLAUSE
-    assert "`*(dest + i)` (L52)" in clause
+    # No line of the facts' file in it: the text is the request's identity (contract_negotiator dedups on it).
+    assert "also writes `*(dest + i)`, which" in clause
 
 
 def test_a_write_the_kernel_names_through_a_temporary_is_named_by_its_root(monkeypatch) -> None:
