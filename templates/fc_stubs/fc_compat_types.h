@@ -2,7 +2,8 @@
  * Frama-C Compatibility Primitive Types (force-included by the pipeline)
  *
  * This header is a Frama-C parse aid only. It contains typedefs, includes,
- * keyword-spelling macros and contracted declarations, never C function bodies, and it is EMPTY whenever __FRAMAC__ is undefined
+ * keyword-spelling macros, contracted declarations and (E-ACSL branch only) weak definitions of __fc_libc's
+ * model objects, never C function bodies, and it is EMPTY whenever __FRAMAC__ is undefined
  * (Clang compile of the self-contained E-ACSL output, sanitizer builds), so it
  * can never redefine types in code that already contains them.
  *
@@ -224,7 +225,9 @@ long long int llabs(long long int j);
  * declares (`__e_acsl_store_block(&__fc_fds, ...)`), so an `extern` failed the link with "undefined
  * reference to `__fc_fds'", and a ghost would be printed as a comment, so a clause E-ACSL does execute
  * (`assumes Frama_C_entropy_source != 0`) would not compile. Weak, so a second definition (another
- * translation unit, a target defining one) links. Clang compiles without __FRAMAC__ never see them. */
+ * translation unit, a target defining one) links. Clang compiles without __FRAMAC__ never see them.
+ * Only `assigns` / `\from` uses mean anything: glibc never writes these objects, so a clause E-ACSL executes
+ * reads a zero that has nothing to do with WP's model (`Frama_C_entropy_source` is always 0). */
 #ifndef __FC_MAX_OPEN_FILES
 #define __FC_MAX_OPEN_FILES 1024
 #endif
