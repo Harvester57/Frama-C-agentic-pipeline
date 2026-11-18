@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -569,8 +570,130 @@ def _failing_predicate(text: str, start: int) -> tuple[str, str]:
     return "", joined
 
 
+# A check of an annotation MetAcsl generated from a meta-property of the run (scripts/security_props.py,
+# loaded into the E-ACSL build by fuzz_build.resolve_security_meta): E-ACSL names it `<property>/meta`
+# and locates it in the meta file, at the property's line:
+#   out/fuzz_m.security_meta.c: In function 'backdoor'
+#   out/fuzz_m.security_meta.c:9: Error: Assertion failed:
+#           The failing predicate is:
+#           L4_auth_state_login/meta:
+#               \separated(state, &auth_ok).
+_META_LABEL_RE = re.compile(r"^(?P<name>[A-Za-z_]\w*)/meta$")
+# The meta file of an E-ACSL build, next to its binary: `<out>.security_meta.c`.
+SECURITY_META_SUFFIX = ".security_meta.c"
+
+
+def meta_sidecar_path(meta_file: str | Path) -> Path:
+    """
+    `<out>.security_meta.json`, which the build writes next to its meta file `<out>.security_meta.c`:
+    {props, meta_file, properties: {name: {obligation_class, instances}}, functions: {name: [file]},
+    harness_functions: [name], line_names}. `functions` maps each function the module's sources
+    define to its file, as the ledger names it; `harness_functions` are the ones the harness defines.
+    """
+    return Path(meta_file).with_suffix(".json")
+
+
+_META_SIDECARS: dict[str, tuple[int, dict]] = {}
+
+
+def _meta_sidecar(meta_file: str) -> dict:
+    """The sidecar of a meta file, {} when there is none to read (a report parsed away from its build)."""
+    if not meta_file.endswith(SECURITY_META_SUFFIX):
+        return {}
+    path = meta_sidecar_path(meta_file)
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return {}
+    cached = _META_SIDECARS.get(str(path))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    _META_SIDECARS[str(path)] = (stamp, data)
+    return data
+
+
+def _meta_class(name: str) -> str | None:
+    """The obligation class a property's name spells (run_wp_function.goal_obligation_class), or None."""
+    from run_wp_function import goal_obligation_class  # here: run_wp_function is not needed to parse anything else
+
+    cls = goal_obligation_class({"kind": "", "annotation": f"{name}: meta:"})
+    return None if cls == "rte" else cls
+
+
+def _wrapper_caller(text: str, function: str) -> str:
+    """
+    The function that called `function` when its `requires` failed: the frame after E-ACSL's contract
+    wrapper `__gen_e_acsl_<function>` in the stack libFuzzer prints, '' without one.
+    """
+    frames = list(_STACK_FRAME_RE.finditer(text))
+    for i, m in enumerate(frames[:-1]):
+        if m.group("function") == _EACSL_GEN_PREFIX + function:
+            return frames[i + 1].group("function").removeprefix(_EACSL_GEN_PREFIX)
+    return ""
+
+
+def _meta_failure(
+    text: str, name: str, meta_file: str, meta_line: int, function: str, kind: str, predicate: str
+) -> dict:
+    """
+    The failure of a run-time check of meta-property `name`. Its identity is the property and the
+    function it failed in, never the meta file (a path of the build, another one in a replay):
+      file         the source file of `function` (the build's sidecar), `unknown` when it cannot be told;
+      line         0: the reported line is the property's, in the meta file (`meta_location`);
+      kind         as E-ACSL reports it (assertion, precondition, postcondition);
+      alarm_kind   `meta_<property>`, the kind slot of the fingerprint: it names the property, whose
+                   name starts with its class (`L4_auth_state_login`); a class the name does not
+                   spell is written in front (`meta_<class>_<property>`);
+      predicate    `<property>: meta: <predicate>`, the form of a WP goal of the same property
+                   (run_wp_function.name_meta_goal), which goal_obligation_class maps to the class;
+      meta_property, obligation_class   for the ledger.
+    A failed `requires` is reported in the function that has it. `caller` is the function that
+    called it, and `harness_induced` says the caller is harness code: the harness reached a
+    protected function without what its callers in the target establish, which is no defect of the
+    target (the build leaves such a property out when it can tell: fuzz_build.resolve_security_meta).
+    """
+    side = _meta_sidecar(meta_file)
+    props = side.get("properties")
+    prop = props.get(name) if isinstance(props, dict) else None
+    cls = (prop.get("obligation_class") if isinstance(prop, dict) else None) or _meta_class(name)
+    functions = side.get("functions")
+    files = functions.get(function) if isinstance(functions, dict) else None
+    files = files if isinstance(files, list) else []
+    harness = side.get("harness_functions")
+    res: dict = {
+        "file": str(files[0]) if len(files) == 1 else "unknown",
+        "line": 0,
+        "function": function,
+        "kind": kind,
+        "alarm_kind": f"meta_{name}" if not cls or str(cls) in name.lower() else f"meta_{cls}_{name}",
+        "is_rte": False,
+        "label": f"{name}/meta",
+        "predicate": f"{name}: meta: {predicate}",
+        "meta_property": name,
+        "obligation_class": cls,
+        "meta_location": f"{meta_file}:{meta_line}",
+    }
+    if kind == "precondition":
+        caller = _wrapper_caller(text, function)
+        if caller:
+            res["caller"] = caller
+            res["harness_induced"] = is_harness_fuzz_function(caller) or (
+                isinstance(harness, list) and caller in harness
+            )
+    return res
+
+
 def parse_eacsl_failure(text: str) -> dict | None:
-    """Extract the first E-ACSL failure (file, line, function, kind, label, predicate) from runtime output."""
+    """
+    Extract the first E-ACSL failure (file, line, function, kind, label, predicate) from runtime output.
+    A failed check of a MetAcsl property is described by `_meta_failure`.
+    """
     if not text:
         return None
     err = _ERR_RE.search(text)
@@ -590,6 +713,11 @@ def parse_eacsl_failure(text: str) -> dict | None:
         function = _resolve_function_at_line(file_, line_)
     label, predicate = _failing_predicate(text, hit.end())
     kind = hit.group("kind").strip().lower().replace(" ", "_")
+    meta = _META_LABEL_RE.match(label)
+    if meta:
+        return _meta_failure(
+            text, meta.group("name"), file_ or "unknown", line_, function or "unknown_function", kind, predicate
+        )
     # A label names the alarm; inside the predicate only a label-like use counts, never an identifier.
     alarm = detect_alarm_kind(label) or detect_predicate_alarm_kind(predicate)
     explicit_rte_prefix = label.lower().startswith("rte") or predicate.lower().startswith("rte")
@@ -863,9 +991,16 @@ def is_sanitizer_allocation_cap(failure: dict | None) -> bool:
 
 
 def needs_attribution(failure: dict | None) -> bool:
-    """True when a failure has no usable target location (missing, line 0, unknown or runtime-internal function)."""
+    """
+    True when a failure has no usable target location (missing, line 0, unknown or runtime-internal function).
+    Never for a failed check of a MetAcsl property (`meta_property`): it has no line by construction, and a
+    sanitizer replay cannot see it (the attribution would give it the identity of whatever the sanitizers
+    report on that input, or none).
+    """
     if not failure:
         return True
+    if failure.get("meta_property"):
+        return False
     fn = failure.get("function") or ""
     return (
         int(failure.get("line") or 0) <= 0
