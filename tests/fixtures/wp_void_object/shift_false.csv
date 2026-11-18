@@ -1,0 +1,5 @@
+directory	file	line	function	property kind	status	property
+/target/wp_void_object/src	voidobj.c	31	shift_false	postcondition	Valid	\false
+/target/wp_void_object/src	voidobj.c	31	shift_false	termination clause	Valid	\true
+/target/wp_void_object/src	voidobj.c	31	shift_false	assigns clause	Valid	assigns \nothing;
+/target/wp_void_object/src	voidobj.c	34	shift_false	user assertion	Unknown	(char *)(p + 4) == &big[16]

@@ -40,6 +40,7 @@ import contextlib
 import json
 import math
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -870,6 +871,35 @@ def frame_clause_state(log_text: str, fn_name: str) -> dict:
     return {"assigns_clause": state, "assigns_clause_basis": basis, "assigns_behaviors": behaviors}
 
 
+# WP gives a `void` object the size of an `int` (plugins/wp/src/ctypes.ml) and says so where a term needs that
+# size: `[wp] f.c:17: Warning: void object`. A goal that depends on it can be proved although it is false.
+_VOID_OBJECT_WARNING = "void object"
+# Properties listed per warned line in the report: enough to see what sits there.
+_VOID_OBJECT_ROWS_KEPT = 8
+
+
+def void_object_sites(log_text: str) -> list[tuple[str, int]]:
+    """
+    The (file, line) of each `Warning: void object` WP printed, once each, in log order; ("", 0) for one without
+    a location. The line is that of the annotation, the alarm or the callee declaration whose translation needed
+    the size of a `void` object. It is not always the line of the goal that depends on it: for a libc contract
+    (`mempcpy`: `\\result == dest + n`) it is the contract's line, and the goals after the call use it.
+    """
+    sites: list[tuple[str, int]] = []
+    for m in fold_messages(log_text):
+        if m.plugin == "wp" and m.kind == "Warning" and m.text.strip() == _VOID_OBJECT_WARNING:
+            if (m.file, m.line) not in sites:
+                sites.append((m.file, m.line))
+    return sites
+
+
+def _report_row_path(row: dict) -> str:
+    """The path of a report CSV row as a WP message writes it: directory and file joined."""
+    directory = str(row.get("directory") or "")
+    name = str(row.get("file") or "")
+    return posixpath.normpath(f"{directory}/{name}") if directory else name
+
+
 def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
     """Return `{line: macro_name}` for loop-bearing `#define` macro invocations inside `fn_name`."""
     if not c_file.is_file():
@@ -1036,6 +1066,21 @@ def _report_field_hints(res: dict) -> list[str]:
             "(WP: \"No 'assigns' specification for function\"): outside them nothing was proved about what it "
             "writes, so 'assigns_vcs_proven' is false. Add an 'assigns' clause to the default behavior, or give "
             "every behavior one and state 'complete behaviors;'."
+        )
+    void_sites = [w for w in res.get("void_object_warnings") or [] if isinstance(w, dict)]
+    if void_sites:
+        shown = ", ".join(
+            f"{w.get('file')}:{w.get('line')}" if w.get("file") else "no location" for w in void_sites[:5]
+        )
+        more = f" and {len(void_sites) - 5} more" if len(void_sites) > 5 else ""
+        hints.append(
+            f"WP printed 'Warning: void object' at {shown}{more}: it gives a 'void' object the size of an 'int', "
+            "so '\\block_length', pointer arithmetic or '\\object_pointer' on a 'void *' on that line is computed "
+            "with the wrong size, and a goal that depends on it can be proved although it is false "
+            "('\\block_length(p) == 32' for 'char buf[8]; void *p = buf;'). In your own annotations cast first: "
+            "'\\block_length((char *)p)', '(char *)p + n'. Where the line is a libc or callee contract, or C code "
+            "that only loads a 'void *', there is nothing to change there: do not build a clause on the size or "
+            "the offset it yields. This warning does not change the status."
         )
     return hints
 
@@ -2073,10 +2118,25 @@ def run_wp_on_function(
     # One Degenerated goal in the log excuses one unproved `\valid_function` row, never a data-pointer
     # `\object_pointer` alarm: the report CSV carries no goal name, so the rows are matched by predicate and count.
     fpv_assumed_left = len(soundness["assumed_function_pointer_goals"])
+    # What the property report has at each line WP warned `void object` on, whichever function it belongs to.
+    void_sites = [
+        (file, line, (posixpath.normpath(file) if file else "", line)) for file, line in void_object_sites(combined_log)
+    ]
+    void_rows: dict[tuple[str, int], list[dict]] = {key: [] for _, _, key in void_sites}
 
     if csv_path.exists():
         for row in read_report_csv(csv_path):
             row_fn = row["function"]
+            at_void_site = void_rows.get((_report_row_path(row), row["line"])) if void_rows else None
+            if at_void_site is not None and len(at_void_site) < _VOID_OBJECT_ROWS_KEPT:
+                at_void_site.append(
+                    {
+                        "function": row_fn,
+                        "kind": row["kind"],
+                        "status": row["status_raw"],
+                        "annotation": row["property"],
+                    }
+                )
             if row_fn and row_fn != fn_name:
                 continue
             st = row["status"]
@@ -2372,6 +2432,12 @@ def run_wp_on_function(
             "l3_frame_goals": by_class.get("l3_frame", {}),
         },
         "soundness": soundness,
+        # The lines WP warned `void object` on (void_object_sites), each with what the property report has
+        # there. Reported only: WP prints it on correct code too (the `pointer_value` alarm on a loaded
+        # `void *`, the libc declaration of a callee with a `void *` formal), so it changes no status.
+        "void_object_warnings": [
+            {"file": file, "line": line, "properties": void_rows[key]} for file, line, key in void_sites
+        ],
         # Non-empty means Frama-C invented `int f()` prototypes: fix the stubs before trusting results.
         "undeclared_functions": scan_undeclared_functions(combined_log),
         "by_obligation_class": by_class,

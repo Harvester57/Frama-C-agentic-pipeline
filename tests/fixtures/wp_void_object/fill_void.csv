@@ -1,0 +1,11 @@
+directory	file	line	function	property kind	status	property
+/target/wp_void_object/src	voidobj.c	79	fill_void	assigns clause	Valid	assigns *((char *)dst + (0 .. n - 1));
+/target/wp_void_object/src	voidobj.c	80	fill_void	postcondition	Valid	\forall integer k; 0 <= k < \old(n) ==> *((char *)\old(dst) + k) == 0
+/target/wp_void_object/src	voidobj.c	82	fill_void	postcondition	Valid	\false
+/target/wp_void_object/src	voidobj.c	82	fill_void	termination clause	Valid	\true
+/target/wp_void_object/src	voidobj.c	85	fill_void	loop invariant	Valid	0 <= i <= n
+/target/wp_void_object/src	voidobj.c	86	fill_void	loop invariant	Valid	\forall integer k; 0 <= k < i ==> *(d + k) == 0
+/target/wp_void_object/src	voidobj.c	87	fill_void	assigns clause	Valid	assigns i, *(d + (0 .. n - 1));
+/target/wp_void_object/src	voidobj.c	90	fill_void	unsigned_overflow	Valid	i + 1 <= 18446744073709551615
+/target/wp_void_object/src	voidobj.c	91	fill_void	pointer_value	Valid	\null == d + i || \object_pointer(d + i)
+/target/wp_void_object/src	voidobj.c	91	fill_void	mem_access	Valid	\valid(d + i)

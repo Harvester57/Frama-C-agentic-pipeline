@@ -1,0 +1,5 @@
+directory	file	line	function	property kind	status	property
+/target/wp_void_object/src	voidobj.c	23	bl_cast	postcondition	Valid	\false
+/target/wp_void_object/src	voidobj.c	23	bl_cast	termination clause	Valid	\true
+/target/wp_void_object/src	voidobj.c	23	bl_cast	assigns clause	Valid	assigns \nothing;
+/target/wp_void_object/src	voidobj.c	26	bl_cast	user assertion	Valid	\block_length((char *)p) == 8

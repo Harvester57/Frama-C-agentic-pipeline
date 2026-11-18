@@ -1,0 +1,6 @@
+directory	file	line	function	property kind	status	property
+/target/wp_void_object/src	voidobj.c	70	stores_void	assigns clause	Valid	assigns h->ctx;
+/target/wp_void_object/src	voidobj.c	71	stores_void	postcondition	Valid	\old(h)->ctx == \old(p)
+/target/wp_void_object/src	voidobj.c	73	stores_void	postcondition	Valid	\false
+/target/wp_void_object/src	voidobj.c	73	stores_void	termination clause	Valid	\true
+/target/wp_void_object/src	voidobj.c	75	stores_void	mem_access	Valid	\valid(&h->ctx)

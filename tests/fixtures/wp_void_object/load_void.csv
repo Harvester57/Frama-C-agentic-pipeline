@@ -1,0 +1,7 @@
+directory	file	line	function	property kind	status	property
+/target/wp_void_object/src	voidobj.c	52	load_void	postcondition	Partially proven	\result == \old(h)->ctx
+/target/wp_void_object/src	voidobj.c	54	load_void	postcondition	Valid	\false
+/target/wp_void_object/src	voidobj.c	54	load_void	termination clause	Valid	\true
+/target/wp_void_object/src	voidobj.c	54	load_void	assigns clause	Partially proven	assigns \nothing;
+/target/wp_void_object/src	voidobj.c	56	load_void	mem_access	Partially proven	\valid_read(&h->ctx)
+/target/wp_void_object/src	voidobj.c	56	load_void	pointer_value	Unknown	\null == h->ctx || \object_pointer(h->ctx)
