@@ -165,7 +165,7 @@ Once `wp_scheduler.py status` reports `"done": true`: `python3 /opt/framac-pipel
 3. Set the terminal status:
    - `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status complete` only if no candidate is unverified and no unit is `planned`/`in_progress`;
    - otherwise `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status incomplete --reason <exact reason>`.
-4. Export the diff, validate and generate the reports: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run report`. It runs `ledger.py audit-hypotheses` (so no caller shows as unconditionally proven while a callee is not), `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs.
+4. Export the diff, validate and generate the reports: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run report`. It runs `ledger.py audit-hypotheses` (so no caller shows as unconditionally proven while a callee is not), `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs. Read two places in REPORT.md before you summarize the run: section 5 lists the merges accepted with a note (a contract that lost a clause, no frame shown for the function, no guardrail run), and section 3 marks the confirmed findings that count a reproducer whose failure was not compared with the candidate's (`failureIdentityNotCompared` in report.sarif).
 5. Mark the checkpoint complete: `python3 /opt/framac-pipeline/scripts/checkpoint.py complete state`.
 6. `--in-place` is a separate host-side step after the user reviews the report: `python <pipeline>\scripts\workspace_overlay.py apply-in-place --overlay <run-dir>\workspace --target <target-dir>`.
 

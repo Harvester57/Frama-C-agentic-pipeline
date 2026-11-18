@@ -181,6 +181,8 @@ Each function's trust belongs to its `file#name`: two same-named statics keep th
 
 (sh: `--codeql`.) `-CodeQL` runs in `framac-codeql:<repo key>`: the target's derived build image plus the CodeQL CLI copied from `framac-codeql:latest`. It is built locally and never pushed. `codeql_trust.py` replays the build recipe under CodeQL's tracer and writes `workspace/reports/codeql_trust.json`. Then `trust.py run` merges its facts.
 
+`trust.py run` and `phase0_model.py run` both take `--metadata` (default `run-metadata.json`) and `--codeql` (default `workspace/reports/codeql_trust.json` when CodeQL is enabled), so a model rebuilt after CodeQL ran merges the same facts itself and records the facts file's sha256 under `trust.codeql`. The DAG copies the trust marks: after any model rebuild or `trust.py run`, rebuild the DAG (Step 2) and run the reach gate again. `validate_artifacts.py run-dir` fails when CodeQL is enabled, the facts file is `ok` and the model's `trust.codeql` does not hold those facts (the fix it names: `trust.py run`, then the DAG rebuild), and when the DAG's copy stands for other facts than the model's.
+
 Consumers of trust:
 - the harness sidecar's `reachability` (`untrusted_surface` at a boundary, else `internal_api`; `reachability_source` records `trust:<rule>`);
 - the contract trust-boundary check, for every boundary function;
@@ -452,6 +454,8 @@ The Makefile's `seed` target (`pipeline_make.py run seed`) runs the first three 
 - unreached header functions are seeded `deferred` (`header_unreached`);
 - concurrent units carry `bookkeeping.concurrent`;
 - the security properties of Step 3 add their classes per instance (`--security-props`, default `workspace/reports/security_props.json` when it exists). The Makefile's `seed` target runs `security-props` first, so the file is current.
+
+A plain `seed` never rewrites an existing unit. `seed --refresh` (a Phase 0 re-run on a changed target) re-derives the units without evidence from the current DAG. It also retires or re-plans the units keyed on a property that `security_props.json` now records as relocated (a wrapper sink with `checked_at`), and lists them under `refresh.relocated` in its output; plain `seed` never does.
 
 `pipeline_make.py gen` writes `workspace/build/Makefile` for the deterministic per-module phases (`/framac-fuzz`, `/framac-eva`), one record per harness module. Check its JSON for modules excluded with a reason before moving on. Under `quick`, Tier 3 modules are excluded with a reason.
 
