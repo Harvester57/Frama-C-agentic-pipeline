@@ -1049,6 +1049,367 @@ def parse_missing_functions(log: str) -> list[str]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# Annotations E-ACSL ignores
+# ---------------------------------------------------------------------------
+
+# E-ACSL does not fail on an annotation it cannot translate: it warns, prints the clause back as a
+# comment and generates no check for it. The warning, in stage 1's output (Frama-C 34.0~beta,
+# tests/fixtures/eacsl_ignored), is wrapped over several lines and uses the kernel's Unicode symbols:
+#   [e-acsl] workspace/work/src/probe.c:13: Warning:
+#     invalid E-ACSL construct
+#     `invalid guard i + n >= 0 in quantification unb_pre: \forall integer i; 0 <= i ==> i + n >= 0.
+#     Missing upper bound for i.
+#     Only < and <= are allowed to guard quantifier variables'.
+#     Ignoring annotation.
+#   [e-acsl] workspace/work/src/probe.c:23: Warning:
+#     E-ACSL construct `loop variant using GMP' is not yet supported.
+#     Ignoring annotation.
+# The file is the source or header the annotation is written in (relative to the build's directory
+# when under it). The line is inside the clause for `requires`, `ensures`, `assert`, loop invariants
+# and variants (any line of a clause written over several). It is the function's own line for
+# `assigns`, `decreases` and `terminates`, and the line of the definition for a `predicate` or
+# `logic` whose body cannot be translated: E-ACSL then drops, without another warning, every clause
+# that uses it. Other warnings (`no assigns clause generated for function ...`) ignore nothing.
+_EACSL_WARNING_HEAD_RE = re.compile(
+    r"^\[e-acsl(?::[^\]]*)?\] (?:(?P<file>\S.*?):(?P<line>\d+): )?Warning:[ \t]*(?P<rest>.*)$"
+)
+_EACSL_IGNORED_SUFFIX = "Ignoring annotation."
+_EACSL_UNSUPPORTED_RE = re.compile(r"^E-ACSL construct `(?P<construct>.+)' is not yet supported\.$")
+
+# `assigns` (a loop's) and `assigns clause` (a contract's): E-ACSL checks no frame condition, and nearly
+# every contract has one. They are counted, not listed.
+EACSL_FRAME_CONSTRUCTS = frozenset({"assigns", "assigns clause"})
+# Clause kinds E-ACSL executes for no function, whatever they say: listed, but a guardrail pass was
+# never expected to cover them (`expected_check` false).
+EACSL_NEVER_EXECUTED_CONSTRUCTS = frozenset(
+    {"decreases clause", "terminates clause", "abnormal termination case in behavior"}
+)
+
+
+def parse_ignored_annotations(log_text: str) -> tuple[list[dict], int]:
+    """
+    The annotations E-ACSL reported as ignored in `log_text` (stage 1's output), in log order and
+    without repeats, and the number of ignored frame clauses (EACSL_FRAME_CONSTRUCTS).
+
+    Each entry: `file` and `line` as E-ACSL printed them (None without a location), `construct` (the
+    name E-ACSL gives a construct it does not support yet, else None), `reason` (the warning's text
+    without `Ignoring annotation.`, on one line) and `expected_check`: False for a clause kind E-ACSL
+    never executes (EACSL_NEVER_EXECUTED_CONSTRUCTS), True otherwise: E-ACSL generates a check for
+    such a clause when it can translate it, and here it did not.
+    """
+    entries: list[dict] = []
+    frame: set[tuple] = set()
+    seen: set[tuple] = set()
+    lines = (log_text or "").splitlines()
+    i = 0
+    while i < len(lines):
+        m = _EACSL_WARNING_HEAD_RE.match(lines[i])
+        i += 1
+        if m is None:
+            continue
+        parts = [m.group("rest").strip()]
+        while i < len(lines) and lines[i][:1] in (" ", "\t") and lines[i].strip():
+            parts.append(lines[i].strip())
+            i += 1
+        message = " ".join(p for p in parts if p)
+        if not message.endswith(_EACSL_IGNORED_SUFFIX):
+            continue
+        reason = message[: -len(_EACSL_IGNORED_SUFFIX)].strip()
+        unsupported = _EACSL_UNSUPPORTED_RE.match(reason)
+        construct = unsupported.group("construct") if unsupported else None
+        line = int(m.group("line")) if m.group("line") else None
+        key = (m.group("file"), line, reason)
+        if construct in EACSL_FRAME_CONSTRUCTS:
+            frame.add(key)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(
+            {
+                "file": m.group("file"),
+                "line": line,
+                "construct": construct,
+                "reason": reason,
+                "expected_check": construct not in EACSL_NEVER_EXECUTED_CONSTRUCTS,
+            }
+        )
+    return entries, len(frame)
+
+
+# The kernel's Unicode spelling of ACSL, as stage 1 prints annotations into the instrumented file.
+_ACSL_UNICODE = {
+    "\N{FOR ALL}": "\\forall",
+    "\N{THERE EXISTS}": "\\exists",
+    "\N{DOUBLE-STRUCK CAPITAL Z}": "integer",
+    "\N{DOUBLE-STRUCK CAPITAL R}": "real",
+    "\N{MATHEMATICAL DOUBLE-STRUCK CAPITAL B}": "boolean",
+    "\N{LESS-THAN OR EQUAL TO}": "<=",
+    "\N{GREATER-THAN OR EQUAL TO}": ">=",
+    "\N{IDENTICAL TO}": "==",
+    "\N{NOT IDENTICAL TO}": "!=",
+    "\N{RIGHTWARDS DOUBLE ARROW}": "==>",
+    "\N{LEFT RIGHT DOUBLE ARROW}": "<==>",
+    "\N{LOGICAL AND}": "&&",
+    "\N{LOGICAL OR}": "||",
+    "\N{XOR}": "^^",
+    "\N{NOT SIGN}": "!",
+}
+_ACSL_UNICODE_RE = re.compile("|".join(re.escape(ch) for ch in _ACSL_UNICODE))
+_ACSL_ASSERT_RE = re.compile(r"(?<![\\\w])(?:assert|check|admit)\b")
+_ACSL_LABEL_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:(?!:)")
+_LOGIC_NAME_RE = re.compile(
+    r"\b(?:predicate|inductive)\s+(?P<pred>[A-Za-z_]\w*)"
+    r"|\blogic\s+[^;=(){}]*?\b(?P<logic>[A-Za-z_]\w*)\s*(?:\{[^}]*\}\s*)?[(=]"
+)
+
+
+def _acsl_ascii(text: str) -> str:
+    return _ACSL_UNICODE_RE.sub(lambda m: _ACSL_UNICODE[m.group(0)], text)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _annotation_clauses(tok_text: str, tok_line: int) -> list[dict]:
+    """The clauses of one ACSL comment: `kind`, `label`, `text`, and the lines `line`..`end_line` it is written on."""
+    import acsl_ast  # lazily: only a build that ignored an annotation reads sources
+
+    clauses = []
+    for kind, label, pred, (start, end) in acsl_ast.iter_clauses(tok_text):
+        clauses.append(
+            {
+                "kind": kind,
+                "label": label,
+                "text": _one_line(pred),
+                "line": tok_line + tok_text.count("\n", 0, start),
+                "end_line": tok_line + tok_text.count("\n", 0, end),
+            }
+        )
+    if not clauses and (m := _ACSL_ASSERT_RE.search(tok_text)) is not None:
+        # `assert`, `check` and `admit` are statements, not clauses `iter_clauses` knows: up to the last `;`.
+        body = tok_text[m.end() :]
+        body = body.rsplit(";", 1)[0] if ";" in body else body.removesuffix("*/")
+        labels = []
+        while (lab := _ACSL_LABEL_RE.match(body)) is not None:
+            labels.append(lab.group(1))
+            body = body[lab.end() :]
+        clauses.append(
+            {
+                "kind": "assert",
+                "label": ", ".join(labels),
+                "text": _one_line(body),
+                "line": tok_line + tok_text.count("\n", 0, m.start()),
+                "end_line": tok_line + tok_text.count("\n"),
+            }
+        )
+    return clauses
+
+
+class _AnnotatedSource:
+    """What attribution reads of one source or header: its functions, ACSL comments and logic definitions."""
+
+    def __init__(self, text: str, path: str):
+        import acsl_ast
+        from c_definitions import extract_functions_from_code
+
+        self.text = text
+        self.path = path
+        self._acsl_ast = acsl_ast
+        self._decl_spans: dict[str, list] = {}
+        self.acsl = [
+            (tok.line, tok.line + tok.text.count("\n"), tok)
+            for tok in acsl_ast.tokenize_c_acsl(text, path=path)
+            if tok.kind in ("acsl_block", "acsl_line")
+        ]
+        self.definitions = [
+            (int(fn["line"]), int(fn["end_line"]), str(fn["name"]))
+            for fn in extract_functions_from_code(text, path=path)
+        ]
+        self.prototypes = acsl_ast.locate_all_prototype_spans(text, path=path)
+        self.logic = acsl_ast.extract_top_level_acsl_declarations(text, path=path)
+
+    def _declared_at(self, name: str, line: int) -> str | None:
+        """`definition` or `prototype` when `line` is in a declaration of `name` (its contract included)."""
+        if name not in self._decl_spans:
+            self._decl_spans[name] = self._acsl_ast.function_declaration_spans(self.text, name, path=self.path)
+        for decl in self._decl_spans[name]:
+            if decl.span.start_line <= line <= decl.span.end_line:
+                return decl.kind
+        return None
+
+    def owner(self, line: int) -> tuple[str, str] | None:
+        """(function, `definition` | `prototype`) of the declaration whose contract or body holds `line`."""
+        for span in self.prototypes:
+            if span.start_line <= line <= span.end_line:
+                return span.function, "prototype"
+        # In a body, or in the contract in front of the next definition (never a guess: the declaration's
+        # own span, read by the tokenizer, must hold the line).
+        inside = [name for first, last, name in self.definitions if first <= line <= last]
+        following = sorted((first, name) for first, _last, name in self.definitions if first > line)
+        for name in inside + [name for _first, name in following[:1]]:
+            kind = self._declared_at(name, line)
+            if kind is not None:
+                return name, kind
+        return None
+
+    def clause(self, line: int) -> dict | None:
+        for first, last, tok in self.acsl:
+            if first <= line <= last:
+                for clause in _annotation_clauses(tok.text, tok.line):
+                    if clause["line"] <= line <= clause["end_line"]:
+                        return {k: clause[k] for k in ("kind", "label", "text", "line")}
+        return None
+
+    def logic_names(self, line: int) -> list[str]:
+        """The logic functions and predicates defined by the file-scope ACSL declaration that holds `line`."""
+        names: list[str] = []
+        for decl in self.logic:
+            first = int(decl["line"])
+            if first <= line <= first + str(decl["text"]).count("\n"):
+                found = [m.group("pred") or m.group("logic") for m in _LOGIC_NAME_RE.finditer(str(decl["text"]))]
+                if decl["kind"] in ("predicate", "logic", "inductive"):
+                    found.append(str(decl["name"]))
+                for name in found:
+                    if name not in names:
+                        names.append(name)
+        return names
+
+
+def _name_ref_re(names: set[str]) -> re.Pattern[str]:
+    return re.compile(r"(?<![\w\\])(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
+
+
+def _logic_definition_users(instrumented_text: str, names: list[str]) -> list[dict]:
+    """
+    The clauses of the instrumented file that use a logic function or predicate of `names`, directly or
+    through another logic definition: `{function, clause: {kind, label, text}, via}`.
+
+    The instrumented file is read because it is complete: stage 1 prints there every contract it
+    merged for a function (from its definition and from the headers) and every logic definition. A
+    contract checked through `__gen_e_acsl_<fn>` belongs to `<fn>`.
+    """
+    import acsl_ast
+
+    text = _acsl_ascii(instrumented_text)
+    tainted = set(names)
+    decls = acsl_ast.extract_top_level_acsl_declarations(text, path="<instrumented>")
+    grown = True
+    while grown:
+        grown = False
+        ref = _name_ref_re(tainted)
+        for decl in decls:
+            own = {m.group("pred") or m.group("logic") for m in _LOGIC_NAME_RE.finditer(str(decl["text"]))}
+            body = str(decl["text"]).split("=", 1)[-1]
+            if own - tainted and ref.search(body):
+                tainted |= own
+                grown = True
+    ref = _name_ref_re(tainted)
+    spans = list(acsl_ast.locate_all_definition_spans(text, path="<instrumented>").values())
+    spans += acsl_ast.locate_all_prototype_spans(text, path="<instrumented>")
+    users: list[dict] = []
+    seen: set[tuple] = set()
+    for span in spans:
+        if not ref.search(span.text):
+            continue
+        function = span.function.removeprefix("__gen_e_acsl_")
+        for tok in acsl_ast.tokenize_c_acsl(span.text, path="<instrumented>"):
+            if tok.kind not in ("acsl_block", "acsl_line") or not ref.search(tok.text):
+                continue
+            clauses = [c for c in _annotation_clauses(tok.text, tok.line) if ref.search(c["text"])]
+            if not clauses:  # a use this reader cannot cut into clauses is still a use
+                clauses = [{"kind": "annotation", "label": "", "text": _one_line(tok.text)[:300]}]
+            for clause in clauses:
+                key = (function, clause["kind"], clause["label"], clause["text"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                used = ref.search(clause["text"])
+                users.append(
+                    {
+                        "function": function,
+                        "clause": {k: clause[k] for k in ("kind", "label", "text")},
+                        "via": used.group(0) if used else names[0],
+                    }
+                )
+    return users
+
+
+def attribute_ignored_annotations(
+    entries: list[dict], instrumented_c: Path | None = None, cwd: Path | None = None
+) -> list[dict]:
+    """
+    Say which function each ignored annotation (parse_ignored_annotations) belongs to. Adds:
+
+      attribution  how `function` was decided, or why it could not be:
+                   `line_in_function`     the line is in a declaration of `function`: in the contract in
+                                          front of its definition or of a prototype, or in its body
+                   `logic_definition`     the line is in a file-scope `predicate`/`logic` definition
+                                          (`logic_names`); `used_by` lists the clauses that use it
+                   `outside_any_function` the line is in neither
+                   `file_not_readable`, `source_not_parsed`, `no_location`
+      function     the function's name, else None (nothing is guessed from the warning's text)
+      declaration  `definition` or `prototype` (with `line_in_function`)
+      clause       {kind, label, text, line} of the clause holding the line, when it is in an annotation
+      logic_names, used_by   with `logic_definition`: [{function, clause: {kind, label, text}, via}],
+                   read from `instrumented_c`; `used_by` is None when that file cannot be read
+
+    The sources are read as they are now, at the paths E-ACSL printed, relative to `cwd` (default: the
+    current directory): call this right after the build, and keep the result with it.
+    """
+    base = Path(cwd) if cwd is not None else Path.cwd()
+    sources: dict[str, _AnnotatedSource | str] = {}
+    instrumented_text: str | None = None
+    out: list[dict] = []
+    for entry in entries:
+        entry = dict(entry, function=None, declaration=None, clause=None)
+        out.append(entry)
+        file, line = entry.get("file"), entry.get("line")
+        if not file or not line:
+            entry["attribution"] = "no_location"
+            continue
+        if file not in sources:
+            try:
+                text = (base / file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                sources[file] = "file_not_readable"
+            else:
+                try:
+                    sources[file] = _AnnotatedSource(text, file)
+                except Exception:  # a file the tokenizer cannot read attributes nothing
+                    sources[file] = "source_not_parsed"
+        src = sources[file]
+        if isinstance(src, str):
+            entry["attribution"] = src
+            continue
+        try:
+            owner = src.owner(line)
+            entry["clause"] = src.clause(line)
+            names = [] if owner else src.logic_names(line)
+        except Exception:
+            entry["attribution"] = "source_not_parsed"
+            continue
+        if owner is not None:
+            entry.update(function=owner[0], declaration=owner[1], attribution="line_in_function")
+        elif names:
+            entry.update(attribution="logic_definition", logic_names=names, clause=None, used_by=None)
+            if instrumented_text is None and instrumented_c is not None:
+                try:
+                    instrumented_text = Path(instrumented_c).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    instrumented_text = None
+            if instrumented_text is not None:
+                try:
+                    entry["used_by"] = _logic_definition_users(instrumented_text, names)
+                except Exception:
+                    entry["used_by"] = None
+        else:
+            entry["attribution"] = "outside_any_function"
+    return out
+
+
 _LINE_MARKER_RE = re.compile(r'^#\s*(?:line\s+)?\d+\s+"(?P<file>[^"]+)"')
 
 

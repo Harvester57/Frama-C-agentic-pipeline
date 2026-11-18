@@ -32,6 +32,7 @@ from eacsl_toolchain import (
     EACSL_NO_LIBC_CHECKS,
     EACSL_RTE_INITIALIZED_FLAG,
     UnsafePassthroughError,
+    attribute_ignored_annotations,
     build_eacsl_flag_sets,
     build_errno_shim_object,
     build_fallback_object,
@@ -45,6 +46,7 @@ from eacsl_toolchain import (
     mark_wrapper_results_initialized,
     normalize_passthrough,
     order_literal_registrations,
+    parse_ignored_annotations,
     parse_missing_functions,
     parse_undefined_fallbacks,
     prepare_patched_eacsl_share,
@@ -65,6 +67,10 @@ from fuzz_common import (
     DEFAULT_SELFTEST_JSON,
     _in_agent_scratch,
 )
+
+# Part of the build cache key: the shape of `ignored_annotations` in a build result. Raise it when
+# the list's fields or the rule that attributes an entry to a function change.
+IGNORED_ANNOTATIONS_VERSION = 1
 
 
 def _decode(data) -> str:
@@ -245,6 +251,8 @@ def _eacsl_cache_material(
         "check_options": _check_options(is_modern, libc_checks),
         "runtime_patches": _runtime_patches(_check_options(is_modern, libc_checks)),
         "zone_sizes": _zone_size_options(is_modern),
+        # A build stored before its result listed the annotations E-ACSL ignored must not be restored.
+        "ignored_annotations": IGNORED_ANNOTATIONS_VERSION,
     }
 
 
@@ -497,6 +505,11 @@ def _compile_eacsl_binary_uncached(
     stage 2 also links the generated errno shim (`errno_shim`: wrapped functions, or `failed`).
     On success the result's `binary` is the E-ACSL-instrumented executable (`<out>.e-acsl` when
     present) and is guaranteed to contain E-ACSL instrumentation.
+
+    E-ACSL does not fail on an annotation it cannot translate: it warns (`... Ignoring annotation.`)
+    and generates no check. The result lists them in `ignored_annotations`, each with the function it
+    belongs to when that can be read from the sources (eacsl_toolchain.attribute_ignored_annotations),
+    and counts the ignored `assigns` clauses, which E-ACSL never checks, in `ignored_frame_clauses`.
     """
     out_bin = Path(out_bin)
     out_bin.parent.mkdir(parents=True, exist_ok=True)
@@ -526,10 +539,22 @@ def _compile_eacsl_binary_uncached(
         result["stdout"] = out[-16000:]
         result["stderr"] = err[-16000:]
 
+    # The last instrumentation run's output, and whether it left `<out>.instrumented.c` (a failed
+    # run can leave an older build's file there).
+    frontend: dict = {"output": "", "instrumented": False}
+
     def _finish(rc: int, reason: str | None = None) -> dict:
         result["returncode"] = rc
         result["command"] = " && ".join(commands)
         result["undeclared_functions"] = scan_undeclared_functions("\n".join(log_parts))
+        # E-ACSL warns and goes on when it cannot translate an annotation: the binary then checks
+        # nothing for it. Attributed now, while the sources are the ones E-ACSL read, and kept with the
+        # result so that a build restored from the cache says the same.
+        ignored, frame_clauses = parse_ignored_annotations(frontend["output"])
+        result["ignored_annotations"] = attribute_ignored_annotations(
+            ignored, instrumented_c if frontend["instrumented"] else None
+        )
+        result["ignored_frame_clauses"] = frame_clauses
         if reason:
             result["reason"] = reason
         compile_log.write_text("\n".join(log_parts) or f"Returncode: {rc}\nReason: {reason}\n", encoding="utf-8")
@@ -611,6 +636,7 @@ def _compile_eacsl_binary_uncached(
         rc, out, err = _run_tool(cmd, runner)
         _record(cmd, rc, out, err)
         _note_const_unions(out, err)
+        frontend.update(output=out + "\n" + err, instrumented=rc == 0 and instrumented_c.is_file())
         if rc != 0:
             return _finish(rc, "eacsl_compile_failed")
     else:
@@ -659,6 +685,7 @@ def _compile_eacsl_binary_uncached(
                 cmd1, rc, out, err = _stage1([f for f in target_fns if f not in missing])
                 _record(cmd1, rc, out, err)
         _note_const_unions(out, err)  # the last frontend run only: a retry preprocesses the same files again
+        frontend.update(output=out + "\n" + err, instrumented=rc == 0 and instrumented_c.is_file())
         if rc != 0:
             return _finish(rc, "eacsl_instrumentation_failed")
         if instrumented_c.is_file():
