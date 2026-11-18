@@ -91,7 +91,7 @@ Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wa
 | 10:44-10:50 | Five negotiations that changed nothing are refused by the frame check; the fixer for fix 16 is dispatched at 10:52 and the session holds their next results |
 | 11:05 | Fix 16 merged live as `6719f9d`. Two of the five results were already in a merge that started before the fix |
 | 11:22 | Four of the five negotiations are applied. `_modbus_rtu_pre_check_confirmation` ended `done/rejected` on the old scripts |
-| 11:40 | `requeue --frame-refused` merged live; the recovery of that negotiation is queued for the session's next idle moment |
+| 11:33 | `requeue --frame-refused` merged live as `1302bdc`; the recovery of that negotiation is queued for the session's next idle moment |
 | 04:49 | Supervisor finds the confirmed `send_msg` loop documented in `docs/modbus_set_error_recovery.md` ("an infinite close/connect loop until success on send call" under `MODBUS_ERROR_RECOVERY_LINK`). The harness had enabled LINK on a context with no peer, so the verdict is a false positive. Guidance prepared: keep the record, report it as documented behaviour, and mask LINK in the regenerated harness |
 
 ## Pipeline issues and fixes
