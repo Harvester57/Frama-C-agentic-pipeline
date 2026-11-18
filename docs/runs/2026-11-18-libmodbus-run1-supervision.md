@@ -19,7 +19,7 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 
 ## Status
 
-**Phase 0, paused** (`no_unit_parsed`), waiting for the `TIOCM_*` fix to land, after which the supervisor resumes the session.
+**Phase 0, running** (resumed at about 02:40 after fix 4); the session will stop before Phase 1 so seeds can be re-recorded once fix 5 lands.
 
 ## Timeline (supervisor's observations, local time, 2026-11-18)
 
@@ -34,6 +34,10 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 01:55:56 | Build capture `ok`: 1 product unit (`libmodbus.so.5.1.0`, 4 sources, 71 entry points), 9 test executables, and a stray `unlinked:/tmp/cg7zzCGG` |
 | 01:56:12 | `phase0_model.py run`: `no_unit_parsed`, `src/modbus-rtu.c:254: User Error: Cannot resolve variable TIOCM_RTS` |
 | 02:01 | User stops the session and asks the supervisor to land the fix and resume |
+| 02:20 | Supervisor resumes the session (fixes 2 and 3 merged) |
+| 02:21-02:25 | Build capture `ok` (probe unit gone), model `ok` (120 functions, 161 edges), threat model check `ok`, CodeQL 13 facts on 8 functions (6 unmatched test `main`s), seeds `not_relinked` (0 calls), DAG: 1 Tier 1A module, no split; security properties `ok` |
+| 02:25:35 | `generate_harness.py`: `'workspace/work/config.h' file not found`; the session stops and reports (02:28) |
+| ~02:40 | Fix 4 merged; session resumed, told to stop before Phase 1 |
 
 ## Pipeline issues and fixes
 
@@ -43,15 +47,22 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 2 | `phase0_model.py run`: `unlinked:/tmp/<cgXXXXXX>` unit, `source file '/tmp/.../dummy.c' does not exist` (GNU `config.guess` libc probe captured as a product unit) | pipeline bug | `sup/libmodbus-config-guess-probe` `0b3b43b` | merged live into `phase1-remediation` (fast-forward) |
 | 3 | `phase0_model.py run`: `Cannot resolve variable TIOCM_RTS` (`__fc_libc` `<sys/ioctl.h>` has `TIOCMGET` but not the `TIOCM_*` modem bits) | pipeline gap + upstream Frama-C libc gap | `sup/libmodbus-tiocm-bits` `f0bea19` (+ docs `a6e33f8`, `47fb030`), merged live as `34f8747`; also adds `TCGETS2`..`TCSETSF2`, the next missing macros; upstream draft 41 (not filed) |
 
+| 4 | `generate_harness.py --api`: `the harness does not compile outside its cases: <built-in>:1:10: fatal error: 'workspace/work/config.h' file not found` (DAG roots a generated force-include at the work tree) | pipeline bug | `sup/libmodbus-generated-force-include` `9f7b123`, merged live as `222d1d3` | fixed; the run reruns the DAG and the harness |
+| 5 | `seed_harvest.py`: `not_relinked`, every test executable `no_api_function` (the recorder wraps only API functions the executable defines; libmodbus tests call them from the shared library) | pipeline gap | `sup/libmodbus-seed-shared-lib` | fixer running; the run stops before Phase 1 so seeds can be re-recorded |
+
 Tests added:
 
 - `tests/test_crlf_scripts.py`: `test_a_shell_syntax_error_on_a_crlf_script_gets_the_hint`, `test_a_shell_syntax_error_naming_no_crlf_script_gives_no_hint`, `test_crlf_autotools_inputs_are_found`, `test_a_configure_syntax_error_from_a_crlf_configure_ac_gets_the_hint`, `test_a_build_failing_with_a_syntax_error_in_a_crlf_script_gets_the_hint` (branch 1).
 - `tests/test_build_capture.py::TestRecordedEvents::test_config_guess_temp_dir_probe_is_dropped` (merged).
+- `tests/test_unit_view.py::test_generated_force_include_resolves_to_its_snapshot_copy` (merged).
 
 ## Model struggles (not pipeline bugs)
 
 - 01:52, 02:00: inline PowerShell double-quoted commands expanded `$?` and `$(frama-c ...)` on the host. The model noticed and switched to `-ScriptFile`.
 - 01:55: the model changed the confirmed recipe a second time (CR strip over every text file) on its own reading of the user's earlier answer, although the brief said not to change the recipe on its own. The change was harmless (scratch copy only).
+- 02:24: the model removed the build scratch volume right after seed recording, so re-recording seeds needs a rebuild.
+- 02:25: the model passed a Python file to `-ScriptFile`, which runs it with bash (`import: command not found`), then rewrote it as bash with a heredoc. The wrapper's `-ScriptFile` help could say it must be a shell script.
+- 02:28: the run brief asks the model to send its progress report with SendUserFile, a tool opencode does not have; the model said so and left the report on disk (`docs/runs/2026-11-18-libmodbus-run1.md`, uncommitted, not indexed).
 - 01:56-02:00: on `no_unit_parsed` the model investigated pipeline code for several minutes instead of stopping and reporting as framac-slice Step 1c says. It reached the right diagnosis and did not edit pipeline files.
 
 ## Decisions taken for the user
