@@ -453,6 +453,21 @@ def test_struct_members_include_the_member_macros():
 
 
 @pytest.mark.unit
+def test_a_flexible_array_member_is_probed_without_sizeof():
+    # sys/inotify.h: `sizeof(((struct inotify_event *)0)->name)` is "invalid application of 'sizeof' to
+    # incomplete type 'char[]'", and the shipped check failed "with the real header".
+    text = "struct ev { int wd; unsigned len; char name[]; };\nstruct fixed { char tail[4]; char *p[]; };\n"
+    members = stub_check.struct_members(text)
+    assert members == {"ev": ["wd", "len", "name[]"], "fixed": ["tail", "p[]"]}
+    probe = stub_check.layout_probe_source("x.h", {"ev": members["ev"]})
+    assert "offsetof(struct ev, name)" in probe and "->name[0])" in probe
+    assert "sizeof(((struct ev *)0)->name)" not in probe and "name[]" not in probe
+    assert "sizeof(((struct ev *)0)->len)" in probe
+    shipped = (ROOT / "templates" / "fc_stubs" / "sys" / "inotify.h").read_text(encoding="utf-8")
+    assert "name[]" in stub_check.struct_members(shipped)["inotify_event"]
+
+
+@pytest.mark.unit
 def test_shipped_prototypes_drop_the_contracts():
     text = "/*@ requires \\valid(p);\n    assigns *p; */\nint f(int *p);\n// note\nvoid g(void);\n"
     assert stub_check.shipped_prototypes(text, "x.h") == ["int f(int *p);", "void g(void);"]

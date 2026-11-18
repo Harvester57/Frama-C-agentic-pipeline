@@ -189,9 +189,37 @@ the call fails with `Operation not permitted`.
 
 ## Workaround
 
-On the pipeline side, `templates/fc_stubs/sys/epoll.h` and `sys/inotify.h` (branch
-`sup/c-ares-linux-header-shims`, commit `20a23bd`) are parse shims around glibc's header. Once the
-headers are upstream and released, they can go.
+On the pipeline side, `templates/fc_stubs/sys/epoll.h` and `sys/inotify.h` were parse shims around
+glibc's header (commit `20a23bd`). Since 2026-11-18 they are the two headers of this
+patch for Eva and WP, with their contracts; E-ACSL still reads glibc's header. From `__BEGIN_DECLS`
+to `__END_DECLS` the pipeline's text is the patch's, and
+`tests/test_fc_stub_repairs.py::test_linux_event_headers_carry_the_text_of_the_upstream_patch`
+compares the two: a change the maintainers ask for in !56 goes into the patch file and into the
+pipeline's headers together. Once a release ships the headers, Frama-C's own libc directory comes
+first on the include path and the pipeline's two files are no longer read.
+
+## Candidate change for !56 (found 2026-11-18, not sent)
+
+The pipeline's copy of `sys/epoll.h` has one clause the patch lacks, on `epoll_wait` and
+`epoll_pwait`:
+
+```
+ensures result_bounded: -1 <= \result <= maxevents;
+```
+
+- **Why:** the patch states the result only inside the `full` and `partial_timeout_or_error`
+  behaviours, whose `assumes` read the volatile `Frama_C_entropy_source`. WP gives each read of a
+  volatile its own value, so it assumes neither behaviour and knows nothing about the result. A
+  caller cannot prove `n <= maxevents`, which the index of `events[i]` in an event loop needs:
+  `[wp] [Timeout] typed_poll8_ensures` on `34.0~beta`. With the clause WP proves the wrapper and an
+  event loop.
+- **Upstream's `read()` has the same weakness** (`[Timeout] typed_read8_ensures` on the same image;
+  proved with `-wp-no-volatile`), so this is the libc's contract style and the maintainers may
+  prefer to keep the two alike. Not checked on `master`.
+- **The patch's own tests did not show it:** they are Eva tests, and they do not read the events.
+- **Not sent:** the clause is not in the patch file, in the merge request or in a comment. Filing
+  is paused (see the README of this folder), and a push to the branch of !56 needs the owner's
+  go-ahead.
 
 ## Tracker
 

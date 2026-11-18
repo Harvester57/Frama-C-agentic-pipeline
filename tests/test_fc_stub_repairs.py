@@ -723,114 +723,815 @@ def test_compat_eacsl_string_predicates_have_one_conjunct_after_the_guard():
 
 
 # ---------------------------------------------------------------------------------------------------
-# <sys/epoll.h> and <sys/inotify.h>: glibc's headers, parsed by Frama-C (c-ares run-1, 2026-11-16)
+# <sys/epoll.h> and <sys/inotify.h>: the headers of upstream patch 39, with contracts (c-ares run-1)
 # ---------------------------------------------------------------------------------------------------
 
-LINUX_EVENT_SHIMS = {
-    "sys/epoll.h": ("__attr_access", "____sigset_t_defined", "_STRUCT_TIMESPEC"),
-    "sys/inotify.h": ("__flexarr",),
+LINUX_EVENT_HEADERS = {
+    "sys/epoll.h": ["epoll_create", "epoll_create1", "epoll_ctl", "epoll_wait", "epoll_pwait"],
+    "sys/inotify.h": ["inotify_init", "inotify_init1", "inotify_add_watch", "inotify_rm_watch"],
 }
+# Lines the pipeline added inside the patch's text, per header; each one is marked `pipeline addition`.
+LINUX_EVENT_ADDITIONS = {"sys/epoll.h": 2, "sys/inotify.h": 0}
 _EVA_WP_ONLY = "#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)"
+_PATCH_39 = ROOT / "docs" / "upstream" / "frama-c" / "patches" / "39-libc-linux-header-gaps.patch"
+
+
+def _between_decls(lines: list[str]) -> list[str]:
+    return lines[lines.index("__BEGIN_DECLS") : lines.index("__END_DECLS") + 1]
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("rel", sorted(LINUX_EVENT_SHIMS))
-def test_linux_event_shims_only_reconcile_glibc_for_eva_and_wp(rel):
+@pytest.mark.parametrize("rel", sorted(LINUX_EVENT_HEADERS))
+def test_linux_event_headers_declare_with_contracts_for_eva_and_wp_only(rel):
     text = _read(rel)
-    # Declarations stay in glibc's header, so stub_gen classifies the functions as host_header, not pipeline_stub.
-    assert stub_prototypes(rel) == []
-    assert f"#include_next <{rel}>" in text
-    # Never glibc's <sys/cdefs.h>: it would redefine __THROW, __nonnull, ... for every later libc header.
-    assert not re.search(r"#\s*include\s*<sys/cdefs\.h>", text)
-    fixes = text.split(_EVA_WP_ONLY, 1)[1].split("#endif /* Eva / WP */", 1)[0]
-    rest = text.replace(fixes, "")
-    for name in LINUX_EVENT_SHIMS[rel]:
-        # A run's hand-written overlay wrapper may have defined it already: every definition is guarded.
-        assert re.search(rf"#\s*ifndef {name}\b", fixes), name
-        assert not re.search(rf"#\s*(?:define|ifndef) {name}\b", rest), f"{name} outside the Eva / WP branch"
-    assert text.index(_EVA_WP_ONLY) < text.index(f"#include_next <{rel}>")
+    # Declared here, so stub_gen classifies the functions pipeline_stub and drafts no overlay block for them.
+    assert [p.split("(")[0].split()[-1] for p in stub_prototypes(rel)] == LINUX_EVENT_HEADERS[rel]
+    eva_wp, rest = text.split(_EVA_WP_ONLY, 1)[1].split("\n#else", 1)
+    # Eva and WP never read glibc's header: it needs glibc's <sys/cdefs.h>, which redefines __THROW,
+    # __nonnull, ... for every later libc header (c-ares run-1).
+    assert "#include_next" not in eva_wp and not re.search(r"#\s*include\s*<sys/cdefs\.h>", text)
+    # E-ACSL and plain compiles read glibc's header and nothing else: the contracts name objects of
+    # Frama-C's libc (__FC_MAX_OPEN_FILES, Frama_C_entropy_source) that host headers do not have.
+    host = rest.split("#endif /* Eva / WP */", 1)[0].strip().splitlines()
+    assert host[-1] == f"#include_next <{rel}>" and not any(line.startswith("#") for line in host[:-1]), host
+    assert text.count("#include_next") == 1
+    # Not a libc file: only libc's own headers sit under the fc_stdlib pragma.
+    assert "__PUSH_FC_STDLIB" not in re.sub(r"/\*.*?\*/", "", text, flags=re.S)
 
 
-EPOLL_USE = r"""#include <sys/epoll.h>
+@pytest.mark.unit
+@pytest.mark.parametrize("rel", sorted(LINUX_EVENT_HEADERS))
+def test_linux_event_headers_carry_the_text_of_the_upstream_patch(rel):
+    """One text for the pipeline and for pub/frama-c!56: a change to one side is made to both."""
+    patch_text = _PATCH_39.read_text(encoding="utf-8")
+    section = patch_text.split(f"+++ b/share/libc/{rel}\n", 1)[1].split("\ndiff --git ", 1)[0]
+    patch = [line[1:] for line in section.split("\n")[1:] if line.startswith("+")]
+    upstream = [re.sub(r'^#include "\.\./([^"]+)"$', r"#include <\1>", line) for line in _between_decls(patch)]
+    local = _between_decls(_read(rel).split("\n"))
+    added = [line for line in local if "pipeline addition" in line]
+    assert len(added) == LINUX_EVENT_ADDITIONS[rel], added
+    assert [line for line in local if line not in added] == upstream
+
+
+def _linux_event_constants() -> list[str]:
+    names: list[str] = []
+    for rel in sorted(LINUX_EVENT_HEADERS):
+        names += re.findall(r"^#define ((?:EPOLL|IN_)[A-Z0-9_]+)\s", _read(rel), re.M)
+    return names
+
+
+@pytest.mark.unit
+def test_linux_event_constant_list_covers_both_headers():
+    names = _linux_event_constants()
+    assert {"EPOLLIN", "EPOLLET", "EPOLL_CLOEXEC", "EPOLL_CTL_MOD", "IN_MODIFY", "IN_ALL_EVENTS", "IN_NONBLOCK"} <= set(
+        names
+    )
+    assert len(names) == len(set(names))
+
+
+LINUX_EVENT_LAYOUT = [
+    "sizeof(struct epoll_event)", "offsetof(struct epoll_event, events)", "offsetof(struct epoll_event, data)",
+    "sizeof(epoll_data_t)", "sizeof(struct inotify_event)", "offsetof(struct inotify_event, wd)",
+    "offsetof(struct inotify_event, mask)", "offsetof(struct inotify_event, cookie)",
+    "offsetof(struct inotify_event, len)", "offsetof(struct inotify_event, name)",
+]  # fmt: skip
+
+LINUX_EVENT_EVA = r"""#include <sys/epoll.h>
+#include <sys/inotify.h>
 #include <signal.h>
-#include <time.h>
-int use_epoll(void) {
-  struct epoll_event ev[4];
-  sigset_t mask;
-  struct timespec ts = {0, 0};
+#include <unistd.h>
+
+/* An event loop as c-ares writes it: every event the call returned is read. */
+int loop(void) {
+  struct epoll_event ev[8];
+  unsigned seen = 0;
   int fd = epoll_create1(EPOLL_CLOEXEC);
   if (fd < 0) return -1;
-  ev[0].events = EPOLLIN;
-  ev[0].data.u64 = 1;
-  (void)epoll_ctl(fd, EPOLL_CTL_ADD, 0, ev);
-  sigemptyset(&mask);
-  return epoll_wait(fd, ev, 4, 0) + epoll_pwait(fd, ev, 4, 0, &mask) + epoll_pwait2(fd, ev, 4, &ts, &mask);
+  ev[0].events = EPOLLIN | EPOLLRDHUP;
+  ev[0].data.fd = 0;
+  if (epoll_ctl(fd, EPOLL_CTL_ADD, 0, &ev[0]) != 0) return -1;
+  int n = epoll_wait(fd, ev, 8, 1000);
+  for (int i = 0; i < n; i++)
+    seen += (ev[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0;
+  (void)epoll_ctl(fd, EPOLL_CTL_DEL, 0, 0);
+  return (int)(seen & 1);
 }
-"""
-
-# Frama-C's <signal.h> and <time.h> before glibc's <sys/epoll.h>.
-EPOLL_LATE = "#include <signal.h>\n#include <time.h>\n" + EPOLL_USE
-
-INOTIFY_USE = r"""#include <sys/inotify.h>
-int use_inotify(void) {
-  char buf[sizeof(struct inotify_event) + 16];
-  struct inotify_event *e = (struct inotify_event *)buf;
+int pwait(void) {
+  struct epoll_event ev[4];
+  sigset_t mask;
+  int fd = epoll_create(1);
+  if (fd < 0) return -1;
+  sigemptyset(&mask);
+  return epoll_pwait(fd, ev, 4, 0, &mask) + epoll_pwait(fd, ev, 4, 0, 0);
+}
+int watch(void) {
   int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
   if (fd < 0) return -1;
-  e->len = 0;
-  return inotify_add_watch(fd, "/etc", IN_MODIFY) + inotify_rm_watch(fd, 1) + (int)sizeof(e->name[0]);
+  int wd = inotify_add_watch(fd, "/etc", IN_MODIFY | IN_CREATE | IN_MOVED_TO | IN_ONLYDIR);
+  if (wd < 0) return -1;
+  return inotify_rm_watch(fd, wd);
+}
+int short_events(void) {
+  struct epoll_event ev[2];
+  int fd = epoll_create1(0);
+  if (fd < 0) return -1;
+  return epoll_wait(fd, ev, 4, 0);
+}
+int unchecked_fd(void) { struct epoll_event ev[2]; return epoll_wait(epoll_create1(0), ev, 2, 0); }
+int add_without_event(void) {
+  int fd = epoll_create1(0);
+  if (fd < 0) return -1;
+  return epoll_ctl(fd, EPOLL_CTL_ADD, 0, 0);
+}
+int unterminated_path(void) {
+  char p[2] = {'/', 'x'};
+  int fd = inotify_init();
+  if (fd < 0) return -1;
+  return inotify_add_watch(fd, p, IN_MODIFY);
 }
 """
 
-# A filled stub_gen overlay header in front of the shim: overlay -> fc_stubs shim -> glibc.
-EPOLL_OVERLAY_BLOCK = """
-/* fc-stub: epoll_create1 */
-/*@ assigns \\result \\from __flags; */
-extern int epoll_create1(int __flags);
+# Frama-C's <signal.h>, <time.h> and <sys/select.h> before the two headers.
+LINUX_EVENT_LATE = "#include <signal.h>\n#include <time.h>\n#include <sys/select.h>\n" + LINUX_EVENT_EVA
+
+LINUX_EVENT_WP = r"""#include <sys/epoll.h>
+#include <sys/inotify.h>
+#include <signal.h>
+
+/*@ requires 0 <= epfd < __FC_MAX_OPEN_FILES;
+    assigns \nothing; */
+unsigned count_ready(int epfd) {
+  struct epoll_event ev[8];
+  unsigned seen = 0;
+  int n = epoll_wait(epfd, ev, 8, 0);
+  /*@ loop invariant 0 <= i <= 8;
+      loop assigns i, seen;
+      loop variant n - i; */
+  for (int i = 0; i < n; i++)
+    seen += (ev[i].events & EPOLLIN) != 0;   /* the index needs n <= 8 */
+  return seen;
+}
+
+/*@ requires 0 <= epfd < __FC_MAX_OPEN_FILES;
+    requires \valid(ev + (0 .. 7)) && \valid_read(mask);
+    assigns ev[0 .. 7];
+    ensures -1 <= \result <= 8; */
+int ppoll8(int epfd, struct epoll_event *ev, const sigset_t *mask) { return epoll_pwait(epfd, ev, 8, 0, mask); }
+
+/*@ requires 0 <= fd < __FC_MAX_OPEN_FILES;
+    assigns \nothing;
+    ensures \result >= -1; */
+int watch_etc(int fd) { return inotify_add_watch(fd, "/etc", IN_MODIFY); }
 """
-LINUX_EVENT_CASES = (
-    # (case, source, flags variable, extra Frama-C options)
-    ("epoll", "epoll.c", "$A", ""),
-    ("epoll_late", "epoll_late.c", "$A", ""),
-    ("inotify", "inotify.c", "$A", ""),
-    ("overlay", "epoll.c", "$O", "-print"),
-    ("eacsl_epoll", "epoll.c", "$F", "-no-frama-c-stdlib"),
-    ("eacsl_inotify", "inotify.c", "$F", "-no-frama-c-stdlib"),
-)
+
+# What the E-ACSL frontend reads is glibc's header: epoll_pwait2 exists only there (under _GNU_SOURCE).
+LINUX_EVENT_HOST = r"""#include <sys/epoll.h>
+#include <sys/inotify.h>
+#include <signal.h>
+#include <time.h>
+int host(void) {
+  struct epoll_event ev[4];
+  char buf[sizeof(struct inotify_event) + 16];
+  struct inotify_event *e = (struct inotify_event *)buf;
+  struct timespec ts = {0, 0};
+  sigset_t mask;
+  int fd = epoll_create1(EPOLL_CLOEXEC);
+  if (fd < 0) return -1;
+  sigemptyset(&mask);
+  e->len = 0;
+  return epoll_pwait2(fd, ev, 4, &ts, &mask) + inotify_init1(IN_CLOEXEC) + (int)sizeof(e->name[0]);
+}
+"""
+
+LINUX_EVENT_MAINS = ["loop", "pwait", "watch", "short_events", "unchecked_fd", "add_without_event", "unterminated_path"]
 
 
 @pytest.mark.integration
 @pytest.mark.slow
-def test_frama_c_parses_glibc_epoll_and_inotify_with_the_pipeline_flags(tmp_path):
-    import stub_gen
-
+def test_linux_event_headers_in_eva_wp_and_against_glibc(tmp_path):
     require_docker_images(ANALYSIS_IMAGE)
-    for name, text in (("epoll.c", EPOLL_USE), ("epoll_late.c", EPOLL_LATE), ("inotify.c", INOTIFY_USE)):
+    exprs = LINUX_EVENT_LAYOUT + _linux_event_constants()
+    sources = {
+        "eva.c": LINUX_EVENT_EVA,
+        "late.c": LINUX_EVENT_LATE,
+        "wp.c": LINUX_EVENT_WP,
+        "host.c": LINUX_EVENT_HOST,
+        "gen.c": _static_assert_generator("sys/epoll.h", exprs, pre="#include <sys/inotify.h>\n"),
+    }
+    for name, text in sources.items():
         (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
-    overlay = tmp_path / "ov" / "sys"
-    overlay.mkdir(parents=True)
-    (overlay / "epoll.h").write_text(
-        stub_gen.header_preamble("sys/epoll.h", "/usr/include/x86_64-linux-gnu/sys/epoll.h") + EPOLL_OVERLAY_BLOCK,
-        encoding="utf-8",
-        newline="\n",
+    fc = "timeout 300 frama-c -no-unicode -machdep gcc_x86_64"
+    script = "".join(
+        f'echo "@@MAIN {m}"; {fc} eva.c -cpp-extra-args="$A" -eva -eva-no-show-progress -warn-invalid-pointer '
+        f"-main {m} 2>&1; "
+        for m in LINUX_EVENT_MAINS
     )
-    # c-ares's own defines (phase0 log of run-1): glibc declares epoll_pwait2 under __USE_GNU.
-    defines = "-D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700"
-    script = (
-        'O=$(FRAMAC_STUB_OVERLAY_DIR=/w/ov python3 -c "$py import framac_common; '
-        'print(framac_common.augment_framac_cppflags(\\"-I.\\"))"); '
+    script += (
+        f'echo "@@MAIN late"; {fc} late.c -cpp-extra-args="$A" 2>&1 && echo PARSE_OK; '
+        f'echo "@@MAIN wp"; {fc} wp.c -cpp-extra-args="$A" -wp -wp-rte -wp-timeout 30 2>&1; '
+        # glibc's values (gcc) become _Static_asserts that Frama-C checks against this header.
+        'echo "@@MAIN layout"; gcc -o gen gen.c && ./gen > asserts.inc && '
+        '{ printf "#include <stddef.h>\\n#include <sys/epoll.h>\\n#include <sys/inotify.h>\\n"; cat asserts.inc; } '
+        f'> check.c && {fc} check.c -cpp-extra-args="$A" 2>&1 && echo FRAMAC_OK; '
+        f'echo "@@MAIN host"; {fc} host.c -cpp-extra-args="$F -D_GNU_SOURCE" -no-frama-c-stdlib 2>&1 && echo PARSE_OK'
     )
-    for case, src, flags, extra in LINUX_EVENT_CASES:
-        script += (
-            f'echo "@@MAIN {case}"; timeout 300 frama-c -no-unicode -machdep gcc_x86_64 {src} '
-            f'-cpp-extra-args="{flags} {defines}" {extra} 2>&1 && echo PARSE_OK; '
-        )
-    log = _docker(ANALYSIS_IMAGE, tmp_path, script, timeout=1200)
+    log = _docker(ANALYSIS_IMAGE, tmp_path, script, timeout=1800)
     per = _per_main(log)
-    for case, *_ in LINUX_EVENT_CASES:
-        assert "PARSE_OK" in per[case], per[case]
-        assert "User Error" not in per[case] and "incompatible" not in per[case].lower(), per[case]
-    for case in ("epoll", "epoll_late", "inotify", "overlay"):
-        assert "Warning" not in per[case], per[case]
-    # The overlay's contract reached Frama-C: overlay -> shim -> glibc.
-    assert re.search(r"assigns \\result\s*\\from __flags;", per["overlay"]), per["overlay"]
+    for main in ("pwait", "watch"):
+        _assert_clean(per[main])
+    # The loop: every precondition holds. One alarm stays, on the events the loop reads: Eva joins the
+    # `full` and `partial_timeout_or_error` behaviors and loses the link between n and the initialized
+    # prefix, as it does for read() (stated in pub/frama-c#2828; README of fc_stubs).
+    assert re.search(r"Preconditions\s+\d+ valid\s+0 unknown\s+0 invalid", per["loop"]), per["loop"]
+    assert "assert \\initialized(&ev[i].events);" in per["loop"], per["loop"]
+    assert "1 alarm generated by the analysis" in per["loop"], per["loop"]
+    for main, failed in (
+        ("short_events", "epoll_wait: precondition 'valid_events' got status invalid"),
+        ("unchecked_fd", "epoll_wait: precondition 'valid_epfd' got status unknown"),
+        ("add_without_event", "epoll_ctl: precondition 'valid_event' got status invalid"),
+        ("unterminated_path", "inotify_add_watch: precondition 'valid_pathname' got status invalid"),
+    ):
+        assert f"function {failed}" in per[main], per[main]
+    for main in LINUX_EVENT_MAINS:
+        assert "User Error" not in per[main] and "found two contracts" not in per[main], per[main]
+    assert "PARSE_OK" in per["late"] and "Warning" not in per["late"], per["late"]
+    # count_ready's index proof needs `result_bounded`, the clause the pipeline added to the patch's text.
+    assert all(proved == total for proved, total in wp_proved_goals(per["wp"])), per["wp"]
+    assert "FRAMAC_OK" in per["layout"] and "User Error" not in per["layout"], per["layout"]
+    assert (tmp_path / "asserts.inc").read_text(encoding="utf-8").count("_Static_assert") == len(exprs), log
+    assert "PARSE_OK" in per["host"], per["host"]
+    assert "User Error" not in per["host"] and "undeclared" not in per["host"], per["host"]
+
+
+# ---------------------------------------------------------------------------------------------------
+# glibc names __fc_libc lacks, found on c-ares: pipe2, getservbyname_r, getservbyport_r, IN6_IS_ADDR_*
+# ---------------------------------------------------------------------------------------------------
+
+# function -> (the behavior of a success, the behavior of a failure) in its fc_compat_types.h contract
+LIBC_GAP_BEHAVIORS = {
+    "pipe2": ("ok", "error"),
+    "getservbyname_r": ("found", "not_found_or_error"),
+    "getservbyport_r": ("found", "not_found_or_error"),
+}
+LIBC_GAP_IN6 = [
+    "UNSPECIFIED",
+    "LOOPBACK",
+    "MULTICAST",
+    "LINKLOCAL",
+    "SITELOCAL",
+    "V4MAPPED",
+    "V4COMPAT",
+    "MC_NODELOCAL",
+    "MC_LINKLOCAL",
+    "MC_SITELOCAL",
+    "MC_ORGLOCAL",
+    "MC_GLOBAL",
+]
+
+
+def _fc_libc_branch() -> str:
+    text = _read("fc_compat_types.h")
+    return text.split("#else /* Frama-C __fc_libc */", 1)[1].split("#endif /* __FRAMAC_EACSL__ */", 1)[0]
+
+
+def _contract_parts(contract: str) -> tuple[str, dict[str, str]]:
+    """(the clauses before the first behavior, {behavior: its clauses without the `assumes`})."""
+    head, *rest = re.split(r"^\s*behavior\s+(\w+):\s*$", contract, flags=re.M)
+    behaviors = {}
+    for name, body in zip(rest[0::2], rest[1::2], strict=True):
+        body = re.sub(r"^\s*(?:complete|disjoint) behaviors;\s*$", "", body, flags=re.M)
+        behaviors[name] = re.sub(r"^\s*assumes\b[^;]*;\s*$", "", body, flags=re.M)
+    return head, behaviors
+
+
+def _in6_macro_block() -> str:
+    block = _fc_libc_branch().split("#ifndef IN6_IS_ADDR_UNSPECIFIED\n", 1)[1]
+    return block.split("#endif /* IN6_IS_ADDR_UNSPECIFIED */", 1)[0]
+
+
+def test_libc_gap_names_are_declared_for_eva_and_wp_after_the_renaming_blocks():
+    text = _read("fc_compat_types.h")
+    fc_libc = _fc_libc_branch()
+    # After the blocks that must be the first to include <sys/socket.h>, <unistd.h> and <string.h>.
+    order = [
+        fc_libc.index('#include "fc_strlcpy.h"'),
+        fc_libc.index("#ifndef FC_STUBS_NO_PIPE2_DECL"),
+        fc_libc.index("extern int pipe2("),
+        fc_libc.index("#ifndef FC_STUBS_NO_NETDB_DECLS"),
+        fc_libc.index("#include <netdb.h>"),
+        fc_libc.index("extern int getservbyname_r("),
+        fc_libc.index("#endif /* FC_STUBS_NO_NETDB_DECLS */"),
+    ]
+    assert order == sorted(order)
+    assert fc_libc.count("#include <netdb.h>") == 1 and fc_libc.count("#include <netinet/in.h>") == 1
+    # E-ACSL builds take all of them from glibc.
+    eacsl_branch = text.split("#if defined(__FRAMAC_EACSL__)", 1)[1].split("#else /* Frama-C __fc_libc */", 1)[0]
+    assert not re.search(r"pipe2|getservby|IN6_IS_ADDR", eacsl_branch)
+    for name, wanted in LIBC_GAP_BEHAVIORS.items():
+        contract = _contract_of(fc_libc, name)
+        head, behaviors = _contract_parts(contract)
+        assert tuple(behaviors) == wanted, name
+        assert "complete behaviors;" in contract and "disjoint behaviors;" in contract, name
+        # What WP can use is stated outside the behaviors, which split on a volatile.
+        assert "Frama_C_entropy_source" not in re.sub(r"indirect:Frama_C_entropy_source", "", head), name
+        assert head.count("ensures ") >= 4, name
+
+
+def test_pipe2_leaves_the_ends_alone_on_error():
+    head, behaviors = _contract_parts(_contract_of(_fc_libc_branch(), "pipe2"))
+    assert "ensures result_ok_or_error: \\result == 0 || \\result == -1;" in head
+    # __fc_libc's pipe() claims both ends initialized and valid whatever the result.
+    assert "\\result == 0 ==> \\initialized(&pipefd[0 .. 1]);" in head
+    assert not re.search(r"ensures [\w:]+: \\initialized", head)
+    assert "\\result == -1 ==> pipefd[0] == \\old(pipefd[0]) && pipefd[1] == \\old(pipefd[1]);" in head
+    assert "pipefd" not in behaviors["error"]
+
+
+@pytest.mark.parametrize("name", ["getservbyname_r", "getservbyport_r"])
+def test_getservby_r_can_give_the_callers_structure(name):
+    head, behaviors = _contract_parts(_contract_of(_fc_libc_branch(), name))
+    # `\from result_buf`: with a \from that leaves the caller's structure out, Eva can only give NULL
+    # (__fc_libc's getpwnam_r, docs/upstream/frama-c/frama-c-hunt-2026-11-18-candidates.md, N6).
+    assert re.search(r"assigns \*res \\from result_buf,", head)
+    assert "ensures result_null_or_result_buf: *res == \\null || *res == result_buf;" in head
+    assert "ensures null_on_error: \\result != 0 ==> *res == \\null;" in head
+    assert "proto == \\null || valid_read_string(proto)" in head
+    # Field by field: the padding after s_port is not written, and s_port holds no address.
+    assert "assigns *result_buf" not in head and "\\initialized(result_buf)" not in head
+    assert re.search(r"assigns result_buf->s_port \\from (?!buf)", head)
+    assert "*res == result_buf" in behaviors["found"] and "*res == \\null" in behaviors["not_found_or_error"]
+
+
+def test_in6_macros_are_the_posix_family_and_read_bytes():
+    block = _in6_macro_block()
+    assert re.findall(r"^#define IN6_IS_ADDR_(\w+)\(a\)", block, flags=re.M) == LIBC_GAP_IN6
+    # Through s6_addr, the one member __fc_libc's struct in6_addr has: no word cast, no byte order.
+    code = re.sub(r"/\*.*?\*/", "", block, flags=re.S)
+    assert not re.search(r"uint(?:8|16|32)_t|htonl|ntohl|__in6_u", code)
+    assert code.count("(const struct in6_addr *)(a)") == 1
+
+
+LIBC_GAP_EVA = r"""#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <unistd.h>
+#include "__fc_builtin.h"
+
+/* c-ares, ares_event_wake_pipe.c: both ends preset to -1, closed on failure when not -1. */
+int wake_pipe(void) {
+  int fds[2] = {-1, -1};
+  if (pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
+    Frama_C_show_each_error(fds[0], fds[1]);
+    //@ check error_keeps_the_ends: fds[0] == -1 && fds[1] == -1;
+    if (fds[0] != -1) close(fds[0]);
+    return -1;
+  }
+  Frama_C_show_each_ok(fds[0], fds[1]);
+  close(fds[0]);
+  close(fds[1]);
+  return 0;
+}
+int pipe_uninit(void) {
+  int fds[2];
+  if (pipe2(fds, 0) != 0) return -1;
+  close(fds[0]);
+  close(fds[1]);
+  return 0;
+}
+int pipe_short(void) { int one; return pipe2(&one, 0); }
+
+/* c-ares, ares_getaddrinfo.c: the service's port. */
+int by_name(void) {
+  struct servent se, *sep;
+  char tmp[4096];
+  memset(&se, 0, sizeof se);
+  sep = &se;
+  memset(tmp, 0, sizeof tmp);
+  if (getservbyname_r("http", "tcp", &se, (void *)tmp, sizeof tmp, &sep) != 0) sep = NULL;
+  if (sep) {
+    Frama_C_show_each_found(sep, sep->s_port);
+    return sep->s_port;
+  }
+  Frama_C_show_each_none(sep);
+  return -1;
+}
+int by_name_any_proto(void) {
+  struct servent se, *sep;
+  char tmp[512];
+  int r = getservbyname_r("http", NULL, &se, tmp, sizeof tmp, &sep);
+  Frama_C_show_each_any(r, sep);
+  return sep != NULL;
+}
+/* c-ares, ares_getnameinfo.c: the port's service name, which is then copied. */
+int by_port(void) {
+  struct servent se, *sep;
+  char tmp[4096];
+  memset(&se, 0, sizeof se);
+  sep = &se;
+  memset(tmp, 0, sizeof tmp);
+  if (getservbyport_r(htons(80), "tcp", &se, (void *)tmp, sizeof tmp, &sep) != 0) sep = NULL;
+  if (sep && sep->s_name) {
+    Frama_C_show_each_port(sep->s_port, sep->s_name);
+    return (int)strlen(sep->s_name);
+  }
+  return -1;
+}
+int short_buf(void) {
+  struct servent se, *sep;
+  char tmp[16];
+  return getservbyname_r("http", "tcp", &se, tmp, 64, &sep);
+}
+int unterminated_name(void) {
+  struct servent se, *sep;
+  char tmp[64], n[4] = {'h', 't', 't', 'p'};
+  return getservbyname_r(n, "tcp", &se, tmp, sizeof tmp, &sep);
+}
+int null_res(void) {
+  struct servent se;
+  char tmp[64];
+  return getservbyport_r(80, "tcp", &se, tmp, sizeof tmp, NULL);
+}
+int overlap(void) {
+  struct servent se, *sep;
+  return getservbyname_r("http", "tcp", &se, (char *)&se, sizeof se, &sep);
+}
+
+static int scope(const struct in6_addr *a) { /* c-ares, ares_sortaddrinfo.c: get_scope */
+  if (IN6_IS_ADDR_MULTICAST(a)) return 1;
+  else if (IN6_IS_ADDR_LOOPBACK(a) || IN6_IS_ADDR_LINKLOCAL(a)) return 2;
+  else if (IN6_IS_ADDR_SITELOCAL(a)) return 5;
+  else if (IN6_IS_ADDR_V4COMPAT(a) || IN6_IS_ADDR_V4MAPPED(a)) return 4;
+  return 14;
+}
+int in6(void) {
+  struct in6_addr lo = IN6ADDR_LOOPBACK_INIT, any = IN6ADDR_ANY_INIT;
+  struct in6_addr ll = {{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+  struct in6_addr sl = {{0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+  struct in6_addr mc = {{0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
+  struct in6_addr v4m = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4}};
+  struct in6_addr v4c = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4}};
+  struct sockaddr_in6 sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sin6_addr = ll;
+  int a = scope(&lo), b = scope(&ll), c = scope(&sl), d = scope(&mc), e = scope(&v4m), f = scope(&v4c);
+  int g = scope(&any);
+  //@ check scopes: a == 2 && b == 2 && c == 5 && d == 1 && e == 4 && f == 4 && g == 14;
+  int u = IN6_IS_ADDR_UNSPECIFIED(&any), nu = IN6_IS_ADDR_UNSPECIFIED(&lo);
+  int v = IN6_IS_ADDR_V4COMPAT(&lo), w = IN6_IS_ADDR_V4COMPAT(&any);
+  //@ check unspecified: u == 1 && nu == 0 && v == 0 && w == 0;
+  int is_ll = IN6_IS_ADDR_LINKLOCAL(&sa.sin6_addr), is_mcll = IN6_IS_ADDR_MC_LINKLOCAL(&sa.sin6_addr);
+  int m1 = IN6_IS_ADDR_MC_LINKLOCAL(&mc);
+  int m2 = IN6_IS_ADDR_MC_NODELOCAL(&mc) + IN6_IS_ADDR_MC_SITELOCAL(&mc) + IN6_IS_ADDR_MC_ORGLOCAL(&mc)
+           + IN6_IS_ADDR_MC_GLOBAL(&mc);
+  //@ check multicast_scopes: is_ll == 1 && is_mcll == 0 && m1 == 1 && m2 == 0;
+  int n = 0;
+  const struct in6_addr *p = &lo;
+  int once = IN6_IS_ADDR_LOOPBACK((n++, p));
+  //@ check evaluated_once: once == 1 && n == 1;
+  return a + b + c + d + e + f + g;
+}
+"""
+
+LIBC_GAP_WP = r"""#include <netdb.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+/*@ requires \valid(fds + (0 .. 1));
+    assigns fds[0 .. 1];
+    ensures \result == 0 || \result == -1;
+    ensures \result == 0 ==> 0 <= fds[0] < 1024 && 0 <= fds[1] < 1024;
+    ensures \result == -1 ==> fds[0] == \old(fds[0]) && fds[1] == \old(fds[1]); */
+int open_pair(int *fds) { return pipe2(fds, 0); }
+
+/*@ requires valid_read_string(name);
+    assigns \nothing;
+    ensures \result == 0 || \result == 1; */
+int known_service(const char *name) {
+  struct servent se, *sep = &se;
+  char tmp[1024];
+  int r = getservbyname_r(name, (const char *)0, &se, tmp, sizeof tmp, &sep);
+  if (r != 0) {
+    //@ assert error_gives_null: sep == \null;
+    return 0;
+  }
+  if (sep == (struct servent *)0) return 0;
+  //@ assert found_is_the_callers: sep == &se;
+  //@ assert found_strings: valid_read_string(se.s_name) && valid_read_string(se.s_proto);
+  return 1;
+}
+
+/*@ assigns \nothing;
+    ensures \result == -1 || \result == port; */
+int port_or_minus_one(int port) {
+  struct servent se, *sep = &se;
+  char tmp[1024];
+  if (getservbyport_r(port, "tcp", &se, tmp, sizeof tmp, &sep) != 0) return -1;
+  if (sep == (struct servent *)0) return -1;
+  return se.s_port;
+}
+
+/*@ requires \valid_read(a);
+    assigns \nothing;
+    ensures a->s6_addr[0] == 0xff ==> \result == 1;
+    ensures a->s6_addr[0] == 0xfe && (a->s6_addr[1] & 0xc0) == 0x80 ==> \result == 2;
+    ensures \result == 1 || \result == 2 || \result == 14; */
+int scope(const struct in6_addr *a) {
+  if (IN6_IS_ADDR_MULTICAST(a)) return 1;
+  else if (IN6_IS_ADDR_LOOPBACK(a) || IN6_IS_ADDR_LINKLOCAL(a)) return 2;
+  return 14;
+}
+"""
+
+# What the E-ACSL frontend reads is glibc: the ten names c-ares uses must come from there, untouched.
+LIBC_GAP_HOST = r"""#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <unistd.h>
+int host(const struct sockaddr_in6 *a) {
+  int fds[2] = {-1, -1};
+  struct servent se, *sep = &se;
+  char tmp[1024];
+  const struct in6_addr *p = &a->sin6_addr;
+  int n = pipe2(fds, O_CLOEXEC) + getservbyname_r("http", "tcp", &se, tmp, sizeof tmp, &sep)
+          + getservbyport_r(80, (const char *)0, &se, tmp, sizeof tmp, &sep);
+  return n + IN6_IS_ADDR_LINKLOCAL(p) + IN6_IS_ADDR_LOOPBACK(p) + IN6_IS_ADDR_MC_LINKLOCAL(p)
+         + IN6_IS_ADDR_MULTICAST(p) + IN6_IS_ADDR_SITELOCAL(p) + IN6_IS_ADDR_V4COMPAT(p) + IN6_IS_ADDR_V4MAPPED(p);
+}
+"""
+
+# glibc's macros against the stub's, renamed FC_IN6_IS_ADDR_*, in one gcc program.
+LIBC_GAP_IN6_CMP = r"""#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+@@OURS@@
+static unsigned long n, bad;
+static struct in6_addr a;
+#define CMP(name)                                                              \
+  do {                                                                         \
+    int g = IN6_IS_ADDR_##name(&a) != 0, o = FC_IN6_IS_ADDR_##name(&a) != 0;   \
+    n++;                                                                       \
+    if (g != o && bad++ < 5) {                                                 \
+      printf("MISMATCH %s glibc=%d stub=%d:", #name, g, o);                    \
+      for (int k = 0; k < 16; k++) printf(" %02x", a.s6_addr[k]);              \
+      printf("\n");                                                            \
+    }                                                                          \
+  } while (0)
+static void all(const unsigned char *b) {
+  memcpy(a.s6_addr, b, 16);
+@@CMPS@@
+}
+int main(void) {
+  static const unsigned char tails[][14] = {
+    {0},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4},
+    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4},
+    {1},
+    {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+  };
+  unsigned char b[16];
+  /* every value of the first two bytes, over each tail */
+  for (unsigned t = 0; t < sizeof tails / sizeof tails[0]; t++)
+    for (unsigned hi = 0; hi < 65536; hi++) {
+      b[0] = (unsigned char)(hi >> 8);
+      b[1] = (unsigned char)hi;
+      memcpy(b + 2, tails[t], 14);
+      all(b);
+    }
+  /* every value of each pair of bytes, the others zero */
+  for (int i = 0; i < 16; i++)
+    for (int j = i + 1; j < 16; j++)
+      for (unsigned v = 0; v < 65536; v++) {
+        memset(b, 0, 16);
+        b[i] = (unsigned char)(v >> 8);
+        b[j] = (unsigned char)v;
+        all(b);
+      }
+  /* a fixed pseudo-random sample */
+  unsigned long long s = 0x9e3779b97f4a7c15ull;
+  for (int r = 0; r < 200000; r++) {
+    for (int k = 0; k < 16; k++) {
+      s = s * 6364136223846793005ull + 1442695040888963407ull;
+      b[k] = (unsigned char)(s >> 56);
+    }
+    all(b);
+  }
+  printf("IN6_CMP n=%lu bad=%lu\n", n, bad);
+  return bad != 0;
+}
+"""
+
+# The real glibc functions behind wrappers that carry the contract text of fc_compat_types.h: `top_` its
+# clauses outside the behaviors, the others the clauses of one behavior. Each case calls `top_`, then the
+# wrapper of the behavior the outcome belongs to, so E-ACSL checks that glibc keeps what the contract says.
+LIBC_GAP_REAL = r"""#define _GNU_SOURCE
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+@@WRAPPERS@@
+static char buf[4096], buf2[4096];
+static int in_buf(const char *p, const char *b, size_t len) { return p >= b && p < b + len; }
+
+/* E-ACSL does not see glibc's writes, so the \initialized clauses hold from the fill below. `written`
+   says the fields left the fill pattern and point into the caller's buffer. */
+static int entry_written(const struct servent *se, const char *b, size_t len) {
+  return se->s_port != 0x5a5a5a5a && in_buf(se->s_name, b, len) && in_buf(se->s_proto, b, len)
+         && in_buf((const char *)se->s_aliases, b, len);
+}
+static void lookup(int by_port, const char *name, int port, const char *proto, size_t len) {
+  struct servent se, se2, *sep = &se2, *sep2 = &se;
+  int r, r2, found, written = 0;
+  memset(&se, 0x5a, sizeof se);
+  memset(&se2, 0x5a, sizeof se2);
+  memset(buf, 0, sizeof buf);
+  memset(buf2, 0, sizeof buf2);
+  r = by_port ? top_getservbyport_r(port, proto, &se, buf, len, &sep)
+              : top_getservbyname_r(name, proto, &se, buf, len, &sep);
+  found = sep != NULL;
+  if (found) {
+    r2 = by_port ? found_getservbyport_r(port, proto, &se2, buf2, len, &sep2)
+                 : found_getservbyname_r(name, proto, &se2, buf2, len, &sep2);
+    written = entry_written(&se, buf, len) && entry_written(&se2, buf2, len);
+  } else {
+    r2 = by_port ? not_found_or_error_getservbyport_r(port, proto, &se2, buf2, len, &sep2)
+                 : not_found_or_error_getservbyname_r(name, proto, &se2, buf2, len, &sep2);
+  }
+  printf("r=%d found=%d r2=%d written=%d\n", r, found, r2, written);
+}
+static void pipes(int flags) {
+  int fds[2] = {-1, -1}, fds2[2] = {-1, -1};
+  int r = top_pipe2(fds, flags), r2;
+  int kept = fds[0] == -1 && fds[1] == -1;
+  if (r == 0) {
+    r2 = ok_pipe2(fds2, flags);
+    close(fds[0]);
+    close(fds[1]);
+    if (r2 == 0) {
+      close(fds2[0]);
+      close(fds2[1]);
+    }
+  } else {
+    r2 = error_pipe2(fds2, flags);
+    kept = kept && fds2[0] == -1 && fds2[1] == -1;
+  }
+  printf("r=%d r2=%d kept=%d\n", r, r2, kept);
+}
+int main(int argc, char **argv) {
+  const char *c = argc > 1 ? argv[1] : "";
+  if (!strcmp(c, "name_found")) lookup(0, "http", 0, "tcp", sizeof buf);
+  if (!strcmp(c, "name_any_proto")) lookup(0, "domain", 0, NULL, sizeof buf);
+  if (!strcmp(c, "name_not_found")) lookup(0, "no-such-service", 0, "tcp", sizeof buf);
+  if (!strcmp(c, "name_wrong_proto")) lookup(0, "http", 0, "no-such-proto", sizeof buf);
+  if (!strcmp(c, "name_small_buf")) lookup(0, "http", 0, "tcp", 8);
+  if (!strcmp(c, "port_found")) lookup(1, NULL, htons(80), "tcp", sizeof buf);
+  if (!strcmp(c, "port_any_proto")) lookup(1, NULL, htons(53), NULL, sizeof buf);
+  if (!strcmp(c, "port_not_found")) lookup(1, NULL, htons(65000), "tcp", sizeof buf);
+  if (!strcmp(c, "port_small_buf")) lookup(1, NULL, htons(80), "tcp", 8);
+  if (!strcmp(c, "pipe_ok")) pipes(O_CLOEXEC | O_NONBLOCK);
+  if (!strcmp(c, "pipe_bad_flags")) pipes(-1);
+  printf("%s done\n", c);
+  return 0;
+}
+"""
+
+_SERVENT_ARGS = "(%s, const char *proto, struct servent *result_buf, char *buf, size_t buflen, struct servent **res)"
+LIBC_GAP_SIGNATURES = {
+    "pipe2": ("(int pipefd[2], int flags)", "(pipefd, flags)"),
+    "getservbyname_r": (_SERVENT_ARGS % "const char *name", "(name, proto, result_buf, buf, buflen, res)"),
+    "getservbyport_r": (_SERVENT_ARGS % "int port", "(port, proto, result_buf, buf, buflen, res)"),
+}
+
+# case -> what it prints: the result, whether an entry was found, and what the behavior's wrapper gave.
+# 34 is ERANGE; an entry glibc 2.41 does not find is result 0 with a NULL *res.
+LIBC_GAP_REAL_CASES = {
+    "name_found": "r=0 found=1 r2=0 written=1",
+    "name_any_proto": "r=0 found=1 r2=0 written=1",
+    "name_not_found": "r=0 found=0 r2=0 written=0",
+    "name_wrong_proto": "r=0 found=0 r2=0 written=0",
+    "name_small_buf": "r=34 found=0 r2=34 written=0",
+    "port_found": "r=0 found=1 r2=0 written=1",
+    "port_any_proto": "r=0 found=1 r2=0 written=1",
+    "port_not_found": "r=0 found=0 r2=0 written=0",
+    "port_small_buf": "r=34 found=0 r2=34 written=0",
+    "pipe_ok": "r=0 r2=0 kept=0",
+    "pipe_bad_flags": "r=-1 r2=-1 kept=1",
+}
+
+LIBC_GAP_MAINS = [
+    "wake_pipe",
+    "pipe_uninit",
+    "pipe_short",
+    "by_name",
+    "by_name_any_proto",
+    "by_port",
+    "short_buf",
+    "unterminated_name",
+    "null_res",
+    "overlap",
+    "in6",
+]
+
+
+def _libc_gap_wrappers() -> str:
+    fc_libc = _fc_libc_branch()
+    out = []
+    for name, (params, args) in LIBC_GAP_SIGNATURES.items():
+        head, behaviors = _contract_parts(_contract_of(fc_libc, name))
+        for prefix, clauses in (("top", head), *behaviors.items()):
+            out.append(f"/*@{clauses}*/\nint {prefix}_{name}{params} {{ return {name}{args}; }}\n")
+    return "".join(out)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_libc_gap_names_in_eva_wp_and_against_glibc(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    prototypes = stub_prototypes("fc_compat_types.h", set(LIBC_GAP_BEHAVIORS))
+    assert len(prototypes) == len(LIBC_GAP_BEHAVIORS), prototypes
+    ours = _in6_macro_block().replace("IN6_IS_ADDR_", "FC_IN6_IS_ADDR_")
+    cmps = "".join(f"  CMP({name});\n" for name in LIBC_GAP_IN6)
+    sources = {
+        "eva.c": LIBC_GAP_EVA,
+        "wp.c": LIBC_GAP_WP,
+        "host.c": LIBC_GAP_HOST,
+        "abi.c": "#define _GNU_SOURCE\n#include <netdb.h>\n#include <unistd.h>\n" + "\n".join(prototypes) + "\n",
+        "in6.c": LIBC_GAP_IN6_CMP.replace("@@OURS@@", ours).replace("@@CMPS@@", cmps),
+        "real.c": LIBC_GAP_REAL.replace("@@WRAPPERS@@", _libc_gap_wrappers()),
+    }
+    for name, text in sources.items():
+        (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
+    fc = "timeout 300 frama-c -no-unicode -machdep gcc_x86_64"
+    cases = " ".join(LIBC_GAP_REAL_CASES)
+    # -eva-slevel 100 is the pipeline's default (pipeline_make.DEFAULT_EVA_SLEVEL): with it Eva keeps the
+    # two behaviors of a call apart.
+    script = "".join(
+        f'echo "@@MAIN {m}"; {fc} eva.c -cpp-extra-args="$A" -eva -eva-no-show-progress -warn-invalid-pointer '
+        f"-eva-slevel 100 -main {m} 2>&1; "
+        for m in LIBC_GAP_MAINS
+    )
+    script += (
+        f'echo "@@MAIN wp"; {fc} wp.c -cpp-extra-args="$A" -wp -wp-rte -wp-timeout 30 2>&1; '
+        'echo "@@MAIN abi"; gcc -fsyntax-only -Werror abi.c 2>&1 && echo ABI_OK; '
+        'echo "@@MAIN in6cmp"; gcc -O1 -o in6 in6.c 2>&1 && ./in6; '
+        f'echo "@@MAIN host"; {fc} host.c -cpp-extra-args="$F -D_GNU_SOURCE" -no-frama-c-stdlib 2>&1 && echo PARSE_OK; '
+        'echo "@@MAIN real"; e-acsl-gcc --full-mtracking -G clang -E "$F" '
+        '-e "-I/opt/framac-pipeline/templates/fc_stubs" -O rb real.c > real.build.log 2>&1 || cat real.build.log; '
+        f'for k in {cases}; do timeout 60 ./rb.e-acsl $k > $k.out 2>&1; echo "case $k rc=$?"; done'
+    )
+    log = _docker(ANALYSIS_IMAGE, tmp_path, script, timeout=1800)
+    per = _per_main(log)
+    for main in LIBC_GAP_MAINS:
+        assert "User Error" not in per[main] and "found two contracts" not in per[main], per[main]
+        assert "undeclared function" not in per[main], per[main]
+    # The pipe idiom of c-ares: -1 kept on error, two descriptors close() accepts on success.
+    for main in ("wake_pipe", "pipe_uninit", "in6"):
+        _assert_clean(per[main])
+    assert "Frama_C_show_each_error: {-1}, {-1}" in per["wake_pipe"], per["wake_pipe"]
+    assert "Frama_C_show_each_ok: [0..1023], [0..1023]" in per["wake_pipe"], per["wake_pipe"]
+    assert re.search(r"Assertions\s+1 valid\s+0 unknown\s+0 invalid", per["wake_pipe"]), per["wake_pipe"]
+    assert re.search(r"Assertions\s+4 valid\s+0 unknown\s+0 invalid", per["in6"]), per["in6"]
+    # Both outcomes of a lookup are reachable (the found branch is dead with __fc_libc's getpwnam_r shape).
+    for main in ("by_name", "by_name_any_proto"):
+        assert "0 alarms generated by the analysis." in per[main], per[main]
+        assert re.search(r"Preconditions\s+\d+ valid\s+0 unknown\s+0 invalid", per[main]), per[main]
+    assert "Frama_C_show_each_found: {{ &se }}" in per["by_name"], per["by_name"]
+    assert "Frama_C_show_each_none: {0}" in per["by_name"], per["by_name"]
+    assert "Frama_C_show_each_any: {0}, {{ &se }}" in per["by_name_any_proto"], per["by_name_any_proto"]
+    # The found name lies in the caller's buffer. One Unknown stays: Eva cannot tell that the bytes the
+    # call wrote there are a string.
+    assert "Frama_C_show_each_port: [0..65535], {{ &tmp + [0..4095] }}" in per["by_port"], per["by_port"]
+    assert "function strlen: precondition 'valid_string_s' got status unknown" in per["by_port"], per["by_port"]
+    assert re.search(r"Preconditions\s+\d+ valid\s+1 unknown\s+0 invalid", per["by_port"]), per["by_port"]
+    assert "0 alarms generated by the analysis." in per["by_port"], per["by_port"]
+    for main, failed in (
+        ("pipe_short", "pipe2: precondition 'valid_pipefd'"),
+        ("short_buf", "getservbyname_r: precondition 'valid_buf'"),
+        ("unterminated_name", "getservbyname_r: precondition 'valid_name'"),
+        ("null_res", "getservbyport_r: precondition 'valid_res'"),
+        ("overlap", "getservbyname_r: precondition 'separation'"),
+    ):
+        assert f"function {failed} got status invalid" in per[main], per[main]
+    assert all(proved == total for proved, total in wp_proved_goals(per["wp"])), per["wp"]
+    assert "ABI_OK" in per["abi"], per["abi"]
+    compared = re.search(r"IN6_CMP n=(\d+) bad=0\b", per["in6cmp"])
+    assert compared and int(compared.group(1)) > 100_000_000, per["in6cmp"]
+    assert "PARSE_OK" in per["host"], per["host"]
+    assert "User Error" not in per["host"] and "undeclared" not in per["host"], per["host"]
+    # E-ACSL runs every clause but the six `\subset` of the two `found` behaviors (and no `assigns`);
+    # the program's own `written` covers what those say.
+    build = (tmp_path / "real.build.log").read_text(encoding="utf-8", errors="replace")
+    skipped = re.findall(r"E-ACSL construct\s+`([^']+)'\s+is not yet supported", build)
+    assert sorted(set(skipped)) == [
+        "assigns clause",
+        "logic functions or predicates with no definition nor reads clause",
+    ]
+    assert skipped.count("logic functions or predicates with no definition nor reads clause") == 6, build
+    for case, printed in LIBC_GAP_REAL_CASES.items():
+        out = (tmp_path / f"{case}.out").read_text(encoding="utf-8", errors="replace")
+        assert f"case {case} rc=0" in log and f"{case} done" in out, (case, out, per["real"])
+        assert printed in out, (case, out)
