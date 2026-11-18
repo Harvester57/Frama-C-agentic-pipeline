@@ -94,8 +94,12 @@ On a build of `b80fcac74f` with the patch (Debian 13, OCaml 5.5 switch, gcc 14.2
 - **E-ACSL:** on a file that calls `strlcat`, `frama-c -e-acsl` ended with
   `Failure: typing was not performed on construct 1` (exit code 4) before the patch. With it, the
   translation ends normally (exit code 0) and reports the postcondition as not yet supported.
+  `e-acsl-gcc -L` on the same file goes from `fatal error: aborted by Frama-C` to an instrumented
+  program that runs to the end.
 - **Not in this merge request:** the `separation` precondition, which covers only the first
-  `strnlen(src, n-1)` bytes of `src` (see the issue). I can add it here if you want it.
+  `strnlen(src, n-1)` bytes of `src` (see the issue). I tried `src+(0..strlen(src))` on top of
+  this patch: `tests/libc` and `plugins/e-acsl/tests` pass with no oracle change. I can add it
+  here if you want it.
 - **Not run:** the rest of `tests/`, the default ptests of the other plugins, and the cram tests.
   Two searches of the source tree say they are not concerned:
   - `strlcat` appears only in `share/libc/string.h` and in the `tests/libc` files above;

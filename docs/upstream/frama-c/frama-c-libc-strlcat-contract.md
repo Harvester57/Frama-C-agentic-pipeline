@@ -204,8 +204,20 @@ and E-ACSL reports it as not yet supported and ignores it.
   - `bounded_result` removed: exit code 0.
 - L4's entry says the clause was not identified for `stpncpy`; that part is unchanged.
 - The patch hides the E-ACSL defect for `strlcat`. It does not fix it: the cause is in E-ACSL.
-- `e-acsl-gcc` on the same file exits 0 before and after, and the instrumented program runs
-  (`34.0~beta` only; not run on `master`).
+- **`e-acsl-gcc` without `-L` never showed the failure, and that is expected.** By default the
+  wrapper passes `-no-frama-c-stdlib` (read in its `bash -x` trace), so Frama-C parses glibc's
+  `<string.h>`, where `strlcat` has no contract: the generated code calls `strlcat` directly,
+  with no `__gen_e_acsl_strlcat` wrapper. The first version of this draft said "exits 0 before
+  and after" without saying why.
+- **With `-L` (Frama-C's libc) the wrapper fails like plain Frama-C** (both versions):
+
+  | `e-acsl-gcc -L -c l4.c` | Released header | Patched header |
+  | :-- | :-- | :-- |
+  | exit code | 1 (`e-acsl-gcc: fatal error: aborted by Frama-C`) | 0 |
+  | instrumented program | none | built, runs to the end (exit code 0) |
+
+- **The pipeline is not concerned:** its E-ACSL builds use the host's headers
+  (`-no-frama-c-stdlib`), and its own stub has no such clause in its E-ACSL branch.
 
 ## Related, not requested
 
@@ -220,6 +232,20 @@ and E-ACSL reports it as not yet supported and ignores it.
     is unchanged after the copy, and WP does not prove it against upstream's contract.
   - Both filing texts name it and offer to add `src+(0..strlen(src))` to the merge request. It is
     left out of the patch because a stronger precondition can break existing proofs.
+  - **Measured on 2026-11-18** (container of `framac-master-audit:b80fcac`, 44's patch plus that
+    one-line change, rebuilt):
+
+    | Check | 44's patch | With `src+(0..strlen(src))` |
+    | :-- | :-- | :-- |
+    | `tests/libc`, default configuration (123 result logs) | pass | pass, no oracle changes |
+    | `plugins/e-acsl/tests`, default configuration | pass | pass, no oracle changes |
+    | Eva on the overlapping call above | `separation` valid, `r ∈ {24}`, 0 alarms | `separation` **invalid**, the call does not terminate |
+    | WP on the byte-loop body plus an assertion that `src` is unchanged up to its NUL | 35 / 36 (the assertion times out) | 36 / 36 |
+    | Reproducer 44 and the issue's `cat.c` | fixed, 12 preconditions valid | the same |
+
+    So no upstream test depends on the weak form. Proofs of users who call `strlcat` on
+    overlapping strings would break, which is the purpose. The change is ready to add as one
+    line if the maintainers ask; the patch file still leaves it out.
 - **`strlcpy`:** its contract is consistent. WP proves a byte-loop body against it, 31 of 31
   goals, with one admitted fact (the bytes of `src` are initialized).
 - **No clause on the bytes written,** for `strlcat` and `strlcpy` alike. The pipeline's stub

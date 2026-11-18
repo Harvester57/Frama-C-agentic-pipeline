@@ -148,8 +148,9 @@ depends on the real value 4 is seen as dead.
   `char buf[32] = "0123456789abcdefghij";`, the call `strlcat(buf + 16, buf, 8)` has its four
   preconditions valid, and it writes `buf[20..23]`, which holds the NUL of `src`. The BSD manual
   says the behaviour is undefined when the strings overlap. Requiring
-  `src+(0..strlen(src))` to be separated would reject that call. It is a stronger precondition
-  for existing users, so I left it out; I can add it to the merge request if you want it.
+  `src+(0..strlen(src))` to be separated rejects that call (Eva: `separation` invalid), and
+  changes no oracle of `tests/libc` or of the E-ACSL tests. It is a stronger precondition for
+  existing users, so I left it out; I can add it to the merge request if you want it.
 
 A merge request with the three clauses and a test follows.
 
