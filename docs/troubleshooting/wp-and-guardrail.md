@@ -109,6 +109,11 @@ Issues encountered in Phase 3 deductive verification (`run_wp_function.py`), Dua
 - **Cause:** pipeline bug. `_FPV_DEGEN_RE` in [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) matched the literal `(Degenerated)` only, so a degenerated goal that also carries warnings was not listed in `assumed_function_pointer_goals` and its report row stayed unproven. A function with two pointer calls (libmodbus's `send_msg`) could not end `all_proven`, and its `l5_sanitized` unit could not be credited.
 - **Fix (fixed 2026-11-18 on branch `metacsl-integ`):** the pattern accepts `(Degenerated, N warnings)`. Test: `test_degenerated_pointer_value_goal_with_warnings_is_listed` in [`../../tests/test_run_wp_function.py`](../../tests/test_run_wp_function.py). Checked on the log lines above, not by a new image run of the fixture.
 
+### Symptom: A Loop Invariant Goal Is Counted Under `l2_termination`
+- **Seen:** package D2 of [`../plans/metacsl-exploitation-plan.md`](../plans/metacsl-exploitation-plan.md), 2026-11-18, in a unit test: `goal_obligation_class({"kind": "precondition", "annotation": "L4_invariants: len <= cap"})` returned `l2_termination`. Not looked for in the reports of earlier runs.
+- **Cause:** pipeline bug. `goal_obligation_class` in [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) tested `"variant" in low`, which the word "invariant" satisfies. Every goal whose kind or text holds "invariant" went to the termination unit instead of `rte`: an unproven loop invariant was reported against termination, and proven invariants counted as termination goals. What this did to the credit of `l2_termination` units in past runs was not measured.
+- **Fix (fixed 2026-11-18 on branch `metacsl-integ`):** the test is `variant` not preceded by `in`. Test: `test_a_loop_invariant_is_no_termination_goal` in [`../../tests/test_run_wp_function.py`](../../tests/test_run_wp_function.py). No existing test depended on the old behaviour.
+
 ---
 
 ## Dual-Oracle E-ACSL Guardrail

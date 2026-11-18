@@ -434,7 +434,7 @@ def goal_obligation_class(item: dict) -> str:
     if meta:
         return _META_CLASS[next(g for g in meta.groups() if g)]
     low = text.lower()
-    if "variant" in low or "decreases" in low:
+    if re.search(r"(?<!in)variant", low) or "decreases" in low:
         return "l2_termination"
     if "assigns" in low or "\\separated" in low or "frees" in low or "allocates" in low:
         return "l3_frame"

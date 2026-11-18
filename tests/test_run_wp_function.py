@@ -14,6 +14,15 @@ CSV_HEADER = "directory\tfile\tfunction\tline\tkind\tstatus\tproperty\n"
 
 
 @pytest.mark.unit
+def test_a_loop_invariant_is_no_termination_goal() -> None:
+    # "invariant" contains "variant": only a variant or a decreases clause belongs to l2_termination.
+    assert W.goal_obligation_class({"kind": "loop invariant", "annotation": "0 <= i <= n"}) == "rte"
+    assert W.goal_obligation_class({"kind": "precondition", "annotation": "L4_invariants: len <= cap"}) == "rte"
+    assert W.goal_obligation_class({"kind": "loop variant", "annotation": "n - i"}) == "l2_termination"
+    assert W.goal_obligation_class({"kind": "variant", "annotation": "decreases n"}) == "l2_termination"
+
+
+@pytest.mark.unit
 def test_degenerated_pointer_value_goal_with_warnings_is_listed() -> None:
     # WP prints `(Degenerated, 2 warnings)` for a second function-pointer call of the same function.
     log = (
