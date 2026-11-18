@@ -67,7 +67,6 @@ from acsl_ast import (  # noqa: E402
     locate_all_prototype_spans,
     splice_architect_header,
     splice_prover_changes,
-    tokenize_c_acsl,
     verify_acsl_only,
 )
 from fingerprint import normalize_file  # noqa: E402
@@ -1691,15 +1690,6 @@ def _function_frame_skeleton(
     return skel if isinstance(skel, dict) else None
 
 
-def _acsl_text_of_span(span) -> str:
-    """The ACSL comment texts inside a function span (its contract and body annotations)."""
-    try:
-        tokens = tokenize_c_acsl(span.text, path=span.function)
-    except AcslError:
-        return ""
-    return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
-
-
 def _frame_contract_files(
     run_dir: Path,
     overlay: Path,
@@ -1723,26 +1713,29 @@ def _frame_contract_files(
 
 def _merged_contract_acsl(shared_work: Path, rels: list[str], new_contents: dict[str, str], function: str) -> str:
     """
-    The ACSL of `function`'s declarations in `rels` as the merge leaves them: the spliced text of a file the
-    agent changed, the shared tree's text of any other. An unchanged file that cannot be read contributes no
-    clause, so it can only make the frame check refuse.
+    The function contract of `function`'s declarations in `rels` as the merge leaves them: the spliced text of
+    a file the agent changed, the shared tree's text of any other. An unchanged file that cannot be read
+    contributes no clause, so it can only make the frame check refuse. Annotations inside the body are not
+    part of the contract: a statement contract there says nothing about what the function writes.
     """
     parts: list[str] = []
     for rel in rels:
         spliced = new_contents.get(rel)
         try:
             text = spliced if spliced is not None else (shared_work / rel).read_text(encoding="utf-8")
-            decls = contract_declaration_spans(text, function, is_header=rel.endswith(".h"), path=rel)
+            # A header may declare the function twice (prototype and `static inline` definition); the
+            # contract can sit on either declaration, so read the contract of every one. Frama-C merges
+            # the contracts and takes the union of their `assigns`, which is what "some clause lists the
+            # location" checks.
+            pieces = [
+                declaration_contract_text(decl, rel)
+                for decl in contract_declaration_spans(text, function, is_header=rel.endswith(".h"), path=rel)
+            ]
         except (AcslError, ValueError, OSError):  # UnicodeDecodeError is a ValueError
             if spliced is not None:
                 raise
             continue
-        # A header may declare the function twice (prototype and `static inline` definition); the
-        # contract can sit on either declaration, so read the ACSL of every one. Frama-C merges the
-        # contracts and takes the union of their `assigns`, which is what "some clause lists the
-        # location" checks.
-        for decl in decls:
-            piece = _acsl_text_of_span(decl.span)
+        for piece in pieces:
             if piece and piece not in parts:
                 parts.append(piece)
     return "\n".join(parts)
