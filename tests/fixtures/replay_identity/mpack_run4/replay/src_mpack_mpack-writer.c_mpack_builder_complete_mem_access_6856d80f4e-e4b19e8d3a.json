@@ -1,0 +1,80 @@
+{
+  "mode": "replay",
+  "module": "libmpack_a__mpack_writer_2",
+  "status": "reproduced",
+  "binary": "workspace/harnesses/fuzz_libmpack_a__mpack_writer_2",
+  "inputs": [
+    "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92",
+    "workspace/crashes/libmpack_a__mpack_writer_2/crash-ebfbdf62234fefb756649dbe99ef66f9d24cf9c8"
+  ],
+  "missing_inputs": [],
+  "per_input_timeout": 10,
+  "rss_limit_mb": 2048,
+  "artifacts": [
+    {
+      "artifact": "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92",
+      "kind": "crash",
+      "sha256": "1fe7fd895f286fcc06a5afa8ef05a77ccfb8db89915cd7b8232b92fa842cb7d5",
+      "size_bytes": 9,
+      "reproducible": true,
+      "failure": {
+        "file": "workspace/work/src/mpack/mpack-writer.c",
+        "line": 1791,
+        "function": "mpack_builder_complete",
+        "kind": "ubsan_runtime_error",
+        "alarm_kind": "mem_access",
+        "is_rte": true,
+        "predicate": "rte: mem_access: execution reached an unreachable program point",
+        "message": "execution reached an unreachable program point"
+      },
+      "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::6856d80f4e",
+      "failure_source": "primary",
+      "returncode": 77,
+      "timed_out": false,
+      "seed": 1516881274,
+      "replay_log_tail": "1a6d7352f349793bff6c)\n    #3 0x7c948d796d6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #4 0x7c948d7eb69b  (/lib/x86_64-linux-gnu/libc.so.6+0x9469b) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #5 0x7c948d796c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #6 0x7c948d77f4ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #7 0x6326d84eca7f in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x151a7f) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #8 0x6326d84ea8b1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x14f8b1) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #9 0x6326d8500796 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x165796) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #10 0x6326d8502f08 in handleBuiltinUnreachableImpl(__ubsan::UnreachableData*, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x6326d8502dd7 in __ubsan_handle_builtin_unreachable (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x167dd7) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #12 0x6326d8515257 in mpack_builder_complete /framac-run/workspace/work/src/mpack/mpack-writer.c:1791:5\n    #13 0x6326d85418a4 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libmpack_a__mpack_writer_2.c:477:524\n    #14 0x6326d840a4fa in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x6f4fa) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #15 0x6326d83f23f3 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x573f3) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #16 0x6326d83f8531 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x5d531) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #17 0x6326d84249e6 in main (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x899e6) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #18 0x7c948d780ca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #19 0x7c948d780d64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #20 0x6326d83ec9e0 in _start (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x519e0) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n\nNOTE: libFuzzer has rudimentary signal handlers.\n      Combine libFuzzer with AddressSanitizer or similar for better crash reports.\nSUMMARY: libFuzzer: deadly signal\n"
+    },
+    {
+      "artifact": "workspace/crashes/libmpack_a__mpack_writer_2/crash-ebfbdf62234fefb756649dbe99ef66f9d24cf9c8",
+      "kind": "crash",
+      "sha256": "06cebb47290ed3556de3a4120c37c8aa739b3a7277b752563932d3137ede147c",
+      "size_bytes": 9,
+      "reproducible": true,
+      "failure": {
+        "file": "workspace/work/src/mpack/mpack-writer.c",
+        "line": 1791,
+        "function": "mpack_builder_complete",
+        "kind": "ubsan_runtime_error",
+        "alarm_kind": "mem_access",
+        "is_rte": true,
+        "predicate": "rte: mem_access: execution reached an unreachable program point",
+        "message": "execution reached an unreachable program point"
+      },
+      "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::6856d80f4e",
+      "failure_source": "primary",
+      "returncode": 77,
+      "timed_out": false,
+      "seed": 1516881274,
+      "replay_log_tail": "1a6d7352f349793bff6c)\n    #3 0x7c8f35941d6f  (/lib/x86_64-linux-gnu/libc.so.6+0x3fd6f) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #4 0x7c8f3599669b  (/lib/x86_64-linux-gnu/libc.so.6+0x9469b) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #5 0x7c8f35941c41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #6 0x7c8f3592a4ab in abort (/lib/x86_64-linux-gnu/libc.so.6+0x284ab) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #7 0x649465499a7f in __sanitizer::Abort() (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x151a7f) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #8 0x6494654978b1 in __sanitizer::Die() (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x14f8b1) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #9 0x6494654ad796 in __ubsan::ScopedReport::~ScopedReport() (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x165796) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #10 0x6494654aff08 in handleBuiltinUnreachableImpl(__ubsan::UnreachableData*, __ubsan::ReportOptions) ubsan_handlers.cpp.o\n    #11 0x6494654afdd7 in __ubsan_handle_builtin_unreachable (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x167dd7) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #12 0x6494654c2257 in mpack_builder_complete /framac-run/workspace/work/src/mpack/mpack-writer.c:1791:5\n    #13 0x6494654f0269 in LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_libmpack_a__mpack_writer_2.c:474:524\n    #14 0x6494653b74fa in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x6f4fa) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #15 0x64946539f3f3 in fuzzer::RunOneTest(fuzzer::Fuzzer*, char const*, unsigned long) (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x573f3) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #16 0x6494653a5531 in fuzzer::FuzzerDriver(int*, char***, int (*)(unsigned char const*, unsigned long)) (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x5d531) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #17 0x6494653d19e6 in main (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x899e6) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n    #18 0x7c8f3592bca7  (/lib/x86_64-linux-gnu/libc.so.6+0x29ca7) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #19 0x7c8f3592bd64 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x29d64) (BuildId: 5e5b51f4c39af9ac589408c1dc432ba390a273cc)\n    #20 0x6494653999e0 in _start (/framac-run/workspace/harnesses/fuzz_libmpack_a__mpack_writer_2+0x519e0) (BuildId: 04621d9ebe075fdcf43f1a6d7352f349793bff6c)\n\nNOTE: libFuzzer has rudimentary signal handlers.\n      Combine libFuzzer with AddressSanitizer or similar for better crash reports.\nSUMMARY: libFuzzer: deadly signal\n"
+    }
+  ],
+  "engine_used": "sanitizers",
+  "compile": {
+    "engine": "sanitizers",
+    "returncode": 0,
+    "reason": null,
+    "binary": "workspace/harnesses/fuzz_libmpack_a__mpack_writer_2",
+    "compile_log": "workspace/harnesses/fuzz_libmpack_a__mpack_writer_2.sanitizer_compile.log",
+    "cache": {
+      "hit": true,
+      "key": "0d1069932179b3d2ca7e4c3c3b84c54d1131f4eb2710e2ee9aba90c50fd0497f"
+    }
+  },
+  "cache": {
+    "hit": true,
+    "key": "0d1069932179b3d2ca7e4c3c3b84c54d1131f4eb2710e2ee9aba90c50fd0497f"
+  },
+  "seed": 1516881274,
+  "candidate_fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::6856d80f4e",
+  "fingerprint_matches": true
+}

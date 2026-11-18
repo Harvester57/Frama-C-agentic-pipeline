@@ -1,0 +1,125 @@
+[
+  {
+    "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::initialization::0f273bdef1",
+    "status": "verified",
+    "origin": "fuzz",
+    "proposed_verdict": "confirmed",
+    "module": "libmpack_a__mpack_writer_2",
+    "location": {
+      "file": "src/mpack/mpack-writer.c",
+      "line": 1793,
+      "function": "mpack_builder_complete"
+    },
+    "property": {
+      "kind": "initialization",
+      "predicate": "\\initialized(&(builder->current_build)->type)"
+    },
+    "reproducers": [
+      "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92",
+      "workspace/crashes/libmpack_a__mpack_writer_2/crash-ebfbdf62234fefb756649dbe99ef66f9d24cf9c8"
+    ],
+    "tool_outputs": [
+      "workspace/reports/fuzz/libmpack_a__mpack_writer_2.json",
+      "workspace/reports/eva/libmpack_a__mpack_writer_2.json"
+    ],
+    "linked_units": [
+      "src/mpack/mpack-writer.c#mpack_builder_complete::rte"
+    ],
+    "first_seen": "2026-11-17T12:44:23.248909+00:00",
+    "observations": [
+      {
+        "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::initialization::0f273bdef1",
+        "origin": "fuzz",
+        "engine": "eacsl",
+        "kind": "initialization",
+        "message": "\\initialized(&(builder->current_build)->type)",
+        "tool_output": "workspace/reports/fuzz/libmpack_a__mpack_writer_2.json",
+        "reproducer": "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92"
+      },
+      {
+        "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::71054705f5",
+        "origin": "eva",
+        "engine": null,
+        "kind": "mem_access",
+        "message": "\\valid_read(&(builder->current_build)->type)",
+        "tool_output": "workspace/reports/eva/libmpack_a__mpack_writer_2.json",
+        "reproducer": null
+      }
+    ],
+    "site": "src/mpack/mpack-writer.c#mpack_builder_complete@64d908112d",
+    "notes": [
+      "Eva Invalid status without a concrete witness input"
+    ],
+    "related": [
+      {
+        "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::6856d80f4e",
+        "reason": "cross-engine replay: sanitizers fails at workspace/work/src/mpack/mpack-writer.c:1791 on the same reproducer"
+      }
+    ],
+    "resolved_fingerprints": [
+      "src/mpack/mpack-writer.c#mpack_builder_complete::initialization::0f273bdef1"
+    ],
+    "last_rejection": {
+      "at": "2026-11-17T13:57:36.343120+00:00",
+      "rejection_class": "harness_induced",
+      "refutation_basis": "checked",
+      "harness_sha256": "df9a1fbfcd17ab55f0aaa47aee0c8b76df463f3fecb35f3538966eaea791117d",
+      "repair_attempts": 0
+    }
+  },
+  {
+    "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::6856d80f4e",
+    "status": "verified",
+    "origin": "fuzz",
+    "proposed_verdict": "confirmed",
+    "module": "libmpack_a__mpack_writer_2",
+    "location": {
+      "file": "src/mpack/mpack-writer.c",
+      "line": 1791,
+      "function": "mpack_builder_complete"
+    },
+    "property": {
+      "kind": "mem_access",
+      "predicate": "rte: mem_access: execution reached an unreachable program point"
+    },
+    "reproducers": [
+      "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92",
+      "workspace/crashes/libmpack_a__mpack_writer_2/crash-ebfbdf62234fefb756649dbe99ef66f9d24cf9c8"
+    ],
+    "tool_outputs": [
+      "workspace/reports/fuzz/libmpack_a__mpack_writer_2.json"
+    ],
+    "linked_units": [
+      "src/mpack/mpack-writer.c#mpack_builder_complete::rte"
+    ],
+    "first_seen": "2026-11-17T12:44:23.210303+00:00",
+    "observations": [
+      {
+        "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::6856d80f4e",
+        "origin": "fuzz",
+        "engine": "sanitizers",
+        "kind": "mem_access",
+        "message": "rte: mem_access: execution reached an unreachable program point",
+        "tool_output": "workspace/reports/fuzz/libmpack_a__mpack_writer_2.json",
+        "reproducer": "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92"
+      }
+    ],
+    "site": "src/mpack/mpack-writer.c#mpack_builder_complete@e0b30a3818",
+    "related": [
+      {
+        "fingerprint": "src/mpack/mpack-writer.c#mpack_builder_complete::initialization::0f273bdef1",
+        "reason": "cross-engine replay: sanitizers fails at workspace/work/src/mpack/mpack-writer.c:1791 on the same reproducer"
+      }
+    ],
+    "resolved_fingerprints": [
+      "src/mpack/mpack-writer.c#mpack_builder_complete::mem_access::6856d80f4e"
+    ],
+    "last_rejection": {
+      "at": "2026-11-17T13:55:16.220604+00:00",
+      "rejection_class": "harness_induced",
+      "refutation_basis": "checked",
+      "harness_sha256": "df9a1fbfcd17ab55f0aaa47aee0c8b76df463f3fecb35f3538966eaea791117d",
+      "repair_attempts": 0
+    }
+  }
+]

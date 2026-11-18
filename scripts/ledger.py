@@ -3265,8 +3265,14 @@ def cmd_record_stub_contracts(report_path: Path, check_path: Path | None = None)
     return out
 
 
-def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_outputs: list[str]) -> set[str]:
-    shas: set[str] = set()
+def _collect_reproducible_artifacts(
+    run_dir: Path, report_paths: list[Path], tool_outputs: list[str]
+) -> dict[str, list[tuple[str, dict]]]:
+    """
+    sha256 -> (report, artifact record) of every input a parent report (the replay reports, then the
+    candidate's tool outputs) replayed and saw fail. The record says what the replay failed on.
+    """
+    found: dict[str, list[tuple[str, dict]]] = {}
     all_paths = list(report_paths) + [run_dir / t for t in tool_outputs]
     seen_paths: set[Path] = set()
     for p in all_paths:
@@ -3284,8 +3290,300 @@ def _collect_reproducible_shas(run_dir: Path, report_paths: list[Path], tool_out
         if isinstance(data, dict):
             for art in data.get("artifacts", []):
                 if isinstance(art, dict) and art.get("reproducible") is True and art.get("sha256"):
-                    shas.add(str(art["sha256"]))
+                    found.setdefault(str(art["sha256"]), []).append((rel(str(rp)), art))
+    return found
+
+
+# ------------------------------------------- what the parent's replay of a reproducer failed on
+#
+# A `confirmed` reproducer counts only when the parent's replay of it failed on the defect the record is
+# about, not on any failure. Fingerprints differ per engine by design (D1), so the comparison is the one
+# candidates are grouped by: the candidate's key, an observation's fingerprint, the candidate's statement
+# site, the same of a `related` candidate (D1b), or the record's own fingerprint and site (only for a
+# record the verifier refingerprinted; an additional record has nothing else). Where one side has no
+# statement (a hypothesis without a line, a failure a runtime reports without one), function and kind
+# stand for it, as hypotheses merge (D1c).
+UNLOCATED_FUNCTION = "unknown_function"
+
+
+class _FailurePlacer:
+    """
+    Places a failure's line for comparison with a candidate's site. The DAG's extents and the sites
+    recorded in Phases 1 and 2 are in baseline lines. A report replayed after annotations were merged
+    names lines of the work tree; one replayed before names baseline lines, and says nothing of which.
+    `sites` therefore reads a line each way it can have been meant: at most three keys, one of them the
+    site `ingest-fuzz` would record for the line now.
+    """
+
+    def __init__(self, mm: ModuleMap, module: str, run_dir: Path) -> None:
+        self.index = _dag_line_index(dag=mm.dag)
+        self.kernel = _model_kernel_names()
+        self.link_unit = str((mm.modules.get(mm.unit_of(module)) or {}).get("unit") or mm.unit_of(module))
+        self.run_dir = run_dir
+        self._readings: dict[tuple[str, int], list[tuple[str, int]]] = {}
+
+    def readings(self, file: str, line: object) -> list[tuple[str, int]]:
+        """(source path, line) for each reading of `file`:`line`; none for a line that is not positive."""
+        if not isinstance(line, int) or line <= 0 or file in ("", "unknown"):
+            return []
+        if (file, line) not in self._readings:
+            from workspace_overlay import map_work_to_baseline_line
+
+            baseline = f"workspace/baseline/{file}"
+            mapped = map_work_to_baseline_line(file, line, run_dir=self.run_dir)[0]
+            # As ingest-fuzz reads it; a work-tree line mapped back to the baseline; a baseline line.
+            self._readings[(file, line)] = list(dict.fromkeys([(file, line), (baseline, mapped), (baseline, line)]))
+        return self._readings[(file, line)]
+
+    def functions(self, file: str, line: object, reported: str) -> set[str]:
+        """The names the function of a failure can go by: the reported one and the DAG's for each reading."""
+        names = {
+            _located_function(file, at, reported, self.index, self.kernel, self.link_unit)
+            for _, at in self.readings(file, line)
+        }
+        return {n for n in (reported, *names) if n and n != UNLOCATED_FUNCTION}
+
+    def sites(self, file: str, line: object, reported: str) -> set[str]:
+        """The statement site of `file`:`line` under each reading (failure_identity.site_key)."""
+        found: set[str] = set()
+        for path, at in self.readings(file, line):
+            function = _located_function(file, at, reported, self.index, self.kernel, self.link_unit)
+            site = _candidate_site(path, at, function or UNLOCATED_FUNCTION, self.index)
+            if site:
+                found.add(site)
+        return found
+
+
+def _candidate_input_shas(run_dir: Path, cand: dict, replayed: dict[str, list[tuple[str, dict]]]) -> set[str]:
+    """sha256 of the inputs recorded on the candidate before its verdict (its `reproducers`)."""
+    own: set[str] = set()
+    for raw in cand.get("reproducers") or []:
+        path = raw.get("input") if isinstance(raw, dict) else raw
+        if isinstance(path, str) and path:
+            own.add(rel(path))
+    shas: set[str] = set()
+    for path in own:
+        try:
+            shas.add(hashlib.sha256((run_dir / path).read_bytes()).hexdigest())
+        except OSError:
+            continue
+    for sha, arts in replayed.items():
+        if any(rel(str(art.get("artifact") or "")) in own for _, art in arts):
+            shas.add(sha)
     return shas
+
+
+def _accepted_failures(
+    cand: dict, candidates: dict[str, dict], rec: dict, placer: _FailurePlacer, split_off: bool = False
+) -> dict:
+    """
+    The failures that are the defect of `rec`, a verdict record on `cand`: `fingerprints`, statement
+    `sites` and recorded `lines` (file, line), each mapped to whose it is; the `sink` (file, function,
+    kind) that stands for a missing statement, and whether there is one to compare with (`has_statement`).
+
+    The record is the verifier's, so its own fingerprint and location count only where it says it
+    names another failure than the candidate's key (a refingerprinted record, which needs a reason): a
+    record that keeps the key cannot move the statement to where its input failed. A `split_off`
+    record (an additional record) is another defect: only its own fingerprint and location count.
+    """
+    fingerprints: dict[str, str] = {}
+    sites: dict[str, str] = {}
+    lines: dict[tuple[str, int], str] = {}
+
+    def place(loc: dict, stored: object, whose: str) -> bool:
+        file, line = normalize_file(str(loc.get("file") or "")), loc.get("line")
+        found = (
+            {stored} if isinstance(stored, str) and stored else placer.sites(file, line, str(loc.get("function") or ""))
+        )
+        for site in sorted(found):
+            sites.setdefault(site, whose)
+        if isinstance(line, int) and line > 0 and file != "unknown":
+            lines.setdefault((file, line), whose)
+            return True
+        return bool(found)
+
+    def add(other: dict, whose: str) -> bool:
+        fingerprints.setdefault(str(other.get("fingerprint") or ""), whose)
+        for obs in other.get("observations") or []:
+            if isinstance(obs, dict) and obs.get("fingerprint"):
+                fingerprints.setdefault(str(obs["fingerprint"]), f"an observation of {whose}")
+        return place(other.get("location") or {}, other.get("site"), whose)
+
+    has_statement = False
+    if not split_off:
+        has_statement = add(cand, "the candidate")
+        for link in cand.get("related") or []:
+            other = candidates.get(str(link.get("fingerprint") or "")) if isinstance(link, dict) else None
+            if other is not None and other is not cand:
+                add(other, f"related candidate {other['fingerprint']}")
+    if split_off or rec.get("fingerprint") != cand.get("fingerprint"):
+        fingerprints.setdefault(str(rec.get("fingerprint") or ""), "the record")
+        placed = place(rec.get("location") or {}, None, "the record")
+        has_statement = placed if split_off else has_statement
+    fingerprints.pop("", None)
+
+    sink: tuple[str, str, str] | None = None
+    named = rec if split_off else cand
+    loc, prop = named.get("location") or {}, named.get("property") or {}
+    function = str(loc.get("function") or "")
+    if function not in ("", UNLOCATED_FUNCTION):
+        sink = (
+            normalize_file(str(loc.get("file") or "")),
+            function,
+            normalize_kind(str(prop.get("kind") or ""), str(prop.get("predicate") or "")),
+        )
+    return {
+        "fingerprints": fingerprints,
+        "sites": sites,
+        "lines": lines,
+        "sink": sink,
+        "sink_of": "the record" if split_off else "the candidate",
+        "has_statement": has_statement,
+    }
+
+
+def _replayed_failure(art: dict, placer: _FailurePlacer) -> dict:
+    """
+    What a replayed artifact failed on. `statement` is False when the report gives no file and line to
+    compare with a candidate's: no failure was parsed (a crash without a report, a timeout, a runtime
+    resource abort), the failure has no source line (a runtime's libc check, an `unknown_function`
+    one), or an older report kept only the fingerprint. `what` says which.
+    """
+    raw = art.get("failure")
+    failure: dict = raw if isinstance(raw, dict) else {}
+    fingerprint = str(art.get("fingerprint") or "")
+    file = normalize_file(str(failure.get("file") or "")) if failure else "unknown"
+    reported = str(failure.get("function") or "")
+    kind = str(failure.get("alarm_kind") or failure.get("kind") or "")
+    if not failure and "#" in fingerprint:
+        # An older report: the fingerprint is all it says (`<file>#<function>::<kind>::<hash>`).
+        file, _, tail = fingerprint.partition("#")
+        reported, kind = (tail.split("::") + [""])[:2]
+    raw_line = failure.get("line")
+    line: int = raw_line if isinstance(raw_line, int) else 0
+    if art.get("timed_out"):
+        what = "the replay timed out"
+    elif isinstance(art.get("eacsl_resource_abort"), dict):
+        what = "the E-ACSL runtime stopped on its own resource limit"
+    elif not failure and not fingerprint:
+        what = f"no failure report could be parsed from its output (return code {art.get('returncode')})"
+    else:
+        what = f"the failure it reports ({fingerprint or kind or 'no fingerprint'}) has no source line"
+    return {
+        "fingerprint": fingerprint,
+        "file": file,
+        "line": line,
+        "function": reported,
+        "functions": placer.functions(file, line, reported),
+        "kind": normalize_kind(kind, str(failure.get("predicate") or "")) if kind else "",
+        "predicate": str(failure.get("predicate") or ""),
+        "sites": placer.sites(file, line, reported),
+        "statement": file != "unknown" and line > 0,
+        "what": what,
+    }
+
+
+def _failure_match(seen: dict, accepted: dict) -> str | None:
+    """Why the failure a replay hit is the record's defect (`_accepted_failures`), or None."""
+    whose = accepted["fingerprints"].get(seen["fingerprint"])
+    if whose:
+        return f"the fingerprint of {whose}"
+    for site in sorted(seen["sites"]):
+        if site in accepted["sites"]:
+            return f"the statement site of {accepted['sites'][site]}"
+    if seen["statement"] and not seen["sites"]:
+        # The line could not be read (no source under the run directory): the recorded line stands for the site.
+        whose = accepted["lines"].get((seen["file"], seen["line"]))
+        if whose:
+            return f"the recorded line of {whose}"
+    sink = accepted["sink"]
+    if sink is not None and not (accepted["has_statement"] and seen["statement"]):
+        same_file = seen["file"] == sink[0] or "unknown" in (seen["file"], sink[0])
+        # A hypothesis may leave its kind open (`rte`); a replay that does is not shown to be of the sink's kind.
+        same_kind = seen["kind"] == sink[2] or sink[2] in SINK_KIND_WILDCARDS
+        if same_file and same_kind and sink[1] in seen["functions"]:
+            return f"the function and kind of {accepted['sink_of']} (one of the two has no statement to compare)"
+    return None
+
+
+def _judge_reproducer(arts: list[tuple[str, dict]], accepted: dict, placer: _FailurePlacer) -> tuple[str, dict]:
+    """
+    How the parent's replays of one input compare with the record's defect: `match` when one of them
+    failed on it, else `mismatch` when one failed at another statement (the input shows another
+    defect), else `uncompared`: no replay of it names a statement. With it, the replay that decided.
+    """
+    other: dict | None = None
+    blind: dict | None = None
+    for report, art in arts:
+        seen = {**_replayed_failure(art, placer), "report": report}
+        basis = _failure_match(seen, accepted)
+        if basis is not None:
+            return "match", {**seen, "basis": basis}
+        if seen["statement"]:
+            other = other or seen
+        else:
+            blind = blind or seen
+    if other is not None:
+        return "mismatch", other
+    return "uncompared", blind or {}
+
+
+def _failure_text(fingerprint: str, loc: dict, prop: dict) -> str:
+    """`<fingerprint> at <file>:<line> in <function> (<kind>: <predicate>)`, for a refusal message."""
+    kind, predicate = str(prop.get("kind") or ""), " ".join(str(prop.get("predicate") or "").split())[:160]
+    return (
+        f"{fingerprint or 'a failure without a fingerprint'} at {loc.get('file') or 'unknown'}:{loc.get('line') or 0}"
+        f" in {loc.get('function') or UNLOCATED_FUNCTION}"
+        + (f" ({': '.join(x for x in (kind, predicate) if x)})" if kind or predicate else "")
+    )
+
+
+def _other_failure_refusal(
+    fp: str, sha: str, cand: dict, rec: dict, seen: dict, candidates: dict[str, dict], split_off: bool = False
+) -> str:
+    """The refusal of a reproducer whose replay failed on another failure: it names both, and whose the other is."""
+    own = _failure_text(fp, rec.get("location") or {}, rec.get("property") or {})
+    if split_off:
+        wanted = f"this additional record's own failure: {own}"
+        rule = "An additional record counts only reproducers whose parent replay fails on its own failure."
+    else:
+        wanted = "the candidate's failure: " + _failure_text(
+            str(cand.get("fingerprint") or ""), cand.get("location") or {}, cand.get("property") or {}
+        )
+        if fp != cand.get("fingerprint"):
+            wanted += f"; the record's: {own}"
+        rule = (
+            "List only reproducers whose parent replay fails on the candidate's failure, at its statement, or on a "
+            "failure recorded as its observation or as a related candidate."
+        )
+    hit = _failure_text(
+        seen["fingerprint"],
+        {"file": seen["file"], "line": seen["line"], "function": seen["function"]},
+        {"kind": seen["kind"], "predicate": seen["predicate"]},
+    )
+    owner = next(
+        (
+            key
+            for key, other in candidates.items()
+            if seen["fingerprint"]
+            and (
+                key == seen["fingerprint"]
+                or any(o.get("fingerprint") == seen["fingerprint"] for o in other.get("observations") or [])
+            )
+        ),
+        None,
+    )
+    if owner is not None:
+        whose = f"That failure is candidate {owner} ({candidates[owner].get('status')}), which gets its own verdict."
+    else:
+        whose = (
+            "No candidate records that failure: if it is a defect, return it as its own record (additional_records, "
+            "its own fingerprint, the file and line the replay names, this reproducer, refingerprint_reason)."
+        )
+    return (
+        f"confirmed finding {fp}: the parent's replay of reproducer sha256 {sha} failed, but on another failure "
+        f"than this record's. Expected {wanted}. The replay hit: {hit} (report {seen['report']}). {whose} {rule}"
+    )
 
 
 # A generic kind matches any kind at the same sink line (a prover's `rte` goal and a fuzz `mem_access`).
@@ -3619,7 +3917,8 @@ def cmd_ingest_verifier(
     if cand_fp not in candidates:
         raise LedgerError(f"unknown candidate_fingerprint: {cand_fp}")
     cand = candidates[cand_fp]
-    module = _candidate_harness_module(ModuleMap.load(run_dir), cand)
+    mm = ModuleMap.load(run_dir)
+    module = _candidate_harness_module(mm, cand)
 
     # A reopened candidate: this verdict supersedes the rejected record(s) it was reopened from. They
     # leave findings.json here and come back as `prior_verdicts` of the new record (see below).
@@ -3630,11 +3929,14 @@ def cmd_ingest_verifier(
             superseded.append(findings.pop(old_fp))
     rejection_sources: dict[str, str | None] = {}
 
-    reproducible_shas = _collect_reproducible_shas(
+    replayed = _collect_reproducible_artifacts(
         run_dir,
         list(replay_reports or []),
         list(cand.get("tool_outputs") or []),
     )
+    placer = _FailurePlacer(mm, module, run_dir)
+    own_inputs = _candidate_input_shas(run_dir, cand, replayed)
+    uncompared: list[str] = []
 
     meta_file = harness_meta_path or (run_dir / "workspace" / "harnesses" / f"harness_{module}.json")
     harness_exhausted = False
@@ -3677,6 +3979,8 @@ def cmd_ingest_verifier(
                 }
 
         if verdict == "confirmed":
+            split_off = rec is not records[0]  # an additional record: another defect than the candidate's
+            accepted = _accepted_failures(cand, candidates, rec, placer, split_off)
             for rep in rec["reproducers"]:
                 inp = rep["input"].replace("\\", "/")
                 if inp.startswith(f"agents/{aid}/scratch/"):
@@ -3684,11 +3988,53 @@ def cmd_ingest_verifier(
                     rep["input"] = str(prom_crash["dest"])
                     rep["sha256"] = str(prom_crash["sha256"])
                     rep["size_bytes"] = int(prom_crash["size_bytes"])
-                if rep["sha256"] not in reproducible_shas:
+                if rep["sha256"] not in replayed:
                     raise LedgerError(
                         f"confirmed finding {fp} requires a parent-verified reproducible crash report "
                         f"matching sha256 {rep['sha256']}"
                     )
+                # The replay must have failed on this record's defect, not on any failure.
+                outcome, seen = _judge_reproducer(replayed[rep["sha256"]], accepted, placer)
+                if outcome == "mismatch":
+                    raise LedgerError(_other_failure_refusal(fp, rep["sha256"], cand, rec, seen, candidates, split_off))
+                if outcome == "uncompared":
+                    if split_off:
+                        wanted = "this additional record's own failure: " + _failure_text(
+                            fp, rec.get("location") or {}, rec.get("property") or {}
+                        )
+                        why = "Such a replay does not count for an additional record."
+                    else:
+                        wanted = "the candidate's failure: " + _failure_text(
+                            cand_fp, cand.get("location") or {}, cand.get("property") or {}
+                        )
+                        why = (
+                            "Such a replay counts only for an input recorded on the candidate before verification, "
+                            "and this one is not."
+                        )
+                    if split_off or rep["sha256"] not in own_inputs:
+                        raise LedgerError(
+                            f"confirmed finding {fp}: the parent's replay of reproducer sha256 {rep['sha256']} failed, "
+                            f"but {seen.get('what')} (report {seen.get('report')}), so it cannot be compared with "
+                            f"{wanted}. {why} List a reproducer whose parent replay reports that failure"
+                            + ("" if split_off else ", or one recorded on the candidate")
+                            + ", and cite this input in record.evidence."
+                        )
+                    # Counted, and said: the finding states that the parent could not compare the failure.
+                    report = str(seen.get("report") or "")
+                    note = {
+                        "phase": "fuzz",
+                        "tool_output": report if is_safe_relative_path(report) else rec["evidence"][0]["tool_output"],
+                        "description": (
+                            f"Failure identity not compared: the parent's replay of {rep['input']} (sha256 "
+                            f"{rep['sha256']}) failed, but {seen.get('what')} (report {report}). It is not shown to "
+                            f"be {wanted}. It counts because the input was recorded on the candidate before "
+                            "verification."
+                        ),
+                    }
+                    if note not in rec["evidence"]:
+                        rec["evidence"].append(note)
+                    if rep["sha256"] not in uncompared:
+                        uncompared.append(rep["sha256"])
 
             fix_patch = rec["remediation"].get("fix_patch")
             if isinstance(fix_patch, str) and fix_patch.replace("\\", "/").startswith(f"agents/{aid}/scratch/"):
@@ -3905,6 +4251,8 @@ def cmd_ingest_verifier(
         "decision": res["decision"],
         "resolved_fingerprints": resolved_fps,
         "harness_exhausted": harness_exhausted,
+        # Reproducers counted although the parent's replay named no failure to compare (see the record's evidence).
+        **({"reproducers_not_compared": uncompared} if uncompared else {}),
         **({"superseded_rejections": [o["fingerprint"] for o in superseded]} if superseded else {}),
         **({"sink_conflicts": conflicts} if conflicts else {}),
     }

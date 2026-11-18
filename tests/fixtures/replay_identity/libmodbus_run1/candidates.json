@@ -1,0 +1,248 @@
+[
+  {
+    "fingerprint": "src/modbus-data.c#modbus_get_float_abcd::mem_access::35b22ac2fe",
+    "status": "verified",
+    "origin": "fuzz",
+    "proposed_verdict": "confirmed",
+    "module": "libmodbus_so_5_1_0",
+    "location": {
+      "file": "src/modbus-data.c",
+      "line": 89,
+      "function": "modbus_get_float_abcd"
+    },
+    "property": {
+      "kind": "mem_access",
+      "predicate": "\\valid_read(src + 1)"
+    },
+    "reproducers": [
+      "workspace/crashes/libmodbus_so_5_1_0/crash-550974fbf6087616129fe4b148c1f154faa02e1d",
+      "workspace/crashes/libmodbus_so_5_1_0/crash-d9605760cae43a02c1d19543b5ac4945a271dee9"
+    ],
+    "tool_outputs": [
+      "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+      "workspace/reports/eva/libmodbus_so_5_1_0.json"
+    ],
+    "linked_units": [
+      "src/modbus-data.c#modbus_get_float_abcd::rte"
+    ],
+    "first_seen": "2026-11-18T03:25:13.855374+00:00",
+    "observations": [
+      {
+        "fingerprint": "src/modbus-data.c#modbus_get_float_abcd::mem_access::35b22ac2fe",
+        "origin": "fuzz",
+        "engine": "sanitizers",
+        "kind": "mem_access",
+        "message": "rte: mem_access: AddressSanitizer: stack-buffer-overflow (READ) [line 5b704834c5]",
+        "tool_output": "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+        "reproducer": "workspace/crashes/libmodbus_so_5_1_0/crash-550974fbf6087616129fe4b148c1f154faa02e1d"
+      },
+      {
+        "fingerprint": "src/modbus-data.c#modbus_get_float_abcd::initialization::f3c81a75e0",
+        "origin": "fuzz",
+        "engine": "eacsl",
+        "kind": "initialization",
+        "message": "\\initialized(src + 1)",
+        "tool_output": "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+        "reproducer": "workspace/crashes/libmodbus_so_5_1_0/crash-d9605760cae43a02c1d19543b5ac4945a271dee9"
+      },
+      {
+        "fingerprint": "src/modbus-data.c#modbus_get_float_abcd::mem_access::8d6202e2d7",
+        "origin": "eva",
+        "engine": null,
+        "kind": "mem_access",
+        "message": "\\valid_read(src + 1)",
+        "tool_output": "workspace/reports/eva/libmodbus_so_5_1_0.json",
+        "reproducer": null
+      }
+    ],
+    "site": "src/modbus-data.c#modbus_get_float_abcd@5b704834c5",
+    "notes": [
+      "Eva Invalid status without a concrete witness input"
+    ],
+    "resolved_fingerprints": [
+      "src/modbus-data.c#modbus_get_float_abcd::mem_access::35b22ac2fe"
+    ],
+    "last_rejection": {
+      "at": "2026-11-18T03:37:59.923195+00:00",
+      "rejection_class": "harness_induced",
+      "refutation_basis": "checked",
+      "harness_sha256": "4fc9232c8e752f0815286d20c4dc38a0aa4ceddd4e4cac1b7a13cdadcb982b1d",
+      "repair_attempts": 0
+    }
+  },
+  {
+    "fingerprint": "src/modbus-data.c#modbus_get_float_badc::mem_access::8caef6cae1",
+    "status": "verified",
+    "origin": "fuzz",
+    "proposed_verdict": "confirmed",
+    "module": "libmodbus_so_5_1_0",
+    "location": {
+      "file": "src/modbus-data.c",
+      "line": 133,
+      "function": "modbus_get_float_badc"
+    },
+    "property": {
+      "kind": "mem_access",
+      "predicate": "\\valid_read(src + 1)"
+    },
+    "reproducers": [
+      "workspace/crashes/libmodbus_so_5_1_0/crash-5892157a052cb477987072a6e488afa69278758e",
+      "workspace/crashes/libmodbus_so_5_1_0/crash-e56747dcd8347b17060d506f4f32179e93c35ba9"
+    ],
+    "tool_outputs": [
+      "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+      "workspace/reports/eva/libmodbus_so_5_1_0.json"
+    ],
+    "linked_units": [
+      "src/modbus-data.c#modbus_get_float_badc::rte"
+    ],
+    "first_seen": "2026-11-18T03:25:13.870027+00:00",
+    "observations": [
+      {
+        "fingerprint": "src/modbus-data.c#modbus_get_float_badc::mem_access::8caef6cae1",
+        "origin": "fuzz",
+        "engine": "sanitizers",
+        "kind": "mem_access",
+        "message": "rte: mem_access: AddressSanitizer: stack-buffer-overflow (READ) [line 58e4e7135b]",
+        "tool_output": "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+        "reproducer": "workspace/crashes/libmodbus_so_5_1_0/crash-5892157a052cb477987072a6e488afa69278758e"
+      },
+      {
+        "fingerprint": "src/modbus-data.c#modbus_get_float_badc::initialization::f3c81a75e0",
+        "origin": "fuzz",
+        "engine": "eacsl",
+        "kind": "initialization",
+        "message": "\\initialized(src + 1)",
+        "tool_output": "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+        "reproducer": "workspace/crashes/libmodbus_so_5_1_0/crash-5892157a052cb477987072a6e488afa69278758e"
+      },
+      {
+        "fingerprint": "src/modbus-data.c#modbus_get_float_badc::mem_access::8d6202e2d7",
+        "origin": "eva",
+        "engine": null,
+        "kind": "mem_access",
+        "message": "\\valid_read(src + 1)",
+        "tool_output": "workspace/reports/eva/libmodbus_so_5_1_0.json",
+        "reproducer": null
+      }
+    ],
+    "site": "src/modbus-data.c#modbus_get_float_badc@58e4e7135b",
+    "notes": [
+      "Eva Invalid status without a concrete witness input"
+    ],
+    "resolved_fingerprints": [
+      "src/modbus-data.c#modbus_get_float_badc::mem_access::8caef6cae1"
+    ],
+    "last_rejection": {
+      "at": "2026-11-18T03:37:01.746461+00:00",
+      "rejection_class": "harness_induced",
+      "refutation_basis": "checked",
+      "harness_sha256": "4fc9232c8e752f0815286d20c4dc38a0aa4ceddd4e4cac1b7a13cdadcb982b1d",
+      "repair_attempts": 0
+    }
+  },
+  {
+    "fingerprint": "harness_libmodbus_so_5_1_0.c#unknown_function::timeout::c2aa56485a",
+    "status": "verified",
+    "origin": "fuzz",
+    "proposed_verdict": "needs_validation",
+    "module": "libmodbus_so_5_1_0",
+    "location": {
+      "file": "harness_libmodbus_so_5_1_0.c",
+      "line": 0,
+      "function": "unknown_function"
+    },
+    "property": {
+      "kind": "timeout",
+      "predicate": ""
+    },
+    "reproducers": [
+      "workspace/crashes/libmodbus_so_5_1_0/timeout-246633d057b6f4f9f8b086114e28a13ec0017dd6",
+      "workspace/crashes/libmodbus_so_5_1_0/timeout-30c15058ce7dc7cb6c51d2b6d9dd9b4c2f68705c",
+      "workspace/crashes/libmodbus_so_5_1_0/timeout-be3a2dae770254f18cab1829dd4225e479165a8a",
+      "workspace/crashes/libmodbus_so_5_1_0/timeout-5efc609a1687f34ca9e03c1c5c8e946122065296"
+    ],
+    "tool_outputs": [
+      "workspace/reports/fuzz/libmodbus_so_5_1_0.json"
+    ],
+    "linked_units": [],
+    "first_seen": "2026-11-18T03:25:14.713340+00:00",
+    "observations": [
+      {
+        "fingerprint": "harness_libmodbus_so_5_1_0.c#unknown_function::timeout::c2aa56485a",
+        "origin": "fuzz",
+        "engine": "eacsl",
+        "kind": "timeout",
+        "message": "",
+        "tool_output": "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+        "reproducer": "workspace/crashes/libmodbus_so_5_1_0/timeout-246633d057b6f4f9f8b086114e28a13ec0017dd6"
+      },
+      {
+        "fingerprint": "harness_libmodbus_so_5_1_0.c#unknown_function::timeout::c2aa56485a",
+        "origin": "fuzz",
+        "engine": "sanitizers",
+        "kind": "timeout",
+        "message": "",
+        "tool_output": "workspace/reports/fuzz/libmodbus_so_5_1_0.json",
+        "reproducer": "workspace/crashes/libmodbus_so_5_1_0/timeout-5efc609a1687f34ca9e03c1c5c8e946122065296"
+      }
+    ],
+    "notes": [
+      "no E-ACSL failure report could be parsed; verifier must triage and link units"
+    ],
+    "resolved_fingerprints": [
+      "src/modbus.c#send_msg::timeout::8d02b7ec71"
+    ],
+    "refingerprint_reason": "The candidate comes from a fuzz timeout artifact whose failure could not be parsed, so its fingerprint carries the placeholder file and function (harness_libmodbus_so_5_1_0.c#unknown_function). Source triage and both replays locate the non-terminating statement in the target: the link-recovery do/while of send_msg (src/modbus.c:184-220), for which the coverage ledger holds src/modbus.c#send_msg::l2_termination. Canonical fingerprint computed with /opt/framac-pipeline/scripts/fingerprint.py --file src/modbus.c --function send_msg --kind timeout --predicate 'send_msg does not terminate when MODBUS_ERROR_RECOVERY_LINK is set and the backend send keeps failing'."
+  },
+  {
+    "fingerprint": "src/modbus-rtu.c#modbus_rtu_set_serial_mode::rte::2820aa2803",
+    "status": "verified",
+    "origin": "breaker",
+    "proposed_verdict": "confirmed",
+    "module": "libmodbus_so_5_1_0",
+    "location": {
+      "file": "src/modbus-rtu.c",
+      "line": 0,
+      "function": "modbus_rtu_set_serial_mode"
+    },
+    "property": {
+      "kind": "rte",
+      "predicate": "\\initialized(&ctx->debug)"
+    },
+    "reproducers": [
+      "workspace/crashes/libmodbus_so_5_1_0/crash-83891d7fe85c33e5"
+    ],
+    "tool_outputs": [
+      "agents/breaker-modbus_rtu_set_serial_mode/artifacts/result.json"
+    ],
+    "linked_units": [
+      "src/modbus-rtu.c#modbus_rtu_set_serial_mode::rte"
+    ],
+    "first_seen": "2026-11-18T11:47:41.698580+00:00",
+    "observations": [
+      {
+        "fingerprint": "src/modbus-rtu.c#modbus_rtu_set_serial_mode::rte::2820aa2803",
+        "origin": "breaker",
+        "engine": null,
+        "kind": "rte",
+        "message": "\\initialized(&ctx->debug)",
+        "tool_output": "agents/breaker-modbus_rtu_set_serial_mode/artifacts/result.json",
+        "reproducer": "workspace/crashes/libmodbus_so_5_1_0/crash-83891d7fe85c33e5"
+      }
+    ],
+    "notes": [
+      "Reached through harness case 20. Byte 0 is the dispatch selector 20 (0x14); bytes 1-4 are the int port and bytes 5-8 the int mode passed to modbus_new_tcp(device, port), and bytes 9.. are the NUL-terminated device string. When that device string is empty (the 1-byte crash artifact) or longer than 15 chars, modbus_new_tcp() reports the string error, frees the context and returns NULL, and the harness still calls modbus_rtu_set_serial_mode(NULL, mode). The function itself handles this as its contract says: ctx->s, ctx->backend, ctx->backend_data and ctx->debug are never touched, errno is set to EINVAL and it returns -1. The failure is in the E-ACSL instrumentation of the keep_debug frame postcondition: at function entry E-ACSL snapshots the \\old(...) terms of the four keep_* clauses, and for keep_debug this materializes as an unguarded __e_acsl_assert(__e_acsl_initialized((void *)(&ctx->debug), sizeof(int))) tagged line 1053 of workspace/work/src/modbus-rtu.c. With ctx == NULL that address is 0 + offsetof(modbus_t, debug), which is not a tracked block, so the initialization check fails with the reported predicate \\initialized(&ctx->debug). Verified trigger isolation: the five surgical seeds (non-NULL TCP contexts built from valid device strings, modes RS232/RS485/0x7FFFFFFF/-1) and a valid-IP probe all run clean, while both NULL-producing device strings (empty and 16-char truncated) reproduce the identical failure at line 1053, so the trigger is a NULL context, not the port or mode value. This is not a libmodbus memory-safety defect: the NULL argument is explicitly permitted by the file's contract (requires ctx_shape: ctx == \\null || \\valid_read(ctx); ensures null_result/null_errno), the body returns -1/EINVAL, and the keep_debug clause is semantically true on that path because \\old(ctx) == \\null short-circuits the ||. The crash is E-ACSL's eager entry-time \\old(ctx->debug) snapshot of a frame clause whose guard is evaluated later, i.e. a tool/spec gap, not target behaviour."
+    ],
+    "resolved_fingerprints": [
+      "src/modbus-rtu.c#modbus_rtu_set_serial_mode::rte::2820aa2803"
+    ],
+    "last_rejection": {
+      "at": "2026-11-18T12:18:44.960709+00:00",
+      "rejection_class": "toolchain_artifact",
+      "refutation_basis": "checked",
+      "harness_sha256": "5f49c831ca00369b1377df88ba670beae773bfdff726e65d83719dbdcc0fcce6",
+      "repair_attempts": 2
+    }
+  }
+]

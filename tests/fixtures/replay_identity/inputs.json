@@ -1,0 +1,42 @@
+{
+  "libmodbus_run1": {
+    "workspace/crashes/libmodbus_so_5_1_0/crash-46dd39bf47948c0d578ec8f12b0c4887a484fed7": {
+      "hex": "27002400000000092500",
+      "sha256": "7118fb65b1b07945f3722c76819d3bc39fd334a67f2d1ece4151e599cac57706"
+    },
+    "workspace/crashes/libmodbus_so_5_1_0/crash-550974fbf6087616129fe4b148c1f154faa02e1d": {
+      "hex": "02f147",
+      "sha256": "58a9f940a3256f787d697d026a76d561a83e6772aa0303e12c9be00a2474b57d"
+    },
+    "workspace/crashes/libmodbus_so_5_1_0/crash-5892157a052cb477987072a6e488afa69278758e": {
+      "hex": "03c7f1",
+      "sha256": "145b22cafe82e257d5c0b897791f9928961e00afb4cd3f468f241f2a4ba17926"
+    },
+    "workspace/crashes/libmodbus_so_5_1_0/crash-83891d7fe85c33e5": {
+      "hex": "14",
+      "sha256": "83891d7fe85c33e52c8b4e5814c92fb6a3b9467299200538a6babaa8b452d879"
+    },
+    "workspace/crashes/libmodbus_so_5_1_0/crash-d9605760cae43a02c1d19543b5ac4945a271dee9": {
+      "hex": "02f1c7",
+      "sha256": "9fc1c3e727346c909860375f529835900db2e1f2f6adc5ffa5f66580c55e6c3b"
+    },
+    "workspace/crashes/libmodbus_so_5_1_0/crash-e56747dcd8347b17060d506f4f32179e93c35ba9": {
+      "hex": "0347f1",
+      "sha256": "edbaa56f6225f418c58370c202e316290c041e206df2969026bc4e49b75b2598"
+    },
+    "workspace/crashes/libmodbus_so_5_1_0/timeout-246633d057b6f4f9f8b086114e28a13ec0017dd6": {
+      "hex": "436f756c64206e6f742a692c6e7374616c6c204572726f722072657475726e65642062792067657461646472696e666f3a2025730a534947504950452068616e646c65722e0ad0",
+      "sha256": "cb55484d0b34bde7a61f1bf490d3702ac512d6342d9e17fea6ec34505c3383b4"
+    }
+  },
+  "mpack_run4": {
+    "workspace/crashes/libmpack_a__mpack_writer_2/crash-8aab9277e568265082fbe49b276a52f2adb1bf92": {
+      "hex": "1b0010000000000000",
+      "sha256": "1fe7fd895f286fcc06a5afa8ef05a77ccfb8db89915cd7b8232b92fa842cb7d5"
+    },
+    "workspace/crashes/libmpack_a__mpack_writer_2/crash-ebfbdf62234fefb756649dbe99ef66f9d24cf9c8": {
+      "hex": "1a0010000000000000",
+      "sha256": "06cebb47290ed3556de3a4120c37c8aa739b3a7277b752563932d3137ede147c"
+    }
+  }
+}
