@@ -7,17 +7,22 @@ index is LF (`git ls-files --eol`: `i/lf w/crlf`). In the Linux build container 
 shebang then does not start: the kernel looks for the interpreter `/bin/sh\\r`, and `sh -c
 tools/unit.sh` says `tools/unit.sh: not found` (exit 127). A shell reading a CRLF script itself fails
 on its first `\\r`: `/bin/sh: 0: Illegal option -`, `configure: error: cannot run /bin/bash
-./config.sub`.
+./config.sub`, dash's `./autogen.sh: 22: Syntax error: end of file unexpected (expecting "then")`
+(`then\\r` is not `then`; under `bear intercept` a `#!/bin/sh\\r` script is read by sh, exit 2).
+autoconf copies the `\\r` of a CRLF `configure.ac` (or `*.m4`) into the generated `configure`, which
+then fails with bash's `./configure: line <n>: syntax error near unexpected token ...`.
 
 `scan_crlf_scripts()` lists them: files whose first line starts with `#!` and holds a `\\r` before its
-`\\n`, and the shell scripts the build runs by name without a shebang (`configure`, `config.sub`,
-`*.sh`, ...) holding CRLF. It is bounded: no `.git` or pipeline output, symlinks not followed, files
-with a known non-script extension, binary files (a NUL in the head) and files over MAX_FILE_BYTES
-skipped, MAX_HEAD_BYTES read per file, at most `max_files` files opened.
+`\\n`, the shell scripts the build runs by name without a shebang (`configure`, `config.sub`,
+`*.sh`, ...) and the autotools inputs (`configure.ac`, `Makefile.am`, `*.m4`, ...) holding CRLF. It
+is bounded: no `.git` or pipeline output, symlinks not followed, files with a known non-script
+extension, binary files (a NUL in the head) and files over MAX_FILE_BYTES skipped, MAX_HEAD_BYTES
+read per file, at most `max_files` files opened.
 
 `workspace_overlay.py init` reports them as an early warning; build_capture.py and seed_harvest.py
-turn a failed build or test command (exit 126/127, `not found`, `Illegal option -`, `cannot run`)
-into a hint naming them (`failure_hint()`).
+turn a failed build or test command (exit 126/127, `Illegal option -`; or `not found`, `cannot
+run`, a shell syntax error when the log or command names one, `configure` naming the autotools
+inputs) into a hint naming them (`failure_hint()`).
 
     line_endings.py <dir>     # print the scan's summary as JSON (read-only)
 """
@@ -45,6 +50,8 @@ SHELL_SCRIPT_NAMES = frozenset(
     {"configure", "config.sub", "config.guess", "config.status", "autogen.sh", "bootstrap", "install-sh",
      "ltmain.sh", "depcomp", "missing", "compile", "libtool"}
 )  # fmt: skip
+# autotools inputs: their `\r` ends up in the generated configure or Makefiles (and `*.m4`).
+AUTOTOOLS_INPUT_NAMES = frozenset({"configure.ac", "configure.in", "Makefile.am", "Makefile.in", "aclocal.m4"})
 # Never run as scripts: not opened.
 SKIP_SUFFIXES = frozenset(
     {".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".inc", ".s", ".asm", ".o", ".obj",
@@ -58,13 +65,18 @@ FIX = (
     "the target was probably checked out on Windows with core.autocrlf=true. Check it out again with LF endings "
     "(`git config --local core.autocrlf false`, `git config --local core.eol lf`, then "
     "`git rm -r --cached -q . && git reset --hard`, which discards uncommitted changes), or strip the "
-    "CRs in the build recipe before they run (`sed -i 's/\\r$//' <script>...`); see "
+    "CRs in the build recipe before they run (`sed -i 's/\\r$//' <script>...`, and before autoreconf "
+    "over the autotools inputs too: configure.ac, Makefile.am, m4/*.m4); see "
     "docs/troubleshooting/phase0-build-and-model.md (Windows checkout)"
 )
 # A shell's own messages on a CRLF script, or a CR before a closing quote: bash's
 # `$'\r': command not found`, env's `'python3\r': No such file or directory`.
 _STRONG_RE = re.compile(r"Illegal option -\s*$|bad interpreter|cannot run /bin/(?:ba)?sh|\r'", re.MULTILINE)
-_WEAK_RE = re.compile(r"not found|cannot run|No such file or directory")
+# Counted only when the log or the command names a CRLF file. The syntax errors are a shell's own
+# (dash `<script>: 22: Syntax error: ...`, bash `<script>: line 9: syntax error ...`), not a parser's.
+_WEAK_RE = re.compile(r"not found|cannot run|No such file or directory|: (?:line )?\d+: [Ss]yntax error\b")
+# The generated script a CRLF autotools input breaks.
+_CONFIGURE_RE = re.compile(r"(?<![\w.-])configure(?![\w.-])")
 
 
 @dataclass(frozen=True)
@@ -87,6 +99,11 @@ def _is_pipeline_output_dir(path: Path) -> bool:
     return is_pipeline_output_dir(path)
 
 
+def _is_autotools_input(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1]
+    return base in AUTOTOOLS_INPUT_NAMES or base.endswith(".m4")
+
+
 def check_file(path: Path, name: str) -> Hit | None:
     """A Hit when the file at `path` is a CRLF script (its relative POSIX path is `name`)."""
     try:
@@ -104,7 +121,7 @@ def check_file(path: Path, name: str) -> Hit | None:
         text = first.decode("utf-8", errors="replace").replace("\r", "\\r")
         return Hit(name, text[:120])
     base = name.rsplit("/", 1)[-1]
-    if (base in SHELL_SCRIPT_NAMES or base.endswith(".sh")) and b"\r\n" in head:
+    if (base in SHELL_SCRIPT_NAMES or base.endswith(".sh") or _is_autotools_input(name)) and b"\r\n" in head:
         return Hit(name, None)
     return None
 
@@ -159,8 +176,11 @@ def _describe(hit: Hit) -> str:
 
 
 def _mentioned(hit: Hit, text: str) -> bool:
+    """`text` names the hit, or the generated `configure` an autotools input breaks."""
     parts = hit.path.split("/")
-    return any("/".join(parts[i:]) in text for i in range(len(parts)))
+    if any("/".join(parts[i:]) in text for i in range(len(parts))):
+        return True
+    return _is_autotools_input(hit.path) and bool(_CONFIGURE_RE.search(text))
 
 
 def named(scan: Scan, text: str = "", limit: int = NAMED) -> str:
@@ -179,7 +199,8 @@ def overlay_warning(scan: Scan) -> str | None:
     return (
         f"the target checkout has CRLF line endings: {count} script(s) a Linux shell cannot run as they "
         f"are ({named(scan)}); a build or test command that runs one fails with `not found` (exit 127), "
-        f"`Illegal option -` or `cannot run`: {FIX}"
+        f"`Illegal option -`, `cannot run` or a shell `Syntax error`, and a CRLF configure.ac breaks the "
+        f"generated configure: {FIX}"
     )
 
 
@@ -207,10 +228,12 @@ def failure_hint(what: str, returncode: int | None, log: str, scan: Scan, comman
     shebang = f" ({first.first_line})" if first.first_line else ""
     others = Scan([h for h in scan.hits if h != first], scan.complete)
     also = f"; so do {named(others, text)}" if others.hits else ""
-    return (
-        f"{what} exited {returncode}; {first.path} has CRLF line endings{shebang} and cannot run in the "
-        f"Linux container{also}: {FIX}"
+    effect = (
+        "which autoconf/automake copy into the generated configure and Makefiles"
+        if _is_autotools_input(first.path)
+        else "and cannot run in the Linux container"
     )
+    return f"{what} exited {returncode}; {first.path} has CRLF line endings{shebang} {effect}{also}: {FIX}"
 
 
 def main(argv: list[str] | None = None) -> int:

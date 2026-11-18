@@ -97,6 +97,68 @@ def test_no_hint_without_crlf_scripts_or_for_an_unrelated_failure(tmp_path):
     assert line_endings.failure_hint("the build", 2, "/bin/sh: 0: Illegal option -", scan) is not None
 
 
+def test_a_shell_syntax_error_on_a_crlf_script_gets_the_hint(tmp_path):
+    # libmodbus run-1 (2026-11-18): under `bear intercept` dash reads the `#! /bin/sh\r` script and
+    # stops at its first `then\r`; no 126/127, no `Illegal option -`. Repro in framac-build:latest.
+    (tmp_path / "autogen.sh").write_bytes(b"#! /bin/sh\r\nif [ -f configure.ac ]; then\r\n  echo ok\r\nfi\r\n")
+    scan = line_endings.scan_crlf_scripts(tmp_path)
+    command = './autogen.sh && ./configure && make -j"$(nproc)"'
+    dash = './autogen.sh: 22: Syntax error: end of file unexpected (expecting "then")\n'
+    bash = "./autogen.sh: line 9: syntax error: unexpected end of file\n"
+    for log in (dash, bash):
+        hint = line_endings.failure_hint("the build command", 2, log, scan, command)
+        assert hint is not None
+        assert hint.startswith("the build command exited 2; autogen.sh has CRLF line endings (#! /bin/sh\\r)")
+
+
+def test_a_shell_syntax_error_naming_no_crlf_script_gives_no_hint(tmp_path):
+    scan = line_endings.scan_crlf_scripts(_crlf_target(tmp_path))
+    for log in (
+        './build.sh: 3: Syntax error: "fi" unexpected\n',
+        "./build.sh: line 3: syntax error near unexpected token `fi'\n",
+        "parse.y:12.5-10: syntax error, unexpected identifier\n",
+    ):
+        assert line_endings.failure_hint("the build command", 2, log, scan, "./build.sh && make") is None
+
+
+def test_crlf_autotools_inputs_are_found(tmp_path):
+    (tmp_path / "m4").mkdir()
+    (tmp_path / "configure.ac").write_bytes(b"AC_INIT([x], [1])\r\nAC_OUTPUT\r\n")
+    (tmp_path / "Makefile.am").write_bytes(b"SUBDIRS = src\r\n")
+    (tmp_path / "m4" / "ax_x.m4").write_bytes(b"AC_DEFUN([AX_X], [:])\r\n")
+    (tmp_path / "configure.in").write_bytes(b"AC_INIT\nAC_OUTPUT\n")
+    scan = line_endings.scan_crlf_scripts(tmp_path)
+    assert [(h.path, h.first_line) for h in scan.hits] == [
+        ("Makefile.am", None),
+        ("configure.ac", None),
+        ("m4/ax_x.m4", None),
+    ]
+
+
+def test_a_configure_syntax_error_from_a_crlf_configure_ac_gets_the_hint(tmp_path):
+    # libmodbus run-1 (2026-11-18), after `sed` over the scripts: autoconf copies the `\r` of a
+    # CRLF configure.ac into the generated configure, which bash then cannot parse. The generated
+    # configure itself has no CRLF in its head, so `configure` in the log points at configure.ac.
+    (tmp_path / "configure.ac").write_bytes(b"AC_INIT([x], [1])\r\nAC_CHECK_HEADERS([ \\\r\n  a.h \\\r\n])\r\n")
+    (tmp_path / "autogen.sh").write_bytes(LF_SHEBANG)
+    scan = line_endings.scan_crlf_scripts(tmp_path)
+    log = (
+        "./configure: line 14962: syntax error near unexpected token "
+        '`as_ac_Header=`printf "%s\\n" "ac_cv_header_$ac_header" | sed "$as_sed_sh"`\'\n'
+    )
+    command = "sed -i 's/\\r$//' autogen.sh && ./autogen.sh && ./configure && make"
+    hint = line_endings.failure_hint("the build command", 2, log, scan, command)
+    assert hint is not None
+    assert hint.startswith("the build command exited 2; configure.ac has CRLF line endings")
+    assert "Makefile.am" in hint and "m4" in hint
+    # the same error with no CRLF autotools input in the tree is not blamed on line endings
+    (tmp_path / "configure.ac").write_bytes(b"AC_INIT([x], [1])\n")
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "unit.sh").write_bytes(CRLF_SHEBANG)
+    scan = line_endings.scan_crlf_scripts(tmp_path)
+    assert line_endings.failure_hint("the build command", 2, log, scan, command) is None
+
+
 def test_a_127_naming_no_crlf_script_singles_none_out(tmp_path):
     scan = line_endings.scan_crlf_scripts(_crlf_target(tmp_path))
     hint = line_endings.failure_hint("the build command", 127, "sh: 1: ninja: not found", scan, "ninja")
@@ -199,4 +261,39 @@ def test_a_failed_build_on_a_crlf_script_gets_the_hint(tmp_path, monkeypatch):
     assert report["diagnostics"]["crlf_scripts"]["paths"] == ["tools/unit.sh"]
     hints = [w for w in report["warnings"] if "CRLF" in w]
     assert len(hints) == 1 and hints[0].startswith("the build command exited 127; tools/unit.sh has CRLF")
+    assert not bc.validate_report({**report, "status": bc.STATUS_NEEDS_RECIPE})
+
+
+def test_a_build_failing_with_a_syntax_error_in_a_crlf_script_gets_the_hint(tmp_path, monkeypatch):
+    # libmodbus run-1 (2026-11-18): rc 2 and dash's syntax error are the whole log.
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "autogen.sh").write_bytes(b"#! /bin/sh\r\nif [ -f configure.ac ]; then\r\n  echo ok\r\nfi\r\n")
+    recipe: dict = {
+        "command": './autogen.sh && ./configure && make -j"$(nproc)"',
+        "workdir": ".",
+        "packages": [],
+        "env": {},
+        "test_command": None,
+        "install_command": None,
+        "snapshot_extra": [],
+        "origin": "user",
+    }
+
+    def run_sandboxed_shell(command, cwd, scratch, timeout, env_, wrap):
+        err = './autogen.sh: 22: Syntax error: end of file unexpected (expecting "then")\n'
+        return SimpleNamespace(returncode=2, timed_out=False, stdout="", stderr=err)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bc, "host_machine", lambda: bc.SUPPORTED_ARCH)
+    monkeypatch.setattr(bc, "load_recipe", lambda args: dict(recipe))
+    monkeypatch.setattr(bc, "packages_missing", lambda pkgs: [])
+    monkeypatch.setattr(bc, "job_count", lambda: 1)
+    monkeypatch.setattr(bc, "run_sandboxed_shell", run_sandboxed_shell)
+    args = argparse.Namespace(target=str(target), scratch=str(tmp_path / "scratch"), timeout=30)
+    report, code = bc.capture(args)
+    assert code == bc.EXIT_NEEDS_RECIPE
+    assert report["diagnostics"]["crlf_scripts"]["paths"] == ["autogen.sh"]
+    hints = [w for w in report["warnings"] if "CRLF" in w]
+    assert len(hints) == 1 and hints[0].startswith("the build command exited 2; autogen.sh has CRLF")
     assert not bc.validate_report({**report, "status": bc.STATUS_NEEDS_RECIPE})
