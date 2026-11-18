@@ -262,8 +262,11 @@ def tree_rel(path: str, tree: str, cwd: str | None = None) -> str | None:
 def _call_sites(fn: dict) -> list[dict] | None:
     """
     The direct calls of a function body with their string-literal arguments (dump schema 4, plan
-    steps M2 and M5): [{callee, line, literals: {argument index: text}}], in body order. None when the
-    dump predates them, so a consumer can tell "no literal" from "not recorded".
+    steps M2 and M5): [{callee, line, literals: {argument index: text}[, initializer]}], in body
+    order. None when the dump predates them, so a consumer can tell "no literal" from "not recorded".
+    `initializer` (dump schema 5, package E of docs/plans/metacsl-exploitation-plan.md): the call is
+    the initializer of a local (`int n = f(x);`), where MetAcsl generates no \\calling, \\writing or
+    \\strong_invariant instance. Absent when the dump does not say.
     """
     calls = [c for c in fn.get("calls") or [] if not c.get("indirect")]
     if any("literal_args" not in c for c in calls) or (not calls and "calls" not in fn):
@@ -272,7 +275,10 @@ def _call_sites(fn: dict) -> list[dict] | None:
     for c in calls:
         loc = parse_location(str(c.get("loc") or ""))
         lits = c.get("literal_args") if isinstance(c.get("literal_args"), dict) else {}
-        out.append({"callee": str(c.get("name") or ""), "line": loc[1] if loc else 0, "literals": dict(lits)})
+        site = {"callee": str(c.get("name") or ""), "line": loc[1] if loc else 0, "literals": dict(lits)}
+        if "initializer" in c:
+            site["initializer"] = bool(c["initializer"])
+        out.append(site)
     return out
 
 

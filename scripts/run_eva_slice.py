@@ -609,6 +609,9 @@ def load_security_meta(props_path: str, sources: list[str], flags: list[str], mo
       {props, meta_file, properties, line_names, extra_sources, classes, planned, decided, functions,
        outside_functions, roots[, skipped]}      the module meta file was written and is to be parsed.
 
+    Only the properties security_props.for_engine keeps for Eva are considered; the names it left
+    out are listed under `not_for_engine` (absent when there are none).
+
     The module's functions are those security_props.json knows in the sources and in every file they
     include (the dependency manifest: a harness that `#include`s the target source lists only itself).
     A property whose `sources` (the file defining a global it names) is neither in the parse nor under
@@ -625,11 +628,23 @@ def load_security_meta(props_path: str, sources: list[str], flags: list[str], mo
         return {"props": path.as_posix(), "error": f"unreadable: {exc}", "properties": []}
     if not isinstance(doc, dict) or META_ENGINE not in security_props.meta_engines(doc):
         return None
+    # A property whose `engines` leave Eva out (a monotonic invariant: Eva does not evaluate
+    # \at(x, Before)) never reaches the meta file, nor the planned instances and classes below.
+    listed = [p for p in doc.get("properties") or [] if isinstance(p, dict)]
+    doc = security_props.for_engine({**doc, "properties": listed}, META_ENGINE)
+    not_for_engine = sorted(
+        {str(p.get("name")) for p in listed} - {str(p.get("name")) for p in doc.get("properties") or []}
+    )
     manifest = cache.dependency_manifest(sources, flags)
     source_paths = [_posix(s) for s in sources]
     paths = sorted({_posix(dep) for dep, _ in manifest} | set(source_paths)) if manifest else source_paths
     ids, roots, matched = _module_functions(doc, paths)
-    nothing: dict = {"props": path.as_posix(), "properties": [], "meta_file": None}
+    nothing: dict = {
+        "props": path.as_posix(),
+        "properties": [],
+        "meta_file": None,
+        **({"not_for_engine": not_for_engine} if not_for_engine else {}),
+    }
     if not ids:
         return nothing
 
@@ -686,6 +701,7 @@ def load_security_meta(props_path: str, sources: list[str], flags: list[str], mo
         "line_names": {str(line): name for line, name in security_props.meta_line_names(text).items()},
         "extra_sources": extra,
         **({"skipped": skipped} if skipped else {}),
+        **({"not_for_engine": not_for_engine} if not_for_engine else {}),
         "classes": {str(p["name"]): str(p.get("obligation_class") or "") for p in selected},
         "planned": {str(p["name"]): sorted(set(p.get("instances") or []) & ids) for p in selected},
         "decided": {
@@ -805,6 +821,9 @@ def security_section(meta_rows: Iterable[dict], section: dict) -> dict:
     out: its call sites have rows of their own, in the callers.
     """
     out = {key: section[key] for key in META_STATIC_KEYS if key in section}
+    # Not a cache input (_meta_digest): the meta file's text already differs without those properties.
+    if section.get("not_for_engine"):
+        out["not_for_engine"] = section["not_for_engine"]
     classes = section.get("classes") or {}
 
     def zero() -> dict:
