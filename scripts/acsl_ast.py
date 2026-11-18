@@ -92,10 +92,9 @@ _C_INT_PARAM_RE = re.compile(rf"^\s*(?:const\s+)?{_C_INT_TYPE_CORE}\s+[A-Za-z_][
 _INVARIANT_CLAUSE_RE = re.compile(r"(?:(loop|type|global|strong)\s+)?\binvariant\b(?!\s*:)")
 _VACUOUS_CLAUSE_HEAD_RE = re.compile(r"(?<![\\\w])(requires|assumes|loop\s+invariant)\b")
 _EMPTY_BEHAVIOR_RE = re.compile(r"\bbehavior\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*;")
-# String and character literals, scanned left to right in one pass and bounded by the line: a `'"'`
-# character literal must not open a string that swallows the annotation text up to the next quote.
-_LITERAL_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n]){1,4}\'')
 _COMMENT_IN_ACSL_RE = re.compile(r"//(?![@])[^\n]*")
+# A backslash that ends a line: cpp joins the next line to it (it accepts blanks after the backslash).
+_SPLICED_LINE_RE = re.compile(r"\\[ \t\r]*(?:\n|\Z)")
 # A ghost function's own contract, written `/@ ... @/` inside a `/*@ ghost ... */` block.
 _GHOST_CONTRACT_RE = re.compile(r"/@.*?@/", re.DOTALL)
 _ESCAPED_CTRL_IN_ACSL_RE = re.compile(r"[\x07\x08\x0c]")
@@ -253,6 +252,8 @@ _UNCLOSED_LABELS = {
     "char_literal": "character literal",
 }
 _NOT_LINE_END_RE = re.compile(r"[^\r\n]")
+# The kernel's lexer enters ghost code when an annotation starts with `ghost`, after blanks and `@` only.
+_GHOST_ANNOTATION_RE = re.compile(r"[ \t\r\n@]*ghost")
 
 
 def _directive_comment_spans(text: str, start: int, end: int) -> tuple[list[tuple[str, int, int]], int | None]:
@@ -397,8 +398,10 @@ def mask_comments_and_literals(
       directive are always left as written (`#include "x.h"`, `#define S "..."`).
     - ACSL annotations (`/*@ */`, `//@`), by `acsl`:
         `"keep"` (default): left as written, with their own `//` comments and literals;
-        `"mask"`: kept, but the `//` comments inside them are blanked, and their literal contents too
-            (when `literals`);
+        `"mask"`: kept, but what the Frama-C kernel reads as a comment inside them is blanked, and their
+            literal contents too (when `literals`). A `//@` inside an annotation is such a comment (the
+            kernel does not read it as a nested annotation, whatever the ACSL manual says), except in
+            `/*@ ghost` code, which is C: there it is an annotation, kept and masked the same way;
         `"blank"`: blanked like any comment. This is what the old `re.sub(r"/\\*.*?\\*/", " ", ...)` did.
     - Text the tokenizer rejects, by `on_error` (see `comment_and_literal_spans`): `"raise"` (default)
       raises `AcslSyntaxError`; `"mask"` blanks an unclosed block comment up to the end of the text, and an
@@ -422,7 +425,9 @@ def mask_comments_and_literals(
             if acsl == "mask":
                 closed = kind == "acsl_block" and len(piece) >= 5 and piece.endswith("*/")
                 body_end = len(piece) - 2 if closed else len(piece)
-                body = mask_comments_and_literals(piece[3:body_end], literals=literals, on_error="mask", path=path)
+                body = piece[3:body_end]
+                nested = "mask" if _GHOST_ANNOTATION_RE.match(body) else "blank"
+                body = mask_comments_and_literals(body, acsl=nested, literals=literals, on_error="mask", path=path)
                 piece = piece[:3] + body + piece[body_end:]
         elif literals:
             piece = _blank_literal(piece)
@@ -431,6 +436,26 @@ def mask_comments_and_literals(
         last = end
     out.append(text[last:])
     return "".join(out)
+
+
+def _kernel_views(text: str) -> tuple[str, str]:
+    """
+    Two readings of C/ACSL `text` that leave out what the Frama-C kernel does not read inside an annotation,
+    both with the length and line ends of `text`, so an offset in one is valid in the other and in `text`:
+
+    - `shape`: comments and literal contents blanked (`mask_comments_and_literals(acsl="mask")`) and every
+      `@` replaced by a space. For the structure of a clause: keywords, brackets, `;`.
+    - `visible`: the same with the literals as written (an `@` in a literal stays). For the text of a clause.
+
+    The kernel reads `@` as white space anywhere in an annotation, not only in the margin, so
+    `requires @ \\false;` is `requires \\false;`. Neither reading can be tokenized again: the `/*@` and `//@`
+    openers lose their `@` too. Never raises (`on_error="mask"`).
+    """
+    masked = mask_comments_and_literals(text, acsl="mask", on_error="mask")
+    visible = mask_comments_and_literals(text, acsl="mask", literals=False, on_error="mask")
+    if "@" not in masked:
+        return masked, visible
+    return masked.replace("@", " "), "".join(" " if m == "@" else c for c, m in zip(visible, masked, strict=True))
 
 
 def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path: str) -> list[str]:
@@ -454,20 +479,30 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                 f"{path}:{tok.line}: syntax hazard: control character {m_ctrl.group(0)!r} ({esc}) found in ACSL "
                 "annotation (likely caused by unescaped \\false, \\forall, \\at, or \\base_addr in a Python/shell string)"
             )
+        m_splice = _SPLICED_LINE_RE.search(tok.text)
+        if m_splice:
+            errors.append(
+                f"{path}:{tok.line + tok.text.count(chr(10), 0, m_splice.start())}: syntax hazard: a line of an ACSL "
+                "annotation ends with a backslash (the preprocessor joins the next line to it: after a `//@` "
+                "annotation the C code that follows becomes part of the comment, and in a `//` comment inside an "
+                "annotation the next clause does); remove the backslash"
+            )
         scrubbed = _scrub_acsl_literals(tok.text)
-        m = _UNSOUND_ACSL_RE.search(scrubbed)
+        # `@` is white space for the kernel: `logic @ int f(...)` is `logic int f(...)`.
+        flat = scrubbed.replace("@", " ")
+        m = _UNSOUND_ACSL_RE.search(flat)
         if m:
             errors.append(
                 f"{path}:{tok.line}: forbidden unsound ACSL construct '{m.group(1)}' introduced in annotation"
             )
-        m_logic = _LOGIC_C_INT_RE.search(scrubbed)
+        m_logic = _LOGIC_C_INT_RE.search(flat)
         if m_logic:
             errors.append(
                 f"{path}:{tok.line}: forbidden C integer type in ACSL logic signature '{m_logic.group(0)}' "
                 "(use unbounded 'integer' or 'real'; C integer types introduce wraparound into logic)"
             )
         else:
-            for m_decl in _LOGIC_DECL_RE.finditer(scrubbed):
+            for m_decl in _LOGIC_DECL_RE.finditer(flat):
                 for param in m_decl.group(1).split(","):
                     if "*" not in param and "[" not in param and _C_INT_PARAM_RE.match(param):
                         errors.append(
@@ -475,7 +510,7 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                             "(use unbounded 'integer' instead of C integer types)"
                         )
                         break
-        for m_inv in _INVARIANT_CLAUSE_RE.finditer(scrubbed):
+        for m_inv in _INVARIANT_CLAUSE_RE.finditer(flat):
             if m_inv.group(1) is None:
                 errors.append(
                     f"{path}:{tok.line}: forbidden statement-level 'invariant' in annotation "
@@ -492,9 +527,13 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
 
 
 def _scrub_acsl_literals(text: str) -> str:
-    """ACSL annotation text with string and character literals emptied and `//` comments removed."""
-    emptied = _LITERAL_IN_ACSL_RE.sub(lambda m: '""' if m.group(0).startswith('"') else "' '", text)
-    return _COMMENT_IN_ACSL_RE.sub("", emptied)
+    """
+    One ACSL annotation (with its `/*@ */` or `//@`) with the contents of its literals and what the kernel
+    reads as a comment inside it blanked, at the same length: `mask_comments_and_literals(acsl="mask")`.
+    Its `@` are kept, so the result is still one annotation for `iter_clauses`; a regex that must read
+    `@` as white space searches the result with `.replace("@", " ")`.
+    """
+    return mask_comments_and_literals(text, acsl="mask", on_error="mask")
 
 
 def _first_vacuous_clause(scrubbed: str) -> str | None:
@@ -515,7 +554,7 @@ def find_empty_named_behaviors(tokens: list[Token], path: str = "<input>") -> li
     for tok in tokens:
         if tok.kind not in ("acsl_block", "acsl_line"):
             continue
-        scrubbed = _scrub_acsl_literals(tok.text)
+        scrubbed = _scrub_acsl_literals(tok.text).replace("@", " ")
         for m in _EMPTY_BEHAVIOR_RE.finditer(scrubbed):
             errors.append(
                 f"{path}:{tok.line}: empty named behavior '{m.group(0).strip()}' is forbidden since Frama-C 34 "
@@ -2315,12 +2354,15 @@ def extract_frame_clauses(acsl_text: str) -> dict:
     """
     Parse the frame clauses of one ACSL contract text:
     `\\separated(...)` argument lists and function-level `assigns ... [\\from ...];` clauses
-    (`loop assigns` is not a function frame clause and is skipped). Purely syntactic.
+    (`loop assigns` is not a function frame clause and is skipped). Purely syntactic, on the text the
+    kernel reads (`_kernel_views`): a location or a `\\separated(...)` written in a comment or in a
+    literal is not one.
     """
     separated: list[list[str]] = []
-    for m in _SEPARATED_RE.finditer(acsl_text):
-        inner, _ = _paren_group_at(acsl_text, m.end() - 1)
-        separated.append(_split_top_level(inner, ","))
+    masked, visible = _kernel_views(acsl_text)
+    for m in _SEPARATED_RE.finditer(masked):
+        inner, _ = _paren_group_at(masked, m.end() - 1)
+        separated.append(_split_top_level(visible[m.end() : m.end() + len(inner)], ","))
     assigns: list[dict] = []
     for kind, _label, clause, _span in iter_clauses(acsl_text):
         if kind != "assigns":
@@ -2627,15 +2669,14 @@ _C_PARAM_KEYWORDS = frozenset(
 
 
 def _acsl_comment_body(text: str) -> str:
-    """The inside of an ACSL comment: no `/*@`, `*/`, `//@`, leading `@` margins or `//` comments."""
+    """
+    The inside of one ACSL comment as the kernel reads it (`_kernel_views`): no `/*@`, `*/` or `//@`, and
+    its comments and `@` blanked. Line ends are kept, so a line counted in the result is a line of `text`.
+    """
+    body = _kernel_views(text)[1]
     if text.startswith("/*@"):
-        text = text[3:]
-        if text.endswith("*/"):
-            text = text[:-2]
-    elif text.startswith("//@"):
-        text = text[3:]
-    text = _COMMENT_IN_ACSL_RE.sub(" ", text)
-    return re.sub(r"(^|\n)\s*@", r"\1 ", text)
+        return body[3:-2] if text.endswith("*/") else body[3:]
+    return body[3:] if text.startswith("//@") else body
 
 
 def _first_top_level_binder(text: str) -> int:
@@ -2669,8 +2710,14 @@ _CLAUSE_HEAD_RE = re.compile(
 
 
 def iter_clauses(annotation: str) -> Iterator[tuple[str, str, str, tuple[int, int]]]:
-    """Iterate parsed ACSL clauses (kind, label, predicate, span) across annotation text."""
-    masked = mask_comments_and_literals(annotation, acsl="mask", on_error="mask")
+    """
+    Iterate parsed ACSL clauses (kind, label, predicate, span) across annotation text.
+
+    The clauses are those the Frama-C kernel reads (`_kernel_views`): a `//` comment inside an annotation,
+    a `//@` nested in one (outside ghost code) and an `@` are white space in the label and the predicate, and
+    cannot start, end or extend a clause. `span` is an offset pair in `annotation`.
+    """
+    masked, visible = _kernel_views(annotation)
     i = 0
     n = len(annotation)
     while i < n:
@@ -2682,7 +2729,7 @@ def iter_clauses(annotation: str) -> Iterator[tuple[str, str, str, tuple[int, in
         if end >= n:
             i = m.end()
             continue
-        raw = re.sub(r"(^|\n)\s*@", r"\1 ", annotation[m.end() : end])
+        raw = visible[m.end() : end]
         labels: list[str] = []
         while (lab := _CLAUSE_LABEL_RE.match(raw)) is not None:
             labels.append(lab.group(1))
@@ -3047,7 +3094,7 @@ def contract_shape(contract_text: str, returns_void: bool = False) -> str:
                     found.add(m.group(0))
                     break
         roots = frozenset(found)
-    masked = mask_comments_and_literals(contract_text, acsl="mask", on_error="mask")
+    masked = _kernel_views(contract_text)[0]
     clauses = list(iter_clauses(contract_text))
     for kind, _label, predicate, span in clauses:
         if kind != "ensures" or not predicate or is_trivial_predicate(predicate):

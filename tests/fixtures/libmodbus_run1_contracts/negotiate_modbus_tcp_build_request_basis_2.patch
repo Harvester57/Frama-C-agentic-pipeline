@@ -1,0 +1,34 @@
+--- a/src/modbus-tcp.c
++++ b/src/modbus-tcp.c
+@@ -115,6 +115,31 @@
+ }
+ 
+ /* Builds a TCP request header */
++/*@ requires ctx_valid: \valid(ctx);
++  @ requires ctx_tcp_valid: \valid((modbus_tcp_t *)ctx->backend_data);
++  @ requires ctx_tcp_initialized:
++  @     \initialized(&((modbus_tcp_t *)ctx->backend_data)->t_id);
++  @ requires req_valid: \valid(req + (0 .. 11));
++  @ requires ctx_req_separated: \separated(ctx, req + (0 .. 11));
++  @ requires addr_nonneg: 0 <= addr;
++  @ requires nb_nonneg: 0 <= nb;
++  @ terminates \true;
++  @ exits \false;
++  @ assigns t_id_frame:
++  @     ((modbus_tcp_t *)ctx->backend_data)->t_id // , ctx_tcp->t_id ,
++  @     \from \nothing;
++  @ assigns *(req + 0) \from \nothing;
++  @ assigns *(req + 1) \from \nothing;
++  @ assigns *(req + 2) \from \nothing;
++  @ assigns *(req + 3) \from \nothing;
++  @ assigns *(req + 6) \from ctx;
++  @ assigns *(req + 7) \from function;
++  @ assigns *(req + 8) \from addr;
++  @ assigns *(req + 9) \from addr;
++  @ assigns *(req + 10) \from nb;
++  @ assigns *(req + 11) \from nb;
++  @ ensures result_length: \result == _MODBUS_TCP_PRESET_REQ_LENGTH;
++  @*/
+ static int _modbus_tcp_build_request_basis(
+     modbus_t *ctx, int function, int addr, int nb, uint8_t *req)
+ {
