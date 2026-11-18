@@ -1,0 +1,93 @@
+{
+ "schema_version": 1,
+ "run_id": "run-1",
+ "repo": "libmodbus",
+ "target": "/target",
+ "source_ref": {
+  "vcs": "git",
+  "commit": "a9b025d12289855490b10d77461c99e001abfc0f",
+  "dirty": true
+ },
+ "profile": "standard",
+ "scope_paths": [],
+ "budget": null,
+ "execution_policy": "sandboxed-local-only",
+ "sandbox": {
+  "outer": "docker-hardened",
+  "inner": "rlimits"
+ },
+ "prior_runs": [],
+ "toolchain": {
+  "frama-c": "34.0~beta (Selenium)",
+  "alt-ergo": "2.4.3-free",
+  "z3": "Z3 version 4.13.3 - 64 bit",
+  "cvc5": "This is cvc5 version 1.1.2",
+  "clang": "Debian clang version 19.1.7 (3+b1)"
+ },
+ "run_dir_host": "/runs/libmodbus/run-1",
+ "run_status": "incomplete",
+ "incomplete_reason": "All 35 candidates verified; wp-sweep 43/43 proven with 0 regressions. 2 ledger units remain planned and 115 blocked (single-translation-unit ctx->backend vtable calls, contract-less send_msg/_modbus_receive_msg/check_confirmation/_modbus_rtu_ioctl_rts/crc16, lsl shift encoding, variadic ioctl/inet_pton unbounded assigns, per-agent WP wall budgets); 6 candidate, 5 deferred, 87 covered.",
+ "created_at": "2026-11-18T00:51:32.144193+00:00",
+ "updated_at": "2026-11-18T16:55:33.331664+00:00",
+ "resources": {
+  "cpus": 15,
+  "mem_mb": 17408,
+  "sources": {
+   "cpus": {
+    "machine": 32.0,
+    "affinity": 32.0,
+    "cgroup": 15.0,
+    "grant": 15.0,
+    "cap": 30.0
+   },
+   "mem_mb": {
+    "machine": 40107,
+    "cgroup": 17408,
+    "grant": 17408,
+    "cap": 36096
+   }
+  },
+  "binding": {
+   "cpus": "cgroup",
+   "mem_mb": "cgroup"
+  },
+  "reserve": {
+   "cpus": 0.0,
+   "mem_mb": 0
+  },
+  "warnings": [
+   "run dir /framac-run is on 9p (network or virtualized filesystem): slower I/O than a local disk"
+  ],
+  "pool": {
+   "cpus": 30,
+   "mem_mb": 36096,
+   "source": "host broker"
+  }
+ },
+ "build": {
+  "command": "find . -type f -not -path './.git/*' -exec grep -Il '' {} + | xargs -r sed -i 's/\\r$//' && ./autogen.sh && ./configure && make -j\"$(nproc)\"",
+  "workdir": ".",
+  "packages": [
+   "autoconf",
+   "automake",
+   "gcc",
+   "libtool",
+   "make",
+   "pkg-config"
+  ],
+  "env": {},
+  "test_command": "cd tests && ./unit-test-server & s=$!; sleep 1; (cd tests && ./unit-test-client); rc1=$?; kill $s; \\\ncd tests && ./unit-test-server & b=$!; sleep 1; (cd tests && ./proxy-test-server) & p=$!; sleep 1; \\\n(cd tests && ./proxy-test-client); rc2=$?; kill $p $b; exit $((rc1|rc2))",
+  "install_command": null,
+  "snapshot_extra": [],
+  "origin": "user",
+  "updated_at": "2026-11-18T00:55:08.429964+00:00"
+ },
+ "codeql": {
+  "enabled": true,
+  "open_source": true,
+  "declared_by": "user",
+  "updated_at": "2026-11-18T00:51:53.402393+00:00"
+ },
+ "snapshot_manifest": "state/snapshot-manifest.json",
+ "snapshot_digest": "df1f9d3d6209947905450bc3a54ed5cf857fb8cd1bafba25946505135ba0d825"
+}

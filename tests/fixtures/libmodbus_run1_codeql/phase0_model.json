@@ -1,0 +1,6234 @@
+{
+ "schema_version": 2,
+ "generated_at": "2026-11-18T01:41:04.170584+00:00",
+ "status": "ok",
+ "capture": "workspace/reports/build_capture.json",
+ "warnings": [],
+ "tree": "/framac-scratch/tree",
+ "snapshot": {
+  "root": "/framac-run/workspace/snapshot/root",
+  "digest": "1d2c26e42a39717b127d49deb087bd12d8e4b7f428f6e122b4b9f689d1797ef8"
+ },
+ "capture_generated_at": "2026-11-18T01:40:13.439322+00:00",
+ "dump_module": {
+  "status": "ok"
+ },
+ "alias": {
+  "enabled": false
+ },
+ "units": {
+  "src/.libs/libmodbus.so.5.1.0": {
+   "kind": "shared_lib",
+   "test": false,
+   "files": [
+    "src/modbus-data.c",
+    "src/modbus-rtu.c",
+    "src/modbus-tcp.c",
+    "src/modbus.c"
+   ],
+   "links": [],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "src",
+    "-I",
+    ".",
+    "-I",
+    "tests",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-DPIC"
+   ],
+   "entry_points": [
+    "src/modbus-data.c#modbus_get_byte_from_bits",
+    "src/modbus-data.c#modbus_get_float",
+    "src/modbus-data.c#modbus_get_float_abcd",
+    "src/modbus-data.c#modbus_get_float_badc",
+    "src/modbus-data.c#modbus_get_float_cdab",
+    "src/modbus-data.c#modbus_get_float_dcba",
+    "src/modbus-data.c#modbus_set_bits_from_byte",
+    "src/modbus-data.c#modbus_set_bits_from_bytes",
+    "src/modbus-data.c#modbus_set_float",
+    "src/modbus-data.c#modbus_set_float_abcd",
+    "src/modbus-data.c#modbus_set_float_badc",
+    "src/modbus-data.c#modbus_set_float_cdab",
+    "src/modbus-data.c#modbus_set_float_dcba",
+    "src/modbus-rtu.c#modbus_new_rtu",
+    "src/modbus-rtu.c#modbus_rtu_get_rts",
+    "src/modbus-rtu.c#modbus_rtu_get_rts_delay",
+    "src/modbus-rtu.c#modbus_rtu_get_serial_mode",
+    "src/modbus-rtu.c#modbus_rtu_set_custom_rts",
+    "src/modbus-rtu.c#modbus_rtu_set_rts",
+    "src/modbus-rtu.c#modbus_rtu_set_rts_delay",
+    "src/modbus-rtu.c#modbus_rtu_set_serial_mode",
+    "src/modbus-tcp.c#modbus_new_tcp",
+    "src/modbus-tcp.c#modbus_new_tcp_pi",
+    "src/modbus-tcp.c#modbus_tcp_accept",
+    "src/modbus-tcp.c#modbus_tcp_listen",
+    "src/modbus-tcp.c#modbus_tcp_pi_accept",
+    "src/modbus-tcp.c#modbus_tcp_pi_listen",
+    "src/modbus.c#_error_print",
+    "src/modbus.c#_modbus_init_common",
+    "src/modbus.c#_modbus_receive_msg",
+    "src/modbus.c#modbus_close",
+    "src/modbus.c#modbus_connect",
+    "src/modbus.c#modbus_disable_quirks",
+    "src/modbus.c#modbus_enable_quirks",
+    "src/modbus.c#modbus_flush",
+    "src/modbus.c#modbus_free",
+    "src/modbus.c#modbus_get_byte_timeout",
+    "src/modbus.c#modbus_get_header_length",
+    "src/modbus.c#modbus_get_indication_timeout",
+    "src/modbus.c#modbus_get_response_timeout",
+    "src/modbus.c#modbus_get_slave",
+    "src/modbus.c#modbus_get_socket",
+    "src/modbus.c#modbus_mapping_free",
+    "src/modbus.c#modbus_mapping_new",
+    "src/modbus.c#modbus_mapping_new_start_address",
+    "src/modbus.c#modbus_mask_write_register",
+    "src/modbus.c#modbus_proxy",
+    "src/modbus.c#modbus_read_bits",
+    "src/modbus.c#modbus_read_input_bits",
+    "src/modbus.c#modbus_read_input_registers",
+    "src/modbus.c#modbus_read_registers",
+    "src/modbus.c#modbus_receive",
+    "src/modbus.c#modbus_receive_confirmation",
+    "src/modbus.c#modbus_reply",
+    "src/modbus.c#modbus_reply_exception",
+    "src/modbus.c#modbus_report_slave_id",
+    "src/modbus.c#modbus_send_raw_request",
+    "src/modbus.c#modbus_send_raw_request_tid",
+    "src/modbus.c#modbus_set_byte_timeout",
+    "src/modbus.c#modbus_set_debug",
+    "src/modbus.c#modbus_set_error_recovery",
+    "src/modbus.c#modbus_set_indication_timeout",
+    "src/modbus.c#modbus_set_response_timeout",
+    "src/modbus.c#modbus_set_slave",
+    "src/modbus.c#modbus_set_socket",
+    "src/modbus.c#modbus_strerror",
+    "src/modbus.c#modbus_write_and_read_registers",
+    "src/modbus.c#modbus_write_bit",
+    "src/modbus.c#modbus_write_bits",
+    "src/modbus.c#modbus_write_register",
+    "src/modbus.c#modbus_write_registers"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "ok",
+    "job": "82dd662425c9de49",
+    "seconds": 2.77
+   },
+   "concurrent": false,
+   "header_api": [],
+   "trust": {
+    "threat_model": "ok",
+    "functions": 120,
+    "untrusted": 120,
+    "boundary": 71,
+    "api": 71
+   }
+  },
+  "tests/.libs/bandwidth-client": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/bandwidth-client.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/bandwidth-client.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/bandwidth-server-many-up": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/bandwidth-server-many-up.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/bandwidth-server-many-up.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/bandwidth-server-one": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/bandwidth-server-one.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/bandwidth-server-one.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/proxy-test-client": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/proxy-test-client.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/proxy-test-client.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/proxy-test-server": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/proxy-test-server.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/proxy-test-server.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/random-test-client": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/random-test-client.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/random-test-client.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/random-test-server": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/random-test-server.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/random-test-server.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/unit-test-client": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/unit-test-client.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/unit-test-client.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/unit-test-server": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/unit-test-server.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/unit-test-server.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  },
+  "tests/.libs/version": {
+   "kind": "executable",
+   "test": true,
+   "files": [
+    "tests/version.c"
+   ],
+   "links": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "cppflags": [
+    "-DHAVE_CONFIG_H",
+    "-I",
+    "tests",
+    "-I",
+    ".",
+    "-include",
+    "config.h",
+    "-DSYSCONFDIR=\"/usr/local/etc\"",
+    "-DLIBEXECDIR=\"/usr/local/libexec\"",
+    "-I",
+    "src"
+   ],
+   "entry_points": [
+    "tests/version.c#main"
+   ],
+   "embedded_api": [],
+   "parse": {
+    "status": "skipped_test"
+   },
+   "concurrent": false,
+   "trust": {
+    "threat_model": "ok",
+    "functions": 0,
+    "untrusted": 0,
+    "boundary": 0,
+    "api": 0
+   }
+  }
+ },
+ "functions": {
+  "src/modbus-data.c#modbus_get_byte_from_bits": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_get_byte_from_bits",
+   "line": 61,
+   "end_line": 76,
+   "lines": 16,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "unsigned char(unsigned char *,int,unsigned int)",
+   "loops": 1,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_byte_from_bits"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_get_float": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_get_float",
+   "line": 164,
+   "end_line": 167,
+   "lines": 4,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "float(unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_float"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_get_float_abcd": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_get_float_abcd",
+   "line": 79,
+   "end_line": 101,
+   "lines": 23,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "float(unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_float_abcd"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_get_float_badc": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_get_float_badc",
+   "line": 124,
+   "end_line": 141,
+   "lines": 18,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "float(unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_float_badc"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_get_float_cdab": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_get_float_cdab",
+   "line": 144,
+   "end_line": 161,
+   "lines": 18,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "float(unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_float_cdab"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_get_float_dcba": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_get_float_dcba",
+   "line": 104,
+   "end_line": 121,
+   "lines": 18,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "float(unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_float_dcba"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_bits_from_byte": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_set_bits_from_byte",
+   "line": 32,
+   "end_line": 39,
+   "lines": 8,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(unsigned char *,int,unsigned char)",
+   "loops": 1,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_bits_from_byte"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_bits_from_bytes": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_set_bits_from_bytes",
+   "line": 43,
+   "end_line": 57,
+   "lines": 15,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(unsigned char *,int,unsigned int,unsigned char *)",
+   "loops": 1,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_bits_from_bytes"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_float": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_set_float",
+   "line": 242,
+   "end_line": 245,
+   "lines": 4,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(float,unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_float"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_float_abcd": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_set_float_abcd",
+   "line": 170,
+   "end_line": 188,
+   "lines": 19,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(float,unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_float_abcd"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_float_badc": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_set_float_badc",
+   "line": 208,
+   "end_line": 222,
+   "lines": 15,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(float,unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_float_badc"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_float_cdab": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_set_float_cdab",
+   "line": 225,
+   "end_line": 239,
+   "lines": 15,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(float,unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_float_cdab"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-data.c#modbus_set_float_dcba": {
+   "file": "src/modbus-data.c",
+   "name": "modbus_set_float_dcba",
+   "line": 191,
+   "end_line": 205,
+   "lines": 15,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(float,unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_float_dcba"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_build_request_basis": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_build_request_basis",
+   "line": 94,
+   "end_line": 106,
+   "lines": 13,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,int,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_build_request_basis"
+   },
+   "external_calls": [
+    "__FC_assert"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_build_response_basis": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_build_response_basis",
+   "line": 109,
+   "end_line": 117,
+   "lines": 9,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _sft *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_build_response_basis"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_proxy (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_check_integrity": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_check_integrity",
+   "line": 377,
+   "end_line": 412,
+   "lines": 36,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 7,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_check_integrity"
+   },
+   "external_calls": [
+    "fprintf",
+    "printf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_close": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_close",
+   "line": 1164,
+   "end_line": 1206,
+   "lines": 43,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_close"
+   },
+   "external_calls": [
+    "__va_ioctl_ptr",
+    "close",
+    "fprintf",
+    "strerror"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_connect": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_connect",
+   "line": 650,
+   "end_line": 934,
+   "lines": 285,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 16,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_connect"
+   },
+   "external_calls": [
+    "__va_ioctl_ptr",
+    "__va_open_void",
+    "close",
+    "fprintf",
+    "memset",
+    "printf",
+    "strerror"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_flush": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_flush",
+   "line": 1208,
+   "end_line": 1217,
+   "lines": 10,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_flush"
+   },
+   "external_calls": [
+    "tcflush"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_free": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_free",
+   "line": 1262,
+   "end_line": 1270,
+   "lines": 9,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_free"
+   },
+   "external_calls": [
+    "free"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_get_response_tid": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_get_response_tid",
+   "line": 135,
+   "end_line": 139,
+   "lines": 5,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_get_response_tid"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_proxy (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_ioctl_rts": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_ioctl_rts",
+   "line": 242,
+   "end_line": 263,
+   "lines": 22,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 6,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_ioctl_rts"
+   },
+   "external_calls": [
+    "__va_ioctl_ptr",
+    "fprintf",
+    "strerror"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_is_connected": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_is_connected",
+   "line": 938,
+   "end_line": 948,
+   "lines": 11,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "unsigned int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_is_connected"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_pre_check_confirmation": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_pre_check_confirmation",
+   "line": 353,
+   "end_line": 372,
+   "lines": 20,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_pre_check_confirmation"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_receive": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_receive",
+   "line": 319,
+   "end_line": 340,
+   "lines": 22,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_receive"
+   },
+   "external_calls": [
+    "printf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_recv": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_recv",
+   "line": 342,
+   "end_line": 349,
+   "lines": 8,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct _modbus *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_recv"
+   },
+   "external_calls": [
+    "read"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "threat-model input source (reader)",
+     "calls read"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_select": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_select",
+   "line": 1220,
+   "end_line": 1260,
+   "lines": 41,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,struct __fc_fd_set *,struct timeval *,int)",
+   "loops": 1,
+   "cyclomatic": 7,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_select"
+   },
+   "external_calls": [
+    "FD_SET",
+    "FD_ZERO",
+    "fprintf",
+    "select"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_send": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_send",
+   "line": 266,
+   "end_line": 317,
+   "lines": 52,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct _modbus *,unsigned char *,int)",
+   "loops": 1,
+   "cyclomatic": 6,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_send"
+   },
+   "external_calls": [
+    "fprintf",
+    "usleep",
+    "write"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_rtu_send_msg_pre": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_rtu_send_msg_pre",
+   "line": 141,
+   "end_line": 151,
+   "lines": 11,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_rtu_send_msg_pre"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#_modbus_set_slave": {
+   "file": "src/modbus-rtu.c",
+   "name": "_modbus_set_slave",
+   "line": 78,
+   "end_line": 91,
+   "lines": 14,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_set_slave"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_proxy (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#crc16": {
+   "file": "src/modbus-rtu.c",
+   "name": "crc16",
+   "line": 119,
+   "end_line": 133,
+   "lines": 15,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "unsigned short(unsigned char *,unsigned short)",
+   "loops": 1,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "crc16"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_new_rtu": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_new_rtu",
+   "line": 1299,
+   "end_line": 1399,
+   "lines": 101,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "struct _modbus *(char *,int,char,int,int)",
+   "loops": 0,
+   "cyclomatic": 15,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_new_rtu"
+   },
+   "external_calls": [
+    "fprintf",
+    "malloc",
+    "strcpy",
+    "strlen"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_rtu_get_rts": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_rtu_get_rts",
+   "line": 1028,
+   "end_line": 1050,
+   "lines": 23,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_rtu_get_rts"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_rtu_get_rts_delay": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_rtu_get_rts_delay",
+   "line": 1113,
+   "end_line": 1136,
+   "lines": 24,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_rtu_get_rts_delay"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_rtu_get_serial_mode": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_rtu_get_serial_mode",
+   "line": 1004,
+   "end_line": 1026,
+   "lines": 23,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_rtu_get_serial_mode"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_rtu_set_custom_rts": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_rtu_set_custom_rts",
+   "line": 1088,
+   "end_line": 1111,
+   "lines": 24,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,void (*)(struct _modbus *ctx, int on))",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_rtu_set_custom_rts"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_rtu_set_rts": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_rtu_set_rts",
+   "line": 1052,
+   "end_line": 1086,
+   "lines": 35,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 6,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_rtu_set_rts"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_rtu_set_rts_delay": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_rtu_set_rts_delay",
+   "line": 1138,
+   "end_line": 1162,
+   "lines": 25,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_rtu_set_rts_delay"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-rtu.c#modbus_rtu_set_serial_mode": {
+   "file": "src/modbus-rtu.c",
+   "name": "modbus_rtu_set_serial_mode",
+   "line": 950,
+   "end_line": 1002,
+   "lines": 53,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 10,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_rtu_set_serial_mode"
+   },
+   "external_calls": [
+    "__va_ioctl_ptr"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_connect": {
+   "file": "src/modbus-tcp.c",
+   "name": "_connect",
+   "line": 284,
+   "end_line": 335,
+   "lines": 52,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(int,struct sockaddr *,unsigned int,struct timeval *)",
+   "loops": 0,
+   "cyclomatic": 8,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_connect"
+   },
+   "external_calls": [
+    "FD_SET",
+    "FD_ZERO",
+    "connect",
+    "getsockopt",
+    "select"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_set_slave": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_set_slave",
+   "line": 87,
+   "end_line": 104,
+   "lines": 18,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 5,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_set_slave_0"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_proxy (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_build_request_basis": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_build_request_basis",
+   "line": 107,
+   "end_line": 135,
+   "lines": 29,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,int,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_build_request_basis"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_build_response_basis": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_build_response_basis",
+   "line": 138,
+   "end_line": 158,
+   "lines": 21,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _sft *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_build_response_basis"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_proxy (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_check_integrity": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_check_integrity",
+   "line": 195,
+   "end_line": 198,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_check_integrity"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_close": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_close",
+   "line": 524,
+   "end_line": 531,
+   "lines": 8,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_close"
+   },
+   "external_calls": [
+    "close",
+    "shutdown"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_connect": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_connect",
+   "line": 338,
+   "end_line": 413,
+   "lines": 76,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 10,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_connect"
+   },
+   "external_calls": [
+    "close",
+    "fprintf",
+    "htons",
+    "inet_pton",
+    "printf",
+    "socket"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_flush": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_flush",
+   "line": 533,
+   "end_line": 582,
+   "lines": 50,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 1,
+   "cyclomatic": 4,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_flush"
+   },
+   "external_calls": [
+    "recv"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "calls recv"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_free": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_free",
+   "line": 911,
+   "end_line": 917,
+   "lines": 7,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_free"
+   },
+   "external_calls": [
+    "free"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_get_response_tid": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_get_response_tid",
+   "line": 160,
+   "end_line": 163,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_get_response_tid"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_proxy (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_is_connected": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_is_connected",
+   "line": 518,
+   "end_line": 521,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "unsigned int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_is_connected"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_pi_connect": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_pi_connect",
+   "line": 416,
+   "end_line": 516,
+   "lines": 101,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 1,
+   "cyclomatic": 13,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_pi_connect"
+   },
+   "external_calls": [
+    "close",
+    "fprintf",
+    "freeaddrinfo",
+    "gai_strerror",
+    "getaddrinfo",
+    "memset",
+    "printf",
+    "socket"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_pi_free": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_pi_free",
+   "line": 919,
+   "end_line": 929,
+   "lines": 11,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_pi_free"
+   },
+   "external_calls": [
+    "free"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_pre_check_confirmation": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_pre_check_confirmation",
+   "line": 200,
+   "end_line": 229,
+   "lines": 30,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 6,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_pre_check_confirmation"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_receive": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_receive",
+   "line": 185,
+   "end_line": 188,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_receive"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_recv": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_recv",
+   "line": 190,
+   "end_line": 193,
+   "lines": 4,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct _modbus *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_recv"
+   },
+   "external_calls": [
+    "recv"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "threat-model input source (reader)",
+     "calls recv"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_select": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_select",
+   "line": 883,
+   "end_line": 909,
+   "lines": 27,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,struct __fc_fd_set *,struct timeval *,int)",
+   "loops": 1,
+   "cyclomatic": 7,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_select"
+   },
+   "external_calls": [
+    "FD_SET",
+    "FD_ZERO",
+    "fprintf",
+    "select"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_send": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_send",
+   "line": 176,
+   "end_line": 183,
+   "lines": 8,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "long(struct _modbus *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_send"
+   },
+   "external_calls": [
+    "send"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_send_msg_pre": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_send_msg_pre",
+   "line": 165,
+   "end_line": 174,
+   "lines": 10,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": true,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_send_msg_pre"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#_modbus_tcp_set_ipv4_options": {
+   "file": "src/modbus-tcp.c",
+   "name": "_modbus_tcp_set_ipv4_options",
+   "line": 231,
+   "end_line": 282,
+   "lines": 52,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(int)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_tcp_set_ipv4_options"
+   },
+   "external_calls": [
+    "setsockopt"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#modbus_new_tcp": {
+   "file": "src/modbus-tcp.c",
+   "name": "modbus_new_tcp",
+   "line": 980,
+   "end_line": 1045,
+   "lines": 66,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "struct _modbus *(char *,int)",
+   "loops": 0,
+   "cyclomatic": 6,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_new_tcp"
+   },
+   "external_calls": [
+    "fprintf",
+    "malloc",
+    "strlcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#modbus_new_tcp_pi": {
+   "file": "src/modbus-tcp.c",
+   "name": "modbus_new_tcp_pi",
+   "line": 1047,
+   "end_line": 1102,
+   "lines": 56,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "struct _modbus *(char *,char *)",
+   "loops": 0,
+   "cyclomatic": 8,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_new_tcp_pi"
+   },
+   "external_calls": [
+    "malloc",
+    "strdup"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#modbus_tcp_accept": {
+   "file": "src/modbus-tcp.c",
+   "name": "modbus_tcp_accept",
+   "line": 786,
+   "end_line": 832,
+   "lines": 47,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int *)",
+   "loops": 0,
+   "cyclomatic": 7,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_tcp_accept"
+   },
+   "external_calls": [
+    "accept4",
+    "close",
+    "fprintf",
+    "inet_ntop",
+    "printf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#modbus_tcp_listen": {
+   "file": "src/modbus-tcp.c",
+   "name": "modbus_tcp_listen",
+   "line": 585,
+   "end_line": 658,
+   "lines": 74,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 9,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_tcp_listen"
+   },
+   "external_calls": [
+    "bind",
+    "close",
+    "fprintf",
+    "htonl",
+    "htons",
+    "inet_pton",
+    "listen",
+    "memset",
+    "setsockopt",
+    "socket"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#modbus_tcp_pi_accept": {
+   "file": "src/modbus-tcp.c",
+   "name": "modbus_tcp_pi_accept",
+   "line": 834,
+   "end_line": 880,
+   "lines": 47,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int *)",
+   "loops": 0,
+   "cyclomatic": 7,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_tcp_pi_accept"
+   },
+   "external_calls": [
+    "accept4",
+    "close",
+    "fprintf",
+    "inet_ntop",
+    "printf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus-tcp.c#modbus_tcp_pi_listen": {
+   "file": "src/modbus-tcp.c",
+   "name": "modbus_tcp_pi_listen",
+   "line": 660,
+   "end_line": 784,
+   "lines": 125,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 1,
+   "cyclomatic": 17,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_tcp_pi_listen"
+   },
+   "external_calls": [
+    "bind",
+    "close",
+    "fprintf",
+    "freeaddrinfo",
+    "gai_strerror",
+    "getaddrinfo",
+    "listen",
+    "memset",
+    "perror",
+    "setsockopt",
+    "socket"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#_error_print": {
+   "file": "src/modbus.c",
+   "name": "_error_print",
+   "line": 86,
+   "end_line": 96,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *,char *)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_error_print"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#_modbus_init_common": {
+   "file": "src/modbus.c",
+   "name": "_modbus_init_common",
+   "line": 1979,
+   "end_line": 1997,
+   "lines": 19,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_init_common"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#_modbus_receive_msg": {
+   "file": "src/modbus.c",
+   "name": "_modbus_receive_msg",
+   "line": 365,
+   "end_line": 547,
+   "lines": 183,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,enum __anonenum_msg_type_t_5)",
+   "loops": 2,
+   "cyclomatic": 33,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_modbus_receive_msg"
+   },
+   "external_calls": [
+    "FD_SET",
+    "FD_ZERO",
+    "fprintf",
+    "printf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (reader)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model reader"
+    ]
+   }
+  },
+  "src/modbus.c#_sleep_response_timeout": {
+   "file": "src/modbus.c",
+   "name": "_sleep_response_timeout",
+   "line": 98,
+   "end_line": 113,
+   "lines": 16,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 1,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "_sleep_response_timeout"
+   },
+   "external_calls": [
+    "nanosleep"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#check_confirmation": {
+   "file": "src/modbus.c",
+   "name": "check_confirmation",
+   "line": 578,
+   "end_line": 735,
+   "lines": 158,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 33,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "check_confirmation"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#compute_data_length_after_meta": {
+   "file": "src/modbus.c",
+   "name": "compute_data_length_after_meta",
+   "line": 320,
+   "end_line": 351,
+   "lines": 32,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,enum __anonenum_msg_type_t_5)",
+   "loops": 0,
+   "cyclomatic": 7,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "compute_data_length_after_meta"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#compute_meta_length_after_function": {
+   "file": "src/modbus.c",
+   "name": "compute_meta_length_after_function",
+   "line": 280,
+   "end_line": 316,
+   "lines": 37,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "unsigned char(int,enum __anonenum_msg_type_t_5)",
+   "loops": 0,
+   "cyclomatic": 9,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "compute_meta_length_after_function"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#compute_response_length_from_request": {
+   "file": "src/modbus.c",
+   "name": "compute_response_length_from_request",
+   "line": 133,
+   "end_line": 166,
+   "lines": 34,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "unsigned int(struct _modbus *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 7,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "compute_response_length_from_request"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_mask_write_register (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_close": {
+   "file": "src/modbus.c",
+   "name": "modbus_close",
+   "line": 2176,
+   "end_line": 2182,
+   "lines": 7,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_close"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_connect": {
+   "file": "src/modbus.c",
+   "name": "modbus_connect",
+   "line": 2166,
+   "end_line": 2174,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_connect"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_disable_quirks": {
+   "file": "src/modbus.c",
+   "name": "modbus_disable_quirks",
+   "line": 2154,
+   "end_line": 2164,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_disable_quirks"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_enable_quirks": {
+   "file": "src/modbus.c",
+   "name": "modbus_enable_quirks",
+   "line": 2142,
+   "end_line": 2152,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_enable_quirks"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_flush": {
+   "file": "src/modbus.c",
+   "name": "modbus_flush",
+   "line": 115,
+   "end_line": 130,
+   "lines": 16,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_flush"
+   },
+   "external_calls": [
+    "printf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_free": {
+   "file": "src/modbus.c",
+   "name": "modbus_free",
+   "line": 2184,
+   "end_line": 2190,
+   "lines": 7,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_free"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_get_byte_timeout": {
+   "file": "src/modbus.c",
+   "name": "modbus_get_byte_timeout",
+   "line": 2080,
+   "end_line": 2090,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int *,unsigned int *)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_byte_timeout"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_get_header_length": {
+   "file": "src/modbus.c",
+   "name": "modbus_get_header_length",
+   "line": 2132,
+   "end_line": 2140,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_header_length"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_get_indication_timeout": {
+   "file": "src/modbus.c",
+   "name": "modbus_get_indication_timeout",
+   "line": 2107,
+   "end_line": 2117,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int *,unsigned int *)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_indication_timeout"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_get_response_timeout": {
+   "file": "src/modbus.c",
+   "name": "modbus_get_response_timeout",
+   "line": 2055,
+   "end_line": 2065,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int *,unsigned int *)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_response_timeout"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_get_slave": {
+   "file": "src/modbus.c",
+   "name": "modbus_get_slave",
+   "line": 2010,
+   "end_line": 2018,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_slave"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_get_socket": {
+   "file": "src/modbus.c",
+   "name": "modbus_get_socket",
+   "line": 2044,
+   "end_line": 2052,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_get_socket"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_mapping_free": {
+   "file": "src/modbus.c",
+   "name": "modbus_mapping_free",
+   "line": 2318,
+   "end_line": 2329,
+   "lines": 12,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "void(struct _modbus_mapping_t *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_mapping_free"
+   },
+   "external_calls": [
+    "free"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_mapping_new": {
+   "file": "src/modbus.c",
+   "name": "modbus_mapping_new",
+   "line": 2300,
+   "end_line": 2315,
+   "lines": 16,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "struct _modbus_mapping_t *(int,int,int,int)",
+   "loops": 0,
+   "cyclomatic": 5,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_mapping_new"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_mapping_new_start_address": {
+   "file": "src/modbus.c",
+   "name": "modbus_mapping_new_start_address",
+   "line": 2209,
+   "end_line": 2298,
+   "lines": 90,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "struct _modbus_mapping_t *(unsigned int,unsigned int,unsigned int,unsigned int,unsigned int,unsigned int,unsigned int,unsigned int)",
+   "loops": 0,
+   "cyclomatic": 14,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_mapping_new_start_address"
+   },
+   "external_calls": [
+    "free",
+    "malloc",
+    "memset"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_mask_write_register": {
+   "file": "src/modbus.c",
+   "name": "modbus_mask_write_register",
+   "line": 1810,
+   "end_line": 1851,
+   "lines": 42,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,unsigned short,unsigned short)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_mask_write_register"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_proxy": {
+   "file": "src/modbus.c",
+   "name": "modbus_proxy",
+   "line": 1303,
+   "end_line": 1445,
+   "lines": 143,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,struct _modbus *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 16,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_proxy"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_read_bits": {
+   "file": "src/modbus.c",
+   "name": "modbus_read_bits",
+   "line": 1492,
+   "end_line": 1518,
+   "lines": 27,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 7,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_read_bits"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_read_input_bits": {
+   "file": "src/modbus.c",
+   "name": "modbus_read_input_bits",
+   "line": 1521,
+   "end_line": 1547,
+   "lines": 27,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 7,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_read_input_bits"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_read_input_registers": {
+   "file": "src/modbus.c",
+   "name": "modbus_read_input_registers",
+   "line": 1621,
+   "end_line": 1644,
+   "lines": 24,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 6,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_read_input_registers"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_read_registers": {
+   "file": "src/modbus.c",
+   "name": "modbus_read_registers",
+   "line": 1596,
+   "end_line": 1618,
+   "lines": 23,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned short *)",
+   "loops": 0,
+   "cyclomatic": 6,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_read_registers"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_receive": {
+   "file": "src/modbus.c",
+   "name": "modbus_receive",
+   "line": 550,
+   "end_line": 558,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_receive"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (reader)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model reader"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_receive_confirmation": {
+   "file": "src/modbus.c",
+   "name": "modbus_receive_confirmation",
+   "line": 568,
+   "end_line": 576,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_receive_confirmation"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (reader)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_reply": {
+   "file": "src/modbus.c",
+   "name": "modbus_reply",
+   "line": 802,
+   "end_line": 1265,
+   "lines": 464,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,int,struct _modbus_mapping_t *)",
+   "loops": 4,
+   "cyclomatic": 82,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_reply"
+   },
+   "external_calls": [
+    "memcpy",
+    "strlen"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_reply_exception": {
+   "file": "src/modbus.c",
+   "name": "modbus_reply_exception",
+   "line": 1267,
+   "end_line": 1298,
+   "lines": 32,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,unsigned int)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_reply_exception"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_report_slave_id": {
+   "file": "src/modbus.c",
+   "name": "modbus_report_slave_id",
+   "line": 1936,
+   "end_line": 1977,
+   "lines": 42,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,unsigned char *)",
+   "loops": 1,
+   "cyclomatic": 9,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_report_slave_id"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_send_raw_request": {
+   "file": "src/modbus.c",
+   "name": "modbus_send_raw_request",
+   "line": 268,
+   "end_line": 271,
+   "lines": 4,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,int)",
+   "loops": 0,
+   "cyclomatic": 1,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_send_raw_request"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_send_raw_request_tid": {
+   "file": "src/modbus.c",
+   "name": "modbus_send_raw_request_tid",
+   "line": 230,
+   "end_line": 266,
+   "lines": 37,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,int,int)",
+   "loops": 0,
+   "cyclomatic": 6,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_send_raw_request_tid"
+   },
+   "external_calls": [
+    "memcpy"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "threat_model",
+    "sources": [
+     "threat_model",
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "threat-model input source (entry)",
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "threat-model input source"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_set_byte_timeout": {
+   "file": "src/modbus.c",
+   "name": "modbus_set_byte_timeout",
+   "line": 2092,
+   "end_line": 2103,
+   "lines": 12,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int,unsigned int)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_byte_timeout"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_set_debug": {
+   "file": "src/modbus.c",
+   "name": "modbus_set_debug",
+   "line": 2192,
+   "end_line": 2201,
+   "lines": 10,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_debug"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_set_error_recovery": {
+   "file": "src/modbus.c",
+   "name": "modbus_set_error_recovery",
+   "line": 2020,
+   "end_line": 2030,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,enum __anonenum_modbus_error_recovery_mode_2)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_error_recovery"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_set_indication_timeout": {
+   "file": "src/modbus.c",
+   "name": "modbus_set_indication_timeout",
+   "line": 2119,
+   "end_line": 2130,
+   "lines": 12,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int,unsigned int)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_indication_timeout"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_set_response_timeout": {
+   "file": "src/modbus.c",
+   "name": "modbus_set_response_timeout",
+   "line": 2067,
+   "end_line": 2077,
+   "lines": 11,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned int,unsigned int)",
+   "loops": 0,
+   "cyclomatic": 5,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_response_timeout"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_set_slave": {
+   "file": "src/modbus.c",
+   "name": "modbus_set_slave",
+   "line": 2000,
+   "end_line": 2008,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_slave"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "on the input path from src/modbus.c#modbus_proxy (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_set_socket": {
+   "file": "src/modbus.c",
+   "name": "modbus_set_socket",
+   "line": 2033,
+   "end_line": 2042,
+   "lines": 10,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_set_socket"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_strerror": {
+   "file": "src/modbus.c",
+   "name": "modbus_strerror",
+   "line": 48,
+   "end_line": 84,
+   "lines": 37,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "char *(int)",
+   "loops": 0,
+   "cyclomatic": 16,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_strerror"
+   },
+   "external_calls": [
+    "strerror"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "on the input path from src/modbus-rtu.c#_modbus_rtu_receive (calls _modbus_receive_msg (threat-model reader))"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_write_and_read_registers": {
+   "file": "src/modbus.c",
+   "name": "modbus_write_and_read_registers",
+   "line": 1855,
+   "end_line": 1932,
+   "lines": 78,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned short *,int,int,unsigned short *)",
+   "loops": 2,
+   "cyclomatic": 15,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_write_and_read_registers"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_write_bit": {
+   "file": "src/modbus.c",
+   "name": "modbus_write_bit",
+   "line": 1677,
+   "end_line": 1685,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_write_bit"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_write_bits": {
+   "file": "src/modbus.c",
+   "name": "modbus_write_bits",
+   "line": 1699,
+   "end_line": 1759,
+   "lines": 61,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned char *)",
+   "loops": 2,
+   "cyclomatic": 13,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_write_bits"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_write_register": {
+   "file": "src/modbus.c",
+   "name": "modbus_write_register",
+   "line": 1688,
+   "end_line": 1696,
+   "lines": 9,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,unsigned short)",
+   "loops": 0,
+   "cyclomatic": 2,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_write_register"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0"
+    ]
+   }
+  },
+  "src/modbus.c#modbus_write_registers": {
+   "file": "src/modbus.c",
+   "name": "modbus_write_registers",
+   "line": 1762,
+   "end_line": 1808,
+   "lines": 47,
+   "static": false,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned short *)",
+   "loops": 1,
+   "cyclomatic": 9,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "modbus_write_registers"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "default",
+    "sources": [
+     "default",
+     "call_graph"
+    ],
+    "boundary": true,
+    "reasons": [
+     "API of src/.libs/libmodbus.so.5.1.0",
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#read_io_status": {
+   "file": "src/modbus.c",
+   "name": "read_io_status",
+   "line": 1448,
+   "end_line": 1488,
+   "lines": 41,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,int,unsigned char *)",
+   "loops": 2,
+   "cyclomatic": 8,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "read_io_status"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#read_registers": {
+   "file": "src/modbus.c",
+   "name": "read_registers",
+   "line": 1550,
+   "end_line": 1592,
+   "lines": 43,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,int,unsigned short *)",
+   "loops": 1,
+   "cyclomatic": 7,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "read_registers"
+   },
+   "external_calls": [
+    "fprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#response_exception": {
+   "file": "src/modbus.c",
+   "name": "response_exception",
+   "line": 763,
+   "end_line": 794,
+   "lines": 32,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,struct _sft *,int,unsigned char *,unsigned int,char *,void **)",
+   "loops": 0,
+   "cyclomatic": 3,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "response_exception"
+   },
+   "external_calls": [
+    "vfprintf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_reply (threat-model input source)"
+    ]
+   }
+  },
+  "src/modbus.c#response_io_status": {
+   "file": "src/modbus.c",
+   "name": "response_io_status",
+   "line": 738,
+   "end_line": 760,
+   "lines": 23,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(unsigned char *,int,int,unsigned char *,int)",
+   "loops": 1,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "response_io_status"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "on the input path from src/modbus.c#modbus_reply (threat-model input source)"
+    ]
+   }
+  },
+  "src/modbus.c#send_msg": {
+   "file": "src/modbus.c",
+   "name": "send_msg",
+   "line": 169,
+   "end_line": 228,
+   "lines": 60,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,unsigned char *,int)",
+   "loops": 2,
+   "cyclomatic": 12,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "send_msg"
+   },
+   "external_calls": [
+    "printf"
+   ],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "calls _modbus_tcp_recv (threat-model reader)"
+    ]
+   }
+  },
+  "src/modbus.c#write_single": {
+   "file": "src/modbus.c",
+   "name": "write_single",
+   "line": 1648,
+   "end_line": 1674,
+   "lines": 27,
+   "static": true,
+   "inline": false,
+   "header": false,
+   "signature": "int(struct _modbus *,int,int,unsigned short)",
+   "loops": 0,
+   "cyclomatic": 4,
+   "address_taken": false,
+   "source": "frama-c-kernel",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "kernel_names": {
+    "src/.libs/libmodbus.so.5.1.0": "write_single"
+   },
+   "external_calls": [],
+   "trust": {
+    "value": "untrusted",
+    "source": "call_graph",
+    "sources": [
+     "call_graph"
+    ],
+    "boundary": false,
+    "reasons": [
+     "calls _modbus_receive_msg (threat-model reader)"
+    ]
+   }
+  }
+ },
+ "edges": [
+  {
+   "caller": "src/modbus-data.c#modbus_get_float",
+   "callee": "src/modbus-data.c#modbus_get_float_cdab",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-data.c#modbus_set_float",
+   "callee": "src/modbus-data.c#modbus_set_float_cdab",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#_modbus_rtu_check_integrity",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_flush",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#_modbus_rtu_check_integrity",
+   "callee": "src/modbus-rtu.c#crc16",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#_modbus_rtu_receive",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#_modbus_rtu_send",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_ioctl_rts",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#_modbus_rtu_send_msg_pre",
+   "callee": "src/modbus-rtu.c#crc16",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#modbus_new_rtu",
+   "callee": "src/modbus.c#_modbus_init_common",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#modbus_new_rtu",
+   "callee": "src/modbus.c#modbus_free",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-rtu.c#modbus_rtu_set_rts",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_ioctl_rts",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#_modbus_tcp_connect",
+   "callee": "src/modbus-tcp.c#_connect",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#_modbus_tcp_connect",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_set_ipv4_options",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#_modbus_tcp_pi_connect",
+   "callee": "src/modbus-tcp.c#_connect",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#_modbus_tcp_pi_connect",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_set_ipv4_options",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#_modbus_tcp_receive",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#modbus_new_tcp",
+   "callee": "src/modbus.c#_modbus_init_common",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#modbus_new_tcp",
+   "callee": "src/modbus.c#modbus_free",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#modbus_new_tcp_pi",
+   "callee": "src/modbus.c#_modbus_init_common",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus-tcp.c#modbus_new_tcp_pi",
+   "callee": "src/modbus.c#modbus_free",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_error_print",
+   "callee": "src/modbus.c#modbus_strerror",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_check_integrity",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_is_connected",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_select",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_check_integrity",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_is_connected",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_select",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus.c#_error_print",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus.c#_sleep_response_timeout",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus.c#compute_data_length_after_meta",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus.c#compute_meta_length_after_function",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus.c#modbus_close",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus.c#modbus_connect",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#_modbus_receive_msg",
+   "callee": "src/modbus.c#modbus_flush",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#check_confirmation",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_pre_check_confirmation",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#check_confirmation",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_pre_check_confirmation",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#check_confirmation",
+   "callee": "src/modbus.c#_error_print",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#check_confirmation",
+   "callee": "src/modbus.c#_sleep_response_timeout",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#check_confirmation",
+   "callee": "src/modbus.c#compute_response_length_from_request",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#check_confirmation",
+   "callee": "src/modbus.c#modbus_flush",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_close",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_close",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_close",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_free",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_close",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_close",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_close",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_free",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_close",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_pi_free",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_connect",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_connect",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_connect",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_flush",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_connect",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_connect",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_connect",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_flush",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_connect",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_pi_connect",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_flush",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_connect",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_flush",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_flush",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_flush",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_connect",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_flush",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_flush",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_flush",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_pi_connect",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_free",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_close",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_free",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_free",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_free",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_close",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_free",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_free",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_free",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_pi_free",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_mapping_new",
+   "callee": "src/modbus.c#modbus_mapping_new_start_address",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_mask_write_register",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_mask_write_register",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_mask_write_register",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_mask_write_register",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_mask_write_register",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_get_response_tid",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_pre_check_confirmation",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_get_response_tid",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_pre_check_confirmation",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus.c#modbus_reply_exception",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus.c#modbus_send_raw_request_tid",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus.c#modbus_set_slave",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_proxy",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_read_bits",
+   "callee": "src/modbus.c#read_io_status",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_read_input_bits",
+   "callee": "src/modbus.c#read_io_status",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_read_input_registers",
+   "callee": "src/modbus.c#read_registers",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_read_registers",
+   "callee": "src/modbus.c#read_registers",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_receive",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_receive",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_receive",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_receive",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_receive_confirmation",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus-data.c#modbus_set_bits_from_bytes",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_get_response_tid",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_get_response_tid",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus.c#compute_data_length_after_meta",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus.c#compute_meta_length_after_function",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus.c#compute_response_length_from_request",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus.c#response_exception",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus.c#response_io_status",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply_exception",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply_exception",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_get_response_tid",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply_exception",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply_exception",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_get_response_tid",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_reply_exception",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_report_slave_id",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_report_slave_id",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_report_slave_id",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_report_slave_id",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_report_slave_id",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_send_raw_request",
+   "callee": "src/modbus.c#modbus_send_raw_request_tid",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_send_raw_request_tid",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_send_raw_request_tid",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_send_raw_request_tid",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_set_slave",
+   "callee": "src/modbus-rtu.c#_modbus_set_slave",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_set_slave",
+   "callee": "src/modbus-tcp.c#_modbus_set_slave",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_and_read_registers",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_and_read_registers",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_and_read_registers",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_and_read_registers",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_and_read_registers",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_bit",
+   "callee": "src/modbus.c#write_single",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_bits",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_bits",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_bits",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_bits",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_bits",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_register",
+   "callee": "src/modbus.c#write_single",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_registers",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_registers",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_registers",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_registers",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#modbus_write_registers",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_io_status",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_io_status",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_io_status",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_io_status",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_io_status",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_registers",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_registers",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_registers",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_registers",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#read_registers",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#response_exception",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#response_exception",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_response_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#response_exception",
+   "callee": "src/modbus.c#_sleep_response_timeout",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#response_exception",
+   "callee": "src/modbus.c#modbus_flush",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_send_msg_pre",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_recv",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_send",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_send_msg_pre",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus.c#_error_print",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus.c#_sleep_response_timeout",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus.c#modbus_close",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus.c#modbus_connect",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#send_msg",
+   "callee": "src/modbus.c#modbus_flush",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#write_single",
+   "callee": "src/modbus-rtu.c#_modbus_rtu_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#write_single",
+   "callee": "src/modbus-tcp.c#_modbus_tcp_build_request_basis",
+   "kind": "indirect",
+   "sources": [
+    "type-match"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#write_single",
+   "callee": "src/modbus.c#_modbus_receive_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#write_single",
+   "callee": "src/modbus.c#check_confirmation",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  },
+  {
+   "caller": "src/modbus.c#write_single",
+   "callee": "src/modbus.c#send_msg",
+   "kind": "direct",
+   "sources": [
+    "frama-c-kernel"
+   ]
+  }
+ ],
+ "externals": [
+  "FD_SET",
+  "FD_ZERO",
+  "__FC_assert",
+  "__va_ioctl_ptr",
+  "__va_open_void",
+  "accept4",
+  "bind",
+  "close",
+  "connect",
+  "fprintf",
+  "free",
+  "freeaddrinfo",
+  "gai_strerror",
+  "getaddrinfo",
+  "getsockopt",
+  "htonl",
+  "htons",
+  "inet_ntop",
+  "inet_pton",
+  "listen",
+  "malloc",
+  "memcpy",
+  "memset",
+  "nanosleep",
+  "perror",
+  "printf",
+  "read",
+  "recv",
+  "select",
+  "send",
+  "setsockopt",
+  "shutdown",
+  "socket",
+  "strcpy",
+  "strdup",
+  "strerror",
+  "strlcpy",
+  "strlen",
+  "tcflush",
+  "usleep",
+  "vfprintf",
+  "write"
+ ],
+ "macro_aliases": {},
+ "entry_points": [
+  "src/modbus-data.c#modbus_get_byte_from_bits",
+  "src/modbus-data.c#modbus_get_float",
+  "src/modbus-data.c#modbus_get_float_abcd",
+  "src/modbus-data.c#modbus_get_float_badc",
+  "src/modbus-data.c#modbus_get_float_cdab",
+  "src/modbus-data.c#modbus_get_float_dcba",
+  "src/modbus-data.c#modbus_set_bits_from_byte",
+  "src/modbus-data.c#modbus_set_bits_from_bytes",
+  "src/modbus-data.c#modbus_set_float",
+  "src/modbus-data.c#modbus_set_float_abcd",
+  "src/modbus-data.c#modbus_set_float_badc",
+  "src/modbus-data.c#modbus_set_float_cdab",
+  "src/modbus-data.c#modbus_set_float_dcba",
+  "src/modbus-rtu.c#modbus_new_rtu",
+  "src/modbus-rtu.c#modbus_rtu_get_rts",
+  "src/modbus-rtu.c#modbus_rtu_get_rts_delay",
+  "src/modbus-rtu.c#modbus_rtu_get_serial_mode",
+  "src/modbus-rtu.c#modbus_rtu_set_custom_rts",
+  "src/modbus-rtu.c#modbus_rtu_set_rts",
+  "src/modbus-rtu.c#modbus_rtu_set_rts_delay",
+  "src/modbus-rtu.c#modbus_rtu_set_serial_mode",
+  "src/modbus-tcp.c#modbus_new_tcp",
+  "src/modbus-tcp.c#modbus_new_tcp_pi",
+  "src/modbus-tcp.c#modbus_tcp_accept",
+  "src/modbus-tcp.c#modbus_tcp_listen",
+  "src/modbus-tcp.c#modbus_tcp_pi_accept",
+  "src/modbus-tcp.c#modbus_tcp_pi_listen",
+  "src/modbus.c#_error_print",
+  "src/modbus.c#_modbus_init_common",
+  "src/modbus.c#_modbus_receive_msg",
+  "src/modbus.c#modbus_close",
+  "src/modbus.c#modbus_connect",
+  "src/modbus.c#modbus_disable_quirks",
+  "src/modbus.c#modbus_enable_quirks",
+  "src/modbus.c#modbus_flush",
+  "src/modbus.c#modbus_free",
+  "src/modbus.c#modbus_get_byte_timeout",
+  "src/modbus.c#modbus_get_header_length",
+  "src/modbus.c#modbus_get_indication_timeout",
+  "src/modbus.c#modbus_get_response_timeout",
+  "src/modbus.c#modbus_get_slave",
+  "src/modbus.c#modbus_get_socket",
+  "src/modbus.c#modbus_mapping_free",
+  "src/modbus.c#modbus_mapping_new",
+  "src/modbus.c#modbus_mapping_new_start_address",
+  "src/modbus.c#modbus_mask_write_register",
+  "src/modbus.c#modbus_proxy",
+  "src/modbus.c#modbus_read_bits",
+  "src/modbus.c#modbus_read_input_bits",
+  "src/modbus.c#modbus_read_input_registers",
+  "src/modbus.c#modbus_read_registers",
+  "src/modbus.c#modbus_receive",
+  "src/modbus.c#modbus_receive_confirmation",
+  "src/modbus.c#modbus_reply",
+  "src/modbus.c#modbus_reply_exception",
+  "src/modbus.c#modbus_report_slave_id",
+  "src/modbus.c#modbus_send_raw_request",
+  "src/modbus.c#modbus_send_raw_request_tid",
+  "src/modbus.c#modbus_set_byte_timeout",
+  "src/modbus.c#modbus_set_debug",
+  "src/modbus.c#modbus_set_error_recovery",
+  "src/modbus.c#modbus_set_indication_timeout",
+  "src/modbus.c#modbus_set_response_timeout",
+  "src/modbus.c#modbus_set_slave",
+  "src/modbus.c#modbus_set_socket",
+  "src/modbus.c#modbus_strerror",
+  "src/modbus.c#modbus_write_and_read_registers",
+  "src/modbus.c#modbus_write_bit",
+  "src/modbus.c#modbus_write_bits",
+  "src/modbus.c#modbus_write_register",
+  "src/modbus.c#modbus_write_registers"
+ ],
+ "entry_points_source": "build_capture",
+ "thread_entries": [],
+ "parse_jobs": [
+  {
+   "key": "82dd662425c9de49",
+   "units": [
+    "src/.libs/libmodbus.so.5.1.0"
+   ],
+   "sources": [
+    "src/modbus-data.c",
+    "src/modbus-rtu.c",
+    "src/modbus-tcp.c",
+    "src/modbus.c"
+   ],
+   "status": "ok",
+   "seconds": 2.77
+  }
+ ],
+ "seconds": 3.36,
+ "trust": {
+  "generated_at": "2026-11-18T01:41:07.595254+00:00",
+  "threat_model": {
+   "status": "ok",
+   "path": "/target/.security-reviews/20261118T003542Z-nogit/ThreatModel.md",
+   "sha256": "1441dd0590eb3e8a167064e0ee312f46c91ecb076d2f7d4e66f44fbcdb5aab9c",
+   "reason": null,
+   "errors": []
+  },
+  "codeql": {
+   "status": "off"
+  },
+  "input_readers": [
+   "__fc_syscall_read",
+   "__fc_syscall_recvfrom",
+   "fgetc",
+   "fgets",
+   "fread",
+   "fscanf",
+   "getc",
+   "getchar",
+   "getdelim",
+   "getenv",
+   "getline",
+   "pread",
+   "read",
+   "readv",
+   "recv",
+   "recvfrom",
+   "recvmsg",
+   "scanf",
+   "secure_getenv"
+  ],
+  "summary": {
+   "untrusted": 120,
+   "trusted": 0,
+   "boundary": 71,
+   "by_source": {
+    "untrusted:call_graph": 47,
+    "untrusted:default": 56,
+    "untrusted:threat_model": 17
+   },
+   "with_codeql": 0,
+   "overridden": 0
+  },
+  "warnings": []
+ }
+}

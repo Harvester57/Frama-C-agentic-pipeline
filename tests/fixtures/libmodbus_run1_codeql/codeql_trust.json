@@ -1,0 +1,278 @@
+{
+ "schema_version": 1,
+ "generated_at": "2026-11-18T01:22:43.524112+00:00",
+ "status": "ok",
+ "codeql_version": "2.27.3",
+ "recipe": {
+  "command": "find . -type f -not -path './.git/*' -exec grep -Il '' {} + | xargs -r sed -i 's/\\r$//' && ./autogen.sh && ./configure && make -j\"$(nproc)\"",
+  "workdir": "."
+ },
+ "facts": [
+  {
+   "function": "src/modbus-rtu.c#_modbus_rtu_recv",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "buffer read by read",
+    "file": "src/modbus-rtu.c",
+    "line": 347
+   }
+  },
+  {
+   "function": "src/modbus-rtu.c#modbus_new_rtu",
+   "kind": "parameter",
+   "parameter": "device",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-client.c",
+    "line": 60
+   }
+  },
+  {
+   "function": "src/modbus-rtu.c#modbus_new_rtu",
+   "kind": "parameter",
+   "parameter": "device",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-server.c",
+    "line": 35
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#_modbus_tcp_flush",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "buffer read by recv",
+    "file": "src/modbus-tcp.c",
+    "line": 544
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#_modbus_tcp_pi_connect",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "address returned by getaddrinfo",
+    "file": "src/modbus-tcp.c",
+    "line": 442
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#_modbus_tcp_recv",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "buffer read by recv",
+    "file": "src/modbus-tcp.c",
+    "line": 192
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#modbus_new_tcp",
+   "kind": "parameter",
+   "parameter": "ip",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/proxy-test-client.c",
+    "line": 38
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#modbus_new_tcp",
+   "kind": "parameter",
+   "parameter": "ip",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/proxy-test-server.c",
+    "line": 25
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#modbus_new_tcp",
+   "kind": "parameter",
+   "parameter": "ip",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-client.c",
+    "line": 60
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#modbus_new_tcp",
+   "kind": "parameter",
+   "parameter": "ip",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-server.c",
+    "line": 35
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#modbus_new_tcp_pi",
+   "kind": "parameter",
+   "parameter": "node",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-client.c",
+    "line": 60
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#modbus_new_tcp_pi",
+   "kind": "parameter",
+   "parameter": "node",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-server.c",
+    "line": 35
+   }
+  },
+  {
+   "function": "src/modbus-tcp.c#modbus_tcp_pi_listen",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "address returned by getaddrinfo",
+    "file": "src/modbus-tcp.c",
+    "line": 709
+   }
+  },
+  {
+   "function": "tests/bandwidth-client.c#main",
+   "kind": "parameter",
+   "parameter": "argv",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/bandwidth-client.c",
+    "line": 39
+   }
+  },
+  {
+   "function": "tests/bandwidth-client.c#main",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/bandwidth-client.c",
+    "line": 39
+   }
+  },
+  {
+   "function": "tests/bandwidth-server-one.c#main",
+   "kind": "parameter",
+   "parameter": "argv",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/bandwidth-server-one.c",
+    "line": 26
+   }
+  },
+  {
+   "function": "tests/bandwidth-server-one.c#main",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/bandwidth-server-one.c",
+    "line": 26
+   }
+  },
+  {
+   "function": "tests/proxy-test-client.c#main",
+   "kind": "parameter",
+   "parameter": "argv",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/proxy-test-client.c",
+    "line": 38
+   }
+  },
+  {
+   "function": "tests/proxy-test-client.c#main",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/proxy-test-client.c",
+    "line": 38
+   }
+  },
+  {
+   "function": "tests/proxy-test-server.c#main",
+   "kind": "parameter",
+   "parameter": "argv",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/proxy-test-server.c",
+    "line": 25
+   }
+  },
+  {
+   "function": "tests/proxy-test-server.c#main",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/proxy-test-server.c",
+    "line": 25
+   }
+  },
+  {
+   "function": "tests/unit-test-client.c#main",
+   "kind": "parameter",
+   "parameter": "argv",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-client.c",
+    "line": 60
+   }
+  },
+  {
+   "function": "tests/unit-test-client.c#main",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-client.c",
+    "line": 60
+   }
+  },
+  {
+   "function": "tests/unit-test-server.c#main",
+   "kind": "parameter",
+   "parameter": "argv",
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-server.c",
+    "line": 35
+   }
+  },
+  {
+   "function": "tests/unit-test-server.c#main",
+   "kind": "source_site",
+   "parameter": null,
+   "source": {
+    "type": "a command-line argument",
+    "file": "tests/unit-test-server.c",
+    "line": 35
+   }
+  }
+ ],
+ "warnings": [],
+ "database": {
+  "returncode": 0,
+  "timed_out": false,
+  "seconds": 11.62
+ },
+ "query": {
+  "path": "templates/codeql/trust/untrusted_functions.ql",
+  "sha256": "0164f9f27dfe822cc848dbace34c7a98fde598f299626d13cb129350e43ccea0",
+  "seconds": 48.71
+ },
+ "tree": "/framac-scratch/codeql/tree",
+ "rows": 26,
+ "rows_outside_target": 1,
+ "functions": 14,
+ "seconds": 61.87
+}
