@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -623,22 +623,158 @@ def _next_meaningful(tokens: list[Token], idx: int, include_acsl: bool = False) 
     return idx
 
 
-def _find_matching_delim(tokens: list[Token], open_idx: int, open_ch: str, close_ch: str) -> int:
-    """Find the token index of the matching closing delimiter starting at open_idx."""
+def _next_after_params(tokens: list[Token], idx: int) -> int:
+    """The next meaningful token after a parameter list; a conditional may stand between it and the body."""
+    idx = _next_meaningful(tokens, idx)
+    while idx < len(tokens) and tokens[idx].kind == "pp_directive":
+        idx = _next_meaningful(tokens, idx + 1)
+    return idx
+
+
+_COND_DIRECTIVE_RE = re.compile(r"#\s*(ifdef|ifndef|if|elif|else|endif)\b")
+_DIRECTIVE_NOISE_RE = re.compile(r"/\*.*?\*/|//[^\n]*|\\\r?\n", re.DOTALL)
+_DEFINED_OPERAND_RE = re.compile(r"\bdefined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|([A-Za-z_]\w*))")
+_SINGLE_OPERAND_RE = re.compile(r"[A-Za-z_]\w*|defined\([A-Za-z_]\w*\)")
+_DELIM_KIND = {"{": "{", "}": "{", "(": "(", ")": "("}
+
+
+@dataclass(slots=True)
+class _CondArm:
+    """One arm of a conditional: the delimiters it leaves unmatched, per kind, and whether it is the arm read."""
+
+    selected: bool
+    opens: dict[str, list[int]] = field(default_factory=lambda: {"{": [], "(": []})
+    closes: dict[str, list[int]] = field(default_factory=lambda: {"{": [], "(": []})
+
+    def close(self, kind: str, idx: int) -> None:
+        if self.opens[kind]:
+            self.opens[kind].pop()
+        else:
+            self.closes[kind].append(idx)
+
+
+@dataclass(slots=True, frozen=True)
+class _ConditionalDelims:
+    """
+    `ignored`: the delimiters of the arms not read. `close_alias`: a closing delimiter of the arm read, mapped to
+    the last one that plays the same part in another arm, so that a span ends after every arm.
+    """
+
+    ignored: frozenset[int] = frozenset()
+    close_alias: Mapping[int, int] = field(default_factory=dict)
+
+
+def _condition_of(word: str, directive: str) -> tuple[str, bool]:
+    """(canonical condition, whether the directive negates it): `#ifndef A` and `#if !defined(A)` name one condition."""
+    rest = _COND_DIRECTIVE_RE.sub("", _DIRECTIVE_NOISE_RE.sub(" ", directive), count=1).strip()
+    if word in ("ifdef", "ifndef"):
+        return f"defined({rest})", word == "ifndef"
+    text = re.sub(r"\s+", "", _DEFINED_OPERAND_RE.sub(lambda m: f"defined({m.group(1) or m.group(2)})", rest))
+    negated = False
+    while True:
+        text = _strip_outer_parens(text)
+        operand = _strip_outer_parens(text[1:])
+        if not text.startswith("!") or not (operand != text[1:] or _SINGLE_OPERAND_RE.fullmatch(operand)):
+            return text, negated
+        text, negated = operand, not negated
+
+
+def _conditional_delims(tokens: list[Token]) -> _ConditionalDelims:
+    """
+    Read one configuration of the file's conditionals, so that a block both arms open is counted once
+    (libmodbus: `#ifdef W` / `if (a) {` / `#else` / `if (b) {` / `#endif` / ... / `}`).
+
+    The first arm is read unless an earlier conditional settled its condition: the same condition is answered the
+    same way all through the file, and `#if 0` is false. Only what an arm not read leaves unmatched is ignored, so
+    the functions and blocks complete inside any arm stay visible, and balanced arms change nothing. A file this
+    reading leaves unbalanced, when plain counting balances it (conditions related in a way not seen here), is counted.
+    """
+    known: dict[str, bool] = {}
+    ignored: set[int] = set()
+    alias: dict[int, int] = {}
+    root = _CondArm(selected=True)
+    arm = root
+    frames: list[tuple[_CondArm, list[_CondArm]]] = []  # (the arm holding the conditional, its arms so far)
+    counts = {"{": 0, "(": 0}
+    plain_balanced = True
+
+    def read(word: str, directive: str, taken: bool) -> bool:
+        if taken:
+            return False
+        condition, negated = _condition_of(word, directive)
+        if condition.isdigit():
+            return (int(condition) != 0) != negated
+        return known.setdefault(condition, not negated) != negated
+
+    def end_conditional() -> _CondArm:
+        parent, arms = frames.pop()
+        chosen = next((a for a in arms if a.selected), None)
+        for other in arms:
+            if other.selected:
+                continue
+            for kind in ("{", "("):
+                ignored.update(other.opens[kind], other.closes[kind])
+                if chosen is not None:
+                    for own, theirs in zip(chosen.closes[kind], other.closes[kind], strict=False):
+                        alias[own] = max(alias.get(own, own), theirs)
+        if chosen is not None:
+            for kind in ("{", "("):
+                for idx in chosen.closes[kind]:
+                    parent.close(kind, idx)
+                parent.opens[kind].extend(chosen.opens[kind])
+        return parent
+
+    for idx, tok in enumerate(tokens):
+        if tok.kind == "pp_directive":
+            m = _COND_DIRECTIVE_RE.match(tok.text)
+            word = m.group(1) if m else ""
+            if word in ("if", "ifdef", "ifndef"):
+                parent = arm
+                arm = _CondArm(selected=read(word, tok.text, False))
+                frames.append((parent, [arm]))
+            elif word in ("elif", "else") and frames:
+                arms = frames[-1][1]
+                taken = any(a.selected for a in arms)
+                arm = _CondArm(selected=not taken if word == "else" else read(word, tok.text, taken))
+                arms.append(arm)
+            elif word == "endif" and frames:
+                arm = end_conditional()
+        elif tok.kind == "c_token" and tok.text in _DELIM_KIND:
+            kind = _DELIM_KIND[tok.text]
+            if tok.text == kind:
+                arm.opens[kind].append(idx)
+                counts[kind] += 1
+            else:
+                arm.close(kind, idx)
+                counts[kind] -= 1
+                plain_balanced = plain_balanced and counts[kind] >= 0
+    while frames:  # a fragment may end inside a conditional
+        arm = end_conditional()
+    balanced = not any(root.opens[k] or root.closes[k] for k in ("{", "("))
+    if not balanced and plain_balanced and not any(counts.values()):
+        return _ConditionalDelims()
+    return _ConditionalDelims(frozenset(ignored), alias)
+
+
+def _find_matching_delim(
+    tokens: list[Token], open_idx: int, open_ch: str, close_ch: str, delims: _ConditionalDelims | None = None
+) -> int:
+    """Find the token index of the matching closing delimiter starting at open_idx, reading one configuration."""
+    delims = _conditional_delims(tokens) if delims is None else delims
     depth = 0
     for idx in range(open_idx, len(tokens)):
         tok = tokens[idx]
-        if tok.kind == "c_token":
+        if tok.kind == "c_token" and (idx == open_idx or idx not in delims.ignored):
             if tok.text == open_ch:
                 depth += 1
             elif tok.text == close_ch:
                 depth -= 1
                 if depth == 0:
-                    return idx
+                    return delims.close_alias.get(idx, idx)
     return -1
 
 
-def _linkage_block_braces(tokens: list[Token]) -> frozenset[int]:
+def _linkage_block_braces(tokens: list[Token], delims: _ConditionalDelims | None = None) -> frozenset[int]:
     """
     Indices of the `{` and `}` of every `extern "C" { ... }` block.
 
@@ -646,6 +782,7 @@ def _linkage_block_braces(tokens: list[Token]) -> frozenset[int]:
     API in one under `#ifdef __cplusplus`, and counting it as nesting would hide every prototype
     and top-level ACSL declaration in the file.
     """
+    delims = _conditional_delims(tokens) if delims is None else delims
     skip: set[int] = set()
     for i, tok in enumerate(tokens):
         if tok.kind != "c_token" or tok.text != "{":
@@ -660,7 +797,7 @@ def _linkage_block_braces(tokens: list[Token]) -> frozenset[int]:
             j -= 1
         if j < 0 or tokens[j].kind != "c_token" or tokens[j].text != "extern":
             continue
-        close = _find_matching_delim(tokens, i, "{", "}")
+        close = _find_matching_delim(tokens, i, "{", "}", delims)
         skip.add(i)
         if close != -1:
             skip.add(close)
@@ -675,7 +812,8 @@ def locate_function_span(
     ACSL contract block) in a C source file (`is_header=False`) or header file (`is_header=True`).
     """
     tokens = tokenize_c_acsl(source, path=path)
-    linkage = _linkage_block_braces(tokens)
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     brace_depth = 0
     paren_depth = 0
     last_top_boundary_idx = -1  # index of last top-level ';', '}', or 'pp_directive'
@@ -724,13 +862,13 @@ def locate_function_span(
                     and tokens[open_paren_idx].kind == "c_token"
                     and tokens[open_paren_idx].text == "("
                 ):
-                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
+                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
                     if close_paren_idx != -1:
-                        after_paren_idx = _next_meaningful(tokens, close_paren_idx + 1)
+                        after_paren_idx = _next_after_params(tokens, close_paren_idx + 1)
                         if after_paren_idx < n and tokens[after_paren_idx].kind == "c_token":
                             next_tok = tokens[after_paren_idx]
                             if not is_header and next_tok.text == "{":
-                                close_brace_idx = _find_matching_delim(tokens, after_paren_idx, "{", "}")
+                                close_brace_idx = _find_matching_delim(tokens, after_paren_idx, "{", "}", delims)
                                 if close_brace_idx != -1:
                                     start_idx = _compute_span_start(tokens, last_top_boundary_idx, idx)
                                     start_tok = tokens[start_idx]
@@ -776,7 +914,8 @@ def function_declaration_spans(source: str, function_name: str, path: str = "<in
     declaration (Frama-C merges them), so every reader of a header function's contract uses this.
     """
     tokens = tokenize_c_acsl(source, path=path)
-    linkage = _linkage_block_braces(tokens)
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     out: list[DeclSpan] = []
     brace_depth = 0
     paren_depth = 0
@@ -806,13 +945,13 @@ def function_declaration_spans(source: str, function_name: str, path: str = "<in
             elif brace_depth == 0 and paren_depth == 0 and tok.text == function_name:
                 open_paren_idx = _next_meaningful(tokens, idx + 1)
                 if open_paren_idx < n and tokens[open_paren_idx].kind == "c_token" and tokens[open_paren_idx].text == "(":
-                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
-                    after_idx = _next_meaningful(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
+                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
+                    after_idx = _next_after_params(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
                     end_idx = -1
                     kind = ""
                     if after_idx < n and tokens[after_idx].kind == "c_token":
                         if tokens[after_idx].text == "{":
-                            end_idx = _find_matching_delim(tokens, after_idx, "{", "}")
+                            end_idx = _find_matching_delim(tokens, after_idx, "{", "}", delims)
                             kind = "definition"
                         elif tokens[after_idx].text == ";":
                             end_idx = after_idx
@@ -901,7 +1040,8 @@ def _compute_span_start(tokens: list[Token], last_top_boundary_idx: int, fn_name
 def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]:
     """Locate all function prototype spans in a header source file in source order."""
     tokens = tokenize_c_acsl(source, path=path)
-    linkage = _linkage_block_braces(tokens)
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     brace_depth = 0
     paren_depth = 0
     last_top_boundary_idx = -1
@@ -961,9 +1101,9 @@ def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]
                         and tokens[open_paren_idx].kind == "c_token"
                         and tokens[open_paren_idx].text == "("
                     ):
-                        close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
+                        close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
                         if close_paren_idx != -1:
-                            after_paren_idx = _next_meaningful(tokens, close_paren_idx + 1)
+                            after_paren_idx = _next_after_params(tokens, close_paren_idx + 1)
                             if (
                                 after_paren_idx < n
                                 and tokens[after_paren_idx].kind == "c_token"
@@ -997,7 +1137,8 @@ def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]
 def locate_all_definition_spans(source: str, path: str = "<input>") -> dict[str, Span]:
     """Spans of every function definition in `source`, in one pass; the first one when a name repeats."""
     tokens = tokenize_c_acsl(source, path=path)
-    linkage = _linkage_block_braces(tokens)
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     spans: dict[str, Span] = {}
     brace_depth = 0
     paren_depth = 0
@@ -1031,10 +1172,10 @@ def locate_all_definition_spans(source: str, path: str = "<input>") -> dict[str,
                     and tokens[open_paren_idx].kind == "c_token"
                     and tokens[open_paren_idx].text == "("
                 ):
-                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")")
-                    after_paren_idx = _next_meaningful(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
+                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
+                    after_paren_idx = _next_after_params(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
                     if after_paren_idx < n and tokens[after_paren_idx].text == "{":
-                        close_brace_idx = _find_matching_delim(tokens, after_paren_idx, "{", "}")
+                        close_brace_idx = _find_matching_delim(tokens, after_paren_idx, "{", "}", delims)
                         if close_brace_idx != -1:
                             start_tok = tokens[_compute_span_start(tokens, last_top_boundary_idx, idx)]
                             end_tok = tokens[close_brace_idx]
@@ -1059,9 +1200,10 @@ def locate_all_definition_spans(source: str, path: str = "<input>") -> dict[str,
 def _find_body_brace_offset(span_text: str, path: str = "<input>") -> int | None:
     """Return the byte offset of the function body's opening `{` inside `span_text`, or None."""
     tokens = tokenize_c_acsl(span_text, path=path)
+    ignored = _conditional_delims(tokens).ignored
     paren_depth = 0
-    for tok in tokens:
-        if tok.kind == "c_token":
+    for idx, tok in enumerate(tokens):
+        if tok.kind == "c_token" and idx not in ignored:
             if tok.text == "(":
                 paren_depth += 1
             elif tok.text == ")":
@@ -1690,7 +1832,8 @@ def extract_top_level_acsl_declarations(source: str, path: str = "<input>") -> l
     `axiomatic`, `inductive`, `ghost`) outside C `{ ... }` blocks in `source`.
     """
     tokens = tokenize_c_acsl(source, path=path)
-    linkage = _linkage_block_braces(tokens)
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     brace_depth = 0
     paren_depth = 0
     decls: list[dict] = []
@@ -1777,7 +1920,8 @@ def dedup_acsl_declarations(
     removed: list[str] = []
 
     tokens = tokenize_c_acsl(target_text, path=path)
-    linkage = _linkage_block_braces(tokens)
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     brace_depth = 0
     paren_depth = 0
     out_parts: list[str] = []
