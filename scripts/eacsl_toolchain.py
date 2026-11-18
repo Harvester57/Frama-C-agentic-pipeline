@@ -1566,6 +1566,25 @@ EACSL_LIBC_EFFECTS: dict[str, tuple[str, tuple[str, ...], str, str, str, str | N
     },
     "fgets": ("char *", ("char *", "int", "FILE *"), "stdio.h", "", "if (r) FC_INIT(a0, strlen(a0) + 1);", None),
     "fread": ("size_t", ("void *", "size_t", "size_t", "FILE *"), "stdio.h", "", "FC_INIT(a0, r * a1);", None),
+    # r is strlen(src): strlcpy writes min(r, size - 1) bytes and a NUL, nothing when size is 0.
+    "strlcpy": (
+        "size_t",
+        ("char *", "const char *", "size_t"),
+        "string.h",
+        "",
+        "if (a2) FC_INIT(a0, FC_MIN(r, a2 - 1) + 1);",
+        None,
+    ),
+    # strlcat writes after the old string (it only reads that one), and nothing when dst holds no
+    # NUL within size; then r is size + strlen(src), else old length + strlen(src).
+    "strlcat": (
+        "size_t",
+        ("char *", "const char *", "size_t"),
+        "string.h",
+        "size_t fc_d = a2 ? strnlen(a0, a2) : 0;",
+        "if (fc_d < a2) FC_INIT(a0 + fc_d, FC_MIN(r - fc_d, a2 - fc_d - 1) + 1);",
+        None,
+    ),
     # Blocks libc allocates through the runtime's malloc and fills itself.
     "strdup": ("char *", ("const char *",), "string.h", "", "if (r) FC_INIT(r, strlen(r) + 1);", None),
     "strndup": ("char *", ("const char *", "size_t"), "string.h", "", "if (r) FC_INIT(r, strlen(r) + 1);", None),
@@ -1592,6 +1611,12 @@ EACSL_LIBC_EFFECTS: dict[str, tuple[str, tuple[str, ...], str, str, str, str | N
     },
     **{name: ("struct tm *", ("const time_t *",), "time.h", "", "", "struct") for name in ("gmtime", "localtime")},
 }
+# Functions a supported libc may not declare (glibc has strlcpy/strlcat from 2.38 only; Debian
+# bookworm's 2.36 lacks them). The shim declares them itself, a compatible redeclaration where the
+# header has them, so an older libc does not fail the -Werror shim and drop every other effect.
+# Their `__real_` is weak: when libc lacks the symbol and the target's fallback is static (its calls
+# are then never wrapped), the unused wrapper must not fail the link on an undefined `__real_`.
+EACSL_SHIM_OWN_PROTOTYPES = frozenset({"strlcpy", "strlcat"})
 
 
 def find_eacsl_effect_calls(instrumented_source: str) -> list[str]:
@@ -1692,8 +1717,13 @@ def generate_errno_shim_source(names: Sequence[str], effects: Sequence[str] = ()
         else:
             lines.append("return r;")
         body = "".join(f"    {line}\n" for line in lines)
+        own = name in EACSL_SHIM_OWN_PROTOTYPES
+        proto = f"{ret} {name}({', '.join(params)});\n" if own else ""
         bodies.append(
-            f"extern __typeof__({name}) __real_{name};\n" + storage + f"{ret} __wrap_{name}({decls})\n{{\n{body}}}\n"
+            proto
+            + f"extern __typeof__({name}) __real_{name}{' __attribute__((weak))' if own else ''};\n"
+            + storage
+            + f"{ret} __wrap_{name}({decls})\n{{\n{body}}}\n"
             f"static __typeof__({name}) *const fc_errno_shim_check_{name} __attribute__((unused)) = __wrap_{name};\n"
         )
     return (
