@@ -250,6 +250,7 @@ Every time you edit `agents/{agent_id}/scratch/work/{c_file}` or `agents/{agent_
    - The shared corpus is replayed read-only; new units and artifacts stay in your scratch directory.
    - `--functions {function_name}` instruments only your function: its contract, loop annotations and RTE checks. That makes each iteration about an order of magnitude faster than instrumenting the whole module. The parent's re-check after the merge instruments the whole module.
    - The run uses a fixed seed and fixed limits, so the same inputs give the same verdict.
+   - `passed_dynamic_oracle` says nothing about a clause E-ACSL did not translate (an unbounded quantifier, a predicate whose body has one): it warns `Ignoring annotation` and generates no check. The report names those clauses of your function in `unchecked_clauses` (`dynamic_oracle_incomplete: true`) and a hint gives the usual remedy. Rewrite the clause so E-ACSL can execute it when that is possible (explicit integer bounds); otherwise it rests on WP alone and the ledger records it as an assumption of the proof.
    - `rejected_overconstrained`: one of your annotations is FALSE on a real input. Read `runtime_trace` and `failure`, and fix it.
    - `code_fault`: an RTE assertion failed on a real input. This is a code defect, not a contract problem. Stop and return it (status `blocked`, include the guardrail report in `evidence`).
 
