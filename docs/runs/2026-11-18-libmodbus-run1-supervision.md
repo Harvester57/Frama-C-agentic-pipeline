@@ -37,7 +37,9 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 02:20 | Supervisor resumes the session (fixes 2 and 3 merged) |
 | 02:21-02:25 | Build capture `ok` (probe unit gone), model `ok` (120 functions, 161 edges), threat model check `ok`, CodeQL 13 facts on 8 functions (6 unmatched test `main`s), seeds `not_relinked` (0 calls), DAG: 1 Tier 1A module, no split; security properties `ok` |
 | 02:25:35 | `generate_harness.py`: `'workspace/work/config.h' file not found`; the session stops and reports (02:28) |
-| ~02:40 | Fix 4 merged; session resumed, told to stop before Phase 1 |
+| 02:32 | Fix 4 merged; session resumed, told to stop before Phase 1 |
+| 02:32-02:36 | DAG `force_includes` now the snapshot copy; harness generated with 20 cases and 51 skipped (`no constructor for opaque handle`); reach gate fails on 51 gaps; session stops and asks |
+| ~02:50 | Fix 5 merged; session told to rebuild the scratch tree and re-record seeds, then wait for fix 6 |
 
 ## Pipeline issues and fixes
 
@@ -48,7 +50,8 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 3 | `phase0_model.py run`: `Cannot resolve variable TIOCM_RTS` (`__fc_libc` `<sys/ioctl.h>` has `TIOCMGET` but not the `TIOCM_*` modem bits) | pipeline gap + upstream Frama-C libc gap | `sup/libmodbus-tiocm-bits` `f0bea19` (+ docs `a6e33f8`, `47fb030`), merged live as `34f8747`; also adds `TCGETS2`..`TCSETSF2`, the next missing macros; upstream draft 41 (not filed) |
 
 | 4 | `generate_harness.py --api`: `the harness does not compile outside its cases: <built-in>:1:10: fatal error: 'workspace/work/config.h' file not found` (DAG roots a generated force-include at the work tree) | pipeline bug | `sup/libmodbus-generated-force-include` `9f7b123`, merged live as `222d1d3` | fixed; the run reruns the DAG and the harness |
-| 5 | `seed_harvest.py`: `not_relinked`, every test executable `no_api_function` (the recorder wraps only API functions the executable defines; libmodbus tests call them from the shared library) | pipeline gap | `sup/libmodbus-seed-shared-lib` | fixer running; the run stops before Phase 1 so seeds can be re-recorded |
+| 5 | `seed_harvest.py`: `not_relinked`, every test executable `no_api_function` (the recorder wraps only API functions the executable defines; libmodbus tests call them from the shared library) | pipeline gap | `sup/libmodbus-seed-shared-lib` `6212e3b` (+ skill wording `041048f`), merged live as `5ef9ea4` | fixed: 0 -> 321 calls over 46 API functions in the fixer's repro; two narrower libtool sub-gaps stay open (see the entry) |
+| 6 | `generate_harness.py --api`: 51 of 71 entry points `no constructor for opaque handle struct _modbus *`, reach gate 51 gaps (`_INIT_NAME_RE` accepts `new`/`create` only as a suffix, so `modbus_new_tcp` is no constructor) | pipeline bug | `sup/libmodbus-new-ctor-name` | fixer running |
 
 Tests added:
 
@@ -60,6 +63,7 @@ Tests added:
 
 - 01:52, 02:00: inline PowerShell double-quoted commands expanded `$?` and `$(frama-c ...)` on the host. The model noticed and switched to `-ScriptFile`.
 - 01:55: the model changed the confirmed recipe a second time (CR strip over every text file) on its own reading of the user's earlier answer, although the brief said not to change the recipe on its own. The change was harmless (scratch copy only).
+- 02:33-02:36: the model read `handle_functions`'s docstring ("returns the handle type and takes none") as "a constructor takes no parameters" and proposed writing 51 dispatch cases; the code means "no handle parameter". The docstring is reworded by fix 6.
 - 02:24: the model removed the build scratch volume right after seed recording, so re-recording seeds needs a rebuild.
 - 02:25: the model passed a Python file to `-ScriptFile`, which runs it with bash (`import: command not found`), then rewrote it as bash with a heredoc. The wrapper's `-ScriptFile` help could say it must be a shell script.
 - 02:28: the run brief asks the model to send its progress report with SendUserFile, a tool opencode does not have; the model said so and left the report on disk (`docs/runs/2026-11-18-libmodbus-run1.md`, uncommitted, not indexed).
@@ -69,6 +73,8 @@ Tests added:
 
 - Fix 2 and fix 3 are landed live (user's instruction at 02:01); fix 1 stays held.
 - Overnight, the supervisor answers the session's questions on the user's behalf; each answer is listed here.
+- 02:36, "how to recover the 51 functions skipped for `modbus_t *`": pipeline fix (the session's option 1), not 51 hand-written dispatch cases. The session's diagnosis (constructors with parameters refused) was wrong: the code accepts them, and the name rule is what fails.
+- ~02:50, seeds: the session redoes the build capture on a fresh scratch volume, the model, threat model checks, DAG and security properties, then re-records seeds with the fixed recorder before any harness is regenerated.
 
 Also added by fix 3: `tests/test_fc_compat_contracts.py::test_modem_line_bits_and_termios2_requests_are_defined_for_frama_c_libc_only` and `::test_modem_line_bits_and_termios2_requests_parse_with_frama_c_libc_as_gcc_reads_them` (`FRAMAC_DOCKER_TESTS=1`, rerun green by the supervisor).
 
