@@ -19,7 +19,7 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 
 ## Status
 
-**Phase 0, running** (resumed at about 02:40 after fix 4); the session will stop before Phase 1 so seeds can be re-recorded once fix 5 lands.
+**Phase 1, running.** Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wall clock, including about 70 min of fix and wait time).
 
 ## Timeline (supervisor's observations, local time, 2026-11-18)
 
@@ -48,6 +48,8 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 02:49 | `pipeline_make.py run seed`: `validate_artifacts.py` rejects the sidecar (`$.api_cases[67].rest: expected type null`); session stops and asks |
 | 02:52 | Fixer dispatched for fix 7 (`sup/libmodbus-lifecycle-rest`) |
 | 03:03 | Fix 7 merged; session told to regenerate the harness, rerun the reach gate, seed, gen, build-check and validate, then stop before Phase 1 |
+| 03:02-03:06 | Harness regenerated (69 cases; lifecycle case: 16-byte `ip` slot + `port`, `rest` null, no warnings), reach gate `gaps: []`, `run seed` validate ok, `gen` ok (1 module), build-check ok (E-ACSL engine, sanitizer build), final `validate_artifacts` ok; ledger 215 planned units; Phase 0 checkpoint (`phase_done` 0) |
+| 03:08 | Supervisor tells the session to run Phases 1-3 and the report without stopping between phases |
 
 ## Pipeline issues and fixes
 
