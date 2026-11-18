@@ -104,6 +104,11 @@ Issues encountered in Phase 3 deductive verification (`run_wp_function.py`), Dua
 - **Cause:** `_FPV_DEGEN_RE` captures the degenerated goal names, but only their count was used: with one or more, every Unknown or Invalid row whose property contained `pointer_value` or `\valid_function` moved to `proven_under_hyp`, a data-pointer `\object_pointer` alarm included.
 - **Fix (fixed 2026-11-11, uncommitted, `scripts/run_wp_function.py`):** a row is moved only when its property contains `\valid_function` and not `\object_pointer`, and at most one row per degenerated goal. The report CSV has no goal name, so rows cannot be matched to the log by name.
 
+### Symptom: A Second Function-Pointer Call Leaves `\null == fp || \valid_function(fp)` Unproven (`(Degenerated, 2 warnings)`)
+- **Seen on:** `tests/fixtures/security_props/forward/l5_forwarding.c`, function `send_msg` (two calls through `ctx->backend`), package A of [`../plans/metacsl-exploitation-plan.md`](../plans/metacsl-exploitation-plan.md), 2026-11-18, `framac-analysis:latest`. WP log: `[wp] [Timeout] typed_send_msg_assert_rte_pointer_value_4 (Qed 5ms) (Alt-Ergo) (Degenerated, 2 warnings)`.
+- **Cause:** pipeline bug. `_FPV_DEGEN_RE` in [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) matched the literal `(Degenerated)` only, so a degenerated goal that also carries warnings was not listed in `assumed_function_pointer_goals` and its report row stayed unproven. A function with two pointer calls (libmodbus's `send_msg`) could not end `all_proven`, and its `l5_sanitized` unit could not be credited.
+- **Fix (fixed 2026-11-18 on branch `metacsl-integ`):** the pattern accepts `(Degenerated, N warnings)`. Test: `test_degenerated_pointer_value_goal_with_warnings_is_listed` in [`../../tests/test_run_wp_function.py`](../../tests/test_run_wp_function.py). Checked on the log lines above, not by a new image run of the fixture.
+
 ---
 
 ## Dual-Oracle E-ACSL Guardrail

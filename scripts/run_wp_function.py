@@ -147,7 +147,7 @@ _SKIPPED_RTE_RE = re.compile(
 )
 _INDIRECT_CALL_UNSOUND_RE = re.compile(r"Missing 'calls'|Unknown callee")
 _FPV_DEGEN_RE = re.compile(
-    r"^\[wp\] \[(?:Timeout|Unknown|Failed|Stepout)\] ([A-Za-z0-9_]+_assert_rte_pointer_value[A-Za-z0-9_]*) .*\(Degenerated\)",
+    r"^\[wp\] \[(?:Timeout|Unknown|Failed|Stepout)\] ([A-Za-z0-9_]+_assert_rte_pointer_value[A-Za-z0-9_]*) .*\(Degenerated(?:, [^)]*)?\)",
     re.MULTILINE,
 )
 # With -wp-counter-examples, failed goals carry a witness model: "[wp] [Unsuccess] <goal> (<prover>) (Model)"

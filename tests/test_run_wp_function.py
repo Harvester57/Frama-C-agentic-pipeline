@@ -13,6 +13,20 @@ import run_wp_function as W
 CSV_HEADER = "directory\tfile\tfunction\tline\tkind\tstatus\tproperty\n"
 
 
+@pytest.mark.unit
+def test_degenerated_pointer_value_goal_with_warnings_is_listed() -> None:
+    # WP prints `(Degenerated, 2 warnings)` for a second function-pointer call of the same function.
+    log = (
+        "[wp] [Timeout] typed_send_msg_assert_rte_pointer_value_2 (Qed 2ms) (Alt-Ergo) (Degenerated)\n"
+        "[wp] [Timeout] typed_send_msg_assert_rte_pointer_value_4 (Qed 5ms) (Alt-Ergo) (Degenerated, 2 warnings)\n"
+        "[wp] [Timeout] typed_send_msg_assert_rte_pointer_value_6 (Qed 5ms) (Alt-Ergo) (2 warnings)\n"
+    )
+    assert [m.group(1) for m in W._FPV_DEGEN_RE.finditer(log)] == [
+        "typed_send_msg_assert_rte_pointer_value_2",
+        "typed_send_msg_assert_rte_pointer_value_4",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Feature A2: Vacuity Log Classification
 # ---------------------------------------------------------------------------
