@@ -129,6 +129,7 @@ Invoke the skills from your AI coding assistant:
 | Skill | Stage | Purpose |
 | :--- | :---: | :--- |
 | [`/framac-verify`](./skills/framac-verify/SKILL.md) | **All (0–4)** | **End-to-end orchestrator:** slices the codebase, fuzzes with E-ACSL, prunes with Eva, verifies crash candidates, proves surviving obligations with parallel WP subagents, and emits final reports. Supports `--profile quick\|standard\|deep`. |
+| [`/threat-model`](./skills/threat-model/SKILL.md) | **Before Phase 0** | **Source-backed threat model of the target:** understands it from its documentation and build files, inventories every file with coverage receipts, classes every exported function, traces data flows, states what can go wrong and which property rules it out, has an independent reviewer challenge the result, and ends `ThreatModel.md` with the validated `framac-threat-model` block that Phase 0 takes through `--threat-model`. Reports no vulnerability and never changes the target. |
 | [`/framac-slice`](./skills/framac-slice/SKILL.md) | **Phase 0** | Initializes the `workspace/` shadow overlay, captures the target's build, parses each link unit with Frama-C (call graph, API, trust), records seeds from the tests, builds the DAG with link units as modules and risk tiers from trust, generates the MetAcsl security properties and dual harnesses, gates them on API reachability and on a working E-ACSL build, and seeds `coverage-ledger.json`. |
 | [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice via Make. |
 | [`/framac-eva`](./skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
@@ -177,6 +178,7 @@ frama-c/
 │       ├── SKILL.md
 │       └── *_brief.md                # Subagent briefs (header_architect, prover, breaker, crash_verifier)
 │   ├── run-supervisor/SKILL.md       # Read-only supervisor of a live run (/run-supervisor)
+│   ├── threat-model/SKILL.md         # Source-backed threat model ending with the framac-threat-model block (/threat-model)
 │   ├── paper-assessment/SKILL.md     # Research papers to a ranked improvement plan (/paper-assessment)
 │   ├── python-patterns/SKILL.md      # Conventions for the pipeline's Python scripts
 │   └── python-testing/SKILL.md       # Pytest conventions for tests/
