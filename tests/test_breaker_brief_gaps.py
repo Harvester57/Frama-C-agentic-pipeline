@@ -186,6 +186,52 @@ def test_a_second_report_of_the_same_failure_adds_a_reproducer_not_a_candidate(r
     assert len(cand["reproducers"]) == 2
 
 
+def test_a_failure_phase_1_already_ledgered_lands_on_its_fuzz_candidate(run_dir):
+    """The campaign replays workspace/corpus/<harness>, so a breaker re-lists known fuzz failures."""
+    _seed_run(run_dir)
+    known = run_dir / "workspace/crashes/snmp/crash-known"
+    known.parent.mkdir(parents=True, exist_ok=True)
+    known.write_bytes(b"\x01\x02")
+    abs_file = f"/framac-run/workspace/work/{OTHER_FILE}"
+    failure: dict = {
+        "file": abs_file,
+        "function": OTHER_FN,
+        "line": OTHER_LINE,
+        "predicate": OTHER_PRED,
+        "alarm_kind": "signed_overflow",
+        "kind": "rte",
+    }
+    fuzz_fp = make_fingerprint(abs_file, OTHER_FN, "signed_overflow", OTHER_PRED)
+    write_json(
+        run_dir / "workspace/reports/fuzz/snmp.json",
+        {
+            "module": "snmp",
+            "status": "crash",
+            "artifacts": [
+                {
+                    "artifact": "workspace/crashes/snmp/crash-known",
+                    "kind": "crash",
+                    "fingerprint": fuzz_fp,
+                    "reproducible": True,
+                    "failure": failure,
+                }
+            ],
+        },
+    )
+    ledger.cmd_ingest_fuzz([Path("workspace/reports/fuzz/snmp.json")])
+    (fuzz_cand,) = _load(run_dir, "candidates.json")
+    art, sha = _crash(run_dir, "crash-a", b"\x03")
+    write_json(
+        run_dir / f"agents/{BRK_AID}/scratch/breaker_{BRK_FN}.json",
+        {"mode": "campaign", "artifacts": [{"artifact": art, "sha256": sha, "reproducible": True, "failure": failure}]},
+    )
+    entry = _other_entry(art, file=abs_file)  # copied as printed: an absolute path validates
+    out = _ingest(run_dir, _breaker_result(other_function_crashes=[entry]))
+    assert out["candidates_added"] == 0 and out["other_function_crashes_recorded"] == 1
+    (cand,) = _load(run_dir, "candidates.json")
+    assert cand["fingerprint"] == fuzz_cand["fingerprint"] == fuzz_fp and len(cand["reproducers"]) == 2
+
+
 def test_without_a_campaign_record_the_claimed_location_is_kept_and_only_proposed_for_validation(run_dir):
     _seed_run(run_dir)
     art, _ = _crash(run_dir, "crash-a", b"\x05")

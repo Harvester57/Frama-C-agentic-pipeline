@@ -441,7 +441,6 @@ def validate_agent_result(data, run_dir: Path | None = None) -> Errors:
         for idx, entry in enumerate(data.get("other_function_crashes") or []):
             where = f"$.other_function_crashes[{idx}]"
             _under_agent_dir(errors, f"{where}.crash_artifact", aid, entry["crash_artifact"])
-            _path_ok(errors, f"{where}.file", entry["file"])
             art = str(entry["crash_artifact"]).replace("\\", "/")
             if art == str(data["crash_artifact"] or "").replace("\\", "/"):
                 errors.add(f"{where}.crash_artifact: already the result's crash_artifact; list it once")

@@ -89,19 +89,19 @@
         "fault_hypothesis": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/fault_hypothesis"}]},
         "proof_gap": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/proof_gap"}]},
         "other_function_crashes": {
-          "$comment": "Campaign failures located outside the assigned function; each becomes an unverified candidate that the parent replays.",
+          "$comment": "Campaign failures located outside the assigned function; each becomes an unverified candidate that the parent replays. The other fields are copied from the campaign's failure record as printed (a file may be absolute); the ledger prefers the record itself.",
           "type": "array",
-          "maxItems": 32,
+          "maxItems": 64,
           "items": {
             "type": "object",
             "properties": {
               "crash_artifact": {"$ref": "#/definitions/relpath"},
-              "file": {"$ref": "#/definitions/relpath"},
-              "function": {"$ref": "#/definitions/text"},
-              "line": {"type": ["integer", "null"], "minimum": 1},
-              "failing_predicate": {"$ref": "#/definitions/text"}
+              "file": {"type": ["string", "null"]},
+              "function": {"type": ["string", "null"]},
+              "line": {"type": ["integer", "null"]},
+              "failing_predicate": {"type": ["string", "null"]}
             },
-            "required": ["crash_artifact", "file", "function", "failing_predicate"],
+            "required": ["crash_artifact"],
             "additionalProperties": false
           }
         }

@@ -2758,6 +2758,11 @@ class _BreakerCrashContext:
         self.campaign = campaign
         self.findings = findings
         self.reopen_outcomes = reopen_outcomes
+        # Placed as cmd_ingest_fuzz places a campaign failure, so the same failure gets the same candidate.
+        mm = ModuleMap.load(".")
+        self.index = _dag_line_index(dag=mm.dag)
+        self.kernel = _model_kernel_names()
+        self.link_unit = str((mm.modules.get(mm.unit_of(mod)) or {}).get("unit") or mm.unit_of(mod))
 
 
 def _ingest_breaker_crash(
@@ -2767,13 +2772,15 @@ def _ingest_breaker_crash(
     Record one crashing input of a breaker as an unverified candidate; 1 when a new candidate was created.
 
     `assigned` is the breaker's own `crash_found` (located in the assigned function, as before);
-    otherwise an `other_function_crashes` entry, located by the campaign's own failure record for the
-    same input when the breaker's scratch has one (`_breaker_campaign_failures`), else by what the
-    breaker copied from it. The input is promoted to workspace/crashes/<harness module>/ and listed as
-    the reproducer: the scheduler replays it on that module's binary before a verifier's verdict is
-    ingested, so the agent's claim is never a finding by itself. Deduplicated like a guardrail
-    `code_fault`: the exact fingerprint first, then the candidate at the same statement site, then the
-    same function and kind (`_find_matching_sink_candidate`).
+    otherwise an `other_function_crashes` entry. An entry whose input has a failure record in a campaign
+    report of the breaker's scratch (`_breaker_campaign_failures`, matched by sha256) is placed exactly
+    as `cmd_ingest_fuzz` places that record: the same fingerprint, the function its line lies in, the
+    same site, so a failure Phase 1 already ledgered lands on its candidate. Without a record the
+    breaker's own fields are used and the candidate is only proposed for validation. The input is
+    promoted to workspace/crashes/<harness module>/ and listed as the reproducer: the scheduler replays
+    it on that module's binary before a verifier's verdict is ingested, so the agent's claim is never a
+    finding by itself. Deduplicated like a guardrail `code_fault`: the exact fingerprint first, then the
+    candidate at the same statement site, then the same function and kind (`_find_matching_sink_candidate`).
     """
     crash_rel = rel(crash_src)
     record: dict | None = None
@@ -2782,45 +2789,65 @@ def _ingest_breaker_crash(
         crash_rel = str(prom_crash["dest"])
         record = ctx.campaign.get(str(prom_crash["sha256"]))
     failure = (record or {}).get("failure") or {}
-    tool_fn = str(failure.get("function") or "").removeprefix("__gen_e_acsl_")
-    tool_file = normalize_file(str(failure.get("file") or ""))
     claimed_line = claimed.get("line") if isinstance(claimed.get("line"), int) else 0
+    leak = False
+    tool_backed = False
     if assigned:
         ffile, ffn = normalize_file(str(claimed["file"])), str(claimed["function"])
+        source_fn = ffn
         pred = str(claimed["failing_predicate"])
         kind = goal_obligation_class({"kind": "assertion", "annotation": pred})
-        same_place = bool(failure) and tool_fn == ffn and (not tool_file or tool_file == ffile)
+        cls = kind
+        tool_fn = str(failure.get("function") or "").removeprefix("__gen_e_acsl_")
+        tool_file = normalize_file(str(failure.get("file") or ""))
+        same_place = bool(failure) and tool_fn == ffn and tool_file in ("unknown", ffile)
         line = int(failure.get("line") or 0) if same_place else claimed_line
         proposed = "confirmed"
-    elif failure and tool_fn and tool_file:
-        ffile, ffn = tool_file, tool_fn
-        pred = str(failure.get("predicate") or claimed.get("failing_predicate") or "")
+        tool_backed = True
+    elif failure:
+        # The reported name stays in the fingerprint and the location, as cmd_ingest_fuzz keeps it.
+        ffile = normalize_file(str(failure.get("file") or ""))
+        ffn = str(failure.get("function") or "") or "unknown_function"
+        pred = str(failure.get("predicate") or "")
         kind = str(failure.get("alarm_kind") or failure.get("kind") or "assertion")
-        line = int(failure.get("line") or 0)
-        proposed = "confirmed" if (record or {}).get("reproducible") is True else "needs_validation"
+        line = failure.get("line") if isinstance(failure.get("line"), int) else 0
+        source_fn = _located_function(ffile, line, ffn, ctx.index, ctx.kernel, ctx.link_unit)
+        cls = goal_obligation_class({"kind": failure.get("kind", ""), "annotation": pred})
+        leak = failure.get("alarm_kind") == "memory_leak"
+        proposed = "confirmed" if record and record.get("reproducible") else "needs_validation"
+        tool_backed = True
     else:
-        ffile = normalize_file(str(claimed.get("file") or "")) or "unknown"
+        ffile = normalize_file(str(claimed.get("file") or ""))
+        if not is_safe_relative_path(ffile):
+            ffile = "unknown"
         ffn = str(claimed.get("function") or "") or "unknown_function"
+        source_fn = ffn
         pred = str(claimed.get("failing_predicate") or "")
         kind = goal_obligation_class({"kind": "assertion", "annotation": pred})
+        cls = kind
         line = claimed_line
         proposed = "needs_validation"
         note += "; location as the breaker reported it (no campaign record of this input in its scratch)"
-    cls = goal_obligation_class({"kind": "assertion", "annotation": pred})
     exact_fp = make_fingerprint(ffile, ffn, kind, pred)
-    site = _candidate_site(ffile, line, ffn, _dag_line_index())
+    site = _candidate_site(ffile, line, source_fn, ctx.index)
     existing_cand = ctx.candidates.get(exact_fp) or _find_matching_sink_candidate(
-        ctx.candidates, ffile, ffn, kind, pred, site=site
+        ctx.candidates, ffile, source_fn, kind, pred, site=site
     )
     fp = existing_cand["fingerprint"] if existing_cand is not None else exact_fp
     fn_units = [
-        u for u in units_for_function(ctx.units, ffile, ffn) if u["status"] not in ("out_of_scope", "not_applicable")
+        u
+        for u in units_for_function(ctx.units, ffile, source_fn)
+        if u["status"] not in ("out_of_scope", "not_applicable")
     ]
-    linked = [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls] or [
-        u["coverage_id"] for u in fn_units
-    ]
+    # A leak has no obligation class (D5): it links no unit. Otherwise the class's units, else all of them.
+    linked = (
+        []
+        if leak
+        else [u["coverage_id"] for u in fn_units if u["obligation_class"] == cls]
+        or [u["coverage_id"] for u in fn_units]
+    )
     if not linked:
-        note += f"; no ledger unit for {ffile}#{ffn}::{cls}"
+        note += f"; no ledger unit for {ffile}#{source_fn}::{cls}"
     tool_out = str(promote_file(Path.cwd(), ctx.aid, rel(str(ctx.result_path)), kind="artifact")["dest"])
     already_listed = existing_cand is not None and crash_rel in existing_cand["reproducers"]
     verified_before = existing_cand is not None and existing_cand.get("status") == "verified"
@@ -2854,7 +2881,8 @@ def _ingest_breaker_crash(
         )
         if existing_cand is None or existing_cand.get("status") == "unverified":
             mark_candidate(ctx.units[cid], fp)
-    if ctx.findings is not None and existing_cand is not None and verified_before:
+    # Only a tool's report of the failure reopens a rejected candidate; a breaker's own words never do.
+    if ctx.findings is not None and existing_cand is not None and verified_before and tool_backed:
         ctx.reopen_outcomes.append(
             tool_evidence_on_verified_candidate(
                 ctx.units,
