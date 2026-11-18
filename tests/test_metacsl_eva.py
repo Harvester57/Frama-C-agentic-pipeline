@@ -635,6 +635,40 @@ def test_finish_files_the_combined_rows_and_a_metacsl_unknown_alone_starts_no_tu
 
 
 @pytest.mark.unit
+def test_two_checks_of_one_property_in_one_function_are_proved_together_or_not_at_all(meta_run, capsys):
+    """
+    Every check of a property sits on the property's line of the meta file: two sink calls in one
+    function with the same predicate share an obligation key (and the CSV drops identical rows). A rung
+    that proves one of the two does not prove the key, so the instance keeps its Unknown.
+    """
+    (meta_run / "workspace/build").mkdir(parents=True)
+    static = static_section()
+    unknown, valid = meta_row(static, MB_SANITIZED, "emit", "Unknown"), meta_row(static, MB_SANITIZED, "emit")
+    assert et.obligation_key(unknown) == et.obligation_key(valid)
+    base_rows = [row("workspace/work", "a.c", 1, "parse", "mem_access", "Unknown", "\\valid(p+1)"), unknown]
+    rung_rows = [row("workspace/work", "a.c", 1, "parse", "mem_access", "Valid", "\\valid(p+1)"), valid, unknown]
+    for name, rows, options in (("base", base_rows, {}), ("slevel", rung_rows, {"slevel": 1000})):
+        section = rs.summarize_report(rows, static)["security_props"]
+        _write_trial(meta_run, "m", name, rows, eva_options=options, security_props=section)
+    assert et.main(_finish_args(meta_run, ["slevel"])) == 0
+    capsys.readouterr()
+    report = json.loads((meta_run / "workspace/reports/eva/m.json").read_text(encoding="utf-8"))
+    assert report["tuning"]["selected"] == "slevel" and report["unknown_count"] == 0
+    entry = instance(report["security_props"], MB_SANITIZED, "prog.c#emit")
+    assert entry["unknown"] == 1 and entry["valid"] == 1
+    assert L._eva_meta_instance_verdict(entry) == "unknown"
+    # Proved together (both Valid: one row in the CSV), the key is proved.
+    rung_rows = [rung_rows[0], valid]
+    section = rs.summarize_report(rung_rows, static)["security_props"]
+    _write_trial(meta_run, "m", "slevel", rung_rows, eva_options={"slevel": 1000}, security_props=section)
+    assert et.main(_finish_args(meta_run, ["slevel"])) == 0
+    capsys.readouterr()
+    report = json.loads((meta_run / "workspace/reports/eva/m.json").read_text(encoding="utf-8"))
+    entry = instance(report["security_props"], MB_SANITIZED, "prog.c#emit")
+    assert entry["unknown"] == 0 and entry["valid"] == 1
+
+
+@pytest.mark.unit
 def test_loop_trials_load_the_same_properties(meta_run, monkeypatch):
     seen: list[dict] = []
 
