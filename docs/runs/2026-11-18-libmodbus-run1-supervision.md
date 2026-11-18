@@ -39,7 +39,9 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 | 02:25:35 | `generate_harness.py`: `'workspace/work/config.h' file not found`; the session stops and reports (02:28) |
 | 02:32 | Fix 4 merged; session resumed, told to stop before Phase 1 |
 | 02:32-02:36 | DAG `force_includes` now the snapshot copy; harness generated with 20 cases and 51 skipped (`no constructor for opaque handle`); reach gate fails on 51 gaps; session stops and asks |
-| ~02:50 | Fix 5 merged; session told to rebuild the scratch tree and re-record seeds, then wait for fix 6 |
+| 02:39 | Fix 5 merged; session told to rebuild the scratch tree and re-record seeds, then wait for fix 6 |
+| 02:40-02:42 | Capture, model, threat model checks, DAG and security properties rebuilt identical; seeds `ok`: 321 calls (189 unique) over 46 API functions, 9 of 10 executables relinked |
+| ~02:50 | Fix 6 merged; session told to regenerate the harness, pass the reach gate, finish Phase 0 and stop before Phase 1 |
 
 ## Pipeline issues and fixes
 
@@ -51,13 +53,15 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 
 | 4 | `generate_harness.py --api`: `the harness does not compile outside its cases: <built-in>:1:10: fatal error: 'workspace/work/config.h' file not found` (DAG roots a generated force-include at the work tree) | pipeline bug | `sup/libmodbus-generated-force-include` `9f7b123`, merged live as `222d1d3` | fixed; the run reruns the DAG and the harness |
 | 5 | `seed_harvest.py`: `not_relinked`, every test executable `no_api_function` (the recorder wraps only API functions the executable defines; libmodbus tests call them from the shared library) | pipeline gap | `sup/libmodbus-seed-shared-lib` `6212e3b` (+ skill wording `041048f`), merged live as `5ef9ea4` | fixed: 0 -> 321 calls over 46 API functions in the fixer's repro; two narrower libtool sub-gaps stay open (see the entry) |
-| 6 | `generate_harness.py --api`: 51 of 71 entry points `no constructor for opaque handle struct _modbus *`, reach gate 51 gaps (`_INIT_NAME_RE` accepts `new`/`create` only as a suffix, so `modbus_new_tcp` is no constructor) | pipeline bug | `sup/libmodbus-new-ctor-name` | fixer running |
+| 6 | `generate_harness.py --api`: 51 of 71 entry points `no constructor for opaque handle struct _modbus *`, reach gate 51 gaps (`_INIT_NAME_RE` accepts `new`/`create` only as a suffix, so `modbus_new_tcp` is no constructor) | pipeline bug | `sup/libmodbus-new-ctor-name` `08bec6c`, merged live as `c8484c6` | fixed; a `char *device` constructor parameter is not treated as a path (open, narrow) |
 
 Tests added:
 
 - `tests/test_crlf_scripts.py`: `test_a_shell_syntax_error_on_a_crlf_script_gets_the_hint`, `test_a_shell_syntax_error_naming_no_crlf_script_gives_no_hint`, `test_crlf_autotools_inputs_are_found`, `test_a_configure_syntax_error_from_a_crlf_configure_ac_gets_the_hint`, `test_a_build_failing_with_a_syntax_error_in_a_crlf_script_gets_the_hint` (branch 1).
 - `tests/test_build_capture.py::TestRecordedEvents::test_config_guess_temp_dir_probe_is_dropped` (merged).
 - `tests/test_unit_view.py::test_generated_force_include_resolves_to_its_snapshot_copy` (merged).
+- `tests/test_seed_harvest.py::test_record_wraps_api_functions_the_executable_calls_from_a_shared_library`, `::test_undefined_functions_reads_the_dynamic_symbol_table`, `tests/test_seed_harvest_shared_lib.py::test_recorder_wraps_calls_into_a_shared_library` (merged; the last is Linux-only and skips on the Windows host).
+- `tests/test_api_harness_lifecycle.py::test_a_lib_new_kind_constructor_builds_the_handle` (merged).
 
 ## Model struggles (not pipeline bugs)
 
