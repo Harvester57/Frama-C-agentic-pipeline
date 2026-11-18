@@ -54,9 +54,11 @@ def _limits(**oracle) -> dict:
     }
 
 
-def _ingest(run_dir: Path, function: str, limits: dict) -> dict:
-    write_json(run_dir / "run-metadata.json", metadata("in_progress"))
-    write_json(run_dir / "coverage-ledger.json", [unit("src/probe.c", function, "rte", module="probe")])
+def _ingest(run_dir: Path, function: str, limits: dict, again: bool = False) -> dict:
+    """Ingest one all_proven report into a fresh one-unit ledger (`again`: into the ledger as it is)."""
+    if not again:
+        write_json(run_dir / "run-metadata.json", metadata("in_progress"))
+        write_json(run_dir / "coverage-ledger.json", [unit("src/probe.c", function, "rte", module="probe")])
     report = {
         "status": "all_proven",
         "function": function,
@@ -141,13 +143,81 @@ def test_many_clauses_are_named_up_to_a_bound_and_then_counted(run_dir):
 # ------------------------------------------------------------------ controls
 
 
-@pytest.mark.parametrize("oracle", [{}, {"unchecked_clauses": []}, {"unchecked_clauses": None, "unattributed": None}])
-def test_a_complete_or_unreported_oracle_adds_nothing(run_dir, oracle):
-    """An empty list is "every clause was executed"; a missing key or None is "not reported", and neither is guessed."""
+@pytest.mark.parametrize("oracle", [{}, {"unchecked_clauses": []}, {"unchecked_clauses": [], "unattributed": None}])
+def test_a_complete_oracle_and_a_report_without_the_key_add_nothing(run_dir, oracle):
+    """An empty list is "every clause was executed"; a report written before the key existed says nothing."""
     covered = _ingest(run_dir, "walk", _limits(**oracle))
     assert covered["status"] == "covered" and covered["assumptions"] == []
     text = "\n".join(G.verdict_limits_section([covered]))
-    assert "never executed" not in text and "could not be tied" not in text
+    assert "never executed" not in text and "could not be tied" not in text and "did not report" not in text
+
+
+def test_clauses_the_guardrail_could_not_report_are_an_open_assumption(run_dir):
+    """`unchecked_clauses: None` (workspace_overlay.py): no build report to read them from. Not "none"."""
+    covered = _ingest(run_dir, "walk", _limits(unchecked_clauses=None))
+    assert covered["status"] == "covered"
+    assert [a["description"] for a in covered["assumptions"]] == [
+        "The guardrail of walk did not report which clauses E-ACSL generated no check for: whether the dynamic "
+        "oracle executed every clause of walk is not known."
+    ]
+    text = "\n".join(G.verdict_limits_section([covered]))
+    assert "the guardrail did not report which clauses E-ACSL generated no check for (1): `src/probe.c#walk`" in text
+
+
+# ------------------------------------------------------------------ limits.guardrail
+
+
+def _guarded(status: str | None, reason: str | None = None, oracle: bool = True) -> dict:
+    """Limits in the shapes workspace_overlay.py writes: `guardrail` {status[, reason]}, `dynamic_oracle` optional."""
+    limits = _limits(unchecked_clauses=[])
+    if not oracle:
+        del limits["dynamic_oracle"], limits["guardrail_corpus"]
+    if status is not None:
+        limits["guardrail"] = {"status": status, **({"reason": reason} if reason else {})}
+    return limits
+
+
+def test_a_guardrail_that_did_not_run_is_an_open_assumption_never_a_pass(run_dir):
+    why = "module probe has no harness sidecar with sources"
+    covered = _ingest(run_dir, "walk", _guarded("not_run", why, oracle=False))
+    assert covered["status"] == "covered"
+    texts = [a["description"] for a in covered["assumptions"]]
+    assert len(texts) == 1 and texts[0].startswith(
+        f"No E-ACSL guardrail ran for the WP result credited for walk ({why})"
+    )
+    assert "not exercised at runtime" in texts[0]
+    text = "\n".join(G.verdict_limits_section([covered]))
+    assert "- Proven, but the latest credited WP result had no E-ACSL guardrail pass (1)" in text
+    assert f"  - `src/probe.c#walk`: {why}" in text
+
+
+def test_a_recheck_without_a_guardrail_does_not_erase_or_inherit_an_earlier_pass(run_dir):
+    """A merge whose guardrail passed, then a contract re-check that ran none: both stay on the unit."""
+    first = _ingest(run_dir, "walk", _guarded("passed_dynamic_oracle"))
+    assert first["assumptions"] == [] and "no E-ACSL guardrail pass" not in "\n".join(G.verdict_limits_section([first]))
+    second = _ingest(run_dir, "walk", _guarded("not_run", "contract re-check: no guardrail is run", oracle=False), True)
+    statuses = [e["details"]["limits"]["guardrail"]["status"] for e in second["evidence"] if e.get("details")]
+    assert statuses == ["passed_dynamic_oracle", "not_run"]
+    assert (
+        len(second["assumptions"]) == 1
+        and "contract re-check: no guardrail is run" in second["assumptions"][0]["description"]
+    )
+    assert "A guardrail that passed for an earlier result of the unit" in second["assumptions"][0]["description"]
+    text = "\n".join(G.verdict_limits_section([second]))
+    assert "`src/probe.c#walk`: contract re-check: no guardrail is run; an earlier result's guardrail passed" in text
+
+
+@pytest.mark.parametrize("limits", [_guarded("passed_dynamic_oracle"), _guarded(None)])
+def test_a_passed_guardrail_and_a_report_without_the_key_add_nothing(run_dir, limits):
+    covered = _ingest(run_dir, "walk", limits)
+    assert covered["assumptions"] == []
+    assert "no E-ACSL guardrail pass" not in "\n".join(G.verdict_limits_section([covered]))
+
+
+def test_a_guardrail_status_that_is_not_a_pass_is_said(run_dir):
+    covered = _ingest(run_dir, "walk", _guarded("build_failed"))
+    assert "did not pass (status `build_failed`" in covered["assumptions"][0]["description"]
+    assert "status `build_failed`" in "\n".join(G.verdict_limits_section([covered]))
 
 
 def test_the_other_limits_still_become_assumptions(run_dir):

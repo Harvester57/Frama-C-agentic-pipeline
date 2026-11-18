@@ -36,6 +36,7 @@ from framac_common import (  # noqa: E402
     load_json_strict,
 )
 from ledger import (  # noqa: E402
+    GUARDRAIL_PASSED_STATUS,
     INDUCTIVE_LEMMA_GAP,
     PROPERTY_RELOCATED,
     relocated_properties,
@@ -556,18 +557,29 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     shapes: dict[str, str] = {}
     never_run: dict[str, dict[str, str]] = {}
     unattributed: dict[str, int] = {}
+    # `limits.guardrail` of each unit's latest credited WP result: `not_run` is never a pass.
+    no_guardrail: dict[str, str] = {}
+    clauses_unreported: set[str] = set()
     credited = 0
     for u in ledger:
+        guard_passed = False
+        latest_guard: dict | None = None
         for e in u["evidence"]:
             limits = (e.get("details") or {}).get("limits")
             if e["phase"] != "wp" or not isinstance(limits, dict):
                 continue
             credited += 1
             name = f"{u['file']}#{u['function']}"
+            guard = limits.get("guardrail")
+            if isinstance(guard, dict):
+                guard_passed = guard_passed or (latest_guard or {}).get("status") == GUARDRAIL_PASSED_STATUS
+                latest_guard = guard
             oracle = limits.get("dynamic_oracle")
             oracle = oracle if isinstance(oracle, dict) else {}
             if oracle.get("exercised") is False:
                 unexercised.add(name)
+            if "unchecked_clauses" in oracle and not isinstance(oracle["unchecked_clauses"], list):
+                clauses_unreported.add(name)
             # The clauses E-ACSL generated no check for: the guardrail passed without executing them.
             clauses = oracle.get("unchecked_clauses")
             for clause in clauses if isinstance(clauses, list) else []:
@@ -587,6 +599,13 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
                 shapes[name] = shape
             else:
                 shapes.setdefault(name, CONTRACT_SHAPE_NOT_RECORDED)
+        if latest_guard is not None and latest_guard.get("status") != GUARDRAIL_PASSED_STATUS:
+            why = " ".join(str(latest_guard.get("reason") or "no reason recorded").split())[:200]
+            if latest_guard.get("status") != "not_run":
+                why = f"status `{latest_guard.get('status')}`, {why}"
+            if guard_passed:
+                why += "; an earlier result's guardrail passed, on the contract as it was then"
+            no_guardrail[f"{u['file']}#{u['function']}"] = why
     if not credited:
         return []
     out = [
@@ -611,6 +630,7 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     for label, names in (
         ("Proven with a safety-only contract", safety_only),
         ("Proven, but no guardrail input reached the function", unexercised),
+        ("Proven, but the guardrail did not report which clauses E-ACSL generated no check for", clauses_unreported),
         ("Contract consistency check inconclusive", inconclusive),
         ("Layer clauses that say nothing about the function", trivial),
         ("Layer clauses whose source could not be read", unchecked),
@@ -619,6 +639,16 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
             shown = ", ".join(f"`{n}`" for n in sorted(names)[:20])
             more = f" and {len(names) - 20} more" if len(names) > 20 else ""
             out.append(f"- {label} ({len(names)}): {shown}{more}")
+    if no_guardrail:
+        out.append(
+            f"- Proven, but the latest credited WP result had no E-ACSL guardrail pass ({len(no_guardrail)}): "
+            "these proofs stand on WP alone, not exercised at runtime."
+        )
+        out += [
+            f"  - `{name}`: {md_escape(why)}" for name, why in sorted(no_guardrail.items())[:UNCHECKED_CLAUSE_ROWS_MAX]
+        ]
+        if len(no_guardrail) > UNCHECKED_CLAUSE_ROWS_MAX:
+            out.append(f"  - ... and {len(no_guardrail) - UNCHECKED_CLAUSE_ROWS_MAX} more (`limits.guardrail`)")
     if never_run:
         total = sum(len(c) for c in never_run.values())
         out.append(

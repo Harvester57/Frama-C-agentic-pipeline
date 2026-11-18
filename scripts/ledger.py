@@ -298,8 +298,40 @@ def add_wp_limit_assumptions(unit: dict, limits: dict, function: str, model_assu
             "other",
             f"No guardrail input reached {function}: its contract was proven but not exercised at runtime.",
         )
+    guardrail = guardrail_limit_note(limits, function)
+    if guardrail:
+        add_assumption(unit, "other", guardrail)
     for text in unchecked_clause_notes(limits, function):
         add_assumption(unit, "other", text)
+
+
+# `limits.guardrail.status` of a parent WP report (workspace_overlay.py): the E-ACSL guardrail ran and passed.
+GUARDRAIL_PASSED_STATUS = "passed_dynamic_oracle"
+
+
+def guardrail_limit_note(limits: dict, function: str) -> str | None:
+    """
+    The assumption text for a credited WP result whose limits say its guardrail did not pass
+    (`limits.guardrail`: {status: `not_run`, reason} when the parent re-check ran none, a contract
+    re-check included), or None when it passed or the report does not record the key (written before
+    it existed). `not_run` is never a pass. An earlier result of the same unit whose guardrail passed
+    keeps its evidence entry; this note is about the result credited now, and says so.
+    """
+    record = limits.get("guardrail")
+    status = record.get("status") if isinstance(record, dict) else None
+    if not isinstance(record, dict) or status == GUARDRAIL_PASSED_STATUS:
+        return None
+    reason = _one_line(record.get("reason"), 200) or "no reason recorded"
+    if status != "not_run":
+        return (
+            f"The E-ACSL guardrail of the WP result credited for {function} did not pass (status "
+            f"`{_one_line(status, 60) or 'not recorded'}`, {reason}): the proof stands on WP alone."
+        )
+    return (
+        f"No E-ACSL guardrail ran for the WP result credited for {function} ({reason}): this proof was not "
+        "exercised at runtime. A guardrail that passed for an earlier result of the unit, if any, is in its "
+        "evidence and checked the contract as it was then."
+    )
 
 
 # Clauses named one by one on a unit; the rest are counted (the evidence's `details.limits` has them all).
@@ -327,13 +359,20 @@ def unchecked_clause_notes(limits: dict, function: str) -> list[str]:
     via}: E-ACSL warned `Ignoring annotation` and generated no check, run_eacsl_fuzz.py
     dynamic_oracle_fields), and one for the ignored annotations no function could be read for
     (`unattributed`). A guardrail that `passed` says nothing about these clauses: WP alone stands for
-    them. A key that is not a list means the guardrail did not report it, which is not "none".
+    them. `unchecked_clauses: None` means the guardrail had no build report to read them from: not
+    known, which is not "none", and an assumption of its own. A report without the key (written before
+    it existed) adds nothing.
     """
     oracle = limits.get("dynamic_oracle")
     if not isinstance(oracle, dict):
         return []
     notes: list[str] = []
     raw = oracle.get("unchecked_clauses")
+    if "unchecked_clauses" in oracle and not isinstance(raw, list):
+        notes.append(
+            f"The guardrail of {function} did not report which clauses E-ACSL generated no check for: whether "
+            f"the dynamic oracle executed every clause of {function} is not known."
+        )
     clauses = [c for c in raw if isinstance(c, dict)] if isinstance(raw, list) else []
     for clause in clauses[:UNCHECKED_CLAUSES_NAMED]:
         owner = str(clause.get("function") or function)
