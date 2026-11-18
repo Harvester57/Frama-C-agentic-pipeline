@@ -2743,9 +2743,11 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
     mod = mod or "unknown"
 
     seeds_promoted: list[dict] = []
+    seeds_refused_hanging: list[dict] = []
     if role == "breaker" and res.get("seeds"):
         prom = promote_seeds(Path.cwd(), aid, mod, list(res["seeds"]))
         seeds_promoted = list(prom["promoted"])
+        seeds_refused_hanging = list(prom["refused_hanging"])
 
     strengthening_requests_added = 0
     if role == "prover" and res.get("strengthening_requests"):
@@ -2925,6 +2927,7 @@ def cmd_ingest_agent_hypothesis(result_path: Path, module: str | None = None) ->
         "agent_id": aid,
         "role": role,
         "seeds_promoted": seeds_promoted,
+        **({"seeds_refused_hanging": seeds_refused_hanging} if seeds_refused_hanging else {}),
         "candidates_added": candidates_added,
         "strengthening_requests_added": strengthening_requests_added,
         "proof_gaps_recorded": 1 if pg is not None else 0,

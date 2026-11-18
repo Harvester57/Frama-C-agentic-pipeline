@@ -10,6 +10,7 @@ caller. No module here imports run_eacsl_fuzz.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -38,6 +39,7 @@ from eacsl_toolchain import (
     eacsl_share_dir,
     eacsl_zone_size_options,
     fix_readonly_scalar_globals,
+    generate_errno_shim_source,
     is_eacsl_instrumented,
     mark_formals_initialized,
     mark_wrapper_results_initialized,
@@ -222,6 +224,8 @@ def _eacsl_cache_material(
         return None
     return {
         "kind": "eacsl",
+        # The generated libc shim is linked into the binary, and no source or flag says when its text changes.
+        "libc_shim": hashlib.sha256(generate_errno_shim_source(["close"]).encode("utf-8")).hexdigest(),
         "eacsl_gcc": [eacsl_bin, is_modern],
         "sources": [str(s) for s in sources],
         "out_bin": out_bin.as_posix(),

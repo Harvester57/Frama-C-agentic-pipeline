@@ -16,6 +16,7 @@ Subcommands (run with the run directory as working directory; each prints one JS
   merge-pending  [--module M] [--force]         merge finished provers in micro-batches, run re-checks
   refresh        [--module M]                   re-sync after a harness repair or a module re-run
   requeue        --agent-id ID | --stale-minutes N | --memory-refused | --locate-failed
+  requeue        --guardrail-hung               recover the tasks a hanging corpus input left without a dynamic verdict
   status
 
 Tasks: verify:<fingerprint>, repair:<module> (parent work), arch:<module> (one per harness header:
@@ -130,6 +131,12 @@ NEGOTIATE_EVIDENCE_ENV = "FRAMAC_NEGOTIATE_EVIDENCE"
 MAX_EVIDENCE_GOALS_PER_CALLER = 12
 _SEAM_BUCKETS = frozenset({"step_c_caller_precondition", "step_c_contract_postcondition"})
 MAX_MERGE_ATTEMPTS = 2  # a prover whose merge fails twice is blocked
+PARENT_GUARD_ERROR = "parent guardrail returned status='guardrail_error'"
+# How an agent whose own guardrail hung ends its task: the ones `requeue --guardrail-hung` reopens.
+HUNG_ENDINGS = {
+    "prove": (("blocked", "stalled_after_k_retries"), ("blocked", "blocked")),
+    "negotiate": (("done", "rejected"),),
+}
 MAX_ANALYSIS_ERRORS = 2  # a WP analysis_error is retried once, then the units are blocked
 # run_wp_function.py refuses to start WP below this: nothing ran, so the refusal says nothing about the proof.
 MEMORY_REFUSAL = "insufficient_memory"
@@ -3771,7 +3778,8 @@ def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path:
     )
     if res["status"] == "crash_found":
         artifact = res.get("crash_artifact")
-        if artifact and artifact not in (res.get("seeds") or []):
+        # A `timeout-` artifact hangs: in the corpus it would cost every later guardrail a whole per-input timeout.
+        if artifact and artifact not in (res.get("seeds") or []) and not Path(artifact).name.startswith("timeout-"):
             # Promote the crashing input into the module corpus; repair:<module> is only created
             # when a verifier rejects a candidate as harness_induced.
             _try(
@@ -4871,6 +4879,195 @@ def cmd_requeue_locate_failed() -> dict:
     return out
 
 
+def _hung_report_input(path: Path) -> str | None:
+    """The `timeout-` input a guardrail report stopped on, when that guardrail gave no verdict; else None."""
+    report = _load_report(path) or {}
+    crash_input = str(report.get("crash_input") or "")
+    hung = report.get("status") == "guardrail_error" and report.get("returncode") == 70
+    return crash_input if hung and Path(crash_input).name.startswith("timeout-") else None
+
+
+def _hung_guardrail_input(aid: str | None, function: str | None) -> str | None:
+    """The hanging input of the agent's own last guardrail."""
+    return _hung_report_input(Path(f"agents/{aid}/scratch/guard_{function}.json")) if aid and function else None
+
+
+def _hung_parent_guard_input(aid: str, task: dict) -> str | None:
+    """The hanging input of the parent guardrail of this agent's merge: the function's, or the module-wide one."""
+    names = [n for n in (task.get("function"), task.get("module")) if n]
+    found = (_hung_report_input(Path(f"agents/{aid}/scratch/parent_guard_{n}.json")) for n in names)
+    return next((crash_input for crash_input in found if crash_input), None)
+
+
+def _release_parked_units(task: dict, aid: str, errors: list) -> list[str]:
+    """Units the agent's stall parked, with no other note, go back to planned; in_progress ones are released too."""
+    released = _release_units(task)
+    units, _ = ledger.load_state()
+    parked_note = f"prover {aid} returned "
+    specs = [
+        {"id": cid, "status": "planned", "agent_id": None, "reason": None, "expected": ["blocked"]}
+        for cid in _unit_ids(task, units)
+        if units[cid]["status"] == "blocked"
+        and units[cid].get("unresolved")
+        and all(parked_note in str(note) for note in units[cid]["unresolved"])
+    ]
+    return released + _batch_or_individual_transitions(specs, errors=errors, tag=f"release units of {task['id']}")
+
+
+def _reopen_hung(state: dict, task: dict, aid: str) -> None:
+    """A fresh agent runs the task again: the hung run spent no dispatch, and its result can no longer be completed."""
+    _reopen(state, task, f"the guardrail of {aid} hung on a corpus input: the dynamic oracle gave no verdict")
+    task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+    task.pop("requeued_from", None)
+    _forget_request_agent(task, aid)
+
+
+def _restore_hung_merge(state: dict, ctx: Ctx, task: dict, aid: str, crash_input: str, out: dict) -> dict:
+    """
+    A proved result whose parent guardrail hung goes back to the merge queue, where that guardrail runs again. A result
+    that can no longer merge gets a fresh agent. Neither costs a dispatch. Returns the callers a negotiation holds.
+    """
+    entry: dict[str, Any] = {"task": task["id"], "agent_id": aid, "crash_input": crash_input}
+    callee = state["tasks"].get(f"prove:{_key(task)}") if task["kind"] == "negotiate" else None
+    merges_first = callee is not None and callee["state"] in ("merge_queued", "merging")
+    why = "the callee's own proof merges first" if merges_first else DEPS.splice_refusal(task, aid)
+    task["merge_attempts"] = 0
+    task["reopened"] = max(0, int(task.get("reopened") or 0) - 1)  # the failed merge reopened it
+    if why:
+        _reopen_hung(state, task, aid)
+        if task["kind"] == "negotiate":
+            task["deps"] = _negotiate_deps(state, ctx, task)
+        entry.update(reason=why, was_running=False)
+    else:
+        now = {"queued_at": utc_now(), "queued_ts": DEPS.now(), "analysis_retries": 0}
+        task.update(agent_id=aid, merge={"agent_id": aid, **now})
+        if task["kind"] == "prove":
+            entry["units"] = _reclaim_parked_units(task, aid, out["errors"], PARENT_GUARD_ERROR)
+        else:
+            entry["requests"] = [str(rid) for rid in task.get("requests") or []]
+        _requeue_refused_merge(state, task, aid, PARENT_GUARD_ERROR)
+    callers = _hold_callers(state, task) if task["kind"] == "negotiate" else {}
+    if callers:
+        entry["callers"] = callers
+    out["reopened" if why else "merge_restored"].append(entry)
+    return callers
+
+
+def cmd_requeue_guardrail_hung() -> dict:
+    """
+    Recover the tasks a guardrail that hung on a corpus input (`guardrail_error`, exit 70, a `timeout-` crash input)
+    left without a dynamic verdict. A proved result whose parent guardrail hung at merge time goes back to the merge
+    queue with its agent's result. Provers and negotiations that ended on their own hung guardrail, and agents still
+    `running` with such a finished result, are reopened for a fresh agent. Idempotent. An agent still working, or one
+    that proved everything (the parent re-check runs the guardrail again), is listed and left alone.
+    """
+    out: dict[str, Any] = {
+        "ok": True,
+        "merge_restored": [],
+        "reopened": [],
+        "requests_restored": [],
+        "left": [],
+        "running_left": [],
+        "blocked_callers_to_review": [],
+        "errors": [],
+    }
+    with run_lock("ledger"):
+        state = load_schedule()
+        tasks = state["tasks"]
+        ctx = Ctx()
+        store = {str(r.get("id")): r for r in _requests()}
+        reopened_keys: set[str] = set()
+        held: set[str] = set()
+
+        for tid, task in sorted(tasks.items()):
+            if task["kind"] not in PROVER_KINDS or PARENT_GUARD_ERROR not in str(task.get("last_reason") or ""):
+                continue
+            agents = [str(a) for a in task.get("agents") or []]
+            hung = next((a for a in reversed(agents) if _hung_parent_guard_input(a, task)), None)
+            if hung is None:
+                continue
+            crash_input = _hung_parent_guard_input(hung, task)
+            if task["state"] != "pending" or hung != agents[-1]:
+                why = f"{task['state']} as {task.get('agent_id')}: the task has moved on since the merge of {hung}"
+                out["left"].append({"task": tid, "agent_id": hung, "crash_input": crash_input, "reason": why})
+                continue
+            held.update(_restore_hung_merge(state, ctx, task, hung, str(crash_input), out))
+            if task["kind"] == "prove":
+                reopened_keys.add(_key(task))
+
+        for tid, task in sorted(tasks.items()):
+            aid = task.get("agent_id")
+            crash_input = _hung_guardrail_input(aid, task.get("function")) if task["kind"] in PROVER_KINDS else None
+            if crash_input is None:
+                continue
+            entry: dict[str, Any] = {"task": tid, "agent_id": aid, "crash_input": crash_input}
+            was_running = task["state"] == "running"
+            if was_running:
+                result = _load_report(Path(f"agents/{aid}/scratch/result.json"))
+                if result is None or result.get("status") == "all_proven":
+                    why = "still working" if result is None else "all_proven: the parent re-check runs the guardrail"
+                    out["running_left"].append({**entry, "reason": why})
+                    continue
+            elif (task["state"], task.get("outcome")) not in HUNG_ENDINGS[task["kind"]]:
+                if task["state"] == "blocked":
+                    why = f"ended {task.get('outcome')}, which is not the agent's own stall: review it by hand"
+                    out["left"].append({**entry, "reason": why})
+                continue
+            requests: list[str] = []
+            if task["kind"] == "prove":
+                negotiation = tasks.get(f"negotiate:{_key(task)}") or {}
+                if task.get("partial_contract_merged"):
+                    out["left"].append({**entry, "reason": "its partial contract is merged and callers rely on it"})
+                    continue
+                if negotiation.get("outcome") == "applied":
+                    why = f"{negotiation['id']} has merged a proved contract for this function since"
+                    out["left"].append({**entry, "reason": why})
+                    continue
+                entry["units_released"] = _release_parked_units(task, str(aid), out["errors"])
+            elif not was_running:
+                note = f"callee prover {aid} returned "
+                requests = [
+                    rid
+                    for rid in map(str, task.get("requests") or [])
+                    if (store.get(rid) or {}).get("status") == "rejected_by_callee"
+                    and str((store.get(rid) or {}).get("resolution_note")).startswith(note)
+                ]
+                if not requests:
+                    why = "none of its requests is still rejected by this run: the callers have moved on"
+                    out["left"].append({**entry, "reason": why})
+                    continue
+                for rid in requests:
+                    _try(out["errors"], f"reopen {rid}", DEPS.resolve_request, REQUESTS, rid, "pending", "")
+                out["requests_restored"].extend(requests)
+                entry["requests"] = requests
+            _reopen_hung(state, task, str(aid))
+            if task["kind"] == "negotiate":
+                task["deps"] = _negotiate_deps(state, ctx, task)
+                entry["callers"] = _hold_callers(state, task)
+                held.update(entry["callers"])
+            else:
+                reopened_keys.add(_key(task))
+            entry["was_running"] = was_running
+            out["reopened"].append(entry)
+
+        out["blocked_callers_to_review"] = [
+            {"task": tid, "callees": sorted(reopened_keys & set(t.get("callees") or []))}
+            for tid, t in sorted(tasks.items())
+            if t["kind"] == "prove"
+            and t["state"] == "blocked"
+            and tid not in held
+            and reopened_keys & set(t.get("callees") or [])
+        ]
+        out["sync"] = _sync(state, Ctx())
+        save_schedule(state)
+    out["obstructions_forgotten"] = (
+        _try(out["errors"], "forget reopened requests", spec_kb.forget_requests, Path.cwd(), out["requests_restored"])
+        or 0
+    )
+    out["ok"] = not out["errors"]
+    return out
+
+
 def cmd_status() -> dict:
     """Counts by state, ready and running tasks, the merge queue, gates and the remaining critical path."""
     with run_lock("ledger"):
@@ -5334,6 +5531,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Restore merges and negotiations ended by 'could not locate definition of function'",
     )
+    group.add_argument(
+        "--guardrail-hung",
+        action="store_true",
+        help="Restore merges and reopen tasks that ended on a guardrail that hung on a corpus input",
+    )
     sub.add_parser("status", help="Counts, ready/running tasks, gates and the remaining critical path")
     args = parser.parse_args(argv)
 
@@ -5374,6 +5576,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_merge_pending(args.module, args.force)
         elif args.cmd == "refresh":
             out = cmd_refresh(args.module)
+        elif args.cmd == "requeue" and args.guardrail_hung:
+            out = cmd_requeue_guardrail_hung()
         elif args.cmd == "requeue":
             if args.locate_failed:
                 out = cmd_requeue_locate_failed()

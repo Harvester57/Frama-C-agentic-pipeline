@@ -1704,6 +1704,10 @@ def generate_errno_shim_source(names: Sequence[str], effects: Sequence[str] = ()
         lines: list[str] = []
         if effect and effect[3]:
             lines.append(effect[3])
+        if name == "close":
+            # The process's stdio belongs to libFuzzer and the E-ACSL runtime. A target handed descriptor 2 as its
+            # socket closes it on teardown: every later report is lost and the next failure is a silent exit 77.
+            lines.append("if (a0 >= 0 && a0 <= 2) return 0;")
         if sync:
             lines.append(f"errno = {ERRNO_SHIM_GLOBAL};")
         lines.append(f"{ret} r = __real_{name}({args});")
