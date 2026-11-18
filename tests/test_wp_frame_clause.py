@@ -174,7 +174,7 @@ def test_a_log_without_the_warning_and_without_the_report_is_unknown() -> None:
 
 @pytest.mark.unit
 def test_a_run_limited_to_some_properties_is_unknown() -> None:
-    """Under `-wp-prop` WP prints no such warning and `-report` leaves out the properties it did not try."""
+    """`-report` leaves out the assigns property a `-wp-prop` run did not try; no warning either, so no answer."""
     log = (FRAME_FIXTURES / "pure_ok.log").read_text(encoding="utf-8")
     untried = "\n".join(line for line in log.splitlines() if "Assigns nothing" not in line) + "\n"
     assert W.frame_clause_state(log, "pure_ok")["assigns_clause"] == "present"

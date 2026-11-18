@@ -853,8 +853,10 @@ def frame_clause_state(log_text: str, fn_name: str) -> dict:
       are not `complete` or because one of the complete behaviors has none;
     - `present`: no such warning, and the report lists an assigns property of the function (`assigns \\nothing`
       is one; so are complete behaviors that each have a clause, which WP takes as the function's frame);
-    - `unknown`: neither. WP prints the warning only when it generates goals, and `-report` leaves out a property
-      nothing tried, so a `-wp-prop` run and a log without a report end here.
+    - `unknown`: neither. WP prints the warning whenever it generates at least one goal for the function, also
+      under a `-wp-prop` filter, and `-report` leaves out a property nothing tried. So a filter that selects no
+      goal, a filtered run that left out the assigns goals of a function that has a clause, and a log without
+      a report end here.
 
     `assigns_clause_basis` names the output the answer rests on.
     """
