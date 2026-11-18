@@ -10,6 +10,7 @@ import pytest
 
 import cache
 import crash_replay
+import eacsl_toolchain
 import fuzz_build
 import promote_artifact as P
 import run_eacsl_fuzz as R
@@ -264,6 +265,41 @@ def test_a_cached_pass_keeps_the_count_of_inputs_it_replayed(run, monkeypatch):
     FakeFuzzer(monkeypatch, set())
     verdict = run(use_cache=True)
     assert verdict["cache"]["hit"] is True and verdict["corpus_replayed"] == 5
+
+
+# ---------------------------------------------------------------------------
+# A target that closes the process's stdio (seed-66-select-fd2-timeout: modbus_set_socket(ctx, 2), then modbus_close)
+# ---------------------------------------------------------------------------
+
+
+def _close_wrapper() -> str:
+    src = eacsl_toolchain.generate_errno_shim_source(["close"])
+    body = src[src.index("int __wrap_close(") :]
+    return body[: body.index("}")]
+
+
+def test_the_close_shim_keeps_the_process_stdio_open():
+    body = _close_wrapper()
+    assert body.index("if (a0 >= 0 && a0 <= 2) return 0;") < body.index("__real_close(a0)")
+
+
+def test_only_close_gets_the_stdio_guard():
+    assert "a0 <= 2" not in eacsl_toolchain.generate_errno_shim_source(["read", "dup"])
+
+
+def test_a_changed_shim_does_not_restore_a_cached_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc.sh", True))
+    monkeypatch.setattr(fuzz_build, "slice_has_pthread", lambda sources: False)
+
+    def material() -> dict:
+        args = ("gcc_x86_64", "-I.", "all", True, None, "", True, False, True)
+        found = fuzz_build._eacsl_cache_material(["a.c"], tmp_path / "fuzz_mod", *args)
+        assert found is not None
+        return found
+
+    before = material()["libc_shim"]
+    monkeypatch.setattr(fuzz_build, "generate_errno_shim_source", lambda names: "another shim")
+    assert material()["libc_shim"] != before
 
 
 # ---------------------------------------------------------------------------
