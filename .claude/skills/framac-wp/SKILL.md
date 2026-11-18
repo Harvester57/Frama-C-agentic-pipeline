@@ -100,6 +100,7 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
    ```text
    python3 /opt/framac-pipeline/scripts/wp_scheduler.py step --complete <id1> <id2>... --slots auto --prepare
    ```
+   - `step`, `complete` and `merge-pending` run the parent WP re-check: let the wrapper infer their class (`verify`) and never pass `-Class light`. A top-level `merge_deferred` in the output means the container was too small and nothing was decided: rerun with `-Class verify`.
    - On the first iteration, run with `--slots auto --prepare` without `--complete`.
    - `--slots auto` = `recommend().max_agents` minus running tasks. On high-spec hardware, this scales dynamically up to 32 agents on $\ge 32$ CPUs and 64 agents on $\ge 64$ CPUs.
    - Finished provers merge eagerly without waiting for unrelated module provers, unblocking callers immediately.

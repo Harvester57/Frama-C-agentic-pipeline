@@ -85,6 +85,7 @@ class Sim:
         self.merge_calls: list[list[str]] = []
         self.merge_fail: dict[str, str] = {}
         self.parent_status: dict[str, str] = {}
+        self.parent_reason: dict[str, str] = {}
         self.modified: dict[str, list[str]] = {}
         self.recheck_calls: list[str] = []
         self.recheck_ok: dict[str, bool] = {}
@@ -97,6 +98,7 @@ class Sim:
         monkeypatch.setattr(S.DEPS, "recheck_function", self.recheck_function)
         monkeypatch.setattr(S.DEPS, "recommend", lambda max_agents=None: {"max_agents": max_agents or 8})
         monkeypatch.setattr(S.DEPS, "now", lambda: self.clock)
+        monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: None, raising=False)
         monkeypatch.delenv("FRAMAC_SCHEDULER", raising=False)
 
     # ----------------------------------------------------------------- run setup
@@ -317,7 +319,8 @@ class Sim:
             aid, fn = e["agent_id"], e["function"]
             status = self.parent_status.get(aid, "unproven_goals_remain" if aid in self.merge_fail else "all_proven")
             rel = f"agents/{aid}/scratch/parent_wp/{fn}.json"
-            write_json(self.run_dir / rel, wp_report(fn, f"workspace/work/{e['file']}", status, "oom_killed"))
+            reason = self.parent_reason.get(aid, "oom_killed")
+            write_json(self.run_dir / rel, wp_report(fn, f"workspace/work/{e['file']}", status, reason))
             if aid in self.merge_fail:
                 failed.append({"ok": False, "rolled_back": True, "agent_id": aid, "reason": self.merge_fail[aid]})
             else:
@@ -2490,3 +2493,331 @@ def test_baseline_unambiguous_name_still_publishes_the_name_only_report(sim, mon
     task = load(sim.run_dir / "state" / "wp_schedule.json")["tasks"]["prove:src/m/a.c#a"]
     assert Path(task["baseline"]["report"]).is_file()
     assert Path(task["baseline"]["report"]) != canonical
+
+
+# ---------------------------------------------------------------------------
+# A memory refusal is never a verdict (libmodbus run-1)
+# ---------------------------------------------------------------------------
+
+MEMORY_REFUSAL_FAILURE = "parent WP check on merged tree returned status='analysis_error': insufficient_memory"
+
+
+def refuse_merge(sim, aid):
+    """The parent WP re-check of `aid` refuses to start: the container is below the WP minimum."""
+    sim.merge_fail[aid] = MEMORY_REFUSAL_FAILURE
+    sim.parent_status[aid] = "analysis_error"
+    sim.parent_reason[aid] = "insufficient_memory"
+
+
+def allow_merge(sim, aid):
+    for table in (sim.merge_fail, sim.parent_status, sim.parent_reason):
+        table.pop(aid, None)
+
+
+def damage_as_before_the_fix(sim, task_id):
+    """What the scheduler made of a refused merge before refusals were deferred (the state a live run holds)."""
+    state = S.load_schedule()
+    task = state["tasks"][task_id]
+    aid = task["merge"]["agent_id"]
+    rel = f"agents/{aid}/scratch/parent_wp/{task['function']}.json"
+    report = wp_report(task["function"], f"workspace/work/{task['file']}", "analysis_error", "insufficient_memory")
+    write_json(sim.run_dir / rel, report)
+    S.DEPS.ingest_wp([Path(rel)])
+    task["merge"].update(analysis_retries=1, started_at="2026-11-18T06:00:00+00:00", started_ts=sim.clock)
+    if task["kind"] == "negotiate":
+        note = "parent WP re-check did not complete (insufficient_memory)"
+        S._resolve_negotiation(state, task, False, note, {"errors": []})
+    else:
+        parked = "analysis_error: the parent WP re-check did not complete twice (insufficient_memory)"
+        S._park_units(task, aid, parked)
+        S._finish(state, task, "blocked", "analysis_error", reason=MEMORY_REFUSAL_FAILURE)
+    S.save_schedule(state)
+
+
+def negotiation_waiting_to_merge(sim):
+    """g is merged, its caller f stalled on a request, and the negotiator's proof of g is queued for merge."""
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-f", "f", "src/m/f.c", status="stalled_after_k_retries", requests=[request("g", 1)])
+    S.cmd_complete("prove-f")
+    S.cmd_next("auto", prepare=True)
+    sim.prover("negotiate-g", "g", "src/m/g.c")
+    assert S.cmd_complete("negotiate-g")["action"] == "queued_for_merge"
+
+
+def request_store():
+    return load("workspace/reports/strengthen_requests.json")["requests"]
+
+
+def test_a_memory_refusal_leaves_the_merge_queued_with_its_retries_and_units(sim):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    refuse_merge(sim, "prove-a")
+    for _ in range(3):  # however often it is called from an undersized container
+        out = S.cmd_merge_pending(force=True)
+        assert out["merge_deferred"]["tasks"] == ["prove:src/m/a.c#a"] and out["failed"] == []
+    task = tasks()["prove:src/m/a.c#a"]
+    assert (task["state"], task["outcome"]) == ("merge_queued", None)
+    assert task["merge"]["analysis_retries"] == 0 and task["merge_attempts"] == 0
+    u = units()["src/m/a.c#a::rte"]
+    assert (u["status"], u["agent_id"], u["unresolved"]) == ("in_progress", "prove-a", [])
+
+    allow_merge(sim, "prove-a")
+    assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "prove-a"
+    assert tasks()["prove:src/m/a.c#a"]["outcome"] == "merged"
+
+
+def test_an_undersized_container_starts_no_merge_and_says_how_to_rerun(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: 1024)
+    out = S.cmd_step(force_merge=True)
+    assert sim.merge_calls == []
+    deferred = out["merge_deferred"]  # top level of `step`, not only under merge_pending
+    assert (deferred["enforced_memory_mb"], deferred["required_memory_mb"]) == (1024, 1768)
+    assert deferred["queued_merges"] == ["prove:src/m/a.c#a"] and "-Class verify" in deferred["action"]
+    assert tasks()["prove:src/m/a.c#a"]["state"] == "merge_queued"
+
+    monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: 8192)
+    out = S.cmd_step(force_merge=True)
+    assert "merge_deferred" not in out and sim.merge_calls == [["prove-a"]]
+
+
+def test_an_undersized_container_leaves_a_prover_result_uncompleted(sim, monkeypatch):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c", status="stalled_after_k_retries")
+    monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: 1024)
+    out = S.cmd_step(complete_ids=["prove-a"])
+    assert out["completed"][0]["action"] == "merge_deferred" and out["merge_deferred"]["required_memory_mb"] == 1768
+    assert tasks()["prove:src/m/a.c#a"]["state"] == "running"
+
+    monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: None)
+    assert S.cmd_complete("prove-a")["action"] == "blocked"
+
+
+def test_a_memory_refusal_never_rejects_a_negotiation(sim):
+    negotiation_waiting_to_merge(sim)
+    refuse_merge(sim, "negotiate-g")
+    out = S.cmd_merge_pending(force=True)
+    assert out["merge_deferred"]["tasks"] == ["negotiate:src/m/g.c#g"]
+    assert tasks()["negotiate:src/m/g.c#g"]["state"] == "merge_queued"
+    assert [r["status"] for r in request_store()] == ["pending"]
+
+    allow_merge(sim, "negotiate-g")
+    S.cmd_merge_pending(force=True)
+    assert [r["status"] for r in request_store()] == ["verified_and_applied"]
+    assert tasks()["prove:src/m/f.c#f"]["state"] == "pending"
+
+
+def test_a_memory_refusal_on_a_recheck_keeps_it_queued(sim, monkeypatch):
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-f", "f", "src/m/f.c")
+    state = S.load_schedule()
+    rid = S._add_recheck(state, state["tasks"]["prove:src/m/f.c#f"], "contract of g changed")
+    S.save_schedule(state)
+
+    def refused(run_dir, agent_id, file, function, module):
+        rel = f"agents/{agent_id}/scratch/parent_wp/{function}.json"
+        write_json(sim.run_dir / rel, wp_report(function, file, "analysis_error", "insufficient_memory"))
+        return {"ok": False, "reason": MEMORY_REFUSAL_FAILURE, "report": rel}
+
+    monkeypatch.setattr(S.DEPS, "recheck_function", refused)
+    for _ in range(3):
+        out = S.cmd_merge_pending()
+        assert out["rechecks"]["deferred"][0]["recheck"] == rid and "merge_deferred" in out
+    entry = load("state/wp_schedule.json")["rechecks"][rid]
+    assert (entry["state"], entry["retries"]) == ("queued", 0)
+    assert (tasks()["prove:src/m/f.c#f"]["state"], units()["src/m/f.c#f::rte"]["status"]) == ("done", "covered")
+
+
+def test_a_stale_refusal_report_does_not_turn_a_later_splice_failure_into_an_analysis_error(sim):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    refuse_merge(sim, "prove-a")
+    sim.merge_fail["prove-a"] = "src/m/a.c: function 'a' in workspace/work/ diverged from agent base snapshot"
+    out = S.cmd_merge_pending(force=True)  # the report on disk is still the refusal; this failure is not one
+    assert "merge_deferred" not in out and out["failed"][0]["action"] == "requeued"
+
+
+def test_requeue_memory_refused_restores_the_merge_and_nothing_else(sim, capsys):
+    sim.build({n: (f"src/m/{n}.c", "m", []) for n in "abc"})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    for n in "ab":
+        sim.prover(f"prove-{n}", n, f"src/m/{n}.c")
+        S.cmd_complete(f"prove-{n}")
+    sim.prover("prove-c", "c", "src/m/c.c", status="stalled_after_k_retries")
+    S.cmd_complete("prove-c")
+    damage_as_before_the_fix(sim, "prove:src/m/a.c#a")
+    state = S.load_schedule()  # a real analysis error: a verdict of the tool, which stays
+    S._finish(state, state["tasks"]["prove:src/m/b.c#b"], "blocked", "analysis_error", reason="status: timeout")
+    S.save_schedule(state)
+    assert units()["src/m/a.c#a::rte"]["status"] == "blocked"
+    others = {t: tasks()[t] for t in ("prove:src/m/b.c#b", "prove:src/m/c.c#c")}
+
+    out = S.cmd_requeue_memory_refused()
+    assert [(r["task"], r["agent_id"]) for r in out["restored"]] == [("prove:src/m/a.c#a", "prove-a")]
+    assert out["restored"][0]["units"] == ["src/m/a.c#a::rte"]
+    task = tasks()["prove:src/m/a.c#a"]
+    assert (task["state"], task["outcome"], task["completed_at"], task["last_reason"]) == (
+        "merge_queued",
+        None,
+        None,
+        None,
+    )
+    assert task["merge"]["analysis_retries"] == 0 and "started_ts" not in task["merge"]
+    u = units()["src/m/a.c#a::rte"]
+    assert (u["status"], u["agent_id"], u["unresolved"]) == ("in_progress", "prove-a", [])
+    assert {t: tasks()[t] for t in others} == others
+
+    before = tasks()
+    again = S.cmd_requeue_memory_refused()  # idempotent
+    assert again["restored"] == [] and again["left"] == [] and tasks() == before
+
+    assert S.main(["requeue", "--memory-refused"]) == 0
+    capsys.readouterr()
+    assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "prove-a"
+    assert (tasks()["prove:src/m/a.c#a"]["outcome"], units()["src/m/a.c#a::rte"]["status"]) == ("merged", "covered")
+
+
+def test_requeue_memory_refused_leaves_a_refusal_without_a_result_to_merge(sim):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    state = S.load_schedule()  # the prover's own WP run was refused: no result was ever queued for merge
+    S._finish(state, state["tasks"]["prove:src/m/a.c#a"], "blocked", "analysis_error", reason="insufficient_memory")
+    S.save_schedule(state)
+    out = S.cmd_requeue_memory_refused()
+    assert out["restored"] == [] and [e["task"] for e in out["left"]] == ["prove:src/m/a.c#a"]
+    assert tasks()["prove:src/m/a.c#a"]["state"] == "blocked"
+
+
+def test_requeue_memory_refused_leaves_a_proof_a_negotiation_has_replaced(sim):
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-g", "g", "src/m/g.c")
+    S.cmd_complete("prove-g")
+    damage_as_before_the_fix(sim, "prove:src/m/g.c#g")
+    S.cmd_next("auto", prepare=True)
+    sim.finish("negotiate-g", "g", "src/m/g.c", force=True)  # merged while the refused proof stayed blocked
+    assert tasks()["negotiate:src/m/g.c#g"]["outcome"] == "applied"
+
+    out = S.cmd_requeue_memory_refused()
+    assert out["restored"] == [] and [e["task"] for e in out["left"]] == ["prove:src/m/g.c#g"]
+    assert "negotiate:src/m/g.c#g" in out["left"][0]["reason"]
+    assert tasks()["prove:src/m/g.c#g"]["state"] == "blocked"
+
+
+def test_requeue_memory_refused_names_a_partial_contract_it_cannot_merge(sim):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c", status="stalled_after_k_retries")
+    S.cmd_complete("prove-a")
+    rel = "agents/prove-a/scratch/parent_wp/a.json"
+    write_json(sim.run_dir / rel, wp_report("a", "workspace/work/src/m/a.c", "analysis_error", "insufficient_memory"))
+    assert S.cmd_requeue_memory_refused()["partial_merges_refused"] == ["prove:src/m/a.c#a"]
+
+
+def test_requeue_memory_refused_reopens_a_false_rejection_and_the_real_outcome_decides(sim):
+    negotiation_waiting_to_merge(sim)
+    damage_as_before_the_fix(sim, "negotiate:src/m/g.c#g")
+    rid = request_store()[0]["id"]
+    assert request_store()[0]["status"] == "rejected_by_callee"
+    store = Path("workspace/reports/kb/obstructions.json")
+    note = request_store()[0]["resolution_note"]  # the false rejection had reached the store of known dead ends
+    write_json(sim.run_dir / store, {"items": [{"id": f"req:{rid}", "resolution_note": note}]})
+    S.spec_kb.mine_obstructions(Path.cwd())
+    assert [i["id"] for i in load(store)["items"]] == [f"req:{rid}"]
+
+    out = S.cmd_requeue_memory_refused()
+    assert [n["task"] for n in out["negotiations_restored"]] == ["negotiate:src/m/g.c#g"]
+    assert out["requests_restored"] == [rid] and out["obstructions_forgotten"] == 1
+    assert (request_store()[0]["status"], request_store()[0]["resolution_note"]) == ("pending", "")
+    assert f"req:{rid}" not in [i["id"] for i in load(store)["items"]]
+    neg = tasks()["negotiate:src/m/g.c#g"]
+    assert (neg["state"], neg["outcome"], neg["merge"]["analysis_retries"]) == ("merge_queued", None, 0)
+    assert tasks()["prove:src/m/f.c#f"]["state"] == "blocked"  # requeued only by a request really applied
+
+    S.cmd_merge_pending(force=True)
+    assert request_store()[0]["status"] == "verified_and_applied"
+    assert tasks()["negotiate:src/m/g.c#g"]["outcome"] == "applied"
+    assert tasks()["prove:src/m/f.c#f"]["state"] == "pending"
+
+
+def test_requeue_memory_refused_holds_a_pending_caller_of_the_restored_negotiation(sim):
+    negotiation_waiting_to_merge(sim)
+    damage_as_before_the_fix(sim, "negotiate:src/m/g.c#g")
+    state = S.load_schedule()  # released by the false rejection: it would now prove against the old contract
+    S._reopen(state, state["tasks"]["prove:src/m/f.c#f"], "released by the rejection")
+    S.save_schedule(state)
+    assert "prove:src/m/f.c#f" in ready()
+
+    S.cmd_requeue_memory_refused()
+    assert "negotiate:src/m/g.c#g" in tasks()["prove:src/m/f.c#f"]["extra_deps"]
+    assert "prove:src/m/f.c#f" not in ready()
+
+
+def test_requeue_memory_refused_reruns_a_negotiation_whose_callee_proof_merges_first(sim):
+    # Both overlays start from the same contract-less function: after the prove merge the negotiator's base has
+    # diverged from the tree, so its result cannot be spliced and the negotiation is run again on the merged contract.
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-g", "g", "src/m/g.c")
+    S.cmd_complete("prove-g")
+    damage_as_before_the_fix(sim, "prove:src/m/g.c#g")
+    # g looks contract-less to its caller f, so the scheduler files a request on f's behalf (libmodbus run-1).
+    assert [x["agent_id"] for x in S.cmd_next("auto", prepare=True)["tasks"]] == ["negotiate-g"]
+    sim.prover("negotiate-g", "g", "src/m/g.c")
+    S.cmd_complete("negotiate-g")
+    damage_as_before_the_fix(sim, "negotiate:src/m/g.c#g")
+
+    out = S.cmd_requeue_memory_refused()
+    assert [r["task"] for r in out["restored"]] == ["prove:src/m/g.c#g"]
+    assert out["negotiations_restored"] == []
+    assert [n["task"] for n in out["negotiations_rerun"]] == ["negotiate:src/m/g.c#g"]
+    assert [r["status"] for r in request_store()] == ["pending"]
+    neg = tasks()["negotiate:src/m/g.c#g"]
+    assert (neg["state"], neg["dispatches"]) == ("pending", 0)  # the voided round does not count against the cap
+    assert "prove:src/m/g.c#g" in neg["deps"]
+
+    assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "prove-g"
+    rerun = [x for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "negotiate"]
+    assert [x["agent_id"] for x in rerun] == ["negotiate-g-2"]
+
+
+def test_requeue_memory_refused_gives_back_a_retry_a_queued_merge_lost_to_a_refusal(sim):
+    sim.build({"a": ("src/m/a.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-a", "a", "src/m/a.c")
+    S.cmd_complete("prove-a")
+    state = S.load_schedule()
+    state["tasks"]["prove:src/m/a.c#a"]["merge"]["analysis_retries"] = 1
+    S.save_schedule(state)
+    rel = "agents/prove-a/scratch/parent_wp/a.json"
+    write_json(sim.run_dir / rel, wp_report("a", "workspace/work/src/m/a.c", "analysis_error", "insufficient_memory"))
+
+    out = S.cmd_requeue_memory_refused()
+    assert out["retries_reset"] == ["prove:src/m/a.c#a"]
+    assert tasks()["prove:src/m/a.c#a"]["merge"]["analysis_retries"] == 0
