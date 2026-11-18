@@ -1669,6 +1669,54 @@ def _acsl_text_of_span(span) -> str:
     return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
 
 
+def _frame_contract_files(
+    run_dir: Path,
+    overlay: Path,
+    c_file: str | None,
+    function: str | None,
+    header_file: str | None,
+    module: str | None,
+    header_flags: str,
+    changed_rels: list[str],
+) -> list[str]:
+    """
+    The files that can hold `function`'s contract: its source, the header declaring it and whatever the
+    agent changed. Only read by the frame check: what the agent may edit is decided by the merge's scope check.
+    """
+    header = header_file
+    if not header and module:
+        named = merged_sidecar(module_map_for(overlay), module).get("header")
+        header = _prover_header(run_dir, overlay / "work", c_file, function, named and str(named), header_flags)
+    return list(dict.fromkeys(rel for rel in (c_file, header, *changed_rels) if rel))
+
+
+def _merged_contract_acsl(shared_work: Path, rels: list[str], new_contents: dict[str, str], function: str) -> str:
+    """
+    The ACSL of `function`'s declarations in `rels` as the merge leaves them: the spliced text of a file the
+    agent changed, the shared tree's text of any other. An unchanged file that cannot be read contributes no
+    clause, so it can only make the frame check refuse.
+    """
+    parts: list[str] = []
+    for rel in rels:
+        spliced = new_contents.get(rel)
+        try:
+            text = spliced if spliced is not None else (shared_work / rel).read_text(encoding="utf-8")
+            decls = contract_declaration_spans(text, function, is_header=rel.endswith(".h"), path=rel)
+        except (AcslError, ValueError, OSError):  # UnicodeDecodeError is a ValueError
+            if spliced is not None:
+                raise
+            continue
+        # A header may declare the function twice (prototype and `static inline` definition); the
+        # contract can sit on either declaration, so read the ACSL of every one. Frama-C merges the
+        # contracts and takes the union of their `assigns`, which is what "some clause lists the
+        # location" checks.
+        for decl in decls:
+            piece = _acsl_text_of_span(decl.span)
+            if piece and piece not in parts:
+                parts.append(piece)
+    return "\n".join(parts)
+
+
 TRUST_BOUNDARY_REASON = "trust-boundary check failed"
 
 
@@ -1942,21 +1990,13 @@ def _merge_agent_overlay_locked(
     if frame_skel is not None:
         # The projected frame skeleton is a required minimum: a prover candidate that deletes
         # or weakens a projected \separated / assigns...\from clause is rejected. The contract
-        # may live in the .c or the .h, so check the ACSL of the function's span across all
-        # spliced files together.
-        frame_parts: list[str] = []
-        for rel_str in changed_rels:
-            # A header may declare the function twice (prototype and `static inline` definition);
-            # the spliced contract can sit on either declaration, so read the ACSL of every one.
-            # Frama-C merges the two contracts and takes the union of their `assigns`, which is
-            # what "some clause lists the location" checks here.
-            for decl in contract_declaration_spans(
-                new_contents[rel_str], function or "", is_header=rel_str.endswith(".h"), path=rel_str
-            ):
-                acsl_piece = _acsl_text_of_span(decl.span)
-                if acsl_piece and acsl_piece not in frame_parts:
-                    frame_parts.append(acsl_piece)
-        frame_errs = check_frame_preserved(frame_skel, "\n".join(frame_parts), path=norm_c_file or "<work>")
+        # may live in the .c or the .h, whichever of them the agent changed (possibly neither),
+        # so check the function's contract as the merge would leave it in all of them together.
+        frame_rels = _frame_contract_files(
+            run_dir, overlay, norm_c_file, function, norm_header_file, module, header_flags, changed_rels
+        )
+        frame_acsl = _merged_contract_acsl(shared_work, frame_rels, new_contents, function or "")
+        frame_errs = check_frame_preserved(frame_skel, frame_acsl, path=norm_c_file or "<work>")
         if frame_errs:
             raise AcslError("frame-preservation check failed:\n  " + "\n  ".join(frame_errs))
 
