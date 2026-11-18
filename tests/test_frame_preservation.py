@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import function_facts as ff  # noqa: E402
 import workspace_overlay  # noqa: E402
+import wp_scheduler  # noqa: E402
 from acsl_ast import AcslError, check_frame_preserved, extract_frame_clauses  # noqa: E402
 
 SKELETON = {
@@ -317,6 +318,37 @@ def test_unchanged_result_is_refused_when_the_tree_lacks_the_projected_clauses(t
     with pytest.raises(AcslError, match="frame-preservation"):
         _merge(run_dir, overlay)
     assert (overlay / "work" / "parser.c").read_text(encoding="utf-8") == WEAK_C
+
+
+@pytest.mark.parametrize(
+    ("tree_c", "tree_h", "agent_h", "header"),
+    [
+        (GOOD_C, BASELINE_H, None, None),  # unchanged, the contract on the source
+        (BASELINE_C, GOOD_H, None, None),  # unchanged, the contract on a header nobody named
+        (WEAK_C, BASELINE_H, None, None),  # unchanged, and the tree lacks the clauses
+        (BASELINE_C, BASELINE_H, GOOD_H, "parser.h"),
+        (BASELINE_C, BASELINE_H, WEAK_H, "parser.h"),
+    ],
+)
+def test_the_dry_run_of_a_requeue_gives_the_verdict_of_the_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tree_c: str, tree_h: str, agent_h: str | None, header: str | None
+) -> None:
+    run_dir, overlay = _init_tree(tmp_path, tree_c=tree_c, tree_h=tree_h)
+    scratch = run_dir / "agents" / "prover-1" / "scratch"
+    (scratch / "result.json").write_text(json.dumps({"status": "all_proven"}), encoding="utf-8")
+    if agent_h is not None:
+        (scratch / "work" / "parser.h").write_text(agent_h, encoding="utf-8")
+    monkeypatch.chdir(run_dir)
+    task = {"id": "prove:parser.c#parse_payload", "function": "parse_payload", "file": "parser.c", "module": "m"}
+
+    dry = wp_scheduler._splice_refusal({**task, "header": header} if header else task, "prover-1")
+
+    try:
+        _merge(run_dir, overlay, header_file=header)
+    except AcslError as exc:
+        assert dry == str(exc)
+    else:
+        assert dry is None
 
 
 def test_agent_weakening_the_contract_of_the_source_is_refused(tmp_path: Path) -> None:
