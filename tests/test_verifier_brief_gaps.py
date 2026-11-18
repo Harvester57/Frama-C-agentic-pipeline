@@ -50,6 +50,11 @@ def test_case_a_replays_with_the_candidates_engine_and_keeps_the_sanitizer_witne
     assert "not_reproduced" in case_a
     assert "record.verifier.notes" in case_a
     assert "never reject the candidate because of it" in case_a
+    # Where the pipeline cannot ingest such a witness yet, the brief says so rather than promise `confirmed`.
+    assert "fuzz_unreproduced" in case_a
+    assert "record.harness.file" in case_a
+    case_b = _section(_brief_text(), "### Case B")
+    assert "E-ACSL build only" in case_b
 
 
 def test_dual_engine_report_names_the_sanitizer_engine_for_a_sanitizer_artifact(run_dir: Path):
@@ -66,6 +71,16 @@ def test_dual_engine_report_names_the_sanitizer_engine_for_a_sanitizer_artifact(
     )
     cand = {"fingerprint": _SAN_FP, "tool_outputs": ["workspace/reports/fuzz/minmea.json"]}
     assert crash_replay._candidate_engine(cand) == "sanitizers"
+    # A candidate whose tool outputs name no engine (a hypothesis, a breaker's result.json) replays on `auto`,
+    # and so do the inputs a verifier lists from its scratch (the brief's Case B caveat).
+    write_json(run_dir / "agents/breaker-1/artifacts/result.json", {"role": "breaker"})
+    assert crash_replay._candidate_engine({"fingerprint": _SAN_FP, "tool_outputs": []}) == "auto"
+    assert (
+        crash_replay._candidate_engine(
+            {"fingerprint": _SAN_FP, "tool_outputs": ["agents/breaker-1/artifacts/result.json"]}
+        )
+        == "auto"
+    )
 
 
 def test_an_observation_reproducer_replays_on_its_own_engine():
@@ -224,19 +239,31 @@ def test_brief_template_builds_harness_paths_from_the_harness_module():
 
 
 def test_verifier_brief_names_the_submodule_harness_of_a_link_unit_candidate(tmp_path: Path):
-    """A hypothesis candidate carries its link unit (`libm_a`); its harness is the sub-module `m`."""
+    """A hypothesis candidate carries its link unit (`libm_a`); its harness is the sub-module `m`.
+
+    The unit's first sub-module is `a` (the fallback when the location is ignored): only the
+    candidate's location picks `m`.
+    """
     target = tmp_path / "target"
     target.mkdir()
     (target / "m.c").write_text("int parse(char *s) { return s ? 1 : 0; }\n", encoding="utf-8")
+    (target / "a.c").write_text("int first(int x) { return x; }\n", encoding="utf-8")
     run = tmp_path / "run"
     WO.init_overlay(target, run / "workspace")
     write_json(run / "run-metadata.json", {"profile": "standard"})
     write_json(
         run / "workspace/reports/callgraph_dag.json",
         {
-            "modules": {"libm_a": {"tier": "Tier 1A", "functions": ["parse"]}},
-            "functions": {"parse": {"name": "parse", "file": "m.c", "module": "libm_a", "wave": 0}},
+            "modules": {"libm_a": {"tier": "Tier 1A", "functions": ["first", "parse"]}},
+            "functions": {
+                "first": {"name": "first", "file": "a.c", "module": "libm_a", "wave": 0},
+                "parse": {"name": "parse", "file": "m.c", "module": "libm_a", "wave": 0},
+            },
         },
+    )
+    write_json(
+        run / "workspace/harnesses/harness_a.json",
+        {"module": "a", "unit": "libm_a", "sources": ["workspace/work/a.c"], "header": "a.h", "entry_fn": "first"},
     )
     write_json(
         run / "workspace/harnesses/harness_m.json",
@@ -270,8 +297,10 @@ def test_verifier_brief_names_the_submodule_harness_of_a_link_unit_candidate(tmp
     assert "workspace/reports/fuzz/m.json" in brief
     assert "--module m " in brief
     assert "harness_libm_a" not in brief
+    assert "harness_a." not in brief
     assert "--module libm_a" not in brief
     # Sources and flags come from the sub-module's sidecar, not the unit's merged one.
     assert "fuzz.c" not in brief
+    assert "workspace/work/a.c" not in brief
     # The candidate's own module is still named.
     assert "in module **`libm_a`**" in brief
