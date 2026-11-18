@@ -1,0 +1,277 @@
+From 6721db3b0b421cea8843534d4cf1c3df78eb1ac1 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Wed, 18 Nov 2026 21:38:14 +0000
+Subject: [PATCH] [libc] strlcat: result from the pre-state, no write past n
+ bytes
+
+The contract of strlcat had two wrong clauses:
+
+- "ensures bounded_result: \result == strlen(dest) + strlen(src)" read
+  the length of dest after the call. strlcat returns the length of the
+  string it tried to create: the length of dest before the call, or n
+  when dest has no NUL within its first n bytes, plus the length of
+  src. With dest "abcdef", src "x" and n 3, Eva gave 7 where the
+  function returns 4, and WP proved the post-state equation for a
+  caller that appends "cd" to "ab" (the result is 4, the sum is 6).
+- "assigns dest[strlen(dest)..n]" included dest[n], one byte past the
+  n bytes the function may write, and every byte up to it. A field
+  that follows the buffer was considered modified.
+
+State the result with \old and the minimum with n, and stop the frame
+at the last byte the function writes. Also name the bytes of dest and
+all the bytes of src among the dependencies of the result.
+
+New test: tests/libc/strlcat.c. tests/libc/string_h.c: a check that was
+unknown ("imprecise") is now valid.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ share/libc/string.h                     |  8 +-
+ tests/libc/oracle/string_h.0.res.oracle | 28 ++++---
+ tests/libc/oracle/strlcat.0.res.oracle  | 99 +++++++++++++++++++++++++
+ tests/libc/strlcat.c                    | 35 +++++++++
+ 4 files changed, 155 insertions(+), 15 deletions(-)
+ create mode 100644 tests/libc/oracle/strlcat.0.res.oracle
+ create mode 100644 tests/libc/strlcat.c
+
+diff --git a/share/libc/string.h b/share/libc/string.h
+index a82a6c85ce..92d3c96fb5 100644
+--- a/share/libc/string.h
++++ b/share/libc/string.h
+@@ -544,9 +544,11 @@ extern char *strncat(char *restrict dest, const char *restrict src, size_t n);
+   @ requires separation:
+   @   \separated(dest+(0..\min(n-1, strlen(dest)+strlen(src))),
+   @              src+(0..strnlen(src, n-1)));
+-  @ assigns dest[strlen(dest)..n] \from indirect:n, src[0..strlen(src)];
+-  @ assigns \result \from indirect:src, indirect:src[0..n-1], indirect:n;
+-  @ ensures bounded_result: \result == strlen(dest) + strlen(src);
++  @ assigns dest[strlen(dest)..\min(n-1, strlen(dest)+strlen(src))]
++  @   \from indirect:n, src[0..strlen(src)];
++  @ assigns \result \from indirect:dest[0..], indirect:src[0..], indirect:n;
++  @ ensures bounded_result:
++  @   \result == \old(\min(strlen(dest), n) + strlen(src));
+   @*/
+ extern size_t strlcat(char *restrict dest, const char *restrict src, size_t n);
+ 
+diff --git a/tests/libc/oracle/string_h.0.res.oracle b/tests/libc/oracle/string_h.0.res.oracle
+index 62103246e5..97a8858f48 100644
+--- a/tests/libc/oracle/string_h.0.res.oracle
++++ b/tests/libc/oracle/string_h.0.res.oracle
+@@ -571,7 +571,7 @@
+   function stpncpy: precondition 'valid_dest' got status valid.
+ [eva:progress] string_h.c:209: 
+   function stpncpy: precondition 'separation' got status valid.
+-[eva:acsl:unsupported] FRAMAC_SHARE/libc/string.h:642: 
++[eva:acsl:unsupported] FRAMAC_SHARE/libc/string.h:644: 
+   cannot evaluate ACSL term, unsupported ACSL construct: logic function strncmp
+ [eva:progress] Done for function stpncpy
+ [eva:progress] string_h.c:210: check got status valid.
+@@ -585,7 +585,7 @@
+   function stpncpy: precondition 'valid_dest' got status valid.
+ [eva:progress] string_h.c:213: 
+   function stpncpy: precondition 'separation' got status valid.
+-[eva:acsl:unsupported] FRAMAC_SHARE/libc/string.h:636: 
++[eva:acsl:unsupported] FRAMAC_SHARE/libc/string.h:638: 
+   cannot evaluate ACSL term, unsupported ACSL construct: logic function strcmp
+ [eva:progress] Done for function stpncpy
+ [eva:alarm] string_h.c:214: Warning: check got status unknown.
+@@ -603,14 +603,14 @@
+ [eva:progress] string_h.c:220: 
+   function strlcat: precondition 'separation' got status valid.
+ [eva:progress] Done for function strlcat
+-[eva:alarm] string_h.c:221: Warning: check 'imprecise' got status unknown.
++[eva:progress] string_h.c:221: check 'imprecise' got status valid.
+ [eva:progress] 
+   computing for function strlcat <- main.
+   Called from string_h.c:222.
+-[eva:alarm] string_h.c:222: Warning: 
+-  function strlcat: precondition 'valid_string_src' got status unknown.
+-[eva:alarm] string_h.c:222: Warning: 
+-  function strlcat: precondition 'valid_string_dest' got status unknown.
++[eva:progress] string_h.c:222: 
++  function strlcat: precondition 'valid_string_src' got status valid.
++[eva:progress] string_h.c:222: 
++  function strlcat: precondition 'valid_string_dest' got status valid.
+ [eva:progress] string_h.c:222: 
+   function strlcat: precondition 'room_nstring' got status valid.
+ [eva:progress] string_h.c:222: 
+@@ -791,21 +791,25 @@
+   stpncpy_res ∈ {{ &stpncpy_dest[2] }}
+   stpncpy_src2 ∈ {{ "12" }}
+   strlcat_src ∈ {{ "cat" }}
+-  strlcat_buf[0] ∈ [--..--]
++  strlcat_buf[0] ∈ {100}
+              [1] ∈ {111}
+              [2] ∈ {103}
+-             [3..9] ∈ [--..--]
+-  strlcat_res ∈ [--..--]
++             [3..6] ∈ [--..--]
++             [7..9] ∈ {0}
++  strlcat_res ∈ {4}
+   strlcat_buf2[0] ∈ {100}
+               [1] ∈ {111}
+               [2] ∈ {103}
+-              [3..4] ∈ [--..--]
++              [3] ∈ [--..--]
++              [4] ∈ {97}
+               [5] ∈ {116}
+               [6..9] ∈ {0}
+   strlcat_buf3[0] ∈ {100}
+               [1] ∈ {111}
+               [2] ∈ {103}
+-              [3..9] ∈ [--..--]
++              [3..4] ∈ [--..--]
++              [5] ∈ {116}
++              [6..9] ∈ {0}
+   strxfrm_src ∈ {{ "harr" }}
+   strxfrm_res ∈ [--..--]
+   strxfrm_dest[0..9] ∈ [--..--] or UNINITIALIZED
+diff --git a/tests/libc/oracle/strlcat.0.res.oracle b/tests/libc/oracle/strlcat.0.res.oracle
+new file mode 100644
+index 0000000000..7d1237483f
+--- /dev/null
++++ b/tests/libc/oracle/strlcat.0.res.oracle
+@@ -0,0 +1,99 @@
++[kernel] Parsing strlcat.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] 
++  computing for function strlcat <- main.
++  Called from strlcat.c:13.
++[eva] using specification for function strlcat
++[eva:progress] strlcat.c:13: 
++  function strlcat: precondition 'valid_string_src' got status valid.
++[eva:progress] strlcat.c:13: 
++  function strlcat: precondition 'valid_string_dest' got status valid.
++[eva:progress] strlcat.c:13: 
++  function strlcat: precondition 'room_nstring' got status valid.
++[eva:progress] strlcat.c:13: 
++  function strlcat: precondition 'separation' got status valid.
++[eva:progress] Done for function strlcat
++[eva:progress] strlcat.c:14: check 'appended' got status valid.
++[eva:progress] 
++  computing for function strlcat <- main.
++  Called from strlcat.c:18.
++[eva:progress] strlcat.c:18: 
++  function strlcat: precondition 'valid_string_src' got status valid.
++[eva:progress] strlcat.c:18: 
++  function strlcat: precondition 'valid_string_dest' got status valid.
++[eva:progress] strlcat.c:18: 
++  function strlcat: precondition 'room_nstring' got status valid.
++[eva:progress] strlcat.c:18: 
++  function strlcat: precondition 'separation' got status valid.
++[eva:progress] Done for function strlcat
++[eva:progress] strlcat.c:19: check 'truncated' got status valid.
++[eva:progress] 
++  computing for function strlcat <- main.
++  Called from strlcat.c:23.
++[eva:progress] strlcat.c:23: 
++  function strlcat: precondition 'valid_string_src' got status valid.
++[eva:progress] strlcat.c:23: 
++  function strlcat: precondition 'valid_string_dest' got status valid.
++[eva:progress] strlcat.c:23: 
++  function strlcat: precondition 'room_nstring' got status valid.
++[eva:progress] strlcat.c:23: 
++  function strlcat: precondition 'separation' got status valid.
++[eva:progress] Done for function strlcat
++[eva:progress] strlcat.c:24: check 'no_nul_within_n' got status valid.
++[eva:progress] 
++  computing for function strlcat <- main.
++  Called from strlcat.c:27.
++[eva:progress] strlcat.c:27: 
++  function strlcat: precondition 'valid_string_src' got status valid.
++[eva:progress] strlcat.c:27: 
++  function strlcat: precondition 'valid_string_dest' got status valid.
++[eva:progress] strlcat.c:27: 
++  function strlcat: precondition 'room_nstring' got status valid.
++[eva:progress] strlcat.c:27: 
++  function strlcat: precondition 'separation' got status valid.
++[eva:progress] Done for function strlcat
++[eva:progress] strlcat.c:28: check 'zero_size' got status valid.
++[eva:progress] 
++  computing for function strlcat <- main.
++  Called from strlcat.c:32.
++[eva:progress] strlcat.c:32: 
++  function strlcat: precondition 'valid_string_src' got status valid.
++[eva:progress] strlcat.c:32: 
++  function strlcat: precondition 'valid_string_dest' got status valid.
++[eva:progress] strlcat.c:32: 
++  function strlcat: precondition 'room_nstring' got status valid.
++[eva:progress] strlcat.c:32: 
++  function strlcat: precondition 'separation' got status valid.
++[eva:progress] Done for function strlcat
++[eva:progress] strlcat.c:33: check 'next_kept' got status valid.
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  d[0] ∈ {97}
++   [1] ∈ {98}
++   [2..4] ∈ [--..--]
++   [5..7] ∈ {0}
++  r ∈ {4}
++  t[0] ∈ {97}
++   [1] ∈ {98}
++   [2..3] ∈ [--..--]
++  rt ∈ {6}
++  f[0] ∈ {97}
++   [1] ∈ {98}
++   [2] ∈ {99}
++   [3] ∈ {100}
++   [4] ∈ {101}
++   [5] ∈ {102}
++   [6..7] ∈ {0}
++  rf ∈ {4}
++  r0 ∈ {2}
++  v.d[0] ∈ {97}
++   .d[1..2] ∈ [--..--]
++   .d[3] ∈ {0}
++   .next ∈ {90}
++  __retres ∈ {0}
+diff --git a/tests/libc/strlcat.c b/tests/libc/strlcat.c
+new file mode 100644
+index 0000000000..a7a6962fa0
+--- /dev/null
++++ b/tests/libc/strlcat.c
+@@ -0,0 +1,35 @@
++#include <string.h>
++
++struct s {
++  char d[4];
++  char next;
++};
++
++// strlcat returns the length of the string it tried to create, counted from
++// the destination before the call, and writes at most n bytes.
++int main() {
++  // room for everything
++  char d[8] = "ab";
++  size_t r = strlcat(d, "cd", sizeof(d));
++  //@ check appended: r == 4;
++
++  // truncation
++  char t[4] = "ab";
++  size_t rt = strlcat(t, "cdef", sizeof(t));
++  //@ check truncated: rt == 6;
++
++  // no NUL within the first n bytes: nothing is written
++  char f[8] = "abcdef";
++  size_t rf = strlcat(f, "x", 3);
++  //@ check no_nul_within_n: rf == 4;
++
++  // n == 0: nothing is written either
++  size_t r0 = strlcat(f, "xy", 0);
++  //@ check zero_size: r0 == 2;
++
++  // the byte after the n bytes of the destination is not written
++  struct s v = {"a", 'Z'};
++  strlcat(v.d, "b", sizeof(v.d));
++  //@ check next_kept: v.next == 'Z';
++  return 0;
++}
+-- 
+2.47.3
+
