@@ -1,0 +1,29 @@
+/*
+ * L4, call rules (threat model `call_rules`): a predicate that holds at every call of a function,
+ * defined or only declared (initialized before use, lock held, index in range).
+ *   calling  context \calling: an assertion before each call of the callee, in its callers. The
+ *            outer \tguard makes the property \true in a parse that does not know the callee; the
+ *            \fguard around the predicate makes a predicate that does not type \false (unproven),
+ *            never silently \true.
+ *              global  the predicate names globals only;
+ *              formal  it names parameters of the callee: security_props.py writes each as
+ *                      \called_arg(p), the argument of the call.
+ *   entry    the same rule for a callee the target defines and calls through a function pointer,
+ *            as its precondition (context \precond, parameters written \formal(p)), which WP proves
+ *            at every call. At a pointer call MetAcsl cannot name the arguments, so a `calling`
+ *            instance there is `!(pointer == &callee)`, which never proves. The pointer call needs
+ *            a `calls` annotation naming the callee.
+ * A call placed in an initializer gets no \calling instance (MetAcsl 0.12): security_props.py writes
+ * `init_call` as a `check` into the work tree before the declaration, the call's arguments in place
+ * of the callee's parameters. The same template serves the \calling properties of Layers 5 and 6.
+ */
+//# calling
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\calling),
+      \tguard(\called == ${callee} ==> \fguard(${predicate}));
+*/
+//# entry
+/*@ meta \prop, \name(${name}), \targets({${callee}}), \context(\precond),
+      \fguard(${predicate});
+*/
+//# init_call
+/*@ check ${name}: ${predicate}; */

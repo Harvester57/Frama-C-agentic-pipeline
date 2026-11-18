@@ -1,0 +1,35 @@
+/*
+ * L3, assets (threat model `assets`): an lvalue only its declared writers write, and, when the
+ * threat model lists readers, only they read. It generalizes the auth state of Layer 4 to any
+ * integrity or confidentiality asset. The targets are listed by name: every function but the
+ * declared ones (scripts/security_props.py computes the set; never \inter or \in_file).
+ *   writers  context \writing: before each write, the written location is separated from the asset
+ *   readers  context \reading: before each read, the read location is separated from the asset
+ * Clauses, joined by &&:
+ *   global  the asset is a global lvalue (`config`, `session.mode`): program-wide
+ *   formal  the asset hangs off a parameter (`c->mode`): one clause per parameter name the object
+ *           is passed as (the lvalue's root and the threat model's `params`), each checked in the
+ *           functions that have a parameter of that name (\tguard: \true elsewhere). A helper that
+ *           takes the object under another name escapes the check: list that name.
+ * A call placed in an initializer gets no \writing instance from the callee's assigns (MetAcsl
+ * 0.12): security_props.py writes `init_write` as a `check` into the work tree there, `region`
+ * being what the callee assigns with the call's arguments in place of its parameters.
+ */
+//# writers
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\writing),
+      ${predicate};
+*/
+//# readers
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\reading),
+      ${predicate};
+*/
+//# writers_global
+\separated(\written, &${lvalue})
+//# writers_formal
+\tguard(\separated(\written, &${lvalue}))
+//# readers_global
+\separated(\read, &${lvalue})
+//# readers_formal
+\tguard(\separated(\read, &${lvalue}))
+//# init_write
+\separated(${region}, &${lvalue})

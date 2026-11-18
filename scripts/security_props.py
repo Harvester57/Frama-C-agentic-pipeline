@@ -36,6 +36,26 @@ search order, with a warning). It writes security_props.json
         L6_wiped_<secret>    zero when its release function (the secret's `function`) returns;
         L6_no_leak_<secret>  never passed to a sink, never read by a sink the target defines.
 
+Three optional threat-model lists (docs/plans/metacsl-exploitation-plan.md, package D1):
+  assets      L3_writers_<asset> (only the writers write the lvalue, \\writing) and, with `readers`,
+              L3_readers_<asset> (\\reading); class l3_isolation;
+  invariants  L4_invariant_<name>, class l4_invariant: weak, strong or conditional over the functions
+              of its `scope`, or monotonic (an lvalue only moves one way, at every write; not for Eva,
+              see `engines` and for_engine);
+  call_rules  L4_call_<callee>, class l4_call_rule: a predicate at every call of the callee.
+Their predicates and lvalues are validated before they reach an annotation (predicate_problem), and
+no generated text holds what MetAcsl mishandles (meta_text_problems).
+
+Where MetAcsl 0.12 generates nothing, the property says so instead of passing silently:
+  - a \\writing property reads the `assigns` of the declared functions its targets call (at their
+    declaration; the model holds no contract). Callers of a callee whose `assigns` holds a set leave
+    the targets (MetAcsl stops on it) and are listed under `unchecked`; callees without `assigns`
+    are listed under `declared_callees`;
+  - a call placed in an initializer gets no \\calling, \\writing or \\strong_invariant instance. With
+    the model's `initializer` flag on call sites (phase0_dump.ml, dump schema 5), each such site is
+    listed under `init_checks` and `run` writes a `check` named after the property there
+    (`code_checks`); a site no check can be written for is `unchecked`.
+
 The templates are templates/metacsl/*.acsl. Each property lists its `instances`: the functions in whose
 WP proof its generated annotations land (the target of a \\postcond, the callers of a \\precond or
 \\calling target, the writers of a \\writing property). Those are the ledger units (`ledger.py seed`
@@ -81,8 +101,13 @@ KINDS: dict[str, tuple[int, str]] = {
     "sanitized": (5, "l5_sanitized"),
     "wiped": (6, "l6_wiped"),
     "no_leak": (6, "l6_no_leak"),
+    # Package D1 of docs/plans/metacsl-exploitation-plan.md (names: its section 3.3).
+    "asset_writers": (3, "l3_isolation"),
+    "asset_readers": (3, "l3_isolation"),
+    "invariant": (4, "l4_invariant"),
+    "call_rule": (4, "l4_call_rule"),
 }
-CLASSES = tuple(cls for _, cls in KINDS.values())
+CLASSES = tuple(dict.fromkeys(cls for _, cls in KINDS.values()))
 # Generated property names start with these; run_wp_function maps goals named so to the class.
 NAME_PREFIX = {
     "auth_state": "L4_auth_state_",
@@ -90,6 +115,25 @@ NAME_PREFIX = {
     "sanitized": "L5_sanitized_",
     "wiped": "L6_wiped_",
     "no_leak": "L6_no_leak_",
+    "asset_writers": "L3_writers_",
+    "asset_readers": "L3_readers_",
+    "invariant": "L4_invariant_",
+    "call_rule": "L4_call_",
+}
+# Above this many instances a reads or invariant property gets a warning: each instance is a ledger unit.
+INSTANCE_WARN = 50
+# How the warnings about a threat-model item start, per property kind (`<prefix> <item>: ...`):
+# generate_report.py selects the generator's warnings by these prefixes.
+WARNING_PREFIX = {
+    "auth_state": "auth gate",
+    "auth_required": "auth gate",
+    "sanitized": "output sink",
+    "wiped": "secret",
+    "no_leak": "secret",
+    "asset_writers": "asset",
+    "asset_readers": "asset",
+    "invariant": "invariant",
+    "call_rule": "call rule",
 }
 
 # libc calls that write through a pointer argument: a caller writes through a pointer too.
@@ -211,11 +255,30 @@ class _Model:
             for name in f.get("external_calls") or []:
                 self.ext_callers[name].add(fid)
         self.external_formals: dict[str, list] = model.get("external_formals") or {}
+        self.external_decls: dict[str, dict] = model.get("external_decls") or {}
         self.globals_by_name: dict[str, list[dict]] = defaultdict(list)
         for g in (model.get("global_variables") or {}).values():
             self.globals_by_name[str(g.get("name"))].append(g)
         self.features = model_features(model)
         self.has_writes = self.features["writes"]
+        # Package E: a call site says whether it is the initializer of a local (`initializer`, dump
+        # schema 5). A model whose call sites never carry the key cannot tell.
+        sites = [s for f in self.functions.values() for s in (f.get("call_sites") or []) if isinstance(s, dict)]
+        self.has_call_sites = bool(sites)
+        self.has_init_flags = any("initializer" in s for s in sites)
+
+    def init_sites(self, fid: str, callee: str | None = None) -> list[dict]:
+        """The calls of `fid` placed in an initializer (`int n = f(x);`), of `callee` or of anything."""
+        sites = self.functions[fid].get("call_sites")
+        return [
+            s
+            for s in (sites if isinstance(sites, list) else [])
+            if isinstance(s, dict) and s.get("initializer") is True and callee in (None, s.get("callee"))
+        ]
+
+    def external(self, name: str) -> bool:
+        """`name` is called by the build and defined by none of its units (declared only)."""
+        return name in self.ext_callers and not self.by_name.get(name)
 
     def call_sites(self, fid: str, callee: str) -> list[dict] | None:
         """The calls of `callee` in `fid` with their literal arguments; None when the model recorded none."""
@@ -242,6 +305,51 @@ class _Model:
         name = ref.split("#")[-1]
         f = self.external_formals.get(name)
         return f if isinstance(f, list) else None
+
+    def _signature(self, ref: str) -> str:
+        for fid in self.resolve(ref):
+            if self.functions[fid].get("signature"):
+                return str(self.functions[fid]["signature"])
+        return str((self.external_decls.get(ref.split("#")[-1]) or {}).get("signature") or "")
+
+    def arg_refs(self, ref: str) -> dict[str, str] | None:
+        """
+        Parameter name -> the text that stands for the call's argument in an in-code check written at
+        a call of `ref`: `${argN}`, and for a pointer parameter `((T)${argN})` with the parameter's
+        type. ACSL has no implicit conversion from a C array to a pointer, so an array argument
+        (`char buf[8]; ... f(buf)`) written as it is would not type and would stop the function's WP
+        run; the cast is the conversion the call itself makes. A `void *` parameter is cast to
+        `char *` (its bytes). None when the parameters are unknown, or the type of a pointer one is.
+        """
+        formals = self.formals(ref)
+        if formals is None:
+            return None
+        sig = self._signature(ref)
+        types: list[str] = []
+        if sig.endswith(")") and "(" in sig:
+            depth, start = 0, sig.index("(") + 1
+            for i in range(start, len(sig)):
+                c = sig[i]
+                if c in "([":
+                    depth += 1
+                elif c in ")]" and depth:
+                    depth -= 1
+                elif (c == "," and not depth) or i == len(sig) - 1:
+                    types.append(sig[start:i].strip())
+                    start = i + 1
+        out: dict[str, str] = {}
+        for i, p in enumerate(formals):
+            ref_text = f"${{arg{i}}}"
+            if p.get("kind") in ("pointer", "const_pointer"):
+                kind = _RESTRICT_RE.sub("", types[i]).strip() if i < len(types) else ""
+                if not kind.endswith("*") and "(" not in kind:
+                    return None
+                if "(" not in kind and "[" not in kind:
+                    if _VOID_POINTER_RE.fullmatch(kind):
+                        kind = "char const *" if "const" in kind else "char *"
+                    ref_text = f"(({kind}){ref_text})"
+            out[str(p.get("name"))] = ref_text
+        return out
 
     def callers_of(self, ref: str) -> set[str]:
         """Project functions calling `ref` (a project function or an external one)."""
@@ -303,8 +411,204 @@ def _formalize(expr: str, formals: set[str]) -> str:
     return _IDENT_RE.sub(lambda m: f"\\formal({m.group(0)})" if m.group(0) in formals else m.group(0), expr)
 
 
+# What a threat-model predicate may hold (schemas/threat_model.schema.json, `predicate`): it is written
+# into a generated annotation like secrets[].size. `;` would close the meta-property and open another
+# clause; \result is refused by MetAcsl in a \postcond and becomes a silent \true under \tguard;
+# proof:deduce and proof:axiom (in \flags) assume a property instead of checking it (package R).
+_PREDICATE_RE = re.compile(r"^[A-Za-z0-9_ ()\[\]*+/.<>=!&|%^~?:,\\-]+$")
+_PREDICATE_BANNED = ("/*", "*/", "//", ";", "\\result", "\\flags", "proof:", "\\tguard", "\\inter", "\\in_file")
+# Names a predicate may use that are neither globals nor parameters.
+_ACSL_WORDS = frozenset(
+    "integer real boolean sizeof int char long short unsigned signed float double void struct union enum const "
+    "NULL true false".split()
+)
+
+
+_RESTRICT_RE = re.compile(r"\b(?:__restrict__|__restrict|restrict)\b")
+_VOID_POINTER_RE = re.compile(r"(?:const\s+)?void(?:\s+const)?\s*\*")
+
+
+def predicate_problem(text: object) -> str | None:
+    """Why a threat-model predicate cannot go into an annotation, or None."""
+    if not isinstance(text, str) or not text.strip():
+        return "empty"
+    if len(text) > 400:
+        return "longer than 400 characters"
+    for banned in _PREDICATE_BANNED:
+        if banned in text:
+            return f"holds `{banned}`"
+    if not _PREDICATE_RE.match(text):
+        return "holds a character a predicate cannot (letters, digits, spaces and ()[]*+/.<>=!&|%^~?:,\\- only)"
+    return None
+
+
+def _balanced(text: str, start: int) -> str:
+    """The text between the parenthesis at text[start] and its match (to the end when it never closes)."""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : i]
+    return text[start + 1 :]
+
+
+def meta_text_problems(acsl: str) -> list[str]:
+    """
+    What no generated property may hold, whatever a template or a threat model says (constraints of
+    package R, docs/plans/metacsl-exploitation-plan.md): \\inter or \\in_file in \\targets (the set is
+    computed here and listed), the proof:deduce and proof:axiom flags, \\result under \\tguard.
+    """
+    out: list[str] = []
+    for flag in ("proof:deduce", "proof:axiom"):
+        if re.search(re.escape(flag).replace(":", r"\s*:\s*"), acsl):
+            out.append(f"the flag {flag} (it assumes the property instead of checking it)")
+    for m in re.finditer(r"\\targets\s*\(", acsl):
+        inner = _balanced(acsl, m.end() - 1)
+        for op in ("\\inter", "\\in_file"):
+            if op in inner:
+                out.append(f"{op} in \\targets (MetAcsl 0.12 mishandles it: list the functions)")
+    for m in re.finditer(r"\\tguard\s*\(", acsl):
+        if "\\result" in _balanced(acsl, m.end() - 1):
+            out.append("\\result under \\tguard (it does not type there, so the property is a silent \\true)")
+    return out
+
+
+def _names_in(expr: str) -> list[tuple[int, int, str]]:
+    """(start, end, name) of the C identifiers of an expression: no ACSL builtin (`\\valid`), no field name."""
+    out = []
+    for m in _IDENT_RE.finditer(expr):
+        before = expr[: m.start()]
+        if before.endswith("\\") or before.rstrip().endswith((".", "->")) or (before[-1:].isdigit()):
+            continue
+        out.append((m.start(), m.end(), m.group(0)))
+    return out
+
+
+def _rename(expr: str, mapping: dict[str, str]) -> str:
+    """`expr` with each identifier of `mapping` replaced (not a field name, not an ACSL builtin)."""
+    out, last = [], 0
+    for start, end, name in _names_in(expr):
+        if name in mapping:
+            out += [expr[last:start], mapping[name]]
+            last = end
+    return "".join(out) + expr[last:]
+
+
+# ---------------------------------------------------------------------------------------------------
+# What a declared callee assigns (the \writing context takes a call's writes from the callee's assigns)
+# ---------------------------------------------------------------------------------------------------
+
+_SHARE: list[str | None] = []
+
+
+def _share_path() -> str | None:
+    """Frama-C's share directory (FRAMAC_SHARE, else `frama-c -print-share-path`), where its libc is."""
+    if not _SHARE:
+        import os  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+
+        found = os.environ.get("FRAMAC_SHARE") or None
+        if not found and shutil.which("frama-c"):
+            try:
+                res = subprocess.run(
+                    ["frama-c", "-print-share-path"], capture_output=True, text=True, timeout=30, check=False
+                )
+                found = res.stdout.strip() or None
+            except (OSError, subprocess.SubprocessError):
+                found = None
+        _SHARE.append(found)
+    return _SHARE[0]
+
+
+def contract_assigns(text: str, line: int, name: str) -> dict:
+    """
+    The `assigns` of the ACSL contract written before the declaration of `name` at `line` of `text`:
+    {status, terms}. status `listed` (terms: what it assigns, without \\result and \\nothing), `set`
+    (a term is \\union(...), \\inter(...) or {a, b}: MetAcsl 0.12 stops on it, meta_annotate.ml line
+    675), or `none` (no contract there, or one without `assigns`). Read from the text, not from
+    Frama-C: the Phase 0 parse runs with -no-annot, so the model holds no contract.
+    """
+    lines = text.splitlines(keepends=True)
+    start = sum(len(x) for x in lines[: max(0, line - 1)])
+    m = re.compile(rf"\b{re.escape(name)}\s*\(").search(text, start)
+    head = text[: m.start()] if m and text.count("\n", start, m.start()) <= 3 else text[:start]
+    found = re.search(r"/\*@((?:(?!\*/).)*)\*/[\s\w*]*$", head, re.DOTALL)
+    if not found:
+        return {"status": "none", "terms": []}
+    clauses = re.findall(r"\bassigns\b([^;]*);", found.group(1))
+    if not clauses:
+        return {"status": "none", "terms": []}
+    terms: list[str] = []
+    is_set = False
+    for clause in clauses:
+        lhs = clause.split("\\from")[0].strip()
+        if "\\union" in lhs or "\\inter" in lhs or "{" in lhs:
+            is_set = True
+        depth, cur = 0, ""
+        for ch in lhs + ",":
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            if ch == "," and depth == 0:
+                if cur.strip() and cur.strip() not in ("\\nothing", "\\result"):
+                    terms.append(" ".join(cur.split()))
+                cur = ""
+            else:
+                cur += ch
+    return {"status": "set" if is_set else "listed", "terms": terms}
+
+
+class _Contracts:
+    """What each declared (external) function assigns, read at its first declaration (`external_decls`)."""
+
+    def __init__(self, model: dict, roots: Iterable[Path] | None):
+        self.decls: dict[str, dict] = model.get("external_decls") or {}
+        self.tree = str(model.get("tree") or "").rstrip("/")
+        self.roots = [Path(r) for r in roots or []]
+        self.files: dict[str, str | None] = {}
+        self.cache: dict[str, dict] = {}
+
+    def _read(self, file: str) -> str | None:
+        if file not in self.files:
+            cands: list[Path] = []
+            if file.startswith("FRAMAC_SHARE/"):
+                share = _share_path()
+                cands = [Path(share) / file[len("FRAMAC_SHARE/") :]] if share else []
+            else:
+                rel = file[len(self.tree) + 1 :] if self.tree and file.startswith(self.tree + "/") else file
+                if not rel.startswith("/"):
+                    cands = [root / rel for root in self.roots]
+                cands.append(Path(file))
+            text = None
+            for cand in cands:
+                try:
+                    if cand.is_file():
+                        text = cand.read_text(encoding="utf-8", errors="replace")
+                        break
+                except OSError:
+                    continue
+            self.files[file] = text
+        return self.files[file]
+
+    def of(self, name: str) -> dict:
+        """{status: listed | set | none | unknown, terms, decl} for the declared function `name`."""
+        if name not in self.cache:
+            decl = str((self.decls.get(name) or {}).get("decl") or "")
+            file, _, line = decl.rpartition(":")
+            text = self._read(file) if file and line.isdigit() else None
+            res = contract_assigns(text, int(line), name) if text is not None else {"status": "unknown", "terms": []}
+            self.cache[name] = {**res, "decl": decl}
+        return self.cache[name]
+
+
 class _Gen:
-    def __init__(self, model: dict, block: dict | None, templates: _Templates):
+    def __init__(self, model: dict, block: dict | None, templates: _Templates, roots: Iterable[Path] | None = None):
+        self.contracts = _Contracts(model, roots)
         self.m = _Model(model)
         self.block = block or {}
         self.t = templates
@@ -316,6 +620,13 @@ class _Gen:
             for feature in ("external_calls", "formals", "writes"):
                 if not self.m.features[feature]:
                     self.warnings.append(f"the model has {MODEL_FEATURES[feature]}")
+            if block and self.m.has_call_sites and not self.m.has_init_flags:
+                self.warnings.append(
+                    "the model's call sites do not say which calls are initializers (`initializer`, dump schema 5): "
+                    "MetAcsl generates no \\calling, \\writing or \\strong_invariant instance at `int n = f(x);`, "
+                    "no in-code check is written there, and a unit whose only call of a sink is an initializer "
+                    "can be credited with nothing checked"
+                )
 
     # -- helpers ------------------------------------------------------------------------------------
 
@@ -339,7 +650,43 @@ class _Gen:
 
     def _add(self, kind: str, name: str, acsl: str, instances: set[str], **extra: Any) -> dict:
         layer, cls = KINDS[kind]
+        problems = meta_text_problems(acsl)
+        if problems:
+            self.warnings.append(
+                f"{WARNING_PREFIX.get(kind, kind)} property {name}: not generated, its text holds {'; '.join(problems)}"
+            )
+            return {}
         decided = {f: d for f, d in (extra.pop("decided", None) or {}).items() if f in self.m.live}
+        # An in-code check that does not type stops the whole WP run of its function. The meta file
+        # is parsed with the files that define the globals a property names (`sources`); a check
+        # written into another file is not, so it is placed only where its globals are defined.
+        kept: list[dict] = []
+        hidden: list[dict] = []
+        for c in extra.get("init_checks") or []:
+            file = str(c["function"]).rpartition("#")[0]
+            body = re.sub(r"\$\{arg\d+\}", " ", str(c["check"]).split(":", 1)[-1])
+            foreign = sorted(
+                {n for _, _, n in _names_in(body) if (files := self.m.global_files(n)) and file not in files}
+            )
+            if foreign:
+                where = {k: c[k] for k in ("function", "callee", "line") if k in c}
+                hidden.append(
+                    {
+                        **where,
+                        "reason": f"an initializer call of {c.get('callee')}: its check names {', '.join(foreign)}, "
+                        f"which {file} does not define (the check might not type there)",
+                    }
+                )
+            else:
+                kept.append(c)
+        if hidden:
+            extra["init_checks"] = kept
+            extra["unchecked"] = [*(extra.get("unchecked") or []), *hidden]
+            notes = [n for n in extra.get("notes") or [] if "placed in an initializer" not in n]
+            extra["notes"] = notes + self._init_note(kept)
+        for key in ("init_checks", "unchecked", "declared_callees"):
+            if key in extra and not extra[key]:
+                del extra[key]
         prop = {
             "name": name,
             "layer": layer,
@@ -370,10 +717,314 @@ class _Gen:
             return "formal", f"\\formal({root}){path}", []
         return None
 
+    # -- \writing properties and declared callees ------------------------------------------------------
+
+    def _writing_facts(self, allowed: set[str], scope: set[str] | None, what: str) -> dict:
+        """
+        What a \\writing property over `scope` (None: every function) but `allowed` meets in the
+        declared functions its targets call. MetAcsl takes the writes of such a call from the
+        callee's `assigns`:
+          excluded  the callers of a callee whose `assigns` holds a set (\\union(...), {a, b}):
+                    MetAcsl 0.12 stops on it (meta_annotate.ml line 675), so they leave the targets
+                    and are listed as `unchecked`;
+          writers   the callers of a callee that assigns something: instances of the property;
+          lists     `declared_callees`: set_assigns, no_assigns (nothing is generated for what such
+                    a callee writes, with no warning from MetAcsl) and unknown (declaration not read).
+        """
+        targets = (self.m.live if scope is None else scope & self.m.live) - allowed
+        lists: dict[str, dict[str, list[str]]] = {"set_assigns": {}, "no_assigns": {}, "unknown": {}}
+        key = {"set": "set_assigns", "none": "no_assigns", "unknown": "unknown"}
+        writers: set[str] = set()
+        unchecked: list[dict] = []
+        for fid in sorted(targets):
+            for callee in sorted(set(self.m.functions[fid].get("external_calls") or [])):
+                if not self.m.external(callee):
+                    continue
+                contract = self.contracts.of(callee)
+                status = contract["status"]
+                if status in key:
+                    lists[key[status]].setdefault(callee, []).append(fid)
+                if status == "set":
+                    unchecked.append(
+                        {
+                            "function": fid,
+                            "callee": callee,
+                            "reason": f"calls {callee}, whose `assigns` holds a set (\\union(...) or braces): MetAcsl "
+                            "stops on it, so the function is left out of the property's targets",
+                        }
+                    )
+                elif status == "listed" and contract["terms"]:
+                    writers.add(fid)
+        declared = {
+            k: [
+                {"callee": c, "callers": callers, **({"decl": d} if (d := self.contracts.of(c)["decl"]) else {})}
+                | ({"assigns": self.contracts.of(c)["terms"]} if k == "set_assigns" else {})
+                for c, callers in sorted(v.items())
+            ]
+            for k, v in lists.items()
+            if v
+        }
+
+        def some(names: Iterable[str]) -> str:
+            names = sorted(names)
+            return ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
+
+        if lists["set_assigns"]:
+            self.warnings.append(
+                f"{what}: {some(lists['set_assigns'])} assign(s) a set (`assigns \\union(...)` or `{{a, b}}`), which "
+                f"stops MetAcsl: the caller(s) {some({self.m.name(u['function']) for u in unchecked})} are left "
+                "out of the property and not checked. Write one `assigns` term per location in that contract"
+            )
+        if lists["no_assigns"]:
+            self.warnings.append(
+                f"{what}: the declared function(s) {some(lists['no_assigns'])} have no `assigns` at their "
+                "declaration: MetAcsl generates nothing for what they write, so the property says nothing about it"
+            )
+        return {
+            "excluded": {u["function"] for u in unchecked},
+            "writers": writers,
+            "unchecked": unchecked,
+            "declared_callees": declared,
+        }
+
+    def _but(self, allowed: Iterable[str], excluded: Iterable[str]) -> str:
+        """`a, b`: the C names a \\diff(\\ALL, {...}) leaves out (the allowed functions, then the excluded ids)."""
+        names = list(dict.fromkeys([*allowed, *sorted({self.m.name(f) for f in excluded})]))
+        return ", ".join(names)
+
+    def _targets(self, scope_names: list[str] | None, but: str) -> str:
+        """The \\targets text: the scope listed by name (never \\inter or \\in_file), else every function."""
+        left = {n.strip() for n in but.split(",") if n.strip()}
+        if scope_names is None:
+            return f"\\diff(\\ALL, {{{but}}})" if left else "\\ALL"
+        return "{" + ", ".join(n for n in scope_names if n not in left) + "}"
+
+    def _separated(self, variant: str, fid: str, names: list[str], path: str, state: str):
+        """
+        The in-code form of `\\separated(\\written, &state)` for function `fid`: region -> predicate,
+        or None when the property is \\true there (a state reached from a parameter `fid` lacks).
+        """
+        if variant == "global":
+            lvalues = [state]
+        else:
+            own = {str(p.get("name")) for p in self.m.functions[fid].get("formals") or []}
+            lvalues = [f"{n}{path}" for n in names if n in own]
+        if not lvalues:
+            return None
+        return lambda region: " && ".join(
+            self.t.render("l3_asset", "init_write", region=region, lvalue=lv) for lv in lvalues
+        )
+
+    def _init_write_checks(
+        self, name: str, pool: set[str], variant: str, names: list[str], path: str, state: str, transition: bool = False
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Package E, \\writing: MetAcsl gives a call placed in an initializer no instance from the
+        callee's `assigns`. For each such call of a declared function in `pool`, an in-code check that
+        what the callee assigns, with the call's arguments in place of its parameters, is separated
+        from the state. Returns (init_checks, unchecked): a site whose check cannot be written (the
+        callee's contract or parameters unknown, a transition property) is `unchecked`.
+        """
+        checks: list[dict] = []
+        unchecked: list[dict] = []
+        for fid in sorted(pool):
+            clause = self._separated(variant, fid, names, path, state)
+            if clause is None:
+                continue
+            for site in self.m.init_sites(fid):
+                callee = str(site.get("callee") or "")
+                if not self.m.external(callee):
+                    continue  # a function of the build: its own writes are checked in its own proof
+                where = {"function": fid, "callee": callee, "line": int(site.get("line") or 0)}
+                contract = self.contracts.of(callee)
+                if contract["status"] in ("none", "set") or (contract["status"] == "listed" and not contract["terms"]):
+                    continue  # nothing MetAcsl would check at a statement call either (see declared_callees)
+                mapping = self.m.arg_refs(callee)
+                if contract["status"] == "unknown" or mapping is None:
+                    unchecked.append(
+                        {
+                            **where,
+                            "reason": f"an initializer call of {callee}, whose `assigns` or parameter types are unknown",
+                        }
+                    )
+                    continue
+                if transition:
+                    unchecked.append(
+                        {**where, "reason": f"an initializer call of {callee}: a transition needs the state before it"}
+                    )
+                    continue
+                regions = []
+                for term in contract["terms"]:
+                    text = _rename(term, mapping)
+                    regions.append(text[1:].strip() if text.startswith("*") else f"&({text})")
+                predicate = " && ".join(clause(r) for r in regions)
+                check = self.t.render("l4_call_rule", "init_call", name=name, predicate=predicate)
+                checks.append({**where, "at": "before", "check": check})
+        return checks, unchecked
+
+    def _init_call_checks(
+        self, name: str, pool: Iterable[str], callee: str, predicate: str | None, why: str = ""
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Package E, \\calling: MetAcsl gives a call placed in an initializer no instance. For each such
+        call of `callee` in `pool`, the property's predicate as an in-code check before the
+        declaration (`predicate`: `${argN}` for the call's N-th argument); with no predicate the site
+        is `unchecked`, for the reason `why`.
+        """
+        checks: list[dict] = []
+        unchecked: list[dict] = []
+        for fid in sorted(pool):
+            for site in self.m.init_sites(fid, callee):
+                where = {"function": fid, "callee": callee, "line": int(site.get("line") or 0)}
+                if predicate is None:
+                    unchecked.append({**where, "reason": f"an initializer call of {callee}: {why}"})
+                else:
+                    check = self.t.render("l4_call_rule", "init_call", name=name, predicate=predicate)
+                    checks.append({**where, "at": "before", "check": check})
+        return checks, unchecked
+
+    def _init_note(self, checks: list[dict]) -> list[str]:
+        if not checks:
+            return []
+        return [
+            f"{len(checks)} call(s) placed in an initializer, where MetAcsl generates no instance: a `check` named "
+            "after the property is written into the work tree there (`init_checks`)"
+        ]
+
     # -- L3 -----------------------------------------------------------------------------------------
 
     def frame(self) -> dict[str, str]:
         return self.m.pointer_writers()
+
+    def _lvalue(self, lvalue: str, params: Iterable[str], what: str) -> dict | None:
+        """
+        {variant, root, path, names, acsl, files} of an asset or state lvalue: a global (`config`,
+        `session.mode`), or a field reached from a parameter (`c->mode`), with one ACSL lvalue per
+        parameter name the object is passed as. None (with a warning) when it names neither.
+        """
+        m = _STATE_RE.match(lvalue)
+        if not m:
+            self.warnings.append(f"{what}: `{lvalue}` is not an lvalue a property can name")
+            return None
+        root, path = m.group("root"), m.group("path")
+        files = self.m.global_files(root)
+        if files:
+            return {"variant": "global", "root": root, "path": path, "names": [], "acsl": [lvalue], "files": files}
+        known = {str(p.get("name")) for fid in self.m.live for p in self.m.functions[fid].get("formals") or []}
+        names = [n for n in dict.fromkeys([root, *params]) if n in known]
+        # A misspelt parameter name would make its clause \true in every function, silently.
+        for n in dict.fromkeys([root, *params]):
+            if n not in known:
+                self.warnings.append(
+                    f"{what}: {n} is neither a global of the build nor a parameter of one of its functions"
+                    + ("" if n == root else ": that name is left out")
+                )
+        if root not in known or not path:
+            if root in known:
+                self.warnings.append(
+                    f"{what}: `{lvalue}` is a parameter itself: name what it reaches (`{root}->field`)"
+                )
+            return None
+        return {
+            "variant": "formal",
+            "root": root,
+            "path": path,
+            "names": names,
+            "acsl": [f"\\formal({n}){path}" for n in names],
+            "files": [],
+        }
+
+    def assets(self) -> None:
+        """
+        Threat model `assets` (package D1): L3_writers_<name>, only the declared writers write the
+        lvalue (\\writing over every other function), and with `readers`, L3_readers_<name>, only
+        they read it (\\reading). Class l3_isolation.
+        """
+        pointer_writers = set(self.m.pointer_writers())
+        for item in self.block.get("assets") or []:
+            asset = str(item.get("name") or "")
+            what = f"asset {asset}"
+            lv = self._lvalue(str(item.get("lvalue") or ""), [str(p) for p in item.get("params") or []], what)
+            if lv is None:
+                continue
+            variant, root = lv["variant"], lv["root"]
+            note = (
+                []
+                if variant == "global"
+                else [
+                    f"{item['lvalue']} hangs off a parameter: checked only in functions with a parameter named "
+                    f"{' or '.join(lv['names'])}; a function that takes the object under another name is not checked"
+                ]
+            )
+            meta = {"asset": asset, "lvalue": item.get("lvalue")}
+            writers = [w for w in (self._one(str(r), f"{what} writers") for r in item.get("writers") or []) if w]
+            writer_fids = {f for w in writers for f in self.m.resolve(w)}
+            name = self._unique(f"{NAME_PREFIX['asset_writers']}{_ident(asset)}")
+            facts = self._writing_facts(writer_fids, None, f"{what} ({name})")
+            instances = (pointer_writers | self.m.direct_writers(root) | facts["writers"]) - writer_fids
+            instances -= facts["excluded"]
+            predicate = " &&\n      ".join(
+                self.t.render("l3_asset", f"writers_{variant}", lvalue=a) for a in lv["acsl"]
+            )
+            targets = self._targets(None, self._but(writers, facts["excluded"]))
+            checks, unchecked = self._init_write_checks(
+                name, instances, variant, lv["names"], lv["path"], str(item["lvalue"])
+            )
+            self._add(
+                "asset_writers",
+                name,
+                self.t.render("l3_asset", "writers", name=name, targets=targets, predicate=predicate),
+                instances,
+                sources=lv["files"],
+                notes=note + self._init_note(checks),
+                threat_model={**meta, "writers": writers},
+                targets=f"every function but {', '.join(writers)}" if writers else "every function",
+                variant=variant,
+                direct_writers=sorted(self.m.direct_writers(root) - writer_fids),
+                init_checks=checks,
+                unchecked=facts["unchecked"] + unchecked,
+                declared_callees=facts["declared_callees"],
+            )
+            if item.get("readers") is None:
+                continue
+            readers = [r for r in (self._one(str(r), f"{what} readers") for r in item.get("readers") or []) if r]
+            reader_fids = {f for r in readers for f in self.m.resolve(r)}
+            name = self._unique(f"{NAME_PREFIX['asset_readers']}{_ident(asset)}")
+            # Any function may read it through a pointer: every function but the readers is an instance
+            # (for a parameter-held asset, those with a parameter of one of the names).
+            pool = set(self.m.live)
+            if variant == "formal":
+                pool = {
+                    f
+                    for f in pool
+                    if {str(p.get("name")) for p in self.m.functions[f].get("formals") or []} & set(lv["names"])
+                }
+            instances = pool - reader_fids
+            if len(instances) > INSTANCE_WARN:
+                self.warnings.append(
+                    f"{what} ({name}): {len(instances)} functions carry a unit of this property (every function but the "
+                    "readers may read the asset through a pointer)"
+                )
+            predicate = " &&\n      ".join(
+                self.t.render("l3_asset", f"readers_{variant}", lvalue=a) for a in lv["acsl"]
+            )
+            self._add(
+                "asset_readers",
+                name,
+                self.t.render(
+                    "l3_asset",
+                    "readers",
+                    name=name,
+                    targets=self._targets(None, self._but(readers, [])),
+                    predicate=predicate,
+                ),
+                instances,
+                sources=lv["files"],
+                notes=list(note),
+                threat_model={**meta, "readers": readers},
+                targets=f"every function but {', '.join(readers)}" if readers else "every function",
+                variant=variant,
+            )
 
     # -- L4 -----------------------------------------------------------------------------------------
 
@@ -406,19 +1057,28 @@ class _Gen:
                 else [f"{state} hangs off a parameter: checked only in functions with a parameter named {root}"]
             )
             gate_fids = set(self.m.resolve(gate))
-            writes = (set(writers) | self.m.direct_writers(root)) - gate_fids
             name = self._unique(f"{NAME_PREFIX['auth_state']}{_ident(gate)}")
-            acsl = self.t.render("l4_auth_state", variant, name=name, gate=gate, state=lv)
+            # What declared callees assign counts as a write of their caller (MetAcsl reads their `assigns`).
+            facts = self._writing_facts(gate_fids, None, f"auth gate {gate} ({name})")
+            writes = (set(writers) | self.m.direct_writers(root) | facts["writers"]) - gate_fids - facts["excluded"]
+            acsl = self.t.render(
+                "l4_auth_state", variant, name=name, gate=self._but([gate], facts["excluded"]), state=lv
+            )
+            path = str(state)[len(root) :]
+            checks, unchecked = self._init_write_checks(name, writes, variant, [root], path, str(state))
             self._add(
                 "auth_state",
                 name,
                 acsl,
                 writes,
                 sources=files,
-                notes=note,
+                notes=note + self._init_note(checks),
                 threat_model={"auth_gate": gate, "state": state},
                 targets=f"every function but {gate}",
                 direct_writers=sorted(self.m.direct_writers(root) - gate_fids),
+                init_checks=checks,
+                unchecked=facts["unchecked"] + unchecked,
+                declared_callees=facts["declared_callees"],
             )
             if not protects:
                 continue
@@ -482,6 +1142,217 @@ class _Gen:
             targets=gate,
             code={"returns": True, "check": check},
         )
+
+    def _unknown_names(self, predicate: str, params: set[str]) -> list[str]:
+        """Identifiers of a predicate that are neither globals of the build, `params`, nor ACSL words."""
+        seen = dict.fromkeys(n for _, _, n in _names_in(predicate))
+        return [n for n in seen if n not in params and n not in _ACSL_WORDS and not self.m.global_files(n)]
+
+    def invariants(self) -> None:
+        """
+        Threat model `invariants` (package D1): L4_invariant_<name>, class l4_invariant. Variants
+        weak, strong and conditional state a predicate over globals on the functions in scope;
+        monotonic states that an lvalue only moves one way, at every write.
+        """
+        pointer_writers = set(self.m.pointer_writers())
+        for item in self.block.get("invariants") or []:
+            inv = str(item.get("name") or "")
+            variant = str(item.get("variant") or "")
+            what = f"invariant {inv}"
+            scope_names: list[str] | None = None
+            scope: set[str] | None = None
+            if item.get("scope"):
+                scope_names = [s for s in (self._one(str(r), f"{what} scope") for r in item["scope"]) if s]
+                scope = {f for s in scope_names for f in self.m.resolve(s) if f in self.m.live}
+                if not scope:
+                    self.warnings.append(f"{what}: no function of its scope is defined in the build: not generated")
+                    continue
+            name = self._unique(f"{NAME_PREFIX['invariant']}{_ident(inv)}")
+            meta = {"invariant": inv, "variant": variant, **({"scope": scope_names} if scope_names else {})}
+            if variant == "monotonic":
+                if item.get("predicate") is not None or not item.get("lvalue"):
+                    self.warnings.append(f"{what}: a monotonic invariant takes an `lvalue` and no `predicate`")
+                    continue
+                lv = self._lvalue(str(item["lvalue"]), [], what)
+                if lv is None:
+                    continue
+                order = ">=" if item.get("direction") == "down" else "<="
+                facts = self._writing_facts(set(), scope, f"{what} ({name})")
+                instances = pointer_writers | self.m.direct_writers(lv["root"]) | facts["writers"]
+                instances = (instances & (scope if scope is not None else self.m.live)) - facts["excluded"]
+                template = "monotonic" if lv["variant"] == "global" else "monotonic_formal"
+                targets = self._targets(scope_names, self._but([], facts["excluded"]))
+                # A transition cannot be written as one in-code check: initializer calls are unchecked.
+                _, unchecked = self._init_write_checks(
+                    name, instances, lv["variant"], lv["names"], lv["path"], str(item["lvalue"]), transition=True
+                )
+                prop = self._add(
+                    "invariant",
+                    name,
+                    self.t.render(
+                        "l4_invariant", template, name=name, targets=targets, lvalue=lv["acsl"][0], order=order
+                    ),
+                    instances,
+                    sources=lv["files"],
+                    notes=[
+                        f"{item['lvalue']} only moves {'down' if order == '>=' else 'up'}, at every write; "
+                        "\\at(x, Before) is not evaluated by Eva: `engines` leaves it out"
+                    ],
+                    threat_model={**meta, "lvalue": item["lvalue"], "direction": item.get("direction") or "up"},
+                    targets=", ".join(scope_names) if scope_names else "every function",
+                    variant=template,
+                    engines=[e for e in META_ENGINES if e != "eva"],
+                    unchecked=facts["unchecked"] + unchecked,
+                    declared_callees=facts["declared_callees"],
+                )
+            else:
+                problem = (
+                    predicate_problem(item.get("predicate"))
+                    if variant in ("weak", "strong", "conditional")
+                    else f"unknown variant `{variant}`"
+                )
+                if problem is None and item.get("lvalue"):
+                    problem = "`lvalue` goes with the monotonic variant"
+                if problem is None and variant == "conditional" and scope is None:
+                    problem = "a conditional invariant needs a `scope` (the entry points that keep it)"
+                if problem:
+                    self.warnings.append(f"{what}: {problem}: not generated")
+                    continue
+                predicate = str(item["predicate"])
+                unknown = self._unknown_names(predicate, set())
+                if unknown:
+                    self.warnings.append(
+                        f"{what}: the predicate names {', '.join(unknown)}, which no unit of the build defines as a "
+                        "global: the property does not type where they are not in scope"
+                    )
+                targets = self._targets(scope_names, "")
+                inside = set(scope) if scope is not None else set(self.m.live)
+                notes: list[str] = []
+                instances = set(inside)
+                files = sorted({f for _, _, n in _names_in(predicate) for f in self.m.global_files(n)})
+                checks: list[dict] = []
+                if variant != "conditional":
+                    # The generated `requires` is proved at each call: the callers carry it too.
+                    callers = {c for f in inside for c in self.m.callers.get(f, ())} & self.m.live
+                    instances |= callers
+                    entry = sorted(self.m.name(f) for f in inside if not self.m.callers.get(f))
+                    if entry:
+                        notes.append(
+                            f"no project code calls {', '.join(entry[:8])}{' ...' if len(entry) > 8 else ''}: "
+                            "their external callers must establish the invariant"
+                        )
+                if variant == "strong":
+                    # Package E: after an initializer call MetAcsl's default simplification drops the
+                    # assertion, whatever the callee writes.
+                    for fid in sorted(inside):
+                        for site in self.m.init_sites(fid):
+                            checks.append(
+                                {
+                                    "function": fid,
+                                    "callee": str(site.get("callee") or ""),
+                                    "line": int(site.get("line") or 0),
+                                    "at": "after",
+                                    "check": self.t.render(
+                                        "l4_invariant", "init_strong", name=name, predicate=predicate
+                                    ),
+                                }
+                            )
+                prop = self._add(
+                    "invariant",
+                    name,
+                    self.t.render("l4_invariant", variant, name=name, targets=targets, predicate=predicate),
+                    instances,
+                    sources=files,
+                    notes=notes + self._init_note(checks),
+                    threat_model={**meta, "predicate": predicate},
+                    targets=", ".join(scope_names) if scope_names else "every function",
+                    variant=variant,
+                    init_checks=checks,
+                )
+            count = len(prop.get("instances") or [])
+            if count > INSTANCE_WARN:
+                self.warnings.append(
+                    f"{what} ({name}): {count} functions carry a unit of this invariant"
+                    + (" (no `scope`: every function of the build)" if scope is None else "")
+                    + f": give a `scope` to bound it (warning above {INSTANCE_WARN})"
+                )
+
+    def call_rules(self) -> None:
+        """
+        Threat model `call_rules` (package D1): L4_call_<callee>, class l4_call_rule: a predicate
+        that holds at every call of the callee. A parameter of the callee named in the predicate is
+        the argument of the call (\\called_arg). A callee the target defines and calls through a
+        function pointer gets the rule as its precondition instead, as a Layer 5 sink does.
+        """
+        for item in self.block.get("call_rules") or []:
+            ref = str(item.get("function") or "")
+            callee = self._one(ref, f"call rule {ref.split('#')[-1]}")
+            if callee is None:
+                continue
+            what = f"call rule {callee}"
+            problem = predicate_problem(item.get("predicate"))
+            if problem:
+                self.warnings.append(f"{what}: the predicate {problem}: not generated")
+                continue
+            predicate = str(item["predicate"])
+            formals = self.m.formals(ref)
+            params = [str(p.get("name")) for p in formals or []]
+            used = [p for p in params if p in {n for _, _, n in _names_in(predicate)}]
+            unknown = self._unknown_names(predicate, set(params))
+            if unknown:
+                self.warnings.append(
+                    f"{what}: the predicate names {', '.join(unknown)}, which is neither a parameter of {callee} "
+                    "nor a global of the build"
+                    + ("" if formals is not None else " (the model has no parameters for it)")
+                    + ": the property is \\false (unproven) where the name does not type"
+                )
+            entry = any(f in self.m.pointer_called for f in self.m.resolve(ref) if f in self.m.live)
+            name = self._unique(f"{NAME_PREFIX['call_rule']}{_ident(callee)}")
+            instances = self.m.callers_of(ref)
+            notes = []
+            if not instances:
+                notes.append(f"no project code calls {callee}: nothing to discharge in the target")
+            checks: list[dict] = []
+            unchecked: list[dict] = []
+            if entry:
+                acsl = self.t.render(
+                    "l4_call_rule",
+                    "entry",
+                    name=name,
+                    callee=callee,
+                    predicate=_rename(predicate, {p: f"\\formal({p})" for p in params}),
+                )
+                notes.append(
+                    f"{callee} is called through a function pointer: the rule is its precondition, proved at each "
+                    f"call; a call through a pointer needs a `calls` annotation naming {callee}"
+                )
+            else:
+                acsl = self.t.render(
+                    "l4_call_rule",
+                    "calling",
+                    name=name,
+                    targets="\\ALL",
+                    callee=callee,
+                    predicate=_rename(predicate, {p: f"\\called_arg({p})" for p in params}),
+                )
+                refs = self.m.arg_refs(ref)
+                code = _rename(predicate, refs) if refs is not None else None
+                checks, unchecked = self._init_call_checks(
+                    name, instances, callee, code, "the callee's parameters or their types are unknown"
+                )
+            self._add(
+                "call_rule",
+                name,
+                acsl,
+                instances,
+                sources=sorted({f for _, _, n in _names_in(predicate) for f in self.m.global_files(n)}),
+                notes=notes + self._init_note(checks),
+                threat_model={"call_rule": callee, "predicate": predicate},
+                targets=callee,
+                variant="entry" if entry else "formal" if used else "global",
+                init_checks=checks,
+                unchecked=unchecked,
+            )
 
     # -- L5 -----------------------------------------------------------------------------------------
 
@@ -706,15 +1577,39 @@ class _Gen:
             decided: dict[str, dict] = {}
             if kind in TEXT_SINKS and not buffer:
                 decided = self._decide_text_literals(sink, params, formals, instances, notes)
+            checks: list[dict] = []
+            unchecked: list[dict] = []
+            if variant == "emit":
+                # Package E: the \calling instance MetAcsl does not generate at an initializer call.
+                index = {str(p.get("name")): i for i, p in enumerate(formals or [])}
+                wanted = [*params, *([str(length)] if bytes_sink and length else [])]
+                code = None
+                why = "the sink's parameters or their types are unknown"
+                args = self.m.arg_refs(sink)
+                if kind in TEXT_SINKS:
+                    # `no_crlf_string` is declared in the meta file's preamble; whether the caller's
+                    # file declares it is not known here, and a check that does not type stops its
+                    # function's WP run.
+                    why = "a text sink: `no_crlf_string` is not known to be declared in the caller's file"
+                elif args is not None and all(p in index for p in wanted):
+                    code = " && ".join(
+                        f"\\initialized({args[p]} + (0 .. {args[str(length)]} - 1))"
+                        if length
+                        else f"\\initialized({args[p]})"
+                        for p in params
+                    )
+                checks, unchecked = self._init_call_checks(name, instances - set(decided), sink, code, why)
             self._add(
                 "sanitized",
                 name,
                 acsl,
                 instances,
                 decided=decided,
-                notes=notes,
+                notes=notes + self._init_note(checks),
                 threat_model=meta,
                 targets=sink,
+                init_checks=checks,
+                unchecked=unchecked,
             )
 
     def _format_literal(self, item: dict, sink: str) -> None:
@@ -1015,9 +1910,20 @@ class _Gen:
             if not sinks:
                 continue
             clauses, defined, instances = [], [], set()
+            # Package E: per sink, the same clause over the arguments of a call (`${argN}`), for the
+            # in-code check at an initializer call; None when the sink's parameters are unknown.
+            region_code = re.sub(r"\\formal\((\w+)\)", r"\1", sec["region"])
+            init_code: dict[str, str | None] = {}
             for s in sinks:
                 sname = str(s["function"]).split("#")[-1]
-                params, _ = self._sink_params(s, sname, ("pointer", "const_pointer"))
+                params, sink_formals = self._sink_params(s, sname, ("pointer", "const_pointer"))
+                refs = self.m.arg_refs(sname)
+                if params:
+                    init_code[sname] = (
+                        " && ".join(f"\\separated({refs[p]}, {region_code})" for p in params)
+                        if refs is not None and all(p in refs for p in params)
+                        else None
+                    )
                 for p in params:
                     clauses.append(
                         self.t.render("l6_no_leak", "call_clause", sink=sname, param=p, region=sec["region"])
@@ -1039,6 +1945,13 @@ class _Gen:
             if sec["scope"] != "global":
                 notes.append(f"a parameter secret is checked in {fn_name} only")
             taint = self._taint_plan(item, sec, sinks, set(instances))
+            checks: list[dict] = []
+            unchecked: list[dict] = []
+            for sname, code in sorted(init_code.items()):
+                found = self._init_call_checks(pname, instances, sname, code, "the sink's parameters are unknown")
+                checks += found[0]
+                unchecked += found[1]
+            notes += self._init_note(checks)
             if defined and sec["scope"] == "global":
                 rname = self._unique(f"{NAME_PREFIX['no_leak']}read_{_ident(name)}")
                 sink_names = sorted({self.m.name(f) for f in defined})
@@ -1056,6 +1969,8 @@ class _Gen:
                 threat_model={"secret": name, "kind": item.get("kind"), "sinks": [str(s["function"]) for s in sinks]},
                 targets=targets,
                 taint=taint,
+                init_checks=checks,
+                unchecked=unchecked,
             )
 
     def _local_wipe(self, item: dict, sec: dict) -> None:
@@ -1144,14 +2059,23 @@ class _Gen:
         return {"sources": sources, "checks": checks, "notes": notes}
 
 
-def generate(model: dict, threat: dict | None, templates: _Templates | None = None) -> dict:
-    """The security properties of a model under a threat model (trust.load_threat_model's result)."""
+def generate(
+    model: dict, threat: dict | None, templates: _Templates | None = None, roots: Iterable[Path] | None = None
+) -> dict:
+    """
+    The security properties of a model under a threat model (trust.load_threat_model's result).
+    `roots`: where the target's files are (the work tree, the model's tree), to read what the declared
+    functions assign at their declarations; without them those contracts are `unknown`.
+    """
     threat = threat or {"status": "no_threat_model"}
     block = threat.get("block") if threat.get("status") == "ok" else None
-    gen = _Gen(model, block, templates or _Templates())
+    gen = _Gen(model, block, templates or _Templates(), roots)
     frame = gen.frame()
     if block:
+        gen.assets()
         gen.auth_gates()
+        gen.invariants()
+        gen.call_rules()
         gen.output_sinks()
         gen.secrets()
     elif threat.get("status") == "invalid_threat_model":
@@ -1174,6 +2098,18 @@ def generate(model: dict, threat: dict | None, templates: _Templates | None = No
                     "decided_reason": d["reason"],
                 }
             )
+        # A function left out of the property's targets (a callee whose `assigns` stops MetAcsl): the
+        # obligation stays, marked, so its unit exists and no run without a goal can credit it.
+        for u in prop.get("unchecked") or []:
+            if u["function"] not in prop["instances"] and u["function"] in gen.m.live:
+                obligations[u["function"]].append(
+                    {
+                        "class": prop["obligation_class"],
+                        "property": prop["name"],
+                        "reason": reason,
+                        "unchecked": u["reason"],
+                    }
+                )
     by_class: dict[str, int] = defaultdict(int)
     for items in obligations.values():
         for cls in {i["class"] for i in items}:
@@ -1263,6 +2199,16 @@ def meta_engines(props: dict | None) -> frozenset[str]:
     return frozenset(e for e in chosen if e in META_ENGINES) if isinstance(chosen, list) else frozenset()
 
 
+def for_engine(props: dict, engine: str) -> dict:
+    """
+    `props` with the properties `engine` (`eva`, `eacsl`) may load: a property that lists `engines`
+    is kept only when the engine is among them (a monotonic invariant uses \\at(x, Before), which Eva
+    does not evaluate). Pass the result to module_meta_file_text; WP loads every property.
+    """
+    kept = [p for p in props.get("properties") or [] if "engines" not in p or engine in p["engines"]]
+    return {**props, "properties": kept}
+
+
 def _engine_list(text: str) -> list[str]:
     """`eva,eacsl` -> ["eva", "eacsl"]; `none` -> []."""
     names = [t.strip().lower() for t in text.split(",") if t.strip()]
@@ -1330,15 +2276,18 @@ def meta_line_names(text: str) -> dict[int, str]:
 TAINT_TAG = "eva_taint"
 DEFAULT_WORK = Path("workspace/work")
 # What apply_taint inserts, and nothing else: re-running it first removes these.
+# The checks carry a generated property name: a local's wipe, a gate's failure, and (package E) any
+# property with a call placed in an initializer.
 _GENERATED_TAINT_RE = re.compile(
     r"/\*@ (?:taint [^\n]*?; |assert L6_no_leak_[A-Za-z0-9_]+: " + TAINT_TAG + r": [^\n]*?; "
-    r"|check (?:L6_wiped_|L4_auth_state_)[A-Za-z0-9_]+: [^\n]*?; )\*/ "
+    r"|check (?:" + "|".join(sorted(NAME_PREFIX.values())) + r")[A-Za-z0-9_]+: [^\n]*?; )\*/ "
 )
 # Argument text an assertion may repeat: no call, assignment or increment.
 _ARG_UNSAFE_RE = re.compile(r"[A-Za-z_]\w*\s*\(|(?<![=!<>])=(?!=)|\+\+|--")
 _STATEMENT_STOP = frozenset({";", "{", "}"})
-# Code-check operations (written whatever --eva-taint says): a local's wipe (M6), a gate's failure (M7).
-CODE_OPS = frozenset({"local", "returns"})
+# Code-check operations (written whatever --eva-taint says): a local's wipe (M6), a gate's failure
+# (M7), a property's check at a call placed in an initializer (package E).
+CODE_OPS = frozenset({"local", "returns", "init"})
 
 
 def taint_annotation(lvalues: str) -> str:
@@ -1425,27 +2374,139 @@ def _statement_start(tokens: list, idx: int) -> int | None:
     return start
 
 
+def _unplaced(op: dict, where: str, name: str, reason: str) -> dict:
+    return {
+        "property": op["property"],
+        "function": f"{where}#{name}",
+        "callee": op["callee"],
+        "line": op["line"],
+        "reason": reason,
+    }
+
+
+def _init_check_inserts(
+    source: str,
+    tokens: list,
+    ops: list[dict],
+    skipped: list[str],
+    where: str,
+    name: str,
+    placed: list[dict] | None,
+    unplaced: list[dict] | None,
+) -> list[tuple[int, str]]:
+    """
+    Package E: the checks at the calls placed in initializers (`int n = f(x);`). Each op names a
+    callee and the line the model gives the call; the call is found in the function's tokens as a
+    call of that callee inside a declaration that starts or sits on that line. `at` before: the check
+    goes before the declaration, with `${argN}` replaced by the text of the call's N-th argument;
+    `at` after: after the `;` that ends it. A site that is not found, shares its declaration with
+    another declarator, or has an argument the check cannot repeat (a call, an assignment) goes to
+    `skipped` and `unplaced`.
+    """
+    out: list[tuple[int, str]] = []
+    # (callee, line of the declaration or of the call) -> the call's place and arguments.
+    found: dict[tuple[str, int], dict] = {}
+    callees = {op["callee"] for op in ops}
+    for i, tok in enumerate(tokens):
+        if tok.kind != "c_token" or tok.text not in callees:
+            continue
+        nxt = next((k for k in range(i + 1, len(tokens)) if tokens[k].kind == "c_token"), None)
+        prev = next((k for k in range(i - 1, -1, -1) if tokens[k].kind == "c_token"), None)
+        if nxt is None or tokens[nxt].text != "(" or (prev is not None and tokens[prev].text in (".", "->")):
+            continue
+        depth, close = 0, None
+        for k in range(nxt, len(tokens)):
+            if tokens[k].kind == "c_token" and tokens[k].text == "(":
+                depth += 1
+            elif tokens[k].kind == "c_token" and tokens[k].text == ")":
+                depth -= 1
+                if depth == 0:
+                    close = k
+                    break
+        if close is None:
+            continue
+        start = _statement_start(tokens, i)
+        end = next((k for k in range(close + 1, len(tokens)) if tokens[k].kind == "c_token"), None)
+        site: dict[str, Any] = {"line": tok.line, "problem": None}
+        if start is None or end is None or tokens[end].text != ";":
+            site["problem"] = "the call is not the whole initializer of one declaration"
+        else:
+            head = [t.text for t in tokens[start:i] if t.kind == "c_token"]
+            # A declaration: `T n = f(...)`, at least a type and a name before the `=`, no lvalue operator.
+            lhs = head[: head.index("=")] if "=" in head else []
+            if len(lhs) < 2 or not _IDENT_RE.fullmatch(lhs[0]) or {".", "->", "[", "("} & set(lhs):
+                continue  # a statement call (`n = f(x);`, `f(x);`): MetAcsl handles it
+            site.update(start=tokens[start].start, end=tokens[end].end, args=_call_args(tokens, nxt, close, source))
+            site.update(start_line=tokens[start].line, end_line=tokens[end].line)
+            found.setdefault((tok.text, tokens[start].line), site)
+        found.setdefault((tok.text, tok.line), site)
+    # A fixed order on a line (the checks before a declaration, then the ones after it, by property):
+    # a report names a check by its file and line only, so `index` tells the checks of one line apart.
+    on_line: dict[int, int] = defaultdict(int)
+    for op in sorted(ops, key=lambda o: (o["line"], o["at"] != "before", o["property"])):
+        hit = found.get((op["callee"], op["line"]))
+        problem = "no initializer call found on that line (a macro?)" if hit is None else hit["problem"]
+        text = ""
+        if hit is not None and problem is None:
+            text = op["check"]
+            for n in sorted({int(x) for x in re.findall(r"\$\{arg(\d+)\}", text)}):
+                if n >= len(hit["args"]) or _ARG_UNSAFE_RE.search(hit["args"][n]):
+                    problem = "an argument the check cannot repeat"
+                    break
+                text = text.replace(f"${{arg{n}}}", f"({hit['args'][n]})")
+        if hit is None or problem is not None:
+            skipped.append(f"{where}:{op['line']}: {name}, initializer call of {op['callee']}: {problem}")
+            if unplaced is not None:
+                unplaced.append(_unplaced(op, where, name, f"an initializer call of {op['callee']}: {problem}"))
+            continue
+        out.append((hit["start"] if op["at"] == "before" else hit["end"], text + " "))
+        # Where a report locates the check: the line it is written on, not the line of the call.
+        line = int(hit["start_line"] if op["at"] == "before" else hit["end_line"])
+        if placed is not None:
+            placed.append(
+                {
+                    "file": where,
+                    "line": line,
+                    "function": f"{where}#{name}",
+                    "property": op["property"],
+                    "index": on_line[line],
+                }
+            )
+        on_line[line] += 1
+    return out
+
+
 def _insert_taint_in_function(
-    source: str, name: str, ops: list[dict], skipped: list[str], where: str, placed: list[dict] | None = None
+    source: str,
+    name: str,
+    ops: list[dict],
+    skipped: list[str],
+    where: str,
+    placed: list[dict] | None = None,
+    unplaced: list[dict] | None = None,
 ) -> list:
     """
     (offset, text) insertions for one function's sources and checks; problems go to `skipped`, and each
-    check placed (file, line, function, property: where Eva reports its status) to `placed`.
+    check placed (file, line, function, property: where Eva reports its status) to `placed`. An
+    initializer check that could not be placed also goes to `unplaced`.
     """
     from acsl_ast import _find_body_brace_offset, locate_all_definition_spans, tokenize_c_acsl  # noqa: PLC0415
 
+    init_ops = [op for op in ops if op["kind"] == "init"]
+    ops = [op for op in ops if op["kind"] != "init"]
     spans = locate_all_definition_spans(source, where)
     span = spans.get(name)
-    if span is None:
-        skipped.append(f"{where}#{name}: no definition found")
-        return []
-    brace = _find_body_brace_offset(span.text, where)
-    if brace is None:
-        skipped.append(f"{where}#{name}: no body found")
+    brace = _find_body_brace_offset(span.text, where) if span is not None else None
+    if span is None or brace is None:
+        skipped.append(f"{where}#{name}: no {'definition' if span is None else 'body'} found")
+        if unplaced is not None:
+            unplaced += [_unplaced(op, where, name, "the function was not found in the work tree") for op in init_ops]
         return []
     body_start = span.start_byte + brace
     tokens = [t for t in tokenize_c_acsl(source, where) if body_start <= t.start < span.end_byte]
     out: list[tuple[int, str]] = []
+    if init_ops:
+        out += _init_check_inserts(source, tokens, init_ops, skipped, where, name, placed, unplaced)
     for op in ops:
         if op["kind"] == "local":
             out += _local_check_inserts(source, tokens, op, skipped, where, name, placed)
@@ -1597,7 +2658,22 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
     """
     by_file: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
     code_placed: list[dict] = []
+    init_unplaced: list[dict] = []
     for p in props.get("properties") or []:
+        # Package E: the property's checks at calls placed in initializers. Unlike `code`, the
+        # property keeps its MetAcsl text: these only stand in where MetAcsl generates no instance.
+        for c in p.get("init_checks") or []:
+            file, _, name = str(c["function"]).rpartition("#")
+            by_file[file][name].append(
+                {
+                    "kind": "init",
+                    "callee": c["callee"],
+                    "line": c["line"],
+                    "at": c.get("at") or "before",
+                    "check": c["check"],
+                    "property": p["name"],
+                }
+            )
         code = p.get("code")
         for fid in p.get("instances") or [] if code else []:
             file, _, name = str(fid).rpartition("#")
@@ -1635,6 +2711,12 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
         path = work / file
         if not path.is_file():
             skipped.append(f"{file}: not in the work tree")
+            init_unplaced += [
+                _unplaced(op, file, name, "its file is not in the work tree")
+                for name, ops in sorted(by_file.get(file, {}).items())
+                for op in ops
+                if op["kind"] == "init"
+            ]
             continue
         original = path.read_text(encoding="utf-8", errors="surrogateescape")
         text, _ = strip_taint(original)
@@ -1643,7 +2725,7 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
         for name, ops in sorted(by_file.get(file, {}).items()):
             local_ops = [op for op in ops if op["kind"] in CODE_OPS]
             taint_ops = [op for op in ops if op["kind"] not in CODE_OPS]
-            inserts += _insert_taint_in_function(text, name, local_ops, skipped, file, code_placed)
+            inserts += _insert_taint_in_function(text, name, local_ops, skipped, file, code_placed, init_unplaced)
             found = _insert_taint_in_function(text, name, taint_ops, skipped, file, placed)
             if found:
                 annotated.append(f"{file}#{name}")
@@ -1663,8 +2745,34 @@ def apply_taint(props: dict, work: Path, taint: bool = True) -> dict:
         "functions": sorted(set(annotated)),
         "checks": sorted(placed, key=lambda c: (c["file"], c["line"], c["property"])),
         "code_checks": sorted(code_placed, key=lambda c: (c["file"], c["line"], c["property"])),
+        "init_unplaced": init_unplaced,
         "skipped": skipped,
     }
+
+
+def settle_init_checks(props: dict, unplaced: list[dict]) -> int:
+    """
+    Package E: move each initializer check apply_taint could not write (`init_unplaced`) from its
+    property's `init_checks` to its `unchecked`, with the reason, so that what `init_checks` lists
+    is what the work tree holds. Returns how many moved.
+    """
+    by_name = {p.get("name"): p for p in props.get("properties") or []}
+    moved = 0
+    for u in unplaced:
+        prop = by_name.get(u["property"])
+        if prop is None:
+            continue
+        key = (u["function"], u["callee"], u["line"])
+        left = [c for c in prop.get("init_checks") or [] if (c["function"], c["callee"], c["line"]) != key]
+        if len(left) == len(prop.get("init_checks") or []):
+            continue
+        moved += 1
+        if left:
+            prop["init_checks"] = left
+        else:
+            prop.pop("init_checks", None)
+        prop.setdefault("unchecked", []).append({k: u[k] for k in ("function", "callee", "line", "reason")})
+    return moved
 
 
 def set_taint_params(files: list[str], previous: list[str], work: Path, run_dir: Path = Path(".")) -> dict:
@@ -1736,7 +2844,63 @@ DISCHARGE = {
         "the generated `assert {name}: meta:` before each sink call: no argument points into the secret "
         "(for a pointer parameter, `requires \\separated(...)` with the secret)"
     ),
+    "asset_writers": (
+        "the generated `assert {name}: meta:` before each write: the written location is separated from the "
+        "asset. Give pointer parameters `requires \\separated(p, &asset)`; only the declared writers may write it"
+    ),
+    "asset_readers": (
+        "the generated `assert {name}: meta:` before each read: the location read is separated from the asset. "
+        "Give pointer parameters `requires \\separated(p, &asset)`; only the declared readers may read it"
+    ),
+    "invariant": (
+        "the generated `requires {name}: meta:` and `ensures {name}: meta:` of the functions in scope (the "
+        "`requires` is proved here at each call of one), and for a strong invariant the `assert {name}: meta:` "
+        "after each statement that may change it: keep the predicate true at every such point"
+    ),
+    "invariant_conditional": (
+        "the generated behavior `{name}` (`assumes` the predicate, `ensures` it): when the predicate holds on "
+        "entry it holds on return"
+    ),
+    "invariant_monotonic": (
+        "the generated `assert {name}: meta:` after each write: either the written location is separated from "
+        "the state, or the state did not move back"
+    ),
+    "call_rule": (
+        "the generated `assert {name}: meta:` before each call of the callee here: establish the rule first "
+        "(a test of the state, or a `requires` of this function)"
+    ),
+    "call_rule_entry": (
+        "the precondition `{name}` of the callee (generated `requires {name}: meta:`), at each call of it here. "
+        "A call through a function pointer needs a `calls` annotation naming the callee"
+    ),
 }
+# Added to the entry of a property with a call placed in an initializer in the function (package E).
+DISCHARGE_INIT = (
+    " At a call placed in an initializer (`int n = f(x);`) MetAcsl generates nothing: the generated "
+    "`check {name}` already in the code there (do not edit or move it) is the same obligation"
+)
+
+
+def _discharge(p: dict, fid: str) -> str:
+    kind = str(p.get("kind"))
+    variant = str(p.get("variant") or "")
+    code = p.get("code") or {}
+    if code.get("returns"):
+        key = "gate_failure"
+    elif code:
+        key = "wiped_local"
+    elif kind == "sanitized" and "\\context(\\precond)" in str(p.get("acsl")):
+        key = "sanitized_entry"
+    elif kind == "invariant" and variant in ("conditional", "monotonic", "monotonic_formal"):
+        key = "invariant_conditional" if variant == "conditional" else "invariant_monotonic"
+    elif kind == "call_rule" and variant == "entry":
+        key = "call_rule_entry"
+    else:
+        key = kind
+    text = DISCHARGE.get(key, "")
+    if any(c.get("function") == fid for c in p.get("init_checks") or []):
+        text += DISCHARGE_INIT
+    return text.format(name=p.get("name"))
 
 
 def brief_entries(props: dict, file: str, name: str) -> list[dict]:
@@ -1768,15 +2932,7 @@ def brief_entries(props: dict, file: str, name: str) -> list[dict]:
                 "kind": p.get("kind"),
                 "metacsl": p.get("acsl"),
                 "notes": p.get("notes") or [],
-                "discharge": (
-                    DISCHARGE["gate_failure"]
-                    if (p.get("code") or {}).get("returns")
-                    else DISCHARGE["wiped_local"]
-                    if p.get("code")
-                    else DISCHARGE["sanitized_entry"]
-                    if p.get("kind") == "sanitized" and "\\context(\\precond)" in str(p.get("acsl"))
-                    else DISCHARGE.get(str(p.get("kind")), "")
-                ).format(name=p.get("name")),
+                "discharge": _discharge(p, fid),
             }
         )
     return out
@@ -1831,7 +2987,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
         )
         return 2
-    doc = generate(model, threat)
+    # The declarations of the functions the target only declares are read from the work tree, else
+    # from the tree the model was built on (their `assigns` decides what a \writing property sees).
+    roots = [args.work] + ([Path(str(model["tree"]))] if model.get("tree") else [])
+    doc = generate(model, threat, roots=roots)
     if note:
         doc["warnings"].insert(0, note)
     # Plan step M3, opt in: Eva taint annotations in the work tree. The choice is sticky (the Makefile's
@@ -1842,6 +3001,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     enabled = args.eva_taint if args.eva_taint is not None else bool(previous_taint.get("enabled"))
     applied = apply_taint(doc, args.work, taint=enabled)
     doc["code_checks"] = applied["code_checks"]
+    settle_init_checks(doc, applied["init_unplaced"])
     record: dict[str, Any] = {
         "enabled": enabled,
         **{k: applied[k] for k in ("files", "functions", "checks", "skipped")},

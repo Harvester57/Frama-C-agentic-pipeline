@@ -132,7 +132,8 @@
               "properties": {
                 "callee": {"type": "string"},
                 "line": {"type": "integer", "minimum": 0},
-                "literals": {"type": "object", "additionalProperties": {"type": "string"}}
+                "literals": {"type": "object", "additionalProperties": {"type": "string"}},
+                "initializer": {"$comment": "Dump schema 5 (package E of docs/plans/metacsl-exploitation-plan.md): whether the call is the initializer of a local (`int n = f(x);`). MetAcsl gives such a call no \\calling, \\writing (callee assigns) or \\strong_invariant instance, so security_props.py writes an in-code check there. Absent: a dump before schema 5, which cannot tell", "type": "boolean"}
               },
               "required": ["callee", "line", "literals"],
               "additionalProperties": false

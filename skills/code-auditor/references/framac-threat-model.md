@@ -29,6 +29,7 @@ The top-level keys are `schema_version`, `target`, `summary`, `input_sources`, `
 
 - **Required keys:** `schema_version` (always `1`) and the four lists `input_sources`, `secrets`, `auth_gates` and `output_sinks`.
 - **Recommended keys:** `target` (the project name), `summary` (one sentence) and `trusted_callers`.
+- **Optional lists:** `assets`, `invariants` and `call_rules` (see below). Leave a list out when the model established nothing of that kind.
 - **No other keys are allowed**, at the top level or inside an item.
 
 ### Naming rules
@@ -92,6 +93,33 @@ Each item has `function`, `kind` and `description`.
 - **`length`:** optional; the parameter that gives the number of elements `params` point to.
 - **`format`:** optional; the parameter that holds a printf-style format. Every call must then pass a string literal there.
 - **What counts:** output that leaves the target, such as writes to sockets, files, logs or the terminal, or callbacks that hand data out. A library that writes only into structures its caller owns has no output sink.
+
+### `assets` (optional): state that only named functions may write or read
+
+Each item has `name`, `lvalue`, `writers` and `description`.
+
+- **`lvalue`:** a global (`config`, `session.mode`) or a field reached from a parameter (`c->mode`): a name followed by `.field` or `->field` steps, nothing else.
+- **`writers`:** the functions allowed to write it. Every other function is checked.
+- **`readers`:** optional; the functions allowed to read it. Leave it out when reads are not restricted: with it, every other function of the build is checked.
+- **`params`:** optional; for an `lvalue` reached from a parameter, the other parameter names the same object is passed under.
+
+### `invariants` (optional): predicates the code keeps
+
+Each item has `name`, `variant` and `description`.
+
+- **`variant`** is one of:
+  - `weak`: the `predicate` holds when each function in `scope` is entered and when it returns.
+  - `strong`: it also holds after every statement of those functions.
+  - `conditional`: a function in `scope` that is entered with the `predicate` returns with it. It needs a `scope`.
+  - `monotonic`: the `lvalue` only moves in one `direction` (`up`, the default, or `down`). It takes an `lvalue` and no `predicate`.
+- **`predicate`:** an ACSL predicate over globals, such as `count <= limit`. At most 400 characters; no `;`, no comment markers, no `\result`.
+- **`scope`:** the functions the invariant is stated on. Give one whenever the model allows: without it, every function of the build is checked.
+
+### `call_rules` (optional): what must hold whenever a function is called
+
+Each item has `function`, `predicate` and `description`.
+
+- **`predicate`:** an ACSL predicate over the globals and the parameters of `function`; a parameter name stands for the argument of each call (`idx < 8 && ready != 0`). The same limits as an invariant's `predicate` apply.
 
 ## Example
 

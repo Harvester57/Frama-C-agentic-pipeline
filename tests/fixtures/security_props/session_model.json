@@ -41,6 +41,7 @@
    "call_sites": [
     {
      "callee": "log_line",
+     "initializer": false,
      "line": 25,
      "literals": {
       "0": "admin command"
