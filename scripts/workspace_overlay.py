@@ -1307,6 +1307,7 @@ def _run_parent_reverify(
     wp_extra_sources: list[str] | None = None,
     reach_functions: list[str] | None = None,
     baseline_had_assigns: bool | None = None,
+    guardrail_note: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree. `wp_par`
@@ -1318,10 +1319,19 @@ def _run_parent_reverify(
     `baseline_had_assigns`: whether the contract this merge replaces had an `assigns` clause. When it
     had, a full proof whose WP report says the function has no frame (`frame_summary.assigns_clause`
     `absent` or `behaviors_only`) is refused; None (a re-check of a merged function) refuses nothing.
+
+    The guardrail runs only with a `module` and its harness `sources`. Without them a prover's WP report
+    gets `limits.guardrail` = {"status": "not_run", "reason": ...} (`guardrail_note` when the caller knows
+    the reason better, e.g. the batch, whose module guardrail is a check of its own); with them, the
+    guardrail's status. A report without `limits.guardrail` was written before this field existed.
     """
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
     guard_report: dict | None = None
+    guardrail_gap = _guardrail_gap(module, sources)
+    if guardrail_gap and (function or module):
+        # No guardrail runs in this call: a report left by an earlier one must not be read as its result.
+        _parent_guard_json(run_dir, agent_id, function, module).unlink(missing_ok=True)
 
     if role == "prover" and c_file and function:
         # A proof under a memory model that is not evidence is never replayed, so the parent check
@@ -1475,11 +1485,59 @@ def _run_parent_reverify(
             frame_state = (wp_report.get("frame_summary") or {}).get("assigns_clause")
             if baseline_had_assigns and frame_state in NO_FRAME_STATES:
                 return False, _no_frame_refusal(function, str(frame_state))
-        if guard_report is not None and _apply_guard_limits(wp_report, function, guard_report):
-            wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
+        if guard_report is not None:
+            _apply_guard_limits(wp_report, function, guard_report)
+        else:
+            # The proof stands on WP alone: the report says so, in a shape no reader can take for a pass.
+            limits = wp_report.get("limits")
+            if not isinstance(limits, dict):
+                limits = wp_report["limits"] = {}
+            limits["guardrail"] = guardrail_note or guardrail_not_run(guardrail_gap or "no guardrail report")
+        wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
         _publish_canonical_wp(run_dir, overlay_dir, wp_json, norm_c, function)
 
     return True, "verified"
+
+
+GUARDRAIL_PASSED = "passed_dynamic_oracle"
+GUARDRAIL_NOT_RUN = "not_run"
+
+
+def guardrail_not_run(reason: str) -> dict:
+    """The `guardrail` value of a merge result or of a WP report's limits when no guardrail ran: never a pass."""
+    return {"status": GUARDRAIL_NOT_RUN, "reason": reason}
+
+
+def _guardrail_gap(module: str | None, sources: list[str] | None) -> str | None:
+    """Why `_run_parent_reverify` cannot run the E-ACSL guardrail with these inputs, or None when it can."""
+    if not module:
+        return "no module was named for the re-check, so there is no harness to build the guardrail from"
+    if not sources:
+        return (
+            f"module {module} has no harness sidecar with sources (workspace/harnesses/harness_*.json), "
+            "so no guardrail binary can be built for it"
+        )
+    return None
+
+
+def _guardrail_outcome(
+    run_dir: Path, agent_id: str, function: str | None, module: str | None, sources: list[str] | None
+) -> dict:
+    """
+    What the guardrail of a parent re-check that succeeded established, for the merge result: its status and
+    report, or `not_run` with the reason. Read from the report `_run_parent_reverify` wrote in this call (it
+    removes an older one when it runs no guardrail), so a missing report is `not_run`, never a pass.
+    """
+    gap = _guardrail_gap(module, sources)
+    if gap:
+        return guardrail_not_run(gap)
+    path = _parent_guard_json(run_dir, agent_id, function, module)
+    report = load_json_optional(path, {}) if path.is_file() else None
+    if not isinstance(report, dict) or not report.get("status"):
+        return guardrail_not_run(
+            f"the parent re-check left no guardrail report at {path.relative_to(run_dir).as_posix()}"
+        )
+    return {"status": report["status"], "report": path.relative_to(run_dir).as_posix()}
 
 
 # `frame_summary.assigns_clause` of a WP report (run_wp_function.frame_clause_state) when nothing was proved
@@ -1526,11 +1584,13 @@ def _apply_guard_limits(wp_report: dict, function: str, guard_report: dict) -> b
     `dynamic_oracle` {exercised, hits, executed_inputs} from its reach and `guardrail_corpus`
     {total, replayed, sampled, empty}. A pass on an empty corpus replayed no real input, so it is
     recorded as not exercised (an open assumption in the ledger), never as a pass on inputs.
-    Returns whether anything was recorded.
+    `guardrail` {status} says that this guardrail ran (`_run_parent_reverify` writes `not_run` there
+    when none did). Returns whether anything was recorded (always, since `guardrail` is).
     """
     limits = wp_report.setdefault("limits", {})
+    limits["guardrail"] = {"status": guard_report.get("status")}
     corpus_empty = bool(guard_report.get("corpus_empty"))
-    changed = False
+    changed = True
     if "corpus_total" in guard_report:
         limits["guardrail_corpus"] = {
             "total": guard_report.get("corpus_total"),
@@ -2224,6 +2284,14 @@ def _merge_agent_overlay_locked(
     patch_stem = function if role == "prover" and function else Path(norm_header_file or "header").stem
     patch_path = artifacts_dir / f"{patch_stem}.patch"
 
+    reverifies = not skip_reverify and verify_hook is None
+    if reverifies and module and not sources:
+        # An API caller that passed no sources (wp_scheduler, the proof-carry replay) gets the module's own, as
+        # merge-agent and the batch do: the guardrail must not be skipped because nobody looked them up.
+        side_sources = merged_sidecar(module_map_for(overlay), module).get("sources")
+        if isinstance(side_sources, list):
+            sources = [str(s) for s in side_sources if isinstance(s, str) and s] or None
+
     if journal:
         _write_merge_journal(run_dir, f"merge-agent:{agent_id}", backups)
     try:
@@ -2352,6 +2420,13 @@ def _merge_agent_overlay_locked(
     }
     if contract_changes is not None:
         result["contract_changes"] = contract_changes
+    # Whether the dual-oracle guardrail ran is part of the result: a merge on WP alone never looks like a pass.
+    if skip_reverify:
+        result["guardrail"] = guardrail_not_run("the caller skipped the parent re-check (skip_reverify)")
+    elif verify_hook is not None:
+        result["guardrail"] = guardrail_not_run("the caller's verify hook replaced the parent re-check")
+    else:
+        result["guardrail"] = _guardrail_outcome(run_dir, agent_id, function, module, sources)
     if role == "prover" and function and not skip_reverify and verify_hook is None:
         # The report to ingest: written for this agent only, so same-named functions never collide.
         result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
@@ -2627,6 +2702,7 @@ def _verify_batch_round(
     if verify_hook is not None:
         failures: list[tuple[list[int], str, bool]] = []
         for i, item in enumerate(items):
+            item["guardrail"] = guardrail_not_run("the caller's verify hook replaced the parent re-check")
             ok, reason = verify_hook(item)
             if not ok:
                 failures.append(([i], reason, False))
@@ -2635,7 +2711,11 @@ def _verify_batch_round(
     checks: list[tuple[list[int], dict]] = []
     modules: dict[tuple[str, tuple[str, ...], str, str], list[int]] = {}
     for i, item in enumerate(items):
-        if item.get("module") and item.get("sources"):
+        # Each item's merge result says whether a guardrail checked it (`guardrail`); a module without
+        # harness sources has none, and its items say so instead of looking like the others.
+        gap = _guardrail_gap(item.get("module"), item.get("sources"))
+        item["guardrail"] = guardrail_not_run(gap or "the batch's module guardrail left no report for this item")
+        if not gap:
             mod_key = (item["module"], tuple(item["sources"]), item["cppflags"], item["ldflags"])
             modules.setdefault(mod_key, []).append(i)
     # The module guardrail measures the reach of the batch's prover functions, as the single
@@ -2684,6 +2764,9 @@ def _verify_batch_round(
                 chk_kwargs["wp_extra_sources"] = item["wp_extra_sources"]
             if item.get("baseline_had_assigns") is not None:
                 chk_kwargs["baseline_had_assigns"] = item["baseline_had_assigns"]
+            # This check runs WP only. The report keeps this note unless the module guardrail of the batch
+            # passes and `_record_batch_reach` writes its result over it.
+            chk_kwargs["guardrail_note"] = item["guardrail"]
             checks.append(
                 (
                     [i],
@@ -2711,7 +2794,7 @@ def _verify_batch_round(
         call_kwargs = dict(kwargs)
         if call_kwargs.get("wp_extra_sources") is None or not _supports_kwarg(_run_parent_reverify, "wp_extra_sources"):
             call_kwargs.pop("wp_extra_sources", None)
-        for optional in ("reach_functions", "baseline_had_assigns"):
+        for optional in ("reach_functions", "baseline_had_assigns", "guardrail_note"):
             if optional in call_kwargs and not _supports_kwarg(_run_parent_reverify, optional):
                 call_kwargs.pop(optional, None)
         try:
@@ -2730,6 +2813,11 @@ def _verify_batch_round(
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
+    for (idxs, kwargs), (ok, _reason) in zip(checks, outcomes, strict=True):
+        if ok and kwargs.get("module") and kwargs.get("sources"):
+            outcome = _guardrail_outcome(run_dir, kwargs["agent_id"], None, kwargs["module"], kwargs["sources"])
+            for i in idxs:
+                items[i]["guardrail"] = outcome
     for ci, prover_idxs in reach_by_check.items():
         if not outcomes[ci][0]:
             continue
@@ -2879,6 +2967,8 @@ def _merge_agent_batch_locked(
 
     merged_results = []
     for item, r in active:
+        # The splice ran without a re-check; the batch's own checks are what this item's guardrail status is.
+        r["guardrail"] = item.get("guardrail") or guardrail_not_run("the batch ran no check for this item")
         if verify_hook is None and item["role"] == "prover" and item.get("function"):
             r["parent_wp_report"] = _parent_wp_report_rel(item["agent_id"], item["function"])
             _note_frame_state(run_dir, r)

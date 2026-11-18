@@ -254,6 +254,12 @@ def _save_shard(shard_id: str, report: Path) -> dict:
     return {"saved": True, "shard": shard_id}
 
 
+RECHECK_NO_GUARDRAIL = (
+    "a contract re-check runs WP only: the guardrail of the function's own merge is not repeated for a callee's "
+    "changed contract"
+)
+
+
 def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, module: str | None) -> dict:
     """
     Re-run the parent WP check of one already-merged function on the current workspace/work/ tree
@@ -276,6 +282,11 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
                 extra_sources = workspace_overlay.module_param(pdata.get("modules", {}), mm, module, "wp_extra_sources")
             except Exception:
                 pass
+    kwargs: dict[str, Any] = {}
+    if workspace_overlay._supports_kwarg(workspace_overlay._run_parent_reverify, "guardrail_note"):
+        # A re-check proves the caller again against a changed callee contract, with WP only (`sources=None`).
+        # Its report says so, instead of looking like a proof whose guardrail was never asked for.
+        kwargs["guardrail_note"] = workspace_overlay.guardrail_not_run(RECHECK_NO_GUARDRAIL)
     with run_lock("merge", run_dir):
         ok, reason = workspace_overlay._run_parent_reverify(
             run_dir=run_dir,
@@ -288,6 +299,7 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
             sources=None,
             cppflags=cppflags,
             wp_extra_sources=extra_sources,
+            **kwargs,
         )
     return {"ok": ok, "reason": reason, "report": report.relative_to(run_dir).as_posix() if report.is_file() else None}
 
@@ -3927,6 +3939,7 @@ def _complete_agent(agent_id: str) -> dict:
             if merged.get("ok"):
                 _finish(state, task, "done", "merged")
                 out.update(action="merged", modified_files=merged.get("modified_files") or [])
+                _keep_merge_notes(task, merged, out)
                 arch_result = Path("agents") / agent_id / "scratch" / "result.json"
                 if arch_result.is_file():
                     out["boundary_assumptions"] = _try(
@@ -4060,8 +4073,8 @@ def _merge_notes(merged: dict) -> dict:
     """
     What a merge result (workspace_overlay.merge_agent_overlay) says beside `ok`, kept on the task as `merge_notes`
     so it outlives the call: `contract_changes` when the merged contract lost a clause or could not be compared
-    with the one it replaced, and `frame_state` when WP proved the function without a frame
-    (`assigns_clause` is not `present`).
+    with the one it replaced, `frame_state` when WP proved the function without a frame (`assigns_clause` is
+    not `present`), and `guardrail` when the dual-oracle guardrail did not pass because it did not run.
     """
     notes: dict[str, Any] = {}
     changes = merged.get("contract_changes")
@@ -4072,6 +4085,9 @@ def _merge_notes(merged: dict) -> dict:
     frame = merged.get("frame_state")
     if isinstance(frame, dict) and frame.get("assigns_clause") != "present":
         notes["frame_state"] = frame
+    guardrail = merged.get("guardrail")
+    if isinstance(guardrail, dict) and guardrail.get("status") != workspace_overlay.GUARDRAIL_PASSED:
+        notes["guardrail"] = guardrail  # `not_run` with its reason: the merge stands on WP alone
     return notes
 
 

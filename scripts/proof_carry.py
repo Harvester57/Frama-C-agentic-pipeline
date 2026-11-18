@@ -594,6 +594,19 @@ def _sidecar(overlay: Path, module: str | None) -> dict:
         return {}
 
 
+def carried_guardrail(merge_result: dict) -> dict:
+    """
+    The dual-oracle status of a carried proof, for its `carried` row: the merge result's `guardrail`
+    ({"status": "passed_dynamic_oracle", "report": ...}, or {"status": "not_run", "reason": ...} when the
+    module has no harness sources to build the guardrail from). A merge result that says nothing is
+    `unknown`, never a pass.
+    """
+    guardrail = merge_result.get("guardrail")
+    if isinstance(guardrail, dict) and guardrail.get("status"):
+        return guardrail
+    return {"status": "unknown", "reason": "the merge result names no guardrail status"}
+
+
 def _next_agent_id(run_dir: Path, start: int) -> tuple[str, int]:
     n = start
     while (run_dir / "agents" / f"carry-{n}").exists():
@@ -800,7 +813,16 @@ def replay(
             continue
         summary["reproven"] += 1
         summary["carried"].append(
-            {"file": file, "function": fn, "agent_id": aid, "key": key, "store": entry.store.scope, "units": credited}
+            {
+                "file": file,
+                "function": fn,
+                "agent_id": aid,
+                "key": key,
+                "store": entry.store.scope,
+                "units": credited,
+                # Re-proven by WP; whether the E-ACSL guardrail also ran on the merged tree is said here.
+                "guardrail": carried_guardrail(res),
+            }
         )
     atomic_write_json(run_dir / SUMMARY_REL, summary)
     return summary
