@@ -2823,14 +2823,82 @@ def _model_with_initializer_flags(scripts: Path, target: Path, run: Path) -> dic
 
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.parametrize("violate", [False, True], ids=["satisfied", "violated"])
-def test_initializer_checks_acceptance_in_the_image(tmp_path, violate):
+def test_a_set_valued_assigns_does_not_stop_the_other_proofs_in_the_image(model_run, tmp_path):  # noqa: F811
     """
-    Acceptance of package E, D1 half: phase0_dump.ml marks the calls placed in initializers, the
-    generator writes a check named after each property MetAcsl skips there, and WP has it as a goal:
-    f_init, g_init and h_init each carry one, proved on the correct program and unproven on the
-    violating one. The model keeps the dump's flag only through the pass-through this test applies
-    to a copy of scripts/phase0_model.py (PASSTHROUGH_TO): the file is not package D1's.
+    callees/set_assigns.c: `uses_two` calls a declared function with `assigns \\union(*a, *b)`. With
+    the contract read (the generator is given the tree), `uses_two` leaves the targets of
+    L4_auth_state_login and the WP run of `store`, another instance, proves its goal. Without it
+    (no tree: the contract is unknown) MetAcsl stops, as package R found: a watch on MetAcsl too.
+    """
+    lists = {"auth_gates": [LOGIN_GATE]}
+    target = _one_file_target(tmp_path / "target", FIX / "callees" / "set_assigns.c", lists, False)
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    threat_model = trust.load_threat_model(target / "THREAT_MODEL.md")
+    name = "L4_auth_state_login"
+    doc = sp.generate(m, threat_model, roots=[target])
+    prop = by_name(doc)[name]
+    assert [(u["function"], u["callee"]) for u in prop["unchecked"]] == [("prog.c#uses_two", "two")], prop
+    assert "prog.c#store" in prop["instances"] and "prog.c#uses_two" not in prop["instances"]
+    assert "\\targets(\\diff(\\ALL, {login, uses_two}))" in prop["acsl"]
+    write_json(run / "workspace/reports/security_props.json", doc)
+    report = _forward_wp(target, run, "store")
+    assert not report["security_props"].get("error"), report["security_props"]
+    proven, unproven = _wp_rows(run, name)
+    assert proven and not unproven and report["status"] == "all_proven", json.dumps(report, indent=1)[-3000:]
+    # The same run with the callers left in: MetAcsl's failure, in whatever form the runner reports it.
+    blind = sp.generate(m, threat_model)
+    assert "unchecked" not in by_name(blind)[name] and "uses_two" not in by_name(blind)[name]["acsl"]
+    write_json(run / "workspace/reports/security_props.json", blind)
+    for csv_path in (run / "workspace" / "wp").glob("*.csv"):
+        csv_path.unlink()
+    try:
+        failed = _forward_wp(target, run, "store")
+    except AssertionError as exc:
+        text = str(exc)
+    else:
+        text = json.dumps(failed)
+        assert failed["status"] != "all_proven", text[-3000:]
+    assert "meta_annotate.ml" in text or "Assertion failed" in text, text[-3000:]
+
+
+@pytest.mark.unit
+def test_an_initializer_check_that_might_not_type_is_not_written(tmp_path):
+    """
+    A check that does not type stops its function's whole WP run. A global defined in another file
+    may not be declared where the check goes, and `no_crlf_string` may not be either: such sites are
+    `unchecked`, with the reason.
+    """
+    tree = _init_tree(tmp_path)
+    m = _init_model()
+    m["global_variables"]["key"]["file"] = "keys.c"
+    props = by_name(sp.generate(m, threat(**INIT_LISTS), roots=[tree]))
+    l5, l6 = props["L5_sanitized_net_send"], props["L6_no_leak_key"]
+    assert len(l5["init_checks"]) == 2 and "unchecked" not in l5
+    assert "init_checks" not in l6 and not [n for n in l6["notes"] if "placed in an initializer" in n]
+    assert [(u["function"], u["line"], u["reason"]) for u in l6["unchecked"]] == [
+        (f"prog.c#{f}", line, why)
+        for f, line in (("f_init", 64), ("g_init", 77))
+        for why in [
+            "an initializer call of net_send: its check names key, which prog.c does not define "
+            "(the check might not type there)"
+        ]
+    ]
+    text = {"function": "net_send", "kind": "log", "params": ["buf"], "description": "d"}
+    prop = by_name(sp.generate(_init_model(), threat(output_sinks=[text]), roots=[tree]))["L5_sanitized_net_send"]
+    assert "init_checks" not in prop and [u["function"] for u in prop["unchecked"]] == [
+        "prog.c#f_init",
+        "prog.c#g_init",
+    ]
+    assert "a text sink" in prop["unchecked"][0]["reason"]
+
+
+def _initializer_run(tmp_path: Path, lists: dict, violate: bool) -> tuple[Path, Path, dict, dict, dict]:
+    """
+    local_init.c through the model (with the pass-through applied to a copy of scripts/), the
+    generator and apply_taint: (run, work tree with the checks written, model, properties, what
+    apply_taint placed).
     """
     require_docker_images(ANALYSIS_IMAGE, BUILD_IMAGE)
     scripts = tmp_path / "scripts"
@@ -2840,7 +2908,6 @@ def test_initializer_checks_acceptance_in_the_image(tmp_path, violate):
         assert text.count(PASSTHROUGH_FROM) == 1, "phase0_model._call_sites changed: update the stand-in"
         text = text.replace(PASSTHROUGH_FROM, PASSTHROUGH_TO)
         (scripts / "phase0_model.py").write_text(text, encoding="utf-8", newline="\n")
-    lists = {**INIT_LISTS, "auth_gates": [INIT_GATE], "invariants": [INIT_STRONG]}
     target = _one_file_target(tmp_path / "target", INIT_DIR / "local_init.c", lists, violate)
     run = tmp_path / "run"
     m = _model_with_initializer_flags(scripts, target, run)
@@ -2861,6 +2928,45 @@ def test_initializer_checks_acceptance_in_the_image(tmp_path, violate):
     doc["code_checks"] = applied["code_checks"]
     assert not sp.validate(doc), sp.validate(doc)
     write_json(run / "workspace/reports/security_props.json", doc)
+    return run, work, m, doc, applied
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["satisfied", "violated"])
+def test_a_leak_through_an_initializer_call_is_not_credited_in_the_image(tmp_path, monkeypatch, violate):
+    """
+    What Step 0 of package E showed, closed: before the checks, g_init built with -DVIOLATE (the
+    secret handed to the sink in an initializer) ended `all_proven` with no goal of the property, and
+    ledger.py ingest-wp covered its l6_no_leak unit as `wp_meta_simplified`. With the check in the
+    code the run has an unproven goal and the unit is not covered; on the correct program the check
+    proves and the credit stands.
+    """
+    run, work, m, doc, _ = _initializer_run(tmp_path, INIT_LISTS, violate)
+    monkeypatch.chdir(run)
+    _seed_one_file(run, m, doc)
+    report = _forward_wp(work, run, "g_init", " -DVIOLATE" if violate else "")
+    L.cmd_ingest_wp([run / "workspace/reports/wp/g_init.json"])
+    unit = _ledger_units(run)["prog.c#g_init::l6_no_leak"]
+    if violate:
+        assert report["status"] != "all_proven" and unit["status"] != "covered", (report["status"], unit)
+    else:
+        assert report["status"] == "all_proven" and unit["status"] == "covered", (report["status"], unit)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["satisfied", "violated"])
+def test_initializer_checks_acceptance_in_the_image(tmp_path, violate):
+    """
+    Acceptance of package E, D1 half: phase0_dump.ml marks the calls placed in initializers, the
+    generator writes a check named after each property MetAcsl skips there, and WP has it as a goal:
+    f_init, g_init and h_init each carry one, proved on the correct program and unproven on the
+    violating one. The model keeps the dump's flag only through the pass-through this test applies
+    to a copy of scripts/phase0_model.py (PASSTHROUGH_TO): the file is not package D1's.
+    """
+    lists = {**INIT_LISTS, "auth_gates": [INIT_GATE], "invariants": [INIT_STRONG]}
+    run, work, _, _, applied = _initializer_run(tmp_path, lists, violate)
     expected = {
         "f_init": ["L5_sanitized_net_send", "L6_no_leak_key"],
         "g_init": ["L5_sanitized_net_send", "L6_no_leak_key"],

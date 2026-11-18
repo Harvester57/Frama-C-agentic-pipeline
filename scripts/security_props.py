@@ -657,6 +657,33 @@ class _Gen:
             )
             return {}
         decided = {f: d for f, d in (extra.pop("decided", None) or {}).items() if f in self.m.live}
+        # An in-code check that does not type stops the whole WP run of its function. The meta file
+        # is parsed with the files that define the globals a property names (`sources`); a check
+        # written into another file is not, so it is placed only where its globals are defined.
+        kept: list[dict] = []
+        hidden: list[dict] = []
+        for c in extra.get("init_checks") or []:
+            file = str(c["function"]).rpartition("#")[0]
+            body = re.sub(r"\$\{arg\d+\}", " ", str(c["check"]).split(":", 1)[-1])
+            foreign = sorted(
+                {n for _, _, n in _names_in(body) if (files := self.m.global_files(n)) and file not in files}
+            )
+            if foreign:
+                where = {k: c[k] for k in ("function", "callee", "line") if k in c}
+                hidden.append(
+                    {
+                        **where,
+                        "reason": f"an initializer call of {c.get('callee')}: its check names {', '.join(foreign)}, "
+                        f"which {file} does not define (the check might not type there)",
+                    }
+                )
+            else:
+                kept.append(c)
+        if hidden:
+            extra["init_checks"] = kept
+            extra["unchecked"] = [*(extra.get("unchecked") or []), *hidden]
+            notes = [n for n in extra.get("notes") or [] if "placed in an initializer" not in n]
+            extra["notes"] = notes + self._init_note(kept)
         for key in ("init_checks", "unchecked", "declared_callees"):
             if key in extra and not extra[key]:
                 del extra[key]
@@ -1557,19 +1584,21 @@ class _Gen:
                 index = {str(p.get("name")): i for i, p in enumerate(formals or [])}
                 wanted = [*params, *([str(length)] if bytes_sink and length else [])]
                 code = None
+                why = "the sink's parameters or their types are unknown"
                 args = self.m.arg_refs(sink)
-                if args is not None and all(p in index for p in wanted):
+                if kind in TEXT_SINKS:
+                    # `no_crlf_string` is declared in the meta file's preamble; whether the caller's
+                    # file declares it is not known here, and a check that does not type stops its
+                    # function's WP run.
+                    why = "a text sink: `no_crlf_string` is not known to be declared in the caller's file"
+                elif args is not None and all(p in index for p in wanted):
                     code = " && ".join(
-                        f"no_crlf_string({args[p]})"
-                        if kind in TEXT_SINKS
-                        else f"\\initialized({args[p]} + (0 .. {args[str(length)]} - 1))"
+                        f"\\initialized({args[p]} + (0 .. {args[str(length)]} - 1))"
                         if length
                         else f"\\initialized({args[p]})"
                         for p in params
                     )
-                checks, unchecked = self._init_call_checks(
-                    name, instances - set(decided), sink, code, "the sink's parameters or their types are unknown"
-                )
+                checks, unchecked = self._init_call_checks(name, instances - set(decided), sink, code, why)
             self._add(
                 "sanitized",
                 name,
