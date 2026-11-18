@@ -35,7 +35,7 @@ from framac_common import (  # noqa: E402
     load_json_optional,
     load_json_strict,
 )
-from ledger import INDUCTIVE_LEMMA_GAP  # noqa: E402
+from ledger import INDUCTIVE_LEMMA_GAP, unchecked_clause_text  # noqa: E402
 from mutation_check import classify_open_unit  # noqa: E402
 from phase0_gates import dynamic_gaps  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
@@ -538,6 +538,7 @@ def assurance_table(ledger: list[dict]) -> list[str]:
 CONTRACT_SHAPE_NOT_RECORDED = "not recorded"
 # acsl_ast.CONTRACT_SHAPES, then the proofs whose report predates the field.
 CONTRACT_SHAPE_ORDER = ("functional", "safety_only", "not_applicable", "unknown", CONTRACT_SHAPE_NOT_RECORDED)
+UNCHECKED_CLAUSE_ROWS_MAX = 40
 
 
 def verdict_limits_section(ledger: list[dict]) -> list[str]:
@@ -548,6 +549,8 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     trivial: set[str] = set()
     # Per function, not per ledger unit: one proof is the evidence of several obligation classes.
     shapes: dict[str, str] = {}
+    never_run: dict[str, dict[str, str]] = {}
+    unattributed: dict[str, int] = {}
     credited = 0
     for u in ledger:
         for e in u["evidence"]:
@@ -556,8 +559,19 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
                 continue
             credited += 1
             name = f"{u['file']}#{u['function']}"
-            if (limits.get("dynamic_oracle") or {}).get("exercised") is False:
+            oracle = limits.get("dynamic_oracle")
+            oracle = oracle if isinstance(oracle, dict) else {}
+            if oracle.get("exercised") is False:
                 unexercised.add(name)
+            # The clauses E-ACSL generated no check for: the guardrail passed without executing them.
+            clauses = oracle.get("unchecked_clauses")
+            for clause in clauses if isinstance(clauses, list) else []:
+                if isinstance(clause, dict):
+                    reason = " ".join(str(clause.get("reason") or "no reason recorded").split())
+                    never_run.setdefault(name, {})[unchecked_clause_text(clause)] = reason
+            loose = oracle.get("unattributed")
+            if isinstance(loose, list) and loose:
+                unattributed[name] = max(unattributed.get(name, 0), len(loose))
             if (limits.get("vacuity") or {}).get("status") == "inconclusive":
                 inconclusive.add(name)
             unchecked.update(f"{name} ({c})" for c in limits.get("unchecked_layer_clauses") or [])
@@ -600,6 +614,27 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
             shown = ", ".join(f"`{n}`" for n in sorted(names)[:20])
             more = f" and {len(names) - 20} more" if len(names) > 20 else ""
             out.append(f"- {label} ({len(names)}): {shown}{more}")
+    if never_run:
+        total = sum(len(c) for c in never_run.values())
+        out.append(
+            f"- Proven, and the guardrail passed, but the dynamic oracle never executed {total} clause(s) of "
+            f"{len(never_run)} function(s): E-ACSL generated no check for them, so they rest on the WP proof alone."
+        )
+        rows = [(name, text, reason) for name in sorted(never_run) for text, reason in sorted(never_run[name].items())]
+        for name, text, reason in rows[:UNCHECKED_CLAUSE_ROWS_MAX]:
+            out.append(f"  - `{name}`: {md_escape(text)} ({md_escape(reason[:200])})")
+        if len(rows) > UNCHECKED_CLAUSE_ROWS_MAX:
+            out.append(
+                f"  - ... and {len(rows) - UNCHECKED_CLAUSE_ROWS_MAX} more (`limits.dynamic_oracle.unchecked_clauses` "
+                "of the WP evidence in `coverage-ledger.json`)"
+            )
+    if unattributed:
+        shown = ", ".join(f"`{n}` ({unattributed[n]})" for n in sorted(unattributed)[:20])
+        more = f" and {len(unattributed) - 20} more" if len(unattributed) > 20 else ""
+        out.append(
+            "- E-ACSL ignored annotations in the guardrail build that could not be tied to a function, so whether a "
+            f"clause of the proven function was among them is not known ({len(unattributed)}): {shown}{more}"
+        )
     out.append("")
     return out
 

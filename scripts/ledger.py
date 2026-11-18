@@ -298,6 +298,65 @@ def add_wp_limit_assumptions(unit: dict, limits: dict, function: str, model_assu
             "other",
             f"No guardrail input reached {function}: its contract was proven but not exercised at runtime.",
         )
+    for text in unchecked_clause_notes(limits, function):
+        add_assumption(unit, "other", text)
+
+
+# Clauses named one by one on a unit; the rest are counted (the evidence's `details.limits` has them all).
+UNCHECKED_CLAUSES_NAMED = 20
+
+
+def _one_line(text: object, limit: int) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def unchecked_clause_text(clause: dict) -> str:
+    """`requires `label: predicate` at file:line` for one record of `limits.dynamic_oracle.unchecked_clauses`."""
+    label, body = _one_line(clause.get("label"), 60), _one_line(clause.get("clause"), 160)
+    shown = f"{label}: {body}" if label and body else label or body
+    where = f"{clause.get('file') or 'an unknown file'}:{clause.get('line') or '?'}"
+    via = f", through `{_one_line(clause.get('via'), 60)}`" if clause.get("via") else ""
+    return f"{clause.get('kind') or 'clause'}" + (f" `{shown}`" if shown else "") + f" at {where}{via}"
+
+
+def unchecked_clause_notes(limits: dict, function: str) -> list[str]:
+    """
+    What the parent guardrail of a credited proof did not execute, as assumption texts: one per clause
+    of `limits.dynamic_oracle.unchecked_clauses` ({function, kind, label, clause, file, line, reason,
+    via}: E-ACSL warned `Ignoring annotation` and generated no check, run_eacsl_fuzz.py
+    dynamic_oracle_fields), and one for the ignored annotations no function could be read for
+    (`unattributed`). A guardrail that `passed` says nothing about these clauses: WP alone stands for
+    them. A key that is not a list means the guardrail did not report it, which is not "none".
+    """
+    oracle = limits.get("dynamic_oracle")
+    if not isinstance(oracle, dict):
+        return []
+    notes: list[str] = []
+    raw = oracle.get("unchecked_clauses")
+    clauses = [c for c in raw if isinstance(c, dict)] if isinstance(raw, list) else []
+    for clause in clauses[:UNCHECKED_CLAUSES_NAMED]:
+        owner = str(clause.get("function") or function)
+        notes.append(
+            f"The dynamic oracle never executed the {unchecked_clause_text(clause)} of {owner}: E-ACSL generated "
+            f"no check for it ({_one_line(clause.get('reason'), 200) or 'no reason recorded'}). The guardrail "
+            f"that passed for {function} says nothing about this clause; it rests on the WP proof alone."
+        )
+    if len(clauses) > UNCHECKED_CLAUSES_NAMED:
+        notes.append(
+            f"The dynamic oracle never executed {len(clauses) - UNCHECKED_CLAUSES_NAMED} more clause(s) of "
+            f"{function}'s guardrail build (E-ACSL generated no check; see the limits of the WP evidence)."
+        )
+    loose = oracle.get("unattributed")
+    if isinstance(loose, list) and loose:
+        first = loose[0] if isinstance(loose[0], dict) else {}
+        where = f"{first.get('file') or 'an unknown file'}:{first.get('line') or '?'}"
+        notes.append(
+            f"E-ACSL ignored {len(loose)} annotation(s) in {function}'s guardrail build that could not be tied to "
+            f"a function (first: {where}, {_one_line(first.get('reason'), 160) or 'no reason recorded'}): whether "
+            f"a clause of {function} was among them is not known."
+        )
+    return notes
 
 
 def mark_candidate(unit: dict, fingerprint: str) -> None:
