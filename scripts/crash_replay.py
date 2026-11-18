@@ -203,7 +203,13 @@ def prepare_replay_binary(
     attribution: bool = True,
     **build_options,
 ) -> dict:
-    """Build the module binary for replays (normally a cache hit on the Make or campaign build)."""
+    """
+    Build the module binary for replays (normally a cache hit on the Make or campaign build).
+    `security_props` among `build_options` (`--security-props PATH|none`) names the run's MetAcsl
+    properties as for the campaign's build: the cache key holds their text, not the file's path, so
+    a replay that names the file another way, or builds elsewhere, restores the same entry, and the
+    identity of a violation does not hold the path of its meta file (failure_identity._meta_failure).
+    """
     build = fuzz_build.build_module_binary(sources, Path(out_bin), **build_options)
     comp = build["compile"]
     prepared: dict = {
@@ -214,6 +220,12 @@ def prepare_replay_binary(
         "cache": comp.get("cache"),
         "attribution_builder": None,
     }
+    # The MetAcsl properties of the E-ACSL build (or of the attempt the sanitizers replaced): only
+    # with the engine on, so a replay report without it has the keys it always had.
+    for built in (comp, build.get("eacsl_compile_attempt")):
+        if isinstance(built, dict) and isinstance(built.get("security_props"), dict):
+            prepared["security_props"] = built["security_props"]
+            break
     if build["engine_fallback_reason"]:
         prepared["engine_fallback_reason"] = build["engine_fallback_reason"]
     if comp["returncode"] != 0:
@@ -259,7 +271,7 @@ def replay_report(
     }
     attribution_builder = None
     if prepared is not None:
-        for key in ("engine_used", "engine_fallback_reason", "compile", "cache"):
+        for key in ("engine_used", "engine_fallback_reason", "compile", "cache", "security_props"):
             if key in prepared:
                 report[key] = prepared[key]
         if prepared.get("binary") is None:
@@ -422,6 +434,17 @@ def _reproducer_paths(cand: dict) -> list[Path]:
 _ENGINES = ("eacsl", "sanitizers")
 
 
+def _security_props_option(spec: dict, override: str | None) -> dict:
+    """
+    The `security_props` keyword of a candidate's replay build, {} when nothing names a file: the
+    caller's `--security-props`, else the file Make passes to the module's build and campaign
+    (`security_props` of pipeline_make.module_build_spec, there only with the engine on). Without
+    either, fuzz_build resolves the run's default as the campaign did.
+    """
+    value = override if override is not None else spec.get("security_props")
+    return {"security_props": str(value)} if value else {}
+
+
 def _accepted_fingerprints(cand: dict) -> list[str]:
     """The candidate's key, then the fingerprint of each observation: every failure that is this candidate."""
     out = [str(cand.get("fingerprint") or "")]
@@ -464,6 +487,7 @@ def _prepared_replay(
     attribution: bool,
     selftest_json: Path | None,
     machdep: str,
+    security_props: str | None = None,
 ) -> dict:
     """
     The replay binary for one engine of a module's harness. The candidate's own engine keeps the path of
@@ -487,6 +511,7 @@ def _prepared_replay(
             ldflags=spec["ldflags"],
             rte_initialized=bool(spec.get("rte_initialized", True)),
             libc_checks=bool(spec.get("libc_checks", True)),
+            **_security_props_option(spec, security_props),
         )
     return prepared_by_key[key]
 
@@ -519,6 +544,7 @@ def _cross_engine_replay(
     attribution: bool,
     selftest_json: Path | None,
     machdep: str,
+    security_props: str | None = None,
 ) -> dict:
     """
     Replay a candidate's reproducers on the other engine's binary of its module (D1b). A build that fails
@@ -539,6 +565,7 @@ def _cross_engine_replay(
             ldflags=spec["ldflags"],
             rte_initialized=bool(spec.get("rte_initialized", True)),
             libc_checks=bool(spec.get("libc_checks", True)),
+            **_security_props_option(spec, security_props),
         )
     prepared = prepared_cache[key]
     if prepared.get("binary") is None:
@@ -579,6 +606,7 @@ def replay_candidates(
     inputs: list[Path] | None = None,
     out_json: Path | None = None,
     cross_engine: bool = False,
+    security_props: str | None = None,
 ) -> dict:
     """
     Replay the reproducers of every unverified candidate on its module's binary, built with
@@ -591,6 +619,9 @@ def replay_candidates(
     reproducers, on that candidate's binary, whatever its status. This is how the parent checks the
     reproducers a Crash Verifier lists from its own scratch before `ingest-verifier`. Only `out_json`
     is written: the candidate's own report and `index.json` stay as they are.
+
+    `security_props` (`--security-props PATH|none`) names the MetAcsl properties the E-ACSL replay
+    builds check; by default they are the ones Make gives the module's build (`_security_props_option`).
     """
     candidates = load_json_optional(Path(candidates_path), [])
     todo = [c for c in candidates if isinstance(c, dict) and c.get("status") == "unverified" and _reproducer_paths(c)]
@@ -641,6 +672,7 @@ def replay_candidates(
                 attribution=attribution,
                 selftest_json=selftest_json,
                 machdep=machdep,
+                security_props=security_props,
             )
             group_scratch = scratch if group_eng == eng else scratch.parent / f"{scratch.name}-{group_eng}"
             replays.append(
@@ -680,6 +712,7 @@ def replay_candidates(
                 attribution=attribution,
                 selftest_json=selftest_json,
                 machdep=machdep,
+                security_props=security_props,
             )
         index[fingerprint] = entry
         by_status[report["status"]] = by_status.get(report["status"], 0) + 1
@@ -876,6 +909,7 @@ def minimize_candidates(
     per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
     max_time_s: int = 600,
     jobs: int = 4,
+    security_props: str | None = None,
 ) -> dict:
     """
     Minimize the reproducer of every unverified candidate (same selection as replay-candidates),
@@ -924,6 +958,7 @@ def minimize_candidates(
                 attribution=True,
                 selftest_json=selftest_json,
                 machdep=machdep,
+                security_props=security_props,
             )
             binary = prepared.get("binary")
             if binary is None:

@@ -109,6 +109,9 @@ seed: reach-gate security-props
 
 # Compile only: what `--engine` asks for, both engines for `auto`. It never reads the selftest result;
 # the campaign applies it and restores these builds from the cache.
+# FUZZ_SECURITY_PROPS_<mod> is set when security_props.json turns MetAcsl on for E-ACSL (`meta_engines`):
+# the build and the campaign then name the file (run_eacsl_fuzz.py --security-props), and the build
+# depends on it. Without the variable both recipes expand to the text they always had.
 build: $(BUILD_TARGETS)
 $(BUILD_TARGETS): build-%:
 	$(GATE) --module $* --need reach
@@ -116,8 +119,9 @@ $(BUILD_TARGETS): build-%:
 		$(PY) $(S)/run_eacsl_fuzz.py build --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) $(if $(FUZZ_NO_LIBC_CHECKS_$*),--no-libc-checks) \
-		--engine=$(FUZZ_ENGINE_$*) \
+		--engine=$(FUZZ_ENGINE_$*)$(if $(FUZZ_SECURITY_PROPS_$*), --security-props=$(FUZZ_SECURITY_PROPS_$*)) \
 		--out-json workspace/build/$*.build.json
+$(foreach m,$(FUZZ_MODULES),$(if $(FUZZ_SECURITY_PROPS_$(m)),$(eval build-$(m): $(FUZZ_SECURITY_PROPS_$(m)))))
 
 # The E-ACSL toolchain canary (runs a compiled canary, so dynamic).
 selftest:
@@ -152,7 +156,7 @@ $(FUZZ_TARGETS): fuzz-%: selftest build-%
 		--workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
 		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) $(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
 		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) $(if $(FUZZ_NO_LIBC_CHECKS_$*),--no-libc-checks) \
-		--engine=$(FUZZ_ENGINE_$*) \
+		--engine=$(FUZZ_ENGINE_$*)$(if $(FUZZ_SECURITY_PROPS_$*), --security-props=$(FUZZ_SECURITY_PROPS_$*)) \
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/reports/fuzz/$*.json
 

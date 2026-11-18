@@ -434,6 +434,9 @@ class ModulePlan:
     # (run-relative path, digest) of the security_props.json whose MetAcsl properties the module's Eva
     # runs load (eva_security_props); None when its `meta_engines` leaves Eva out, or without the file.
     eva_security: tuple[str, str] | None = None
+    # The run-relative security_props.json the module's fuzz build and campaign name
+    # (fuzz_security_props); None when its `meta_engines` leaves E-ACSL out, or without the file.
+    fuzz_security: str | None = None
 
     def to_json(self) -> dict:
         return {
@@ -454,6 +457,7 @@ class ModulePlan:
             "eva_replay": self.eva_replay,
             **({"eva_shards": [list(s) for s in self.shards]} if self.shards else {}),
             **({"eva_security_props": self.eva_security[0]} if self.eva_security else {}),
+            **({"fuzz_security_props": self.fuzz_security} if self.fuzz_security else {}),
             "warnings": self.warnings,
         }
 
@@ -511,6 +515,8 @@ class Plan:
     mm: ModuleMap = field(default_factory=lambda: ModuleMap(None))
     # eva_security_props(run_dir): what every Eva module's runs load (ModulePlan.eva_security).
     eva_security: tuple[str, str] | None = None
+    # fuzz_security_props(run_dir): what every fuzzed module's build and campaign name (ModulePlan.fuzz_security).
+    fuzz_security: str | None = None
     modules: dict[str, ModulePlan] = field(default_factory=dict)
     excluded: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
@@ -829,6 +835,7 @@ def _plan_module(plan: Plan, name: str, dag_mod: dict) -> ModulePlan:
         loop_unroll=loop_unroll_level(sidecar.get("max_input_size")),
         eva_off=TARGET_FUZZER_EVA_OFF if target_fuzzer else None,
         eva_security=plan.eva_security if eva else None,
+        fuzz_security=plan.fuzz_security if fuzz else None,
     )
     missing = [s for s in sources if not (plan.run_dir / s if not s.startswith("/") else Path(s)).is_file()]
     if missing:
@@ -878,6 +885,27 @@ def eva_security_props(run_dir: Path | str = ".") -> tuple[str, str] | None:
     }
     blob = json.dumps(material, sort_keys=True, separators=(",", ":"), default=str)
     return SECURITY_PROPS_JSON, hashlib.sha256(blob.encode()).hexdigest()
+
+
+def fuzz_security_props(run_dir: Path | str = ".") -> str | None:
+    """
+    The run-relative path of the run's security_props.json when its `meta_engines` turns MetAcsl on
+    for the E-ACSL fuzz build (docs/guides/security-properties.md), else None. The build and fuzz
+    recipes then pass it to run_eacsl_fuzz.py (`--security-props`), `build-<mod>` depends on the file,
+    and module_build_spec hands it to the replays. No digest is needed here: nothing of Make is
+    recorded against the properties, and the build cache keys on the meta file's text
+    (fuzz_build._security_meta_material).
+    """
+    path = Path(run_dir) / SECURITY_PROPS_JSON
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or "eacsl" not in meta_engines(doc):
+        return None
+    return SECURITY_PROPS_JSON
 
 
 def _has_target_unknowns(report: dict) -> bool:
@@ -1155,6 +1183,7 @@ def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = Non
         records=dict(sorted(records.items())),
         mm=mm,
         eva_security=eva_security_props(run_dir),
+        fuzz_security=fuzz_security_props(run_dir),
         warnings=warnings,
         errors=errors,
     )
@@ -1294,6 +1323,8 @@ def module_build_spec(
         "ldflags": shlex.join(mod.ldflags),
         "rte_initialized": bool(mod.params.get("fuzz_rte_initialized", True)),
         "libc_checks": bool(mod.params.get("fuzz_libc_checks", True)),
+        # Only with MetAcsl on for E-ACSL: the file the build and fuzz recipes name (--security-props).
+        **({"security_props": mod.fuzz_security} if mod.fuzz_security else {}),
     }
 
 
@@ -1365,6 +1396,8 @@ def _module_block(mod: ModulePlan) -> list[str]:
         _assign(f"FUZZ_NO_RTE_INIT_{n}", "" if p["fuzz_rte_initialized"] else "1"),
         _assign(f"FUZZ_NO_LIBC_CHECKS_{n}", "" if p.get("fuzz_libc_checks", True) else "1"),
         _assign(f"FUZZ_ENGINE_{n}", mk_quote(str(p.get("fuzz_engine") or "auto"))),
+        # Only with MetAcsl on for E-ACSL: a run without it gets the modules.mk it always got.
+        *([_assign(f"FUZZ_SECURITY_PROPS_{n}", mk_quote(mod.fuzz_security))] if mod.fuzz_security else []),
     ]
 
 

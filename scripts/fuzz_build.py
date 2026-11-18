@@ -211,8 +211,14 @@ def _eacsl_cache_material(
     rte_initialized: bool,
     concurrency: bool | None = None,
     libc_checks: bool = True,
+    security_meta: dict | None = None,
 ) -> dict | None:
-    """Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse)."""
+    """
+    Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse).
+    `security_meta` is the loaded plan of a build with MetAcsl properties (resolve_security_meta): the
+    key `security_meta` (`_security_meta_material`) is there only then, so a build without properties
+    keeps the key it always had and is never restored for one with them, nor the reverse.
+    """
     has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
     eacsl_bin, is_modern = _resolve_eacsl_gcc()
     try:
@@ -252,6 +258,41 @@ def _eacsl_cache_material(
         "check_options": _check_options(is_modern, libc_checks),
         "runtime_patches": _runtime_patches(_check_options(is_modern, libc_checks)),
         "zone_sizes": _zone_size_options(is_modern),
+        **({"security_meta": _security_meta_material(security_meta)} if security_meta else {}),
+    }
+
+
+def _security_meta_material(plan: dict) -> dict:
+    """
+    What the MetAcsl properties add to the key of an E-ACSL build (plan: resolve_security_meta's
+    `loaded` result), all of it known before the build:
+      text         the digest of the meta file with every selected property (write_security_meta's
+                   text; a property MetAcsl rejects during the build is part of the cached outcome);
+      stage        the Frama-C flags of the MetAcsl stage and the e-acsl-gcc options that open the
+                   next one (eacsl_toolchain.meta_stage_flags);
+      properties, functions, harness_functions, left_out
+                   what the sidecar and the result's `security_props` are written from;
+      max_rejected SECURITY_META_MAX_REJECTED, which bounds the rejections one build absorbs.
+    The path of security_props.json is not in it: Make names the file, a replay or the build check
+    may find it by default, and the same properties must give the same entry.
+    """
+    import security_props
+
+    selected = plan.get("selected") or []
+    found = security_props.module_meta_file_text({"preamble": plan.get("preamble") or "", "properties": selected}, None)
+    text = eacsl_meta_file_text(found[0], security_props.META_INCLUDE) if found else ""
+    first, options = meta_stage_flags(["-rte"])
+    return {
+        "text": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "stage": [first, options],
+        "properties": {
+            str(p["name"]): {"obligation_class": p.get("obligation_class"), "instances": list(p.get("instances") or [])}
+            for p in selected
+        },
+        "functions": plan.get("functions") or {},
+        "harness_functions": plan.get("harness_functions") or [],
+        "left_out": plan.get("left_out") or [],
+        "max_rejected": SECURITY_META_MAX_REJECTED,
     }
 
 
@@ -629,10 +670,14 @@ def compile_eacsl_binary(
 
     `security_meta` (resolve_security_meta's result; None: no MetAcsl property, the build of every
     caller but build_module_binary) adds the run's MetAcsl properties to stage 1, so the binary stops
-    on an input that violates one (`_build_with_security_meta`). Such a build is not cached: the
-    cache key does not hold the properties, and a build with them must never be restored for one
-    without. The result then carries `security_props`. A build the properties make fail is redone
-    without them, through the cache as any plain build.
+    on an input that violates one (`_build_with_security_meta`). The result then carries
+    `security_props`. Such a build is cached under a key of its own (`_security_meta_material`: the
+    meta text, the MetAcsl stage flags and what the sidecar is written from), with the meta file
+    `<out>.security_meta.c` and its sidecar among the restored files: without the sidecar a restored
+    binary would report its violations without their file and class. A build whose toolchain cannot
+    take the properties (`status` skipped) is cached the same way. A build the properties make fail
+    (`status` dropped) is never published: it is redone without them, through the cache as any plain
+    build, and tried again with them the next time.
     """
     out_bin = Path(out_bin)
     # The same build without the properties (the arguments as given: the flags below are completed once).
@@ -679,18 +724,39 @@ def compile_eacsl_binary(
             **({"security_meta": meta} if meta else {}),
         )
 
+    plan: dict | None = None
     if security_meta:
-        record = {k: v for k, v in security_meta.items() if k in ("status", "props", "reason", "left_out")}
         if security_meta.get("status") == "loaded":
-            built, record = _build_with_security_meta(security_meta, out_bin, _build)
-            if built is not None:
-                built["cache"] = {"hit": False, "key": None}
-                built["security_props"] = record
-                return built
-        res = plain()
-        if record.get("status") == "dropped" and res.get("returncode") != 0:
-            record["reason"] = f"{record.get('reason')}; the build without them fails too"
-        res["security_props"] = record
+            plan = security_meta
+        else:
+            res = plain()
+            res["security_props"] = {
+                k: v for k, v in security_meta.items() if k in ("status", "props", "reason", "left_out")
+            }
+            return res
+
+    # The record of a build the properties made fail: it is not a result to publish.
+    dropped: dict = {}
+
+    def _meta_build() -> dict:
+        assert plan is not None
+        built, record = _build_with_security_meta(plan, out_bin, _build)
+        if built is None:
+            dropped.update(record)
+            return {"returncode": 1, "reason": "security_meta_dropped"}
+        built["security_props"] = record
+        return built
+
+    def _with_properties(res: dict) -> dict:
+        assert plan is not None
+        if dropped:
+            res = plain()
+            if res.get("returncode") != 0:
+                dropped["reason"] = f"{dropped.get('reason')}; the build without them fails too"
+            res["security_props"] = dict(dropped)
+        elif isinstance(res.get("security_props"), dict):
+            # The entry may come from a build that named the same properties file another way.
+            res["security_props"]["props"] = plan["props"]
         return res
 
     material = None
@@ -709,11 +775,12 @@ def compile_eacsl_binary(
             rte_initialized,
             concurrency=concurrency,
             libc_checks=libc_checks,
+            security_meta=plan,
         )
     if material is None:
-        res = _build()
+        res = _meta_build() if plan else _build()
         res["cache"] = {"hit": False, "key": None}
-        return res
+        return _with_properties(res) if plan else res
 
     instrumented_c = out_bin.with_suffix(".instrumented.c")
     compile_log = out_bin.with_suffix(".compile.log")
@@ -732,17 +799,22 @@ def compile_eacsl_binary(
         if (res.get("environ_keep") or {}).get("status") == "built":
             files["env_keep.o"] = env_keep_dir / "eacsl_env_keep.o"
             files["env_keep.c"] = env_keep_dir / "eacsl_env_keep.c"
+        if res.get("security_props"):
+            # The meta file is no input of the key (its text is): the rejection loop rewrites it.
+            meta_file = out_bin.with_suffix(SECURITY_META_SUFFIX)
+            files["security_meta.c"] = meta_file
+            files["security_meta.json"] = meta_sidecar_path(meta_file)
         return files
 
     if enable_l2 is None:
         enable_l2 = bool(target_fns)
     l2_functions = target_fns if target_fns else None
-    return cache.memoize(
+    cached = cache.memoize(
         "eacsl-build",
         material,
         sources=sources,
         dep_flags=shlex.split(material["frontend"]),
-        build=_build,
+        build=_meta_build if plan else _build,
         outputs=_outputs,
         ok=lambda res: res.get("returncode") == 0,
         runner=runner,
@@ -750,6 +822,7 @@ def compile_eacsl_binary(
         enable_l2=enable_l2,
         l2_target_functions=l2_functions,
     )
+    return _with_properties(cached) if plan else cached
 
 
 def _compile_eacsl_binary_uncached(
