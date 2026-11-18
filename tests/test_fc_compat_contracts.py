@@ -555,3 +555,107 @@ def test_overflow_builtins_match_gcc_under_eacsl(tmp_path):
     assert "run=0" in eacsl, eacsl
     # Same results as GCC's own builtins, case by case.
     assert native and native in eacsl, (native, eacsl)
+
+
+# ---------------------------------------------------------------------------------------------------
+# Modem-line bits (libmodbus run-1, 2026-11-18): __fc_libc's <sys/ioctl.h> defines TIOCMGET / TIOCMSET but
+# not the TIOCM_* bits of Linux <asm-generic/termios.h>; Phase 0 lost libmodbus.so to the gcc fallback with
+# `src/modbus-rtu.c:254: User Error: Cannot resolve variable TIOCM_RTS`.
+# ---------------------------------------------------------------------------------------------------
+
+# Linux <asm-generic/termios.h> (x86_64 and every architecture using the generic layout).
+TIOCM_BITS = {
+    "TIOCM_LE": "0x001", "TIOCM_DTR": "0x002", "TIOCM_RTS": "0x004", "TIOCM_ST": "0x008",
+    "TIOCM_SR": "0x010", "TIOCM_CTS": "0x020", "TIOCM_CAR": "0x040", "TIOCM_RNG": "0x080",
+    "TIOCM_DSR": "0x100", "TIOCM_CD": "TIOCM_CAR", "TIOCM_RI": "TIOCM_RNG", "TIOCM_OUT1": "0x2000",
+    "TIOCM_OUT2": "0x4000", "TIOCM_LOOP": "0x8000",
+}  # fmt: skip
+
+_TIOCM_DEFINE = re.compile(r"^#define\s+(TIOCM_\w+)\s+(\S+)", re.MULTILINE)
+
+# Linux <asm-generic/ioctls.h>: the termios2 requests (libmodbus with HAVE_STRUCT_TERMIOS2 stopped next at
+# `Cannot resolve variable TCGETS2`).
+TERMIOS2_REQUESTS = {
+    "TCGETS2": "_IOR('T', 0x2A, struct termios2)",
+    "TCSETS2": "_IOW('T', 0x2B, struct termios2)",
+    "TCSETSW2": "_IOW('T', 0x2C, struct termios2)",
+    "TCSETSF2": "_IOW('T', 0x2D, struct termios2)",
+}
+
+# libmodbus's src/modbus-rtu-private.h: <asm/termbits.h> with `struct termios` renamed away, then <termios.h>.
+TIOCM_C = r"""#define termios
+#include <asm/termbits.h>
+#undef termios
+#include <sys/ioctl.h>
+#include <termios.h>
+
+_Static_assert(TCGETS2 == 0x802C542AUL && TCSETS2 == 0x402C542BUL, "x86_64 termios2 requests");
+
+int set_baud(int fd, unsigned baud) {
+  struct termios2 tios;
+  if (ioctl(fd, TCGETS2, &tios) < 0) return -1;
+  tios.c_cflag |= BOTHER;
+  tios.c_ispeed = baud;
+  tios.c_ospeed = baud;
+  return ioctl(fd, TCSETS2, &tios);
+}
+
+int set_rts(int fd, int on) {
+  int flags;
+  if (ioctl(fd, TIOCMGET, &flags) == -1) return -1;
+  if (on)
+    flags |= TIOCM_RTS;
+  else
+    flags &= ~TIOCM_RTS;
+  return ioctl(fd, TIOCMSET, &flags) + (flags & (TIOCM_CTS | TIOCM_CD | TIOCM_RI | TIOCM_LOOP));
+}
+
+int main(void) { return set_rts(3, 1) + set_baud(3, 250000); }
+"""
+
+# The request numbers gcc computes from glibc's own headers.
+TERMIOS2_GCC_C = r"""#include <stdio.h>
+#define termios
+#include <asm/termbits.h>
+#undef termios
+#include <sys/ioctl.h>
+
+int main(void) {
+  printf("%lu %lu\n", (unsigned long)TCGETS2, (unsigned long)TCSETS2);
+  return 0;
+}
+"""
+
+
+@pytest.mark.unit
+def test_modem_line_bits_and_termios2_requests_are_defined_for_frama_c_libc_only():
+    text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    fc_libc = text.split("#else /* Frama-C __fc_libc */", 1)[1].split("#endif /* __FRAMAC_EACSL__ */", 1)[0]
+    assert dict(_TIOCM_DEFINE.findall(fc_libc)) == TIOCM_BITS
+    for name, value in (*TIOCM_BITS.items(), *TERMIOS2_REQUESTS.items()):
+        # Guarded (a later __fc_libc may define them), and nowhere else: E-ACSL builds read glibc's.
+        assert f"#ifndef {name}\n#define {name} {value}\n#endif" in fc_libc, name
+        assert text.count(f"#define {name} ") == 1, name
+    # The requests expand through the _IOC encoding defined above them.
+    assert fc_libc.index("#define _IOR(") < fc_libc.index("#define TCGETS2 ")
+
+
+@image
+@slow
+def test_modem_line_bits_and_termios2_requests_parse_with_frama_c_libc_as_gcc_reads_them(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    script = (
+        FRAMAC_FLAGS + 'echo "==parse=="; '
+        'frama-c -no-unicode t.c -cpp-extra-args="$A" -print 2>&1; echo "rc=$?"; '
+        'echo "==linux=="; grep "^#define[[:space:]]*TIOCM_" /usr/include/asm-generic/termios.h; '
+        'echo "==gcc=="; gcc g.c -o g && ./g; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"t.c": TIOCM_C, "g.c": TERMIOS2_GCC_C}, script, timeout=300)
+    parse = log.split("==parse==", 1)[1].split("==linux==", 1)[0]
+    assert "rc=0" in parse and "Cannot resolve variable" not in parse, parse
+    assert "flags |= 0x004;" in parse, parse
+    linux = log.split("==linux==", 1)[1].split("==gcc==", 1)[0]
+    assert dict(_TIOCM_DEFINE.findall(linux)) == TIOCM_BITS, linux
+    # The `_Static_assert`s of TIOCM_C held under Frama-C; gcc computes the same numbers from glibc.
+    gcc = log.split("==gcc==", 1)[1].split("==end==", 1)[0].split()
+    assert gcc == [str(0x802C542A), str(0x402C542B)], gcc
