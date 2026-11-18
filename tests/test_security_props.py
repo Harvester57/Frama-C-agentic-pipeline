@@ -686,6 +686,13 @@ TEMPLATE_VARIANTS: dict[str, tuple[str, str, dict]] = {
         "L5_sanitized_send_msg",
         {"output_sinks": [{"function": "send_msg", "kind": "ipc", "description": "d"}]},
     ),
+    # A sink the target defines and calls through a function pointer: the property is its precondition.
+    "l5_sanitized_entry_text": ("report", "L5_sanitized_log_line", {"output_sinks": [LOG_SINK]}),
+    "l5_sanitized_entry_object": (
+        "emit",
+        "L5_sanitized_send_msg",
+        {"output_sinks": [{"function": "send_msg", "kind": "ipc", "description": "d"}]},
+    ),
     "l5_sanitized_buffer": (
         "finish",
         "L5_sanitized_finish",
@@ -1529,3 +1536,349 @@ def test_gate_failure_check_in_the_image(model_run, tmp_path, violate):  # noqa:
     goals = wp_proved_goals(res.stdout)
     assert all(total >= 2 for _, total in goals), res.stdout
     assert all(proved == total for proved, total in goals) is (not violate), res.stdout
+
+
+# ---------------------------------------------------------------------------------------------------
+# L5 placement on forwarding sinks (package A of docs/plans/metacsl-exploitation-plan.md)
+# ---------------------------------------------------------------------------------------------------
+
+FORWARD_DIR = FIX / "forward"
+_SEND_FORMALS = [
+    {"name": "ctx", "kind": "pointer"},
+    {"name": "req", "kind": "const_pointer"},
+    {"name": "req_length", "kind": "value"},
+]
+_PRE_FORMALS = [{"name": "req", "kind": "pointer"}, {"name": "req_length", "kind": "value"}]
+
+
+def _net(function: str, param: str = "req", length: str = "req_length") -> dict:
+    return {"function": function, "kind": "network", "params": [param], "length": length, "description": "d"}
+
+
+FORWARD_WRAPPER = _net("send_msg", "msg", "msg_length")
+FORWARD_INNER = _net("tcp_send")
+
+
+def _graph(functions: dict, direct=(), sites=(), **extra) -> dict:
+    """A model with direct edges and indirect call sites, each (caller, called expression, candidates)."""
+    m = model(functions, edges=direct, **extra)
+    m["indirect_sites"] = []
+    for n, (caller, expr, candidates) in enumerate(sites):
+        m["indirect_sites"].append(
+            {
+                "unit": "liba.a",
+                "caller": caller,
+                "expr": expr,
+                "signature": "int(void *)",
+                "loc": f"m.c:{60 + n}",
+                "candidates": list(candidates),
+            }
+        )
+        m["edges"] += [
+            {"caller": caller, "callee": c, "kind": "indirect", "sources": ["type-match"]} for c in candidates
+        ]
+    return m
+
+
+def _modbus_model(rtu: bool = False) -> dict:
+    """
+    libmodbus's shape: write_register calls send_msg, which has the backend complete the request
+    (send_msg_pre) and then calls the backend's send, both through the backend's function pointers.
+    With `rtu`, a second backend whose send transmits through write.
+    """
+    functions = {
+        "m.c#write_register": fn("write_register", "m.c"),
+        "m.c#send_msg": fn(
+            "send_msg",
+            "m.c",
+            formals=[
+                {"name": "ctx", "kind": "pointer"},
+                {"name": "msg", "kind": "pointer"},
+                {"name": "msg_length", "kind": "value"},
+            ],
+        ),
+        "tcp.c#tcp_send_msg_pre": fn("tcp_send_msg_pre", "tcp.c", formals=_PRE_FORMALS),
+        "tcp.c#tcp_send": fn("tcp_send", "tcp.c", formals=_SEND_FORMALS, external_calls=["send"]),
+    }
+    pre, send = ["tcp.c#tcp_send_msg_pre"], ["tcp.c#tcp_send"]
+    if rtu:
+        functions["rtu.c#rtu_send_msg_pre"] = fn("rtu_send_msg_pre", "rtu.c", formals=_PRE_FORMALS)
+        functions["rtu.c#rtu_send"] = fn("rtu_send", "rtu.c", formals=_SEND_FORMALS, external_calls=["write"])
+        pre.append("rtu.c#rtu_send_msg_pre")
+        send.append("rtu.c#rtu_send")
+    return _graph(
+        functions,
+        direct=[("m.c#write_register", "m.c#send_msg")],
+        sites=[
+            ("m.c#send_msg", "(ctx->backend)->send_msg_pre", pre),
+            ("m.c#send_msg", "(ctx->backend)->send", send),
+        ],
+        external_formals={
+            "write": [
+                {"name": "fd", "kind": "value"},
+                {"name": "buf", "kind": "const_pointer"},
+                {"name": "n", "kind": "value"},
+            ]
+        },
+    )
+
+
+def _sink_warnings(doc: dict) -> list[str]:
+    return [w for w in doc["warnings"] if w.startswith("output sink")]
+
+
+@pytest.mark.unit
+def test_a_forwarding_sink_is_checked_at_the_innermost_sink():
+    doc = sp.generate(_modbus_model(), threat(output_sinks=[FORWARD_WRAPPER, FORWARD_INNER]))
+    assert not sp.validate(doc), sp.validate(doc)
+    assert _sink_warnings(doc) == []
+    props = by_name(doc)
+    wrapper, inner = props["L5_sanitized_send_msg"], props["L5_sanitized_tcp_send"]
+    # The wrapper's property has no instance and no MetAcsl text: nothing is checked at its calls.
+    assert wrapper["instances"] == [] and wrapper["forwarded_to"] == ["tcp_send"]
+    assert "meta \\prop" not in wrapper["acsl"] and "tcp_send" in wrapper["notes"][0]
+    assert "m.c#write_register" not in doc["obligations"]
+    assert sp.meta_file_text(doc, "m.c#write_register") is None
+    # The bytes are checked where they leave: at the wrapper's call of the transmitting sink. That
+    # call goes through a pointer, so the property is the sink's precondition.
+    assert inner["instances"] == ["m.c#send_msg"] and "forwarded_to" not in inner
+    assert "\\targets({tcp_send}), \\context(\\precond)" in inner["acsl"]
+    assert "\\fguard(\\initialized(\\formal(req) + (0 .. \\formal(req_length) - 1)))" in inner["acsl"]
+    assert [o["property"] for o in doc["obligations"]["m.c#send_msg"]] == ["L5_sanitized_tcp_send"]
+    meta = sp.module_meta_file_text(doc)
+    assert meta is not None and meta[1] == ["L5_sanitized_tcp_send"]
+    entry = sp.brief_entries(doc, "m.c", "send_msg")[0]
+    assert "precondition `L5_sanitized_tcp_send`" in entry["discharge"] and "`calls`" in entry["discharge"]
+    # A forwarding sink names at least one sink that checks.
+    wrapper["forwarded_to"] = []
+    assert sp.validate(doc)
+
+
+@pytest.mark.unit
+def test_an_undeclared_backend_keeps_the_wrapper_property_with_a_warning():
+    """One call site that reaches a declared sink and a function that reaches none: nothing is dropped."""
+    m = _modbus_model(rtu=True)
+    doc = sp.generate(m, threat(output_sinks=[FORWARD_WRAPPER, FORWARD_INNER]))
+    assert not sp.validate(doc), sp.validate(doc)
+    wrapper = by_name(doc)["L5_sanitized_send_msg"]
+    assert wrapper["instances"] == ["m.c#write_register"] and "forwarded_to" not in wrapper
+    assert "\\context(\\calling)" in wrapper["acsl"]
+    warned = _sink_warnings(doc)
+    assert len(warned) == 1, warned
+    assert "the call through `(ctx->backend)->send` in send_msg (m.c:61)" in warned[0]
+    assert "reaches the declared sink(s) tcp_send and also rtu_send, which reach(es) none" in warned[0]
+    # The pre-send hooks reach no sink in either backend: that site is no transmit path.
+    assert "Declare rtu_send " in warned[0] and "send_msg_pre" not in warned[0]
+    # Declaring the other backend's send makes the wrapper forward to both.
+    doc = sp.generate(m, threat(output_sinks=[FORWARD_WRAPPER, FORWARD_INNER, _net("rtu_send")]))
+    props = by_name(doc)
+    assert props["L5_sanitized_send_msg"]["forwarded_to"] == ["rtu_send", "tcp_send"]
+    assert props["L5_sanitized_send_msg"]["instances"] == []
+    assert props["L5_sanitized_rtu_send"]["instances"] == ["m.c#send_msg"]
+    assert props["L5_sanitized_tcp_send"]["instances"] == ["m.c#send_msg"]
+    assert _sink_warnings(doc) == []
+    # So does declaring what it transmits through: an external sink, checked at its call (\calling)
+    # in the function that transmits.
+    doc = sp.generate(m, threat(output_sinks=[FORWARD_WRAPPER, FORWARD_INNER, _net("write", "buf", "n")]))
+    props = by_name(doc)
+    assert props["L5_sanitized_send_msg"]["forwarded_to"] == ["tcp_send", "write"]
+    assert props["L5_sanitized_write"]["instances"] == ["rtu.c#rtu_send"]
+    assert "\\called == write ==>" in props["L5_sanitized_write"]["acsl"]
+    assert _sink_warnings(doc) == []
+
+
+@pytest.mark.unit
+def test_a_candidate_of_another_pointer_type_does_not_stop_the_forwarding():
+    """The model's type match ignores const, so the backend's recv is a candidate of the send site."""
+    m = _modbus_model()
+    recv_formals = [
+        {"name": "ctx", "kind": "pointer"},
+        {"name": "rsp", "kind": "pointer"},
+        {"name": "rsp_length", "kind": "value"},
+    ]
+    m["functions"]["tcp.c#tcp_recv"] = fn("tcp_recv", "tcp.c", formals=recv_formals, external_calls=["recv"])
+    site = next(s for s in m["indirect_sites"] if s["expr"].endswith("->send"))
+    site["candidates"].append("tcp.c#tcp_recv")
+    m["edges"].append({"caller": "m.c#send_msg", "callee": "tcp.c#tcp_recv", "kind": "indirect"})
+    sinks = threat(output_sinks=[FORWARD_WRAPPER, FORWARD_INNER])
+    doc = sp.generate(m, sinks)
+    assert by_name(doc)["L5_sanitized_send_msg"]["forwarded_to"] == ["tcp_send"]
+    assert _sink_warnings(doc) == []
+    # Parameters the model does not know (the GCC fallback): it may transmit, so the property stays.
+    del m["functions"]["tcp.c#tcp_recv"]["formals"]
+    doc = sp.generate(m, sinks)
+    assert "forwarded_to" not in by_name(doc)["L5_sanitized_send_msg"]
+    assert "and also tcp_recv, which reach(es) none" in _sink_warnings(doc)[0]
+
+
+@pytest.mark.unit
+def test_a_sink_forwards_only_to_another_declared_sink_that_checks_bytes():
+    m = _modbus_model()
+    # The wrapper alone: its property stays at its callers, and there is nothing to warn about.
+    doc = sp.generate(m, threat(output_sinks=[FORWARD_WRAPPER]))
+    alone = by_name(doc)["L5_sanitized_send_msg"]
+    assert alone["instances"] == ["m.c#write_register"] and "forwarded_to" not in alone
+    assert _sink_warnings(doc) == []
+    # Text sinks keep their placement: a wrapper does not sanitize, its callers must.
+    text = {"function": "send_msg", "kind": "log", "params": ["msg"], "description": "d"}
+    inner_text = {"function": "tcp_send", "kind": "log", "params": ["req"], "description": "d"}
+    for sinks in ([text, inner_text], [text, FORWARD_INNER], [FORWARD_WRAPPER, inner_text]):
+        prop = by_name(sp.generate(m, threat(output_sinks=sinks)))["L5_sanitized_send_msg"]
+        assert prop["instances"] == ["m.c#write_register"] and "forwarded_to" not in prop, sinks
+    # A declared sink that gets no property (no pointer parameter known) checks nothing: no forwarding to it.
+    doc = sp.generate(
+        m, threat(output_sinks=[FORWARD_WRAPPER, {"function": "send", "kind": "network", "description": "d"}])
+    )
+    assert by_name(doc)["L5_sanitized_send_msg"]["instances"] == ["m.c#write_register"]
+    assert any(w.startswith("output sink send: no pointer parameter") for w in doc["warnings"])
+    # With its parameters named it does, through the direct call in tcp_send.
+    props = by_name(sp.generate(m, threat(output_sinks=[FORWARD_WRAPPER, _net("send", "buf", "n")])))
+    assert props["L5_sanitized_send_msg"]["forwarded_to"] == ["send"]
+    assert props["L5_sanitized_send"]["instances"] == ["tcp.c#tcp_send"]
+
+
+@pytest.mark.unit
+def test_forwarding_follows_a_chain_and_keeps_one_property_in_a_cycle():
+    formals = [{"name": "req", "kind": "const_pointer"}, {"name": "req_length", "kind": "value"}]
+    functions = {f"a.c#{n}": fn(n, formals=formals) for n in ("user", "outer", "middle", "inner")}
+    sinks = [_net("outer"), _net("middle"), _net("inner")]
+    chain = model(
+        functions, edges=[("a.c#user", "a.c#outer"), ("a.c#outer", "a.c#middle"), ("a.c#middle", "a.c#inner")]
+    )
+    props = by_name(sp.generate(chain, threat(output_sinks=sinks)))
+    assert props["L5_sanitized_outer"]["forwarded_to"] == ["inner"]
+    assert props["L5_sanitized_middle"]["forwarded_to"] == ["inner"]
+    assert props["L5_sanitized_outer"]["instances"] == props["L5_sanitized_middle"]["instances"] == []
+    # Called directly: the innermost sink keeps the assertion at its call, in the sink above it.
+    assert props["L5_sanitized_inner"]["instances"] == ["a.c#middle"]
+    assert "\\called == inner ==>" in props["L5_sanitized_inner"]["acsl"]
+    # Two sinks that only reach each other: one keeps its property, so the bytes are still checked.
+    cycle = model(
+        functions, edges=[("a.c#user", "a.c#outer"), ("a.c#outer", "a.c#middle"), ("a.c#middle", "a.c#outer")]
+    )
+    props = by_name(sp.generate(cycle, threat(output_sinks=sinks[:2])))
+    middle = props["L5_sanitized_middle"]
+    assert middle["instances"] == ["a.c#outer"] and "forwarded_to" not in middle
+    assert props["L5_sanitized_outer"]["forwarded_to"] == ["middle"]
+
+
+@pytest.mark.unit
+def test_a_sink_called_through_a_pointer_is_checked_as_its_precondition():
+    """MetAcsl cannot name the arguments of an indirect call: a \\calling instance there never proves."""
+    functions = {
+        "a.c#log_line": fn("log_line", formals=[{"name": "msg", "kind": "const_pointer"}]),
+        "a.c#report": fn("report"),
+        "a.c#direct": fn("direct"),
+    }
+    m = _graph(functions, direct=[("a.c#direct", "a.c#log_line")], sites=[("a.c#report", "logger", ["a.c#log_line"])])
+    prop = by_name(sp.generate(m, threat(output_sinks=[LOG_SINK])))["L5_sanitized_log_line"]
+    assert "\\targets({log_line}), \\context(\\precond)" in prop["acsl"]
+    assert "\\fguard(no_crlf_string(\\formal(msg)))" in prop["acsl"]
+    assert prop["instances"] == ["a.c#direct", "a.c#report"]
+    assert any("`calls` annotation naming log_line" in n for n in prop["notes"])
+    # Called directly only: the assertion at each call, as before.
+    m = _graph(functions, direct=[("a.c#direct", "a.c#log_line")])
+    prop = by_name(sp.generate(m, threat(output_sinks=[LOG_SINK])))["L5_sanitized_log_line"]
+    assert "\\context(\\calling)" in prop["acsl"] and "no_crlf_string(\\called_arg(msg))" in prop["acsl"]
+    assert prop["instances"] == ["a.c#direct"] and prop["notes"] == []
+
+
+@pytest.mark.unit
+def test_the_seed_gives_the_callers_of_a_forwarding_sink_no_l5_unit(run_dir):
+    m = _modbus_model()
+    doc = sp.generate(m, threat(output_sinks=[FORWARD_WRAPPER, FORWARD_INNER]))
+    _seed_one_file(run_dir, m, doc)
+    units = _ledger_units(run_dir)
+    assert [c for c in units if c.endswith("::l5_sanitized")] == ["m.c#send_msg::l5_sanitized"]
+    assert units["m.c#send_msg::l5_sanitized"]["bookkeeping"]["security_properties"] == ["L5_sanitized_tcp_send"]
+
+
+def _forward_wp(target: Path, run: Path, function: str, defs: str = "") -> dict:
+    """run_wp_function.py on one function of the forwarding fixture, in the image, on this tree's pipeline."""
+    cmd = [
+        "docker", "run", "--rm", "--network", "none", "--entrypoint", "sh",
+        "-v", f"{target.resolve()}:/target:ro", "-v", f"{run.resolve()}:/framac-run", "-w", "/framac-run",
+        "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+        "-v", f"{ROOT / 'schemas'}:/opt/framac-pipeline/schemas:ro",
+        "-v", f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
+        ANALYSIS_IMAGE, "-c",
+        f"python3 /opt/framac-pipeline/scripts/run_wp_function.py --file /target/prog.c --function {function} "
+        f"--out-dir workspace/wp '--cppflags=-I/target{defs}' --timeout 10 "
+        f"--out-json workspace/reports/wp/{function}.json",
+    ]  # fmt: skip
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    return json.loads((run / f"workspace/reports/wp/{function}.json").read_text(encoding="utf-8"))
+
+
+def _named_goals(report: dict, name: str) -> tuple[list[dict], list[dict]]:
+    """(proven, unproven) goals of a WP report that carry the property's name."""
+    mine = f"{name}:"
+    proven = [g for g in report["layer_goals"] if str(g.get("annotation") or "").startswith(mine)]
+    unproven = [g for g in report["unproven_goals"] if str(g.get("annotation") or "").startswith(mine)]
+    return proven, unproven
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("case", ["forwarded", "violated", "no_calls", "wrapper_alone"])
+def test_forwarding_sink_acceptance_in_the_image(model_run, tmp_path, monkeypatch, case):  # noqa: F811
+    """
+    The libmodbus shape (forward/l5_forwarding.c) against the real model, MetAcsl and WP. With the
+    wrapper and the transmitting sink declared, the wrapper's caller has no L5 goal and proves, and
+    the transmitting sink's property proves in the wrapper, after the backend completed the buffer
+    (`forwarded`); it stays unproven when the wrapper skips the completion (`violated`). Without a
+    `calls` annotation at the pointer call, WP has no precondition to prove there: the run is
+    flagged unsound and the ledger credits nothing (`no_calls`). Declared alone, the wrapper is
+    still checked at its callers, one step too early: the goal is unproven on the correct program
+    (`wrapper_alone`, the placement the forwarding replaces).
+    """
+    violate = case in ("violated", "no_calls")
+    defs = {"violated": " -DVIOLATE", "no_calls": " -DVIOLATE -DNO_CALLS"}.get(case, "")
+    sinks = [FORWARD_WRAPPER] if case == "wrapper_alone" else [FORWARD_WRAPPER, FORWARD_INNER]
+    target = _one_file_target(tmp_path / "target", FORWARD_DIR / "l5_forwarding.c", {"output_sinks": sinks}, violate)
+    (target / "Makefile").write_text(_VARIANT_MAKEFILE.format(defs=defs.strip()), encoding="utf-8", newline="\n")
+    run = tmp_path / "run"
+    m = model_run(target, run, "make")
+    assert m["status"] == "ok"
+    # The model resolves the wrapper's call of the backend's send by type.
+    assert ("(ctx->backend)->send", ["prog.c#tcp_send"]) in [(s["expr"], s["candidates"]) for s in m["indirect_sites"]]
+    doc = sp.generate(m, trust.load_threat_model(target / "THREAT_MODEL.md"))
+    assert not sp.validate(doc), sp.validate(doc)
+    assert _sink_warnings(doc) == []
+    props = by_name(doc)
+    write_json(run / "workspace/reports/security_props.json", doc)
+    if case == "wrapper_alone":
+        assert props["L5_sanitized_send_msg"]["instances"] == ["prog.c#write_register"]
+        proven, unproven = _named_goals(_forward_wp(target, run, "write_register"), "L5_sanitized_send_msg")
+        assert unproven and not proven, (proven, unproven)
+        return
+    wrapper, inner = props["L5_sanitized_send_msg"], props["L5_sanitized_tcp_send"]
+    assert wrapper["instances"] == [] and wrapper["forwarded_to"] == ["tcp_send"]
+    assert inner["instances"] == ["prog.c#send_msg"] and "\\context(\\precond)" in inner["acsl"]
+    assert not [o for o in doc["obligations"].get("prog.c#write_register", []) if o["class"] == "l5_sanitized"]
+    monkeypatch.chdir(run)
+    _seed_one_file(run, m, doc)
+    assert [c for c in _ledger_units(run) if c.endswith("::l5_sanitized")] == ["prog.c#send_msg::l5_sanitized"]
+    report = _forward_wp(target, run, "send_msg", defs)
+    assert report["security_props"]["properties"] == ["L5_sanitized_tcp_send"]
+    proven, unproven = _named_goals(report, "L5_sanitized_tcp_send")
+    detail = json.dumps({"proven": proven, "unproven": unproven, "log": report.get("wp_log_tail")}, indent=1)
+    if case == "no_calls":
+        # No goal carries the property, and nothing may read that as "decided statically".
+        assert not proven and not unproven, detail
+        assert report["status"] != "all_proven" and not report["soundness"]["ok"], report["soundness"]
+        L.cmd_ingest_wp([run / "workspace/reports/wp/send_msg.json"])
+        unit = _ledger_units(run)["prog.c#send_msg::l5_sanitized"]
+        assert unit["status"] != "covered" and unit["evidence"][-1]["result"] == "wp_no_credited_goals", unit
+        return
+    if violate:
+        assert unproven and not proven, detail
+        return
+    assert proven and not unproven, detail
+    # The caller loads no property and proves: nothing is asked of it before the buffer is complete.
+    caller = _forward_wp(target, run, "write_register")
+    assert not caller.get("security_props") and "l5_sanitized" not in caller["by_obligation_class"]
+    assert caller["status"] == "all_proven", caller.get("wp_log_tail")

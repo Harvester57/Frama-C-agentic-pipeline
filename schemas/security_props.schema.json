@@ -95,6 +95,12 @@
             "required": ["check"],
             "additionalProperties": false
           },
+          "forwarded_to": {
+            "$comment": "a forwarding sink (L5): a bytes sink the target defines that reaches these declared bytes sinks in the model's call graph. Its bytes are checked at their calls, where they leave; the property has no instance and no MetAcsl text (`acsl` is a comment)",
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1
+          },
           "direct_writers": {"type": "array", "items": {"type": "string"}},
           "entry_points": {"type": "array", "items": {"type": "string"}}
         },

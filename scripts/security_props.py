@@ -25,7 +25,13 @@ search order, with a warning). It writes security_props.json
       in text handed to a log or terminal sink, initialized bytes handed to the others - or, for a
       `buffer` sink, initialized out-parameters when it returns (\\postcond). A caller that hands a
       text sink string literals only is decided from the model's call sites instead (plan step M2):
-      no goal, the property's `decided` and the obligation's `decided` record the verdict;
+      no goal, the property's `decided` and the obligation's `decided` record the verdict.
+      A sink the target defines and calls through a function pointer gets the same obligation as its
+      precondition (\\precond), proved at each call: MetAcsl cannot name the arguments of an indirect
+      call. A bytes sink that reaches other declared bytes sinks in the model's call graph is a
+      forwarding sink: its bytes are checked at the innermost ones, where they leave, and its own
+      property has no instance (`forwarded_to`), unless one indirect call site on the way may also
+      reach a function that reaches no declared sink (the property stays, with a warning);
   L6  each secret:
         L6_wiped_<secret>    zero when its release function (the secret's `function`) returns;
         L6_no_leak_<secret>  never passed to a sink, never read by a sink the target defines.
@@ -184,10 +190,22 @@ class _Model:
         for fid, f in sorted(self.functions.items()):
             self.by_name[str(f.get("name") or fid.split("#")[-1])].append(fid)
         self.callers: dict[str, set[str]] = defaultdict(set)
+        self.callees: dict[str, set[str]] = defaultdict(set)
+        # Functions with a caller that reaches them through a pointer (an indirect call site's type
+        # match, or their address handed to an external as a callback).
+        self.pointer_called: set[str] = set()
         for e in model.get("edges") or []:
             a, b = e.get("caller"), e.get("callee")
             if a in self.functions and b in self.functions and a != b:
                 self.callers[b].add(a)
+                self.callees[a].add(b)
+                if e.get("kind") == "indirect":
+                    self.pointer_called.add(b)
+        # The indirect call sites of each function: one site dispatches to one of its `candidates`.
+        self.sites: dict[str, list[dict]] = defaultdict(list)
+        for s in model.get("indirect_sites") or []:
+            if isinstance(s, dict) and s.get("caller") in self.functions:
+                self.sites[str(s["caller"])].append(s)
         self.ext_callers: dict[str, set[str]] = defaultdict(set)
         for fid, f in self.functions.items():
             for name in f.get("external_calls") or []:
@@ -475,7 +493,135 @@ class _Gen:
             return [], None
         return [str(p["name"]) for p in formals if p.get("kind") in kinds], formals
 
+    def _bytes_sinks(self) -> dict[str, set[str]]:
+        """
+        The sinks of the threat model that get an initialization property (every kind but `log`,
+        `terminal` and `buffer`, with a pointer parameter to state it on): C name -> the live
+        functions defining it (none: a sink the target only declares). No warning here: output_sinks
+        gives them, item by item.
+        """
+        out: dict[str, set[str]] = {}
+        for item in self.block.get("output_sinks") or []:
+            ref = str(item.get("function") or "")
+            name = ref.split("#")[-1]
+            kind = str(item.get("kind") or "other")
+            if not name or kind in TEXT_SINKS or kind == "buffer":
+                continue
+            fids = self.m.resolve(ref)
+            if not fids and name not in self.m.ext_callers:
+                continue
+            if not self._sink_params(item, name, ("pointer", "const_pointer"))[0]:
+                continue
+            out.setdefault(name, set()).update(f for f in fids if f in self.m.live)
+        return out
+
+    def _sinks_from(self, start: Iterable[str], sinks: dict[str, set[str]], own: str) -> tuple[set[str], set[str]]:
+        """
+        The bytes sinks other than `own` that the functions `start` reach in the model's call graph
+        (direct and indirect edges), and the functions walked. The walk stops at a declared sink, so
+        these are the nearest ones on each path.
+        """
+        by_fid = {f: n for n, fids in sinks.items() if n != own for f in fids}
+        external = {n for n, fids in sinks.items() if n != own and not fids}
+        found: set[str] = set()
+        walked: set[str] = set()
+        todo = list(start)
+        while todo:
+            fid = todo.pop()
+            if fid in walked or fid not in self.m.live:
+                continue
+            if fid in by_fid:
+                found.add(by_fid[fid])
+                continue
+            walked.add(fid)
+            found |= external & set(self.m.functions[fid].get("external_calls") or [])
+            todo += sorted(self.m.callees.get(fid, ()))
+        return found, walked
+
+    def _shape(self, fid: str) -> tuple[str, ...] | None:
+        """The kinds of a function's parameters (value, pointer, const_pointer), or None when unknown."""
+        formals = self.m.functions[fid].get("formals")
+        return tuple(str(p.get("kind")) for p in formals) if isinstance(formals, list) else None
+
+    def _forwarding(self, sinks: dict[str, set[str]]) -> tuple[dict[str, list[str]], dict[str, str]]:
+        """
+        The forwarding sinks (plan A of docs/plans/metacsl-exploitation-plan.md): a bytes sink the
+        target defines that reaches other declared bytes sinks. What it is handed may be completed on
+        the way (libmodbus's send_msg has the backend fill the MBAP length before the backend's send),
+        so its bytes are checked where they leave, at the innermost declared sinks, and not at its own
+        calls. Returns (sink -> the innermost sinks its obligation moves to, sink -> why a sink that
+        reaches declared sinks keeps its own property).
+
+        A sink keeps its property when one indirect call site on the way has a candidate that reaches
+        a declared sink and another, callable through the same pointer type, that reaches none (a
+        backend table with one declared `send` and one undeclared): forwarding would then stop
+        checking what the undeclared one transmits. Two sinks that only reach each other keep one
+        property between them.
+        """
+        nearest: dict[str, set[str]] = {}
+        kept: dict[str, str] = {}
+        for name in sorted(sinks):
+            if not sinks[name]:
+                continue  # declared only: nothing of it is in the call graph
+            found, walked = self._sinks_from(sinks[name], sinks, name)
+            if not found:
+                continue
+            reach: dict[str, set[str]] = {}
+            partial: list[str] = []
+            undeclared: set[str] = set()
+            for fid in sorted(walked):
+                for site in self.m.sites.get(fid, []):
+                    cands = sorted(c for c in site.get("candidates") or [] if c in self.m.live)
+                    for c in cands:
+                        if c not in reach:
+                            reach[c] = self._sinks_from([c], sinks, name)[0]
+                    # The model's type match ignores `const`, so a site typed like the backend's send
+                    # (`const unsigned char *`) also lists its recv (`unsigned char *`). One pointer
+                    # type cannot call both without a cast: a candidate that reaches no sink counts
+                    # only when its parameters have the kinds of one that does (or are unknown).
+                    shapes = {self._shape(c) for c in cands if reach[c]}
+                    dead = [
+                        c
+                        for c in cands
+                        if not reach[c] and (self._shape(c) is None or None in shapes or self._shape(c) in shapes)
+                    ]
+                    if not dead or not shapes:
+                        continue
+                    declared = sorted({s for c in cands for s in reach[c]})
+                    undeclared |= {self.m.name(c) for c in dead}
+                    partial.append(
+                        f"the call through `{site.get('expr') or '?'}` in {self.m.name(fid)}"
+                        f" ({site.get('loc') or 'no location'}) reaches the declared sink(s) {', '.join(declared)}"
+                        f" and also {', '.join(sorted(self.m.name(c) for c in dead))}, which reach(es) none"
+                    )
+            if partial:
+                kept[name] = (
+                    f"output sink {name}: it forwards to {', '.join(sorted(found))}, but {'; '.join(partial)}. "
+                    f"Its property stays at its own calls (which is before the buffer is complete when a callee "
+                    f"of {name} completes it). Declare {', '.join(sorted(undeclared))} (or what they transmit "
+                    "through) as output sinks to have the bytes checked where they leave"
+                )
+                continue
+            nearest[name] = found
+
+        def innermost(name: str, seen: frozenset[str]) -> set[str]:
+            out: set[str] = set()
+            for s in nearest[name]:
+                if s not in nearest:
+                    out.add(s)
+                elif s not in seen:
+                    out |= innermost(s, seen | {s})
+            return out
+
+        while True:
+            cyclic = next((n for n in sorted(nearest) if not innermost(n, frozenset({n}))), None)
+            if cyclic is None:
+                break
+            del nearest[cyclic]
+        return {n: sorted(innermost(n, frozenset({n}))) for n in nearest}, kept
+
     def output_sinks(self) -> None:
+        forwards, kept = self._forwarding(self._bytes_sinks())
         for item in self.block.get("output_sinks") or []:
             sink = self._one(str(item.get("function") or ""), "output sink")
             if sink is None:
@@ -496,23 +642,55 @@ class _Gen:
                 )
                 continue
             length = item.get("length")
+            bytes_sink = not buffer and kind not in TEXT_SINKS
+            meta = {"output_sink": sink, "kind": kind, "params": params}
+            if bytes_sink and sink in forwards:
+                # A forwarding sink: no goal at its calls, the innermost declared sinks check the bytes.
+                name = self._unique(f"{NAME_PREFIX['sanitized']}{_ident(sink)}")
+                to = forwards[sink]
+                self._add(
+                    "sanitized",
+                    name,
+                    f"/* {name}: {sink} forwards its buffer to the declared sink(s) {', '.join(to)}; the bytes are "
+                    "checked there, where they leave. No MetAcsl goal. */",
+                    set(),
+                    notes=[
+                        f"{sink} forwards to the declared sink(s) {', '.join(to)}: the bytes are checked at their "
+                        f"calls, after anything {sink} or its callees complete, and the callers of {sink} have no "
+                        "goal"
+                    ],
+                    threat_model=meta,
+                    targets=sink,
+                    forwarded_to=to,
+                )
+                continue
+            if bytes_sink and sink in kept:
+                self.warnings.append(kept[sink])
+            # A sink the target defines and calls through a pointer: a precondition of the sink, which
+            # WP proves at each call. A \calling instance cannot name the arguments of such a call.
+            entry = not buffer and any(f in self.m.pointer_called for f in self.m.resolve(sink) if f in self.m.live)
+            suffix = "_formal" if entry else ""
             clauses = []
             for p in params:
                 if buffer:
                     clauses.append(self.t.render("l5_sanitized", "out_object", param=p))
                 elif kind in TEXT_SINKS:
-                    clauses.append(self.t.render("l5_sanitized", "text", param=p))
+                    clauses.append(self.t.render("l5_sanitized", "text" + suffix, param=p))
                 elif length:
-                    clauses.append(self.t.render("l5_sanitized", "bytes", param=p, length=str(length)))
+                    clauses.append(self.t.render("l5_sanitized", "bytes" + suffix, param=p, length=str(length)))
                 else:
-                    clauses.append(self.t.render("l5_sanitized", "object", param=p))
+                    clauses.append(self.t.render("l5_sanitized", "object" + suffix, param=p))
             name = self._unique(f"{NAME_PREFIX['sanitized']}{_ident(sink)}")
             predicate = " &&\n      ".join(clauses)
-            acsl = self.t.render(
-                "l5_sanitized", "buffer" if buffer else "emit", name=name, sink=sink, predicate=predicate
-            )
+            variant = "buffer" if buffer else "entry" if entry else "emit"
+            acsl = self.t.render("l5_sanitized", variant, name=name, sink=sink, predicate=predicate)
             notes = []
-            if not buffer and kind not in TEXT_SINKS and not length:
+            if entry:
+                notes.append(
+                    f"{sink} is called through a function pointer: the property is its precondition, proved at "
+                    f"each call; a call through a pointer needs a `calls` annotation naming {sink}"
+                )
+            if bytes_sink and not length:
                 notes.append("no `length`: only the first object each parameter points to is checked")
             if buffer:
                 instances = {f for f in self.m.resolve(sink) if f in self.m.live}
@@ -535,7 +713,7 @@ class _Gen:
                 instances,
                 decided=decided,
                 notes=notes,
-                threat_model={"output_sink": sink, "kind": kind, "params": params},
+                threat_model=meta,
                 targets=sink,
             )
 
@@ -1539,6 +1717,11 @@ DISCHARGE = {
         "the generated `assert {name}: meta:` before each call of the sink here (or, for a buffer sink, its "
         "`ensures {name}`): what reaches the sink is sanitized"
     ),
+    "sanitized_entry": (
+        "the precondition `{name}` of the sink (generated `requires {name}: meta:`), at each call of the sink "
+        "here: what reaches the sink is sanitized. A call through a function pointer needs a `calls` annotation "
+        "naming the sink, or WP has no precondition to prove there"
+    ),
     "wiped": "the generated `ensures {name}`: the secret is zero on every return path",
     "gate_failure": (
         "the generated `check {name}` already in the code before each return of the gate (do not edit or move "
@@ -1590,6 +1773,8 @@ def brief_entries(props: dict, file: str, name: str) -> list[dict]:
                     if (p.get("code") or {}).get("returns")
                     else DISCHARGE["wiped_local"]
                     if p.get("code")
+                    else DISCHARGE["sanitized_entry"]
+                    if p.get("kind") == "sanitized" and "\\context(\\precond)" in str(p.get("acsl"))
                     else DISCHARGE.get(str(p.get("kind")), "")
                 ).format(name=p.get("name")),
             }
