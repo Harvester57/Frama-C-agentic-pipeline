@@ -713,28 +713,130 @@ def _decided_only(unit: dict) -> bool:
     return bool(bk.get("decided_properties")) and not bk.get("security_properties")
 
 
-def _meta_no_goal_credit_barred(unit: dict) -> str | None:
+def _meta_facts(path: Path | None = None) -> dict:
     """
-    Why a MetAcsl-class unit WP has no goal for must not be credited as decided statically
-    (`wp_meta_simplified`), or None. The no-goal credit rests on MetAcsl having dropped every instance
-    as obviously true in the per-function parse; it has no proof behind it, so anything that says an
-    instance exists and is open outweighs it:
+    What security_props.json says about where its MetAcsl properties are not checked, or are checked
+    by an in-code check rather than by MetAcsl (package E of docs/plans/metacsl-exploitation-plan.md:
+    MetAcsl gives a call placed in an initializer no \\calling, \\writing or \\strong_invariant
+    instance). Keys are (`file#function`, property):
 
-      - an Eva module left a check of the unit's properties Unknown, Invalid or unclassified
-        (`bookkeeping.eva_verdicts`, the verdicts of EVA_BLOCKING that keep `ingest-eva` from covering
-        the unit): the module parse generated a check the per-function parse did not.
+      gaps    -> [why]: the property does not check something in the function. From the property's
+                 `unchecked` (an initializer site no check could be written for, a caller left out of
+                 the targets), the obligation entry's `unchecked`, and the `init_checks` of the
+                 function that `code_checks` does not hold (listed, never written into the work tree);
+      placed  -> [line]: the in-code checks written there (`code_checks`), which a WP run of the
+                 function must report as goals.
 
-    A goal WP proves is not concerned: it credits the unit whatever Eva left open.
+    Empty without the file. Read as the generator precomputed it; nothing is derived from the model.
     """
+    out: dict[str, dict[tuple[str, str], list]] = {"gaps": {}, "placed": {}}
+    try:
+        doc = load_json_optional(path or DEFAULT_SECURITY_PROPS, {})
+    except ArtifactError:
+        return out
+    if not isinstance(doc, dict):
+        return out
+
+    def fid(ref: object) -> str:
+        file, _, name = str(ref or "").rpartition("#")
+        return f"{normalize_file(file)}#{name}"
+
+    def gap(key: tuple[str, str], why: str) -> None:
+        found = out["gaps"].setdefault(key, [])
+        if why not in found:
+            found.append(why)
+
+    placed_count: dict[tuple[str, str], int] = {}
+    for c in doc.get("code_checks") or []:
+        if isinstance(c, dict) and c.get("function") and c.get("property"):
+            key = (fid(c["function"]), str(c["property"]))
+            out["placed"].setdefault(key, []).append(int(c.get("line") or 0))
+            placed_count[key] = placed_count.get(key, 0) + 1
+    for prop in doc.get("properties") or []:
+        if not isinstance(prop, dict) or not prop.get("name"):
+            continue
+        name = str(prop["name"])
+        for u in prop.get("unchecked") or []:
+            if isinstance(u, dict) and u.get("function"):
+                where = f" (line {u['line']})" if u.get("line") else ""
+                gap((fid(u["function"]), name), f"{u.get('reason') or 'not checked'}{where}")
+        listed: dict[tuple[str, str], list[dict]] = {}
+        for c in prop.get("init_checks") or []:
+            if isinstance(c, dict) and c.get("function"):
+                listed.setdefault((fid(c["function"]), name), []).append(c)
+        for key, sites in listed.items():
+            if len(sites) > placed_count.get(key, 0):
+                calls = ", ".join(f"{s.get('callee')} at line {s.get('line')}" for s in sites)
+                gap(key, f"its check(s) at the initializer call(s) of {calls} are listed but not written into the work tree")
+    for ref, items in (doc.get("obligations") or {}).items():
+        for ob in items if isinstance(items, list) else []:
+            if isinstance(ob, dict) and ob.get("unchecked") and ob.get("property"):
+                gap((fid(ref), str(ob["property"])), str(ob["unchecked"]))
+    return out
+
+
+def _unit_fid(unit: dict) -> str:
+    return f"{normalize_file(unit['file'])}#{unit['function']}"
+
+
+def _meta_unchecked(unit: dict, facts: dict | None) -> list[str]:
+    """`<property>: <why>` for each property of the unit security_props.json says is not checked in its function."""
+    if unit["obligation_class"] not in METACSL_CLASSES or not facts:
+        return []
+    fid = _unit_fid(unit)
+    names = (unit.get("bookkeeping") or {}).get("security_properties") or []
+    return [f"{n}: {why}" for n in sorted(names) for why in facts["gaps"].get((fid, str(n))) or []]
+
+
+def _meta_no_goal_bar(unit: dict, facts: dict | None) -> tuple[str, str] | None:
+    """(evidence result, why) of _meta_no_goal_credit_barred."""
     verdicts = (unit.get("bookkeeping") or {}).get("eva_verdicts") or {}
     blocking = sorted(m for m, v in verdicts.items() if v in EVA_BLOCKING)
     if blocking:
         return (
+            "wp_meta_simplified_eva_open",
             "Eva left a check of them open in module(s) "
             + ", ".join(f"'{m}' ({verdicts[m]})" for m in blocking)
-            + ", so an instance exists that this run did not prove"
+            + ", so an instance exists that this run did not prove",
+        )
+    gaps = _meta_unchecked(unit, facts)
+    if gaps:
+        return "wp_meta_unchecked", "; ".join(gaps)
+    fid = _unit_fid(unit)
+    names = (unit.get("bookkeeping") or {}).get("security_properties") or []
+    placed = {str(n): (facts or {}).get("placed", {}).get((fid, str(n))) for n in names}
+    placed = {n: lines for n, lines in placed.items() if lines}
+    if placed:
+        where = "; ".join(f"{n} at line(s) {', '.join(map(str, sorted(set(ls))))}" for n, ls in sorted(placed.items()))
+        return (
+            "wp_meta_check_not_reported",
+            f"the in-code check(s) written into the function ({where}) are not among this run's goals "
+            "(a work tree without them, or rows the runner could not name)",
         )
     return None
+
+
+def _meta_no_goal_credit_barred(unit: dict, facts: dict | None = None) -> str | None:
+    """
+    Why a MetAcsl-class unit WP has no goal for must not be credited as decided statically
+    (`wp_meta_simplified`), or None. The no-goal credit rests on MetAcsl having dropped every instance
+    as obviously true in the per-function parse; it has no proof behind it, so anything that says an
+    instance exists and is open, or that something is not checked at all, outweighs it:
+
+      - an Eva module left a check of the unit's properties Unknown, Invalid or unclassified
+        (`bookkeeping.eva_verdicts`, the verdicts of EVA_BLOCKING that keep `ingest-eva` from covering
+        the unit): the module parse generated a check the per-function parse did not;
+      - security_props.json (`facts`, _meta_facts) says a property of the unit is not checked in its
+        function: a site under the property's `unchecked`, an obligation entry with `unchecked`, or an
+        initializer check listed under `init_checks` that `code_checks` does not hold. `ingest-wp`
+        refuses every credit to such a unit (wp_meta_unchecked), not only this one;
+      - an in-code check was written into the function (`code_checks`) and the run has no goal of
+        the class: the run did not see it.
+
+    A goal WP proves is not concerned by the first and the last: it credits the unit whatever Eva left open.
+    """
+    found = _meta_no_goal_bar(unit, facts)
+    return found[1] if found else None
 
 
 def _meta_decided_statically(unit: dict, report: dict) -> bool:
@@ -1893,44 +1995,84 @@ def _taint_checks(path: Path = DEFAULT_SECURITY_PROPS) -> list[dict]:
     return [c for c in checks or [] if isinstance(c, dict) and c.get("function")]
 
 
-def _code_checks(path: Path = DEFAULT_SECURITY_PROPS) -> dict[tuple[str, int], dict]:
-    """(file, line) -> the in-code check security_props.py placed there (plan step M6)."""
+def _code_checks(path: Path = DEFAULT_SECURITY_PROPS) -> dict[tuple[str, int, int], dict]:
+    """
+    (file, line, index) -> the in-code check security_props.py placed there (plan steps M6 and M7, and
+    package E's checks at calls placed in initializers). One line can carry several checks (one
+    initializer, two properties): `index` is a check's position among them (absent: 0, the M6 and
+    M7 checks are alone on their line). A second check without an index on the same line takes the
+    next free position.
+    """
     try:
         doc = load_json_optional(path, {})
     except ArtifactError:
         return {}
     checks = doc.get("code_checks") if isinstance(doc, dict) else None
-    return {
-        (normalize_file(str(c.get("file"))), int(c.get("line") or 0)): c
-        for c in checks or []
-        if isinstance(c, dict) and c.get("function")
-    }
+    out: dict[tuple[str, int, int], dict] = {}
+    for c in checks or []:
+        if not isinstance(c, dict) or not c.get("function"):
+            continue
+        file, line = normalize_file(str(c.get("file"))), int(c.get("line") or 0)
+        index = int(c["index"]) if isinstance(c.get("index"), int) else 0
+        while (file, line, index) in out:
+            index += 1
+        out[(file, line, index)] = c
+    return out
+
+
+def _code_lines(checks: dict[tuple[str, int, int], dict]) -> dict[tuple[str, int], list[dict]]:
+    """(file, line) -> the in-code checks of that line, in index order: what an Eva row (file and line only) can match."""
+    out: dict[tuple[str, int], list[dict]] = {}
+    for file, line, index in sorted(checks):
+        out.setdefault((file, line), []).append(checks[(file, line, index)])
+    return out
 
 
 def _ingest_code_checks(
-    units: dict[str, dict], rows: list[tuple[str, dict]], checks: dict, module: str, tool_output: str
+    units: dict[str, dict],
+    rows: list[tuple[str, dict]],
+    lines: dict[tuple[str, int], list[dict]],
+    module: str,
+    tool_output: str,
 ) -> None:
-    """Eva's statuses of the in-code checks (M6 wipes, M7 gate failures): evidence on their property's unit (WP decides it)."""
+    """
+    Eva's statuses of the in-code checks (M6 wipes, M7 gate failures, initializer checks): evidence on
+    their property's unit (WP decides it). Eva's report lists only the open rows, so a row on a line
+    that holds several checks cannot be told apart by its position there: it is filed under every
+    check of the line.
+    """
     for verdict, row in rows:
-        check = checks.get(_code_key(row))
-        if not check:
+        for check in lines.get(_code_key(row)) or []:
+            for u in units.values():
+                if (
+                    str(check.get("property")) in ((u.get("bookkeeping") or {}).get("security_properties") or [])
+                    and u["function"] == str(row.get("function") or "")
+                    and _alarm_in_file(row, u["file"])
+                ):
+                    add_evidence(
+                        u,
+                        "eva",
+                        "run_eva_slice.py",
+                        f"eva_check_{verdict}",
+                        False,
+                        tool_output,
+                        f"Eva slice '{module}': {check.get('property')} at line {row.get('line')} is {verdict}; "
+                        "WP proves the check.",
+                    )
+
+
+def _open_code_checks(
+    unit: dict, code_rows: list[tuple[str, dict]], lines: dict[tuple[str, int], list[dict]]
+) -> list[str]:
+    """The verdicts of the open Eva rows of in-code checks of the unit's properties in its function."""
+    names = set((unit.get("bookkeeping") or {}).get("security_properties") or [])
+    out = []
+    for verdict, row in code_rows:
+        if str(row.get("function") or "") != unit["function"] or not _alarm_in_file(row, unit["file"]):
             continue
-        for u in units.values():
-            if (
-                str(check.get("property")) in ((u.get("bookkeeping") or {}).get("security_properties") or [])
-                and u["function"] == str(row.get("function") or "")
-                and _alarm_in_file(row, u["file"])
-            ):
-                add_evidence(
-                    u,
-                    "eva",
-                    "run_eva_slice.py",
-                    f"eva_check_{verdict}",
-                    False,
-                    tool_output,
-                    f"Eva slice '{module}': {check.get('property')} at line {row.get('line')} is {verdict}; "
-                    "WP proves the check.",
-                )
+        if any(str(c.get("property")) in names for c in lines.get(_code_key(row)) or []):
+            out.append(verdict)
+    return out
 
 
 def _taint_open(unit: dict) -> list[str]:
@@ -2064,9 +2206,15 @@ def _eva_meta_instance_verdict(entry: object) -> str:
     return "valid" if entry.get("valid") else "none"
 
 
-def _eva_meta_cover_barred(unit: dict) -> bool:
-    """An L4-L6 unit Eva's checks cannot cover: decided violated from the model, or its taint check is open."""
-    return unit["obligation_class"] in METACSL_CLASSES and (_decided_violation(unit) or bool(_taint_open(unit)))
+def _eva_meta_cover_barred(unit: dict, facts: dict | None = None) -> bool:
+    """
+    An L4-L6 unit Eva's checks cannot cover: decided violated from the model, its taint check is open,
+    or security_props.json says a property of it is not checked in its function (_meta_unchecked: Eva's
+    module parse skips the same initializer calls MetAcsl skips under WP).
+    """
+    return unit["obligation_class"] in METACSL_CLASSES and (
+        _decided_violation(unit) or bool(_taint_open(unit)) or bool(_meta_unchecked(unit, facts))
+    )
 
 
 def _ingest_eva_meta(
@@ -2078,11 +2226,16 @@ def _ingest_eva_meta(
     tool_output: str,
     index: dict[str, list[tuple[int, int, str]]],
     touched: set[str],
+    code_rows: list[tuple[str, dict]] | None = None,
+    lines: dict[tuple[str, int], list[dict]] | None = None,
 ) -> tuple[int, int]:
     """
     File one Eva report's MetAcsl statuses under the L4-L6 units; returns (units given a verdict,
     candidates opened). A unit gets a verdict when the report lists an instance of one of its
-    properties in its function; the unit's verdict is the worst of its properties':
+    properties in its function; the unit's verdict is the worst of its properties', and an in-code
+    check of one of them that Eva left open in the function (`code_rows`: Unknown, Invalid or Dead
+    rows of the checks `lines` lists, package E's initializer checks) counts as `unknown`, since it is
+    the same obligation at a call MetAcsl gave no instance:
 
       invalid  a check is Invalid: a candidate per Invalid row, the unit becomes `candidate`;
       other    a status Eva left unclassified, or a row that cannot be told apart from another file's
@@ -2118,6 +2271,9 @@ def _ingest_eva_meta(
         filed += 1
         touched.add(u["coverage_id"])
         per = {n: _eva_meta_instance_verdict(e) for n, e in mine.items()}
+        open_code = _open_code_checks(u, code_rows, lines) if code_rows and lines else []
+        if open_code:
+            per["in-code checks"] = "unknown"
         verdict = min(per.values(), key=_META_VERDICT_ORDER.index)
         _unit_eva_verdicts(u)[module] = verdict
         listed = ", ".join(sorted(per))
@@ -2161,6 +2317,8 @@ def _ingest_eva_meta(
                     opened += 1
             continue
         count = sum(int((e or {}).get(verdict) or 0) for e in mine.values())
+        if verdict == "unknown":
+            count += len(open_code)
         if verdict == "other":
             add_evidence(
                 u,
@@ -2228,7 +2386,8 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
     unit_names = {u["function"] for u in units.values()}
     touched: set[str] = set()
     taint_checks = _taint_checks()
-    code_checks = _code_checks()
+    code_lines = _code_lines(_code_checks())
+    meta_facts = _meta_facts()
     for path in paths:
         report = load_json_strict(path, max_bytes=EVA_REPORT_MAX_BYTES)
         stats["reports"] += 1
@@ -2276,10 +2435,10 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             if isinstance(taint, dict) and module in taint:
                 del taint[module]
                 taint_reset.append(u)
-        report, split_rows = _split_taint_rows(report, set(code_checks))
-        code_rows = [(v, r) for v, r in split_rows if _code_key(r) in code_checks and not _is_taint_row(r)]
+        report, split_rows = _split_taint_rows(report, set(code_lines))
+        code_rows = [(v, r) for v, r in split_rows if _code_key(r) in code_lines and not _is_taint_row(r)]
         taint_rows = [(v, r) for v, r in split_rows if _is_taint_row(r)]
-        _ingest_code_checks(units, code_rows, code_checks, module, tool_output)
+        _ingest_code_checks(units, code_rows, code_lines, module, tool_output)
         taint_units = _ingest_taint(units, taint_rows, taint_checks, module, report, tool_output)
         if taint_units:
             stats["taint_units"] = stats.get("taint_units", 0) + taint_units
@@ -2289,7 +2448,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
         if meta_section is not None:
             report = _without_eva_meta_rows(report, meta_section)
             meta_units, meta_candidates = _ingest_eva_meta(
-                units, candidates, meta_section, module, report, tool_output, index, touched
+                units, candidates, meta_section, module, report, tool_output, index, touched, code_rows, code_lines
             )
             if meta_units:
                 stats["meta_units"] = stats.get("meta_units", 0) + meta_units
@@ -2525,7 +2684,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
         verdicts = (u.get("bookkeeping") or {}).get("eva_verdicts") or {}
         valid = sorted(m for m, v in verdicts.items() if v == "valid")
         blocking = sorted(m for m, v in verdicts.items() if v in EVA_BLOCKING)
-        established = bool(valid) and not blocking and not _eva_meta_cover_barred(u)
+        established = bool(valid) and not blocking and not _eva_meta_cover_barred(u, meta_facts)
         u["assumptions"] = [
             a
             for a in u["assumptions"]
@@ -2683,6 +2842,7 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
     stats = {"reports": 0, "covered": 0, "blocked": 0}
     credited: set[str] = set()
     sweep_checks: list[tuple[str, str, list[str]]] = []
+    meta_facts = _meta_facts()
     for path in paths:
         report = load_json_strict(path)
         if "function" not in report or "status" not in report or report.get("mode") == "guardrail":
@@ -2816,6 +2976,26 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     f"{', '.join(_taint_open(u))}); not credited.",
                 )
                 continue
+            gaps = _meta_unchecked(u, meta_facts)
+            if gaps:
+                # Package E: a site the property does not check (an initializer call no check could be
+                # written for, a caller left out of the targets). A goal proven elsewhere in the
+                # function, or none at all, says nothing about it.
+                add_evidence(
+                    u,
+                    "wp",
+                    "run_wp_function.py",
+                    "wp_meta_unchecked",
+                    False,
+                    tool_output,
+                    f"WP result recorded on a unit whose property is not checked everywhere in the function: "
+                    f"{gaps[0]}; not credited."[:400],
+                )
+                if u["status"] != "blocked":
+                    stats["blocked"] += 1
+                u["status"] = "blocked"
+                u["unresolved"] = [f"not checked: {g}"[:240] for g in gaps[:10]]
+                continue
             cls = u["obligation_class"]
             counts = by_class.get(cls)
             if counts and counts.get("unproven", 0) > 0:
@@ -2925,20 +3105,20 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 and all_proven
                 and not counts
                 and _meta_decided_statically(u, report)
-                and _meta_no_goal_credit_barred(u)
+                and (bar := _meta_no_goal_bar(u, meta_facts))
             ):
-                # No goal, and something says an instance is open (docs/troubleshooting/eva.md): the
-                # unit keeps its status, and the next Eva report or a WP run with a goal decides.
+                # No goal, and something says an instance is open (docs/troubleshooting/eva.md) or an
+                # in-code check of the function was not among the goals: the unit keeps its status,
+                # and the next Eva report or a WP run with a goal decides.
                 names = ", ".join(sorted((u.get("bookkeeping") or {}).get("security_properties") or []))
                 add_evidence(
                     u,
                     "wp",
                     "run_wp_function.py",
-                    "wp_meta_simplified_eva_open",
+                    bar[0],
                     False,
                     tool_output,
-                    f"MetAcsl loaded {names} and left no {cls} goal in this function, but "
-                    f"{_meta_no_goal_credit_barred(u)}; not credited."[:400],
+                    f"MetAcsl loaded {names} and left no {cls} goal in this function, but {bar[1]}; not credited."[:400],
                 )
             elif cls in METACSL_CLASSES and all_proven and not counts and _meta_decided_statically(u, report):
                 # MetAcsl's -meta-simpl drops an instance it decides statically: no goal is left, the

@@ -466,6 +466,8 @@ def resolve_security_meta(spec: str | None, sources: list[str], out_bin: Path) -
     target (`_harness_induced`), with the reason: they are not compiled as `check` either, because a
     printed check would be parsed before the real failure of the same input, and a campaign never
     sees one. The properties' own `sources` are not added to the build: it compiles the module as it is.
+    A property whose `engines` leave E-ACSL out (security_props.for_engine) is not considered; the
+    names are listed under `not_for_engine` (absent when there are none).
     """
     import security_props
 
@@ -481,7 +483,10 @@ def resolve_security_meta(spec: str | None, sources: list[str], out_bin: Path) -
     if not isinstance(props, dict) or "eacsl" not in security_props.meta_engines(props):
         return None
 
-    listed = [p for p in props.get("properties") or [] if isinstance(p, dict) and p.get("name")]
+    every = [p for p in props.get("properties") or [] if isinstance(p, dict) and p.get("name")]
+    # A property whose `engines` leave E-ACSL out never reaches the build (security_props.for_engine).
+    listed = security_props.for_engine({**props, "properties": every}, "eacsl")["properties"]
+    not_for_engine = sorted({str(p["name"]) for p in every} - {str(p["name"]) for p in listed})
     all_ids = set(props.get("obligations") or {}) | {str(i) for p in listed for i in p.get("instances") or []}
     ids: set[str] = set()
     functions: dict[str, set[str]] = {}
@@ -520,7 +525,11 @@ def resolve_security_meta(spec: str | None, sources: list[str], out_bin: Path) -
             left_out.append({"property": str(prop["name"]), "reason": reason})
         else:
             kept.append(prop)
-    base = {"props": str(path), "left_out": left_out}
+    base = {
+        "props": str(path),
+        "left_out": left_out,
+        **({"not_for_engine": not_for_engine} if not_for_engine else {}),
+    }
     found = security_props.module_meta_file_text({**props, "properties": kept}, ids)
     if found is None:
         return {"status": "skipped", **base, "reason": "no property has an instance in a function of these sources"}
@@ -584,6 +593,8 @@ def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | 
     instances; not for a precondition, which is checked in its target), `rejected`, `left_out`.
     """
     record: dict = {"status": "loaded", "props": plan["props"], "left_out": plan["left_out"]}
+    if plan.get("not_for_engine"):
+        record["not_for_engine"] = plan["not_for_engine"]
     rejected: list[dict] = []
     while True:
         written = write_security_meta(plan, out_bin, {r["property"] for r in rejected})
@@ -731,7 +742,9 @@ def compile_eacsl_binary(
         else:
             res = plain()
             res["security_props"] = {
-                k: v for k, v in security_meta.items() if k in ("status", "props", "reason", "left_out")
+                k: v
+                for k, v in security_meta.items()
+                if k in ("status", "props", "reason", "left_out", "not_for_engine")
             }
             return res
 

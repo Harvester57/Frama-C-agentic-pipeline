@@ -1069,6 +1069,24 @@ def derive_wp_diagnostic_hints(
         )
         return hints
 
+    if status == "analysis_error" and res.get("reason") == METACSL_SET_ASSIGNS:
+        failure = res.get("metacsl_failure") or {}
+        callees = ", ".join(failure.get("callees") or [])
+        named = (
+            f"The contract(s) of {callees} in the parsed sources hold such an `assigns`."
+            if callees
+            else "No such contract was found in the parsed sources or the headers they include with quotes: "
+            "look for it in the other headers of the function's file."
+        )
+        _add(
+            "MetAcsl stopped before WP ran (meta_annotate.ml, line 675): a function whose `assigns` holds a set "
+            f"(\\union(...), \\inter(...) or {{a, b}}) is called where a \\writing property applies. {named} This "
+            "is not a proof problem and a re-run does not fix it: rewrite that contract with one `assigns` term per "
+            "location, then re-run `security_props.py run` (it leaves the callers of a set-valued contract it can "
+            "read out of the property's targets) and this proof."
+        )
+        return hints
+
     if status == "analysis_error":
         reason = res.get("reason") or "unknown"
         _add(
@@ -1300,8 +1318,9 @@ def _analysis_error_result(
     returncode: int | None,
     soundness: dict,
     combined_log: str,
+    metacsl_failure: dict | None = None,
 ) -> dict:
-    res = {
+    res: dict[str, Any] = {
         "status": "analysis_error",
         "reason": reason,
         "returncode": returncode,
@@ -1323,6 +1342,8 @@ def _analysis_error_result(
         "sarif_file": None,
         "wp_log_tail": combined_log[-3000:],
     }
+    if metacsl_failure is not None:
+        res["metacsl_failure"] = metacsl_failure
     res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
     return res
 
@@ -1917,6 +1938,28 @@ def run_wp_on_function(
         pp_res["sizing"] = sizing
         return pp_res
 
+    meta_failure = metacsl_set_assigns_failure(combined_log, sources) if meta_stage else None
+    if meta_failure is not None:
+        # Deterministic, not a crash a re-run fixes: the contract of the named callee must change.
+        meta_res = _analysis_error_result(
+            fn_name,
+            c_file,
+            METACSL_SET_ASSIGNS,
+            returncode,
+            scan_wp_log_soundness(
+                combined_log,
+                check_memory_model=check_memory_model,
+                unsigned_reduced=unsigned_reduced,
+                warn_invalid_pointer=warn_invalid_pointer,
+                warn_unsigned_downcast=warn_unsigned_downcast,
+                warn_signed_downcast=warn_signed_downcast,
+            ),
+            combined_log,
+            metacsl_failure=meta_failure,
+        )
+        meta_res["sizing"] = sizing
+        return meta_res
+
     syntax_errors = _folded_syntax_errors(combined_log, returncode, timed_out, csv_path.exists())
     if syntax_errors is not None:
         syn_res = {
@@ -2011,8 +2054,13 @@ def run_wp_on_function(
     # `\object_pointer` alarm: the report CSV carries no goal name, so the rows are matched by predicate and count.
     fpv_assumed_left = len(soundness["assumed_function_pointer_goals"])
 
+    code_checks_unnamed: list[dict[str, int]] = []
     if csv_path.exists():
-        for row in read_report_csv(csv_path):
+        rows = read_report_csv(csv_path)
+        check_names, code_checks_unnamed = code_check_names(
+            rows, list((security_meta or {}).get("code_checks") or []), fn_name
+        )
+        for pos, row in enumerate(rows):
             row_fn = row["function"]
             if row_fn and row_fn != fn_name:
                 continue
@@ -2026,6 +2074,7 @@ def run_wp_on_function(
                 "annotation": row["property"],
             }
             name_meta_goal(item, security_meta)
+            name_code_check(item, check_names.get(pos))
             cls = goal_obligation_class(item)
             item["obligation_class"] = cls
             counts = by_class.setdefault(cls, {"proven": 0, "proven_under_hyp": 0, "unproven": 0})
@@ -2323,7 +2372,11 @@ def run_wp_on_function(
         "sizing": sizing,
     }
     if security_meta:
-        res["security_props"] = {k: v for k, v in security_meta.items() if k not in ("meta_file", "line_names")}
+        meta_out: dict[str, Any] = {k: v for k, v in security_meta.items() if k not in ("meta_file", "line_names")}
+        if code_checks_unnamed:
+            # Their goals stay under `rte`: ledger.py does not credit the property from them.
+            meta_out["code_checks_unnamed"] = code_checks_unnamed
+        res["security_props"] = meta_out
     if prop:
         # Counted as proven above, but pending on some other property (check_declared_wraps needs them).
         res["partially_proven_goals"] = [
@@ -2865,9 +2918,14 @@ def resolve_security_meta(spec: str | None, c_file: Path, fn_name: str, out_dir:
     if match is None:
         return None
     fid, root = match
+    # The checks security_props.py wrote into this function (M6, M7, and package E's checks at calls
+    # placed in initializers): the report gives them no name, code_check_names puts it back.
+    checks = [c for c in props.get("code_checks") or [] if isinstance(c, dict) and c.get("function") == fid]
     found = security_props.meta_file_text(props, fid)
     if found is None:
-        return None
+        if not checks:
+            return None
+        return {"props": str(path), "function_id": fid, "properties": [], "code_checks": checks}
     text, names, sources = found
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_file = out_dir / f"security_meta_{fn_name}.c"
@@ -2884,6 +2942,110 @@ def resolve_security_meta(spec: str | None, c_file: Path, fn_name: str, out_dir:
         "meta_file": str(meta_file),
         "extra_sources": extra,
         "line_names": {str(k): v for k, v in security_props.meta_line_names(text).items()},
+        **({"code_checks": checks} if checks else {}),
+    }
+
+
+def code_check_names(
+    rows: list[dict], checks: list[dict], fn_name: str
+) -> tuple[dict[int, str], list[dict[str, int]]]:
+    """
+    Name the rows of the in-code checks security_props.py wrote into `fn_name` (`checks`, the
+    function's `code_checks`). Frama-C's report gives a code `check` its file, line and predicate, not
+    its name, and one line may hold several (one initializer, two properties). Within a line the
+    rows come in source order, which is the order of `index` (absent: the only check of its line).
+    Returns (row position -> property name, the lines left unnamed: {line, checks, rows}). A line is
+    named only when its check rows in this function and file are exactly as many as the checks
+    written there; otherwise (a prover's own check on the line, a stale tree) nothing on it is
+    named, so no goal is credited to the wrong property.
+    """
+    by_line: dict[int, list[dict]] = {}
+    for c in checks:
+        by_line.setdefault(int(c.get("line") or 0), []).append(c)
+    named: dict[int, str] = {}
+    unnamed: list[dict[str, int]] = []
+    for line, placed in sorted(by_line.items()):
+        files = {Path(str(c.get("file") or "")).name for c in placed}
+        found = [
+            i
+            for i, r in enumerate(rows)
+            if int(r.get("line") or 0) == line
+            and "check" in str(r.get("kind") or "").lower()
+            and str(r.get("function") or fn_name) == fn_name
+            and Path(str(r.get("file") or "").replace("\\", "/")).name in files
+        ]
+        order = sorted(placed, key=lambda c: int(c["index"]) if isinstance(c.get("index"), int) else 0)
+        if len(found) != len(order) or len({str(c.get("index", 0)) for c in order}) != len(order):
+            unnamed.append({"line": line, "checks": len(order), "rows": len(found)})
+            continue
+        for i, c in zip(found, order, strict=True):
+            named[i] = str(c.get("property"))
+    return named, unnamed
+
+
+def name_code_check(item: dict, name: str | None) -> None:
+    """Put a code check's property name in front of its predicate (`<property>: <predicate>`), as for a meta goal."""
+    if name and name not in str(item.get("annotation") or ""):
+        item["annotation"] = f"{name}: {item.get('annotation') or ''}"
+
+
+METACSL_SET_ASSIGNS = "metacsl_set_assigns"
+_META_675_RE = re.compile(r'Unexpected error \(File "meta_annotate\.ml", line 675\b[^\n]*')
+_ACSL_THEN_DECL_RE = re.compile(r"/\*@((?:(?!\*/).)*)\*/([^;{}()]*?)\b([A-Za-z_]\w*)\s*\(", re.DOTALL)
+_QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+
+
+def _set_assigns_functions(paths: list[str]) -> list[str]:
+    """
+    The functions whose contract, in `paths` or a file they include with quotes (one level), has an
+    `assigns` that holds a set (`\\union(...)`, `\\inter(...)`, `{a, b}`). Read from the text, as
+    security_props.contract_assigns does.
+    """
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for p in paths:
+        path = Path(p)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        files.append(path)
+        files += [path.parent / inc for inc in _QUOTED_INCLUDE_RE.findall(text)]
+    found: set[str] = set()
+    for path in files:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _ACSL_THEN_DECL_RE.finditer(text):
+            for clause in re.findall(r"\bassigns\b([^;]*);", m.group(1)):
+                lhs = clause.split("\\from")[0]
+                if "\\union" in lhs or "\\inter" in lhs or "{" in lhs:
+                    found.add(m.group(3))
+    return sorted(found)
+
+
+def metacsl_set_assigns_failure(log_text: str, sources: list[str]) -> dict | None:
+    """
+    MetAcsl 0.12's `Unexpected error (File "meta_annotate.ml", line 675, ...: Assertion failed)`:
+    `writing_visitor#external_assigns` asserts that each `assigns` term of a called function is one
+    lvalue, so a function declared with a set-valued `assigns` (`\\union(*a, *b)`, `{*a, *b}`) and
+    called by any function a \\writing property targets stops the whole parse. The log names no
+    function; the callees are read from the contracts of the parsed sources. None for another log.
+    """
+    m = _META_675_RE.search(log_text or "")
+    if not m:
+        return None
+    return {
+        "message": m.group(0).strip(),
+        "cause": (
+            "MetAcsl stops on a called function whose `assigns` holds a set (\\union(...), \\inter(...) or "
+            "{a, b}) when a \\writing property targets one of its callers (meta_annotate.ml, line 675)"
+        ),
+        "callees": _set_assigns_functions(sources),
     }
 
 

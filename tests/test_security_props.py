@@ -1901,13 +1901,6 @@ INIT_STRONG = {
     "scope": ["h_init", "h_assign"],
     "description": "d",
 }
-# What scripts/phase0_model.py must do for package E and does not yet (it is not a file of package
-# D1): carry the dump's `initializer` flag of a call into the model's call site. The image test
-# applies this one-line change to a copy of scripts/ and mounts the copy.
-PASSTHROUGH_FROM = '"literals": dict(lits)})'
-PASSTHROUGH_TO = '"literals": dict(lits), **({"initializer": bool(c["initializer"])} if "initializer" in c else {})})'
-
-
 def _init_model() -> dict:
     """local_init.c as the model would give it: every `_init` function calls in an initializer."""
 
@@ -2793,7 +2786,7 @@ def test_metacsl_skips_calls_in_initializers_in_the_image():
 def _model_with_initializer_flags(scripts: Path, target: Path, run: Path) -> dict:
     """
     The build capture and the model of `target`, as the model_run fixture runs them, with `scripts`
-    mounted as the pipeline's scripts (a copy holding the pass-through phase0_model.py still lacks).
+    mounted as the pipeline's scripts.
     """
     run.mkdir(parents=True, exist_ok=True)
     vol = f"p0model-d1-{uuid.uuid4().hex[:12]}"
@@ -2896,21 +2889,14 @@ def test_an_initializer_check_that_might_not_type_is_not_written(tmp_path):
 
 def _initializer_run(tmp_path: Path, lists: dict, violate: bool) -> tuple[Path, Path, dict, dict, dict]:
     """
-    local_init.c through the model (with the pass-through applied to a copy of scripts/), the
-    generator and apply_taint: (run, work tree with the checks written, model, properties, what
-    apply_taint placed).
+    local_init.c through the model (this tree's scripts/, whose phase0_model.py carries the dump's
+    `initializer` flag), the generator and apply_taint: (run, work tree with the checks written,
+    model, properties, what apply_taint placed).
     """
     require_docker_images(ANALYSIS_IMAGE, BUILD_IMAGE)
-    scripts = tmp_path / "scripts"
-    shutil.copytree(ROOT / "scripts", scripts, ignore=shutil.ignore_patterns("__pycache__"))
-    text = (scripts / "phase0_model.py").read_text(encoding="utf-8")
-    if PASSTHROUGH_TO not in text:
-        assert text.count(PASSTHROUGH_FROM) == 1, "phase0_model._call_sites changed: update the stand-in"
-        text = text.replace(PASSTHROUGH_FROM, PASSTHROUGH_TO)
-        (scripts / "phase0_model.py").write_text(text, encoding="utf-8", newline="\n")
     target = _one_file_target(tmp_path / "target", INIT_DIR / "local_init.c", lists, violate)
     run = tmp_path / "run"
-    m = _model_with_initializer_flags(scripts, target, run)
+    m = _model_with_initializer_flags(ROOT / "scripts", target, run)
     assert m["status"] == "ok"
     # The flag comes from this tree's phase0_dump.ml: a statement call says false, an initializer true.
     flags = {
@@ -2952,6 +2938,8 @@ def test_a_leak_through_an_initializer_call_is_not_credited_in_the_image(tmp_pat
         assert report["status"] != "all_proven" and unit["status"] != "covered", (report["status"], unit)
     else:
         assert report["status"] == "all_proven" and unit["status"] == "covered", (report["status"], unit)
+        # By the check's goal, named after the property (package G), not by the no-goal credit.
+        assert unit["evidence"][-1]["result"] == "wp_proven", unit["evidence"]
 
 
 @pytest.mark.integration
@@ -2962,8 +2950,7 @@ def test_initializer_checks_acceptance_in_the_image(tmp_path, violate):
     Acceptance of package E, D1 half: phase0_dump.ml marks the calls placed in initializers, the
     generator writes a check named after each property MetAcsl skips there, and WP has it as a goal:
     f_init, g_init and h_init each carry one, proved on the correct program and unproven on the
-    violating one. The model keeps the dump's flag only through the pass-through this test applies
-    to a copy of scripts/phase0_model.py (PASSTHROUGH_TO): the file is not package D1's.
+    violating one. The model keeps the dump's flag through the real scripts/phase0_model.py.
     """
     lists = {**INIT_LISTS, "auth_gates": [INIT_GATE], "invariants": [INIT_STRONG]}
     run, work, _, _, applied = _initializer_run(tmp_path, lists, violate)
