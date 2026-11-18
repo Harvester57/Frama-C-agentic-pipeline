@@ -377,6 +377,14 @@ def _blank(text: str) -> str:
     return _NOT_LINE_END_RE.sub(" ", text)
 
 
+def _is_doxygen_comment(annotation: str) -> bool:
+    """
+    Whether a token the tokenizer calls an annotation is a plain comment for Frama-C: its lexer skips
+    `/*@{`, `/*@}`, `/*@*` and `//@{`, `//@}`, `//@*` as doxygen comments (clexer.mll, rule `initial`).
+    """
+    return annotation[3:4] in ("{", "}", "*")
+
+
 def _blank_literal(literal: str) -> str:
     """A string or character literal with its content blanked and its quotes kept."""
     closed = len(literal) >= 2 and literal[-1] == literal[0]
@@ -401,7 +409,8 @@ def mask_comments_and_literals(
         `"mask"`: kept, but what the Frama-C kernel reads as a comment inside them is blanked, and their
             literal contents too (when `literals`). A `//@` inside an annotation is such a comment (the
             kernel does not read it as a nested annotation, whatever the ACSL manual says), except in
-            `/*@ ghost` code, which is C: there it is an annotation, kept and masked the same way;
+            `/*@ ghost` code, which is C: there it is an annotation, kept and masked the same way. A
+            doxygen-style `/*@{`, `/*@}`, `/*@*` (or `//@` form) is no annotation for the kernel: blanked;
         `"blank"`: blanked like any comment. This is what the old `re.sub(r"/\\*.*?\\*/", " ", ...)` did.
     - Text the tokenizer rejects, by `on_error` (see `comment_and_literal_spans`): `"raise"` (default)
       raises `AcslSyntaxError`; `"mask"` blanks an unclosed block comment up to the end of the text, and an
@@ -422,7 +431,9 @@ def mask_comments_and_literals(
         if kind == "c_comment" or (acsl == "blank" and kind in ("acsl_block", "acsl_line")):
             piece = _blank(piece)
         elif kind in ("acsl_block", "acsl_line"):
-            if acsl == "mask":
+            if acsl == "mask" and _is_doxygen_comment(piece):
+                piece = _blank(piece)
+            elif acsl == "mask":
                 closed = kind == "acsl_block" and len(piece) >= 5 and piece.endswith("*/")
                 body_end = len(piece) - 2 if closed else len(piece)
                 body = piece[3:body_end]
@@ -487,6 +498,13 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                 "annotation the C code that follows becomes part of the comment, and in a `//` comment inside an "
                 "annotation the next clause does); remove the backslash"
             )
+        if _is_doxygen_comment(tok.text):
+            errors.append(
+                f"{path}:{tok.line}: syntax hazard: '{tok.text[:4]}' opens a plain comment for Frama-C, not an "
+                "annotation (its lexer skips `/*@{`, `/*@}`, `/*@*` and the `//@` forms as doxygen comments, and "
+                "after `/*@*` it looks for a later `*/`); write the annotation as `/*@ ... */` or `//@ ...`"
+            )
+            continue
         scrubbed = _scrub_acsl_literals(tok.text)
         # `@` is white space for the kernel: `logic @ int f(...)` is `logic int f(...)`.
         flat = scrubbed.replace("@", " ")
@@ -1268,7 +1286,7 @@ def has_function_contract(
     for decl in contract_declaration_spans(source, function_name, is_header=is_header, path=path):
         tokens = tokenize_c_acsl(_span_contract_part(decl, path=path), path=path)
         for tok in tokens:
-            if tok.kind in ("acsl_block", "acsl_line"):
+            if tok.kind in ("acsl_block", "acsl_line") and not _is_doxygen_comment(tok.text):
                 inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
                 for seg in _parse_acsl_inner_segments(inner, tok.line):
                     if seg.kind in _CONTRACT_KWS:

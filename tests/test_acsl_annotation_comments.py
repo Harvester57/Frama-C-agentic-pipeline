@@ -31,6 +31,7 @@ from acsl_ast import (  # noqa: E402
     find_named_clause,
     find_unsound_acsl_keywords,
     function_contract_text,
+    has_function_contract,
     is_trivial_predicate,
     iter_clauses,
     mask_comments_and_literals,
@@ -142,6 +143,44 @@ def test_a_nested_line_annotation_is_a_comment() -> None:
     ]
     source = "//@ ensures L5_out: \\result == 0;\nint f(void);\n"
     assert find_named_clause(source, "L5_out") == "\\result == 0"
+
+
+DOXYGEN_PROTOTYPE = "void f(int *p, int *q);\n"
+
+
+@pytest.mark.parametrize(
+    "fake",
+    [
+        "/*@* assigns *q \\from \\nothing; */",
+        "/*@{ assigns *q \\from \\nothing; */",
+        "/*@} assigns *q \\from \\nothing; */",
+        "//@* assigns *q \\from \\nothing;",
+        "//@{ assigns *q \\from \\nothing;",
+        "//@} assigns *q \\from \\nothing;",
+    ],
+)
+def test_a_doxygen_style_comment_is_not_an_annotation(fake: str) -> None:
+    # Not probed in the image: Frama-C's lexer (clexer.mll, rule `initial`) skips these as comments.
+    text = "/*@ assigns *p; */\n" + fake + "\n" + DOXYGEN_PROTOTYPE
+    assert extract_frame_clauses(text)["assigns"] == [{"locs": ["*p"], "from": [], "from_nothing": False}]
+    assert has_function_contract(fake + "\n" + DOXYGEN_PROTOTYPE, "f", is_header=True) is False
+    errors = verify_acsl_only(DOXYGEN_PROTOTYPE, fake + "\n" + DOXYGEN_PROTOTYPE, path="f.h")
+    assert any("plain comment" in e for e in errors), errors
+
+
+def test_real_annotations_and_baseline_doxygen_groups_are_accepted() -> None:
+    real = "/*@ assigns *q \\from \\nothing; */\n" + DOXYGEN_PROTOTYPE
+    assert has_function_contract(real, "f", is_header=True) is True
+    assert verify_acsl_only(DOXYGEN_PROTOTYPE, real, path="f.h") == []
+    assert extract_frame_clauses(real)["assigns"] == [{"locs": ["*q"], "from": ["\\nothing"], "from_nothing": True}]
+    # A block whose text starts on the next line, with `*` margins, is an annotation.
+    margins = "/*@\n * assigns *q \\from \\nothing;\n */\n" + DOXYGEN_PROTOTYPE
+    assert has_function_contract(margins, "f", is_header=True) is True
+    # The target's own doxygen group markers are not the agent's, and a contract added between them is read.
+    grouped = "//@{\n" + DOXYGEN_PROTOTYPE + "//@}\n"
+    with_contract = "//@{\n/*@ assigns *p; */\n" + DOXYGEN_PROTOTYPE + "//@}\n"
+    assert verify_acsl_only(grouped, with_contract, path="f.h") == []
+    assert extract_frame_clauses(with_contract)["assigns"] == [{"locs": ["*p"], "from": [], "from_nothing": False}]
 
 
 def test_a_nested_annotation_in_ghost_code_stays_visible() -> None:
