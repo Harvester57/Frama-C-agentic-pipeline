@@ -420,7 +420,6 @@ def test_validate_agent_result_proof_gap():
         "crash_artifact": None,
         "failing_predicate": None,
         "analysis": "No crash found within fuzz budget.",
-        "suggested_requires": None,
         "fault_hypothesis": None,
         "proof_gap": {
             "predicate": "0 <= x",
