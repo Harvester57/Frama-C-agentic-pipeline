@@ -98,6 +98,8 @@ Issues encountered in module-level abstract interpretation (`run_eva_slice.py`),
   - The step prints nothing until it ends, so the opencode session's 1 h tool timeout fired first.
   - The model then applied CLAUDE.md's 15-minute no-progress rule to a step that was still computing. It killed `eva-tune` (exit 1) and kept the base report (no tuning decision), then went on to ingest.
   - Why the rungs ran serially here, but in parallel on mpack, was not diagnosed.
+  - The ladder does not skip a rung whose limit is far above what the run can afford. The sharding path starts only when the base run itself nears the limit; at 620 s this one did not, so no shard plan was made.
+  - The 250 Unknowns in 51 functions went to WP untuned: a budget cut, not a target defect.
 - **Fix:** **Open pipeline gap:** nothing was changed. Options:
   - a total wall budget for the ladder, and a progress line per rung (start, finish, timeout), so a supervisor or a model can tell computing from stalled;
   - a lower floor relative to the base run;
