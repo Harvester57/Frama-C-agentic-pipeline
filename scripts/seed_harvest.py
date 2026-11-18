@@ -12,7 +12,7 @@ seed inputs for each harness module, in the byte layout that harness reads.
 `record`, in the build image on the run's scratch volume, after build_capture.py built the tree there:
 
   1. the API to record: the model's entry points (workspace/reports/phase0_model.json) that a test
-     executable defines, with a signature the recorder can spell (scalars, enums, pointers, and structs
+     executable defines or calls from a shared library, with a signature the recorder can spell (scalars, enums, pointers, and structs
      by value whose definition is in a project header); variadic functions (a signature ending in
      `...`, or a last formal named `__va_params`, Frama-C's translation of a variadic definition)
      and anonymous structs are skipped with a reason;
@@ -22,9 +22,12 @@ seed inputs for each harness module, in the byte layout that harness reads.
      pipe, so a bad pointer is recorded as missing, never a crash;
   3. each executable (every one, not only those named as tests: the test command decides which run)
      is linked again from the build's own link command (bear's events) with the
-     recorder and `-Wl,--wrap=<fn>` for each API function it defines. Calls between object files are
-     recorded: the tests call the API from their own objects. Calls inside one object file, and API
-     functions that are header `static inline`, are not;
+     recorder and `-Wl,--wrap=<fn>` for each API function it defines (`nm --defined-only`) or
+     references undefined from a shared library it links (`nm -D --undefined-only`: `__real_<fn>`
+     then resolves to the library at run time, as libtool's wrapper script loads it from the build
+     tree). Calls between object files are recorded: the tests call the API from their own objects.
+     Calls inside one object file or inside the shared library, and API functions that are header
+     `static inline`, are not;
   4. the recipe's test command runs under strace (`openat`), through sandbox_exec.py: no network (the
      container has none), capped time, CPU, processes and file sizes. A failing test suite is not an
      error: seeds are an improvement, not a requirement;
@@ -690,6 +693,24 @@ def defined_functions(binary: Path) -> set[str]:
     return names
 
 
+def undefined_functions(binary: Path) -> set[str]:
+    """Symbols the executable takes from a shared library (its dynamic symbol table), version suffix cut.
+
+    A test linked against the project's shared library (libtool's `.libs/libx.so`) calls the API
+    through undefined references: `--wrap` redirects those too, and `__real_<fn>` then resolves to the
+    library at run time. A static executable has no dynamic symbols: an empty set.
+    """
+    rc, out = _run(["nm", "-D", "--undefined-only", str(binary)], binary.parent, 120)
+    if rc != 0:
+        return set()
+    names: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in ("U", "w"):
+            names.add(parts[1].split("@", 1)[0])
+    return names
+
+
 def link_commands(events: Path, tree: Path) -> dict[str, dict]:
     """Output (tree-relative) -> the last link execution producing it, from bear's events."""
     import build_capture as bc
@@ -880,8 +901,10 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         if not exe.is_file() or link is None:
             info["status"] = "not_built" if not exe.is_file() else "no_link_command"
             continue
-        defined = defined_functions(exe)
-        mine = [p for p in plans if p["name"] in defined][:WRAP_LIMIT]
+        # The API it defines (library sources or a static archive linked in) and the API it calls
+        # from a shared library (undefined references): `--wrap` covers both.
+        linked = defined_functions(exe) | undefined_functions(exe)
+        mine = [p for p in plans if p["name"] in linked][:WRAP_LIMIT]
         if not mine:
             info["status"] = "no_api_function"
             continue

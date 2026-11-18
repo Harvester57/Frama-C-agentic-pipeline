@@ -495,6 +495,35 @@ def test_record_with_a_test_command_relinks_every_executable_and_runs_the_comman
     assert "runs" not in report and ran[-1] == ["sh", "-c", "make check"]
 
 
+def test_record_wraps_api_functions_the_executable_calls_from_a_shared_library(tmp_path, monkeypatch):
+    """libmodbus run-1: tests link libmodbus.so; the API is undefined in them, not defined."""
+    units = {"unit-test-client": {"kind": "executable", "test": True, "objects": []}}
+    ran = _record_fixture(tmp_path, monkeypatch, units, {"command": "make", "test_command": "make check"})
+    monkeypatch.setattr(sh, "defined_functions", lambda exe: set())
+    monkeypatch.setattr(sh, "undefined_functions", lambda exe: {"f", "printf"})
+    monkeypatch.setattr(sh.shutil, "which", lambda name: None)
+    assert sh.main(["record", "--scratch", str(tmp_path / "scratch")]) == 0
+    report = json.loads((tmp_path / "workspace" / "reports" / "seed_harvest.json").read_text())
+    info = report["relink"]["unit-test-client"]
+    assert info["status"] == "relinked" and info["wrapped"] == ["f"]
+    assert any(a == "-Wl,--wrap=f" for a in ran[0]) and not any("printf" in a for a in ran[0])
+
+
+def test_undefined_functions_reads_the_dynamic_symbol_table(monkeypatch):
+    out = "                 w __gmon_start__\n                 U modbus_receive\n                 U printf@GLIBC_2.2.5\n"
+    seen: list[list[str]] = []
+
+    def run(argv, cwd, timeout):
+        seen.append(argv)
+        return 0, out
+
+    monkeypatch.setattr(sh, "_run", run)
+    assert sh.undefined_functions(Path("/t/exe")) == {"__gmon_start__", "modbus_receive", "printf"}
+    assert seen[0][:3] == ["nm", "-D", "--undefined-only"]
+    monkeypatch.setattr(sh, "_run", lambda argv, cwd, timeout: (1, "nm: /t/exe: no symbols"))
+    assert sh.undefined_functions(Path("/t/exe")) == set()
+
+
 def test_record_with_a_test_command_and_no_unit_named_as_a_test(tmp_path, monkeypatch):
     """libpng: ctest runs `pngtest`, `pngvalid`, ...; the name rule calls none of them a test."""
     units = {"pngtest": {"kind": "executable", "objects": []}, "pngvalid": {"kind": "executable", "objects": []}}
