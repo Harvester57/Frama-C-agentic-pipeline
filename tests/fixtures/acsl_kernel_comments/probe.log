@@ -1,0 +1,41 @@
+34.0~beta (Selenium)
+@@ DEFAULT
+[kernel] Parsing probe.c (with preprocessing)
+[kernel:annot-error] probe.c:23: Warning: 
+  lexical error, unexpected block-comment opening
+[kernel] probe.c:23: User Error: 
+  syntax error:
+  Location: "probe.c", line 23, before or at token: *
+        /*@ requires a > 0 /* && b > 0 */;*/
+                                          ^
+  in code pre-processed from the original source
+  21    
+  22    /* E: a block comment inside a line annotation. */
+  23    //@ requires a > 0 /* && b > 0 */;
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  24    void case_e(int a, int b);
+  25
+[kernel] Frama-C aborted: invalid user input.
+@@ NO-PP-ANNOT
+[kernel] Parsing probe.c (with preprocessing)
+[kernel:annot-error] probe.c:23: Warning: 
+  lexical error, unexpected block-comment opening
+[kernel] probe.c:23: User Error: 
+  syntax error:
+  Location: "probe.c", line 23, before or at token: *
+        /*@ requires a > 0 /* && b > 0 */;*/
+                                          ^
+  in code pre-processed from the original source
+  21    
+  22    /* E: a block comment inside a line annotation. */
+  23    //@ requires a > 0 /* && b > 0 */;
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  24    void case_e(int a, int b);
+  25
+[kernel] Frama-C aborted: invalid user input.
+@@ CPP
+[kernel:pp] 
+  preprocessing with "gcc -E -C -I. -I'/tmp/__fc_machdep373ccb.dir' -I'/home/opam/.opam/5.5/share/frama-c/share/libc' -U__STDC_IEC_559_COMPLEX__ -U__STDC_IEC_60559_COMPLEX__ -U__STDC_ISO_10646__ -U__STDC_UTF16__ -U__STDC_UTF32__ -D__FRAMAC__ -dD -nostdinc -undef -imacros __fc_builtin_macros.h -std=c11 -Wno-builtin-macro-redefined -Wno-unknown-warning-option '/w/probe.c' -o '/tmp/probe.ca5e924.i'"
+[kernel] Parsing probe.c (with preprocessing)
+[kernel:pp] Debug: 
+  Full preprocessing command: gcc -E -C -I. -I'/tmp/__fc_machdep373ccb.dir' -I'/home/opam/.opam/5.5/share/frama-c/share/libc' -U__STDC_IEC_559_COMPLEX__ -U__STDC_IEC_60559_COMPLEX__ -U__STDC_ISO_10646__ -U__STDC_UTF16__ -U__STDC_UTF32__ -D__FRAMAC__ -dD -nostdinc -undef -imacros __fc_builtin_macros.h -std=c11 -Wno-builtin-macro-redefined -Wno-unknown-warning-option '/w/probe.c' -o '/tmp/probe.ca5e924.i'

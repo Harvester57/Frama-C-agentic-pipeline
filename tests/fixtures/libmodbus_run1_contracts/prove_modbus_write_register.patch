@@ -1,0 +1,12 @@
+--- a/src/modbus.h
++++ b/src/modbus.h
+@@ -398,8 +398,7 @@
+   requires ctx_shape: ctx == \null || \valid(ctx);
+   terminates \true;
+   exits \false;
+-  assigns *ctx \from reg_addr, value;
+-  ensures status: \result >= -1;
++  ensures null_status: ctx == \null ==> \result == -1;
+ */
+ MODBUS_API int modbus_write_register(modbus_t *ctx, int reg_addr, const uint16_t value);
+ /*@

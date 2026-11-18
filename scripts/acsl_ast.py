@@ -92,10 +92,9 @@ _C_INT_PARAM_RE = re.compile(rf"^\s*(?:const\s+)?{_C_INT_TYPE_CORE}\s+[A-Za-z_][
 _INVARIANT_CLAUSE_RE = re.compile(r"(?:(loop|type|global|strong)\s+)?\binvariant\b(?!\s*:)")
 _VACUOUS_CLAUSE_HEAD_RE = re.compile(r"(?<![\\\w])(requires|assumes|loop\s+invariant)\b")
 _EMPTY_BEHAVIOR_RE = re.compile(r"\bbehavior\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*;")
-# String and character literals, scanned left to right in one pass and bounded by the line: a `'"'`
-# character literal must not open a string that swallows the annotation text up to the next quote.
-_LITERAL_IN_ACSL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n]){1,4}\'')
 _COMMENT_IN_ACSL_RE = re.compile(r"//(?![@])[^\n]*")
+# A backslash that ends a line: cpp joins the next line to it (it accepts blanks after the backslash).
+_SPLICED_LINE_RE = re.compile(r"\\[ \t\r]*(?:\n|\Z)")
 # A ghost function's own contract, written `/@ ... @/` inside a `/*@ ghost ... */` block.
 _GHOST_CONTRACT_RE = re.compile(r"/@.*?@/", re.DOTALL)
 _ESCAPED_CTRL_IN_ACSL_RE = re.compile(r"[\x07\x08\x0c]")
@@ -253,6 +252,8 @@ _UNCLOSED_LABELS = {
     "char_literal": "character literal",
 }
 _NOT_LINE_END_RE = re.compile(r"[^\r\n]")
+# The kernel's lexer enters ghost code when an annotation starts with `ghost`, after blanks and `@` only.
+_GHOST_ANNOTATION_RE = re.compile(r"[ \t\r\n@]*ghost")
 
 
 def _directive_comment_spans(text: str, start: int, end: int) -> tuple[list[tuple[str, int, int]], int | None]:
@@ -376,6 +377,14 @@ def _blank(text: str) -> str:
     return _NOT_LINE_END_RE.sub(" ", text)
 
 
+def _is_doxygen_comment(annotation: str) -> bool:
+    """
+    Whether a token the tokenizer calls an annotation is a plain comment for Frama-C: its lexer skips
+    `/*@{`, `/*@}`, `/*@*` and `//@{`, `//@}`, `//@*` as doxygen comments (clexer.mll, rule `initial`).
+    """
+    return annotation[3:4] in ("{", "}", "*")
+
+
 def _blank_literal(literal: str) -> str:
     """A string or character literal with its content blanked and its quotes kept."""
     closed = len(literal) >= 2 and literal[-1] == literal[0]
@@ -397,8 +406,11 @@ def mask_comments_and_literals(
       directive are always left as written (`#include "x.h"`, `#define S "..."`).
     - ACSL annotations (`/*@ */`, `//@`), by `acsl`:
         `"keep"` (default): left as written, with their own `//` comments and literals;
-        `"mask"`: kept, but the `//` comments inside them are blanked, and their literal contents too
-            (when `literals`);
+        `"mask"`: kept, but what the Frama-C kernel reads as a comment inside them is blanked, and their
+            literal contents too (when `literals`). A `//@` inside an annotation is such a comment (the
+            kernel does not read it as a nested annotation, whatever the ACSL manual says), except in
+            `/*@ ghost` code, which is C: there it is an annotation, kept and masked the same way. A
+            doxygen-style `/*@{`, `/*@}`, `/*@*` (or `//@` form) is no annotation for the kernel: blanked;
         `"blank"`: blanked like any comment. This is what the old `re.sub(r"/\\*.*?\\*/", " ", ...)` did.
     - Text the tokenizer rejects, by `on_error` (see `comment_and_literal_spans`): `"raise"` (default)
       raises `AcslSyntaxError`; `"mask"` blanks an unclosed block comment up to the end of the text, and an
@@ -419,10 +431,14 @@ def mask_comments_and_literals(
         if kind == "c_comment" or (acsl == "blank" and kind in ("acsl_block", "acsl_line")):
             piece = _blank(piece)
         elif kind in ("acsl_block", "acsl_line"):
-            if acsl == "mask":
+            if acsl == "mask" and _is_doxygen_comment(piece):
+                piece = _blank(piece)
+            elif acsl == "mask":
                 closed = kind == "acsl_block" and len(piece) >= 5 and piece.endswith("*/")
                 body_end = len(piece) - 2 if closed else len(piece)
-                body = mask_comments_and_literals(piece[3:body_end], literals=literals, on_error="mask", path=path)
+                body = piece[3:body_end]
+                nested = "mask" if _GHOST_ANNOTATION_RE.match(body) else "blank"
+                body = mask_comments_and_literals(body, acsl=nested, literals=literals, on_error="mask", path=path)
                 piece = piece[:3] + body + piece[body_end:]
         elif literals:
             piece = _blank_literal(piece)
@@ -431,6 +447,26 @@ def mask_comments_and_literals(
         last = end
     out.append(text[last:])
     return "".join(out)
+
+
+def _kernel_views(text: str) -> tuple[str, str]:
+    """
+    Two readings of C/ACSL `text` that leave out what the Frama-C kernel does not read inside an annotation,
+    both with the length and line ends of `text`, so an offset in one is valid in the other and in `text`:
+
+    - `shape`: comments and literal contents blanked (`mask_comments_and_literals(acsl="mask")`) and every
+      `@` replaced by a space. For the structure of a clause: keywords, brackets, `;`.
+    - `visible`: the same with the literals as written (an `@` in a literal stays). For the text of a clause.
+
+    The kernel reads `@` as white space anywhere in an annotation, not only in the margin, so
+    `requires @ \\false;` is `requires \\false;`. Neither reading can be tokenized again: the `/*@` and `//@`
+    openers lose their `@` too. Never raises (`on_error="mask"`).
+    """
+    masked = mask_comments_and_literals(text, acsl="mask", on_error="mask")
+    visible = mask_comments_and_literals(text, acsl="mask", literals=False, on_error="mask")
+    if "@" not in masked:
+        return masked, visible
+    return masked.replace("@", " "), "".join(" " if m == "@" else c for c, m in zip(visible, masked, strict=True))
 
 
 def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path: str) -> list[str]:
@@ -454,20 +490,37 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                 f"{path}:{tok.line}: syntax hazard: control character {m_ctrl.group(0)!r} ({esc}) found in ACSL "
                 "annotation (likely caused by unescaped \\false, \\forall, \\at, or \\base_addr in a Python/shell string)"
             )
+        m_splice = _SPLICED_LINE_RE.search(tok.text)
+        if m_splice:
+            errors.append(
+                f"{path}:{tok.line + tok.text.count(chr(10), 0, m_splice.start())}: syntax hazard: a line of an ACSL "
+                "annotation ends with a backslash (the preprocessor joins the next line to it: after a `//@` "
+                "annotation the C code that follows becomes part of the comment, and in a `//` comment inside an "
+                "annotation the next clause does); remove the backslash"
+            )
+        if _is_doxygen_comment(tok.text):
+            errors.append(
+                f"{path}:{tok.line}: syntax hazard: '{tok.text[:4]}' opens a plain comment for Frama-C, not an "
+                "annotation (its lexer skips `/*@{`, `/*@}`, `/*@*` and the `//@` forms as doxygen comments, and "
+                "after `/*@*` it looks for a later `*/`); write the annotation as `/*@ ... */` or `//@ ...`"
+            )
+            continue
         scrubbed = _scrub_acsl_literals(tok.text)
-        m = _UNSOUND_ACSL_RE.search(scrubbed)
+        # `@` is white space for the kernel: `logic @ int f(...)` is `logic int f(...)`.
+        flat = scrubbed.replace("@", " ")
+        m = _UNSOUND_ACSL_RE.search(flat)
         if m:
             errors.append(
                 f"{path}:{tok.line}: forbidden unsound ACSL construct '{m.group(1)}' introduced in annotation"
             )
-        m_logic = _LOGIC_C_INT_RE.search(scrubbed)
+        m_logic = _LOGIC_C_INT_RE.search(flat)
         if m_logic:
             errors.append(
                 f"{path}:{tok.line}: forbidden C integer type in ACSL logic signature '{m_logic.group(0)}' "
                 "(use unbounded 'integer' or 'real'; C integer types introduce wraparound into logic)"
             )
         else:
-            for m_decl in _LOGIC_DECL_RE.finditer(scrubbed):
+            for m_decl in _LOGIC_DECL_RE.finditer(flat):
                 for param in m_decl.group(1).split(","):
                     if "*" not in param and "[" not in param and _C_INT_PARAM_RE.match(param):
                         errors.append(
@@ -475,7 +528,7 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
                             "(use unbounded 'integer' instead of C integer types)"
                         )
                         break
-        for m_inv in _INVARIANT_CLAUSE_RE.finditer(scrubbed):
+        for m_inv in _INVARIANT_CLAUSE_RE.finditer(flat):
             if m_inv.group(1) is None:
                 errors.append(
                     f"{path}:{tok.line}: forbidden statement-level 'invariant' in annotation "
@@ -492,9 +545,13 @@ def _check_unsound_acsl(tokens: list[Token], baseline_acsl_texts: set[str], path
 
 
 def _scrub_acsl_literals(text: str) -> str:
-    """ACSL annotation text with string and character literals emptied and `//` comments removed."""
-    emptied = _LITERAL_IN_ACSL_RE.sub(lambda m: '""' if m.group(0).startswith('"') else "' '", text)
-    return _COMMENT_IN_ACSL_RE.sub("", emptied)
+    """
+    One ACSL annotation (with its `/*@ */` or `//@`) with the contents of its literals and what the kernel
+    reads as a comment inside it blanked, at the same length: `mask_comments_and_literals(acsl="mask")`.
+    Its `@` are kept, so the result is still one annotation for `iter_clauses`; a regex that must read
+    `@` as white space searches the result with `.replace("@", " ")`.
+    """
+    return mask_comments_and_literals(text, acsl="mask", on_error="mask")
 
 
 def _first_vacuous_clause(scrubbed: str) -> str | None:
@@ -515,7 +572,7 @@ def find_empty_named_behaviors(tokens: list[Token], path: str = "<input>") -> li
     for tok in tokens:
         if tok.kind not in ("acsl_block", "acsl_line"):
             continue
-        scrubbed = _scrub_acsl_literals(tok.text)
+        scrubbed = _scrub_acsl_literals(tok.text).replace("@", " ")
         for m in _EMPTY_BEHAVIOR_RE.finditer(scrubbed):
             errors.append(
                 f"{path}:{tok.line}: empty named behavior '{m.group(0).strip()}' is forbidden since Frama-C 34 "
@@ -1229,7 +1286,7 @@ def has_function_contract(
     for decl in contract_declaration_spans(source, function_name, is_header=is_header, path=path):
         tokens = tokenize_c_acsl(_span_contract_part(decl, path=path), path=path)
         for tok in tokens:
-            if tok.kind in ("acsl_block", "acsl_line"):
+            if tok.kind in ("acsl_block", "acsl_line") and not _is_doxygen_comment(tok.text):
                 inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
                 for seg in _parse_acsl_inner_segments(inner, tok.line):
                     if seg.kind in _CONTRACT_KWS:
@@ -2315,30 +2372,32 @@ def extract_frame_clauses(acsl_text: str) -> dict:
     """
     Parse the frame clauses of one ACSL contract text:
     `\\separated(...)` argument lists and function-level `assigns ... [\\from ...];` clauses
-    (`loop assigns` is not a function frame clause and is skipped). Purely syntactic.
+    (`loop assigns` is not a function frame clause and is skipped). Purely syntactic, on the text the
+    kernel reads (`_kernel_views`): a location or a `\\separated(...)` written in a comment or in a
+    literal is not one.
     """
     separated: list[list[str]] = []
-    for m in _SEPARATED_RE.finditer(acsl_text):
-        inner, _ = _paren_group_at(acsl_text, m.end() - 1)
-        separated.append(_split_top_level(inner, ","))
-    assigns: list[dict] = []
-    for kind, _label, clause, _span in iter_clauses(acsl_text):
-        if kind != "assigns":
-            continue
-        from_m = _FROM_RE.search(clause)
-        if from_m:
-            locs_text, from_text = clause[: from_m.start()], clause[from_m.end() :]
-        else:
-            locs_text, from_text = clause, ""
-        from_parts = _split_top_level(from_text, ",") if from_text.strip() else []
-        assigns.append(
-            {
-                "locs": _split_top_level(locs_text, ","),
-                "from": from_parts,
-                "from_nothing": bool(from_parts) and all(p == "\\nothing" for p in from_parts),
-            }
-        )
+    masked, visible = _kernel_views(acsl_text)
+    for m in _SEPARATED_RE.finditer(masked):
+        inner, _ = _paren_group_at(masked, m.end() - 1)
+        separated.append(_split_top_level(visible[m.end() : m.end() + len(inner)], ","))
+    assigns = [_split_assigns(clause) for kind, _label, clause, _span in iter_clauses(acsl_text) if kind == "assigns"]
     return {"separated": separated, "assigns": assigns}
+
+
+def _split_assigns(clause: str) -> dict:
+    """The locations and the `\\from` sources of one `assigns` clause (its text after the keyword and label)."""
+    from_m = _FROM_RE.search(clause)
+    if from_m:
+        locs_text, from_text = clause[: from_m.start()], clause[from_m.end() :]
+    else:
+        locs_text, from_text = clause, ""
+    from_parts = _split_top_level(from_text, ",") if from_text.strip() else []
+    return {
+        "locs": _split_top_level(locs_text, ","),
+        "from": from_parts,
+        "from_nothing": bool(from_parts) and all(p == "\\nothing" for p in from_parts),
+    }
 
 
 def _norm_clause(text: str) -> str:
@@ -2627,15 +2686,14 @@ _C_PARAM_KEYWORDS = frozenset(
 
 
 def _acsl_comment_body(text: str) -> str:
-    """The inside of an ACSL comment: no `/*@`, `*/`, `//@`, leading `@` margins or `//` comments."""
+    """
+    The inside of one ACSL comment as the kernel reads it (`_kernel_views`): no `/*@`, `*/` or `//@`, and
+    its comments and `@` blanked. Line ends are kept, so a line counted in the result is a line of `text`.
+    """
+    body = _kernel_views(text)[1]
     if text.startswith("/*@"):
-        text = text[3:]
-        if text.endswith("*/"):
-            text = text[:-2]
-    elif text.startswith("//@"):
-        text = text[3:]
-    text = _COMMENT_IN_ACSL_RE.sub(" ", text)
-    return re.sub(r"(^|\n)\s*@", r"\1 ", text)
+        return body[3:-2] if text.endswith("*/") else body[3:]
+    return body[3:] if text.startswith("//@") else body
 
 
 def _first_top_level_binder(text: str) -> int:
@@ -2669,8 +2727,14 @@ _CLAUSE_HEAD_RE = re.compile(
 
 
 def iter_clauses(annotation: str) -> Iterator[tuple[str, str, str, tuple[int, int]]]:
-    """Iterate parsed ACSL clauses (kind, label, predicate, span) across annotation text."""
-    masked = mask_comments_and_literals(annotation, acsl="mask", on_error="mask")
+    """
+    Iterate parsed ACSL clauses (kind, label, predicate, span) across annotation text.
+
+    The clauses are those the Frama-C kernel reads (`_kernel_views`): a `//` comment inside an annotation,
+    a `//@` nested in one (outside ghost code) and an `@` are white space in the label and the predicate, and
+    cannot start, end or extend a clause. `span` is an offset pair in `annotation`.
+    """
+    masked, visible = _kernel_views(annotation)
     i = 0
     n = len(annotation)
     while i < n:
@@ -2682,7 +2746,7 @@ def iter_clauses(annotation: str) -> Iterator[tuple[str, str, str, tuple[int, in
         if end >= n:
             i = m.end()
             continue
-        raw = re.sub(r"(^|\n)\s*@", r"\1 ", annotation[m.end() : end])
+        raw = visible[m.end() : end]
         labels: list[str] = []
         while (lab := _CLAUSE_LABEL_RE.match(raw)) is not None:
             labels.append(lab.group(1))
@@ -3047,7 +3111,7 @@ def contract_shape(contract_text: str, returns_void: bool = False) -> str:
                     found.add(m.group(0))
                     break
         roots = frozenset(found)
-    masked = mask_comments_and_literals(contract_text, acsl="mask", on_error="mask")
+    masked = _kernel_views(contract_text)[0]
     clauses = list(iter_clauses(contract_text))
     for kind, _label, predicate, span in clauses:
         if kind != "ensures" or not predicate or is_trivial_predicate(predicate):
@@ -3077,3 +3141,317 @@ def function_returns_void(source: str, function: str, is_header: bool = False, p
         return None
     prefix = head[: m.start()]
     return "*" not in prefix and "void" in _IDENT_RE.findall(prefix)
+
+
+# ---------------------------------------------------------------------------
+# Contract comparison: which clauses of a function's contract a candidate removed
+# ---------------------------------------------------------------------------
+
+# Frama-C's own name for the behavior holding the clauses written outside every `behavior`; not an identifier,
+# so no named behavior can collide with it.
+DEFAULT_BEHAVIOR = "default!"
+# The clause kinds every behavior of a comparison reports, in this order.
+CONTRACT_CLAUSE_KINDS = (
+    "requires",
+    "assumes",
+    "assigns",
+    "ensures",
+    "terminates",
+    "exits",
+    "decreases",
+    "allocates",
+    "frees",
+)
+
+_BEHAVIOR_NAME_RE = re.compile(r"(?<![\\\w])behavior\s+([A-Za-z_][A-Za-z0-9_]*)\s*:")
+_COMPLETENESS_RE = re.compile(r"(?<![\\\w])(?:complete|disjoint)\s+behaviors\b[^;]*")
+_CLAUSE_MODIFIER_RE = re.compile(r"(?<![\\\w])(check|admit)\s+$")
+_FORMAL_REF_RE = re.compile(r"(?<![\w\\])[A-Za-z_][A-Za-z0-9_]*")
+
+
+class _NoComparison(Exception):
+    """Why `compare_function_contracts` has no comparison to give."""
+
+
+def _empty_contract_comparison(function: object) -> dict:
+    return {
+        "available": False,
+        "reason": "",
+        "function": function if isinstance(function, str) else "",
+        "declarations": {"baseline": [], "candidate": []},
+        "formals_unified": False,
+        "had_contract": False,
+        "has_contract": False,
+        "behaviors": {},
+        "completeness": {"baseline": [], "candidate": [], "removed": [], "added": []},
+        "summary": {"assigns_removed_in": [], "ensures_removed_in": [], "behaviors_removed": []},
+    }
+
+
+def _read_declaration_contract(decl: DeclSpan, path: str) -> dict:
+    """
+    The contract in front of one declaration: its clauses as `(behavior, kind, text)`, the named behaviors and
+    the `complete` / `disjoint` clauses in source order, and the declaration's C tokens. `text` is the clause
+    without keyword and label, white space collapsed; a `check` or `admit` clause keeps that word in front.
+    A contract is one annotation, so each annotation starts in the default behavior. Ghost code is skipped.
+    """
+    tokens = tokenize_c_acsl(_span_contract_part(decl, path=path), path=path)
+    clauses: list[tuple[str, str, str]] = []
+    behaviors: list[str] = []
+    completeness: list[str] = []
+    for tok in tokens:
+        if tok.kind not in ("acsl_block", "acsl_line") or _GHOST_ANNOTATION_RE.match(tok.text, 3):
+            continue
+        shape = _kernel_views(tok.text)[0]
+        heads = [(m.start(), m.group(1)) for m in _BEHAVIOR_NAME_RE.finditer(shape)]
+        behaviors.extend(name for _pos, name in heads)
+        completeness.extend(" ".join(m.group(0).split()) for m in _COMPLETENESS_RE.finditer(shape))
+        for kind, _label, pred, (start, _end) in iter_clauses(tok.text):
+            text = " ".join(pred.split())
+            if kind != "assigns":
+                text = _strip_outer_parens(text)
+            if not text:
+                continue
+            modifier = _CLAUSE_MODIFIER_RE.search(shape, 0, start)
+            if modifier is not None:
+                text = f"{modifier.group(1)} {text}"
+            behavior = DEFAULT_BEHAVIOR
+            for pos, name in heads:
+                if pos < start:
+                    behavior = name
+            clauses.append((behavior, kind, text))
+    signature = [t.text for t in tokens if t.kind not in ("whitespace", "c_comment", "acsl_block", "acsl_line")]
+    return {"clauses": clauses, "behaviors": behaviors, "completeness": completeness, "signature": signature}
+
+
+def _contract_declarations(texts: Mapping[str, str], function: str, side: str) -> list[tuple[str, DeclSpan, dict]]:
+    """`(file, declaration, its contract)` for every declaration of `function` in `texts`, in the given file order."""
+    found: list[tuple[str, DeclSpan, dict]] = []
+    for rel, text in texts.items():
+        if not isinstance(rel, str) or not isinstance(text, str):
+            raise _NoComparison(f"{rel} ({side}): a file name and its text must both be strings")
+        try:
+            for decl in function_declaration_spans(text, function, path=rel):
+                found.append((rel, decl, _read_declaration_contract(decl, rel)))
+        except AcslError as exc:
+            raise _NoComparison(f"{side} text cannot be read: {exc}") from None
+    if not found:
+        raise _NoComparison(f"no declaration of '{function}' in the {side} text of {', '.join(texts)}")
+    return found
+
+
+def _positional_formals(text: str, positions: Mapping[str, str]) -> str:
+    """`text` with each formal of `positions` replaced by its position, except where the name is a field."""
+    if not positions:
+        return text
+
+    def replace(m: re.Match[str]) -> str:
+        position = positions.get(m.group(0))
+        before = text[: m.start()].rstrip()
+        if position is None or before.endswith("->") or (before.endswith(".") and not before.endswith("..")):
+            return m.group(0)
+        return position
+
+    return _FORMAL_REF_RE.sub(replace, text)
+
+
+def _pooled_clauses(decls: list[tuple[str, DeclSpan, dict]], formals: list[dict[str, str]]) -> dict[str, dict]:
+    """
+    The clauses of every declaration, per behavior then per kind, as `(key, text, location keys)`. Frama-C
+    merges the contracts of a function's declarations behavior by behavior, so they are pooled the same way.
+    `key` is what two clauses are compared on: no white space, formals by position, and for `assigns` the
+    locations and the `\\from` sources each in sorted order.
+    """
+    pooled: dict[str, dict] = {DEFAULT_BEHAVIOR: {}}
+    for (_rel, _decl, contract), positions in zip(decls, formals, strict=True):
+        for name in contract["behaviors"]:
+            pooled.setdefault(name, {})
+        for behavior, kind, text in contract["clauses"]:
+            loc_keys: list[str] = []
+            key = _norm_clause(_positional_formals(text, positions))
+            if kind == "assigns":
+                parts = _split_assigns(text)
+                loc_keys = [_norm_clause(_positional_formals(loc, positions)) for loc in parts["locs"]]
+                from_keys = sorted(_norm_clause(_positional_formals(src, positions)) for src in parts["from"])
+                key = ",".join(sorted(loc_keys)) + ("\\from" + ",".join(from_keys) if from_keys else "")
+            pooled.setdefault(behavior, {}).setdefault(kind, []).append((key, text, loc_keys))
+    return pooled
+
+
+def _gone(left: list[tuple[str, str]], right: list[tuple[str, str]]) -> list[str]:
+    """The texts of `left` whose key no entry of `right` has, once each, in order."""
+    have = {key for key, _text in right}
+    out: dict[str, str] = {}
+    for key, text in left:
+        if key not in have:
+            out.setdefault(key, text)
+    return list(out.values())
+
+
+def _clause_delta(base: list, cand: list) -> dict:
+    base_pairs = [(key, text) for key, text, _locs in base]
+    cand_pairs = [(key, text) for key, text, _locs in cand]
+    return {
+        "baseline": [text for _key, text in base_pairs],
+        "candidate": [text for _key, text in cand_pairs],
+        "removed": _gone(base_pairs, cand_pairs),
+        "added": _gone(cand_pairs, base_pairs),
+    }
+
+
+def _assigns_delta(base: list, cand: list) -> dict:
+    delta = _clause_delta(base, cand)
+    if not base and not cand:
+        status = "none"
+    elif not cand:
+        status = "removed"
+    elif not base:
+        status = "added"
+    else:
+        status = "same" if {key for key, _t, _l in base} == {key for key, _t, _l in cand} else "changed"
+
+    def locations(clauses: list) -> list[tuple[str, str]]:
+        return [
+            (k, loc) for _key, text, keys in clauses for k, loc in zip(keys, _split_assigns(text)["locs"], strict=True)
+        ]
+
+    base_locs, cand_locs = locations(base), locations(cand)
+    return {
+        "baseline": [{"text": text, **_split_assigns(text)} for _key, text, _locs in base],
+        "candidate": [{"text": text, **_split_assigns(text)} for _key, text, _locs in cand],
+        "status": status,
+        "removed": delta["removed"],
+        "added": delta["added"],
+        "locations_removed": _gone(base_locs, cand_locs),
+        "locations_added": _gone(cand_locs, base_locs),
+    }
+
+
+def _compare_contracts(result: dict, baseline: Mapping[str, str], candidate: Mapping[str, str], function: str) -> None:
+    if not isinstance(function, str) or not function:
+        raise _NoComparison("no function name given")
+    if not isinstance(baseline, Mapping) or not isinstance(candidate, Mapping):
+        raise _NoComparison("TypeError: baseline and candidate must each map a file name to its text")
+    if set(baseline) != set(candidate):
+        only_base = sorted(str(k) for k in set(baseline) - set(candidate))
+        only_cand = sorted(str(k) for k in set(candidate) - set(baseline))
+        raise _NoComparison(
+            "baseline and candidate do not cover the same files "
+            f"(only in baseline: {only_base}; only in candidate: {only_cand})"
+        )
+    if not baseline:
+        raise _NoComparison("no file to compare")
+    base = _contract_declarations(baseline, function, "baseline")
+    cand = _contract_declarations({rel: candidate[rel] for rel in baseline}, function, "candidate")
+    if [(rel, d.kind, c["signature"]) for rel, d, c in base] != [(rel, d.kind, c["signature"]) for rel, d, c in cand]:
+        raise _NoComparison(
+            f"the declarations of '{function}' differ between baseline and candidate "
+            "(one was added or removed, or its C text changed)"
+        )
+    # The declarations of one function may name their formals differently. A clause moved from one to the
+    # other is rewritten for the other's names, so clauses are compared with formals by position. That needs
+    # every declaration to name the same number of formals; otherwise the names are compared as written.
+    names = [declaration_param_names(decl, path=rel) for rel, decl, _contract in base]
+    unified = len({len(n) for n in names}) == 1
+    formals = [{name: f"${k}" for k, name in enumerate(n)} if unified else {} for n in names]
+    pooled_base = _pooled_clauses(base, formals)
+    pooled_cand = _pooled_clauses(cand, formals)
+
+    result["formals_unified"] = unified
+    for side, decls in (("baseline", base), ("candidate", cand)):
+        result["declarations"][side] = [
+            {"file": rel, "kind": decl.kind, "clauses": len(contract["clauses"])} for rel, decl, contract in decls
+        ]
+    result["had_contract"] = any(c["clauses"] or c["behaviors"] or c["completeness"] for _r, _d, c in base)
+    result["has_contract"] = any(c["clauses"] or c["behaviors"] or c["completeness"] for _r, _d, c in cand)
+    for name in dict.fromkeys([*pooled_base, *pooled_cand]):
+        in_base, in_cand = pooled_base.get(name), pooled_cand.get(name)
+        kinds = dict.fromkeys([*CONTRACT_CLAUSE_KINDS, *sorted({*(in_base or {}), *(in_cand or {})})])
+        entry: dict = {
+            "in_baseline": bool(in_base) if name == DEFAULT_BEHAVIOR else in_base is not None,
+            "in_candidate": bool(in_cand) if name == DEFAULT_BEHAVIOR else in_cand is not None,
+        }
+        for kind in kinds:
+            delta = _assigns_delta if kind == "assigns" else _clause_delta
+            entry[kind] = delta((in_base or {}).get(kind, []), (in_cand or {}).get(kind, []))
+        result["behaviors"][name] = entry
+    completeness: list[list[tuple[str, str, list[str]]]] = [
+        [(_norm_clause(text), text, []) for _r, _d, c in decls for text in c["completeness"]] for decls in (base, cand)
+    ]
+    result["completeness"] = _clause_delta(completeness[0], completeness[1])
+    behaviors = result["behaviors"]
+    result["summary"] = {
+        "assigns_removed_in": [n for n, e in behaviors.items() if e["assigns"]["status"] == "removed"],
+        "ensures_removed_in": [n for n, e in behaviors.items() if e["ensures"]["removed"]],
+        "behaviors_removed": [n for n, e in behaviors.items() if e["in_baseline"] and not e["in_candidate"]],
+    }
+
+
+def compare_function_contracts(baseline: Mapping[str, str], candidate: Mapping[str, str], function: str) -> dict:
+    """
+    What a candidate changed in the contract of `function`, clause by clause: text in, data out.
+
+    `baseline` and `candidate` map a file name to the whole text of that file, before and after. Both must
+    hold the same files: every file that can carry the contract (the source, the declaring header), the
+    unchanged ones included, or a contract in a file left out reads as absent on both sides. The function's
+    contract is the contract in front of every declaration of it in those files, prototypes and definition
+    (`function_declaration_spans`), pooled behavior by behavior as Frama-C merges them. So a clause moved from
+    the prototype to the definition is not removed, and a clause written on both is removed only when both
+    copies go. Annotations inside the body are not part of the contract.
+
+    Never raises. The result is JSON-serialisable and always has these keys:
+
+    - `available` (bool), `reason` (str): False with the reason when there is no comparison: the two sides
+      hold different files, the function is declared in neither side's text, a text does not tokenize
+      (`reason` carries the tokenizer's `file:line: unclosed ...`), or the declarations themselves differ
+      (a declaration added or removed, or its C tokens changed). Every other key then has its empty value.
+      A function declared without any contract IS a comparison (`had_contract` False).
+    - `function`; `declarations`: `{"baseline": [...], "candidate": [...]}`, one
+      `{"file", "kind": "prototype" | "definition", "clauses": <count>}` per declaration.
+    - `had_contract`, `has_contract` (bool): the baseline / candidate has at least one contract clause.
+    - `formals_unified` (bool): True when every declaration names the same number of formals; clauses are
+      then compared with formals by position (the header may say `reg_addr` where the definition says
+      `addr`). False: an unnamed formal somewhere, names compared as written.
+    - `behaviors`: `{name: entry}`, the default behavior first under `DEFAULT_BEHAVIOR` (`"default!"`, always
+      present), then each named behavior in order of first appearance. An entry has `in_baseline` and
+      `in_candidate` (for the default behavior: it has a clause there) and one value per clause kind of
+      `CONTRACT_CLAUSE_KINDS` (plus any other kind met):
+        - every kind but `assigns`: `{"baseline": [text], "candidate": [text], "removed": [text],
+          "added": [text]}`. `removed` are the baseline clauses no candidate clause of the same behavior
+          and kind equals, `added` the reverse, once each.
+        - `assigns`: the same four keys, where `baseline` and `candidate` hold
+          `{"text", "locs": [...], "from": [...], "from_nothing": bool}` per clause, plus
+          `status`: `"none"` (no assigns clause on either side), `"removed"` (had one, has none),
+          `"added"`, `"same"` or `"changed"` (both have one and they differ: narrowed, widened or
+          rewritten), and `locations_removed` / `locations_added`: the locations listed on one side only,
+          whatever their `\\from`.
+    - `completeness`: the four keys again, for `complete behaviors ...` / `disjoint behaviors ...`.
+    - `summary`: `assigns_removed_in` (behaviors whose `assigns` status is `"removed"`),
+      `ensures_removed_in` (behaviors with a removed `ensures`), `behaviors_removed` (named behaviors the
+      candidate no longer has).
+
+    How clauses are compared. Two clauses are equal when their text is, with the clause label dropped,
+    comments and `@` left out as the kernel does (`iter_clauses`), white space ignored, outer parentheses
+    ignored (not for `assigns`), and formals by position. For `assigns`, the order of the locations and of
+    the `\\from` sources is ignored too, and the `\\from` part belongs to the clause: `assigns x \\from a;`
+    against `assigns x;` is `"changed"` with no location removed. `check` and `admit` clauses are kept apart
+    from plain ones (`ensures P;` replaced by `check ensures P;` removes `P` and adds `check P`).
+
+    What is not judged. Nothing here says whether a change weakens the contract. `requires`, `assumes`,
+    `terminates`, `exits`, `decreases`, `allocates` and `frees` are reported exactly like `ensures` (a
+    removed `requires` strengthens the contract for callers, a removed `assumes` widens its behavior; the
+    caller decides). An `assigns` clause is not matched semantically (`*ctx` against `ctx->debug` is one
+    location removed and one added), and a named behavior without `assigns` is reported `"removed"` or
+    `"none"` although the default behavior's clause still frames it.
+    """
+    result = _empty_contract_comparison(function)
+    try:
+        _compare_contracts(result, baseline, candidate, function)
+    except _NoComparison as exc:
+        reason = str(exc)
+    except Exception as exc:  # text this cannot parse must give a result, not an exception: the gate decides
+        reason = f"{type(exc).__name__}: {exc}"
+    else:
+        result["available"] = True
+        return result
+    return {**_empty_contract_comparison(function), "reason": reason}
