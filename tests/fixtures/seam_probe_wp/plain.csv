@@ -1,0 +1,13 @@
+directory	file	line	function	property kind	status	property
+/target/eacsl_ignored	probe.c	62	plain	postcondition	Valid	\result <= 255 * 16
+/target/eacsl_ignored	probe.c	64	plain	postcondition	Valid	\false
+/target/eacsl_ignored	probe.c	64	plain	termination clause	Valid	\true
+/target/eacsl_ignored	probe.c	64	plain	assigns clause	Valid	assigns \nothing;
+/target/eacsl_ignored	probe.c	67	plain	loop invariant	Valid	0 <= i <= n
+/target/eacsl_ignored	probe.c	68	plain	loop invariant	Valid	s <= 255 * i
+/target/eacsl_ignored	probe.c	69	plain	assigns clause	Valid	assigns i, s;
+/target/eacsl_ignored	probe.c	72	plain	signed_overflow	Valid	i + 1 <= 2147483647
+/target/eacsl_ignored	probe.c	73	plain	mem_access	Valid	\valid_read(buf + i)
+/target/eacsl_ignored	probe.c	73	plain	unsigned_overflow	Valid	0 <= s + (unsigned int)*(buf + i)
+/target/eacsl_ignored	probe.c	73	plain	unsigned_overflow	Valid	s + (unsigned int)*(buf + i) <= 4294967295
+/target/eacsl_ignored	probe.c	73	plain	pointer_value	Valid	\null == buf + i || \object_pointer(buf + i)

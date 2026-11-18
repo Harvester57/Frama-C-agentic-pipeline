@@ -1,0 +1,12 @@
+directory	file	line	function	property kind	status	property
+/target/eacsl_ignored	probe.c	15	unb_requires	postcondition	Valid	small: \result <= 16
+/target/eacsl_ignored	probe.c	17	unb_requires	postcondition	Valid	\false
+/target/eacsl_ignored	probe.c	17	unb_requires	termination clause	Valid	\true
+/target/eacsl_ignored	probe.c	17	unb_requires	assigns clause	Valid	assigns \nothing;
+/target/eacsl_ignored	probe.c	20	unb_requires	loop invariant	Valid	0 <= i <= n
+/target/eacsl_ignored	probe.c	21	unb_requires	loop invariant	Valid	(unsigned long)z <= i
+/target/eacsl_ignored	probe.c	22	unb_requires	assigns clause	Valid	assigns i, z;
+/target/eacsl_ignored	probe.c	25	unb_requires	unsigned_overflow	Valid	i + 1 <= 18446744073709551615
+/target/eacsl_ignored	probe.c	26	unb_requires	mem_access	Valid	\valid_read(buf + i)
+/target/eacsl_ignored	probe.c	26	unb_requires	pointer_value	Valid	\null == buf + i || \object_pointer(buf + i)
+/target/eacsl_ignored	probe.c	27	unb_requires	unsigned_overflow	Valid	z + 1 <= 4294967295
