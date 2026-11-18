@@ -1,0 +1,3 @@
+directory	file	line	function	property kind	status	property
+/target/wp_frame_clause/src	frame.c	28	bare	postcondition	Valid	\false
+/target/wp_frame_clause/src	frame.c	28	bare	termination clause	Valid	\true

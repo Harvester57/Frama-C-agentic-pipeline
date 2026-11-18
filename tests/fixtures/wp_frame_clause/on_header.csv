@@ -1,0 +1,5 @@
+directory	file	line	function	property kind	status	property
+/target/wp_frame_clause/src	frame.c	33	on_header	postcondition	Valid	\false
+/target/wp_frame_clause/src	frame.c	33	on_header	termination clause	Valid	\true
+/target/wp_frame_clause/src	frame.c	35	on_header	mem_access	Valid	\valid(p)
+/target/wp_frame_clause/src	frame.h	7	on_header	assigns clause	Valid	assigns *p;

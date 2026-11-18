@@ -1,0 +1,9 @@
+directory	file	line	function	property kind	status	property
+/target/wp_void_object/src	voidobj.c	63	calls_send	postcondition	Valid	\false
+/target/wp_void_object/src	voidobj.c	63	calls_send	termination clause	Valid	\true
+/target/wp_void_object/src	voidobj.c	65	calls_send	precondition of send	Valid	\separated(buf + (..), &__fc_errno)
+/target/wp_void_object/src	voidobj.c	65	calls_send	precondition of send	Valid	available_sockfd: 0 <= sockfd < 1024
+/target/wp_void_object/src	voidobj.c	65	calls_send	precondition of send	Valid	buf_len_ok: \valid_read((char *)buf + (0 .. len - 1))
+FRAMAC_SHARE/libc/sys	socket.h	513	send	postcondition	Unknown	\false
+FRAMAC_SHARE/libc/sys	socket.h	513	send	termination clause	Valid	\true
+FRAMAC_SHARE/libc/sys	socket.h	513	send	precondition	Valid	\separated(buf + (..), &__fc_errno)
