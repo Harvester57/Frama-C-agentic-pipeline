@@ -2027,8 +2027,8 @@ def lifecycle_case(
     """
     A synthesized call sequence on one handle (H2): the constructor builds it (call 0, its arguments
     from the input as in any case, except that it never takes the rest of the input: an unsized input
-    string is a `STRING_SLOT_BYTES` slot, NUL-terminated, and an unsized byte pair a spare buffer with
-    a clamped length), then while the input lasts, up to `max_calls` times, one input
+    string is a `STRING_SLOT_BYTES` slot, NUL-terminated, and an unsized byte pair a zeroed spare
+    buffer with a length read from the input and clamped to it), then while the input lasts, up to `max_calls` times, one input
     byte picks one of `methods` (call k + 1 for methods[k]), called on the handle with its other
     arguments read from the input at that point, then the destructor releases the handle. Only the
     constructor's slots are fixed, so they are the layout's slots (seeds start from the constructor's

@@ -311,6 +311,30 @@ def test_an_out_parameter_lifecycle_constructor_string_is_a_bounded_slot_never_t
 
 
 @pytest.mark.unit
+def test_an_out_parameter_constructor_string_in_a_single_case_is_a_slot_and_the_call_keeps_the_rest():
+    """`_construct` reserves the rest for the call under test: its constructor's string is the bounded slot."""
+    recs = {
+        "ctx_open": _rec("ctx_open", "int(struct ctx **,char const *)", "pointer", "const_pointer"),
+        "ctx_feed": _rec("ctx_feed", "int(struct ctx *,char const *)", "pointer", "const_pointer"),
+    }
+    api = ah.ApiInfo(
+        probed=True,
+        records={"ctx_open": recs["ctx_open"]},
+        handles={"ctx_feed": {0: CTX}},
+        dtors={CTX: "ctx_free"},
+        dtor_names={CTX: {"ctx_free"}},
+        out_ctors={CTX: ("ctx_open", 0)},
+    )
+    case = ah._Case(SPARE, api)
+    params, _ = ah.plan_params(recs["ctx_feed"]["signature"], recs["ctx_feed"]["formals"])
+    stmt = ah._bind_call(case, 0, "ctx_feed", params or [], recs["ctx_feed"]["formals"], recs["ctx_feed"])
+    assert case.slots == [{"call": 1, "param": 1, "size": ah.STRING_SLOT_BYTES, "kind": "bytes"}]
+    assert case.rest == {"call": 0, "param": 1, "kind": "string"}
+    assert "c1a1[sizeof(c1a1) - 1] = 0;" in case.post
+    assert "ctx_open((struct ctx **)&c0a0, (char const *)c1a1);" in " ".join([*case.decls, stmt])
+
+
+@pytest.mark.unit
 def test_a_lifecycle_constructor_byte_pair_never_takes_the_rest():
     """An unsized (buffer, length) input pair of the constructor: a spare buffer and a clamped length slot."""
     recs = {
