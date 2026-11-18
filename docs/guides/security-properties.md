@@ -22,7 +22,7 @@ Layers 3 to 6 come from what the structured threat model (the `framac-threat-mod
 How it runs:
 
 1. `/framac-slice` Step 3 runs `scripts/security_props.py run`. It reads the Phase 0 model (`workspace/reports/phase0_model.json`) and the threat model, and writes `workspace/reports/security_props.json`.
-2. Each property is rendered from [`templates/metacsl/`](../../templates/metacsl/) as a MetAcsl meta-property, and lists its `instances`: the functions where its generated annotations land. Those are the ledger units (`l3_frame`, `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped`, `l6_no_leak`), seeded by `ledger.py seed`. The classes of the asset, invariant and call-rule properties (`l3_isolation`, `l4_invariant`, `l4_call_rule`) are generated but not seeded yet.
+2. Each property is rendered from [`templates/metacsl/`](../../templates/metacsl/) as a MetAcsl meta-property, and lists its `instances`: the functions where its generated annotations land. Those are the ledger units (`l3_frame`, `l4_auth_state`, `l4_auth_required`, `l5_sanitized`, `l6_wiped`, `l6_no_leak`), seeded by `ledger.py seed`. The asset, invariant and call-rule properties add the classes `l3_isolation`, `l4_invariant` and `l4_call_rule`.
 3. `run_wp_function.py` loads the properties of the function under proof (`--security-props`, default the run's file; `none` turns it off) and runs `-meta -then-last -wp`. A prover discharges the generated `assert`, `requires` and `ensures` named `<property>: meta:` like any other goal, and the prover brief lists what to discharge.
 
 Without a threat model only Layer 3 is generated.
@@ -228,7 +228,7 @@ A model whose call sites carry no `initializer` flag gives a warning (`call site
 ## Known Limits
 
 - **Initializer flags reach the generator only when the model carries them.** The dump writes `initializer`, but `phase0_model.py` does not copy it into `call_sites` yet (see [`../troubleshooting/security-properties.md`](../troubleshooting/security-properties.md)). Until it does, no in-code check is written in a real run and the generator warns.
-- **The ledger does not know the classes `l3_isolation`, `l4_invariant` and `l4_call_rule` yet** (package D2 of the plan), and does not read `unchecked`. `run_wp_function.py` loads the new properties and WP proves their goals, but its report does not file them under a class.
+- **In-code checks have no name in a report row.** Frama-C's CSV gives a `check` its file and line only; `code_checks[].index` tells the checks of one line apart. Whether `run_wp_function.py` and `ledger.py` use it, and whether the ledger reads `unchecked`, is recorded in [`../troubleshooting/security-properties.md`](../troubleshooting/security-properties.md).
 - **Parameter-held assets** are checked only under the listed parameter names.
 - **Readers properties are broad:** every function but the readers carries a unit.
 
