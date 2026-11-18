@@ -92,7 +92,8 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py)), because E-ACSL runs on
   host headers without Frama-C's libc `assigns` clauses. Out-parameters get the written bytes marked
   initialized: `strto*`'s `endptr`, the socket address of `getsockname`, `accept` and `recvfrom`,
-  the buffers of `read`, `recv`, `recvmsg` and `readv`, and others. Results in libc's static
+  the buffers of `read`, `recv`, `recvmsg` and `readv`, the bytes `strlcpy` and `strlcat` copied,
+  and others. Results in libc's static
   storage (`strerror`, `gmtime`, ...) are copied into a tracked buffer of the shim. Each entry is
   `(return type, parameter types, header, pre, post, copy)` in C. Add one when a target stops on
   `\initialized` right after a libc call, or on `unallocated` memory libc returned. A signature

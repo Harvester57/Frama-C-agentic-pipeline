@@ -979,6 +979,32 @@ def test_one_wrapper_merges_errno_sync_and_effects():
     assert "__wrap_strerror(" in src
 
 
+def test_strlcpy_and_strlcat_mark_only_the_bytes_they_wrote():
+    # libmodbus run-1 (2026-11-18): modbus_new_tcp fills ctx_tcp->ip with glibc's strlcpy
+    # (HAVE_STRLCPY), which E-ACSL never sees; modbus_tcp_listen then failed \initialized(&ip[0]).
+    call = "    ret_size = strlcpy(ctx_tcp->ip,ip,dest_size);\n    n = strlcat(buf,s,sizeof(buf));\n"
+    assert T.find_eacsl_effect_calls(call) == ["strlcpy", "strlcat"]
+    src = T.generate_errno_shim_source([], ["strlcpy", "strlcat"])
+    cpy = _wrapper_body(src, "strlcpy")
+    # r is strlen(src): min(r, size - 1) bytes plus the NUL, nothing when size is 0.
+    assert cpy.index("__real_strlcpy(a0, a1, a2)") < cpy.index("if (a2) FC_INIT(a0, FC_MIN(r, a2 - 1) + 1);")
+    cat = _wrapper_body(src, "strlcat")
+    # The old length is read before the call overwrites its terminator; the bytes before it were
+    # only read. Nothing is written when dst holds no NUL within size (r is then size + strlen(src)).
+    assert cat.index("size_t fc_d = a2 ? strnlen(a0, a2) : 0;") < cat.index("__real_strlcat(a0, a1, a2)")
+    assert "if (fc_d < a2) FC_INIT(a0 + fc_d, FC_MIN(r - fc_d, a2 - fc_d - 1) + 1);" in cat
+
+
+def test_strlcpy_and_strlcat_shim_compiles_where_libc_does_not_declare_them():
+    # glibc declares them from 2.38 only: the shim brings its own prototype, so an older libc
+    # (or one hiding them) does not fail the -Werror shim and drop every other effect with it.
+    src = T.generate_errno_shim_source([], ["strlcpy", "strlcat"])
+    for name in ("strlcpy", "strlcat"):
+        proto = f"size_t {name}(char *, const char *, size_t);"
+        assert src.index(proto) < src.index(f"extern __typeof__({name}) __real_{name};"), name
+    assert "size_t strtol(" not in T.generate_errno_shim_source([], ["strtol"])
+
+
 def test_effects_only_shim_is_built_and_linked(tmp_path, modern_cli):
     fake = FakeEacslGcc(instrumented_text=EFFECTS_INSTRUMENTED)
     res = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "fuzz_mod", runner=fake, use_cache=False)
@@ -1027,6 +1053,19 @@ def test_every_shim_wrapper_compiles_against_the_host_libc(tmp_path):
             timeout=120,
         )
         assert proc.returncode == 0, proc.stderr[-4000:]
+    # A libc that does not declare strlcpy/strlcat (glibc < 2.38; here hidden by strict POSIX).
+    src = tmp_path / "shim_no_strlcpy.c"
+    text = T.generate_errno_shim_source([], ["strlcpy", "strlcat"])
+    src.write_text(
+        text.replace("#define _GNU_SOURCE 1\n", "#define _POSIX_C_SOURCE 200809L\n"), encoding="utf-8", newline="\n"
+    )
+    proc = subprocess.run(
+        ["clang", "-c", "-O1", "-Werror", "-std=gnu17", str(src), "-o", str(src.with_suffix(".o"))],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
 
 
 def test_va_list_initialized_checks_are_skipped_and_others_kept():
@@ -1890,8 +1929,14 @@ static int sum(int n, ...)
     return s;
 }
 
+/* Runtime source for strlcpy/strlcat: a literal lets clang fold the call into a memcpy. */
+static volatile char g_k = 'a';
+
 static int probe(int sel)
 {
+    char s[9];
+    memset(s, g_k, 8);
+    s[8] = 0;
     switch (sel) {
     case 0: { char *end; long v = strtol("12x", &end, 10); return (int)v + *end; }
     case 1: {
@@ -1936,6 +1981,12 @@ static int probe(int sel)
         close(sv[0]); close(sv[1]);
         return r == 8 ? buf[5] : 0;
     }
+    /* libmodbus run-1: strlcpy truncates 8 bytes to 3 plus the NUL; strlcat appends 4 plus the
+     * NUL after a 1-byte string. The copied bytes are clean, one byte further is not. */
+    case 9: { char buf[16]; size_t r = strlcpy(buf, s, 4); return (int)r + buf[0] + buf[3]; }
+    case 10: { char buf[16]; strlcpy(buf, s, 4); return buf[4]; }
+    case 11: { char buf[16]; buf[0] = g_k; buf[1] = 0; strlcat(buf, s, 6); return buf[1] + buf[4] + buf[5]; }
+    case 12: { char buf[16]; buf[0] = g_k; buf[1] = 0; strlcat(buf, s, 6); return buf[6]; }
     }
     return 0;
 }
@@ -1944,7 +1995,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (size < 1)
         return 0;
-    return probe(data[0] % 9) == 12345;
+    return probe(data[0] % 13) == 12345;
 }
 """
 
@@ -1960,7 +2011,7 @@ keys = ("returncode", "reason", "binary", "errno_shim", "va_list_init_checks_ski
 print("RESULT " + json.dumps({k: res.get(k) for k in keys}))
 EOF
 set +e
-for i in 0 1 2 3 4 5 6 7 8; do
+for i in 0 1 2 3 4 5 6 7 8 9 10 11 12; do
   printf "$(printf '\\%03o' "$i")" > "in$i"
   ./out/fuzz_mod.e-acsl -runs=1 "in$i" > "run$i.log" 2>&1
   echo "CASE $i rc=$? init_failed=$(grep -c 'initialized' "run$i.log")"
@@ -1982,18 +2033,20 @@ def test_libc_shim_clears_libc_false_alarms_and_keeps_real_ones_in_the_analysis_
     assert line, out[-4000:]
     res = json.loads(line[len("RESULT ") :])
     assert res["returncode"] == 0, out[-4000:]
-    assert {"strtol", "getsockname", "strerror", "gmtime", "recvmsg", "read", "recv"} <= set(
-        res["errno_shim"]["eacsl_effects"]
-    )
     assert res["va_list_init_checks_skipped"]
-    cases = dict(re.findall(r"^CASE (\d) (rc=\d+ init_failed=\d+)$", proc.stdout, re.MULTILINE))
-    # strtol endptr, getsockname, strerror into fprintf, gmtime, recvmsg, va_arg: clean.
-    for i in "012345":
+    cases = dict(re.findall(r"^CASE (\d+) (rc=\d+ init_failed=\d+)$", proc.stdout, re.MULTILINE))
+    # strtol endptr, getsockname, strerror into fprintf, gmtime, recvmsg, va_arg, the bytes
+    # strlcpy and strlcat wrote: clean.
+    for i in ("0", "1", "2", "3", "4", "5", "9", "11"):
         assert cases[i] == "rc=0 init_failed=0", (i, out[-4000:])
     # A byte past what read() returned, the address after a failed getsockname, a byte past what
-    # recv(MSG_TRUNC) wrote although it returned more: still caught.
-    for i in "678":
+    # recv(MSG_TRUNC) wrote although it returned more, a byte past strlcpy's and strlcat's NUL:
+    # still caught.
+    for i in ("6", "7", "8", "10", "12"):
         assert not cases[i].startswith("rc=0 ") and not cases[i].endswith("=0"), (i, out[-4000:])
+    assert {"strtol", "getsockname", "strerror", "gmtime", "recvmsg", "read", "recv", "strlcpy", "strlcat"} <= set(
+        res["errno_shim"]["eacsl_effects"]
+    )
 
 
 @pytest.mark.integration
