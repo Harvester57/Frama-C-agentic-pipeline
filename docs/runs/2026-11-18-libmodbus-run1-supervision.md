@@ -4,7 +4,7 @@
 - **Run reports index:** [`./README.md`](./README.md)
 - **Troubleshooting:** [`../troubleshooting/README.md`](../troubleshooting/README.md)
 
-External, read-only supervision of the opencode-driven `standard` run of libmodbus (CodeQL enabled). This report is updated at each milestone.
+External supervision of the opencode-driven `standard` run of libmodbus (CodeQL enabled). The supervision was read-only until the user allowed the supervisor to land fixes and steer the session at 02:01. This is the final report.
 
 ## Parameters
 
@@ -19,9 +19,49 @@ External, read-only supervision of the opencode-driven `standard` run of libmodb
 
 ## Status
 
-**Phase 3, running.** At 17:38 the schedule held 35 prove tasks done, 58 blocked and 10 skipped, with no prove task left to run; 42 negotiations done; 60 breakers done and 1 running; 35 verifiers done (1 confirmed, 1 needs validation, 33 rejected). All 12 caller provers dispatched at 15:45 ended blocked. Of the last two proofs, `modbus_write_bit` stalled and `modbus_write_register` merged with a weakened contract (see Open items). No prove task merged before 08:37: every parent WP re-check was refused for memory (fix 13). **Correction:** the "48 done" and "68 done" counts reported earlier in this run held only verifiers, breakers, negotiations, the architect and the repair task, and no proof.
+**Finished with `run_status: incomplete`** at about 17:56, after 16 h 05 min. The run recorded this reason: "All 35 candidates verified; wp-sweep 43/43 proven with 0 regressions. 2 ledger units remain planned and 115 blocked (...); 6 candidate, 5 deferred, 87 covered."
 
-Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wall clock, including about 70 min of fix and wait time). Phases 1-2 and the crash verification gate ran 03:07-05:59, with two harness repairs. 13 pipeline issues so far.
+The run found no library defect that should be reported as it stands. Its one `confirmed` finding is documented behaviour (see [Read before using the generated report](#read-before-using-the-generated-report)). Proof coverage is partial: 87 of 215 ledger units are covered, all of them with open assumptions.
+
+No prove task merged before 08:37, because every parent WP re-check was refused for memory (fix 13). **Correction:** the "48 done" and "68 done" counts reported earlier in this run held only verifiers, breakers, negotiations, the architect and the repair task, and no proof.
+
+### Wall-clock time per phase
+
+These times come from the supervisor's timeline, not from run timestamps.
+
+| Phase | Local time | Duration |
+| :--- | :--- | :--- |
+| Phase 0, including about 70 min of fix and wait time | 01:51-03:06 | 1 h 15 min |
+| Phases 1-2 and the crash verification gate, with two harness repairs | 03:07-05:59 | 2 h 52 min |
+| Phase 3 | 06:00-17:49 | 11 h 49 min |
+| WP sweep, final status and report | 17:49-17:56 | 7 min |
+
+### Final results
+
+| Area | Result |
+| :--- | :--- |
+| Prove tasks (103) | 35 merged, 58 blocked (53 `stalled_after_k_retries`, 2 `analysis_error`, 2 `blocked`, 1 `merge_failed`), 10 skipped (7 `shell_unverifiable_wp`, 3 `candidate`) |
+| Negotiations (42) | 16 applied, 26 rejected |
+| Breakers (61) | 60 clean, 1 `crash_found` |
+| Verifiers (35) | 1 confirmed, 1 needs validation, 33 rejected |
+| WP sweep | 43 of 43 proven, no regression (17:50:21-17:53:05) |
+| Ledger (215 units) | 87 covered (69 by WP, 18 by Eva), 115 blocked, 6 candidate, 5 deferred, 2 planned. No unit is covered unconditionally |
+
+| Ledger class | Covered | Blocked | Candidate | Deferred | Planned |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `rte` | 60 | 56 | 4 | 0 | 0 |
+| `l2_termination` | 1 | 19 | 1 | 0 | 0 |
+| `l3_frame` | 26 | 27 | 0 | 5 | 2 |
+| `l5_sanitized` | 0 | 13 | 1 | 0 | 0 |
+
+### Read before using the generated report
+
+1. **The `confirmed` medium finding is not a bug report.** `send_msg` at `src/modbus.c:210` retries forever only under `MODBUS_ERROR_RECOVERY_LINK`, and `docs/modbus_set_error_recovery.md` documents this: "an infinite close/connect loop until success on send call". `REPORT.md` does not cite that page. Do not send this finding upstream as a defect.
+2. **`REPORT.md` says `CodeQL: off` although the run enabled CodeQL.** This was a supervisor error. My 02:39 instruction rebuilt the Phase 0 model after CodeQL and did not ask for `trust.py run` again, so the 13 CodeQL facts never reached the trust marks. The pipeline gave no warning (open bug, see Open items).
+3. **`modbus_write_register` is merged with a weakened contract.** Its prover deleted the `assigns` clause and the `\result >= -1` postcondition.
+4. **`L5_sanitized_send_msg` is false on the TCP path.** The generated property is checked before `send_msg_pre` completes the MBAP length bytes, so its four rejected candidates say nothing about the callers.
+5. **One finding needs a human decision.** The signed downcast of the start addresses in `modbus_mapping_new_start_address` (`src/modbus.c:2236`) is `needs_validation`, with no witness.
+6. **The report counts 31 rejected candidates and the schedule counts 33 rejected verifiers.** `verify:harness_libmodbus_so_5_1_0.c#unknown_function::unparsed_crash::d1b3ed4cbb` and `verify:unknown#free::freeable::c2bf36bd0d` have no row in `findings.json`. Both are rejections, so no finding is lost, but I did not trace why they are left out.
 
 ## Timeline (supervisor's observations, local time, 2026-11-18)
 
@@ -99,12 +139,16 @@ Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wa
 | 13:22 | All six requeued prove tasks merged (33 prove tasks done), and the serial-mode crash verifier closed `done/rejected`. Two results written at 12:18 (`breaker-modbus_set_float_abcd-2`, `prove-modbus_rtu_send_msg_pre`) were never completed by the session, so it was given the `step --complete` command |
 | 12:06 | Requeue commands for the 7 tasks sent to the session. **Supervisor error:** three of the six unprepared tasks came from my 09:35 instruction to run `step` without `--prepare` |
 | 04:49 | Supervisor finds the confirmed `send_msg` loop documented in `docs/modbus_set_error_recovery.md` ("an infinite close/connect loop until success on send call" under `MODBUS_ERROR_RECOVERY_LINK`). The harness had enabled LINK on a context with no peer, so the verdict is a false positive. Guidance prepared: keep the record, report it as documented behaviour, and mask LINK in the regenerated harness |
+| 17:34 | `modbus_write_register` merges with its `assigns` clause and one postcondition deleted |
+| 17:50-17:53 | WP sweep: 43 of 43 proven, no regression |
+| 17:55-17:56 | Final status `incomplete`, reports generated |
+| After 17:56 | Fix 1 passes its dry-run merge (6422 passed, 235 skipped; ruff, mypy and `check_generated_text` clean) and merges as `c776343`. The 16 merged `sup/libmodbus-*` branches and their worktrees are deleted. Nothing is pushed |
 
 ## Pipeline issues and fixes
 
 | # | Fingerprint | Category | Branch / commit | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| 1 | `build_capture.py run`: shell `Syntax error` from a CRLF `autogen.sh`, and `configure` syntax error from a CRLF `configure.ac`, with no CRLF hint in `build_capture.json` | pipeline gap (the CRLF checkout itself is target-side) | `sup/libmodbus-crlf-dash-hint` `41c20e9`, `3738ea6` | verified, held until the run ends (the run no longer needs it) |
+| 1 | `build_capture.py run`: shell `Syntax error` from a CRLF `autogen.sh`, and `configure` syntax error from a CRLF `configure.ac`, with no CRLF hint in `build_capture.json` | pipeline gap (the CRLF checkout itself is target-side) | `sup/libmodbus-crlf-dash-hint` `41c20e9`, `3738ea6`, merged as `c776343` after the run ended | fixed |
 | 2 | `phase0_model.py run`: `unlinked:/tmp/<cgXXXXXX>` unit, `source file '/tmp/.../dummy.c' does not exist` (GNU `config.guess` libc probe captured as a product unit) | pipeline bug | `sup/libmodbus-config-guess-probe` `0b3b43b` | merged live into `phase1-remediation` (fast-forward) |
 | 3 | `phase0_model.py run`: `Cannot resolve variable TIOCM_RTS` (`__fc_libc` `<sys/ioctl.h>` has `TIOCMGET` but not the `TIOCM_*` modem bits) | pipeline gap + upstream Frama-C libc gap | `sup/libmodbus-tiocm-bits` `f0bea19` (+ docs `a6e33f8`, `47fb030`), merged live as `34f8747`; also adds `TCGETS2`..`TCSETSF2`, the next missing macros; upstream draft 41 (not filed) |
 | 4 | `generate_harness.py --api`: `the harness does not compile outside its cases: <built-in>:1:10: fatal error: 'workspace/work/config.h' file not found` (DAG roots a generated force-include at the work tree) | pipeline bug | `sup/libmodbus-generated-force-include` `9f7b123`, merged live as `222d1d3` | fixed; the run reruns the DAG and the harness |
@@ -124,10 +168,13 @@ Phase 0 completed and validated at 03:06, after 7 pipeline fixes (01:51-03:06 wa
 | 18 | Phase 3 throughput: one `step --complete` ran 35 minutes (12:12-12:47) in the parent WP re-check of `_modbus_tcp_pi_connect` while 13 finished agents waited. The re-check has no wall limit and runs inside the step | pipeline gap | none | open; entry in `wp-and-guardrail.md`. The step was active and was left to finish |
 | 19 | Phase 3 breaker: `status: clean` although the campaign found E-ACSL alarms in other functions. The result has no field for them, so they cannot reach the crash gate | pipeline gap | none | open; entry in `wp-and-guardrail.md` |
 | 20 | Phase 3 merge: `parent guardrail returned status='rejected_overconstrained'` on a proven result merged alone, for a failure in another function (`modbus-rtu.c:1053`). A batch of two or more was retried per function, a single result was not. 43 of 1741 corpus inputs trip the module-wide guardrail through the upstream E-ACSL `\old` false alarm | pipeline bug, second run-wide guardrail stop caused by promoted seeds (see 15) | `sup/libmodbus-single-merge` `58f18ba`, fast-forwarded live | fixed; full suite 6418 passed, 234 skipped. Tested with fakes only. Each merge still pays for the failing module guardrail plus a scoped re-check (open) |
+| 21 | Phase 0 model rebuild: `phase0_model.json` has `trust.codeql: {"status": "off"}` although `codeql_trust.json` is `ok`, and `REPORT.md` says `CodeQL: off` | pipeline gap, triggered by a supervisor instruction | none | open; entry in `phase0-build-and-model.md` |
+| 22 | Phase 3 merge: a prover deletes the function's `assigns` clause, reports `all_proven`, and the merge accepts it (`modbus_write_register`) | pipeline bug | none | open; entry in `wp-and-guardrail.md` |
+| 23 | Phase 0 security properties: `L5_sanitized_send_msg` is checked before the TCP backend completes the MBAP length bytes | pipeline bug | none | open; entries in `security-properties.md` and `wp-and-guardrail.md` |
 
 Tests added:
 
-- `tests/test_crlf_scripts.py`: `test_a_shell_syntax_error_on_a_crlf_script_gets_the_hint`, `test_a_shell_syntax_error_naming_no_crlf_script_gives_no_hint`, `test_crlf_autotools_inputs_are_found`, `test_a_configure_syntax_error_from_a_crlf_configure_ac_gets_the_hint`, `test_a_build_failing_with_a_syntax_error_in_a_crlf_script_gets_the_hint` (branch 1).
+- `tests/test_crlf_scripts.py`: `test_a_shell_syntax_error_on_a_crlf_script_gets_the_hint`, `test_a_shell_syntax_error_naming_no_crlf_script_gives_no_hint`, `test_crlf_autotools_inputs_are_found`, `test_a_configure_syntax_error_from_a_crlf_configure_ac_gets_the_hint`, `test_a_build_failing_with_a_syntax_error_in_a_crlf_script_gets_the_hint` (merged).
 - `tests/test_build_capture.py::TestRecordedEvents::test_config_guess_temp_dir_probe_is_dropped` (merged).
 - `tests/test_unit_view.py::test_generated_force_include_resolves_to_its_snapshot_copy` (merged).
 - `tests/test_seed_harvest.py::test_record_wraps_api_functions_the_executable_calls_from_a_shared_library`, `::test_undefined_functions_reads_the_dynamic_symbol_table`, `tests/test_seed_harvest_shared_lib.py::test_recorder_wraps_calls_into_a_shared_library` (merged; the last is Linux-only and skips on the Windows host).
@@ -149,7 +196,7 @@ Tests added:
 
 ## Decisions taken for the user
 
-- Fix 2 and fix 3 are landed live (user's instruction at 02:01); fix 1 stays held.
+- Fix 2 and fix 3 are landed live (user's instruction at 02:01); fix 1 stayed held until the run ended.
 - Overnight, the supervisor answers the session's questions on the user's behalf; each answer is listed here.
 - 02:36, "how to recover the 51 functions skipped for `modbus_t *`": pipeline fix (the session's option 1), not 51 hand-written dispatch cases. The session's diagnosis (constructors with parameters refused) was wrong: the code accepts them, and the name rule is what fails.
 - 02:46, "may I hand-write a dispatch case for `modbus_proxy`?" (the one gap left: two `modbus_t` handles, the documented same-type skip): yes, with three changes to the proposed case. Close the preload end of the `socketpair` before the call, or every short input waits the 0.5 s response timeout. Close the backend end after the call, or each execution leaks a descriptor. Set short response and byte timeouts as a backstop. The three internal entry points (`_modbus_init_common`, `_modbus_receive_msg`, `_error_print`) were exempted by the session with a structural reason (they need `modbus-private.h`; reached through public callers).
@@ -173,9 +220,39 @@ Added by fix 12: `tests/test_fc_compat_contracts.py::test_eacsl_host_headers_def
 - Issue 41, [`../upstream/frama-c/frama-c-libc-ioctl-modem-bits.md`](../upstream/frama-c/frama-c-libc-ioctl-modem-bits.md): `__fc_libc` `<sys/ioctl.h>` lacks the `TIOCM_*` modem bits (34.0~beta and master `95408044f7`). Filed by another session as [#2830](https://git.frama-c.com/pub/frama-c/-/work_items/2830) with [!58](https://git.frama-c.com/pub/frama-c/-/merge_requests/58).
 - [`../upstream/frama-c/frama-c-eacsl-old-term-under-guard.md`](../upstream/frama-c/frama-c-eacsl-old-term-under-guard.md): E-ACSL evaluates `\old(p->f)` at function entry even when `\old(p) == \null ||` makes the clause true, and aborts a valid call. Reproduced on 34.0~beta and 35.0~~dev (`b80fcac`). Not filed: upstream filing is paused.
 
+## Troubleshooting entries
+
+The entries for this run are in these files under [`../troubleshooting/`](../troubleshooting/README.md):
+
+- `phase0-build-and-model.md`: the CRLF hint, the `config.guess` probe unit and the dropped CodeQL trust.
+- `kernel-and-stubs.md`: the missing `TIOCM_*` modem bits.
+- `harnesses-and-seeds.md`: the force-included `config.h`, shared-library seeds, `<lib>_new_<kind>` constructors, lifecycle `rest`, the documented retry mode and the harness-induced crashes.
+- `security-properties.md`: `L5_sanitized_send_msg`.
+- `wp-and-guardrail.md`: the merge, guardrail, scheduler and frame issues of Phase 3.
+- `resources-and-infra.md`: the `check_generated_text` hook on a target's CRLF files.
+
+**36 of these entries are not committed:** 26 in `wp-and-guardrail.md`, 9 in `harnesses-and-seeds.md` and 1 in `resources-and-infra.md`. They exist only in the working tree of this checkout. `wp-and-guardrail.md` also holds entries from other work, and the supervisor commits only its own files, so these three files were left out of this report's commits.
+
+## Recommendations for run-2
+
+1. Rerun `trust.py run` after the last model rebuild, and confirm that `REPORT.md` no longer says `CodeQL: off`.
+2. Fix the placement of `L5_sanitized_send_msg` before proving the callers of `send_msg`.
+3. Add a merge gate that refuses a result which deletes an `assigns` clause or a postcondition.
+4. Size prover budgets to the goal count, or split the goals of large functions such as `modbus_reply` (3372 goals) and `_modbus_receive_msg` (724 goals).
+5. Add `//@ calls` for the backend function pointers, so the indirect calls stop failing the soundness check.
+6. Add a WP strategy or lemma for byte shifts, which block the float helpers.
+7. Have the verifier check the target's documentation before it confirms a hang.
+
+## Not verified
+
+- The effect of the missing CodeQL facts on harness and proof priorities was not measured.
+- How many caller stalls come from `L5_sanitized_send_msg` alone was not measured.
+- Fix 20 was tested with fakes only.
+- Fix 1 was reproduced on fixtures. The run itself did not exercise it, because the session had already worked around the CRLF checkout.
+
 ## Open items
 
-- Fix 1 (CRLF hint) is held on its branch until the run ends.
+- Open pipeline bug: a Phase 0 model rebuild drops the CodeQL trust facts without a warning (issue 21).
 - `_modbus_receive_msg` (724 goals) and `modbus_reply` (3372 goals) each spent the prover's whole 900 s budget on one WP call, which was killed with no verdict. Each got a second agent at 14:18. `prove-modbus_reply-2` ended `blocked:analysis_error` at 14:53 (timeout, second analysis error). `prove-modbus_receive_msg-2` stalled with 50 of 111 properties proven, its breaker came back clean at 15:13, and `negotiate-modbus_receive_msg` came back blocked after two killed WP calls, so a second negotiation started at 15:17. Twelve of the 14 pending prove tasks wait on that negotiation. For run-2, large functions need a budget or a goal-splitting strategy sized to their goal count.
 - The session blamed that blocked negotiation on a poisoned WP cache. The run's `Cache.ml` disproves this: both calls used the same prover and the same 2 s timeout, so replaying the cached timeouts was correct, and a longer timeout would have run the prover again. I corrected its troubleshooting entry. The first negotiation ran out of wall time: its second WP call was capped at 351 s. `negotiate-modbus_receive_msg-2` gave one call 600 s at a 10 s goal timeout and got a full report after about 560 s: 54 proven, 1 under hypotheses and 61 unproven of 116 properties, with `soundness.ok` still false for the indirect calls without `//@ calls`.
 - Open pipeline bug: `prove-modbus_write_register` deleted the function's `assigns` clause and its `\result >= -1` postcondition, reported `all_proven` and was merged at 17:34. The merged contract says nothing about what the function writes. I found no wrong proof, and the ledger credits only the `rte` unit, but the merged status overstates the result. The WP report still says `assigns_vcs_proven: true`.
