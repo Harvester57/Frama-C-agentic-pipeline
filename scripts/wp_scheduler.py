@@ -3899,6 +3899,7 @@ def _complete_agent(agent_id: str) -> dict:
                 if ptask is not None:
                     ptask["partial_contract_merged"] = True
                     ptask["partial_merged_at"] = utc_now()
+                    _keep_merge_notes(ptask, pmerged, out)
                     if pmerged.get("modified_files"):
                         out["rechecks_queued"] = _queue_rechecks_for(
                             state, ptask, f"partial contract of {_key(ptask)} merged from {agent_id}"
@@ -4052,10 +4053,42 @@ def _merge_entry(task: dict) -> dict:
     return entry
 
 
+CONTRACT_REMOVAL_KEYS = ("assigns_removed", "ensures_removed", "behaviors_removed", "completeness_removed")
+
+
+def _merge_notes(merged: dict) -> dict:
+    """
+    What a merge result (workspace_overlay.merge_agent_overlay) says beside `ok`, kept on the task as `merge_notes`
+    so it outlives the call: `contract_changes` when the merged contract lost a clause or could not be compared
+    with the one it replaced, and `frame_state` when WP proved the function without a frame
+    (`assigns_clause` is not `present`).
+    """
+    notes: dict[str, Any] = {}
+    changes = merged.get("contract_changes")
+    if isinstance(changes, dict) and (
+        changes.get("available") is False or any(changes.get(k) for k in CONTRACT_REMOVAL_KEYS)
+    ):
+        notes["contract_changes"] = changes
+    frame = merged.get("frame_state")
+    if isinstance(frame, dict) and frame.get("assigns_clause") != "present":
+        notes["frame_state"] = frame
+    return notes
+
+
+def _keep_merge_notes(task: dict, merged: dict, entry: dict) -> None:
+    notes = _merge_notes(merged)
+    if notes:
+        task["merge_notes"] = notes
+        entry["merge_notes"] = notes
+    else:
+        task.pop("merge_notes", None)  # an earlier merge of this task is no longer the one on the tree
+
+
 def _on_merged(state: dict, task: dict, aid: str, merged: dict, out: dict) -> None:
     rep = merged.get("parent_wp_report") or f"agents/{aid}/scratch/parent_wp/{task['function']}.json"
     rep_path = Path(rep)
     entry: dict[str, Any] = {"task": task["id"], "agent_id": aid}
+    _keep_merge_notes(task, merged, entry)
     if rep_path.is_file():
         _try(out["errors"], f"ingest-wp {rep}", DEPS.ingest_wp, [rep_path])
         # The environment facts the merged proof relies on become assumptions of its units.
