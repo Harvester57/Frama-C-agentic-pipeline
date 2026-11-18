@@ -3599,6 +3599,9 @@ def _collect_reproducible_artifacts(
 # statement (a hypothesis without a line, a failure a runtime reports without one), function and kind
 # stand for it, as hypotheses merge (D1c).
 UNLOCATED_FUNCTION = "unknown_function"
+# How the evidence entry of a counted reproducer whose failure could not be compared starts (ingest-verifier);
+# generate_report.py finds such findings by it.
+IDENTITY_NOT_COMPARED = "Failure identity not compared:"
 
 
 class _FailurePlacer:
@@ -4320,7 +4323,7 @@ def cmd_ingest_verifier(
                         "phase": "fuzz",
                         "tool_output": report if is_safe_relative_path(report) else rec["evidence"][0]["tool_output"],
                         "description": (
-                            f"Failure identity not compared: the parent's replay of {rep['input']} (sha256 "
+                            f"{IDENTITY_NOT_COMPARED} the parent's replay of {rep['input']} (sha256 "
                             f"{rep['sha256']}) failed, but {seen.get('what')} (report {report}). It is not shown to "
                             f"be {wanted}. It counts because the input was recorded on the candidate before "
                             "verification."

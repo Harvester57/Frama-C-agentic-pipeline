@@ -37,6 +37,7 @@ from framac_common import (  # noqa: E402
 )
 from ledger import (  # noqa: E402
     GUARDRAIL_PASSED_STATUS,
+    IDENTITY_NOT_COMPARED,
     INDUCTIVE_LEMMA_GAP,
     PROPERTY_RELOCATED,
     relocated_properties,
@@ -363,7 +364,135 @@ def load_inputs(run_dir: Path) -> dict:
         "mutation": load_json_optional(run_dir / "workspace/reports/mutation.json", None),
         "model": load_json_optional(run_dir / "workspace/reports/phase0_model.json", None),
         "security_props": load_json_optional(run_dir / "workspace/reports/security_props.json", None),
+        "merge_notes": load_merge_notes(run_dir),
     }
+
+
+# Where wp_scheduler.py keeps its tasks; a merged task carries `merge_notes` when its merge was not clean.
+WP_SCHEDULE = Path("state/wp_schedule.json")
+MERGE_NOTE_ROWS_MAX = 40
+MERGE_NOTE_REMOVALS = (
+    ("assigns_removed", "`assigns` removed"),
+    ("ensures_removed", "`ensures` removed"),
+)
+
+
+def load_merge_notes(run_dir: Path) -> list[dict]:
+    """
+    What the merges of the run's provers left to say, one item per task of `state/wp_schedule.json` that
+    carries `merge_notes` (wp_scheduler.py: `contract_changes` when the merged contract lost a clause or
+    could not be compared with the one it replaced, `frame_state` when WP proved the function without a
+    frame, `guardrail` when none passed). Read defensively: the file is the scheduler's own state, and
+    a run without it, or a task without the key, has nothing to list.
+    """
+    try:
+        state = load_json_optional(run_dir / WP_SCHEDULE, None)
+    except ArtifactError:
+        return []
+    tasks = state.get("tasks") if isinstance(state, dict) else None
+    items = tasks.items() if isinstance(tasks, dict) else enumerate(tasks if isinstance(tasks, list) else [])
+    out: list[dict] = []
+    for tid, task in items:
+        notes = task.get("merge_notes") if isinstance(task, dict) else None
+        if isinstance(notes, dict) and notes:
+            out.append(
+                {"task": str(task.get("id") or tid), "function": str(task.get("function") or ""), "notes": notes}
+            )
+    return sorted(out, key=lambda n: (n["function"], n["task"]))
+
+
+def _removed_clauses(items: object) -> str:
+    """`default: ensures a; ensures b | behavior x: ...` for a `{behavior, clauses}` list of a contract change."""
+    parts: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        behavior = str(item.get("behavior") or "")
+        where = "the contract outside named behaviors" if behavior in ("", "default!") else f"behavior `{behavior}`"
+        clauses = [" ".join(str(c).split())[:160] for c in item.get("clauses") or []]
+        parts.append(f"{where}: " + ("; ".join(f"`{md_escape(c)}`" for c in clauses) or "clause text not recorded"))
+    return " | ".join(parts)
+
+
+def merge_notes_lines(notes: list[dict] | None) -> list[str]:
+    """
+    The merges that were accepted but not clean: a merged contract that lost an `ensures`, an `assigns`,
+    a behavior or a completeness clause against the contract it replaced (or could not be compared with
+    it), a function proved without a frame, a merge no guardrail passed for. A proof of a weaker
+    contract is still a proof; the report says what the contract no longer states.
+    """
+    rows: list[str] = []
+    for item in notes or []:
+        said: list[str] = []
+        raw = item.get("notes")
+        note: dict = raw if isinstance(raw, dict) else {}
+        changes = note.get("contract_changes")
+        if isinstance(changes, dict):
+            if changes.get("available") is False:
+                said.append(
+                    "the merged contract could not be compared with the one it replaced "
+                    f"({md_escape(str(changes.get('reason') or 'no reason recorded'))[:200]})"
+                )
+            for key, label in MERGE_NOTE_REMOVALS:
+                if text := _removed_clauses(changes.get(key)):
+                    said.append(f"{label} in {text}")
+            for key, label in (("behaviors_removed", "behaviors removed"), ("completeness_removed", "removed")):
+                gone = [str(x) for x in changes.get(key) or []] if isinstance(changes.get(key), list) else []
+                if gone:
+                    said.append(f"{label}: " + ", ".join(f"`{md_escape(' '.join(g.split())[:120])}`" for g in gone))
+        frame = note.get("frame_state")
+        if isinstance(frame, dict):
+            had = " (the contract it replaced had one)" if frame.get("baseline_had_assigns") else ""
+            said.append(
+                "the WP report of the merge shows no frame for the whole function (`assigns` clause: "
+                f"`{md_escape(str(frame.get('assigns_clause')))}`){had}"
+            )
+        guard = note.get("guardrail")
+        if isinstance(guard, dict):
+            said.append(
+                f"no guardrail pass (`{md_escape(str(guard.get('status')))}`: "
+                f"{md_escape(' '.join(str(guard.get('reason') or 'no reason recorded').split()))[:200]})"
+            )
+        if said:
+            rows.append(f"- `{md_escape(item.get('function') or item.get('task') or '?')}`: " + "; ".join(said) + ".")
+    if not rows:
+        return []
+    out = [
+        f"Merges accepted with a note ({len(rows)}; `merge_notes` of the tasks in `{WP_SCHEDULE.as_posix()}`). "
+        "The proof holds for the contract as merged, which states less than the one it replaced where a clause "
+        "is listed as removed:",
+        "",
+        *rows[:MERGE_NOTE_ROWS_MAX],
+    ]
+    if len(rows) > MERGE_NOTE_ROWS_MAX:
+        out.append(f"- ... and {len(rows) - MERGE_NOTE_ROWS_MAX} more")
+    return [*out, ""]
+
+
+def identity_not_compared(rec: dict) -> list[str]:
+    """
+    The evidence entries of a finding that say the parent's replay of a counted reproducer could not be
+    compared with the candidate's failure (`ledger.py ingest-verifier`, `IDENTITY_NOT_COMPARED`): the
+    input failed, but not on a failure that names a statement.
+    """
+    return [
+        str(e.get("description"))
+        for e in rec.get("evidence") or []
+        if isinstance(e, dict) and str(e.get("description") or "").startswith(IDENTITY_NOT_COMPARED)
+    ]
+
+
+def identity_not_compared_text(rec: dict) -> str | None:
+    """One sentence for a finding with such entries: how many of its reproducers, and what that means."""
+    notes = identity_not_compared(rec)
+    if not notes:
+        return None
+    return (
+        f"for {len(notes)} reproducer(s) the parent's replay failed, but not on a failure that could be compared "
+        "with this finding's (no failure report parsed, or one that names no statement), so the replay does not "
+        "show that the failure is this finding's; they count because the inputs were recorded on the candidate "
+        "before verification (see the evidence in `FINDINGS-DETAIL.md`)"
+    )
 
 
 def load_coverage_reports(run_dir: Path) -> list[dict]:
@@ -1131,6 +1260,17 @@ def render_report(data: dict) -> str:
                 f"| {r['severity']} | {md_escape(r['title'])} | {loc(r, run_dir)} | `{r['reachability']}` | {md_escape(r['reproducers'][0]['observed_result'])[:160]} |"
             )
         out.append("")
+        blind = [r for r in confirmed if identity_not_compared(r)]
+        if blind:
+            out += [
+                f"**{len(blind)} of {len(confirmed)} confirmed finding(s) count a reproducer whose failure identity "
+                "was not compared**: the parent's replay of the input failed, but not on a failure that could be "
+                "compared with the finding's (no failure report parsed, or one that names no statement), so the "
+                "replay does not show that the failure is the finding's. Each is marked below: "
+                + ", ".join(f"`{r['fingerprint']}`" for r in blind)
+                + ".",
+                "",
+            ]
         for r in confirmed:
             related_fps = r.get("_related_fingerprints") or []
             fp_suffix = f" (also merged: {', '.join(f'`{f}`' for f in related_fps)})" if related_fps else ""
@@ -1143,6 +1283,7 @@ def render_report(data: dict) -> str:
                 *([f"- **Decision point:** {dp}"] if (dp := decision_point_text(r)) else []),
                 *([f"- **Earlier verdict:** {pv}"] if (pv := prior_verdict_text(r)) else []),
                 *([f"- **Conflicting verdict:** {cv}"] if (cv := conflict_text(r, by_fp)) else []),
+                *([f"- **Failure identity not compared:** {ni}"] if (ni := identity_not_compared_text(r)) else []),
                 f"- **Reproduce:** `{md_escape(r['reproducers'][0]['command'])}` with `{r['reproducers'][0]['input']}`",
                 f"- **Severity rationale:** {md_escape(r['severity_rationale'])}",
                 f"- **Fix:** {md_escape(r['remediation']['summary'])} (invariant: {md_escape(r['remediation']['invariant'])})",
@@ -1178,6 +1319,7 @@ def render_report(data: dict) -> str:
             out.append(f"- of these, {experimental} unit(s) {WP_EXPERIMENTAL_MODEL_ASSUMPTION}")
         out.append("")
     out += verdict_limits_section(ledger)
+    out += merge_notes_lines(data.get("merge_notes"))
     out += concurrency_lines(ledger)
     out += model_only_lines(ledger)
     if run_dir:
@@ -1290,6 +1432,11 @@ def render_findings_detail(findings: list[dict], run_dir: Path | None = None) ->
             "",
             *([f"**Decision point.** {dp}", ""] if (dp := decision_point_text(r)) else []),
             *([f"**Conflicting verdict.** {cv}", ""] if (cv := conflict_text(r, by_fp)) else []),
+            *(
+                [f"**Failure identity not compared.** {ni[0].upper()}{ni[1:]}.", ""]
+                if (ni := identity_not_compared_text(r))
+                else []
+            ),
             f"**Intended behavior.** {md_escape(r['intended_behavior'])}",
             "",
             "**Trace.**",
