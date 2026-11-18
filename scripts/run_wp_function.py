@@ -821,8 +821,53 @@ _PTR_DIFF_EQ_RE = re.compile(
 _MISSING_ASSIGNS_LINE_RE = re.compile(
     r"(?<![\w./-])([^\s:]+\.[ch]):(\d+):(?:\d+:)?\s*Warning:\s*Missing assigns clause"
 )
+# WP's own word that a function has no frame: `[wp:pedantic-assigns] f.c:12: Warning: No 'assigns' specification
+# for function 'f'. Callers assumptions might be imprecise.` It is printed for the function under proof and for
+# each defined callee in that state, so it is matched by name.
+_NO_ASSIGNS_SPEC_RE = re.compile(r"No 'assigns' specification for function '([^']+)'")
+# One function's section of the `-report` output and its function-level assigns properties: `Assigns nothing`,
+# `Assigns ("f.c", line 3)`, `Assigns for 'b' ...`. `Loop assigns` is the frame of a loop, not of the function.
+_REPORT_SECTION_RE = re.compile(
+    r"^--- Properties of Function '([^'\n]+)'\n-+\n(.*?)(?=^-{20,}\n--- |\Z)", re.MULTILINE | re.DOTALL
+)
+_REPORT_ASSIGNS_RE = re.compile(r"^\[[^\]\n]*\] Assigns\b(?: for '([^']+)')?", re.MULTILINE)
+ASSIGNS_PRESENT = "present"
+ASSIGNS_BEHAVIORS_ONLY = "behaviors_only"
+ASSIGNS_ABSENT = "absent"
+ASSIGNS_UNKNOWN = "unknown"
 _WP_PROVED_GOALS_RE = re.compile(r"^\s*(?:\[wp\]\s*)?Proved goals:\s*(\d+)\s*/\s*(\d+)", re.MULTILINE)
 _WP_TIMEOUT_COUNT_RE = re.compile(r"^(?:\[wp\])?\s*Timeout:\s*(\d+)", re.MULTILINE)
+
+
+def frame_clause_state(log_text: str, fn_name: str) -> dict:
+    """
+    Whether the contract WP proved for `fn_name` has an `assigns` clause, read from Frama-C's own output and
+    never from the source, so a contract on a header prototype or merged from several declarations counts as
+    Frama-C sees it. `assigns_clause` is:
+
+    - `absent`: WP printed `No 'assigns' specification for function '<fn_name>'` and the function's section of
+      the `-report` output lists no assigns property (no contract, or a contract without `assigns`);
+    - `behaviors_only`: WP printed that warning and the report lists `Assigns for '<behavior>'` properties: the
+      named behaviors that have a clause (`assigns_behaviors`) do not cover the function, either because they
+      are not `complete` or because one of the complete behaviors has none;
+    - `present`: no such warning, and the report lists an assigns property of the function (`assigns \\nothing`
+      is one; so are complete behaviors that each have a clause, which WP takes as the function's frame);
+    - `unknown`: neither. WP prints the warning only when it generates goals, and `-report` leaves out a property
+      nothing tried, so a `-wp-prop` run and a log without a report end here.
+
+    `assigns_clause_basis` names the output the answer rests on.
+    """
+    warned = any(m.plugin == "wp" and fn_name in _NO_ASSIGNS_SPEC_RE.findall(m.text) for m in fold_messages(log_text))
+    section = next((m.group(2) for m in _REPORT_SECTION_RE.finditer(log_text or "") if m.group(1) == fn_name), "")
+    listed = [m.group(1) for m in _REPORT_ASSIGNS_RE.finditer(section)]
+    behaviors = sorted({name for name in listed if name})
+    if warned:
+        state, basis = (ASSIGNS_BEHAVIORS_ONLY if behaviors else ASSIGNS_ABSENT), "wp_no_assigns_warning"
+    elif listed:
+        state, basis = ASSIGNS_PRESENT, "property_report"
+    else:
+        state, basis = ASSIGNS_UNKNOWN, None
+    return {"assigns_clause": state, "assigns_clause_basis": basis, "assigns_behaviors": behaviors}
 
 
 def _find_macro_loop_lines(c_file: Path, fn_name: str) -> dict[int, str]:
@@ -972,19 +1017,43 @@ def _loop_dependency_slice_hint(res: dict, facts_dir: Path | None) -> str | None
     return None
 
 
+def _report_field_hints(res: dict) -> list[str]:
+    """Hints read from report fields, not from failed goals: they hold for a proof that stands, too."""
+    hints: list[str] = []
+    frame = res.get("frame_summary") or {}
+    fn = res.get("function") or "the function"
+    if frame.get("assigns_clause") == ASSIGNS_ABSENT:
+        hints.append(
+            f"The contract of {fn} has no 'assigns' clause (WP: \"No 'assigns' specification for function\"): "
+            "nothing was proved about what it writes, so 'assigns_vcs_proven' is false although no goal failed, "
+            "and callers must assume it writes everything. Add an 'assigns' clause ('assigns \\nothing;' for a "
+            "function that writes no caller-visible memory); do not delete one to make a proof pass."
+        )
+    elif frame.get("assigns_clause") == ASSIGNS_BEHAVIORS_ONLY:
+        named = ", ".join(frame.get("assigns_behaviors") or [])
+        hints.append(
+            f"The 'assigns' clauses of {fn} sit only in named behaviors ({named}) that do not cover the function "
+            "(WP: \"No 'assigns' specification for function\"): outside them nothing was proved about what it "
+            "writes, so 'assigns_vcs_proven' is false. Add an 'assigns' clause to the default behavior, or give "
+            "every behavior one and state 'complete behaviors;'."
+        )
+    return hints
+
+
 def derive_wp_diagnostic_hints(
     res: dict, log_text: str = "", facts_dir: Path | None = None, kb_dir: Path | None = None
 ) -> list[str]:
     """
     Generate concise, actionable diagnostic hints for ACSL syntax errors, WP soundness
-    aborts, and unproven goal buckets. Returns [] when status == 'all_proven'.
+    aborts, and unproven goal buckets. When status == 'all_proven', returns only the hints
+    about what that proof does not cover (_report_field_hints), usually [].
     `facts_dir` (default workspace/reports/facts) enables loop dependency-slice hints;
     `kb_dir` (default workspace/reports/kb) enables repair-pattern hints from the
     evolved specification knowledge base (spec_kb).
     """
     status = res.get("status")
     if status == "all_proven":
-        return []
+        return _report_field_hints(res)
 
     hints: list[str] = []
 
@@ -1268,6 +1337,8 @@ def derive_wp_diagnostic_hints(
 
     for repair in spec_kb.repair_hints_for_goals(res, kb_dir or Path("workspace/reports/kb")):
         _add(repair)
+    for field_hint in _report_field_hints(res):
+        _add(field_hint)
 
     return hints
 
@@ -1711,6 +1782,11 @@ def run_wp_on_function(
                         }
                         if prior_report.get("wp_allocation_limitation"):
                             cap_res["wp_allocation_limitation"] = True
+                        # What the last run said about the frame stays said: readers take a missing
+                        # `assigns_vcs_proven` as "not false".
+                        for frame_key in ("assigns_vcs_proven", "frame_summary"):
+                            if frame_key in prior_report:
+                                cap_res[frame_key] = prior_report[frame_key]
                         cap_res["diagnostic_hints"] = derive_wp_diagnostic_hints(
                             cap_res, str(cap_res.get("wp_log_tail") or "")
                         )
@@ -2223,7 +2299,11 @@ def run_wp_on_function(
         and (returncode == 0)
         and soundness["ok"]
     )
-    assigns_vcs_proven = len(buckets["step_a_assigns"]) == 0
+    # A contract without an `assigns` clause has no assigns goal that could fail: zero unproven assigns goals is
+    # then not a proven frame (libmodbus run-1, modbus_write_register). `unknown` keeps the goal count's answer.
+    frame_clause = frame_clause_state(combined_log, fn_name)
+    no_frame = frame_clause["assigns_clause"] in (ASSIGNS_ABSENT, ASSIGNS_BEHAVIORS_ONLY)
+    assigns_vcs_proven = len(buckets["step_a_assigns"]) == 0 and not no_frame
 
     if soundness["tier_a_aborts"]:
         status = "wp_aborted"
@@ -2283,10 +2363,12 @@ def run_wp_on_function(
         "assigns_vcs_proven": assigns_vcs_proven,
         # Frame-error-free breakdown (AutoFraming criterion): a missing/incomplete assigns
         # warning, unproven assigns/loop-assigns goals, or unproven \separated goals all
-        # count against the l3_frame unit even when the overall proof succeeds.
+        # count against the l3_frame unit even when the overall proof succeeds. So does a contract
+        # without an `assigns` clause (frame_clause_state): its proof says nothing about the frame.
         "frame_summary": {
-            "missing_assigns_warning": bool(_MISSING_ASSIGNS_LINE_RE.search(combined_log)),
+            "missing_assigns_warning": bool(_MISSING_ASSIGNS_LINE_RE.search(combined_log)) or no_frame,
             "assigns_vcs_proven": assigns_vcs_proven,
+            **frame_clause,
             "l3_frame_goals": by_class.get("l3_frame", {}),
         },
         "soundness": soundness,

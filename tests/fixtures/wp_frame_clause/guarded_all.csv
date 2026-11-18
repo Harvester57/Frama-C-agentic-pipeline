@@ -1,0 +1,8 @@
+directory	file	line	function	property kind	status	property
+/target/wp_frame_clause/src	frame.c	45	guarded_all	assigns clause	Valid	assigns g;
+/target/wp_frame_clause/src	frame.c	46	guarded_all	postcondition	Valid	g == \old(x)
+/target/wp_frame_clause/src	frame.c	53	guarded_all	postcondition	Valid	\false
+/target/wp_frame_clause/src	frame.c	53	guarded_all	termination clause	Valid	\true
+/target/wp_frame_clause/src	frame.c	53	guarded_all	assigns clause	Valid	assigns \nothing;
+/target/wp_frame_clause/src	frame.c	53	guarded_all	complete behaviors	Valid	complete
+/target/wp_frame_clause/src	frame.c	53	guarded_all	disjoint behaviors	Valid	disjoint

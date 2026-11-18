@@ -1,0 +1,6 @@
+directory	file	line	function	property kind	status	property
+/target/wp_frame_clause/src	frame.c	91	calls_post_only	assigns clause	Unknown	assigns *p;
+/target/wp_frame_clause/src	frame.c	92	calls_post_only	postcondition	Valid	*\old(p) == 1
+/target/wp_frame_clause/src	frame.c	94	calls_post_only	postcondition	Valid	\false
+/target/wp_frame_clause/src	frame.c	94	calls_post_only	termination clause	Valid	\true
+/target/wp_frame_clause/src	frame.c	96	calls_post_only	precondition of post_only	Valid	\valid(p)
