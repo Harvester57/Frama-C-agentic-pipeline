@@ -1563,7 +1563,12 @@ def _negotiate_partial_fixture(
     )
     write_json(
         scratch / "guard_callee.json",
-        {"status": guard, "reach": {"measured": True, "functions": {"callee": guard_reach}, "unreached": []}},
+        {
+            "status": guard,
+            "reach": {"measured": True, "functions": {"callee": guard_reach}, "unreached": []},
+            # E-ACSL generated a check for every clause (tests/test_unchecked_clauses_wiring.py has the other cases).
+            "unchecked_clauses": [],
+        },
     )
     # WP files an RTE goal on a `return` expression under the postcondition bucket: the kind decides.
     goal = {

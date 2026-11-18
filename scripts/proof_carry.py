@@ -48,8 +48,10 @@ from acsl_ast import (  # noqa: E402
     Span,
     check_frame_preserved,
     contract_declaration_spans,
+    declaration_contract_text,
     extract_top_level_acsl_declarations,
     function_contract_text,
+    function_declaration_spans,
     locate_function_span,
     tokenize_c_acsl,
 )
@@ -285,12 +287,17 @@ def _acsl_names(span_text: str, path: str) -> set[str]:
     return names
 
 
-def _acsl_of(span_text: str, path: str) -> str:
+def _contract_of(span_text: str, function: str, path: str) -> str:
+    """
+    The function contract in a declaration span of `function` (its prototype, or its definition with the body),
+    as the merge gate reads it: annotations inside the body are not part of it. A span that cannot be read
+    gives no clause, so it can only make the gate refuse.
+    """
     try:
-        tokens = tokenize_c_acsl(span_text, path=path)
-    except AcslSyntaxError:
+        decls = function_declaration_spans(span_text, function, path=path)
+        return "\n".join(declaration_contract_text(d, path) for d in decls)
+    except AcslError:
         return ""
-    return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
 
 
 def frame_gate_errors(
@@ -299,13 +306,15 @@ def frame_gate_errors(
     """
     The merge gate's frame-preservation errors for this contract (workspace_overlay applies the same check when
     the replay merges it): a contract the gate always rejects is not worth publishing. Fail-open without facts.
+    `spans` are (path, declaration span text) pairs; only the contract in front of each declaration counts.
     """
     import workspace_overlay
 
     skel = workspace_overlay._function_frame_skeleton(overlay, module, file, function)
     if skel is None:
         return []
-    return check_frame_preserved(skel, "\n".join(_acsl_of(text, path) for path, text in spans), path=file)
+    acsl = "\n".join(_contract_of(text, function, path) for path, text in spans)
+    return check_frame_preserved(skel, acsl, path=file)
 
 
 def _referenced_decls(sources: list[tuple[str, str]], names: set[str]) -> list[dict]:
@@ -585,6 +594,19 @@ def _sidecar(overlay: Path, module: str | None) -> dict:
         return {}
 
 
+def carried_guardrail(merge_result: dict) -> dict:
+    """
+    The dual-oracle status of a carried proof, for its `carried` row: the merge result's `guardrail`
+    ({"status": "passed_dynamic_oracle", "report": ...}, or {"status": "not_run", "reason": ...} when the
+    module has no harness sources to build the guardrail from). A merge result that says nothing is
+    `unknown`, never a pass.
+    """
+    guardrail = merge_result.get("guardrail")
+    if isinstance(guardrail, dict) and guardrail.get("status"):
+        return guardrail
+    return {"status": "unknown", "reason": "the merge result names no guardrail status"}
+
+
 def _next_agent_id(run_dir: Path, start: int) -> tuple[str, int]:
     n = start
     while (run_dir / "agents" / f"carry-{n}").exists():
@@ -791,7 +813,16 @@ def replay(
             continue
         summary["reproven"] += 1
         summary["carried"].append(
-            {"file": file, "function": fn, "agent_id": aid, "key": key, "store": entry.store.scope, "units": credited}
+            {
+                "file": file,
+                "function": fn,
+                "agent_id": aid,
+                "key": key,
+                "store": entry.store.scope,
+                "units": credited,
+                # Re-proven by WP; whether the E-ACSL guardrail also ran on the merged tree is said here.
+                "guardrail": carried_guardrail(res),
+            }
         )
     atomic_write_json(run_dir / SUMMARY_REL, summary)
     return summary

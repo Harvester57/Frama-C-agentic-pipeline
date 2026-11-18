@@ -254,6 +254,12 @@ def _save_shard(shard_id: str, report: Path) -> dict:
     return {"saved": True, "shard": shard_id}
 
 
+RECHECK_NO_GUARDRAIL = (
+    "a contract re-check runs WP only: the guardrail of the function's own merge is not repeated for a callee's "
+    "changed contract"
+)
+
+
 def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, module: str | None) -> dict:
     """
     Re-run the parent WP check of one already-merged function on the current workspace/work/ tree
@@ -276,6 +282,11 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
                 extra_sources = workspace_overlay.module_param(pdata.get("modules", {}), mm, module, "wp_extra_sources")
             except Exception:
                 pass
+    kwargs: dict[str, Any] = {}
+    if workspace_overlay._supports_kwarg(workspace_overlay._run_parent_reverify, "guardrail_note"):
+        # A re-check proves the caller again against a changed callee contract, with WP only (`sources=None`).
+        # Its report says so, instead of looking like a proof whose guardrail was never asked for.
+        kwargs["guardrail_note"] = workspace_overlay.guardrail_not_run(RECHECK_NO_GUARDRAIL)
     with run_lock("merge", run_dir):
         ok, reason = workspace_overlay._run_parent_reverify(
             run_dir=run_dir,
@@ -288,6 +299,7 @@ def _default_recheck(run_dir: Path, agent_id: str, file: str, function: str, mod
             sources=None,
             cppflags=cppflags,
             wp_extra_sources=extra_sources,
+            **kwargs,
         )
     return {"ok": ok, "reason": reason, "report": report.relative_to(run_dir).as_posix() if report.is_file() else None}
 
@@ -1248,15 +1260,35 @@ DEFAULT_CONTRACT_CLAUSE = "a function contract with a sound assigns clause"
 
 
 def _callee_frame_clause(ctx: Ctx, cfile: str, cname: str, cmod: str | None) -> str:
-    """The callee's projected frame skeleton (its `assigns` clauses, from the module's facts), else a generic ask."""
+    """
+    The callee's projected frame skeleton (its `assigns` clauses, from the module's facts), else a generic ask.
+
+    The skeleton lists under `unprojected` the writes it could not state as a clause. They are named after
+    the clauses, so that a frame that leaves a write out is not read as the callee's whole frame.
+    """
     try:
         skel = workspace_overlay._function_frame_skeleton(
             Path("workspace"), cmod or ctx.file_module.get(cfile), cfile, cname
         )
     except Exception:  # the clause only guides the negotiator: never block the scheduler on the facts
         skel = None
-    clauses = [str(a["clause"]) for a in (skel or {}).get("assigns") or [] if isinstance(a, dict) and a.get("clause")]
-    return " ".join(clauses) or DEFAULT_CONTRACT_CLAUSE
+    skel = skel if isinstance(skel, dict) else {}
+    clauses = [str(a["clause"]) for a in skel.get("assigns") or [] if isinstance(a, dict) and a.get("clause")]
+    text = " ".join(clauses) or DEFAULT_CONTRACT_CLAUSE
+    writes = []
+    for item in skel.get("unprojected") or []:
+        if not isinstance(item, dict):
+            continue
+        # No line number: it is a line of the facts' file, and the text is the request's identity.
+        what = f"`{item['lval']}`" if item.get("lval") else f"memory reached from `{item.get('root') or '?'}`"
+        if what not in writes:
+            writes.append(what)
+    if writes:
+        text += (
+            f" [INCOMPLETE: the function also writes {', '.join(writes)}, which the facts could not state as a "
+            "clause; its `assigns` must cover these writes too]"
+        )
+    return text
 
 
 def _callee_header(cfile: str) -> str:
@@ -3453,6 +3485,13 @@ def _partial_contract_merge_job(task: dict, aid: str, report: dict | None, ctx: 
         reach = guard_data.get("reach") or {}
         if not reach.get("measured") or int((reach.get("functions") or {}).get(fn) or 0) <= 0:
             return None
+        # Nor does one whose build generated no check for a clause of the function (E-ACSL `Ignoring
+        # annotation`), or that cannot say which clauses it executed: the pass is not about them.
+        unchecked = guard_data.get("unchecked_clauses")
+        if not isinstance(unchecked, list):
+            return None
+        if any(isinstance(c, dict) and c.get("function") == fn for c in unchecked):
+            return None
     elif guard_path.is_file():
         guard_data = load_json_optional(guard_path, {}) or {}
         if isinstance(guard_data, dict) and guard_data.get("status") not in (None, "passed_dynamic_oracle"):
@@ -3772,6 +3811,9 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
     if ing.get("sink_conflicts"):
         # Opposite verdicts at one sink (ledger.py): shown to the parent now, not only in the final report.
         out["sink_conflicts"] = ing["sink_conflicts"]
+    if ing.get("reproducers_not_compared"):
+        # Reproducers the ledger counted although the parent's replay named no failure to compare them with.
+        out["reproducers_not_compared"] = ing["reproducers_not_compared"]
 
 
 def _complete_breaker(state: dict, task: dict, aid: str, res: dict, result_path: Path, out: dict) -> None:
@@ -3899,6 +3941,7 @@ def _complete_agent(agent_id: str) -> dict:
                 if ptask is not None:
                     ptask["partial_contract_merged"] = True
                     ptask["partial_merged_at"] = utc_now()
+                    _keep_merge_notes(ptask, pmerged, out)
                     if pmerged.get("modified_files"):
                         out["rechecks_queued"] = _queue_rechecks_for(
                             state, ptask, f"partial contract of {_key(ptask)} merged from {agent_id}"
@@ -3926,6 +3969,7 @@ def _complete_agent(agent_id: str) -> dict:
             if merged.get("ok"):
                 _finish(state, task, "done", "merged")
                 out.update(action="merged", modified_files=merged.get("modified_files") or [])
+                _keep_merge_notes(task, merged, out)
                 arch_result = Path("agents") / agent_id / "scratch" / "result.json"
                 if arch_result.is_file():
                     out["boundary_assumptions"] = _try(
@@ -4052,10 +4096,45 @@ def _merge_entry(task: dict) -> dict:
     return entry
 
 
+CONTRACT_REMOVAL_KEYS = ("assigns_removed", "ensures_removed", "behaviors_removed", "completeness_removed")
+
+
+def _merge_notes(merged: dict) -> dict:
+    """
+    What a merge result (workspace_overlay.merge_agent_overlay) says beside `ok`, kept on the task as `merge_notes`
+    so it outlives the call: `contract_changes` when the merged contract lost a clause or could not be compared
+    with the one it replaced, `frame_state` when WP proved the function without a frame (`assigns_clause` is
+    not `present`), and `guardrail` when the dual-oracle guardrail did not pass because it did not run.
+    """
+    notes: dict[str, Any] = {}
+    changes = merged.get("contract_changes")
+    if isinstance(changes, dict) and (
+        changes.get("available") is False or any(changes.get(k) for k in CONTRACT_REMOVAL_KEYS)
+    ):
+        notes["contract_changes"] = changes
+    frame = merged.get("frame_state")
+    if isinstance(frame, dict) and frame.get("assigns_clause") != "present":
+        notes["frame_state"] = frame
+    guardrail = merged.get("guardrail")
+    if isinstance(guardrail, dict) and guardrail.get("status") != workspace_overlay.GUARDRAIL_PASSED:
+        notes["guardrail"] = guardrail  # `not_run` with its reason: the merge stands on WP alone
+    return notes
+
+
+def _keep_merge_notes(task: dict, merged: dict, entry: dict) -> None:
+    notes = _merge_notes(merged)
+    if notes:
+        task["merge_notes"] = notes
+        entry["merge_notes"] = notes
+    else:
+        task.pop("merge_notes", None)  # an earlier merge of this task is no longer the one on the tree
+
+
 def _on_merged(state: dict, task: dict, aid: str, merged: dict, out: dict) -> None:
     rep = merged.get("parent_wp_report") or f"agents/{aid}/scratch/parent_wp/{task['function']}.json"
     rep_path = Path(rep)
     entry: dict[str, Any] = {"task": task["id"], "agent_id": aid}
+    _keep_merge_notes(task, merged, entry)
     if rep_path.is_file():
         _try(out["errors"], f"ingest-wp {rep}", DEPS.ingest_wp, [rep_path])
         # The environment facts the merged proof relies on become assumptions of its units.

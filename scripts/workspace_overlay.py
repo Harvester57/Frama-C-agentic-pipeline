@@ -46,25 +46,27 @@ import line_endings  # noqa: E402
 import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
 from acsl_ast import (  # noqa: E402
+    DEFAULT_BEHAVIOR,
     AcslError,
     ConflictingProfileError,
     ScopeViolationError,
     TrustBoundaryError,
     check_conflicting_acsl_profiles,
     check_frame_preserved,
+    compare_function_contracts,
     contract_declaration_spans,
     declaration_contract_text,
     declaration_param_names,
     dedup_acsl_declarations,
     entry_requires_violations,
     extract_top_level_acsl_declarations,
+    function_declaration_spans,
     function_trust_records,
     is_trust_boundary,
     locate_all_definition_spans,
     locate_all_prototype_spans,
     splice_architect_header,
     splice_prover_changes,
-    tokenize_c_acsl,
     verify_acsl_only,
 )
 from fingerprint import normalize_file  # noqa: E402
@@ -1304,6 +1306,8 @@ def _run_parent_reverify(
     allow_partial_wp: bool = False,
     wp_extra_sources: list[str] | None = None,
     reach_functions: list[str] | None = None,
+    baseline_had_assigns: bool | None = None,
+    guardrail_note: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree. `wp_par`
@@ -1312,10 +1316,22 @@ def _run_parent_reverify(
     path fixed per module build, so an unchanged module is restored from the build cache.
     `reach_functions`: functions whose reach a module-wide guardrail (no `function`) measures,
     without narrowing its instrumentation; the report is at `_parent_guard_json(...)`.
+    `baseline_had_assigns`: whether the contract this merge replaces had an `assigns` clause. When it
+    had, a full proof whose WP report says the function has no frame (`frame_summary.assigns_clause`
+    `absent` or `behaviors_only`) is refused; None (a re-check of a merged function) refuses nothing.
+
+    The guardrail runs only with a `module` and its harness `sources`. Without them a prover's WP report
+    gets `limits.guardrail` = {"status": "not_run", "reason": ...} (`guardrail_note` when the caller knows
+    the reason better, e.g. the batch, whose module guardrail is a check of its own); with them, the
+    guardrail's status. A report without `limits.guardrail` was written before this field existed.
     """
     scripts_dir = Path(__file__).resolve().parent
     work_dir = overlay_dir / "work"
     guard_report: dict | None = None
+    guardrail_gap = _guardrail_gap(module, sources)
+    if guardrail_gap and (function or module):
+        # No guardrail runs in this call: a report left by an earlier one must not be read as its result.
+        _parent_guard_json(run_dir, agent_id, function, module).unlink(missing_ok=True)
 
     if role == "prover" and c_file and function:
         # A proof under a memory model that is not evidence is never replayed, so the parent check
@@ -1465,11 +1481,83 @@ def _run_parent_reverify(
                 )
         elif wp_status != "all_proven":
             return False, f"parent WP check on merged tree returned status={wp_status!r}{_wp_report_detail(wp_report)}"
-        if guard_report is not None and _apply_guard_limits(wp_report, function, guard_report):
-            wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
+        else:
+            frame_state = (wp_report.get("frame_summary") or {}).get("assigns_clause")
+            if baseline_had_assigns and frame_state in NO_FRAME_STATES:
+                return False, _no_frame_refusal(function, str(frame_state))
+        if guard_report is not None:
+            _apply_guard_limits(wp_report, function, guard_report)
+        else:
+            # The proof stands on WP alone: the report says so, in a shape no reader can take for a pass.
+            limits = wp_report.get("limits")
+            if not isinstance(limits, dict):
+                limits = wp_report["limits"] = {}
+            limits["guardrail"] = guardrail_note or guardrail_not_run(guardrail_gap or "no guardrail report")
+        wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
         _publish_canonical_wp(run_dir, overlay_dir, wp_json, norm_c, function)
 
     return True, "verified"
+
+
+GUARDRAIL_PASSED = "passed_dynamic_oracle"
+GUARDRAIL_NOT_RUN = "not_run"
+
+
+def guardrail_not_run(reason: str) -> dict:
+    """The `guardrail` value of a merge result or of a WP report's limits when no guardrail ran: never a pass."""
+    return {"status": GUARDRAIL_NOT_RUN, "reason": reason}
+
+
+def _guardrail_gap(module: str | None, sources: list[str] | None) -> str | None:
+    """Why `_run_parent_reverify` cannot run the E-ACSL guardrail with these inputs, or None when it can."""
+    if not module:
+        return "no module was named for the re-check, so there is no harness to build the guardrail from"
+    if not sources:
+        return (
+            f"module {module} has no harness sidecar with sources (workspace/harnesses/harness_*.json), "
+            "so no guardrail binary can be built for it"
+        )
+    return None
+
+
+def _guardrail_outcome(
+    run_dir: Path, agent_id: str, function: str | None, module: str | None, sources: list[str] | None
+) -> dict:
+    """
+    What the guardrail of a parent re-check that succeeded established, for the merge result: its status and
+    report, or `not_run` with the reason. Read from the report `_run_parent_reverify` wrote in this call (it
+    removes an older one when it runs no guardrail), so a missing report is `not_run`, never a pass.
+    """
+    gap = _guardrail_gap(module, sources)
+    if gap:
+        return guardrail_not_run(gap)
+    path = _parent_guard_json(run_dir, agent_id, function, module)
+    report = load_json_optional(path, {}) if path.is_file() else None
+    if not isinstance(report, dict) or not report.get("status"):
+        return guardrail_not_run(
+            f"the parent re-check left no guardrail report at {path.relative_to(run_dir).as_posix()}"
+        )
+    return {"status": report["status"], "report": path.relative_to(run_dir).as_posix()}
+
+
+# `frame_summary.assigns_clause` of a WP report (run_wp_function.frame_clause_state) when nothing was proved
+# about what the function writes.
+NO_FRAME_STATES = ("absent", "behaviors_only")
+
+
+def _no_frame_refusal(function: str | None, frame_state: str) -> str:
+    detail = (
+        "WP found no `assigns` clause for the function"
+        if frame_state == "absent"
+        else "only some named behaviors have an `assigns` clause and they do not cover the function"
+    )
+    return (
+        f"parent WP check on merged tree proved every goal of {function}, but its contract has no frame "
+        f"(frame_summary.assigns_clause={frame_state!r}: {detail}), and the contract it replaces had an `assigns` "
+        "clause. Nothing was proved about what the function writes. Put an `assigns` clause back in the default "
+        "behavior (or one in each behavior of a `complete behaviors` set); when a callee without a usable contract "
+        "makes it unprovable, keep the clause, return the function as not proven and file a strengthening request."
+    )
 
 
 def _parent_guard_json(run_dir: Path, agent_id: str, function: str | None, module: str | None) -> Path:
@@ -1496,11 +1584,15 @@ def _apply_guard_limits(wp_report: dict, function: str, guard_report: dict) -> b
     `dynamic_oracle` {exercised, hits, executed_inputs} from its reach and `guardrail_corpus`
     {total, replayed, sampled, empty}. A pass on an empty corpus replayed no real input, so it is
     recorded as not exercised (an open assumption in the ledger), never as a pass on inputs.
-    Returns whether anything was recorded.
+    `guardrail` {status} says that this guardrail ran (`_run_parent_reverify` writes `not_run` there
+    when none did). `dynamic_oracle` also gets `unchecked_clauses` (list, or None when not known) and,
+    when there are any, `unattributed`. Returns whether anything was recorded (always, since
+    `guardrail` is).
     """
     limits = wp_report.setdefault("limits", {})
+    limits["guardrail"] = {"status": guard_report.get("status")}
     corpus_empty = bool(guard_report.get("corpus_empty"))
-    changed = False
+    changed = True
     if "corpus_total" in guard_report:
         limits["guardrail_corpus"] = {
             "total": guard_report.get("corpus_total"),
@@ -1524,6 +1616,20 @@ def _apply_guard_limits(wp_report: dict, function: str, guard_report: dict) -> b
             "executed_inputs": reach.get("executed_inputs") if isinstance(reach, dict) else None,
         }
         changed = True
+    # What E-ACSL generated no check for (run_eacsl_fuzz.dynamic_oracle_fields): a pass says nothing
+    # about those clauses. `unchecked_clauses` is this function's items; None when the guardrail had no
+    # build report to read them from (not known, which is not "none"). `unattributed` lists the
+    # ignored annotations no function could be read for, whichever function they belong to.
+    oracle = limits.setdefault("dynamic_oracle", {})
+    unchecked = guard_report.get("unchecked_clauses")
+    oracle["unchecked_clauses"] = (
+        [c for c in unchecked if isinstance(c, dict) and c.get("function") == function]
+        if isinstance(unchecked, list)
+        else None
+    )
+    unattributed = guard_report.get("unattributed_ignored_annotations")
+    if isinstance(unattributed, list) and unattributed:
+        oracle["unattributed"] = unattributed
     return changed
 
 
@@ -1660,15 +1766,6 @@ def _function_frame_skeleton(
     return skel if isinstance(skel, dict) else None
 
 
-def _acsl_text_of_span(span) -> str:
-    """The ACSL comment texts inside a function span (its contract and body annotations)."""
-    try:
-        tokens = tokenize_c_acsl(span.text, path=span.function)
-    except AcslError:
-        return ""
-    return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
-
-
 def _frame_contract_files(
     run_dir: Path,
     overlay: Path,
@@ -1692,26 +1789,29 @@ def _frame_contract_files(
 
 def _merged_contract_acsl(shared_work: Path, rels: list[str], new_contents: dict[str, str], function: str) -> str:
     """
-    The ACSL of `function`'s declarations in `rels` as the merge leaves them: the spliced text of a file the
-    agent changed, the shared tree's text of any other. An unchanged file that cannot be read contributes no
-    clause, so it can only make the frame check refuse.
+    The function contract of `function`'s declarations in `rels` as the merge leaves them: the spliced text of
+    a file the agent changed, the shared tree's text of any other. An unchanged file that cannot be read
+    contributes no clause, so it can only make the frame check refuse. Annotations inside the body are not
+    part of the contract: a statement contract there says nothing about what the function writes.
     """
     parts: list[str] = []
     for rel in rels:
         spliced = new_contents.get(rel)
         try:
             text = spliced if spliced is not None else (shared_work / rel).read_text(encoding="utf-8")
-            decls = contract_declaration_spans(text, function, is_header=rel.endswith(".h"), path=rel)
+            # A header may declare the function twice (prototype and `static inline` definition); the
+            # contract can sit on either declaration, so read the contract of every one. Frama-C merges
+            # the contracts and takes the union of their `assigns`, which is what "some clause lists the
+            # location" checks.
+            pieces = [
+                declaration_contract_text(decl, rel)
+                for decl in contract_declaration_spans(text, function, is_header=rel.endswith(".h"), path=rel)
+            ]
         except (AcslError, ValueError, OSError):  # UnicodeDecodeError is a ValueError
             if spliced is not None:
                 raise
             continue
-        # A header may declare the function twice (prototype and `static inline` definition); the
-        # contract can sit on either declaration, so read the ACSL of every one. Frama-C merges the
-        # contracts and takes the union of their `assigns`, which is what "some clause lists the
-        # location" checks.
-        for decl in decls:
-            piece = _acsl_text_of_span(decl.span)
+        for piece in pieces:
             if piece and piece not in parts:
                 parts.append(piece)
     return "\n".join(parts)
@@ -1740,6 +1840,112 @@ def _frame_refusal(
     rels = _frame_contract_files(run_dir, overlay, c_file, function, header_file, module, header_flags, [*new_contents])
     acsl = _merged_contract_acsl(overlay / "work", rels, new_contents, function or "")
     errors = check_frame_preserved(skeleton, acsl, path=c_file or "<work>")
+    return f"{FRAME_REFUSAL}:\n  " + "\n  ".join(errors) if errors else None
+
+
+def _had_contract(texts: dict[str, str], function: str) -> bool | None:
+    """Whether a declaration of `function` in `texts` carries a contract; None when a text cannot be read."""
+    try:
+        return any(
+            declaration_contract_text(decl, rel).strip()
+            for rel, text in texts.items()
+            for decl in function_declaration_spans(text, function, path=rel)
+        )
+    except AcslError:
+        return None
+
+
+def contract_change(shared_work: Path, rels: list[str], new_contents: dict[str, str], function: str) -> dict:
+    """
+    What a prover merge changes in the contract of `function` (the merge result's `contract_changes`): the
+    contract in `rels` on the shared tree against the one the merge leaves there (`new_contents` for the files
+    it changes), compared clause by clause (acsl_ast.compare_function_contracts).
+
+    - `available`, `reason`: whether the two could be compared, and why not;
+    - `had_contract`: the shared tree had a contract for the function (None: its text cannot be read);
+    - `baseline_assigns_in`, `candidate_assigns_in`: the behaviors with an `assigns` clause before and after
+      (`default!` is the contract outside every named behavior);
+    - `assigns_removed`, `ensures_removed`: `{behavior, clauses}` per behavior that lost its `assigns` clause
+      altogether, or some `ensures` clause; `behaviors_removed`, `completeness_removed`: the named behaviors
+      and the `complete` / `disjoint` clauses that are gone.
+
+    An unchanged file that cannot be read is left out of both sides: what it holds is there before and after.
+    """
+    before: dict[str, str] = {}
+    after: dict[str, str] = {}
+    for rel in rels:
+        try:
+            text = (shared_work / rel).read_text(encoding="utf-8")
+        except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+            if rel in new_contents:
+                raise
+            continue
+        before[rel] = text
+        after[rel] = new_contents.get(rel, text)
+    cmp = compare_function_contracts(before, after, function)
+    behaviors = cmp["behaviors"]
+    return {
+        "function": function,
+        "files": list(before),
+        "available": bool(cmp["available"]),
+        "reason": cmp["reason"],
+        "had_contract": bool(cmp["had_contract"]) if cmp["available"] else _had_contract(before, function),
+        "baseline_assigns_in": [n for n, e in behaviors.items() if e["assigns"]["baseline"]],
+        "candidate_assigns_in": [n for n, e in behaviors.items() if e["assigns"]["candidate"]],
+        "assigns_removed": [
+            {"behavior": n, "clauses": [c["text"] for c in behaviors[n]["assigns"]["baseline"]]}
+            for n in cmp["summary"]["assigns_removed_in"]
+        ],
+        "ensures_removed": [
+            {"behavior": n, "clauses": list(behaviors[n]["ensures"]["removed"])}
+            for n in cmp["summary"]["ensures_removed_in"]
+        ],
+        "behaviors_removed": list(cmp["summary"]["behaviors_removed"]),
+        "completeness_removed": list(cmp["completeness"]["removed"]),
+    }
+
+
+def contract_change_errors(change: dict) -> list[str]:
+    """
+    Why the merge refuses the contract change `change` (contract_change), or []. Refused:
+
+    - an `assigns` clause the contract had, in the default behavior or in a named one, with none left in that
+      behavior. A tightened or rewritten clause is not a removal. A named behavior removed as a whole takes
+      its clause with it only when the default behavior of the result has an `assigns` clause, which then
+      frames every case;
+    - a comparison that cannot be made, unless the function is known to have had no contract.
+
+    A removed `ensures` or behavior is not refused: `change` records it for the ledger and the report.
+    """
+    fn = change["function"]
+    if not change["available"]:
+        if change["had_contract"] is False:
+            return []
+        had = "had a contract" if change["had_contract"] else "may have had a contract (its text cannot be read)"
+        return [
+            f"{fn}: its contract before and after the merge cannot be compared ({change['reason']}), and the "
+            f"function {had}. A result that may remove a clause is not merged unchecked: keep every declaration "
+            f"of {fn} and its C text as they are, change ACSL annotations only, and return the result again."
+        ]
+    errors: list[str] = []
+    default_framed = DEFAULT_BEHAVIOR in change["candidate_assigns_in"]
+    for item in change["assigns_removed"]:
+        name = item["behavior"]
+        if name in change["behaviors_removed"] and default_framed:
+            continue
+        where = "its contract" if name == DEFAULT_BEHAVIOR else f"behavior '{name}' of its contract"
+        clauses = ", ".join(f"`assigns {c}`" for c in item["clauses"])
+        errors.append(
+            f"{fn}: the result removes {clauses} from {where} and leaves no `assigns` clause there, so nothing "
+            f"would be proved about what {fn} writes. Keep an `assigns` clause there: it may be tightened or "
+            "rewritten, never deleted. When a callee without a usable contract makes it unprovable, keep the "
+            "clause, return the function as not proven and file a strengthening request for that callee."
+        )
+    return errors
+
+
+def _contract_refusal(change: dict) -> str | None:
+    errors = contract_change_errors(change)
     return f"{FRAME_REFUSAL}:\n  " + "\n  ".join(errors) if errors else None
 
 
@@ -1778,14 +1984,16 @@ def merged_frame_refusal(
     overlay = run_dir / "workspace"
     c_rel = _normalize_work_relpath(c_file)
     skeleton = _function_frame_skeleton(overlay, module, c_rel, function)
-    if skeleton is None:
-        return None
     flags = _module_header_flags(overlay, module, cppflags)
     header = (
         _prover_header(run_dir, overlay / "work", c_rel, function, _normalize_work_relpath(header_file), flags)
         if header_file
         else _changed_prover_header(run_dir, overlay, c_rel, function, module, flags, [*new_contents])
     )
+    rels = _frame_contract_files(run_dir, overlay, c_rel, function, header, module, flags, [*new_contents])
+    refusal = _contract_refusal(contract_change(overlay / "work", rels, new_contents, function))
+    if refusal or skeleton is None:
+        return refusal
     return _frame_refusal(skeleton, run_dir, overlay, c_rel, function, header, module, flags, new_contents)
 
 
@@ -2047,6 +2255,23 @@ def _merge_agent_overlay_locked(
         new_contents[rel_str] = spliced
         texts_before[rel_str] = (agent_text, base_snap_text, baseline_text)
 
+    contract_changes: dict | None = None
+    if role == "prover" and function:
+        # The contract the shared tree holds now against the one this merge leaves: an `assigns` clause may be
+        # tightened or rewritten, never deleted (libmodbus run-1, modbus_write_register).
+        contract_changes = contract_change(
+            shared_work,
+            _frame_contract_files(
+                run_dir, overlay, norm_c_file, function, norm_header_file, module, header_flags, [*new_contents]
+            ),
+            new_contents,
+            function,
+        )
+        contract_refusal = _contract_refusal(contract_changes)
+        if contract_refusal:
+            raise AcslError(contract_refusal)
+    baseline_had_assigns = bool(contract_changes["baseline_assigns_in"]) if contract_changes is not None else None
+
     if frame_skel is not None:
         frame_refusal = _frame_refusal(
             frame_skel, run_dir, overlay, norm_c_file, function, norm_header_file, module, header_flags, new_contents
@@ -2074,6 +2299,14 @@ def _merge_agent_overlay_locked(
 
     patch_stem = function if role == "prover" and function else Path(norm_header_file or "header").stem
     patch_path = artifacts_dir / f"{patch_stem}.patch"
+
+    reverifies = not skip_reverify and verify_hook is None
+    if reverifies and module and not sources:
+        # An API caller that passed no sources (wp_scheduler, the proof-carry replay) gets the module's own, as
+        # merge-agent and the batch do: the guardrail must not be skipped because nobody looked them up.
+        side_sources = merged_sidecar(module_map_for(overlay), module).get("sources")
+        if isinstance(side_sources, list):
+            sources = [str(s) for s in side_sources if isinstance(s, str) and s] or None
 
     if journal:
         _write_merge_journal(run_dir, f"merge-agent:{agent_id}", backups)
@@ -2104,6 +2337,8 @@ def _merge_agent_overlay_locked(
                 reverify_kwargs: dict[str, Any] = {
                     "ldflags": ldflags,
                 }
+                if baseline_had_assigns is not None and _supports_kwarg(_run_parent_reverify, "baseline_had_assigns"):
+                    reverify_kwargs["baseline_had_assigns"] = baseline_had_assigns
                 if wp_extra_sources is not None and _supports_kwarg(_run_parent_reverify, "wp_extra_sources"):
                     reverify_kwargs["wp_extra_sources"] = wp_extra_sources
                 if role == "architect" and norm_header_file:
@@ -2199,10 +2434,37 @@ def _merge_agent_overlay_locked(
         "deduplicated_declarations": deduplicated_declarations,
         "patch_artifact": patch_path.relative_to(run_dir).as_posix(),
     }
+    if contract_changes is not None:
+        result["contract_changes"] = contract_changes
+    # Whether the dual-oracle guardrail ran is part of the result: a merge on WP alone never looks like a pass.
+    if skip_reverify:
+        result["guardrail"] = guardrail_not_run("the caller skipped the parent re-check (skip_reverify)")
+    elif verify_hook is not None:
+        result["guardrail"] = guardrail_not_run("the caller's verify hook replaced the parent re-check")
+    else:
+        result["guardrail"] = _guardrail_outcome(run_dir, agent_id, function, module, sources)
     if role == "prover" and function and not skip_reverify and verify_hook is None:
         # The report to ingest: written for this agent only, so same-named functions never collide.
         result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
+        _note_frame_state(run_dir, result)
     return result
+
+
+def _note_frame_state(run_dir: Path, result: dict) -> None:
+    """
+    Add `frame_state` to a prover's merge result: what its parent WP report says about the function's frame
+    (`assigns_clause`: present | behaviors_only | absent | unknown, and `assigns_vcs_proven`) and whether the
+    contract it replaced had an `assigns` clause. A function merged without a frame is visible here.
+    """
+    report = load_json_optional(run_dir / str(result.get("parent_wp_report") or ""), {})
+    frame = report.get("frame_summary") if isinstance(report, dict) else None
+    if not isinstance(frame, dict) or "assigns_clause" not in frame:
+        return
+    result["frame_state"] = {
+        "assigns_clause": frame.get("assigns_clause"),
+        "assigns_vcs_proven": frame.get("assigns_vcs_proven"),
+        "baseline_had_assigns": bool((result.get("contract_changes") or {}).get("baseline_assigns_in")),
+    }
 
 
 def single_merge_build_inputs(
@@ -2425,6 +2687,9 @@ def _splice_batch(run_dir: Path, overlay: Path, items: list[dict]) -> tuple[list
                 journal=False,
                 wp_extra_sources=item.get("wp_extra_sources"),
             )
+            # For the parent WP check of this item: whether the contract it replaces had an `assigns` clause.
+            changes = res.get("contract_changes")
+            item["baseline_had_assigns"] = bool(changes["baseline_assigns_in"]) if isinstance(changes, dict) else None
             spliced.append((item, res))
         except (OverlayMergeError, AcslError, ScopeViolationError, ArtifactError, UnicodeDecodeError, OSError) as exc:
             failures.append(
@@ -2453,6 +2718,7 @@ def _verify_batch_round(
     if verify_hook is not None:
         failures: list[tuple[list[int], str, bool]] = []
         for i, item in enumerate(items):
+            item["guardrail"] = guardrail_not_run("the caller's verify hook replaced the parent re-check")
             ok, reason = verify_hook(item)
             if not ok:
                 failures.append(([i], reason, False))
@@ -2461,7 +2727,11 @@ def _verify_batch_round(
     checks: list[tuple[list[int], dict]] = []
     modules: dict[tuple[str, tuple[str, ...], str, str], list[int]] = {}
     for i, item in enumerate(items):
-        if item.get("module") and item.get("sources"):
+        # Each item's merge result says whether a guardrail checked it (`guardrail`); a module without
+        # harness sources has none, and its items say so instead of looking like the others.
+        gap = _guardrail_gap(item.get("module"), item.get("sources"))
+        item["guardrail"] = guardrail_not_run(gap or "the batch's module guardrail left no report for this item")
+        if not gap:
             mod_key = (item["module"], tuple(item["sources"]), item["cppflags"], item["ldflags"])
             modules.setdefault(mod_key, []).append(i)
     # The module guardrail measures the reach of the batch's prover functions, as the single
@@ -2508,6 +2778,11 @@ def _verify_batch_round(
             }
             if item.get("wp_extra_sources") is not None:
                 chk_kwargs["wp_extra_sources"] = item["wp_extra_sources"]
+            if item.get("baseline_had_assigns") is not None:
+                chk_kwargs["baseline_had_assigns"] = item["baseline_had_assigns"]
+            # This check runs WP only. The report keeps this note unless the module guardrail of the batch
+            # passes and `_record_batch_reach` writes its result over it.
+            chk_kwargs["guardrail_note"] = item["guardrail"]
             checks.append(
                 (
                     [i],
@@ -2535,8 +2810,9 @@ def _verify_batch_round(
         call_kwargs = dict(kwargs)
         if call_kwargs.get("wp_extra_sources") is None or not _supports_kwarg(_run_parent_reverify, "wp_extra_sources"):
             call_kwargs.pop("wp_extra_sources", None)
-        if "reach_functions" in call_kwargs and not _supports_kwarg(_run_parent_reverify, "reach_functions"):
-            call_kwargs.pop("reach_functions", None)
+        for optional in ("reach_functions", "baseline_had_assigns", "guardrail_note"):
+            if optional in call_kwargs and not _supports_kwarg(_run_parent_reverify, optional):
+                call_kwargs.pop(optional, None)
         try:
             return _run_parent_reverify(run_dir=run_dir, overlay_dir=overlay, wp_par=wp_par, **call_kwargs)
         except TypeError as exc:
@@ -2553,6 +2829,11 @@ def _verify_batch_round(
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
+    for (idxs, kwargs), (ok, _reason) in zip(checks, outcomes, strict=True):
+        if ok and kwargs.get("module") and kwargs.get("sources"):
+            outcome = _guardrail_outcome(run_dir, kwargs["agent_id"], None, kwargs["module"], kwargs["sources"])
+            for i in idxs:
+                items[i]["guardrail"] = outcome
     for ci, prover_idxs in reach_by_check.items():
         if not outcomes[ci][0]:
             continue
@@ -2702,8 +2983,11 @@ def _merge_agent_batch_locked(
 
     merged_results = []
     for item, r in active:
+        # The splice ran without a re-check; the batch's own checks are what this item's guardrail status is.
+        r["guardrail"] = item.get("guardrail") or guardrail_not_run("the batch ran no check for this item")
         if verify_hook is None and item["role"] == "prover" and item.get("function"):
             r["parent_wp_report"] = _parent_wp_report_rel(item["agent_id"], item["function"])
+            _note_frame_state(run_dir, r)
         merged_results.append(r)
 
     for item, batch_reason in deferred:
