@@ -29,7 +29,8 @@
           "properties": {
             "reason": {"type": "string"},
             "submodules": {"$ref": "#/definitions/strings"},
-            "unclustered": {"$ref": "#/definitions/keys"}
+            "unclustered": {"$ref": "#/definitions/keys"},
+            "over_limit": {"$comment": "the sub-modules over the split's thresholds (`over_limit` on each)", "$ref": "#/definitions/strings"}
           },
           "required": ["submodules"]
         },
@@ -66,7 +67,17 @@
         "fuzz_engine_reason": {"type": "string", "minLength": 1},
         "recommended_strategy": {"type": "string"},
         "tier_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
-        "deferred_profiles": {"$ref": "#/definitions/strings"}
+        "deferred_profiles": {"$ref": "#/definitions/strings"},
+        "reach": {"$comment": "how its functions were reached from its anchors: address_flow (the model's schema 6 facts) or call_graph (every edge)", "type": "string", "enum": ["address_flow", "call_graph"]},
+        "over_limit": {"$comment": "why it exceeds the split's thresholds: a single entry point reaching more than one Eva run can take", "type": "string", "minLength": 1},
+        "globals": {"$comment": "address_flow: the global variables its code and their initializers name", "$ref": "#/definitions/strings"},
+        "build_sources": {"$comment": "address_flow: the .c files its builds compile (its functions' and its globals' files)", "$ref": "#/definitions/keys"},
+        "link_stubs": {
+          "$comment": "address_flow: unit symbols those files name and do not define, none reachable from its harness; functions are linked as aborting stubs, globals defined zero-initialized",
+          "type": "object",
+          "properties": {"functions": {"$ref": "#/definitions/keys"}, "globals": {"$ref": "#/definitions/keys"}},
+          "required": ["functions", "globals"]
+        }
       },
       "required": ["unit", "functions"]
     },
@@ -159,6 +170,21 @@
       }
     },
     "tiers": {"type": "object"},
+    "global_variables": {
+      "$comment": "the model's global variables with what their initializers name (dump schema 6), function ids as DAG keys; the unit split's address-flow reach reads them",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "file": {"type": "string"},
+          "static": {"type": "boolean"},
+          "init_functions": {"$ref": "#/definitions/keys"},
+          "init_globals": {"$ref": "#/definitions/strings"}
+        },
+        "required": ["init_functions", "init_globals"]
+      }
+    },
     "unit_split": {"type": "object"},
     "trust": {"type": "object"}
   },

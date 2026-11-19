@@ -147,6 +147,37 @@ def test_functions_and_edges_come_from_the_model(target: Path) -> None:
     assert dag["macro_aliases"] == {"run_api": ["api_run"]}
 
 
+def test_the_address_flow_facts_reach_the_dag_with_dag_keys(target: Path) -> None:
+    """Dump schema 6 facts (docs/plans/unit-split-address-flow.md) as the unit split reads them."""
+    model = _model()
+    for rec in model["functions"].values():
+        rec.update(address_refs=[], global_refs=[])
+    model["functions"]["src/a.c#api_run"].update(address_refs=["src/a.c#cb"], global_refs=["src/b.c#table"])
+    model["edges"][1]["sources"] = ["type-match"]
+    model["edges"].append(
+        {"caller": "src/b.c#api_other", "callee": "src/a.c#cb", "kind": "indirect", "sources": ["callback-arg"]}
+    )
+    model["global_variables"] = {
+        "src/b.c#table": {
+            "name": "table",
+            "file": "src/b.c",
+            "static": False,
+            "units": ["lib"],
+            "init_functions": ["src/a.c#cb", "src/gone.c#missing"],
+            "init_globals": [],
+        }
+    }
+    dag = _dag(target, model)
+    run, other = dag["functions"]["api_run"], dag["functions"]["api_other"]
+    # A type-matched edge is indirect; a callback the code passes to the library is called by it.
+    assert run["indirect_callees"] == ["cb"] and other["indirect_callees"] == []
+    assert run["address_refs"] == ["cb"] and run["global_refs"] == ["src/b.c#table"]
+    assert dag["global_variables"]["src/b.c#table"]["init_functions"] == ["cb"]
+    # A model without the facts gives the DAG none, and the split falls back to the call graph.
+    plain = _dag(target, _model())
+    assert "address_refs" not in plain["functions"]["api_run"] and "global_variables" not in plain
+
+
 def test_header_functions_are_reached_only_from_entry_points(target: Path) -> None:
     dag = _dag(target, _model())
     assert dag["functions"]["hin"]["header"] and dag["functions"]["hin"]["reached"]

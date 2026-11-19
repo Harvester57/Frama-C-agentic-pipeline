@@ -125,6 +125,8 @@
             "additionalProperties": false
           },
           "external_calls": {"$comment": "functions it calls that no unit of its program defines (libc, packages)", "type": "array", "items": {"type": "string"}},
+          "address_refs": {"$comment": "Dump schema 6 (docs/plans/unit-split-address-flow.md): the project functions whose address its body takes (a direct call's callee is none). Absent: not recorded", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
+          "global_refs": {"$comment": "Dump schema 6: the project globals (`global_variables` ids) its body names: read, written or address-taken. Absent: not recorded", "type": "array", "items": {"type": "string"}},
           "call_sites": {
             "$comment": "Dump schema 4 (plan steps M2, M5): each direct call of its body, with the string literals it passes (argument index -> text; bytes outside printable ASCII but CR, LF, tab and NUL read '?'). Absent: not recorded",
             "type": "array",
@@ -217,7 +219,9 @@
           "file": {"type": "string"},
           "static": {"type": "boolean"},
           "type": {"$comment": "the canonical C type (typedefs unrolled, qualifiers dropped)", "type": "string"},
-          "units": {"type": "array", "items": {"type": "string"}}
+          "units": {"type": "array", "items": {"type": "string"}},
+          "init_functions": {"$comment": "Dump schema 6: the project functions whose address its initializer holds", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
+          "init_globals": {"$comment": "Dump schema 6: the project globals its initializer names", "type": "array", "items": {"type": "string"}}
         },
         "required": ["name", "file", "static", "units"],
         "additionalProperties": false

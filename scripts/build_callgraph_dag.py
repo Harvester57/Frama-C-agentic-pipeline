@@ -811,6 +811,29 @@ def missing_model_features(model: dict) -> dict[str, str]:
     return {name: MODEL_FEATURES[name] for name in missing_features(model)}
 
 
+TYPE_MATCH_SOURCES = frozenset({"type-match", "alias"})
+
+
+def _flow_globals(model: dict, key_of: dict[str, str]) -> dict[str, dict]:
+    """
+    The model's global variables with what their initializers name (dump schema 6), function ids as
+    DAG keys: the unit split's address-flow reach reads them (scripts/unit_split.py). Empty for a
+    model without those facts.
+    """
+    out: dict[str, dict] = {}
+    for gid, g in sorted((model.get("global_variables") or {}).items()):
+        if not isinstance(g, dict) or not isinstance(g.get("init_functions"), list):
+            continue
+        out[gid] = {
+            "name": g.get("name"),
+            "file": g.get("file"),
+            "static": bool(g.get("static")),
+            "init_functions": sorted({key_of[f] for f in g["init_functions"] if f in key_of}),
+            "init_globals": sorted(str(x) for x in g.get("init_globals") or []),
+        }
+    return out
+
+
 def model_view(model: dict, capture: dict | None = None, root: str = "", sources: SourceLines | None = None) -> dict:
     """
     The DAG of the Phase 0 model (scripts/phase0_model.py) with path modules as its modules:
@@ -880,10 +903,16 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             flags_of.setdefault(f, flags)
 
     succ: dict[str, set[str]] = defaultdict(set)
+    # Callees reached only through an indirect site's type match (Alias-narrowed or not): the unit
+    # split's address-flow reach follows them only when their address flows in (scripts/unit_split.py).
+    # A callback passed to the library (`callback-arg`, `thread-spawn`) is called by it: like a call.
+    called: dict[str, set[str]] = defaultdict(set)
     for e in model.get("edges") or []:
         caller, callee = key_of.get(e.get("caller")), key_of.get(e.get("callee"))
         if caller and callee:
             succ[caller].add(callee)
+            if e.get("kind") != "indirect" or set(e.get("sources") or []) - TYPE_MATCH_SOURCES:
+                called[caller].add(callee)
     site_exprs: dict[str, list[str]] = defaultdict(list)
     for site in model.get("indirect_sites") or []:
         expr = str(site.get("expr") or "")
@@ -926,6 +955,11 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
                 # No unit compiling it parses: Eva and WP cannot run on it (unit_view decides by the
                 # function's home unit instead).
                 rec["eva_wp_blocked"] = fallback_blocked_reason(errors[0])
+        if isinstance(m.get("address_refs"), list):
+            # Address flow (dump schema 6): what the unit split's reach reads.
+            rec["indirect_callees"] = sorted(succ[key] - called[key] - {key})
+            rec["address_refs"] = sorted({key_of[f] for f in m["address_refs"] if f in key_of})
+            rec["global_refs"] = sorted(str(g) for g in m.get("global_refs") or [])
         if m.get("cyclomatic") is not None:
             rec["cyclomatic"] = m["cyclomatic"]
         if isinstance(m.get("trust"), dict):
@@ -1003,6 +1037,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             ),
         ],
         **({"model_only_functions": dict(sorted(model_only_by_file.items()))} if model_only_by_file else {}),
+        **({"global_variables": flow_globals} if (flow_globals := _flow_globals(model, key_of)) else {}),
         "modules": _path_module_records(functions, file_module, flags_of, compiled),
         "waves": [{"wave": i, "count": len(w), "functions": w} for i, w in enumerate(waves)],
         "recursion_cycles": cycles,

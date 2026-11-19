@@ -94,6 +94,44 @@ def test_same_named_statics_stay_apart_and_calls_resolve_to_the_file_local_one()
 
 
 @pytest.mark.unit
+def test_dump_schema_6_address_flow_becomes_ids_resolved_across_parses():
+    """docs/plans/unit-split-address-flow.md: who takes which address, and what globals name."""
+    b = _builder(LIB_EXE)
+    reg = _fn("register_0", "register", "src/lexer.c", 1, static=True)
+    reg.update(address_refs=["on_key", "fopen"], global_refs=["handlers", "errno"])
+    b.add_dump(
+        ["libkv.a"],
+        {
+            "schema": 6,
+            "functions": [reg, _fn("on_key", "on_key", "src/emit.c", 3)],
+            "globals": [
+                {"name": "handlers", "kernel_name": "handlers", "loc": "src/emit.c:9", "static": False,
+                 "type": "int (*[2])(int)", "init_functions": ["on_key"], "init_globals": ["defaults"]},
+                {"name": "defaults", "kernel_name": "defaults", "loc": "src/emit.c:8", "static": False,
+                 "type": "int", "init_functions": [], "init_globals": []},
+            ],
+        },
+    )  # fmt: skip
+    main = _fn("main", "main", "tools/main.c", 5)
+    main.update(address_refs=[], global_refs=["handlers"])  # an `extern` the parse only declares
+    b.add_dump(["kvfmt"], {"schema": 6, "functions": [main], "globals": []})
+    b.resolve()
+    f = b.functions
+    assert f["src/lexer.c#register"]["address_refs"] == ["src/emit.c#on_key"]  # fopen: libc
+    assert f["src/lexer.c#register"]["global_refs"] == ["src/emit.c#handlers"]  # errno: libc
+    assert f["tools/main.c#main"]["global_refs"] == ["src/emit.c#handlers"]
+    g = b.global_vars["src/emit.c#handlers"]
+    assert g["init_functions"] == ["src/emit.c#on_key"] and g["init_globals"] == ["src/emit.c#defaults"]
+    assert pm.model_features({"functions": f})["address_flow"]
+    # A dump before schema 6 records none of it, and the feature is missing.
+    old = _builder(LIB_EXE)
+    old.add_dump(["libkv.a"], {"functions": [reg]})
+    old.resolve()
+    assert "address_refs" not in old.functions["src/lexer.c#register"]
+    assert "address_flow" in pm.missing_features({"schema_version": 2, "functions": old.functions})
+
+
+@pytest.mark.unit
 def test_a_library_call_to_a_function_its_consumer_defines_resolves_there():
     b = _builder(LIB_EXE)
     b.add_dump(["libkv.a"], {"functions": [_fn("kv_next", "kv_next", "src/lexer.c", 1, [_call("user_hook")])]})

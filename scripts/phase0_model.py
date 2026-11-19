@@ -71,8 +71,11 @@ Version 2 of the model (`schema_version`) records `external_calls`, `kernel_name
 and `param_sizes` on its functions; (S2 of docs/plans/templates-and-stubs-improvement-plan.md) each external's
 first declaration and C text under `external_decls`, from which scripts/stub_gen.py writes the stub skeletons
 (a model without it gets no skeletons); and, from dump schema 4 on, the parsed functions' `call_sites`
-(each direct call with its string-literal arguments). Consumers ask `model_features(model)` which of these a
-model has, so a version 1 model is recognized the same way everywhere.
+(each direct call with its string-literal arguments); from dump schema 6 on, the address flow the unit split
+reads (scripts/unit_split.py): the parsed functions' `address_refs` (functions whose address the body takes)
+and `global_refs` (globals it names), and the `init_functions` and `init_globals` each global's initializer
+names. Consumers ask `model_features(model)` which of these a model has, so a version 1 model is recognized
+the same way everywhere.
 
 `selftest` compiles the dump module and checks it on a two-file program (a static collision, a
 callback, an indirect call); the image build runs it, so a kernel upgrade that breaks the dump fails
@@ -157,6 +160,8 @@ _SELFTEST_FILES = {
         "int run_a(int x) { return apply(twice, helper(x)); }\n"
         "int counter;\n"
         "void fill(int *p, int n) { for (int i = 0; i < n; i++) p[i] = 0; counter++; }\n"
+        "int (*table[1])(int) = { twice };\n"
+        "int use_table(int x) { return table[0](x); }\n"
     ),
     "b.c": (
         "static int helper(int x) { return x - 1; }\n"
@@ -185,6 +190,9 @@ MODEL_FEATURES: dict[str, str] = {
     "from defaults",
     "call_sites": "no call sites with their string-literal arguments (dump before schema 4): no sink argument "
     "is decided from the model (L5 text on a literal, L5 format strings), every one is left to WP",
+    "address_flow": "no address-flow facts (dump before schema 6): the unit split follows every type-matched "
+    "indirect call (scripts/unit_split.py), which can fold a callback-heavy unit into one cluster, and its "
+    "clusters build with the unit's whole source list",
 }
 
 
@@ -214,6 +222,8 @@ def model_features(model: dict | None) -> dict[str, bool]:
         "param_sizes": current or any("param_sizes" in f for f in fns),
         # Not implied by the version: dump schema 4 adds it to a version 2 model.
         "call_sites": any("call_sites" in f for f in parsed),
+        # Nor this one: dump schema 6.
+        "address_flow": any("address_refs" in f for f in parsed),
     }
 
 
@@ -759,6 +769,9 @@ class ModelBuilder:
         self.declared_info: dict[str, dict] = {}
         # Callee id -> (caller id, call location, argument index, bytes): what the callers pass.
         self.arg_sites: dict[str, set[tuple[str, str, str, int]]] = defaultdict(set)
+        # Address flow (dump schema 6), resolved in `resolve`: (function or global id, its record, the
+        # kernel names of the functions and globals it names, that parse's function and global maps).
+        self.pending_refs: list[tuple[dict, list[str], list[str], dict[str, str], dict[str, str], str, str]] = []
 
     def _record_arg_sizes(self, caller: str, callee: str, call: dict) -> None:
         sizes = call.get("arg_sizes")
@@ -838,13 +851,17 @@ class ModelBuilder:
                 )
                 if not fn.get("static"):
                     self.globals[u].setdefault(fn["name"], fid)
+        gmap: dict[str, str] = {}  # kernel name -> `file#name` of this parse's defined globals
+        flow = int(dump.get("schema") or 0) >= 6
         for g in dump.get("globals") or []:
             gloc = parse_location(g.get("loc", ""))
             grel = tree_rel(gloc[0], self.tree) if gloc else None
             # `__fc_*`: Frama-C's own globals (string literals), not the project's.
             if grel is not None and g.get("name") and not str(g["name"]).startswith("__fc_"):
+                gid = f"{grel}#{g['name']}"
+                gmap[str(g.get("kernel_name") or g["name"])] = gid
                 rec = self.global_vars.setdefault(
-                    f"{grel}#{g['name']}",
+                    gid,
                     {
                         "name": g["name"],
                         "file": grel,
@@ -854,6 +871,20 @@ class ModelBuilder:
                     },
                 )
                 rec["units"] = sorted(set(rec["units"]) | set(units))
+                if flow:
+                    rec.setdefault("init_functions", [])
+                    rec.setdefault("init_globals", [])
+                    refs = (list(g.get("init_functions") or []), list(g.get("init_globals") or []))
+                    self.pending_refs.append((rec, *refs, kmap, gmap, "init_functions", "init_globals"))
+        if flow:
+            for fn in dump.get("functions") or []:
+                ref_fid = kmap.get(fn["kernel_name"])
+                if ref_fid is not None:
+                    rec = self.functions[ref_fid]
+                    rec.setdefault("address_refs", [])
+                    rec.setdefault("global_refs", [])
+                    refs = (list(fn.get("address_refs") or []), list(fn.get("global_refs") or []))
+                    self.pending_refs.append((rec, *refs, kmap, gmap, "address_refs", "global_refs"))
         for d in dump.get("declared") or []:
             if d.get("name") and d.get("formals") is not None:
                 self.declared_formals.setdefault(d["name"], d["formals"])
@@ -948,7 +979,31 @@ class ModelBuilder:
                 return self.globals[other][name]
         return None
 
+    def resolve_refs(self) -> None:
+        """
+        The address-flow facts (dump schema 6) as ids: a function's address its parse defines, a
+        global its parse defines, else the one non-static global of that name another parse defines
+        (an `extern` the parse only declares). Libc functions and globals are not the project's.
+        """
+        by_name: dict[str, list[str]] = defaultdict(list)
+        for global_id, g in self.global_vars.items():
+            if not g.get("static"):
+                by_name[str(g["name"])].append(global_id)
+        for rec, fnames, gnames, kmap, gmap, fkey, gkey in self.pending_refs:
+            fids = {kmap[k] for k in fnames if k in kmap}
+            gids: set[str] = set()
+            for k in gnames:
+                found = gmap.get(k)
+                if found is None and len(by_name.get(k, [])) == 1:
+                    found = by_name[k][0]
+                if found is not None:
+                    gids.add(found)
+            rec[fkey] = sorted(set(rec.get(fkey) or []) | fids)
+            rec[gkey] = sorted(set(rec.get(gkey) or []) | gids)
+        self.pending_refs = []
+
     def resolve(self) -> None:
+        self.resolve_refs()
         for unit, caller, call in self.pending_calls:
             name = call.get("name") or ""
             own = self.globals.get(unit, {}).get(name) if call.get("gcc") else None
@@ -1307,7 +1362,16 @@ def selftest(runner: Runner | None = None) -> dict:
         )
         builder.add_dump(["selftest"], res["dump"])
         builder.resolve()
-    want_fns = {"a.c#helper", "b.c#helper", "a.c#twice", "a.c#apply", "a.c#run_a", "b.c#run_b", "a.c#fill"}
+    want_fns = {
+        "a.c#helper",
+        "b.c#helper",
+        "a.c#twice",
+        "a.c#apply",
+        "a.c#run_a",
+        "b.c#run_b",
+        "a.c#fill",
+        "a.c#use_table",
+    }
     edges = {(a, b, k) for (a, b, k) in builder.edges}
     want_edges = {
         ("a.c#run_a", "a.c#helper", "direct"),
@@ -1327,6 +1391,22 @@ def selftest(runner: Runner | None = None) -> dict:
         problems.append(f"fill writes {writes}")
     if "a.c#counter" not in builder.global_vars:
         problems.append(f"globals {sorted(builder.global_vars)}")
+    # Address flow (dump schema 6): `run_a` takes `twice`'s address, `table`'s initializer names it,
+    # `use_table` reads `table` and `fill` writes `counter`.
+    flow = {
+        "run_a address_refs": (builder.functions.get("a.c#run_a") or {}).get("address_refs"),
+        "use_table global_refs": (builder.functions.get("a.c#use_table") or {}).get("global_refs"),
+        "fill global_refs": (builder.functions.get("a.c#fill") or {}).get("global_refs"),
+        "table init_functions": (builder.global_vars.get("a.c#table") or {}).get("init_functions"),
+    }
+    want_flow = {
+        "run_a address_refs": ["a.c#twice"],
+        "use_table global_refs": ["a.c#table"],
+        "fill global_refs": ["a.c#counter"],
+        "table init_functions": ["a.c#twice"],
+    }
+    if flow != want_flow:
+        problems.append(f"address flow {flow}")
     return {"ok": not problems, "status": "ok" if not problems else "unexpected_dump", "reason": "; ".join(problems)}
 
 

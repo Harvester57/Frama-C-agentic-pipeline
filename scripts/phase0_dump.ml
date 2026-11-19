@@ -9,7 +9,11 @@
      callbacks, the string literals passed: schema 4, and whether the call is the initializer of a
      local: schema 5) and its indirect call sites, with the called signature;
    - every function whose address is taken (in code or in a global initializer): the only possible
-     targets of an indirect call.
+     targets of an indirect call;
+   - where addresses flow from (schema 6, the unit split's address-flow reach,
+     docs/plans/unit-split-address-flow.md): per function body, the functions whose address it
+     takes (`address_refs`) and the globals it names (`global_refs`); per defined global, the
+     functions and globals its initializer names (`init_functions`, `init_globals`). Kernel names.
 
    Locations stay raw strings (Fclib.Fileloc.pretty), parsed by phase0_model.py; line spans are
    source lines (Fclib.Filepos.line), not lines of the preprocessed file. *)
@@ -92,6 +96,30 @@ class addr_scan = object
        Hashtbl.replace address_taken v.vname ()
      | _ -> ());
     Cil.DoChildren
+end
+
+(* Where function addresses flow from (schema 6): the functions whose address an expression takes,
+   and the globals it names (read, written or address-taken; never a string literal, a global since
+   Frama-C 32). A direct call's callee is no address. Kernel names. *)
+type refs = { mutable faddr : string list; mutable gvars : string list }
+
+let new_refs () = { faddr = []; gvars = [] }
+
+let note_expr (r : refs) (e : exp) =
+  match e.enode with
+  | AddrOf (Var v, NoOffset) | StartOf (Var v, NoOffset) when is_fun_var v ->
+    if not (List.mem v.vname r.faddr) then r.faddr <- v.vname :: r.faddr
+  | _ -> ()
+
+let note_var (r : refs) (v : varinfo) =
+  if v.vglob && (not (is_fun_var v)) && (not (Ast_info.is_string_literal v)) && not (List.mem v.vname r.gvars)
+  then r.gvars <- v.vname :: r.gvars
+
+(* The same for a global's initializer. *)
+class ref_scan (r : refs) = object
+  inherit Visitor.frama_c_inplace
+  method! vexpr e = note_expr r e; Cil.DoChildren
+  method! vvrbl v = note_var r v; Cil.DoChildren
 end
 
 (* The variable a pointer expression is based on (`p`, `p + i`, `(char * )p`), if any. *)
@@ -200,10 +228,14 @@ let literal_args args =
              match lit with Some s -> [ (string_of_int i, S s) ] | None -> [])
           args))
 
-(* Calls, loops, decisions, writes and the last line of a function body, in one pass. *)
-class body_scan (calls : json list ref) (loops : int ref) (decisions : int ref) (last : int ref) (w : writes) =
+(* Calls, loops, decisions, writes, address and global references and the last line of a function
+   body, in one pass. *)
+class body_scan (calls : json list ref) (loops : int ref) (decisions : int ref) (last : int ref) (w : writes)
+    (r : refs) =
 object
   inherit Visitor.frama_c_inplace
+  method! vexpr e = note_expr r e; Cil.DoChildren
+  method! vvrbl v = note_var r v; Cil.DoChildren
   method! vstmt s =
     let _, l = lines (Cil_datatype.Stmt.loc s) in
     if l > !last then last := l;
@@ -264,7 +296,8 @@ let function_json kf =
   let first, def_last = lines def_loc in
   let calls = ref [] and loops = ref 0 and decisions = ref 0 and last = ref def_last in
   let w = { pointer = 0; params = []; globals = [] } in
-  ignore (Visitor.visitFramacFunction (new body_scan calls loops decisions last w) f);
+  let r = new_refs () in
+  ignore (Visitor.visitFramacFunction (new body_scan calls loops decisions last w r) f);
   let names l = L (List.map (fun s -> S s) (List.sort compare l)) in
   O
     [ ("kernel_name", S vi.vname);
@@ -279,6 +312,8 @@ let function_json kf =
       ("cyclomatic", I (1 + !decisions));
       ("formals", formals_json kf);
       ("writes", O [ ("pointer", I w.pointer); ("params", names w.params); ("globals", names w.globals) ]);
+      ("address_refs", names r.faddr);
+      ("global_refs", names r.gvars);
       ("calls", L (List.rev !calls)) ]
 
 let run () =
@@ -299,19 +334,25 @@ let run () =
                 ("formals", formals_json kf); ("decl", S (loc_s vi.vdecl)); ("proto", S (one_line Printer.pp_vdecl vi)) ]
             :: !declared);
     let taken = Hashtbl.fold (fun k () acc -> S k :: acc) address_taken [] in
-    (* Defined global variables, where the security properties that name them are anchored (I9). *)
+    (* Defined global variables, where the security properties that name them are anchored (I9), and
+       what their initializers name (schema 6). *)
+    let names l = L (List.map (fun s -> S s) (List.sort compare l)) in
     let globals =
       List.filter_map
         (function
-          | GVar (vi, _, loc) when not (is_fun_var vi) ->
+          | GVar (vi, _, loc) as g when not (is_fun_var vi) ->
+            let r = new_refs () in
+            ignore (Visitor.visitFramacGlobal (new ref_scan r) g);
+            let gvars = List.filter (fun n -> n <> vi.vname) r.gvars in
             Some
-              (O [ ("name", S vi.vorig_name); ("loc", S (loc_s loc)); ("static", B (vi.vstorage = Static));
-                   ("type", S (canon vi.vtype)) ])
+              (O [ ("name", S vi.vorig_name); ("kernel_name", S vi.vname); ("loc", S (loc_s loc));
+                   ("static", B (vi.vstorage = Static)); ("type", S (canon vi.vtype));
+                   ("init_functions", names r.faddr); ("init_globals", names gvars) ])
           | _ -> None)
         (Ast.get ()).globals
     in
     let doc =
-      O [ ("schema", I 5); ("functions", L (List.rev !functions)); ("declared", L !declared);
+      O [ ("schema", I 6); ("functions", L (List.rev !functions)); ("declared", L !declared);
           ("address_taken", L taken); ("globals", L globals) ]
     in
     let b = Buffer.create 65536 in
