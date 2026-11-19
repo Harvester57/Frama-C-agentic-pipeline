@@ -1128,7 +1128,7 @@ def build_model(
             if g["status"] == "failed":
                 model["warnings"].append(
                     f"{', '.join(job['units'])}: Frama-C cannot parse ({res['error']}) and the GCC fallback "
-                    f"failed too ({(g['errors'] or ['no error recorded'])[0]}): unparsed, no function or edge of it"
+                    f"failed too ({(g['errors'] or ['no error recorded'])[0]}): unparsed, its parse contributes no function or edge"
                 )
             else:
                 model["warnings"].append(

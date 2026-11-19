@@ -991,8 +991,8 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             *(
                 f"unit {u}: Frama-C could not parse it, its call graph comes from GCC (-fcallgraph-info): {err}"
                 if u not in unparsed
-                else f"unit {u}: neither Frama-C nor the GCC fallback parsed it, so the model has no function "
-                f"of it: {err}; GCC: {(units[u].get('parse') or {}).get('gcc_error') or 'no error recorded'}"
+                else f"unit {u}: neither Frama-C nor the GCC fallback parsed it, so its own parse contributed no "
+                f"function or edge: {err}; GCC: {(units[u].get('parse') or {}).get('gcc_error') or 'no error recorded'}"
                 for u, err in sorted(fallback_error.items())
             ),
             *(

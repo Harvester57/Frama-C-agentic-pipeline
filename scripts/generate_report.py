@@ -706,8 +706,8 @@ def fallback_lines(model: dict | None, ledger: list[dict]) -> list[str]:
     out = ["### Phase 0 parse", ""]
     if unparsed:
         out += [
-            "Link units neither Frama-C nor the GCC fallback could parse: the model has no function of them, "
-            "so nothing in them was fuzzed or analysed.",
+            "Link units neither Frama-C nor the GCC fallback could parse: their own parse contributed no "
+            "function or call edge to the model, so code only they compile was neither fuzzed nor analysed.",
             "",
             "| Unit | First Frama-C error | First GCC error |",
             "| :--- | :--- | :--- |",

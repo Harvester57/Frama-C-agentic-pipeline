@@ -226,7 +226,7 @@ def test_an_unparsed_unit_is_blocked_and_reported_without_claiming_a_gcc_call_gr
     assert "probe" not in dag["modules"]
     warnings = [w for w in dag["warnings"] if w.startswith("unit probe:")]
     assert len(warnings) == 1, warnings
-    assert "neither Frama-C nor the GCC fallback" in warnings[0] and "no function" in warnings[0]
+    assert "neither Frama-C nor the GCC fallback" in warnings[0] and "no function or edge" in warnings[0]
     assert "no such file" in warnings[0] and "cc1: fatal error" in warnings[0]
     assert "comes from GCC" not in warnings[0]
     # A function of the unparsed unit's file that another unit parsed is blocked in its module all the same.
