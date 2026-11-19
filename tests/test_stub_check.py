@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -420,6 +421,195 @@ def test_errno_in_a_stub_contract_against_eva_and_eacsl(tmp_path, assigns, eva, 
 
 
 # ---------------------------------------------------------------------------
+# The include context: macros the target defines before it includes the header (nginx run-3, 2026-11-19)
+# ---------------------------------------------------------------------------
+# pcre2.h `#error`s unless PCRE2_CODE_UNIT_WIDTH is defined, and the value picks the function names
+# (pcre2_compile_8). nginx defines it in src/core/ngx_regex.h before `#include <pcre2.h>`; the three probes
+# included the header bare and failed, which blocked every nginx module. `fixlib.h` stands for pcre2.h.
+
+FIX_HDR = "workspace/stubs/fix/fixlib.h"
+FIX_LOGS = "workspace/reports/stub_check/fix__fixlib.h"
+FIX_PROTO = "size_t fix_len_8(unsigned char const *s, size_t n)"
+FIX_REAL_TEXT = """#ifndef FIXLIB_H
+#define FIXLIB_H
+#include <stddef.h>
+#ifndef FIX_CODE_UNIT_WIDTH
+#error FIX_CODE_UNIT_WIDTH must be defined before including fixlib.h.
+#endif
+#define FIX_GLUE_(a, b) a##_##b
+#define FIX_GLUE(a, b) FIX_GLUE_(a, b)
+#define fix_len FIX_GLUE(fix_len, FIX_CODE_UNIT_WIDTH)
+size_t fix_len(const unsigned char *s, size_t n);
+#endif
+"""
+FIX_LIB_SOURCE = """#include <stddef.h>
+size_t fix_len_8(const unsigned char *s, size_t n) { size_t i = 0; while (i < n && s[i]) i++; return i; }
+"""
+FIX_OVERLAY_BLOCK = """
+/* fc-stub: fix_len_8 */
+/*@
+  requires valid_s: n > 0 ==> \\valid_read(s + (0 .. n - 1));
+  assigns \\result \\from s[0 .. n - 1], n;
+  ensures bounded: \\result <= n;
+*/
+extern size_t fix_len_8(unsigned char const *s, size_t n);
+"""
+# Where the target sets the width: its own header (as nginx does), or its compile line.
+FIX_CASES: dict[str, dict[str, Any]] = {
+    "source": {
+        "flags": ["-I", "src"],
+        "use_h": "#define USE_UNRELATED 1\n#define USE_WIDTH 8\n#define FIX_CODE_UNIT_WIDTH USE_WIDTH\n",
+        "context": ["#define FIX_CODE_UNIT_WIDTH USE_WIDTH", "#define USE_WIDTH 8"],
+    },
+    "command_line": {
+        "flags": ["-I", "src", "-DFIX_CODE_UNIT_WIDTH=8", "-DUSE_UNRELATED=1"],
+        "use_h": "#define USE_ALSO_UNRELATED 2\n",
+        "context": ["#define FIX_CODE_UNIT_WIDTH 8"],
+    },
+}
+FIX_USE_C = '#include "use.h"\n#include <fix/fixlib.h>\nsize_t use(const unsigned char *s, size_t n) { return fix_len(s, n); }\n'
+
+
+def _fix_run(run: Path, case: str, snap_in: str, work_in: str) -> None:
+    """A run directory whose target calls fixlib (snapshot, work tree, capture, model, DAG, filled overlay)."""
+    import stub_gen
+
+    spec = FIX_CASES[case]
+    snap = run / "workspace" / "snapshot"
+    (snap / "root" / "usr" / "include" / "fix").mkdir(parents=True)
+    (snap / "root" / "usr" / "lib").mkdir(parents=True)
+    (snap / "root" / "usr" / "include" / "fix" / "fixlib.h").write_text(FIX_REAL_TEXT, encoding="utf-8", newline="\n")
+    write_json(snap / "manifest.json", {"digest": "test", "files": {"/usr/include/fix/fixlib.h": "x",
+                                                                     "/usr/lib/libfix.so": "x"}})  # fmt: skip
+    (run / "fixlib.c").write_text(FIX_LIB_SOURCE, encoding="utf-8", newline="\n")
+    src = run / "workspace" / "work" / "src"
+    src.mkdir(parents=True)
+    (src / "use.h").write_text(spec["use_h"], encoding="utf-8", newline="\n")
+    (src / "use.c").write_text(FIX_USE_C, encoding="utf-8", newline="\n")
+    overlay = run / FIX_HDR
+    overlay.parent.mkdir(parents=True)
+    preamble = stub_gen.header_preamble("fix/fixlib.h", "/usr/include/fix/fixlib.h")
+    overlay.write_text(preamble + FIX_OVERLAY_BLOCK, encoding="utf-8", newline="\n")
+    reports = run / "workspace" / "reports"
+    write_json(reports / "build_capture.json", {"status": "ok", "compiles": [{
+        "source": "src/use.c", "object": "src/use.o", "cwd": ".", "flags": spec["flags"], "system_flags": [],
+        "headers": ["src/use.h"]}]})  # fmt: skip
+    write_json(reports / "phase0_model.json", {
+        "status": "ok", "functions": {"src/use.c#use": {"external_calls": ["fix_len_8"]}}, "externals": ["fix_len_8"],
+        "external_formals": {"fix_len_8": [{"name": "s", "kind": "const_pointer"}, {"name": "n", "kind": "value"}]},
+        "external_decls": {"fix_len_8": {"decl": f"{snap_in}/root/usr/include/fix/fixlib.h:10", "proto": FIX_PROTO}},
+    })  # fmt: skip
+    write_json(reports / "callgraph_dag.json", {"target_dir": work_in, "modules": {
+        "use": {"external_callees": ["fix_len_8"], "ldflags": ["-lfix"]}}})  # fmt: skip
+
+
+def _fix_dd_output(case: str, tree: str, snap: str) -> str:
+    """What `gcc -E -dD` prints for src/use.c up to the end of fixlib.h (trimmed; gcc 12's layout)."""
+    cmdline = "#define FIX_CODE_UNIT_WIDTH 8\n#define USE_UNRELATED 1\n" if case == "command_line" else ""
+    use_h = FIX_CASES[case]["use_h"]
+    real = f"{snap}/root/usr/include/fix/fixlib.h"
+    return (
+        f'# 0 "{tree}/src/use.c"\n# 0 "<built-in>"\n#define __STDC__ 1\n#define __GNUC__ 12\n'
+        f'# 0 "<command-line>"\n{cmdline}# 1 "/usr/include/stdc-predef.h" 1 3 4\n#define _STDC_PREDEF_H 1\n'
+        f'# 0 "<command-line>" 2\n# 1 "{tree}/src/use.c"\n# 1 "{tree}/src/use.h" 1\n{use_h}'
+        f'# 2 "{tree}/src/use.c" 2\n# 1 "{real}" 1 3 4\n#define FIXLIB_H \n'
+        '# 1 "/usr/lib/gcc/x86_64-linux-gnu/12/include/stddef.h" 1 3 4\n#define _STDDEF_H \n'
+        "typedef long unsigned int size_t;\n"
+        f'# 4 "{real}" 2 3 4\n#define FIX_GLUE_(a,b) a ##_ ##b\n#define FIX_GLUE(a,b) FIX_GLUE_(a, b)\n'
+        "#define fix_len FIX_GLUE(fix_len, FIX_CODE_UNIT_WIDTH)\n"
+        "size_t fix_len_8(const unsigned char *s, size_t n);\n"
+        f'# 3 "{tree}/src/use.c" 2\n#define USE_AFTER 1\n'
+        "size_t use(const unsigned char *s, size_t n) { return fix_len_8(s, n); }\n"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("case", sorted(FIX_CASES))
+def test_the_probes_get_the_macros_the_target_defines_before_the_header(run_dir, monkeypatch, case):
+    """
+    The context comes from preprocessing the caller's compile with its own flags: the macros its command
+    line and its own files define before the header, kept when the header reads them (or a kept one's body
+    does). All three probes define them before `#include <fix/fixlib.h>`, and stub_check.json records them.
+    """
+    snap = run_dir / "workspace" / "snapshot"
+    tree = run_dir / "workspace" / "work"
+    _fix_run(run_dir, case, snap.as_posix(), tree.as_posix())
+    monkeypatch.setenv("FRAMAC_SNAPSHOT_DIR", str(snap))
+    monkeypatch.setenv("FRAMAC_STUB_OVERLAY_DIR", str(run_dir / "workspace" / "stubs"))
+    import stub_gen
+
+    assert stub_gen.main(["run"]) == 0
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd, **_):
+        calls.append(list(cmd))
+        if cmd[:2] == ["gcc", "-E"]:
+            return 0, _fix_dd_output(case, tree.as_posix(), snap.as_posix())
+        return 1, "not run in this test"
+
+    monkeypatch.setattr(stub_check, "_run", fake_run)
+    stub_check.main(["run", "--trials", "2"])
+    rec = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))["headers"][FIX_HDR]
+    ctx = rec["include_context"]
+    assert ctx["defines"] == FIX_CASES[case]["context"], ctx
+    assert ctx["status"] == "derived" and ctx["compile"] == {"source": "src/use.c", "object": "src/use.o"}, ctx
+    pre = next(c for c in calls if c[:2] == ["gcc", "-E"])
+    assert f"-I{(tree / 'src').as_posix()}" in pre or (tree / "src").as_posix() in pre, pre
+    if case == "command_line":
+        assert "-DFIX_CODE_UNIT_WIDTH=8" in pre, pre
+    for probe in ("fc_stub_abi.c", "fc_stub_smoke.c", "fc_stub_driver.c"):
+        text = (run_dir / FIX_LOGS / probe).read_text(encoding="utf-8")
+        at = text.index("#include <fix/fixlib.h>")
+        for line in ctx["defines"]:
+            assert 0 <= text.find(line + "\n") < at, (probe, text)
+        assert "USE_UNRELATED" not in text and "USE_AFTER" not in text and "_STDC_PREDEF_H" not in text, text
+
+
+@pytest.mark.unit
+def test_a_header_without_a_compile_gets_no_context_and_the_same_probes(run_dir, monkeypatch):
+    """No caller compile in the capture (the mylib scenario): no preprocessing, the probes as before."""
+    snap = run_dir / "workspace" / "snapshot"
+    _fix_run(run_dir, "source", snap.as_posix(), (run_dir / "workspace" / "work").as_posix())
+    write_json(run_dir / "workspace" / "reports" / "build_capture.json", {"status": "ok", "compiles": []})
+    monkeypatch.setenv("FRAMAC_SNAPSHOT_DIR", str(snap))
+    monkeypatch.setenv("FRAMAC_STUB_OVERLAY_DIR", str(run_dir / "workspace" / "stubs"))
+    import stub_gen
+
+    assert stub_gen.main(["run"]) == 0
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd, **_):
+        calls.append(list(cmd))
+        return 1, "x"
+
+    monkeypatch.setattr(stub_check, "_run", fake_run)
+    stub_check.main(["run", "--checks", "abi"])
+    rec = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))["headers"][FIX_HDR]
+    assert rec["include_context"]["defines"] == [] and rec["include_context"]["status"] == "no_compile"
+    assert [c[0] for c in calls] == ["gcc"] and "-E" not in calls[0]
+    assert (run_dir / FIX_LOGS / "fc_stub_abi.c").read_text(encoding="utf-8") == "#include <fix/fixlib.h>\n"
+
+
+@pytest.mark.unit
+def test_the_context_scan_drops_undefined_guards_and_system_macros(tmp_path):
+    real = tmp_path / "snap" / "root" / "usr" / "include" / "q.h"
+    real.parent.mkdir(parents=True)
+    real.write_text("#ifndef Q_H\n#define Q_H\n#if Q_MODE > 1 || defined(Q_GONE) || defined(Q_SYS)\n#endif\n#endif\n",
+                    encoding="utf-8")  # fmt: skip
+    out = (
+        '# 0 "/t/a.c"\n# 0 "<command-line>"\n#define Q_GONE 1\n# 1 "/t/a.c"\n'
+        '# 1 "/t/cfg.h" 1\n#define Q_MODE 2\n#define Q_H 1\n#undef Q_GONE\n# 2 "/t/a.c" 2\n'
+        '# 1 "/usr/include/sys.h" 1 3 4\n#define Q_SYS 1\n# 3 "/t/a.c" 2\n'
+        f'# 1 "{real.as_posix()}" 1 3 4\n#define Q_H \n# 4 "/t/a.c" 2\n'
+    )
+    scan = stub_check.scan_preprocessed(out, "q.h", tree="/t", generated=None)
+    assert scan["entered"] == real.as_posix()
+    # Q_H is the header's own include guard: defining it in a probe would empty the header.
+    assert stub_check.select_context(scan, snapshot_root=str(tmp_path / "snap" / "root")) == ["#define Q_MODE 2"]
+    assert stub_check.scan_preprocessed('# 0 "/t/a.c"\n#define X 1\n', "q.h", tree="/t", generated=None)["entered"] is None
+
+
+# ---------------------------------------------------------------------------
 # Make and the stage order
 # ---------------------------------------------------------------------------
 
@@ -552,3 +742,34 @@ def test_stub_check_against_the_real_library(mode):
         assert "\\result: 0" in dyn["ml_hash"]["report"], out
         assert report["blocked_modules"] == {"liba": [HEADER], "liba_lex": [HEADER]}, out
         assert f"stub-check failed for {HEADER}" in out, out
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("case", sorted(FIX_CASES))
+def test_a_header_that_needs_the_targets_macros_passes_all_three_checks(tmp_path, case):
+    """
+    nginx run-3's pcre2.h, in miniature: fixlib.h `#error`s without FIX_CODE_UNIT_WIDTH, which the target
+    sets in its own header or on its compile line. With the context derived from the build, the ABI, Eva
+    and E-ACSL probes see the header as the target does, and the filled contract passes all three.
+    """
+    require_docker_images(ANALYSIS_IMAGE)
+    run = tmp_path / "run"
+    _fix_run(run, case, "/w/workspace/snapshot", "/w/workspace/work")
+    out = _docker(
+        "sh", "-c",
+        "cd /w && export FRAMAC_SNAPSHOT_DIR=/w/workspace/snapshot FRAMAC_STUB_OVERLAY_DIR=/w/workspace/stubs "
+        "FRAMAC_CACHE=off && gcc -shared -fPIC -o workspace/snapshot/root/usr/lib/libfix.so fixlib.c && "
+        "timeout 120 python3 /opt/framac-pipeline/scripts/stub_gen.py run && "
+        "timeout 900 python3 /opt/framac-pipeline/scripts/stub_check.py run --trials 4; echo rc=$?",
+        mounts={run: "/w"},
+    )  # fmt: skip
+    report = json.loads((run / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))
+    rec = report["headers"][FIX_HDR]
+    assert rec["abi"]["status"] == "passed", out + json.dumps(rec, indent=1)
+    assert rec["eva"]["status"] == "ok", out + json.dumps(rec, indent=1)
+    assert rec["eva"]["functions"]["fix_len_8"]["status"] == "passed", rec
+    assert rec["dynamic"]["functions"]["fix_len_8"]["status"] == "passed", rec
+    assert rec["include_context"]["defines"] == FIX_CASES[case]["context"], rec
+    assert rec["status"] == "passed" and report["blocked_modules"] == {}, rec
+    assert "rc=0" in out, out

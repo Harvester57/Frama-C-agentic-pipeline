@@ -27,6 +27,19 @@ Checks of stub contracts (docs/plans/templates-and-stubs-improvement-plan.md ste
            the generated arguments do not meet it (`driver_rejected`), a crash or a link failure leaves
            the check `inconclusive`.
 
+The three probes include the header in the macro context the target includes it in: a library header may
+`#error` without a macro the target defines first, or pick its function names from it (pcre2.h and
+PCRE2_CODE_UNIT_WIDTH, which nginx defines in src/core/ngx_regex.h). The context is derived from the build,
+never assumed: one compile of a caller of the header's functions (stubs.json `callers`, build_capture.json
+`compiles`, at most CONTEXT_COMPILES of them, in sorted order) is preprocessed with its own flags in the
+target's tree (`gcc -E -dD`); the macros its command line and the target's own files (generated headers
+included) define before the header is first entered, and that the header or the target-package headers it
+pulls in name (or that the body of such a macro names), except their include guards, are written as
+`#define` lines before `#include <header>` in each probe. The header's `include_context` records them, the
+compile and the command (`status`: derived, no_compile, no_tree or not_included; `differing` when another
+caller compile defines them otherwise). A header without a caller compile, or whose target defines nothing
+it reads, is probed exactly as before.
+
 A header fails when an active contract has an `assigns` location other than \\result without `\\from`
 (read statically, whatever the checks: Eva aborts on it with `assigns:missing`, Phase 2 Eva too, but only
 when a call reaches the contract, and a valid call that fails its own precondition never does), its ABI
@@ -65,6 +78,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +153,17 @@ _TYPE_WORDS = frozenset(
     "void char short int long float double signed unsigned _Bool const volatile size_t ssize_t".split()
 )
 _EACSL_FAIL_RE = re.compile(r"(Precondition|Postcondition) failed", re.IGNORECASE)
+# The include context (`include_context`): caller compiles preprocessed per header, and their timeout.
+CONTEXT_COMPILES = 4
+CONTEXT_TIMEOUT_S = 120
+CONTEXT_COMMENT = "/* include context: macros the target defines before it includes the header (stub_check.py) */"
+_LINEMARKER_RE = re.compile(r'^#\s+\d+\s+"((?:[^"\\]|\\.)*)"((?:\s+\d+)*)\s*$')
+_DEFINE_LINE_RE = re.compile(r"^#define\s+([A-Za-z_]\w*)")
+_UNDEF_LINE_RE = re.compile(r"^#undef\s+([A-Za-z_]\w*)")
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_DIRECTIVE_RE = re.compile(r"^\s*#\s*([a-z]+)\b(.*)$", re.MULTILINE)
+_GUARD_TEST_RE = re.compile(r"^\s*(?:!\s*defined\s*\(?\s*)?([A-Za-z_]\w*)\s*\)?\s*$")
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +292,17 @@ def call_lines(sig: dict, tag: str, short: bool, length: str = str(BUF)) -> list
 # ---------------------------------------------------------------------------
 
 
-def smoke_source(include: str, sigs: list[dict]) -> tuple[str, dict[int, tuple[str, str]]]:
+def context_prelude(context: Sequence[str] = ()) -> list[str]:
+    """The lines a probe starts with before `#include <header>`: none without an include context."""
+    return [CONTEXT_COMMENT, *context] if context else []
+
+
+def smoke_source(
+    include: str, sigs: list[dict], context: Sequence[str] = ()
+) -> tuple[str, dict[int, tuple[str, str]]]:
     """(the Eva smoke program, line -> (function, `ok` | `short`) of each call)."""
     out = [
+        *context_prelude(context),
         f"#include <{include}>",
         "#include <string.h>",
         "volatile int fc_stub_pick;",
@@ -299,9 +332,9 @@ def smoke_source(include: str, sigs: list[dict]) -> tuple[str, dict[int, tuple[s
     return "\n".join(out), lines_of
 
 
-def driver_source(include: str, sigs: list[dict], trials: int) -> str:
+def driver_source(include: str, sigs: list[dict], trials: int, context: Sequence[str] = ()) -> str:
     """One process per function (argv[1] = its index): `trials` valid calls with varied lengths and contents."""
-    out = [f"#include <{include}>", "#include <stdlib.h>", "#include <string.h>"]
+    out = [*context_prelude(context), f"#include <{include}>", "#include <stdlib.h>", "#include <string.h>"]
     for idx, sig in enumerate(sigs):
         out.append(f"static void fc_drive_{idx}(unsigned seed, unsigned long n) {{")
         out.extend(call_lines(sig, "v", False, length="n"))
@@ -469,9 +502,263 @@ def system_include_flags(capture: dict) -> list[str]:
     return target_env.include_flags(root, system) + target_env.generated_include_flags()
 
 
-def check_abi(include: str, overlay: Path, sys_flags: list[str], work: Path) -> dict:
+# ---------------------------------------------------------------------------
+# The include context: the macros the target defines before it includes the header
+# ---------------------------------------------------------------------------
+
+
+def _under(path: str, root: str | None) -> bool:
+    if not root:
+        return False
+    root = root.rstrip("/")
+    return path == root or path.startswith(root + "/")
+
+
+def _unescape_marker(path: str) -> str:
+    return re.sub(r"\\(.)", r"\1", path)
+
+
+def scan_preprocessed(text: str, include: str, tree: str, generated: str | None) -> dict:
+    """
+    Walk the `gcc -E -dD` output of one compile until it leaves the first file it enters whose path ends
+    in `/<include>` outside `tree`. {entered: that path or None, defines: {name: `#define` line} the
+    target's command line and its own files (not system headers, except the build's generated headers
+    under `generated`) left defined before entering it, closure: the files entered while it was open,
+    itself first}. A later redefinition by a system header or an `#undef` removes a name.
+    """
+    suffix = "/" + include.strip("/")
+    stack: list[tuple[str, bool]] = []
+    defines: dict[str, str] = {}
+    entered: str | None = None
+    depth = 0
+    closure: list[str] = []
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            continue
+        m = _LINEMARKER_RE.match(line)
+        if m:
+            path = _unescape_marker(m.group(1))
+            flags = m.group(2).split()
+            system = "3" in flags
+            if "1" in flags:
+                stack.append((path, system))
+                if entered is None and path.endswith(suffix) and not _under(path, tree):
+                    entered, depth = path, len(stack)
+                    closure.append(path)
+                elif entered is not None and path not in closure:
+                    closure.append(path)
+            elif "2" in flags:
+                if stack:
+                    stack.pop()
+                if entered is not None and len(stack) < depth:
+                    break
+                if stack:
+                    stack[-1] = (path, system)
+                else:
+                    stack.append((path, system))
+            elif stack:
+                stack[-1] = (path, system)
+            else:
+                stack.append((path, system))
+            continue
+        if entered is not None:
+            continue
+        cur, system = stack[-1] if stack else ("", False)
+        target = cur != "<built-in>" and (not system or _under(cur, generated))
+        d = _DEFINE_LINE_RE.match(line)
+        if d:
+            if target:
+                defines[d.group(1)] = line.rstrip()
+            else:
+                defines.pop(d.group(1), None)
+            continue
+        u = _UNDEF_LINE_RE.match(line)
+        if u:
+            defines.pop(u.group(1), None)
+    return {"entered": entered, "defines": defines, "closure": closure}
+
+
+def _include_guard(text: str) -> str | None:
+    """The include guard of a header (comments removed): its first directive tests X, its second defines X."""
+    directives = _DIRECTIVE_RE.findall(text)[:2]
+    if len(directives) < 2:
+        return None
+    (kind1, arg1), (kind2, arg2) = directives
+    test = arg1.strip() if kind1 == "ifndef" else (arg1 if kind1 == "if" and "!" in arg1 else None)
+    m = _GUARD_TEST_RE.match(test or "")
+    if m is None or kind2 != "define":
+        return None
+    defined = arg2.split()
+    return m.group(1) if defined and defined[0] == m.group(1) else None
+
+
+def _macro_body(line: str) -> str:
+    """The replacement list of a `#define` line, parameters left out."""
+    rest = _DEFINE_LINE_RE.sub("", line, count=1)
+    if rest.startswith("("):
+        rest = rest.split(")", 1)[1] if ")" in rest else ""
+    return rest
+
+
+def select_context(scan: dict, snapshot_root: str | None, cwd: Path | None = None) -> list[str]:
+    """
+    The `#define` lines of `scan` (scan_preprocessed) the header reads: the macros named in the header
+    and in the target-package headers it entered (under the snapshot's `root/`), then, transitively, the
+    target's macros a kept macro's body names; never one of their include guards. Sorted by name.
+    """
+    defines: dict[str, str] = scan.get("defines") or {}
+    entered = scan.get("entered")
+    if not entered or not defines:
+        return []
+    files = [entered, *(f for f in (scan.get("closure") or [])[1:] if _under(f, snapshot_root))]
+    names: set[str] = set()
+    guards: set[str] = set()
+    for f in files:
+        path = Path(f) if cwd is None or _is_abs_path(f) else cwd / f
+        try:
+            text = _C_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        names |= set(_IDENT_RE.findall(text))
+        guard = _include_guard(text)
+        if guard:
+            guards.add(guard)
+    keep = {n for n in defines if n in names and n not in guards}
+    todo = sorted(keep)
+    while todo:
+        for ident in _IDENT_RE.findall(_macro_body(defines[todo.pop()])):
+            if ident in defines and ident not in keep and ident not in guards:
+                keep.add(ident)
+                todo.append(ident)
+    return [defines[n] for n in sorted(keep)]
+
+
+def _is_abs_path(path: str) -> bool:
+    """An absolute path as gcc prints it: POSIX, or a Windows drive path (host tests)."""
+    return path.startswith("/") or bool(re.match(r"^[A-Za-z]:[/\\]", path))
+
+
+def context_tree(dag: dict, capture: dict) -> Path | None:
+    """The target's tree to preprocess in: the DAG's `target_dir` (the work tree), else the capture's trees."""
+    scratch = capture.get("scratch") if isinstance(capture.get("scratch"), dict) else {}
+    for cand in (dag.get("target_dir"), (scratch or {}).get("tree"), capture.get("target")):
+        if isinstance(cand, str) and cand and Path(cand).is_dir():
+            return Path(cand)
+    return None
+
+
+def caller_compiles(rec: dict, capture: dict) -> list[dict]:
+    """
+    The capture's compiles of the files calling the header's functions (`callers` as `file#function`),
+    drafts included: per caller file in sorted order, the compiles of that source, else the compiles
+    whose dependency list names it (a caller defined in a header); one per source, flags and system flags.
+    """
+    files = sorted(
+        {
+            str(c).split("#", 1)[0]
+            for f in (rec.get("functions") or {}).values()
+            if isinstance(f, dict)
+            for c in f.get("callers") or []
+        }
+    )
+    compiles = [c for c in capture.get("compiles") or [] if isinstance(c, dict) and c.get("source")]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for f in files:
+        direct = [c for c in compiles if c["source"] == f]
+        for c in sorted(
+            direct or [c for c in compiles if f in (c.get("headers") or [])],
+            key=lambda c: (str(c["source"]), str(c.get("object") or "")),
+        ):
+            key = json.dumps([c["source"], c.get("flags") or [], c.get("system_flags") or []])
+            if key not in seen:
+                seen.add(key)
+                out.append(c)
+    return out
+
+
+def preprocess_command(compile_rec: dict, tree: Path, snapshot: Path | None) -> list[str] | None:
+    """
+    `gcc -E -dD` of one compile in the analysis image, with the compile's own flags (project paths made
+    absolute in `tree`), its system include directories and force-included system files read from the
+    snapshot, and the build's generated headers. None when the source is in neither the tree nor the
+    snapshot's generated files.
+    """
+    import build_capture as bc  # lazily: heavy, and only needed when a header has a caller compile
+
+    source = str(compile_rec["source"])
+    src = tree / source
+    if not src.is_file() and snapshot is not None:
+        src = snapshot / target_env.GENERATED_REL / source
+    if not src.is_file():
+        return None
+    root = (snapshot / "root").as_posix() if snapshot else None
+    system = [str(t) for t in compile_rec.get("system_flags") or []]
+    forced: list[str] = []
+    for i, tok in enumerate(system[:-1]):
+        if tok in ("-include", "-imacros") and _is_abs_path(system[i + 1]):
+            copy = f"{root}{system[i + 1]}" if root else system[i + 1]
+            forced += [tok, copy if Path(copy).is_file() else system[i + 1]]
+    return [
+        "gcc",
+        "-E",
+        "-dD",
+        *bc.absolute_flags([str(t) for t in compile_rec.get("flags") or []], tree.as_posix()),
+        *target_env.include_flags(root, system),
+        *target_env.generated_include_flags(snapshot),
+        *forced,
+        src.as_posix(),
+    ]
+
+
+def include_context(rec: dict, include: str, capture: dict, tree: Path | None) -> dict:
+    """
+    The macro context the target includes `include` in (see the module docstring): {status, defines,
+    compile, command, differing?}, or {status: no_compile | no_tree | not_included, defines: [], ...}.
+    Runs nothing when no compile of the capture calls the header's functions.
+    """
+    compiles = caller_compiles(rec, capture)
+    if not compiles:
+        return {"status": "no_compile", "defines": []}
+    if tree is None:
+        return {"status": "no_tree", "defines": [], "reason": "neither the DAG's target_dir nor a capture tree exists"}
+    snapshot = target_env.snapshot_dir()
+    root = (snapshot / "root").as_posix() if snapshot else None
+    generated = (snapshot / target_env.GENERATED_REL).as_posix() if snapshot else None
+    found: list[tuple[dict, list[str], list[str]]] = []
+    tried: list[dict] = []
+    for c in compiles[:CONTEXT_COMPILES]:
+        cmd = preprocess_command(c, tree, snapshot)
+        if cmd is None:
+            tried.append({"source": c["source"], "reason": "source not found in the tree"})
+            continue
+        rc, out = _run(cmd, tree, timeout=CONTEXT_TIMEOUT_S)
+        scan = scan_preprocessed(out, include, tree.as_posix(), generated)
+        if not scan["entered"]:
+            why = f"never enters <{include}>" if rc == 0 else _first_error(out) or f"gcc exited {rc}"
+            tried.append({"source": c["source"], "reason": why})
+            continue
+        found.append((c, cmd, select_context(scan, root, tree)))
+    if not found:
+        return {"status": "not_included", "defines": [], "tried": tried}
+    first, cmd, defines = found[0]
+    ctx: dict[str, Any] = {
+        "status": "derived",
+        "defines": defines,
+        "compile": {"source": first["source"], "object": first.get("object")},
+        "command": shlex.join(cmd),
+    }
+    differing = [
+        {"source": c["source"], "object": c.get("object"), "defines": d} for c, _, d in found[1:] if d != defines
+    ]
+    if differing:
+        ctx["differing"] = differing
+    return ctx
+
+
+def check_abi(include: str, overlay: Path, sys_flags: list[str], work: Path, context: Sequence[str] = ()) -> dict:
     src = work / ABI_SRC
-    src.write_text(f"#include <{include}>\n", encoding="utf-8")
+    src.write_text("".join(f"{line}\n" for line in context_prelude(context)) + f"#include <{include}>\n", encoding="utf-8")
     cmd = ["gcc", "-fsyntax-only", "-DFC_STUB_DRAFT", f"-I{overlay.as_posix()}", *sys_flags, src.name]
     rc, log = _run(cmd, work)
     (work / ABI_LOG).write_text(f"$ {shlex.join(cmd)}\n{log}", encoding="utf-8")
@@ -483,9 +770,9 @@ def check_abi(include: str, overlay: Path, sys_flags: list[str], work: Path) -> 
     return {"status": "failed", "reason": _first_error(log), "command": shlex.join(cmd), "log": ABI_LOG}
 
 
-def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
+def check_eva(include: str, sigs: list[dict], work: Path, context: Sequence[str] = ()) -> dict:
     """{status, functions: {name: {status, alarms}}}: `error` when Frama-C cannot parse the program."""
-    text, lines_of = smoke_source(include, sigs)
+    text, lines_of = smoke_source(include, sigs, context)
     (work / SMOKE).write_text(text, encoding="utf-8")
     csv_path = work / EVA_CSV
     cmd = [
@@ -621,11 +908,13 @@ def build_driver(work: Path, ldflags: str) -> dict:
     return {"status": "built", "binary": str(select_eacsl_binary(out_bin)), "log": BUILD_LOG}
 
 
-def check_dynamic(include: str, sigs: list[dict], ldflags: str, trials: int, work: Path) -> dict:
+def check_dynamic(
+    include: str, sigs: list[dict], ldflags: str, trials: int, work: Path, context: Sequence[str] = ()
+) -> dict:
     """E-ACSL build of the driver against the real library, then one sandboxed process per function."""
     from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed
 
-    (work / DRIVER).write_text(driver_source(include, sigs, trials), encoding="utf-8")
+    (work / DRIVER).write_text(driver_source(include, sigs, trials, context), encoding="utf-8")
     build = build_driver(work, ldflags)
     if build["status"] != "built":
         return {**build, "ldflags": ldflags}
@@ -768,7 +1057,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     capture = load_json_optional(Path(stub_gen.DEFAULT_CAPTURE), {}) or {}
     overlay = stub_overlay_dir() or Path(STUB_OVERLAY_REL).resolve()
     checks = [c for c in args.checks.split(",") if c]
-    sys_flags = system_include_flags(capture if isinstance(capture, dict) else {})
+    capture = capture if isinstance(capture, dict) else {}
+    sys_flags = system_include_flags(capture)
+    tree = context_tree(dag if isinstance(dag, dict) else {}, capture)
     headers = report.get("headers") or {}
     wanted = args.header or sorted(headers)
     artifacts_root = Path(args.out).parent / ARTIFACTS_DIR
@@ -789,16 +1080,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Whatever the checks and whether a call reaches the contract: Eva aborts on such a frame.
         reasons += frame_reasons(header, text or "")
         dest = artifacts_root / artifact_slug(include)
+        # The macros the target defines before it includes the header: every probe defines them first.
+        context: list[str] = []
+        if checks:
+            res["include_context"] = include_context(rec, include, capture, tree)
+            context = list(res["include_context"]["defines"])
         with tempfile.TemporaryDirectory(prefix="stub-check-") as tmp:
             work = Path(tmp)
             try:
                 if "abi" in checks:
-                    res["abi"] = check_abi(include, overlay, sys_flags, work)
+                    res["abi"] = check_abi(include, overlay, sys_flags, work, context)
                 if "eva" in checks and sigs:
-                    res["eva"] = check_eva(include, sigs, work)
+                    res["eva"] = check_eva(include, sigs, work, context)
                 if "dynamic" in checks and sigs:
                     ld = " ".join([*module_ldflags(dag, [s["name"] for s in sigs]), args.ldflags or ""]).strip()
-                    res["dynamic"] = check_dynamic(include, sigs, ld, args.trials, work)
+                    res["dynamic"] = check_dynamic(include, sigs, ld, args.trials, work, context)
             finally:
                 # Kept even when a check raised: the logs are what the agent reads to fix the header.
                 res["artifacts"] = persist_artifacts(work, dest)
