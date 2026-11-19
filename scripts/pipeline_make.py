@@ -2721,7 +2721,8 @@ def _first_build_error(log_path: Path) -> str | None:
         return " ".join(s.strip() for s in section[at : at + 3] if s.strip())[:400]
 
     last = max((i for i, line in enumerate(section) if line.strip()), default=None)
-    if last is not None and _BUILD_TIMEOUT_RE.match(section[last]):
+    killed = any(line.strip() == "Returncode: 124" for line in section[:3])  # as KNOWN_EACSL_FAILURES requires
+    if killed and last is not None and _BUILD_TIMEOUT_RE.match(section[last]):
         return section[last].strip() + " (the attempt was killed at this time limit; no error ended it)"
 
     backtrace = wrap_up = None

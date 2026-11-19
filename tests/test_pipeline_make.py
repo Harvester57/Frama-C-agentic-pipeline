@@ -1825,6 +1825,7 @@ def test_build_check_names_an_eacsl_build_killed_at_the_time_limit(tmp_path):
     # The same wording from a step that does not end the attempt (fuzz_build's shim compile) is no timeout.
     path.write_text(TIMEOUT_LOG.replace("Returncode: 124", "Returncode: 1"), encoding="utf-8")
     assert pm.known_eacsl_failure(path) is None
+    assert "killed" not in (pm._first_build_error(path) or "")
 
     run = _make_run(tmp_path)
     _failed_build(run, "cfg", TIMEOUT_LOG, fallback=True)  # auto fell back to the sanitizers (run-5)
