@@ -73,7 +73,7 @@ _RUNTIME_FN_PREFIXES = (
 )
 
 
-_RUNTIME_FILE_MARKERS = ("e-acsl/", "e_acsl", "/share/frama-c/", "compiler-rt", "libfuzzer")
+_RUNTIME_FILE_MARKERS = ("e-acsl/", "e_acsl", "/share/frama-c/", "compiler-rt", "libsanitizer", "libfuzzer")
 
 
 def is_runtime_function(name: str | None, file_: str | None = None) -> bool:
@@ -807,11 +807,38 @@ _LSAN_ALLOCATORS = frozenset(
 )
 
 
+def _is_target_frame(frame: re.Match[str]) -> bool:
+    """
+    A frame of the target's own code. A libc call the sanitizer intercepts prints under its plain name
+    and without a source location (`#0 0x1 in free (/tmp/prog+0xcdefa)`), at times behind the runtime's
+    helpers (`#0 0x1 in StrstrCheck(...) asan_interceptors.cpp.o`). The source location is what tells it
+    from a function of the target that has the same name.
+    """
+    fn, file_ = frame.group("function"), frame.group("file")
+    if not file_:
+        return False
+    return not (is_runtime_function(fn, file_) or Path(file_).name.startswith("harness_") or is_harness_fuzz_function(fn))
+
+
+def _first_stack(frames: list[re.Match[str]], start: int) -> list[re.Match[str]]:
+    """The frames of the first stack printed after offset `start`: a report's later stacks start at `#0` again."""
+    stack: list[re.Match[str]] = []
+    for frame in frames:
+        if frame.start() < start:
+            continue
+        if stack and frame.group(0).split()[0] == "#0":
+            break
+        stack.append(frame)
+    return stack
+
+
 def _parse_leak_failure(text: str) -> dict | None:
     """
     The first LeakSanitizer block of a report: the first `Direct leak`, else the first `Indirect leak`.
     Its location is the first frame of its allocation stack that is no runtime, harness or allocator
-    frame. A leak links no obligation class (`alarm_kind` memory_leak, CWE-401 in the verifier brief).
+    frame and has a source location, else the first such frame without one (a libc call that allocates,
+    such as `realpath`, is no location while its caller is on the stack). A leak links no obligation
+    class (`alarm_kind` memory_leak, CWE-401 in the verifier brief).
     """
     blocks = list(_LSAN_BLOCK_RE.finditer(text))
     if not blocks or not _LSAN_ERR_RE.search(text):
@@ -822,7 +849,7 @@ def _parse_leak_failure(text: str) -> dict | None:
         if not line.strip():
             break
         stack_lines.append(line)
-    frame = None
+    usable: list[re.Match[str]] = []
     for m in _STACK_FRAME_RE.finditer("\n".join(stack_lines)):
         fn, fpath = m.group("function"), m.group("file") or ""
         base = re.sub(r"^__interceptor_", "", fn)
@@ -833,8 +860,8 @@ def _parse_leak_failure(text: str) -> dict | None:
             or base in _LSAN_ALLOCATORS
         ):
             continue
-        frame = m
-        break
+        usable.append(m)
+    frame = next((m for m in usable if m.group("file")), usable[0] if usable else None)
     file_ = (frame.group("file") or "unknown") if frame else "unknown"
     line_ = int(frame.group("line") or 0) if frame else 0
     fn = frame.group("function") if frame else "unknown_function"
@@ -906,20 +933,33 @@ def parse_sanitizer_failure(text: str) -> dict | None:
         op_m = _ASAN_OP_RE.search(text, asan.end())
         op_txt = f" ({op_m.group('op')})" if op_m else ""
         alarm = _map_sanitizer_alarm_kind(asan_kind)
-        file_ = (best_frame.group("file") if best_frame and best_frame.group("file") else "") or "unknown"
-        line_ = int(best_frame.group("line")) if best_frame and best_frame.group("line") else 0
-        fn = best_frame.group("function") if best_frame else "unknown_function"
+        # The site is on the stack of the failure itself: the `freed by` and `allocated by` stacks that
+        # follow it name other statements. Without a target frame there, the first usable frame stays.
+        stack = _first_stack(frames, asan.end())
+        site = next((i for i, m in enumerate(stack) if _is_target_frame(m)), None)
+        frame = stack[site] if site is not None else best_frame
+        file_ = (frame.group("file") if frame and frame.group("file") else "") or "unknown"
+        line_ = int(frame.group("line")) if frame and frame.group("line") else 0
+        fn = frame.group("function") if frame else "unknown_function"
         if fn == "unknown_function" and file_ != "unknown" and line_ > 0:
             fn = _resolve_function_at_line(file_, line_)
         pred = f"AddressSanitizer: {asan_kind}{op_txt}"
-        top = frames[0] if frames else None
-        if (
-            top is not None
-            and best_frame is not top
-            and top.group("function").startswith(("__interceptor_", "__asan_"))
-        ):
-            # An interceptor (memcpy, strcpy ...) reports the defect in its own frame: the caller is the site.
-            pred += f" in {re.sub(r'^__(?:interceptor|asan)_', '', top.group('function'))} from {fn}"
+        # A libc call (memcpy, free, strlen ...) reports the defect in its own frame: the caller is the site,
+        # and the call it made is the frame next to it, whatever runtime helpers that call went through.
+        called = None
+        if site is not None:
+            called = next(
+                (
+                    m
+                    for m in reversed(stack[:site])
+                    if not m.group("file") or is_runtime_function(m.group("function"), m.group("file"))
+                ),
+                None,
+            )
+        elif frames and frame is not frames[0] and frames[0].group("function").startswith(("__interceptor_", "__asan_")):
+            called = frames[0]
+        if called is not None:
+            pred += f" in {re.sub(r'^_+(?:interceptor|asan)_', '', called.group('function'))} from {fn}"
         line_hash = line_text_hash(file_, line_)
         if line_hash is not None:
             pred += f" [line {line_hash}]"
@@ -1020,25 +1060,22 @@ def is_libfuzzer_out_of_memory(text: str) -> bool:
 def is_sanitizer_allocation_cap(failure: dict | None) -> bool:
     """
     ASan refusing a request past its own allocator maximum (`requested allocation size ... exceeds maximum
-    supported size`, allocation-size-too-big), unlocated in the allocator: a tool limit like the E-ACSL heap
-    zone, no target defect. Campaigns and replays now run with allocator_may_return_null=1
+    supported size`, allocation-size-too-big): a tool limit like the E-ACSL heap zone, no target defect,
+    whichever statement made the request. Campaigns and replays now run with allocator_may_return_null=1
     (fuzz_common.SANITIZER_RUNTIME_ENV), which turns it into a NULL return; reports written before keep it.
     """
-    return (
-        isinstance(failure, dict)
-        and failure.get("kind") == "asan_requested_allocation_size"
-        and needs_attribution(failure)
-    )
+    return isinstance(failure, dict) and failure.get("kind") == "asan_requested_allocation_size"
 
 
 def needs_attribution(failure: dict | None) -> bool:
     """
     True when a failure has no usable target location (missing, line 0, unknown or runtime-internal function).
-    Never for a failed check of a MetAcsl property (`meta_property`): it has no line by construction, and a
-    sanitizer replay cannot see it (the attribution would give it the identity of whatever the sanitizers
-    report on that input, or none).
+    ASan's allocation cap counts as such wherever the request was made: it is a tool limit, so it never
+    gives an artifact its identity. Never for a failed check of a MetAcsl property (`meta_property`): it has
+    no line by construction, and a sanitizer replay cannot see it (the attribution would give it the identity
+    of whatever the sanitizers report on that input, or none).
     """
-    if not failure:
+    if not failure or is_sanitizer_allocation_cap(failure):
         return True
     if failure.get("meta_property"):
         return False

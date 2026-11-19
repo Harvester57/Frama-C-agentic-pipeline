@@ -32,7 +32,7 @@ The skipped tests need tools this Windows host lacks outside the image (GNU make
 
 ## Pipeline bugs and limits found
 
-- **Open pipeline bug:** every double free or bad free gets the fingerprint `unknown#free::freeable::<hash>`, so different sites collapse into one candidate. See [`../troubleshooting/eacsl-and-fuzzing.md`](../troubleshooting/eacsl-and-fuzzing.md). A fix changes the fingerprints of existing candidates, so it was left for the owner.
+- **Fixed after this integration, on the owner's request:** a failure inside a libc call got the fingerprint `unknown#<call>::<alarm>::<hash>`, so different sites collapsed into one candidate. See [`../troubleshooting/eacsl-and-fuzzing.md`](../troubleshooting/eacsl-and-fuzzing.md).
 - **Limit:** a forwarding wrapper without a `calls` annotation gets no L5 goal from WP. The run is flagged unsound and earns no credit, but a real violation is not reported as an L5 failure either. See [`../troubleshooting/security-properties.md`](../troubleshooting/security-properties.md).
 
 ## Decision taken for the owner: the main checkout changed branch

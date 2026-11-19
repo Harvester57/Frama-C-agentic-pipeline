@@ -95,6 +95,125 @@ def test_an_interceptor_frame_names_the_interceptor_and_its_caller(monkeypatch):
     assert " in memcpy from copy_block [line " in failure["predicate"]
 
 
+# The frames of a libc call as framac-analysis:latest prints them (Debian clang 19.1.7, static ASan runtime):
+# no source location, the name without `__interceptor_`, sometimes behind the runtime's own helpers.
+_BARE = "(/tmp/prog+0xcdefa) (BuildId: b66b8b41b662fb3faecaf12d07fe035f5676f003)"
+_DOUBLE_FREE = "==13==ERROR: AddressSanitizer: attempting double-free on 0x503000000040 in thread T0:\n"
+_OVERFLOW = "==63==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000018 at pc 0x1 bp 0x2 sp 0x3\n"
+_READ_OP = "READ of size 9 at 0x502000000018 thread T0\n"
+
+
+def _stack(*frames: str) -> str:
+    return "".join(f"    #{i} 0x5ae09b724efa in {frame}\n" for i, frame in enumerate(frames))
+
+
+@pytest.mark.parametrize("call", ["free", "realloc", "strlen", "strcpy", "atoi", "read", "fwrite", "getcwd"])
+def test_a_bare_libc_frame_is_not_the_site_of_the_failure(call, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    text = _OVERFLOW + _READ_OP + _stack(f"{call} {_BARE}", "parse_name src/name.c:33:51", "main src/main.c:71:28")
+    failure = FI.parse_runtime_failure(text)
+    assert failure is not None
+    assert (failure["file"], failure["line"], failure["function"]) == ("src/name.c", 33, "parse_name")
+    assert f" in {call} from parse_name" in failure["predicate"]
+
+
+@pytest.mark.parametrize("frame", ["__interceptor_free", "___interceptor_free"])
+def test_the_prefixed_spellings_of_an_interceptor_name_the_same_call(frame, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    failure = FI.parse_runtime_failure(_DOUBLE_FREE + _stack(frame, "release src/a.c:10:5"))
+    assert failure is not None
+    assert failure["function"] == "release" and " in free from release" in failure["predicate"]
+
+
+@pytest.mark.parametrize(
+    ("helpers", "call"),
+    [
+        (["StrstrCheck(void*, char*, char const*, char const*) asan_interceptors.cpp.o", f"strstr {_BARE}"], "strstr"),
+        (["StrtolFixAndCheck(void*, char const*, char**, char*, int) asan_interceptors.cpp.o", f"strtol {_BARE}"], "strtol"),
+        (
+            [
+                "printf_common(void*, char const*, __va_list_tag*) asan_interceptors.cpp.o",
+                f"vsnprintf {_BARE}",
+                f"snprintf {_BARE}",
+            ],
+            "snprintf",
+        ),
+    ],
+)
+def test_the_runtime_helpers_behind_a_libc_call_name_the_call_the_target_made(helpers, call, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    failure = FI.parse_runtime_failure(_OVERFLOW + _stack(*helpers, "fill src/name.c:56:49"))
+    assert failure is not None
+    assert (failure["file"], failure["line"], failure["function"]) == ("src/name.c", 56, "fill")
+    assert f" in {call} from fill" in failure["predicate"]
+
+
+def test_two_double_frees_at_two_sites_have_two_fingerprints(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    one = FI.parse_runtime_failure(_DOUBLE_FREE + _stack(f"free {_BARE}", "release_a src/a.c:10:5"))
+    two = FI.parse_runtime_failure(_DOUBLE_FREE + _stack(f"free {_BARE}", "release_b src/b.c:20:5"))
+    assert FI.failure_fingerprint(one) != FI.failure_fingerprint(two)
+    fingerprint = FI.failure_fingerprint(one)
+    assert fingerprint is not None and fingerprint.startswith("src/a.c#release_a::freeable::")
+
+
+def test_the_target_s_own_function_named_like_libc_is_the_site(tmp_path, monkeypatch):
+    """A source location tells them apart: this `free` is code of the target."""
+    monkeypatch.chdir(tmp_path)
+    failure = FI.parse_runtime_failure(_OVERFLOW + _stack("free src/pool.c:12:3", "drop src/pool.c:40:5"))
+    assert failure is not None
+    assert (failure["file"], failure["line"], failure["function"]) == ("src/pool.c", 12, "free")
+    assert " from " not in failure["predicate"]
+
+
+def test_a_crash_stack_without_a_target_frame_does_not_borrow_one_from_the_free_stack(tmp_path, monkeypatch):
+    """The harness made the second call: the target function on the `freed by` stack did nothing wrong."""
+    monkeypatch.chdir(tmp_path)
+    crash = _stack(
+        f"free {_BARE}",
+        "LLVMFuzzerTestOneInput /framac-run/workspace/harnesses/harness_mod.c:14:5",
+        "fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/tmp/prog+0x4e4ba)",
+    )
+    freed = _stack(f"free {_BARE}", "target_release src/a.c:6:40")
+    failure = FI.parse_runtime_failure(_DOUBLE_FREE + crash + "\nfreed by thread T0 here:\n" + freed)
+    assert failure is not None
+    assert failure["function"] != "target_release" and failure["file"] != "src/a.c"
+
+
+def test_the_frame_of_a_shared_gcc_runtime_is_not_the_site(tmp_path, monkeypatch):
+    """gcc's libasan has debug information, so its `free` carries a source location of the runtime."""
+    monkeypatch.chdir(tmp_path)
+    runtime = "free ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:52"
+    failure = FI.parse_runtime_failure(_DOUBLE_FREE + _stack(runtime, "site src/a.c:23"))
+    assert failure is not None
+    assert (failure["file"], failure["line"], failure["function"]) == ("src/a.c", 23, "site")
+    assert " in free from site" in failure["predicate"]
+
+
+def test_asan_s_allocation_cap_stays_a_tool_limit_now_that_it_has_a_location(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    text = (
+        "==17==ERROR: AddressSanitizer: requested allocation size 0x7fffffffffff (0x800000001000 after adjustments "
+        "for alignment, red zones etc.) exceeds maximum supported size of 0x10000000000 (thread T0)\n"
+    ) + _stack(f"malloc {_BARE}", "read_bytes src/reader.c:527:15")
+    failure = FI.parse_runtime_failure(text)
+    assert failure is not None
+    assert (failure["file"], failure["line"]) == ("src/reader.c", 527)
+    assert FI.is_sanitizer_allocation_cap(failure) and FI.needs_attribution(failure)
+
+
+def test_a_leak_allocated_inside_a_libc_call_is_attributed_to_its_caller(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    text = (
+        "==47==ERROR: LeakSanitizer: detected memory leaks\n\n"
+        "Direct leak of 4097 byte(s) in 1 object(s) allocated from:\n"
+        + _stack(f"malloc {_BARE}", f"realpath {_BARE}", "resolve src/path.c:22:47", "main src/main.c:33:9")
+    )
+    failure = FI.parse_runtime_failure(text)
+    assert failure is not None
+    assert (failure["file"], failure["line"], failure["function"]) == ("src/path.c", 22, "resolve")
+
+
 def test_a_fixture_parsed_twice_gives_one_fingerprint_and_other_addresses_do_not_change_it(monkeypatch):
     once = _fingerprint_in_fixtures(monkeypatch, "asan_heap_overflow")
     assert _fingerprint_in_fixtures(monkeypatch, "asan_heap_overflow") == once

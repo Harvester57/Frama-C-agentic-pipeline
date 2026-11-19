@@ -1,5 +1,5 @@
 ==4256==ERROR: AddressSanitizer: attempting free on address which was not malloc()-ed: 0x7ffd4c2f0a50 in thread T0
-    #0 0x55555558a100 in __interceptor_free
+    #0 0x55555558a100 in free (/tmp/prog+0xcdefa) (BuildId: b66b8b41b662fb3faecaf12d07fe035f5676f003)
     #1 0x55555558b020 in release_local src/demo.c:40:5
     #2 0x55555558b0c0 in LLVMFuzzerTestOneInput harness_demo.c:12:5
     #3 0x55555558b100 in main

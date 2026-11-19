@@ -49,3 +49,6 @@ def test_program_output_parses_to_its_fixture_kind(name):
     assert failure is not None, res.stderr[-2000:]
     assert failure["kind"] == want["kind"]
     assert failure["alarm_kind"] == want["alarm_kind"]
+    # UBSan prints no stack: its function comes from the source file, which stays in the container here.
+    if not want["kind"].startswith("ubsan_"):
+        assert failure["function"] == want["function"], res.stderr[-2000:]
