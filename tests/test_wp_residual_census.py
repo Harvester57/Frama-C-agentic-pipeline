@@ -151,6 +151,31 @@ def _by_fn(data: dict) -> dict[str, dict]:
     return {r["function"]: r for r in data["functions"]}
 
 
+def test_verdicts_by_prover_only_for_single_prover_runs(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    goals = [_goal(20, "q1"), _goal(21, "q2"), _goal(22, "q3")]
+    costs = [
+        _cost("one_assert_rte_mem_access", "timeout", 20),
+        _cost("one_assert_rte_mem_access_2", "stepout", 21),
+        _cost("one_assert_rte_mem_access_3", "unknown", 22),
+    ]
+    _write(run, "one", _report("one", goals, 5, costs=costs, wp_provers=["z3"]))
+    _write(run, "two", _report("two", goals, 5, costs=costs, wp_provers=["alt-ergo", "z3"]))
+    _write(run, "old", _report("old", goals[:2], 5))
+    _write(run, "fail", _report("fail", goals[:1], 5, costs=[_cost("p", "failed", 20)], wp_provers=["z3"]))
+    data = census_mod.census(run)
+    fns = _by_fn(data)
+    assert fns["one"]["by_prover"] == {"z3": {"timeout": 2, "gave_up": 1, "failed": 0}}
+    assert fns["one"]["without_prover_data"] == 0
+    assert fns["two"]["by_prover"] == {} and fns["two"]["without_prover_data"] == 3
+    assert fns["old"]["by_prover"] == {} and fns["old"]["without_prover_data"] == 2
+    assert data["totals"]["unproved_by_prover"] == {"z3": {"timeout": 2, "gave_up": 1, "failed": 1}}
+    assert data["totals"]["unproved_without_prover_data"] == 5
+    assert any("5 unproved goal(s) have no per-prover data" in n for n in data["notes"])
+    table = census_mod.render_table(data)
+    assert "| z3 | 2 | 1 | 1 |" in table and "Goals without per-prover data: 5" in table
+
+
 def test_report_counts_fail_closed(census_run: Path) -> None:
     data = census_mod.census(census_run)
     reports = data["reports"]

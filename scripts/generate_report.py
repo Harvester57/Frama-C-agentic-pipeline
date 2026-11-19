@@ -800,6 +800,7 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
     # `limits.guardrail` of each unit's latest credited WP result: `not_run` is never a pass.
     no_guardrail: dict[str, str] = {}
     clauses_unreported: set[str] = set()
+    frames: dict[str, dict] = {}
     credited = 0
     for u in ledger:
         guard_passed = False
@@ -839,6 +840,9 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
                 shapes[name] = shape
             else:
                 shapes.setdefault(name, CONTRACT_SHAPE_NOT_RECORDED)
+            frame = limits.get("frame_only_ensures")
+            if isinstance(frame, dict) and frame.get("status") in ("decided", "undecided"):
+                frames[name] = frame
         if latest_guard is not None and latest_guard.get("status") != GUARDRAIL_PASSED_STATUS:
             why = " ".join(str(latest_guard.get("reason") or "no reason recorded").split())[:200]
             if latest_guard.get("status") != "not_run":
@@ -854,19 +858,46 @@ def verdict_limits_section(ledger: list[dict]) -> list[str]:
         "- Contract consistency means no prover refuted the contract within its timeout, not that it is satisfiable.",
         "- Trivial-clause detection is syntactic: a tautology it cannot recognize is still credited.",
     ]
+    # The semantic reading wins when it decided that every `ensures` follows from the frame alone; an
+    # `ensures` it could not derive from the frame is no evidence of a functional contract.
+    semantic = {
+        name
+        for name, f in frames.items()
+        if f.get("status") == "decided"
+        and f.get("all_frame_only") is True
+        and int(f.get("ensures") or 0) > 0
+        and shapes.get(name) in ("functional", "safety_only")
+    }
+    for name in semantic:
+        shapes[name] = "safety_only"
     shape_counts = Counter(shapes.values())
     if set(shape_counts) - {CONTRACT_SHAPE_NOT_RECORDED}:
         order = [s for s in CONTRACT_SHAPE_ORDER if s in shape_counts] + sorted(
             set(shape_counts) - set(CONTRACT_SHAPE_ORDER)
         )
         out.append(
-            "- Contract shape of the proven functions, read from the contract text (syntactic): "
+            "- Contract shape of the proven functions, read from the contract text (syntactic"
+            + (f"; {len(semantic)} `safety_only` by the semantic reading" if semantic else "")
+            + "): "
             + ", ".join(f"`{s}` {shape_counts[s]}" for s in order)
             + ". A `safety_only` proof is fully credited for the absence of runtime errors, but its "
             "postconditions state validity, initialization or a constant range at most, so a caller learns "
             "nothing about the result."
         )
-    safety_only = {name for name, shape in shapes.items() if shape == "safety_only"}
+    if frames:
+        decided = [f for f in frames.values() if f.get("status") == "decided"]
+        total = sum(int(f.get("ensures") or 0) for f in decided)
+        frame_only = sum(len(f.get("frame_only") or []) for f in decided)
+        undecided = len(frames) - len(decided)
+        out.append(
+            f"- Postconditions that follow from the `requires` and `assigns` alone (semantic, contract refinement "
+            f"probe): {frame_only} of {total} `ensures` in {len(decided)} proven functions; the probe could not "
+            f"decide for {undecided} function(s). Such a postcondition holds for any body, so it tells a caller "
+            "nothing about this one."
+        )
+    safety_only = {
+        f"{name} (semantic)" if name in semantic else name for name, shape in shapes.items() if shape == "safety_only"
+    }
     for label, names in (
         ("Proven with a safety-only contract", safety_only),
         ("Proven, but no guardrail input reached the function", unexercised),

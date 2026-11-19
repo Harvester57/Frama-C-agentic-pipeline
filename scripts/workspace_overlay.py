@@ -40,6 +40,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import contract_refinement  # noqa: E402
 import function_facts  # noqa: E402
 import function_slice  # noqa: E402
 import line_endings  # noqa: E402
@@ -65,6 +66,8 @@ from acsl_ast import (  # noqa: E402
     is_trust_boundary,
     locate_all_definition_spans,
     locate_all_prototype_spans,
+    locate_function_span,
+    mask_comments_and_literals,
     splice_architect_header,
     splice_prover_changes,
     verify_acsl_only,
@@ -1560,6 +1563,62 @@ def _no_frame_refusal(function: str | None, frame_state: str) -> str:
     )
 
 
+def _merged_contract(
+    work_dir: Path, c_file: str | None, function: str | None, cppflags: str
+) -> contract_refinement.FunctionContract | None:
+    """The contract of `function` as it stands in `work_dir` (None when it cannot be read)."""
+    if not c_file or not function:
+        return None
+    try:
+        return contract_refinement.read_function_contract(work_dir / c_file, function, cppflags)
+    except (OSError, AcslError):
+        return None
+
+
+def record_contract_refinement(
+    run_dir: Path,
+    overlay_dir: Path,
+    agent_id: str,
+    c_file: str,
+    function: str,
+    cppflags: str,
+    previous: contract_refinement.FunctionContract | None,
+) -> dict | None:
+    """
+    Merge re-check, use 1 of scripts/contract_refinement.py: whether the contract just merged for
+    `function` gives everything the contract it replaced did. Runs on the merged tree after the parent
+    WP re-check passed, and writes the verdict into the parent WP report (`contract_refinement`) and its
+    canonical copy. `weaker` and `undecided` never block the merge: the scheduler re-checks the merged
+    callers against the new contract and reopens any whose proof no longer holds. None (nothing recorded)
+    when no contract was merged before.
+    """
+    if previous is not None and not previous.pieces:
+        return None
+    work_dir = overlay_dir / "work"
+    new = _merged_contract(work_dir, c_file, function, cppflags)
+    if previous is None or new is None:
+        res: dict = {
+            "verdict": contract_refinement.UNDECIDED,
+            "reason": "the previous or the merged contract could not be read",
+            "probe_run": False,
+        }
+    else:
+        try:
+            res = contract_refinement.refinement_check(new, previous, work_dir / c_file, cppflags)
+        except Exception as exc:  # the check is a record: it never fails a merge that passed its re-check
+            res = {"verdict": contract_refinement.UNDECIDED, "reason": f"{type(exc).__name__}: {exc}"}
+    wp_json = run_dir / _parent_wp_report_rel(agent_id, function)
+    try:
+        wp_report = json.loads(wp_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        wp_report = None
+    if isinstance(wp_report, dict):
+        wp_report["contract_refinement"] = res
+        wp_json.write_text(json.dumps(wp_report, indent=2) + "\n", encoding="utf-8")
+        _publish_canonical_wp(run_dir, overlay_dir, wp_json, c_file, function)
+    return res
+
+
 def _parent_guard_json(run_dir: Path, agent_id: str, function: str | None, module: str | None) -> Path:
     """Where `_run_parent_reverify` writes its guardrail report."""
     return run_dir / "agents" / agent_id / "scratch" / f"parent_guard_{function or module}.json"
@@ -2308,6 +2367,12 @@ def _merge_agent_overlay_locked(
         if isinstance(side_sources, list):
             sources = [str(s) for s in side_sources if isinstance(s, str) and s] or None
 
+    # The contract this merge replaces, read before the splice is written: the merge re-check compares
+    # the merged contract against it (record_contract_refinement).
+    previous_contract = (
+        _merged_contract(shared_work, norm_c_file, function, cppflags) if role == "prover" and changed_rels else None
+    )
+
     if journal:
         _write_merge_journal(run_dir, f"merge-agent:{agent_id}", backups)
     try:
@@ -2447,6 +2512,15 @@ def _merge_agent_overlay_locked(
         # The report to ingest: written for this agent only, so same-named functions never collide.
         result["parent_wp_report"] = _parent_wp_report_rel(agent_id, function)
         _note_frame_state(run_dir, result)
+        if norm_c_file and changed_rels:
+            refinement = record_contract_refinement(
+                run_dir, overlay, agent_id, norm_c_file, function, cppflags, previous_contract
+            )
+            if refinement is not None:
+                result["contract_refinement"] = refinement
+    elif role == "prover" and skip_reverify and previous_contract is not None:
+        # A batch splice: the batch re-check runs the comparison once its round passes.
+        result["previous_contract"] = previous_contract.to_dict()
     return result
 
 
@@ -2935,6 +3009,8 @@ def _merge_agent_batch_locked(
 
     if skip_reverify or not spliced_entries:
         merged_results = [r for _, r in spliced_entries]
+        for r in merged_results:
+            r.pop("previous_contract", None)
         return {
             "ok": len(failed_results) == 0,
             "batch_verified": not skip_reverify,
@@ -2985,9 +3061,27 @@ def _merge_agent_batch_locked(
     for item, r in active:
         # The splice ran without a re-check; the batch's own checks are what this item's guardrail status is.
         r["guardrail"] = item.get("guardrail") or guardrail_not_run("the batch ran no check for this item")
+        raw_previous = r.pop("previous_contract", None)
         if verify_hook is None and item["role"] == "prover" and item.get("function"):
             r["parent_wp_report"] = _parent_wp_report_rel(item["agent_id"], item["function"])
             _note_frame_state(run_dir, r)
+            if item.get("c_file") and r.get("modified_files"):
+                previous = (
+                    contract_refinement.FunctionContract.from_dict(raw_previous)
+                    if isinstance(raw_previous, dict)
+                    else None
+                )
+                refinement = record_contract_refinement(
+                    run_dir,
+                    overlay,
+                    item["agent_id"],
+                    _normalize_work_relpath(item["c_file"]),
+                    item["function"],
+                    item["cppflags"],
+                    previous,
+                )
+                if refinement is not None:
+                    r["contract_refinement"] = refinement
         merged_results.append(r)
 
     for item, batch_reason in deferred:
@@ -3163,6 +3257,159 @@ def _callees_without_contract_section(callees: list[str] | None, role: str) -> s
         "nothing. Do not assume any postcondition of these calls, do not write a contract for them, and do not "
         "file a strengthening request for them. Prove what holds without them, and list the goals that depend "
         "on their effects in `unproven_goals`.\n"
+    )
+
+
+CALLER_USAGE_MAX_CALLERS = 6
+CALLER_USAGE_LINES_AFTER = 4
+CALLER_USAGE_MAX_LINE_CHARS = 160
+
+
+def _call_sites(work_dir: Path, caller_file: str, caller: str, callee: str) -> list[tuple[int, list[str]]]:
+    """
+    The textual calls of `callee` in the definition of `caller` (`work_dir/caller_file`): for each, its
+    1-based line and the source lines from the call line on (at most CALLER_USAGE_LINES_AFTER after it,
+    never past the caller's body). Comments, literals and ACSL are not searched. [] when the file or the
+    definition cannot be read, or the call is not written by name (a call through a pointer).
+    """
+    try:
+        text = (work_dir / caller_file).read_text(encoding="utf-8", errors="replace")
+        span = locate_function_span(text, caller, path=caller_file)
+    except (OSError, AcslError):
+        return []
+    if span is None:
+        return []
+    body = text[span.start_byte : span.end_byte]
+    masked = mask_comments_and_literals(body, acsl="blank", on_error="mask", path=caller_file)
+    lines = text.splitlines()
+    sites: list[tuple[int, list[str]]] = []
+    seen: set[int] = set()
+    for match in re.finditer(rf"(?<![A-Za-z0-9_.>]){re.escape(callee)}\s*\(", masked):
+        line = span.start_line + masked.count("\n", 0, match.start())
+        if line in seen:
+            continue
+        seen.add(line)
+        last = min(line + CALLER_USAGE_LINES_AFTER, span.end_line, len(lines))
+        sites.append((line, [lines[i - 1][:CALLER_USAGE_MAX_LINE_CHARS] for i in range(line, last + 1)]))
+    return sites
+
+
+def _caller_usage_section(overlay: Path, function: str | None, fn_meta: dict, dag_fns: dict, role: str) -> str:
+    """
+    "How the callers use this function" in a prover's brief: for each direct caller in the call-graph
+    DAG, its first textual call of `function` and the lines after it, read from `workspace/work/`. A
+    function with no caller in the DAG gets a sentence saying it is an entry point. Empty for other roles
+    and when the DAG has no record of the function.
+    """
+    if role != "prover" or not function or not fn_meta:
+        return ""
+    name = function.rpartition("#")[2]
+    callers = [str(c) for c in fn_meta.get("internal_callers") or []]
+    head = "\n## How the Callers Use This Function\n\n"
+    if not callers:
+        return (
+            head + f"No function in the analysed code calls `{name}`: it is an API entry point (or reached only "
+            "through a function pointer). Its callers are outside the slice, so its contract is what they rely "
+            "on: state in `ensures` what the function gives them (the result's range and meaning, the memory "
+            "it writes), not only that it runs without errors.\n"
+        )
+    blocks: list[str] = []
+    not_shown = 0
+    for key in callers:
+        rec = dag_function_record(dag_fns, key)
+        cfile = _normalize_work_relpath(str(rec.get("file") or "")) if rec else ""
+        cname = str(rec.get("name") or key.rpartition("#")[2]) if rec else key.rpartition("#")[2]
+        if len(blocks) >= CALLER_USAGE_MAX_CALLERS:
+            not_shown += 1
+            continue
+        sites = _call_sites(overlay / "work", cfile, cname, name) if cfile else []
+        if not sites:
+            not_shown += 1
+            continue
+        line, text = sites[0]
+        more = f", and {len(sites) - 1} more call(s) in it" if len(sites) > 1 else ""
+        code = "\n".join(text).replace("```", "'''")
+        blocks.append(f"`{cname}` (`{cfile}` line {line}{more}):\n\n```c\n{code}\n```\n")
+    if blocks:
+        out = (
+            head
+            + f"Where the direct callers of `{name}` call it, and what they do next (from `workspace/work/`):\n\n"
+            + "\n".join(blocks)
+        )
+    else:
+        out = head + f"No call of `{name}` by name was found in its callers' code.\n"
+    if not_shown:
+        out += (
+            f"\n{not_shown} caller(s) not shown: over the limit of {CALLER_USAGE_MAX_CALLERS}, or calling "
+            "through a pointer or a macro.\n"
+        )
+    return out
+
+
+PROVEN_EXAMPLES_MAX = 2
+PROVEN_EXAMPLE_MAX_LINES = 30
+
+
+def _example_candidates(function: str, fn_meta: dict, dag_fns: dict) -> list[tuple[int, str]]:
+    """(distance, DAG key) of the functions near `function`: its direct callees (0), then the other callees
+    of its direct callers (1), in DAG order, each once and never `function` itself."""
+    name = function.rpartition("#")[2]
+    out: dict[str, int] = {}
+    for key in fn_meta.get("internal_callees") or []:
+        out.setdefault(str(key), 0)
+    for caller in fn_meta.get("internal_callers") or []:
+        for key in dag_function_record(dag_fns, str(caller)).get("internal_callees") or []:
+            out.setdefault(str(key), 1)
+    return [(d, k) for k, d in out.items() if k.rpartition("#")[2] != name]
+
+
+def _proven_examples_section(
+    overlay: Path, function: str | None, fn_meta: dict, dag_fns: dict, cppflags: str, role: str
+) -> str:
+    """
+    "Proven Contracts Near This Function" in a prover's brief: up to PROVEN_EXAMPLES_MAX contracts of
+    functions already `all_proven` in this run (their latest WP report, `load_function_wp_report`), the
+    nearest in the call graph first (direct callees, then functions sharing a caller) and, at the same
+    distance, a `functional` contract shape before any other. Each contract is inlined as written in
+    `workspace/work/`, cut at PROVEN_EXAMPLE_MAX_LINES lines. Empty when none is proven yet.
+    """
+    if role != "prover" or not function or not fn_meta:
+        return ""
+    work = overlay / "work"
+    found: list[tuple[int, int, str, str, contract_refinement.FunctionContract]] = []
+    for order, (distance, key) in enumerate(_example_candidates(function, fn_meta, dag_fns)):
+        rec = dag_function_record(dag_fns, key)
+        cfile = _normalize_work_relpath(str(rec.get("file") or "")) if rec else ""
+        cname = str(rec.get("name") or key.rpartition("#")[2]) if rec else ""
+        if not cfile or not cname:
+            continue
+        report = load_function_wp_report(overlay, cfile, cname)
+        if report.get("status") != "all_proven":
+            continue
+        contract = _merged_contract(work, cfile, cname, cppflags)
+        if contract is None or not contract.pieces:
+            continue
+        shape = str((report.get("limits") or {}).get("contract_shape") or "not recorded")
+        found.append((distance * 2 + (shape != "functional"), order, cname, cfile, contract))
+    if not found:
+        return ""
+    found.sort(key=lambda item: item[:2])
+    blocks = []
+    for _, _, cname, cfile, contract in found[:PROVEN_EXAMPLES_MAX]:
+        lines: list[str] = []
+        for piece in contract.pieces:
+            lines += [*piece.acsl.splitlines(), f"{piece.declarator};"]
+        cut = len(lines) - PROVEN_EXAMPLE_MAX_LINES
+        if cut > 0:
+            lines = [*lines[:PROVEN_EXAMPLE_MAX_LINES], f"/* ... {cut} more line(s) in workspace/work/{cfile} */"]
+        code = "\n".join(lines).replace("```", "'''")
+        blocks.append(f"`{cname}` (`{cfile}`):\n\n```c\n{code}\n```\n")
+    return (
+        "\n## Proven Contracts Near This Function\n\n"
+        "Contracts this run has already proven (WP `all_proven`) for functions close to yours in the call "
+        "graph, as they stand in `workspace/work/`. WP proved them on this code base, so their idioms, "
+        "predicates and level of detail are a model to follow. Never copy a clause without checking that it "
+        "holds for your function.\n\n" + "\n".join(blocks)
     )
 
 
@@ -3688,6 +3935,8 @@ def prepare_agent(
             "```json\n" + json.dumps(requests, indent=2) + "\n```\n"
         )
         rendered += _negotiation_evidence_section(caller_evidence, callee_history)
+    rendered += _caller_usage_section(overlay, function, fn_meta, dag_fns, role)
+    rendered += _proven_examples_section(overlay, function, fn_meta, dag_fns, eff_cppflags, role)
     rendered += _callees_without_contract_section(callees_without_contract, role)
     rendered += _rejected_result_section(rejected_result, agent_id, role)
 
