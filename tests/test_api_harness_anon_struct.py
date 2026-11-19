@@ -29,6 +29,7 @@ AS_KV = "struct __anonstruct_kv_t_2"
 AS_NUM = "union __anonunion_num_t_3"
 AS_SBUF = "struct __anonstruct_sbuf_t_4"
 AS_BARE = "struct __anonstruct_5"  # a struct with no name at all: declared inside a parameter list
+AS_BIG = "struct __anonstruct_big_t_6"
 
 # name -> (model signature, formal kinds, the declaration's parameter types as clang writes them, return).
 AS_API: dict[str, tuple[str, list[str], list[str], str]] = {
@@ -47,6 +48,9 @@ AS_API: dict[str, tuple[str, list[str], list[str], str]] = {
     ),
     "sbuf_free": (f"void({AS_SBUF} *)", ["pointer"], ["sbuf_t *"], "void"),
     "anon_use": (f"int({AS_BARE} *)", ["pointer"], ["struct (unnamed struct at lib.h:21:14) *"], "int"),
+    # GMP's shape: `typedef struct { int _mp_alloc; int _mp_size; mp_limb_t *_mp_d; } __mpz_struct;`
+    # and `typedef __mpz_struct mpz_t[1];`, a parameter `const mpz_t x` decays to `const big_t *`.
+    "big_top": (f"unsigned long({AS_BIG} *)", ["const_pointer"], ["const big_t *"], "unsigned long"),
 }
 # The model's call-site sizes: str_copy's destination is a 16-byte object at its call sites.
 AS_SIZES: dict[str, dict[str, dict[str, int]]] = {"str_copy": {"0": {"min": 16, "max": 16, "sites": 2}}}
@@ -57,8 +61,9 @@ AS_FIELDS: dict[str, list[tuple[str, str, str | None]]] = {
     "kv_t": [("key", "str_t", None), ("value", "str_t", None)],
     "num_t": [("i", "int", None), ("f", "float", None)],
     "sbuf_t": [("buf", "unsigned char *", None), ("cap", "size_t", "unsigned long"), ("used", "size_t", "unsigned long")],
+    "big_t": [("alloc_", "int", None), ("size", "int", None), ("limbs", "unsigned long *", None)],
 }
-AS_WHAT = {"str_t": "struct", "kv_t": "struct", "num_t": "union", "sbuf_t": "struct"}
+AS_WHAT = {"str_t": "struct", "kv_t": "struct", "num_t": "union", "sbuf_t": "struct", "big_t": "struct"}
 
 
 def _as_records(names: list[str], api: dict | None = None) -> dict[str, dict]:
@@ -276,12 +281,25 @@ def test_an_anonymous_struct_typedef_gets_its_initializer_and_destructor():
     cases = _as_cases(_as_plan(list(AS_API)))
     put = cases["sbuf_put"]
     assert "sbuf_t c0a0; memset(&c0a0, 0, sizeof(c0a0));" in put, put
-    assert put.index("sbuf_init(&c0a0, ") < put.index("sbuf_put(&c0a0, ") < put.index("(void)sbuf_free(&c0a0);"), put
+    init = "sbuf_init((sbuf_t *)&c0a0, "
+    assert put.index(init) < put.index("sbuf_put(&c0a0, ") < put.index("(void)sbuf_free(&c0a0);"), put
     # The initializer's own case releases what it set up; the destructor's case runs after an initializer.
     assert "(void)sbuf_free(" in cases["sbuf_init"]
     free_ = cases["sbuf_free"]
-    assert free_.index("sbuf_init(&c0a0, ") < free_.index("(void)sbuf_free(&c0a0);"), free_
+    assert free_.index(init) < free_.index("(void)sbuf_free(&c0a0);"), free_
     assert free_.count("sbuf_free(") == 1
+
+
+@pytest.mark.unit
+def test_a_length_of_wider_elements_before_its_pointer_stays_zero():
+    """GMP's `__mpz_struct { _mp_alloc, _mp_size, _mp_d }`: `_mp_size` counts limbs of a buffer the harness owns."""
+    stmt = _as_cases(_as_plan(list(AS_API)))["big_top"]
+    assert "big_t c0a0; memset(&c0a0, 0, sizeof(c0a0));" in stmt, stmt
+    assert "memcpy(&c0a0.alloc_, " in stmt
+    assert "memcpy(&c0a0.size, " not in stmt, stmt
+    assert re.search(r"c0a0\.limbs = \(void \*\)\w+;", stmt), stmt
+    lay = next(lay for lay in _as_plan(list(AS_API))["layouts"] if lay.get("entry") == "lib.c#big_top")
+    assert any("field size" in n for n in lay.get("notes") or []), lay
 
 
 @pytest.mark.unit
@@ -313,6 +331,8 @@ typedef struct { size_t len; unsigned char *data; } str_t;
 typedef struct { str_t key; str_t value; } kv_t;
 typedef union { int i; float f; } num_t;
 typedef struct { unsigned char *buf; size_t cap; size_t used; } sbuf_t;
+typedef struct { int alloc_; int size; unsigned long *limbs; } big_t;
+typedef big_t bignum[1];
 struct holder { str_t name; int x; };
 int str_check(const str_t *s);
 int str_copy(str_t *dst, const str_t *src);
@@ -324,6 +344,7 @@ int sbuf_init(sbuf_t *b, size_t cap);
 int sbuf_put(sbuf_t *b, const unsigned char *p, size_t n);
 void sbuf_free(sbuf_t *b);
 int anon_use(struct { int a; int b; } *p);
+unsigned long big_top(const bignum x);
 """
 
 # Every function reads what its arguments point to, to their length: a length past its buffer is
@@ -360,6 +381,7 @@ int sbuf_put(sbuf_t *b, const unsigned char *p, size_t n) {
     return 0;
 }
 void sbuf_free(sbuf_t *b) { free(b->buf); b->buf = NULL; b->cap = b->used = 0; }
+unsigned long big_top(const bignum x) { return x->size > 0 ? x->limbs[x->size - 1] : 0; }
 """
 
 AS_AST_SCRIPT = "cd /fixture && clang -fsyntax-only -w -x c -Xclang -ast-dump=json lib.h"
