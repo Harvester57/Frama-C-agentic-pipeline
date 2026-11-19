@@ -1928,8 +1928,8 @@ def history_run_dir() -> Path | None:
     return None
 
 
-# First build of a module (no history for its key): sized from Phase 0's measured parse of the link
-# unit(s) its sources come from. nginx run-3: the parse of the 165-file unit peaked at 10471 MiB (the
+# Floor of every `build` lease (a first build has no history; a short aborted attempt records a tiny
+# peak): sized from Phase 0's measured parse of the link unit(s) its sources come from. nginx run-3: the parse of the 165-file unit peaked at 10471 MiB (the
 # model container's record); two E-ACSL builds of 163 and 161 of those files, admitted at the class's
 # 2048 MiB, held 8.76 and 8.39 GB each when the 17 GiB container's OOM killer struck. An E-ACSL build
 # parses the same files again before instrumenting them, so the parse peak scaled by the share of the
@@ -2003,7 +2003,8 @@ def first_build_estimate(
     run_dir: Path | str | None, cmd: list[str], cache_dir: Path | str | None = None
 ) -> tuple[int, str] | None:
     """
-    (MiB, basis) for the first build of a module, or None when Phase 0 measured nothing usable:
+    (MiB, basis) for a module's build (cmd_run takes the larger of it and the key's history), or None
+    when Phase 0 measured nothing usable:
     EACSL_BUILD_MARGIN x sum over the model's parse jobs of (the job's parse peak x the share of its
     sources the build compiles). A job's parse peak comes from its own `parse` lease history
     (`p0-<job>`, already with history_estimate's margin), else from the model container's record, split
@@ -2996,15 +2997,25 @@ def oom_kills_during(before: dict, after: dict) -> int | None:
     return max(0, int(a) - int(b))
 
 
-def oom_evidence(rc: int, before: dict, after: dict, *, single: bool, peak_mb: int | None, lease_mb: int) -> str | None:
+def oom_evidence(
+    rc: int,
+    before: dict,
+    after: dict,
+    *,
+    single: bool,
+    peak_mb: int | None,
+    lease_mb: int,
+    gated: bool = True,
+) -> str | None:
     """
     Why the cgroup's OOM kills during a job are charged to it, or None. The kill can hit a grandchild
     (E-ACSL's Frama-C under run_eacsl_fuzz.py), after which the job exits with its own code, so a
     kill is charged when the job was SIGKILLed itself (`sigkill`), when it held the only lease from
     grant to release (`alone`: nothing else of the broker ran), or when its own peak overran its
-    lease (`overran_lease`: grants never exceed the pool, so only jobs above their grant can push
-    the container over it). A job that stayed within its lease beside others is not charged: the
-    kill may be a neighbour's, and its record keeps only `oom_kills_during`.
+    lease (`overran_lease`: gated grants never exceed the pool, so only jobs above their grant can
+    push the container over it; an ungated `light` lease is outside that sum, so it never qualifies).
+    A job that stayed within its lease beside others is not charged: the kill may be a neighbour's,
+    and its record keeps only `oom_kills_during`.
     """
     if not oom_kills_during(before, after):
         return None
@@ -3012,7 +3023,7 @@ def oom_evidence(rc: int, before: dict, after: dict, *, single: bool, peak_mb: i
         return "sigkill"
     if single:
         return "alone"
-    if peak_mb is not None and peak_mb > lease_mb:
+    if gated and peak_mb is not None and peak_mb > lease_mb:
         return "overran_lease"
     return None
 
@@ -3091,11 +3102,13 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
         if attempt > 1:
             return None  # the retry's floor already holds what the first attempt measured
         hist = history_estimate(run_dir, c, k)
-        if hist is None and c == "build":
-            first = first_build_estimate(run_dir, cmd)
-            if first is not None:
-                _say(f"first build of {k or 'this module'}: {first[0]} MiB from Phase 0's parse ({first[1]})")
-                return first[0]
+        if c == "build":
+            # The Phase 0 estimate stays a floor: a build that aborted in seconds (run-3's missing
+            # objs/ngx_modules.c) records a tiny peak, which must not shrink the next whole-program build.
+            phase0 = first_build_estimate(run_dir, cmd)
+            if phase0 is not None and phase0[0] > (hist or 0):
+                _say(f"build of {k or 'this module'}: {phase0[0]} MiB from Phase 0's parse ({phase0[1]})")
+                return phase0[0]
         return hist
 
     broker = Broker(
@@ -3128,10 +3141,12 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
         cg_peak, cg_before = after.get("peak_mb"), before.get("peak_mb")
         if single and cg_peak and (cg_before is None or cg_peak > cg_before) and cg_peak > (peak or 0):
             peak, source = cg_peak, "cgroup"  # alone in the container: its new memory.peak is this job's
-        oom = oom_evidence(rc, before, after, single=single, peak_mb=peak, lease_mb=lease.mem_mb)
+        oom = oom_evidence(rc, before, after, single=single, peak_mb=peak, lease_mb=lease.mem_mb, gated=lease.gated)
         kills = oom_kills_during(before, after)
         _record_run_history(run_dir, cls_name, args.key, lease, rc, oom, kills, peak, source, wall, attempt)
-        if oom and CLASSES[cls_name].idempotent and attempt == 1:
+        # A job that still exited 0 (say, a sanitizer build after its E-ACSL attempt was killed) is not
+        # re-run in place; its record says oom_killed, so its next lease doubles.
+        if oom and rc != 0 and CLASSES[cls_name].idempotent and attempt == 1:
             floor = retry_memory(lease, peak)
             _say(
                 f"{cls_name} job was OOM-killed ({oom}, peak {peak or 'unknown'} MiB) with {lease.mem_mb} MiB; "

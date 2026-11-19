@@ -257,25 +257,39 @@ def test_first_builds_of_two_whole_unit_modules_run_one_at_a_time(build_harness)
     first, second = h.record("nginx__ngx_event_openssl", "end"), h.record("nginx__ngx_files", "end")
     assert (first["mem"], second["mem"]) == (_expected(OPENSSL_UNIT_FILES), _expected(FILES_UNIT_FILES)), h.output()
     assert second["start"] >= first["end"], h.output()
-    assert "first build" in h.output()
+    assert "from Phase 0's parse" in h.output()
+
+
+def test_a_short_aborted_build_does_not_lower_the_phase0_floor(build_harness):
+    """Run-3's repaired attempt aborted in seconds (missing objs/ngx_modules.c): its tiny peak must not size the next."""
+    h = build_harness
+    h.set_pool(POOL_CPUS, POOL_MEM_MB)
+    _run3_dir(h.cwd)
+    R.write_history(h.cwd, {"class": "build", "key": "nginx__ngx_files", "rc": 1, "peak_mb": 120, "oom_killed": False})
+    assert R.history_estimate(h.cwd, "build", "nginx__ngx_files") == 150
+    _start_build(h, "nginx__ngx_files", FILES_UNIT_FILES, hold=0)
+    h.finish()
+    assert h.record("nginx__ngx_files", "end")["mem"] == _expected(FILES_UNIT_FILES), h.output()
 
 
 OOM_GRANDCHILD = """
 import json, os, sys
-state, events, peak = sys.argv[1], sys.argv[2], sys.argv[3]
+state, events, peak, first_rc = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 runs = json.load(open(state)) if os.path.exists(state) else []
 runs.append(int(os.environ["FRAMAC_JOB_MEM_MB"]))
 json.dump(runs, open(state, "w"))
 if len(runs) == 1:
-    # The cgroup OOM killer took a grandchild (Frama-C) at 9000 MiB; the build then fell back and failed.
+    # The cgroup OOM killer took a grandchild (Frama-C) at 9000 MiB; the build then fell back.
     open(peak, "w").write(str(9000 * 1024 * 1024))
     open(events, "w").write("low 0\\nhigh 0\\nmax 3\\noom 1\\noom_kill 1\\n")
-    sys.exit(1)
+    sys.exit(first_rc)
 sys.exit(0)
 """
 
 
-def test_an_oom_kill_below_the_job_is_retried_from_its_observed_peak_and_recorded(build_harness):
+@pytest.mark.parametrize("first_rc", [1, 0])
+def test_an_oom_kill_below_the_job_is_recorded_and_a_failed_job_retried_from_its_peak(build_harness, first_rc):
+    """rc 1: the fallback failed too (run-3), so the job is retried. rc 0: kept, but its next lease doubles."""
     h = build_harness
     h.set_pool(POOL_CPUS, POOL_MEM_MB)
     cg = h.root / "sys/fs/cgroup"
@@ -299,39 +313,50 @@ def test_an_oom_kill_below_the_job_is_retried_from_its_observed_peak_and_recorde
             str(state),
             str(cg / "memory.events"),
             str(cg / "memory.peak"),
+            str(first_rc),
         ],
         h.cwd,
     )
     runs = json.loads(state.read_text(encoding="utf-8"))
-    # max(2 x 2048, 1.25 x 9000): the lease was far below what the job needed.
-    assert proc.returncode == 0 and runs == [2048, 11250], proc.stderr
-    assert "retrying once with 11250 MiB" in proc.stderr
     recs = [
         json.loads(p.read_text(encoding="utf-8"))
         for p in sorted((h.cwd / "state/resource-history/build").glob("*.json"))
     ]
-    assert [(r["rc"], r["oom_killed"], r.get("oom_evidence")) for r in recs] == [(1, True, "alone"), (0, False, None)]
+    first = (first_rc, True, "alone")
+    if first_rc:
+        # max(2 x 2048, 1.25 x 9000): the lease was far below what the job needed.
+        assert proc.returncode == 0 and runs == [2048, 11250], proc.stderr
+        assert "retrying once with 11250 MiB" in proc.stderr
+        assert [(r["rc"], r["oom_killed"], r.get("oom_evidence")) for r in recs] == [first, (0, False, None)]
+    else:
+        assert proc.returncode == 0 and runs == [2048], proc.stderr
+        assert [(r["rc"], r["oom_killed"], r.get("oom_evidence")) for r in recs] == [first]
     assert recs[0]["peak_mb"] == 9000 and recs[0]["oom_kills_during"] == 1
     assert R.history_estimate(h.cwd, "build", "mod1") == 18000  # the next lease doubles the OOM-killed peak
 
 
 @pytest.mark.parametrize(
-    ("rc", "kills", "single", "peak", "lease", "evidence"),
+    ("rc", "kills", "single", "peak", "lease", "gated", "evidence"),
     [
-        (137, 1, False, None, 2048, "sigkill"),
-        (-9, 1, False, 500, 2048, "sigkill"),
-        (1, 1, True, None, 2048, "alone"),
-        (1, 1, False, 8760, 2048, "overran_lease"),  # run-3: 8.76 GB under a 2 GiB lease
-        (1, 1, False, 1500, 2048, None),  # stayed within its lease: the neighbour's OOM, not this job's
-        (1, 1, False, None, 2048, None),  # no peak of its own (no rusage) and not alone: unknown
-        (137, 0, True, 9000, 2048, None),  # SIGKILL without an OOM kill in the cgroup: not an OOM
-        (0, None, True, 9000, 2048, None),  # no memory.events (cgroup v1 without oom_kill, macOS)
+        (137, 1, False, None, 2048, True, "sigkill"),
+        (-9, 1, False, 500, 2048, True, "sigkill"),
+        (1, 1, True, None, 2048, True, "alone"),
+        (0, 1, True, None, 2048, True, "alone"),  # charged; cmd_run retries only a failed job
+        (1, 1, False, 8760, 2048, True, "overran_lease"),  # run-3: 8.76 GB under a 2 GiB lease
+        (1, 1, False, 1500, 2048, True, None),  # stayed within its lease: the neighbour's OOM, not this job's
+        (1, 1, False, None, 2048, True, None),  # no peak of its own (no rusage) and not alone: unknown
+        (0, 1, False, 1100, 1024, False, None),  # an ungated light lease is outside the pool's sum
+        (137, 0, True, 9000, 2048, True, None),  # SIGKILL without an OOM kill in the cgroup: not an OOM
+        (0, None, True, 9000, 2048, True, None),  # no memory.events (cgroup v1 without oom_kill, macOS)
     ],
 )
-def test_oom_evidence_is_charged_only_to_a_job_that_could_have_caused_it(rc, kills, single, peak, lease, evidence):
+def test_oom_evidence_is_charged_only_to_a_job_that_could_have_caused_it(
+    rc, kills, single, peak, lease, gated, evidence
+):
     before = {"oom_kill": 0 if kills is not None else None}
     after = {"oom_kill": kills}
-    assert R.oom_evidence(rc, before, after, single=single, peak_mb=peak, lease_mb=lease) == evidence
+    got = R.oom_evidence(rc, before, after, single=single, peak_mb=peak, lease_mb=lease, gated=gated)
+    assert got == evidence
 
 
 def test_retry_memory_is_grounded_in_the_observed_peak_and_capped_at_the_pool():
