@@ -212,7 +212,7 @@ uses `-wp-prover alt-ergo -wp-timeout 20` and gives the same counts with both.
 On a file that only calls `strlcat`, `frama-c -e-acsl -then-last -print` ends with
 `[e-acsl] Failure: typing was not performed on construct 1` and exit code 4 (both versions). It is
 candidate L4 of
-[`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md). With the
+`frama-c-hunt-2026-11-18-candidates.md` (not committed yet). With the
 patched header the translation ends normally (exit code 0): the postcondition is under `\old`,
 and E-ACSL reports it as not yet supported and ignores it.
 
@@ -293,7 +293,7 @@ Searched live on 2026-11-18 through the read-only API (`glab api`, issues and me
 - **The overview issue #2832 lists it** since 2026-11-18, 21:56 UTC, on the owner's request
   ("update the main discussion but don't fill a unitary issue for this yet"). Four additions
   to its description, the same in
-  [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md):
+  `filing/00-reports-overview-issue.md` (not committed yet):
   - a dated note at the top of "Findings I have not filed";
   - a Libc row in the table of wrong-answer findings, which says a patch exists;
   - a row `44` in the Libc table of the annex;
