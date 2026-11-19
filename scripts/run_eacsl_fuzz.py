@@ -1361,6 +1361,23 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
         if msg not in hints:
             hints.append(msg)
 
+    # Link repair needed a file that is not there (nginx's generated objs/ngx_modules.c): it was not compiled.
+    for missing in (res.get("link_repair") or {}).get("missing_sources") or []:
+        _add(
+            f"Link repair needs {missing.get('file')} (it defines {', '.join(missing.get('symbols') or [])}) and did "
+            f"not add it, because the file does not exist: {missing.get('reason')}."
+        )
+    # Earlier attempts of a repaired build: their failure differs from the last one's (`build_attempts`).
+    for attempt in (res.get("build_attempts") or [])[:-1]:
+        killed = [part for part in (attempt, attempt.get("eacsl") or {}) if part.get("killed")]
+        if killed:
+            logs = ", ".join(attempt.get("logs") or []) or "overwritten"
+            _add(
+                f"Build attempt {attempt.get('attempt')} was killed (return code {killed[0].get('returncode')}): out "
+                "of memory or a hard limit, not a compile error. The report's `compile` is the last attempt's; "
+                f"this attempt's logs: {logs}."
+            )
+
     if status == "rejected_overconstrained":
         failure = res.get("failure") or {}
         kind = (failure.get("kind") or "").lower()
@@ -2919,6 +2936,8 @@ def _run_build_mode(args) -> dict:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
     if build.get("link_repair"):
         res["link_repair"] = build["link_repair"]
+    if build.get("attempts"):
+        res["build_attempts"] = build["attempts"]
     note_security_props(res, build_security_props(build))
     if args.engine == "auto" and build["engine_used"] == "eacsl":
         # The campaign falls back to the sanitizers when the selftest fails: build them now, with the
@@ -3122,6 +3141,8 @@ def _run_campaign_mode(args) -> dict:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
     if build.get("link_repair"):
         res["link_repair"] = build["link_repair"]
+    if build.get("attempts"):
+        res["build_attempts"] = build["attempts"]
     note_security_props(res, build_security_props(build))
     induced = harness_induced_failures(res.get("artifacts"))
     if induced:

@@ -40,6 +40,12 @@ the run's named Docker volume at /framac-scratch:
      reports, without running the dynamic loader on target binaries). The headers the build generated in
      the tree (`config.h`: named in a dependency list, absent from the target) are copied to
      <run>/workspace/snapshot/generated/<tree-relative path>, with the include directories that find them.
+     The C sources the build generated and compiled (nginx's `objs/ngx_modules.c`: a compile's source,
+     absent from the target) go there too (manifest `generated_sources`, in the digest), and are installed
+     in the run's overlay, <run>/workspace/baseline/ and work/, at their tree path
+     (target_env.install_generated_sources): the analyses after Phase 0 compile them from workspace/work
+     like the target's own files, once the scratch tree is gone. A generated source the build deleted
+     (a yacc or lex intermediate) cannot be kept: `snapshot.generated.sources_deleted` and a warning.
      The libc headers in the dependency lists that Frama-C's libc lacks (`linux-libc-dev`'s, glibc's
      `elf.h`) are copied to <run>/workspace/snapshot/libc/<absolute path>, so Frama-C parses read the
      build image's versions (FRAMAC_LIBC_GAP_PACKAGES, FRAMAC_LIBC_GAP_FILES).
@@ -1348,6 +1354,25 @@ def generated_headers(compiles: Iterable[dict], target: Path) -> list[str]:
     return sorted(h for h in named if not (target / h).is_file())
 
 
+def generated_sources(compiles: Iterable[dict], target: Path, tree: Path) -> tuple[list[str], list[str]]:
+    """
+    C sources the build generated, as (kept, deleted): a compile's source inside the tree that the
+    read-only target does not have (nginx's configure writes objs/ngx_modules.c). `kept` are still in the
+    build tree after the build, so the snapshot can keep them; `deleted` are gone (a yacc or lex output
+    make removed), and no later step will find them.
+    """
+    kept: list[str] = []
+    deleted: list[str] = []
+    named = {c.get("source") for c in compiles}
+    for src in sorted(s for s in named if isinstance(s, str) and s):
+        if posixpath.isabs(src) or os.path.isabs(src) or ".." in src.split("/") or not src.lower().endswith(".c"):
+            continue
+        if (target / src).is_file():
+            continue
+        (kept if (tree / src).is_file() else deleted).append(src)
+    return kept, deleted
+
+
 def generated_include_dirs(headers: list[str], compiles: Iterable[dict]) -> list[str]:
     """
     Tree-relative directories the analyses search for the generated headers: each header's own directory
@@ -1435,13 +1460,15 @@ def export_snapshot(
     generated: dict[str, Path] | None = None,
     generated_dirs: list[str] | None = None,
     libc: dict[str, Path] | None = None,
+    sources: dict[str, Path] | None = None,
 ) -> dict:
     """
-    Copy the exported files under <snapshot>/root/<absolute path>, the build's generated headers under
-    <snapshot>/generated/<tree-relative path> and the libc headers Frama-C's libc lacks (`libc`: absolute
-    path -> file to copy) under <snapshot>/libc/<absolute path>; digest over (path, sha256), the generated
-    headers keyed `generated/<path>` and the libc ones `libc/<path>` (a snapshot without either keeps the
-    digest it always had).
+    Copy the exported files under <snapshot>/root/<absolute path>, the build's generated headers and C
+    sources (`sources`: tree-relative path -> file to copy) under <snapshot>/generated/<tree-relative
+    path> and the libc headers Frama-C's libc lacks (`libc`: absolute path -> file to copy) under
+    <snapshot>/libc/<absolute path>; digest over (path, sha256), the generated files keyed
+    `generated/<path>` and the libc ones `libc/<path>` (a snapshot without any keeps the digest it always
+    had). The manifest lists the sources apart (`generated_sources`): they are no include directory.
     """
     root = snapshot / "root"
     if snapshot.exists():
@@ -1465,6 +1492,15 @@ def export_snapshot(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dest)
         gen[rel] = sha256_file(dest)
+    gen_sources: dict[str, str] = {}
+    for rel in sorted(sources or {}):
+        src = (sources or {})[rel]
+        if rel in gen or posixpath.isabs(rel) or ".." in rel.split("/") or not src.is_file():
+            continue
+        dest = snapshot / target_env.GENERATED_REL / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dest)
+        gen_sources[rel] = sha256_file(dest)
     gaps: dict[str, str] = {}
     for path in sorted(libc or {}):
         src = (libc or {})[path]
@@ -1479,6 +1515,7 @@ def export_snapshot(
         [
             *manifest.items(),
             *((f"{target_env.GENERATED_REL}/{r}", h) for r, h in gen.items()),
+            *((f"{target_env.GENERATED_REL}/{r}", h) for r, h in gen_sources.items()),
             *((f"{target_env.LIBC_REL}{p}", h) for p, h in gaps.items()),
         ]
     )
@@ -1487,10 +1524,15 @@ def export_snapshot(
     if gen:
         data["generated"] = gen
         data["generated_dirs"] = list(generated_dirs or [])
+    if gen_sources:
+        data[target_env.GENERATED_SOURCES_KEY] = gen_sources
     if gaps:
         data["libc"] = gaps
     atomic_write_json(snapshot / "manifest.json", data)
-    summary: dict[str, Any] = {"digest": digest, "files": len(manifest) + len(gen) + len(gaps), "generated": len(gen)}
+    total = len(manifest) + len(gen) + len(gen_sources) + len(gaps)
+    summary: dict[str, Any] = {"digest": digest, "files": total, "generated": len(gen)}
+    if gen_sources:
+        summary["generated_sources"] = len(gen_sources)
     if gaps:
         summary["libc"] = len(gaps)
     return summary
@@ -2210,6 +2252,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     report["build"]["vanished_probes"] = cap.get("vanished_probes") or []
     snapshot = Path.cwd() / target_env.SNAPSHOT_REL
     generated = generated_headers(entries, Path(report["target"]))
+    gen_sources, gen_deleted = generated_sources(entries, Path(report["target"]), tree)
     report["snapshot"] = build_snapshot(
         snapshot,
         tree,
@@ -2219,7 +2262,22 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
         report["warnings"],
         generated=generated,
         generated_dirs=generated_include_dirs(generated, entries),
+        generated_sources=gen_sources,
     )
+    if gen_deleted:
+        report["snapshot"].setdefault("generated", {})["sources_deleted"] = gen_deleted
+        report["warnings"].append(
+            f"{len(gen_deleted)} C source(s) the build generated, compiled and then deleted "
+            f"({', '.join(gen_deleted[:5])}): the snapshot cannot keep them, so no analysis after Phase 0 "
+            "finds them in workspace/work (snapshot.generated.sources_deleted)"
+        )
+    # The analyses after Phase 0 read workspace/work, not the scratch tree: the generated sources go there.
+    gen_install = target_env.install_generated_sources(snapshot.parent, snapshot)
+    if gen_install["annotated"]:
+        report["warnings"].append(
+            "generated source(s) with ACSL merged in workspace/work kept as they are, not replaced by this "
+            f"capture's copy: {', '.join(gen_install['annotated'])}"
+        )
 
 
 def build_snapshot(
@@ -2231,13 +2289,14 @@ def build_snapshot(
     warnings: list[str],
     generated: list[str] | None = None,
     generated_dirs: list[str] | None = None,
+    generated_sources: list[str] | None = None,
 ) -> dict:
     """
     Headers, libraries and their shared dependencies outside the project and libc, copied with a digest
     to the run's snapshot (<run>/workspace/snapshot): every container of the run mounts the run
-    directory, so the analysis image finds them there (scripts/target_env.py). The headers the build
-    generated in the tree (`generated`, tree-relative) go with them: the analyses read the target, not
-    the scratch tree, and would miss `config.h`.
+    directory, so the analysis image finds them there (scripts/target_env.py). The headers and C sources
+    the build generated in the tree (`generated`, `generated_sources`, tree-relative) go with them: the
+    analyses read the target, not the scratch tree, and would miss `config.h` and `objs/ngx_modules.c`.
     """
     t = str(tree)
     libs: dict[str, str] = {}  # path -> how it was found
@@ -2287,6 +2346,8 @@ def build_snapshot(
         {h: tree / h for h in generated or []},
         generated_dirs,
         libc={p: Path(g["source"]) for p, g in gaps.items()},
+        # Only when the build generated some: an export without them is the call it always was.
+        **({"sources": {s: tree / s for s in generated_sources}} if generated_sources else {}),
     )
     result: dict[str, Any] = {
         "root": (snapshot / "root").as_posix(),
@@ -2304,8 +2365,10 @@ def build_snapshot(
         "packages": sorted({e["package"] for e in exported.values() if e.get("package")}),
         "extra": extra,
     }
-    if summary["generated"]:
+    if summary["generated"] or summary.get("generated_sources"):
         result["generated"] = {"headers": sorted(generated or []), "include_dirs": list(generated_dirs or [])}
+        if summary.get("generated_sources"):
+            result["generated"]["sources"] = sorted(generated_sources or [])
     if gaps:
         result["framac_libc_gaps"] = [
             {"path": p, "package": gaps[p]["package"]}

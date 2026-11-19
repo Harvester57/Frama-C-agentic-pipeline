@@ -13,6 +13,11 @@ them from there instead:
   - generated headers: the headers the build generated in its tree (`config.h`), which the target
     does not have, under `generated/<tree-relative path>` with the manifest's `generated_dirs`;
     `-idirafter <snapshot>/generated/<dir>` for each, before the system directories;
+  - generated C sources: the translation units the build generated and compiled (nginx's
+    `objs/ngx_modules.c`), under `generated/<tree-relative path>` with the manifest's
+    `generated_sources` (path -> sha256). They are not read from the snapshot:
+    `install_generated_sources` copies them into the overlay's `baseline/` and `work/` at their tree
+    path, so every consumer finds them where it finds the target's own files (`workspace/work/<path>`);
   - Frama-C's libc gaps (Frama-C parses only, `nostdinc=True`): the build image's copies of the
     libc headers Frama-C's libc lacks (`linux-libc-dev`'s `linux/*` and `asm/*`, glibc's `elf.h`),
     under `libc/<absolute path>` with the manifest's `libc`; `-idirafter <snapshot>/libc/<dir>` for
@@ -39,8 +44,12 @@ from pathlib import Path
 
 SNAPSHOT_REL = "workspace/snapshot"
 CONTAINER_SNAPSHOT_DIR = f"/framac-run/{SNAPSHOT_REL}"
-# The build's generated headers, by tree-relative path, inside the snapshot directory.
+# The build's generated headers and C sources, by tree-relative path, inside the snapshot directory.
 GENERATED_REL = "generated"
+# The manifest key of the generated C sources (tree-relative path -> sha256).
+GENERATED_SOURCES_KEY = "generated_sources"
+# The overlay's metadata file (scripts/workspace_overlay.py init), which records the installed ones.
+OVERLAY_META = "overlay_meta.json"
 # The build image's copies of the libc headers Frama-C's libc lacks, by absolute path, inside the snapshot.
 LIBC_REL = "libc"
 # System include directories gcc searches by default: their target headers come from the snapshot.
@@ -110,6 +119,88 @@ def generated_include_flags(d: Path | None = None) -> list[str]:
         path = base if rel in ("", ".") else base / rel
         if path.is_dir() and path.as_posix() not in out[1::2]:
             out += ["-idirafter", path.as_posix()]
+    return out
+
+
+def _tree_relative(rel: object) -> bool:
+    """A path inside the tree: relative, forward slashes, no `..` component."""
+    return (
+        isinstance(rel, str)
+        and bool(rel)
+        and "\\" not in rel
+        and not posixpath.isabs(rel)
+        and ".." not in rel.split("/")
+    )
+
+
+def generated_source_paths(d: Path | None = None) -> dict[str, str]:
+    """
+    Tree-relative path -> sha256 of the C sources the build generated, from the snapshot manifest
+    (`generated_sources`); {} without a snapshot or for a capture that kept none.
+    """
+    d = d or snapshot_dir()
+    if d is None:
+        return {}
+    data = _manifest(d).get(GENERATED_SOURCES_KEY)
+    if not isinstance(data, dict):
+        return {}
+    return {rel: digest for rel, digest in data.items() if _tree_relative(rel) and isinstance(digest, str)}
+
+
+def install_generated_sources(overlay: Path, snapshot: Path | None = None) -> dict[str, list[str]]:
+    """
+    Copy the C sources the build generated from the snapshot (`<snapshot>/generated/<path>`, manifest
+    `generated_sources`) into the overlay `overlay` (the run's `workspace/`) at the same tree-relative
+    path, in both `baseline/` and `work/`, so the one path rule every consumer uses (`workspace/work/
+    <path>`) finds them after the scratch volume is gone, and the ACSL-only checks and apply-in-place
+    compare `work/` against a baseline. `snapshot` defaults to `<overlay>/snapshot`.
+
+    Per path, the result lists it under `installed` (copied now), `current` (both copies already equal
+    to the snapshot's), `annotated` (`work/` differs from `baseline/`: merged ACSL, left alone) or
+    `missing` (named by the manifest, absent from the snapshot). The overlay's metadata records the
+    installed set as `generated_sources` (path -> sha256), which apply-in-place never writes into the
+    target. Nothing happens without an initialized overlay (`baseline/` and `work/`) or a snapshot that
+    kept generated sources: a target whose build generates none keeps its overlay as it was.
+    """
+    overlay = Path(overlay)
+    snapshot = Path(snapshot) if snapshot is not None else overlay / Path(SNAPSHOT_REL).name
+    out: dict[str, list[str]] = {"installed": [], "current": [], "annotated": [], "missing": []}
+    work, base = overlay / "work", overlay / "baseline"
+    sources = generated_source_paths(snapshot)
+    if not sources or not work.is_dir() or not base.is_dir():
+        return out
+    kept: dict[str, str] = {}
+    for rel in sorted(sources):
+        src = snapshot / GENERATED_REL / rel
+        if not src.is_file():
+            out["missing"].append(rel)
+            continue
+        data = src.read_bytes()
+        kept[rel] = sources[rel]
+        work_file, base_file = work / rel, base / rel
+        work_bytes = work_file.read_bytes() if work_file.is_file() else None
+        base_bytes = base_file.read_bytes() if base_file.is_file() else None
+        if work_bytes is not None and work_bytes != (base_bytes if base_bytes is not None else data):
+            out["annotated"].append(rel)
+            continue
+        if work_bytes == data and base_bytes == data:
+            out["current"].append(rel)
+            continue
+        for dest in (base_file, work_file):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        out["installed"].append(rel)
+    meta_path = overlay / OVERLAY_META
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    except (OSError, ValueError):
+        meta = {}
+    meta = meta if isinstance(meta, dict) else {}
+    if meta.get(GENERATED_SOURCES_KEY) != kept:
+        meta[GENERATED_SOURCES_KEY] = kept
+        tmp = meta_path.with_name(f".{meta_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8", newline="\n")
+        os.replace(tmp, meta_path)
     return out
 
 

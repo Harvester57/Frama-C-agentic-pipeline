@@ -14,6 +14,7 @@ import functools
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -1687,6 +1688,47 @@ def _dag_tree_path(path: str) -> str:
     return p[len("workspace/work/") :] if p.startswith("workspace/work/") else p
 
 
+def _missing_source(sym: str, file: str, norm: str, dag_path: Path, run_dir: Path) -> dict:
+    """
+    Why link repair cannot add `norm` (the overlay path of DAG file `file`, defining `sym`): it does not
+    exist. A file the build compiles and the target does not have is a source the build generated (nginx's
+    objs/ngx_modules.c): the Phase 0 build capture keeps it in the snapshot and installs it in
+    workspace/work (target_env.install_generated_sources). The reason names the step to redo.
+    """
+    rel = _dag_tree_path(file)
+    capture = load_json_optional(Path(dag_path).parent / "build_capture.json", None)
+    capture = capture if isinstance(capture, dict) else {}
+    compiled = any(isinstance(c, dict) and c.get("source") == rel for c in capture.get("compiles") or [])
+    gen = ((capture.get("snapshot") or {}).get("generated") or {}) if isinstance(capture.get("snapshot"), dict) else {}
+    snap = Path(run_dir) / target_env.SNAPSHOT_REL
+    if rel in target_env.generated_source_paths(snap):
+        kind = "generated_source_missing"
+        reason = (
+            f"{rel} is a C source the build generated; the Phase 0 snapshot keeps it "
+            f"({target_env.SNAPSHOT_REL}/{target_env.GENERATED_REL}/{rel}) but it is not installed in "
+            "workspace/work: run `workspace_overlay.py install-generated --overlay workspace`"
+        )
+    elif rel in (gen.get("sources_deleted") or []):
+        kind = "generated_source_missing"
+        reason = (
+            f"{rel} is a C source the build generated, compiled and then deleted, so the Phase 0 build capture "
+            "(build_capture.py run) could not keep it in the snapshot: change the recipe so the build keeps it, "
+            "and run the build capture again"
+        )
+    elif compiled:
+        kind = "generated_source_missing"
+        reason = (
+            f"{rel} is a source the build compiles (build_capture.json) and the target does not have: the build "
+            "generated it, and the Phase 0 build capture (build_capture.py run) did not keep it in the snapshot "
+            f"({target_env.SNAPSHOT_REL}/{target_env.GENERATED_REL}) nor install it in workspace/work. A capture "
+            "made before generated sources were kept never has it: run the build capture again"
+        )
+    else:
+        kind = "source_missing"
+        reason = f"{rel} is not in workspace/work and the build capture does not compile it"
+    return {"file": rel, "path": norm, "symbols": [sym], "kind": kind, "reason": reason}
+
+
 def _link_unit_context(dag_path: Path, module: str | None) -> dict:
     """
     What placing a global needs from the DAG: the link unit record of harness module `module`
@@ -1746,6 +1788,7 @@ def repair_sources_for_link(
     stub_dir: Path | None = None,
     stubbed: list[dict] | None = None,
     unresolved: list[dict] | None = None,
+    missing: list[dict] | None = None,
 ) -> tuple[list[str], dict]:
     """
     One link-repair round: map `undefined reference to 'X'` symbols to their
@@ -1761,6 +1804,10 @@ def repair_sources_for_link(
     the new ones (name, type, file, units, definition, assumption). The globals left undefined
     are appended to `unresolved` (name, file, units, reason), not to `info`, which stays empty
     for a round that repaired nothing.
+    A defining file that does not exist is never added (the compiler would stop on it: E-ACSL's
+    `source file ... does not exist`): it goes to `missing` (file, path, symbols, kind, reason;
+    one record per file), whose reason names the Phase 0 step that should have kept it
+    (`_missing_source`: nginx's generated objs/ngx_modules.c).
     """
     syms = parse_undefined_references(log)
     if not syms or not dag_path:
@@ -1807,6 +1854,15 @@ def repair_sources_for_link(
                 continue
             f = rec["file"]
         norm = _normalize_dag_source(f, Path(run_dir))
+        if norm not in have and not (Path(norm) if posixpath.isabs(norm) else Path(run_dir) / norm).is_file():
+            if missing is not None:
+                record = _missing_source(sym, f, norm, Path(dag_path), Path(run_dir))
+                same = next((m for m in missing if m.get("path") == norm), None)
+                if same is None:
+                    missing.append(record)
+                elif sym not in same["symbols"]:
+                    same["symbols"].append(sym)
+            continue
         if norm not in have:
             have.add(norm)
             added.append(norm)
@@ -1858,9 +1914,12 @@ def build_module_binary(
     definition in the generated `<out_bin>_link_globals/link_globals.c`, recorded under
     `link_repair` as `stubbed_globals` (name, type, file, units, definition, assumption) with
     `globals_file`: an assumption of the build, to show in the report. `unresolved_globals`
-    (name, file, units, reason) lists the globals no rule could define.
+    (name, file, units, reason) lists the globals no rule could define, `missing_sources` the defining
+    files that do not exist (a generated source Phase 0 did not keep), which are never compiled.
     Returns {compile, engine_used, engine_fallback_reason, eacsl_compile_attempt, sources}, where
-    `sources` is what was compiled last (the input plus any repair).
+    `sources` is what was compiled last (the input plus any repair). After a repair, `attempts` lists
+    every attempt (engine, return code, reason, `killed`, the end of stderr, the E-ACSL attempt that
+    fell back, and the earlier attempts' logs kept as `<log stem>.attempt<N>.log`).
     With `apply_selftest` False, the selftest result is not read: `auto` tries E-ACSL as `eacsl` does
     (D8). The campaign applies the selftest, and it restores these builds from the cache.
     `security_props` (`--security-props PATH|none`; None: $FRAMAC_SECURITY_PROPS, else
@@ -1906,12 +1965,47 @@ def build_module_binary(
             comp = compile_sanitizer_binary(srcs, out_bin, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
         return comp, eacsl_attempt, fallback_reason
 
+    attempts: list[dict] = []
+
+    def _note(comp: dict, eacsl_attempt: dict | None, fallback_reason: str | None, srcs: list[str]) -> None:
+        # What this attempt did, kept when a later one replaces `compile` and `eacsl_compile_attempt`.
+        rec: dict[str, Any] = {
+            "attempt": len(attempts) + 1,
+            "sources": len(srcs),
+            "engine_used": comp.get("engine", engine),
+            "returncode": comp.get("returncode"),
+        }
+        if comp.get("returncode") != 0:
+            rec.update(_attempt_failure(comp))
+        if eacsl_attempt is not None:
+            rec["eacsl"] = {"returncode": eacsl_attempt.get("returncode"), **_attempt_failure(eacsl_attempt)}
+        if fallback_reason:
+            rec["engine_fallback_reason"] = fallback_reason
+        attempts.append(rec)
+
+    def _keep_logs(*results: dict | None) -> None:
+        # The next attempt rewrites the same logs: the last attempt's are kept under an attempt number.
+        rec = attempts[-1]
+        kept: list[str] = []
+        for res in results:
+            log = Path(str((res or {}).get("compile_log") or ""))
+            if not log.name or not log.is_file():
+                continue
+            dest = log.with_name(f"{log.stem}.attempt{rec['attempt']}{log.suffix}")
+            with contextlib.suppress(OSError):
+                shutil.copyfile(log, dest)
+                kept.append(dest.as_posix())
+        if kept:
+            rec["logs"] = kept
+
     current = list(sources)
     comp, eacsl_attempt, fallback_reason = _attempt(current)
+    _note(comp, eacsl_attempt, fallback_reason, current)
     rounds: list[dict] = []
     stub_dir = Path(out_bin).parent / f"{Path(out_bin).name}_link_globals"
     stubbed: list[dict] = []
     left: list[dict] = []
+    missing_sources: list[dict] = []
     if comp["returncode"] != 0 and dag_path:
         # Each round adds at least one file the DAG names or defines one global of the model, so
         # this many rounds always suffice.
@@ -1930,12 +2024,15 @@ def build_module_binary(
                 stub_dir=stub_dir,
                 stubbed=stubbed,
                 unresolved=left,
+                missing=missing_sources,
             )
             if not info:
                 break
             stubbed += info.get("stubbed_globals", [])
             rounds.append(info)
+            _keep_logs(comp, eacsl_attempt)
             comp, eacsl_attempt, fallback_reason = _attempt(current)
+            _note(comp, eacsl_attempt, fallback_reason, current)
     result = {
         "compile": comp,
         "engine_used": comp.get("engine", engine),
@@ -1943,8 +2040,12 @@ def build_module_binary(
         "eacsl_compile_attempt": eacsl_attempt,
         "sources": current,
     }
+    if len(attempts) > 1:
+        # `compile` and `eacsl_compile_attempt` are the last attempt's; each earlier failure stays here
+        # (nginx run-3: an OOM-killed first E-ACSL attempt was reported as the retry's failure).
+        result["attempts"] = attempts
     unresolved_globals = list({u["name"]: u for u in left}.values())
-    if rounds or unresolved_globals:
+    if rounds or unresolved_globals or missing_sources:
         result["link_repair"] = {
             "symbols": [sym for r in rounds for sym in r["symbols"]],
             "added_sources": [src for r in rounds for src in r["added_sources"]],
@@ -1955,7 +2056,26 @@ def build_module_binary(
             result["link_repair"]["globals_file"] = (stub_dir / LINK_GLOBALS_FILE).as_posix()
         if unresolved_globals:
             result["link_repair"]["unresolved_globals"] = unresolved_globals
+        if missing_sources:
+            result["link_repair"]["missing_sources"] = missing_sources
     return result
+
+
+def _attempt_failure(comp: dict) -> dict:
+    """The failure of one build attempt as a report keeps it: reason, a killed process, the end of stderr."""
+    out: dict[str, Any] = {}
+    if comp.get("reason"):
+        out["reason"] = comp["reason"]
+    rc = comp.get("returncode")
+    stderr = str(comp.get("stderr") or "")
+    if rc in (-9, 137) or any("Killed" in line for line in stderr.splitlines()[-5:]):
+        # SIGKILL: the kernel's OOM killer or a hard limit (run-3: Frama-C at 8.7 GB, docker `oom` event).
+        out["killed"] = True
+    if stderr.strip():
+        out["stderr_tail"] = stderr[-1500:]
+    if comp.get("compile_log"):
+        out["compile_log"] = str(comp["compile_log"])
+    return out
 
 
 def _sanitizer_attribution_builder(
