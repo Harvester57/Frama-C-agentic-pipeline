@@ -287,6 +287,32 @@ def test_a_cluster_lists_the_unit_symbols_its_files_name_without_defining_them_a
     }
 
 
+def test_a_cluster_harness_compiles_the_address_flow_build_sources(tmp_path):
+    """
+    generate_harness takes a cluster's `build_sources`, not its callees' lexer closures (the whole
+    program on nginx); a function the harness names outside the cluster joins the reach.
+    """
+    import json
+
+    import generate_harness as GH
+
+    d = U.apply(flow_dag(), max_functions=6, min_functions=1)
+    name = next(n for n, s in d["submodules"].items() if s["anchors"] == ["run"])
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "callgraph_dag.json").write_text(json.dumps(d), encoding="utf-8")
+    out_dir = tmp_path / "harnesses"
+    src = ["workspace/work/src/run.c"]
+    merged = GH._merge_dag_harness_sources(out_dir, src, False, "run", module_name=name)
+    assert merged == ["workspace/work/src/run.c", "workspace/work/src/h1.c", "workspace/work/src/register1.c"]
+    # `elsewhere` takes h4's address: with both in one harness, `run`'s pointer can reach h4.
+    merged = GH._merge_dag_harness_sources(out_dir, src, False, "run(); elsewhere();", module_name=name)
+    assert merged == [
+        "workspace/work/src/run.c",
+        *(f"workspace/work/src/{f}.c" for f in ("elsewhere", "h1", "h4", "register1")),
+    ]
+    assert GH._flow_harness_sources(d, "no_such_cluster", {"run"}) is None
+
+
 def test_a_single_cluster_is_not_a_split():
     d = big_dag()
     d["modules"]["libbig_a"]["candidate_entry_points"] = ["tc_apply"]

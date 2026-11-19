@@ -2155,6 +2155,7 @@ def _merge_dag_harness_sources(
     sources: list[str],
     include_source: bool,
     *invocation_snippets: str | None,
+    module_name: str | None = None,
 ) -> list[str]:
     """
     If `callgraph_dag.json` exists next to `out_dir` and `include_source` is False,
@@ -2163,6 +2164,12 @@ def _merge_dag_harness_sources(
     `static inline` wrappers via the DAG, and append their module `required_sources`
     (preserving `workspace/work/` prefix conventions from `sources` and respecting
     explicit sub-module slices).
+
+    For an address-flow cluster (`module_name` is a DAG submodule with `reach: address_flow`,
+    scripts/unit_split.py), the files appended are instead those of the address-flow reach of the
+    cluster's anchors and the functions the harness names (`_flow_harness_sources`): the cluster's
+    `build_sources` when it names none outside the cluster. A lexer module's closure follows every
+    signature-matched indirect edge, and on nginx is the whole program.
     """
     norm_sources = [_normalize_run_rel_dir(s) for s in sources if isinstance(s, str) and s.strip()]
     if include_source or not norm_sources:
@@ -2230,7 +2237,8 @@ def _merge_dag_harness_sources(
             if isinstance(key, str) and key in functions_map:
                 target_fns.add(key)
 
-    if not target_fns:
+    flow_rels = _flow_harness_sources(dag, module_name, target_fns)
+    if not target_fns and flow_rels is None:
         return list(norm_sources)
 
     # Determine whether `sources` uses a prefix like `workspace/work/`
@@ -2256,6 +2264,19 @@ def _merge_dag_harness_sources(
         for f in (info.get("files") if isinstance(info, dict) else None) or []:
             if isinstance(f, str):
                 owner_of.setdefault(f, str(mod_key))
+
+    def _append(rel: str) -> None:
+        rel_clean = _rel_path(rel)
+        if rel_clean in seen_rel:
+            return
+        cand = f"{prefix}{rel_clean}" if (prefix and not rel_clean.startswith(prefix)) else rel_clean
+        merged.append(_resolve_overlay_source(out_dir.parent / "work", cand))
+        seen_rel.add(rel_clean)
+
+    if flow_rels is not None:
+        for rel in flow_rels:
+            _append(rel)
+        return merged
 
     for fn_name in sorted(target_fns):
         fn_rec = functions_map.get(fn_name)
@@ -2292,14 +2313,37 @@ def _merge_dag_harness_sources(
         elif isinstance(fn_rec.get("file"), str):
             extra_rels.append(fn_rec["file"])
         for rel in extra_rels:
-            rel_clean = _rel_path(rel)
-            if rel_clean in seen_rel:
-                continue
-            cand = f"{prefix}{rel_clean}" if (prefix and not rel_clean.startswith(prefix)) else rel_clean
-            cand = _resolve_overlay_source(out_dir.parent / "work", cand)
-            merged.append(cand)
-            seen_rel.add(rel_clean)
+            _append(rel)
     return merged
+
+
+def _flow_harness_sources(dag: dict[str, Any], module_name: str | None, named: set[str]) -> list[str] | None:
+    """
+    The files (as the DAG names them) a harness of address-flow cluster `module_name` compiles: the
+    `build_sources` (scripts/unit_split.py `build_plan`) of the address-flow reach of the cluster's
+    anchors and of the unit functions the harness names (`named`, DAG keys). Without such a function
+    outside the cluster, the cluster's own `build_sources`. None when `module_name` is no address-flow
+    cluster of the DAG.
+    """
+    sub = (dag.get("submodules") or {}).get(module_name or "")
+    if (
+        not isinstance(sub, dict)
+        or sub.get("reach") != "address_flow"
+        or not isinstance(sub.get("build_sources"), list)
+    ):
+        return None
+    functions = dag.get("functions") or {}
+    unit = (dag.get("modules") or {}).get(sub.get("unit") or "")
+    keys = [k for k in ((unit or {}).get("functions") or []) if k in functions]
+    extra = {k for k in named if k in set(keys)} - set(sub.get("functions") or [])
+    if not extra:
+        return [str(f) for f in sub["build_sources"]]
+    import unit_split
+
+    global_vars = dag.get("global_variables") or {}
+    starts = [*(sub.get("anchors") or []), *sorted(extra)]
+    fns, globs = unit_split.flow_reach(functions, global_vars, starts, set(keys))
+    return [str(f) for f in unit_split.build_plan(functions, global_vars, keys, fns, globs)["build_sources"]]
 
 
 def _entry_file(functions: dict, entry_fn: str, sources: list[str]) -> str | None:
@@ -2693,6 +2737,7 @@ def _generate_module_harness(
         *norm_dispatch_cases,
         # The unit functions the target's fuzzer calls pull in their sources too.
         target_fuzzer_snippet,
+        module_name=module_name,
     )
 
     inc_lines: list[str] = []
@@ -3357,7 +3402,11 @@ def main(argv: list[str] | None = None) -> int:
         """The files a `--record-repair` regeneration may rewrite: they are rolled back on any failure."""
         if args.record_repair is None:
             return None
-        return [args.record_repair, args.out_dir / f"harness_{args.module}.c", args.out_dir / f"harness_{args.module}.json"]
+        return [
+            args.record_repair,
+            args.out_dir / f"harness_{args.module}.c",
+            args.out_dir / f"harness_{args.module}.json",
+        ]
 
     if args.api:
         if not args.module:
