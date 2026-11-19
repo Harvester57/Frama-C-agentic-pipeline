@@ -231,9 +231,18 @@ Issues encountered during build capture (`build_capture.py`), Phase 0 model pars
   - As a result, 152 of the 793 candidate entry points each reach 1548 functions on their own, including `ngx_destroy_pool`, `ngx_get_connection` and `ngx_output_chain`.
   - Any cluster that holds one of them overlaps every other cluster by more than `OVERLAP`, so the merge step folds them all together.
   - The split's own calibration says a harness should reach at most 400 functions and 15,000 lines, which keeps one Eva run within half of the 30-minute cap. This cluster is about 5 times over the function limit and about 9 times over the line limit.
-- **Fix:** none yet. **Open pipeline gap:** the split cannot divide a unit whose indirect edges are over-approximated by signature. Options, not decided:
-  - cluster on direct edges only and give indirect callees to the cluster that takes their address;
-  - cap the merge size;
-  - rely on Eva sharding ([`../guides/eva-sharding.md`](../guides/eva-sharding.md)) for such clusters, and record in the DAG that the split failed its own thresholds.
+- **Seen again on:** nginx-1.31.9 run-5, 2026-11-19. One cluster, `nginx__ngx_http_script`, held 1650 of 1679 functions (102,784 lines). Both cluster builds compiled 134 sources, which link repair raised to 136 (it added `src/core/nginx.c` and `objs/ngx_modules.c`). That is the whole program, even for the 23-function `nginx__ngx_bpf` cluster: harness sources take the lexer closures, which follow the same edges, and each file link repair adds names more files, through `ngx_cycle` and `objs/ngx_modules.c`. The E-ACSL build of such a cluster is the one killed at the time limit (S14, [`./eacsl-and-fuzzing.md`](./eacsl-and-fuzzing.md)).
+- **Fix:** prototyped on branch `claude/unit-split-indirect-edges` (commits `63cddeb`, `003e261`, `b64a3db`). It is **not merged**. The design and the option comparison are in [`../plans/unit-split-address-flow.md`](../plans/unit-split-address-flow.md). The prototype has four parts:
+  - **Address-flow reach.** [`../../scripts/phase0_dump.ml`](../../scripts/phase0_dump.ml) (dump schema 6) and [`../../scripts/phase0_model.py`](../../scripts/phase0_model.py) record which function addresses each body takes and which globals it names, plus each global's initializer references. [`../../scripts/unit_split.py`](../../scripts/unit_split.py) then follows a signature-matched indirect callee only when its address flows into the reached code. A unit missing those facts keeps the call-graph reach.
+  - **Capped merges.** Merging and packing happen only within both limits. A cluster that one entry point makes too large on its own is marked `over_limit`, and nothing else is folded into it.
+  - **Narrow sources.** An address-flow cluster records `build_sources` and `link_stubs`. [`../../scripts/generate_harness.py`](../../scripts/generate_harness.py) compiles the `build_sources`, not the lexer closures.
+  - **Link stubs.** For such a cluster, [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py) link repair defines a function outside the cluster's files as an asm stub that prints `FRAMAC_LINK_STUB_CALLED` and aborts, instead of linking its file.
 
-  Watch Phase 1 harness generation and Phase 2 Eva on this run for the consequences.
+  Tests: `tests/test_unit_split.py`, `tests/test_link_repair_flow_stubs.py`, `tests/test_dag_model_view.py`, `tests/test_phase0_model.py`, and the `phase0_model.py` selftest in `framac-analysis:latest`. On run-5's model, with address-flow facts derived from an ELF build because run-5 predates dump schema 6, the split gives 21 clusters instead of 2. The median build is 28.5 files instead of 136. Seven clusters stay over a limit: the four startup clusters, which read `ngx_modules` and so every module table, plus the clusters of `ngx_http_proxy_v2_module` (457 functions), `ngx_http_upstream_init` (405 functions) and `ngx_http_init_connection` (15,691 lines).
+
+  **Open pipeline gap**, until the following are done:
+  - the branch is merged;
+  - a Phase 0 run on nginx produces the dump-schema-6 facts;
+  - crash triage classifies `FRAMAC_LINK_STUB_CALLED` as a pipeline defect;
+  - an Eva gate flags a reached project function without a body;
+  - the user decides how to run the seven over-limit, single-anchor clusters (Eva sharding cannot split them).
