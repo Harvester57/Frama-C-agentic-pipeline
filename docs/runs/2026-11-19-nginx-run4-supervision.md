@@ -26,7 +26,15 @@ This report covers the external, read-only supervision of nginx 1.31.9 run-4. ru
 
 After the stop, `validate_artifacts.py run-dir .` reported 0 errors, and the report has 0 confirmed findings, 0 needs-validation and 0 rejected candidates. It lists 8 blocked units, 7262 planned and 31 deferred (2 `header_unreached`, 29 `tier3_not_scheduled`). The 8 blocked units are `l5_sanitized` format-string violations decided from the model (`ngx_log_error_core` passed a non-literal `fmt`, CWE-134) in `ngx_connection_error`, `ngx_event_accept`, `ngx_http_process_request_line` and five resolver functions; Phase 1 did not run, so none was checked. No container of the run and no scratch volume was left.
 
-The run-3 fixes worked: S4 (feature-test macros), S5 (anonymous-struct typedefs), S7 (generated `objs/ngx_modules.c`) and S8 (parse history) were seen working on the real run. S10, a new stub-check bug, was fixed and merged during the run (`6217968`).
+The run-3 fixes worked on the real run:
+- S3: all 25 headers passed stub-check with no `#define` in the overlay; `pcre2.h` got its macro from the include context.
+- S4: the feature-test macros were derived.
+- S5: anonymous-struct typedefs got cases.
+- S6: `validate_artifacts` gave 0 errors on a sidecar with 850 dispatch cases.
+- S7: `objs/ngx_modules.c` was kept as a generated source.
+- S8: the parse history was written and used for the build estimate.
+
+S10, a new stub-check bug, was fixed on a branch during the run and merged into main after the stop (`6217968`).
 
 ### Timeline
 
@@ -112,7 +120,8 @@ Open after run-3. Fixed in the same branch: the driver declares a value paramete
   - `objects.h` `OBJ_nid2sn`: its `ensures` removed.
   - `err.h` `ERR_peek_error_data`: now `(\result != 0 && data != \null) ==> \initialized(data)`. The `\result != 0` guard is a genuine correction.
   - The weaker contracts are sound but tell Eva and WP less, so nginx code that reads these strings would get alarms it should not. The S10 fix changes the brief.
-- **Four exemptions reword a generator limit (17:59).** Of the 15 exemptions on `nginx__ngx_event_openssl`, eleven name a real limit, two of them borderline. Four turn an `api_skipped` reason into a property of the function, although a `--dispatch-case` can drive each from bytes: `ngx_regex_exec` (compile a pattern first), `ngx_quic_crypto_init` (`EVP_aes_128_gcm()`), `ngx_quic_hkdf_expand` (`EVP_sha256()`) and `ngx_vslprintf` (through `ngx_slprintf`). The gate accepted them: this is the open exemption gate gap.
+- **Exemptions that reword a generator limit (17:59).** Of the 15 exemptions on `nginx__ngx_event_openssl`, eleven name a real limit, two of them borderline. Three turn an `api_skipped` reason into a property of the function, although a `--dispatch-case` can drive each from bytes: `ngx_regex_exec` (compile a pattern first), `ngx_quic_crypto_init` (`EVP_aes_128_gcm()`) and `ngx_quic_hkdf_expand` (`EVP_sha256()`). The gate accepted them: this is the open exemption gate gap.
+  - **Correction to the stop reason:** it names `ngx_vslprintf` as a fourth, but a case cannot call it directly. A `--dispatch-case` is statements only, and a `va_list` exists only inside a variadic function. Its body runs through the agent's `ngx_slprintf` case, while the direct-call reach rule still counts it as a gap. Its exemption is acceptable if it names that case; run-4's reason did not. The missing `va_list` case is an open generator gap.
 - **Gate commands raced the regeneration, and passes were claimed early (18:01-18:05).** The model ran the exemptions and the reach check while a `--dispatch-case` regeneration was still writing the harness. Twice it claimed that `harness_reach.py check` had exited 0 while the check was still running, and launched the ledger seed. The pipeline refused both times (`Phase 0 reach gate: reach failed for nginx__ngx_event_openssl`; the real count at the first claim was 499 of 779 reached). The model then reran the steps in order, and the gate passed at 18:08:13.
 - **Ordering slip (17:00).** CodeQL and `trust.py` were started while the model was still being built. `trust.py` failed and was rerun after the model at 17:10. Nothing was lost.
 - **Context compaction (18:04).** Antigravity's checkpoint summary quoted the run-3 prompt (checkout `nginx-run3-p1r` at `f37cc6a`). The model kept using `nginx-run4-main`.
@@ -121,6 +130,6 @@ Open after run-3. Fixed in the same branch: the driver declares a value paramete
 
 ## Open items
 
-- Open pipeline bugs: S11 (automatic prelude on nginx), S12 (`__fc_` libc tags in `--api`), the exemption gate gap, the first-build E-ACSL estimate, the missing header in the anonymous-struct skip reason, O1, and the errno Docker test.
+- Open pipeline bugs: S11 (automatic prelude on nginx), S12 (`__fc_` libc tags in `--api`), the exemption gate gap, no direct case for a `va_list` function, the first-build E-ACSL estimate, the missing header in the anonymous-struct skip reason, O1, and the errno Docker test.
 - Not verified: the peak memory of the openssl E-ACSL build, whether it fits under `-Memory 32g`, and the duplicate `main` that link repair may add (S7's likely next failure).
 - A next run must start from a fresh overlay: run-4's keeps the nine weakened contracts.
