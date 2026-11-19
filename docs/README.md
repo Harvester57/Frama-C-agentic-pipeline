@@ -3,6 +3,8 @@
 - **Repository Root:** [`../README.md`](../README.md)
 - **Documentation Maintenance Rules:** [`./AGENTS.md`](./AGENTS.md)
 
+For what the pipeline can do today and how recent runs ended, start with the [Project Status](../README.md#project-status) and [Capabilities](../README.md#capabilities) sections of the repository README.
+
 This directory holds all architecture documentation, operational guides, troubleshooting catalogs, verified target advisories, upstream issue drafts, active/archived engineering plans, and greppable Frama-C reference manuals.
 
 ---
@@ -11,7 +13,7 @@ This directory holds all architecture documentation, operational guides, trouble
 
 | Goal | Entry Point | Contents |
 | :--- | :--- | :--- |
-| **Understand how the pipeline works** | [`./guides/README.md`](./guides/README.md) | Macro/micro architecture, v2 evidence discipline, 90k+ LoC slicing, Layers 1-6 security properties, multi-agent swarm & guardrail, resource broker & caching, Eva sharding, and benchmark harness |
+| **Understand how the pipeline works** | [`./guides/README.md`](./guides/README.md) | Macro/micro architecture, v2 evidence discipline, slicing of large codebases, Layers 1-6 security properties, multi-agent swarm & guardrail, resource broker & caching, Eva sharding, and benchmark harness |
 | **Diagnose a build, tool, or gate failure** | [`./troubleshooting/README.md`](./troubleshooting/README.md) | 10 thematic symptom/cause/fix catalogs covering Phase 0 through Phase 3, MetAcsl, the coverage ledger, and host/container infrastructure |
 | **Review verified target vulnerabilities** | [`./bugs-found/README.md`](./bugs-found/README.md) | Master vulnerability index, per-target advisories, standalone reproducers, and proof summaries |
 | **Inspect staged upstream bug reports & reference snippets** | [`./upstream/README.md`](./upstream/README.md) | Frama-C / E-ACSL / `e-acsl-gcc` bug drafts (`./upstream/frama-c/`), staged target disclosures (`./upstream/qcbor/`), and vendored Frama-C master C/ACSL examples (`./upstream/sources/`) |

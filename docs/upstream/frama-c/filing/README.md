@@ -18,7 +18,22 @@ sentences of the WP manual only: it says "Related to", not "Closes", because the
 its issue stays open. The texts are self-contained: they quote the reproducer and its output, and
 they link nothing in this repository.
 
-Every text of this folder is filed (01 to 27 on 2026-11-15, 28 to 40 on 2026-11-18), and the
-placeholders now hold the real numbers. For a new package, write `#<issue>` for its own issue and
+[`./00-reports-overview-issue.md`](./00-reports-overview-issue.md) is not a bug report: it is an
+overview of the 39 filed issues for the maintainers (where they come from, the five that
+matter, an index by component, the findings of the hunt of 2026-11-18 that are not filed, three
+questions and the CLA status). It is filed as
+[#2832](https://git.frama-c.com/pub/frama-c/-/work_items/2832) (2026-11-18). If the issue is
+edited on the tracker, edit this file the same way.
+
+The texts of 43 (E-ACSL real constants, drafted on 2026-11-18) are **not filed** either: the MR
+text still holds `#<issue>`. The same goes for the texts of 44 (the contract of `strlcat`,
+drafted the same day).
+
+45 (MetAcsl refuses `\result` in a `\postcond` property, drafted on 2026-11-18) is **not filed**
+and has an issue text only. It is written for the MetAcsl tracker,
+[`pub/meta`](https://git.frama-c.com/pub/meta/-/issues), so its title carries no plug-in tag.
+
+Every other text of this folder is filed (01 to 27 on 2026-11-15, 28 to 42 on 2026-11-18), and
+their placeholders now hold the real numbers. For a new package, write `#<issue>` for its own issue and
 `#ISSUE-NN` for another package's, file the issues in an order that lets each text cite the ones it
 needs, and replace the placeholders before sending: 30 to 33 cite each other, and 38 cites 37.

@@ -32,8 +32,8 @@ Bottom-up verification would otherwise have to wait for leaf functions before ca
 
 ### Level 3: Dependency-Driven Function Provers (no waves)
 `wp_scheduler.py` keeps a ready queue instead of global waves. A function's prover is dispatched as soon as all of these are done:
-- its callees are merged (recursion cycles become ready together);
-- the architects of its own unit and of every callee's unit (a leaf or static function that touches no module header skips them);
+- each callee either already has a contract in `workspace/work/` that the caller can see, or its prove task has ended (recursion cycles become ready together);
+- the architects of its own unit (a leaf or static function that touches no module header skips them) and of the unit of each callee that has no visible contract yet;
 - the gate of every fuzz/Eva slice covering its file; a sub-module's open candidates hold only the functions in its own scope, and the callers whose call cone they lie in.
 
 A callee that ends up without a contract the caller's proof can see (its prove task ended without one, or it has none) does not release the caller. The scheduler files a strengthening request itself (`origin: scheduler`, reason `caller needs a contract`), which opens `negotiate:<callee>` (Section 3), and the caller waits on that negotiation. When no negotiation can run (a crash candidate, a `shell_unverifiable_wp` function, a callee out of scope, a negotiation that ended without a contract or was refused by a cap), the caller is tagged `callees_without_contract`: it is dispatched after every untagged ready task, and its brief ends with a "Calls Without a Contract" section.
@@ -41,10 +41,10 @@ A callee that ends up without a contract the caller's proof can see (its prove t
 Ordering and merging:
 - Functions with the longest chains of callers waiting on them go first, so the critical path starts early. Provers tagged `callees_without_contract` come after all of them.
 - Inside each prover's WP run, `-wp-par` follows the lease (min of CPUs and memory at the fixed 1000 MB prover limit).
-- Finished provers are merged in micro-batches. Their parent re-checks run in parallel, one WP job per function.
+- Finished provers are merged in micro-batches. Their parent re-checks run in parallel, one WP job per function. When a module guardrail fails on a batch, no overlay is blamed yet: each is retried alone on the converged tree. A failed per-function WP re-check rejects that overlay at once.
 
 ### Level 4: Adversarial Prover-vs-Breaker Dual-Play
-When a Function Prover Subagent fails to prove a specific RTE or security assertion after `K` retries (default `K = 4`):
+When a Function Prover Subagent fails to prove a specific RTE or security assertion after `K` retries (4 under `standard`, 6 under `deep`, 2 under `quick` or for a `shell_unverifiable_wp` function):
 - The scheduler queues an **Adversarial Breaker Subagent** ([`../../skills/framac-wp/breaker_brief.md`](../../skills/framac-wp/breaker_brief.md)). Callers of the stalled function are released immediately: the breaker never blocks them.
 - No task waits on a breaker, so it would rank below every ready prover. A quarter of each round's dispatch slots (at least one) is therefore reserved for ready breakers; reserved slots no breaker needs go to the normal order.
 - The Breaker analyzes the exact unproven assertion and synthesizes surgical binary seed inputs for `E-ACSL + LibFuzzer` to trigger a runtime crash at that line.
@@ -79,6 +79,7 @@ Every WP run also writes WP's own JSON report (`-wp-report-json`, file `wp_<fn>[
 - `unproven_goal_costs`: one object per goal WP reports as not proved, keyed by the WP goal name (the report CSV has no goal name): `{"goal", "property", "file", "line", "verdict_kind", "provers", "time_ms", "cached"}`. `verdict_kind` is `timeout`, `stepout`, `unknown` or `failed`; `property` is WP's property name from the JSON report, and `file` and `line` are where WP reports the goal (all three null when the entry comes from the log). `property` is a name such as `f_assert_rte_signed_overflow_3`, not the predicate text in `unproven_goals[].annotation`, so a goal and its report row are paired through the line and the kind (`scripts/wp_residual_census.py` does this and marks what it cannot pair `unjoined`); `provers` are prover names without their version; `cached` is true when WP took the result from its cache.
 - `slowest_proved_goals`: at most five `{"goal", "prover", "time_ms"}`, slowest first, cached results left out, so a goal proved close to the timeout is visible before it flips.
 - `goal_costs_source`: `report_json`, `log` (the JSON report was missing or unreadable, so the entries come from the `[wp] [<Verdict>] <goal> (<tags>)` log lines), or null. The result also records `wp_timeout_s` and `wp_provers`, which the hints read.
+- `python3 scripts/wp_residual_census.py --run-dir <run>` counts the goals a finished run left unproved, from these fields. It changes nothing in the run.
 
 What WP 34 gives, measured in `framac-analysis:latest`: a proved goal carries the time of the prover that proved it. An unproved goal carries one merged prover entry whose time is a 0 placeholder, so its `time_ms` is null; WP ranks a Timeout above an Unknown when it merges several provers. The log carries no solver time, and under `-wp-cache update` it tags a result `(Cached)` even on the run that first fills the cache, so a log-sourced entry never has a time. The parser fails closed: an entry without a goal name, a smoke goal, another function's goal or a verdict outside the four kinds is left out, and a field it cannot read stays empty or null.
 

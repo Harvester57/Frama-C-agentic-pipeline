@@ -1,4 +1,8 @@
 {
+ "00": {
+  "issue": 2832,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2832"
+ },
  "28": {
   "issue": 2817,
   "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2817",
@@ -74,5 +78,17 @@
   "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2829",
   "mr": 57,
   "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/57"
+ },
+ "41": {
+  "issue": 2830,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2830",
+  "mr": 58,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/58"
+ },
+ "42": {
+  "issue": 2831,
+  "issue_url": "https://git.frama-c.com/pub/frama-c/-/work_items/2831",
+  "mr": 59,
+  "mr_url": "https://git.frama-c.com/pub/frama-c/-/merge_requests/59"
  }
 }

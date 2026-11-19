@@ -1,0 +1,460 @@
+From d873cd8fdc4a3598e2466b7daa5b194a53f80585 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Wed, 18 Nov 2026 09:43:38 +0000
+Subject: [PATCH] [e-acsl] read real constants with an exponent or in
+ hexadecimal
+
+A real constant that is not exactly a double is given to GMP as a
+fraction, and Gmp.Q.normalize_str only converted plain decimal
+expansions:
+
+- with an exponent (1e-9) or in hexadecimal notation, the conversion
+  raised Not_a_decimal, which nothing caught since the handler was
+  left on Invalid_argument: Frama-C stopped on an unexpected error;
+- with a suffix, that is for a long double constant such as 0.1L, the
+  text was passed unchanged to __gmpq_set_str, which rejects it and
+  leaves 0: "0.1L > 0.05" failed at run time and "0.1L == 0" held.
+
+Exponent and hexadecimal notations are now converted with Zarith's
+Q.of_string, which reads both exactly. A constant that still has its
+suffix is reported as not yet supported, since its value depends on
+the long double format of the target.
+
+New test: arith/real_constants.c.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ plugins/e-acsl/src/code_generator/gmp.ml      |  32 +--
+ plugins/e-acsl/src/code_generator/gmp.mli     |   3 +-
+ .../tests/arith/oracle/gen_real_constants.0.c | 263 ++++++++++++++++++
+ .../arith/oracle/real_constants.0.res.oracle  |  32 +++
+ plugins/e-acsl/tests/arith/real_constants.c   |  25 ++
+ 5 files changed, 335 insertions(+), 20 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/arith/oracle/gen_real_constants.0.c
+ create mode 100644 plugins/e-acsl/tests/arith/oracle/real_constants.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/arith/real_constants.c
+
+diff --git a/plugins/e-acsl/src/code_generator/gmp.ml b/plugins/e-acsl/src/code_generator/gmp.ml
+index c832a335c3..93f875cfbd 100644
+--- a/plugins/e-acsl/src/code_generator/gmp.ml
++++ b/plugins/e-acsl/src/code_generator/gmp.ml
+@@ -232,11 +232,6 @@ module Q = struct
+         Printer.pp_binop bop
+ 
+   exception Not_a_decimal of string
+-  exception Is_a_float
+-
+-  (* The possible float suffixes (ISO C 6.4.4.2) are lLfF.
+-     dD is a GNU extension accepted by Frama-C (only!) in the logic *)
+-  let float_suffixes = [ 'f'; 'F'; 'l'; 'L'; 'd'; 'D' ]
+ 
+   (* Computes the fractional representation of a decimal number.
+      Does NOT perform reduction.
+@@ -265,10 +260,6 @@ module Q = struct
+           Bytes.unsafe_set buf (i - 1) c;
+           Bytes.unsafe_set buf len' '0';
+           post str len buf (len' + 1) (i + 1)
+-        | c when List.mem c float_suffixes ->
+-          (* [JS] a suffix denoting a C type is possible *)
+-          assert (i = len - 1);
+-          raise Is_a_float
+         | _ ->
+           raise (Not_a_decimal str)
+     in
+@@ -290,10 +281,6 @@ module Q = struct
+         | c when '0' <= c && c <= '9' ->
+           Bytes.unsafe_set buf i c;
+           pre str len buf (i + 1)
+-        | c when List.mem c float_suffixes ->
+-          (* [JS] a suffix denoting a C type is possible *)
+-          assert (i = len - 1);
+-          raise Is_a_float
+         | _ ->
+           raise (Not_a_decimal str)
+     in
+@@ -303,17 +290,24 @@ module Q = struct
+          as the decimal one. *)
+       2 * strlen
+     in
+-    try pre str strlen (Bytes.create buflen) 0
+-    with Is_a_float -> str (* just left it unchanged *)
++    pre str strlen (Bytes.create buflen) 0
+ 
+   (* ACSL considers strings written in decimal expansion to be reals.
+      Yet GMPQ considers them to be double:
+      they MUST be converted into fractional representation. *)
+   let normalize_str str =
+-    try
+-      decimal_to_fractional str
+-    with Invalid_argument _ ->
+-      Error.not_yet "number not written in decimal expansion"
++    match Floating_point.extract_suffix str with
++    | Some (_, "", _) ->
++      begin
++        try decimal_to_fractional str
++        with Not_a_decimal _ ->
++          (* exponent or hexadecimal notation: Zarith's [Q] reads both *)
++          Q.to_string (Q.of_string str)
++      end
++    | Some _ | None ->
++      (* A suffixed constant only comes here when it is not exactly a double:
++         in practice a long double, whose value depends on the target. *)
++      Error.not_yet "suffixed floating-point constant that is not a double"
+ 
+   let create ~loc ?name t_opt env kf e =
+     let ty = Cil.typeOf e in
+diff --git a/plugins/e-acsl/src/code_generator/gmp.mli b/plugins/e-acsl/src/code_generator/gmp.mli
+index 695127c89d..33685caf71 100644
+--- a/plugins/e-acsl/src/code_generator/gmp.mli
++++ b/plugins/e-acsl/src/code_generator/gmp.mli
+@@ -77,7 +77,8 @@ module Q : sig
+       underlying real library. For example, "0.1" is a real number in ACSL
+       whereas it is considered as a double by [libgmp] because it is written in
+       decimal expansion. In order to make [libgmp] consider it to be a rational,
+-      it must be converted into "1/10". *)
++      it must be converted into "1/10". A constant with an exponent or in
++      hexadecimal notation is converted as well. *)
+ 
+   val create:
+     loc:Fileloc.t -> ?name:string -> term option ->  Env.t -> kernel_function ->
+diff --git a/plugins/e-acsl/tests/arith/oracle/gen_real_constants.0.c b/plugins/e-acsl/tests/arith/oracle/gen_real_constants.0.c
+new file mode 100644
+index 0000000000..e938708794
+--- /dev/null
++++ b/plugins/e-acsl/tests/arith/oracle/gen_real_constants.0.c
+@@ -0,0 +1,263 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++int main(void)
++{
++  int __retres;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  double x = 0.5;
++  {
++    __e_acsl_mpq_t __gen_e_acsl_;
++    __e_acsl_mpq_t __gen_e_acsl__2;
++    int __gen_e_acsl_eq;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl_);
++    __gmpq_set_str(__gen_e_acsl_,"1/10",10);
++    __gmpq_init(__gen_e_acsl__2);
++    __gmpq_set_str(__gen_e_acsl__2,"01/10",10);
++    __gen_e_acsl_eq = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl_),
++                                 (__e_acsl_mpq_struct const *)(__gen_e_acsl__2));
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "1e-1 == 0.1";
++    __gen_e_acsl_assert_data.file = "real_constants.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 9;
++    __e_acsl_assert(__gen_e_acsl_eq == 0,& __gen_e_acsl_assert_data);
++    __gmpq_clear(__gen_e_acsl_);
++    __gmpq_clear(__gen_e_acsl__2);
++  }
++  /*@ assert 1e-1 == 0.1; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__3;
++    __e_acsl_mpq_t __gen_e_acsl__4;
++    int __gen_e_acsl_eq_2;
++    int __gen_e_acsl_and;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__3);
++    __gmpq_set_str(__gen_e_acsl__3,"3/2000",10);
++    __gmpq_init(__gen_e_acsl__4);
++    __gmpq_set_str(__gen_e_acsl__4,"00015/10000",10);
++    __gen_e_acsl_eq_2 = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl__3),
++                                   (__e_acsl_mpq_struct const *)(__gen_e_acsl__4));
++    if (__gen_e_acsl_eq_2 == 0) {
++      __e_acsl_mpq_t __gen_e_acsl__5;
++      __e_acsl_mpq_t __gen_e_acsl__6;
++      int __gen_e_acsl_eq_3;
++      __gmpq_init(__gen_e_acsl__5);
++      __gmpq_set_str(__gen_e_acsl__5,"3858/3125",10);
++      __gmpq_init(__gen_e_acsl__6);
++      __gmpq_set_str(__gen_e_acsl__6,"123456/100000",10);
++      __gen_e_acsl_eq_3 = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl__5),
++                                     (__e_acsl_mpq_struct const *)(__gen_e_acsl__6));
++      __gen_e_acsl_and = __gen_e_acsl_eq_3 == 0;
++      __gmpq_clear(__gen_e_acsl__5);
++      __gmpq_clear(__gen_e_acsl__6);
++    }
++    else __gen_e_acsl_and = 0;
++    __gen_e_acsl_assert_data_2.blocking = 1;
++    __gen_e_acsl_assert_data_2.kind = "Assertion";
++    __gen_e_acsl_assert_data_2.pred_txt = "1.5e-3 == 0.0015 && 123.456E-2 == 1.23456";
++    __gen_e_acsl_assert_data_2.file = "real_constants.c";
++    __gen_e_acsl_assert_data_2.fct = "main";
++    __gen_e_acsl_assert_data_2.line = 10;
++    __e_acsl_assert(__gen_e_acsl_and,& __gen_e_acsl_assert_data_2);
++    __gmpq_clear(__gen_e_acsl__3);
++    __gmpq_clear(__gen_e_acsl__4);
++  }
++  /*@ assert 1.5e-3 == 0.0015 && 123.456E-2 == 1.23456; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__7;
++    __e_acsl_mpq_t __gen_e_acsl__8;
++    __e_acsl_mpq_t __gen_e_acsl_mul;
++    __e_acsl_mpq_t __gen_e_acsl__9;
++    int __gen_e_acsl_eq_4;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__7);
++    __gmpq_set_d(__gen_e_acsl__7,100.);
++    __gmpq_init(__gen_e_acsl__8);
++    __gmpq_set_str(__gen_e_acsl__8,"0001/1000",10);
++    __gmpq_init(__gen_e_acsl_mul);
++    __gmpq_mul(__gen_e_acsl_mul,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__7),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__8));
++    __gmpq_init(__gen_e_acsl__9);
++    __gmpq_set_str(__gen_e_acsl__9,"01/10",10);
++    __gen_e_acsl_eq_4 = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl_mul),
++                                   (__e_acsl_mpq_struct const *)(__gen_e_acsl__9));
++    __gen_e_acsl_assert_data_3.blocking = 1;
++    __gen_e_acsl_assert_data_3.kind = "Assertion";
++    __gen_e_acsl_assert_data_3.pred_txt = "1e+2 * 0.001 == 0.1";
++    __gen_e_acsl_assert_data_3.file = "real_constants.c";
++    __gen_e_acsl_assert_data_3.fct = "main";
++    __gen_e_acsl_assert_data_3.line = 11;
++    __e_acsl_assert(__gen_e_acsl_eq_4 == 0,& __gen_e_acsl_assert_data_3);
++    __gmpq_clear(__gen_e_acsl__7);
++    __gmpq_clear(__gen_e_acsl__8);
++    __gmpq_clear(__gen_e_acsl_mul);
++    __gmpq_clear(__gen_e_acsl__9);
++  }
++  /*@ assert 1e+2 * 0.001 == 0.1; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl_x;
++    __e_acsl_mpq_t __gen_e_acsl__10;
++    __e_acsl_mpq_t __gen_e_acsl_sub;
++    __e_acsl_mpq_t __gen_e_acsl__11;
++    int __gen_e_acsl_le;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl_x);
++    __gmpq_set_d(__gen_e_acsl_x,x);
++    __gmpq_init(__gen_e_acsl__10);
++    __gmpq_set_d(__gen_e_acsl__10,0.5);
++    __gmpq_init(__gen_e_acsl_sub);
++    __gmpq_sub(__gen_e_acsl_sub,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_x),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__10));
++    __gmpq_init(__gen_e_acsl__11);
++    __gmpq_set_str(__gen_e_acsl__11,"1/1000000000",10);
++    __gen_e_acsl_le = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl_sub),
++                                 (__e_acsl_mpq_struct const *)(__gen_e_acsl__11));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_4,"x",x);
++    __gen_e_acsl_assert_data_4.blocking = 1;
++    __gen_e_acsl_assert_data_4.kind = "Assertion";
++    __gen_e_acsl_assert_data_4.pred_txt = "x - 0.5 <= 1e-9";
++    __gen_e_acsl_assert_data_4.file = "real_constants.c";
++    __gen_e_acsl_assert_data_4.fct = "main";
++    __gen_e_acsl_assert_data_4.line = 12;
++    __e_acsl_assert(__gen_e_acsl_le <= 0,& __gen_e_acsl_assert_data_4);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++    __gmpq_clear(__gen_e_acsl_x);
++    __gmpq_clear(__gen_e_acsl__10);
++    __gmpq_clear(__gen_e_acsl_sub);
++    __gmpq_clear(__gen_e_acsl__11);
++  }
++  /*@ assert x - 0.5 <= 1e-9; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__12;
++    __e_acsl_mpq_t __gen_e_acsl__13;
++    int __gen_e_acsl_gt;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__12);
++    __gmpq_set_str(__gen_e_acsl__12,
++                   "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++                   10);
++    __gmpq_init(__gen_e_acsl__13);
++    __gmpq_set_str(__gen_e_acsl__13,
++                   "100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
++                   10);
++    __gen_e_acsl_gt = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl__12),
++                                 (__e_acsl_mpq_struct const *)(__gen_e_acsl__13));
++    __gen_e_acsl_assert_data_5.blocking = 1;
++    __gen_e_acsl_assert_data_5.kind = "Assertion";
++    __gen_e_acsl_assert_data_5.pred_txt = "1e400 > 1e308";
++    __gen_e_acsl_assert_data_5.file = "real_constants.c";
++    __gen_e_acsl_assert_data_5.fct = "main";
++    __gen_e_acsl_assert_data_5.line = 13;
++    __e_acsl_assert(__gen_e_acsl_gt > 0,& __gen_e_acsl_assert_data_5);
++    __gmpq_clear(__gen_e_acsl__12);
++    __gmpq_clear(__gen_e_acsl__13);
++  }
++  /*@ assert 1e400 > 1e308; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__14;
++    __e_acsl_mpq_t __gen_e_acsl__15;
++    int __gen_e_acsl_gt_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__14);
++    __gmpq_set_str(__gen_e_acsl__14,
++                   "295147905179352825857/295147905179352825856",10);
++    __gmpq_init(__gen_e_acsl__15);
++    __gmpq_set_str(__gen_e_acsl__15,"1",10);
++    __gen_e_acsl_gt_2 = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl__14),
++                                   (__e_acsl_mpq_struct const *)(__gen_e_acsl__15));
++    __gen_e_acsl_assert_data_6.blocking = 1;
++    __gen_e_acsl_assert_data_6.kind = "Assertion";
++    __gen_e_acsl_assert_data_6.pred_txt = "0x1.00000000000000001p0 > 1";
++    __gen_e_acsl_assert_data_6.file = "real_constants.c";
++    __gen_e_acsl_assert_data_6.fct = "main";
++    __gen_e_acsl_assert_data_6.line = 15;
++    __e_acsl_assert(__gen_e_acsl_gt_2 > 0,& __gen_e_acsl_assert_data_6);
++    __gmpq_clear(__gen_e_acsl__14);
++    __gmpq_clear(__gen_e_acsl__15);
++  }
++  /*@ assert 0x1.00000000000000001p0 > 1; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__16;
++    __e_acsl_mpq_t __gen_e_acsl__17;
++    __e_acsl_mpq_t __gen_e_acsl_mul_2;
++    __e_acsl_mpq_t __gen_e_acsl__18;
++    int __gen_e_acsl_eq_5;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__16);
++    __gmpq_set_str(__gen_e_acsl__16,
++                   "295147905179352825857/295147905179352825856",10);
++    __gmpq_init(__gen_e_acsl__17);
++    __gmpq_set_str(__gen_e_acsl__17,"295147905179352825856",10);
++    __gmpq_init(__gen_e_acsl_mul_2);
++    __gmpq_mul(__gen_e_acsl_mul_2,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__16),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__17));
++    __gmpq_init(__gen_e_acsl__18);
++    __gmpq_set_str(__gen_e_acsl__18,"295147905179352825857",10);
++    __gen_e_acsl_eq_5 = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl_mul_2),
++                                   (__e_acsl_mpq_struct const *)(__gen_e_acsl__18));
++    __gen_e_acsl_assert_data_7.blocking = 1;
++    __gen_e_acsl_assert_data_7.kind = "Assertion";
++    __gen_e_acsl_assert_data_7.pred_txt = "0x1.00000000000000001p0 * 295147905179352825856 == 295147905179352825857";
++    __gen_e_acsl_assert_data_7.file = "real_constants.c";
++    __gen_e_acsl_assert_data_7.fct = "main";
++    __gen_e_acsl_assert_data_7.line = 16;
++    __e_acsl_assert(__gen_e_acsl_eq_5 == 0,& __gen_e_acsl_assert_data_7);
++    __gmpq_clear(__gen_e_acsl__16);
++    __gmpq_clear(__gen_e_acsl__17);
++    __gmpq_clear(__gen_e_acsl_mul_2);
++    __gmpq_clear(__gen_e_acsl__18);
++  }
++  /*@
++  assert
++    0x1.00000000000000001p0 * 295147905179352825856 == 295147905179352825857;
++   */
++  ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__19;
++    __e_acsl_mpq_t __gen_e_acsl__20;
++    int __gen_e_acsl_lt;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__19);
++    __gmpq_set_str(__gen_e_acsl__19,
++                   "295147905179352825855/590295810358705651712",10);
++    __gmpq_init(__gen_e_acsl__20);
++    __gmpq_set_d(__gen_e_acsl__20,0.5);
++    __gen_e_acsl_lt = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl__19),
++                                 (__e_acsl_mpq_struct const *)(__gen_e_acsl__20));
++    __gen_e_acsl_assert_data_8.blocking = 1;
++    __gen_e_acsl_assert_data_8.kind = "Assertion";
++    __gen_e_acsl_assert_data_8.pred_txt = "0X.fffffffffffffffffP-1 < 0.5";
++    __gen_e_acsl_assert_data_8.file = "real_constants.c";
++    __gen_e_acsl_assert_data_8.fct = "main";
++    __gen_e_acsl_assert_data_8.line = 18;
++    __e_acsl_assert(__gen_e_acsl_lt < 0,& __gen_e_acsl_assert_data_8);
++    __gmpq_clear(__gen_e_acsl__19);
++    __gmpq_clear(__gen_e_acsl__20);
++  }
++  /*@ assert 0X.fffffffffffffffffP-1 < 0.5; */ ;
++  /*@ assert 0.1L > 0.05; */ ;
++  /*@ assert 1e-1L > 0.05; */ ;
++  __retres = 0;
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/arith/oracle/real_constants.0.res.oracle b/plugins/e-acsl/tests/arith/oracle/real_constants.0.res.oracle
+new file mode 100644
+index 0000000000..5060f81977
+--- /dev/null
++++ b/plugins/e-acsl/tests/arith/oracle/real_constants.0.res.oracle
+@@ -0,0 +1,32 @@
++[e-acsl] beginning translation.
++[e-acsl] real_constants.c:21: Warning: 
++  E-ACSL construct `suffixed floating-point constant that is not a double'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] real_constants.c:22: Warning: 
++  E-ACSL construct `suffixed floating-point constant that is not a double'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] real_constants.c:9: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:9: Warning: assertion got status unknown.
++[eva:alarm] real_constants.c:10: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:10: Warning: assertion got status unknown.
++[eva:alarm] real_constants.c:11: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:11: Warning: assertion got status unknown.
++[eva:alarm] real_constants.c:12: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:13: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:15: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:15: Warning: assertion got status unknown.
++[eva:alarm] real_constants.c:16: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:16: Warning: assertion got status unknown.
++[eva:alarm] real_constants.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] real_constants.c:18: Warning: assertion got status unknown.
+diff --git a/plugins/e-acsl/tests/arith/real_constants.c b/plugins/e-acsl/tests/arith/real_constants.c
+new file mode 100644
+index 0000000000..0eab71494e
+--- /dev/null
++++ b/plugins/e-acsl/tests/arith/real_constants.c
+@@ -0,0 +1,25 @@
++/* run.config
++   COMMENT: real constants with an exponent, in hexadecimal notation or with
++   COMMENT: a suffix, that are not exactly a double
++*/
++
++int main(void) {
++  double x = 0.5;
++
++  /*@ assert 1e-1 == 0.1; */
++  /*@ assert 1.5e-3 == 0.0015 && 123.456E-2 == 1.23456; */
++  /*@ assert 1e+2 * 0.001 == 0.1; */
++  /*@ assert x - 0.5 <= 1e-9; */
++  /*@ assert 1e400 > 1e308; */
++
++  /*@ assert 0x1.00000000000000001p0 > 1; */
++  /*@ assert 0x1.00000000000000001p0 * 295147905179352825856 ==
++        295147905179352825857; */
++  /*@ assert 0X.fffffffffffffffffP-1 < 0.5; */
++
++  // Not yet: the value of a long double constant depends on the target
++  /*@ assert 0.1L > 0.05; */
++  /*@ assert 1e-1L > 0.05; */
++
++  return 0;
++}
+-- 
+2.47.3
+

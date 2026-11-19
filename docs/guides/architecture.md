@@ -9,8 +9,8 @@ This document details the macro-level and micro-level architecture of the Frama-
 | Plugin | Role in Pipeline | Input | Output |
 | :--- | :--- | :--- | :--- |
 | **RTE (`-rte`)** | **Syntactic Proof-Obligation Generator.** Scans the C AST and inserts explicit ACSL `/*@ assert rte: ...; */` annotations at every potential runtime error (signed/unsigned overflow, `\valid` / `\valid_read` pointer dereference, division by zero, bitshift bounds, float-to-int cast, function pointer call). | Raw C AST | Annotated C AST with numbered RTE assertions |
-| **E-ACSL (`-e-acsl`)** | **Executable Contract Compiler & Dynamic Oracle.** Translates ACSL assertions, preconditions, postconditions, loop invariants, and ghost state into runtime C instrumentation backed by shadow memory. Paired with Clang `-fsanitize=fuzzer`. | C AST + RTE / ACSL annotations | Instrumented C binary (`fuzz_runner`) that aborts on any UB or contract violation |
-| **Eva (`-eva`)** | **Whole-Slice Abstract Interpreter.** Propagates value intervals, octagons, and symbolic pointer locations from a module's `eva_main()` harness without requiring user-written loop invariants. Automatically proves 80–90% of RTE assertions (`Valid`). | Module C slice + `eva_main()` | Per-assertion status (`Valid`, `Unknown`, `Invalid`) + SARIF |
+| **E-ACSL (`-e-acsl`)** | **Executable Contract Compiler & Dynamic Oracle.** Translates ACSL assertions, preconditions, postconditions, loop invariants, and ghost state into runtime C instrumentation backed by shadow memory. Paired with Clang `-fsanitize=fuzzer`. | C AST + RTE / ACSL annotations | Instrumented C binary (`workspace/harnesses/fuzz_<mod>`) that aborts on any UB or contract violation |
+| **Eva (`-eva`)** | **Whole-Slice Abstract Interpreter.** Propagates value intervals, octagons, and symbolic pointer locations from a module's `eva_main()` harness without requiring user-written loop invariants. On the modules it finished in recent runs, it proved 73% to 93% of the RTE assertions (`Valid`); some modules time out instead. | Module C slice + `eva_main()` | Per-assertion status (`Valid`, `Unknown`, `Invalid`) + SARIF |
 | **WP (`-wp -wp-rte`)** | **Modular Deductive Verifier.** Translates one C function at a time (`-wp-fct`) and its ACSL contract (`requires`, `assigns`, `ensures`, `loop invariant`, `loop variant`) into first-order logic goals discharged in parallel by `Alt-Ergo`, `Z3`, and `CVC5`. | Single C function + Callee `.h` contracts | Mathematical proof (`100% Valid`) or failed goal sequent |
 
 ---
@@ -20,7 +20,7 @@ This document details the macro-level and micro-level architecture of the Frama-
 ```mermaid
 flowchart TD
     subgraph P0["Phase 0: Build Capture, Frama-C Model & Module Slicing (/framac-slice)"]
-        A["Target C Codebase (e.g. 90,000 LoC)"] --> B["Initialize run workspace/ Shadow Copy<br/>(workspace_overlay.py init)"]
+        A["Target C Codebase"] --> B["Initialize run workspace/ Shadow Copy<br/>(workspace_overlay.py init)"]
         B --> BC{"Build Capture in the build image<br/>(build_capture.py: bear, link units, API, snapshot)"}
         BC -- "Build fails" --> ASK["Stop: needs_build_recipe<br/>Ask the user, then resume"]
         BC -- "OK" --> MO["Frama-C Model per Link Unit<br/>(phase0_model.py; GCC fallback per unit)<br/>+ Trust (trust.py, THREAT_MODEL.md)"]
@@ -56,10 +56,10 @@ flowchart TD
     ING -- "Clean (any fuzzed tier)" --> J
 
     subgraph P2["Phase 2: Module-Level Abstract Interpretation (/framac-eva)"]
-        J["Run frama-c -eva -main eva_main ... -then -rte<br/>(run_eva_slice.py)"] --> K{"Inspect RTE Alarm Table"}
-        K -- "Green (Valid: ~85%)" --> L["Discharged Automatically"]
+        J["Run frama-c -main eva_main -rte -then -eva ...<br/>(run_eva_slice.py)"] --> K{"Inspect RTE Alarm Table"}
+        K -- "Green (Valid)" --> L["Discharged Automatically"]
         K -- "Red (Invalid): candidate" --> CAND
-        K -- "Orange (Unknown: ~15%)" --> M["Queue Surviving Unknown Functions<br/>(wp_scheduler.py init)"]
+        K -- "Orange (Unknown)" --> M["Queue Surviving Unknown Functions<br/>(wp_scheduler.py init)"]
     end
 
     subgraph P3["Phase 3: Continuous Reactive Subagent WP Loop (/framac-wp)"]
@@ -82,11 +82,13 @@ Design and measurements: [`../plans/archive/phase0-redesign.md`](../plans/archiv
 - **Images.** The build image (`framac-build`) runs the target's own build and tests. The analysis image (`framac-analysis`) runs everything else and holds no target packages. The CodeQL image is optional and off by default. There are no other images: the monolithic `framac-pipeline` image was removed in step I10.
 - **Build capture** (`build_capture.py`, build image, scratch volume). The target's build runs under `bear` from a recipe the user gave or confirmed. It gives the link units, per-file flags, test units, API entry points, and a snapshot of the target's headers and libraries in `workspace/snapshot/`. A build that fails stops Phase 0 with `needs_build_recipe` until the user fixes the recipe. x86_64 Linux is the only supported platform: the capture's architecture guard stops Phase 0 with `unsupported_architecture` when the host is not x86_64, or when the build produced an object or binary that is not ELF64 x86-64 (`-m32`, `-mx32`, a cross compiler).
 - **Frama-C model** (`phase0_model.py`, analysis image). One Frama-C parse per distinct set of sources and flags gives the functions (`file#name`), direct and indirect edges, macro aliases, thread entries and each function's trust. A unit Frama-C cannot parse falls back to GCC's `-fcallgraph-info`, and is flagged. Alias narrowing of indirect edges exists but is off by default.
-- **Trust** (`trust.py`). Library API and functions reached from input readers are untrusted, unless the structured threat model says otherwise. Optional CodeQL facts can only add untrusted marks.
+- **Trust** (`trust.py`). A library's exported API and functions reached from input readers are untrusted, unless the structured threat model says otherwise. Functions defined in public headers are harnessed entry points, but they are untrusted only when the threat model or CodeQL marks them, or an input reader reaches them. Optional CodeQL facts can only add untrusted marks.
 - **DAG view** (`build_callgraph_dag.py`). Modules are the build's link units. Harnesses may be sub-modules of a unit, and `module_map.py` maps every report back to its unit. Tiers come from trust (`tiers.py`), and units too large for one Eva run are split into clusters (`unit_split.py`).
 - **Seeds** (`seed_harvest.py`). The API calls the target's tests make are recorded in the build image and written as seeds in each harness's case format.
+- **The target's own fuzzing assets** (`fuzz_assets.py`). The corpora the target ships are imported, and each usable fuzz target becomes a `tf_<id>` module that is fuzzed but never run through Eva.
+- **Harness cases.** `variadic_calls.py` turns the target's own variadic call sites into harness cases. Functions defined in public headers get their cases after the exported ones. Above 256 cases, the dispatch selector takes two bytes.
 - **Security properties** (`security_props.py`). The threat model's auth gates, output sinks and secrets become MetAcsl properties (Layers 4 to 6), and pointer writers get Layer 3 frame units.
-- **Gates.** The reach gate and the E-ACSL build check write `workspace/reports/phase0_gates.json`, and Make refuses to fuzz, run Eva or queue WP on a module that failed one, except for a dynamic reach gap: that holds only the module's planned units out of WP (`ledger.py gate-reach`). `pipeline_make.py run` refuses every target after Phase 0 while the DAG has no module or no harness sidecar matches a DAG module. Coverage after fuzzing records the entry points no input executed as a dynamic gap, which stops none of the module's fuzz or Eva; a fuzz crash counts as executing an entry point only when it was found under the current harness (`harness_digest` and `dispatch_case_count` of the fuzz report and its artifacts) and shows the entry point ran (`crash_notes` say why a crash did not count).
+- **Gates.** The reach gate and the E-ACSL build check write `workspace/reports/phase0_gates.json`, and Make enforces them per target: building and Eva need the reach gate, fuzzing also needs the E-ACSL build check, and `wp-queue` needs both for the whole run. A dynamic reach gap is the exception: it holds only the module's planned units out of WP (`ledger.py gate-reach`). `pipeline_make.py run` refuses every target after Phase 0 while the DAG has no module or no harness sidecar matches a DAG module. Coverage after fuzzing records the entry points no input executed as a dynamic gap, which stops none of the module's fuzz or Eva; a fuzz crash counts as executing an entry point only when it was found under the current harness (`harness_digest` and `dispatch_case_count` of the fuzz report and its artifacts) and shows the entry point ran (`crash_notes` say why a crash did not count).
 
 ---
 
@@ -136,17 +138,19 @@ run-<N>/
 ├── REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif   # Derived reports
 ├── state/
 │   ├── progress.json                         # Phase resume pointer
-│   ├── phase0.json, phase2.json, phase3.json # Phase completion snapshots (Phase 0 seed, `run wp-queue`, end of Phase 3)
+│   ├── phase0.json, phase2.json, phase3.json # Phase completion snapshots (Phase 0 `build-check`, `run wp-queue`, end of Phase 3)
 │   ├── phase3_shards/<fn>.json               # Per-function WP completion shards
 │   ├── wp_schedule.json                      # Phase-3 task graph (wp_scheduler.py)
 │   ├── merge-journal.json                    # Present only while a merge is in flight
 │   ├── cache/                                # Per-run caches: E-ACSL builds, WP proofs, Eva results
 │   ├── resource-history/<class>/             # Peak memory / OOM records that size future leases
 │   └── ingested.json                         # Digests of reports already ingested
+├── inputs/corpora/<name>/                    # Fuzz corpora you supply from outside the target
 ├── workspace/
 │   ├── baseline/                             # Clean read-only snapshot of original C/H files
 │   ├── work/                                 # Active shadow tree (ACSL annotations only)
 │   ├── snapshot/                             # The target's headers and libraries from the build (root/, generated/, libc/, manifest.json)
+│   ├── stubs/                                # The run's contracts for functions declared in host headers
 │   ├── harnesses/                            # Generated harness_<mod>.c, harness_<mod>.json, and E-ACSL binaries
 │   ├── build/                                # Generated Makefile, modules.mk, params.json (pipeline_make.py)
 │   ├── seed_records/                         # API calls recorded from the target's tests (calls.jsonl)
@@ -165,6 +169,8 @@ run-<N>/
 │       ├── variadic_calls.json               # Call sites of the variadic API in the target's own programs
 │       ├── imported_corpus/<mod>.json        # What each harness case got from the imported corpora
 │       ├── security_props.json               # MetAcsl Layer 3-6 properties and their instances
+│       ├── stubs.json, stub_check.json       # State of each stub contract, and the checks run on them
+│       ├── decision_point/<fingerprint>.json # A Crash Verifier's patch-and-replay check of its decision point
 │       ├── callgraph_dag.json                # DAG view: link-unit modules, waves, tiers, unit split
 │       ├── phase0_gates.json                 # Reach gate and E-ACSL build check, per module
 │       ├── harness_reach.json                # Static reach gate report (harness_reach_dynamic.json after coverage)
@@ -178,5 +184,5 @@ run-<N>/
 │       ├── wp/<fn>.json                      # Phase 3 per-function WP results by obligation class
 │       ├── proof-carry/summary.json          # wp-replay: cached proofs re-applied and re-proven before Phase 3
 │       └── wp-sweep/                         # End-of-run re-proof of merged functions (publishes the proofs cache)
-└── agents/<agent-id>/scratch/                # The only place a subagent may write (parent_wp/ holds the parent re-check)
+└── agents/<agent-id>/scratch/                # Where subagents write (parent_wp/ holds the parent re-check); the Phase 0 stub author edits its header in workspace/stubs/
 ```

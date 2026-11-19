@@ -39,15 +39,30 @@ int main(void) {
 }
 ```
 
+`m.c`, for `main`'s own parameters (`argc` and `argv`), no option needed:
+
+```c
+int main(int argc, char **argv) {
+  int *p = &argc;
+  char ***q = &argv;
+  /*@ assert \initialized(p); */
+  /*@ assert \initialized(q); */
+  return 0;
+}
+```
+
 ```sh
 e-acsl-gcc -o f.inst.c -O f f.c && ./f.e-acsl
 e-acsl-gcc -F "-rte -rte-initialized @all" -o k.inst.c -O k k.c && ./k.e-acsl
+e-acsl-gcc -o m.inst.c -O m m.c && ./m.e-acsl
+e-acsl-gcc -m bittree -o mb.inst.c -O mb m.c && ./mb.e-acsl
 ```
 
 ### Expected behaviour
 
-Both programs run and exit 0: the caller initializes every argument, and `k` is even assigned
-explicitly before its address is taken.
+All three programs (including `m.c` under both the default segment model and `-m bittree`) run and
+exit 0: the caller (or runtime startup for `main`) initializes every argument, and `k` is even
+assigned explicitly before its address is taken.
 
 ### Actual behaviour
 
@@ -70,16 +85,25 @@ k.c:4: Error: E-ACSL RTE failed:
 	- uninitialized: \initialized(pk): 0
 ```
 
-(both abort, exit status 134.) The same happens for any read of a field of a by-value struct
-parameter when initialization checks are on (`-e-acsl-rte-initialized`, `-rte -rte-initialized`):
-every function that reads such a field aborts on its first call, whatever the caller passed, and
-nothing after the check is ever reached. Under a fuzzer, every input that reaches such a function
-is reported as a crash.
+```text
+m.c: In function 'main'
+m.c:4: Error: Assertion failed:
+	The failing predicate is:
+	\initialized(p).
+	With values at failure point:
+	- \initialized(p): 0
+```
+
+(all abort, exit status 134; `m.c` fails the same way under both the segment model and `-m bittree`.)
+The same happens for any read of a field of a by-value struct parameter when initialization checks
+are on (`-e-acsl-rte-initialized`, `-rte -rte-initialized`): every function that reads such a field
+aborts on its first call, whatever the caller passed, and nothing after the check is ever reached.
+Under a fuzzer, every input that reaches such a function is reported as a crash.
 
 ### Contextual information
 
 - Frama-C installation mode: from source (`master`) and opam (Docker image based on `framac/frama-c:dev`)
-- Frama-C version: 35.0~~dev (Bromine), `master` at 3dff90fc70; also 34.0~beta (Selenium)
+- Frama-C version: 35.0~~dev (Bromine), `master` at `b80fcac74f` (first reproduced on `3dff90fc70`); also 34.0~beta (Selenium)
 - Plug-in used: E-ACSL (`e-acsl-gcc`, gcc 14.2.0), RTE
 - OS name: Debian GNU/Linux
 - OS version: 13 (trixie)
@@ -91,6 +115,16 @@ is reported as a crash.
 although the caller has just written the parameter. The call comes from `inject_in_stmt`
 (`plugins/e-acsl/src/code_generator/injector.ml:470`), which calls `Memory_observer.store` on the
 formals (`plugins/e-acsl/src/code_generator/memory_observer.ml:24`); that emits the store only.
+
+For `main`, `inject_in_stmt` intentionally skips `Memory_observer.store` and delegates tracking of
+`argc` and `argv` to `__e_acsl_memory_init(&argc, &argv, ...)` -> `argv_alloca(argc_ref, argv_ref)`
+in the runtime observation models. Both `argv_alloca` implementations register `argc_ref` and
+`argv_ref` without marking them initialized, even though they immediately initialize `argv[]`,
+`*argv`, and `*environ` right below:
+- `plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c`:
+  calls `shadow_alloca` for `argc_ref` and `argv_ref` without `initialize_static_region`;
+- `plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c`:
+  calls `eacsl_store_block` for `argc_ref` and `argv_ref` without `eacsl_initialize`.
 
 The rest of E-ACSL assumes formals are initialized:
 
@@ -107,11 +141,13 @@ fix of #975 ("Global variables are not marked as initialized"); formals never go
 
 **Fix.** Where E-ACSL stores the formals, also mark each one initialized, as for globals:
 `__e_acsl_store_block((void *)(& s),16UL); __e_acsl_full_init((void *)(& s));`. The
-`__gen_e_acsl_<f>` wrapper of a function with a contract gets the same for its own formals. With
-the fix both programs run and exit 0, #177's kind of program (an `assert \initialized(&s.t)` on a
-by-value struct) passes, and genuinely uninitialized data is still reported: an uninitialized
-local read, and an uninitialized `int` passed by value (reported at the call site, where the
-argument is read).
+`__gen_e_acsl_<f>` wrapper of a function with a contract gets the same for its own formals. In
+addition, mark `argc_ref` and `argv_ref` initialized in `argv_alloca` in both observation models
+(`initialize_static_region` in the segment model, `eacsl_initialize` in the bittree model). With
+the fix all three programs run and exit 0 (including `m.c` in both segment and bittree models),
+#177's kind of program (an `assert \initialized(&s.t)` on a by-value struct) passes, and genuinely
+uninitialized data is still reported: an uninitialized local read, and an uninitialized `int`
+passed by value (reported at the call site, where the argument is read).
 
 Skipping the guard in `needs_guard` for formals would not be enough: a user annotation
 (`requires \initialized(&s.len)` above) and a read through a pointer (`*pk`) consult shadow memory,

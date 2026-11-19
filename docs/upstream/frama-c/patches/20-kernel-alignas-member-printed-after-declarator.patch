@@ -1,5 +1,5 @@
-From 207503305b11f74f2653d7c8be549cea3ba5be73 Mon Sep 17 00:00:00 2001
-From: Florian Stosse <florian.stosse@gmail.com>
+From 3730ffb49a566cbc5e4af06517f005777bbc4d3b Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
 Date: Sun, 15 Nov 2026 13:29:12 +0100
 Subject: [PATCH] [kernel] print _Alignas with the base type, never inside the
  declarator
@@ -15,32 +15,39 @@ _Alignas is an alignment specifier, part of the declaration specifiers
 - after the '*' of a pointer element of an array:
     char * _Alignas(8)gap[2];
 
-GCC, Clang and Frama-C itself reject all of them, so the output of
--print or -ocode could not be compiled or re-parsed (E-ACSL's generated
-code included).
+and silently dropped it on __builtin_va_list declarations (and, once
+TPtr forwards ?alignas, on pointers to __builtin_va_list under
+-no-variadic-translation).
+
+GCC, Clang and Frama-C itself reject the misplaced specifiers, so the
+output of -print or -ocode could not be compiled or re-parsed (E-ACSL's
+generated code included), and both GCC and Clang accept _Alignas on
+__builtin_va_list objects and pointers.
 
 Cil_printer.typ now passes the alignment down through TPtr, TArray and
 TFun to the base type, where it is printed after the type name and its
-qualifiers (int _Alignas(16) *gp;), and fieldinfo uses the same path as
-vdecl instead of appending the specifier after the member name.
+qualifiers (int _Alignas(16) *gp;), also prints it in the
+TBuiltin_va_list case, and fieldinfo uses the same path as vdecl instead
+of appending the specifier after the member name.
 
 Declarations whose alignment was already valid only change spacing
 (char  _Alignas(16)la[4] becomes char _Alignas(16) la[4]), which updates
 the oracles of tests/syntax/alignas_typing_constrains and
 plugins/rte/tests/basic/unaligned_pointer. The new test
-tests/pretty_printing/alignas.c re-parses the printed code.
+tests/pretty_printing/alignas.c re-parses the printed code (with
+-no-variadic-translation, covering __builtin_va_list as well).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  .../oracle/unaligned_pointer.0.res.oracle     |  4 +-
- .../services/ast_printing/cil_printer.ml      | 32 ++++----
- tests/pretty_printing/alignas.c               | 39 +++++++++
- .../oracle/alignas.0.res.oracle               | 81 +++++++++++++++++++
+ .../services/ast_printing/cil_printer.ml      | 36 ++++----
+ tests/pretty_printing/alignas.c               | 41 +++++++++
+ .../oracle/alignas.0.res.oracle               | 85 +++++++++++++++++++
  .../alignas_typing_constrains.2.res.oracle    |  4 +-
  .../alignas_typing_constrains.29.res.oracle   |  4 +-
  .../alignas_typing_constrains.3.res.oracle    |  4 +-
  .../alignas_typing_constrains.30.res.oracle   |  4 +-
- 8 files changed, 144 insertions(+), 28 deletions(-)
+ 8 files changed, 152 insertions(+), 30 deletions(-)
  create mode 100644 tests/pretty_printing/alignas.c
  create mode 100644 tests/pretty_printing/oracle/alignas.0.res.oracle
 
@@ -61,7 +68,7 @@ index e10b52a0d5..9c65c025ec 100644
    int8_t *pc2 = c4;
    int8_t *pc3 = (int8_t *)(i);
 diff --git a/src/kernel/services/ast_printing/cil_printer.ml b/src/kernel/services/ast_printing/cil_printer.ml
-index ab38658129..579e5c76f6 100644
+index ab38658129..af5f2a7fdb 100644
 --- a/src/kernel/services/ast_printing/cil_printer.ml
 +++ b/src/kernel/services/ast_printing/cil_printer.ml
 @@ -1893,13 +1893,12 @@ class cil_printer () = object (self)
@@ -143,12 +150,24 @@ index ab38658129..579e5c76f6 100644
  
      | TNamed ti ->
        fprintf fmt "%a%a%a%a"
+@@ -2191,9 +2187,9 @@ class cil_printer () = object (self)
+         pname true
+ 
+     | TBuiltin_va_list ->
+-      (* Note: no printing of _Alignas here, since it does not make sense. *)
+-      fprintf fmt "__builtin_va_list%a%a"
++      fprintf fmt "__builtin_va_list%a%a%a"
+         self#attributes t.tattr
++        palignas true
+         pname true
+ 
+   (**** PRINTING ATTRIBUTES *********)
 diff --git a/tests/pretty_printing/alignas.c b/tests/pretty_printing/alignas.c
 new file mode 100644
-index 0000000000..8cbac8be42
+index 0000000000..b325de5a6c
 --- /dev/null
 +++ b/tests/pretty_printing/alignas.c
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +/* run.config
 +   STDOPT:
 +*/
@@ -178,6 +197,8 @@ index 0000000000..8cbac8be42
 +_Alignas(16) int ga[2][3];
 +_Alignas(16) const char *const gcp = 0;
 +_Alignas(8) char *gap[2];
++_Alignas(16) __builtin_va_list gva;
++_Alignas(16) __builtin_va_list *gvap = &gva;
 +
 +int main(void)
 +{
@@ -186,14 +207,14 @@ index 0000000000..8cbac8be42
 +  union blk u = { .b = { 0 } };
 +  struct s v = { 0 };
 +  return (int)u.u64[0] + v.c + (lp == 0) + la[0] + (gp == 0) + (gfp == 0)
-+    + ga[0][0] + (gcp == 0) + (gap[0] == 0);
++    + ga[0][0] + (gcp == 0) + (gap[0] == 0) + (gvap == 0);
 +}
 diff --git a/tests/pretty_printing/oracle/alignas.0.res.oracle b/tests/pretty_printing/oracle/alignas.0.res.oracle
 new file mode 100644
-index 0000000000..775d34e529
+index 0000000000..3d647936cb
 --- /dev/null
 +++ b/tests/pretty_printing/oracle/alignas.0.res.oracle
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,85 @@
 +[kernel] Parsing alignas.c (with preprocessing)
 +/* Generated by Frama-C */
 +union blk {
@@ -213,6 +234,8 @@ index 0000000000..775d34e529
 +int _Alignas(16) ga[2][3];
 +char const _Alignas(16) * const gcp = (char const *)0;
 +char _Alignas(8) *gap[2];
++__builtin_va_list _Alignas(16) gva;
++__builtin_va_list _Alignas(16) *gvap = & gva;
 +int main(void)
 +{
 +  int __retres;
@@ -226,17 +249,17 @@ index 0000000000..775d34e529
 +     .a = {(int *)0, (int *)0},
 +     .fp = (int (*)(int ))0,
 +     .x = 0U};
-+  __retres = ((((((((int)u.u64[0] + (int)v.c) + (lp == (int *)0)) + (int)la[0]) + (
-+                 gp == (int *)0)) + (gfp == (int (*)(int ))0)) + ga[0][0]) + (
-+              gcp == (char const *)0)) + (gap[0] == (char *)0);
++  __retres = (((((((((int)u.u64[0] + (int)v.c) + (lp == (int *)0)) + (int)la[0]) + (
++                  gp == (int *)0)) + (gfp == (int (*)(int ))0)) + ga[0][0]) + (
++               gcp == (char const *)0)) + (gap[0] == (char *)0)) + (gvap == (__builtin_va_list *)0);
 +  return __retres;
 +}
 +
 +
 +[kernel] Parsing ocode_alignas.c (with preprocessing)
 +[kernel] Parsing alignas.c (with preprocessing)
-+[kernel] alignas.c:31: Warning: 
-+  def'n of func main at alignas.c:31-39 (sum 4629) conflicts with the one at ocode_alignas.c:19-36 (sum 5516); keeping the one at ocode_alignas.c:19-36.
++[kernel] alignas.c:33: Warning: 
++  def'n of func main at alignas.c:33-41 (sum 4629) conflicts with the one at ocode_alignas.c:21-38 (sum 5516); keeping the one at ocode_alignas.c:21-38.
 +/* Generated by Frama-C */
 +union blk {
 +   unsigned long long _Alignas(16) u64[2] ;
@@ -255,6 +278,8 @@ index 0000000000..775d34e529
 +int _Alignas(16) ga[2][3];
 +char const _Alignas(16) * const gcp = (char const *)0;
 +char _Alignas(8) *gap[2];
++__builtin_va_list _Alignas(16) gva;
++__builtin_va_list _Alignas(16) *gvap = & gva;
 +int main(void)
 +{
 +  int __retres;
@@ -268,9 +293,9 @@ index 0000000000..775d34e529
 +     .a = {(int *)0, (int *)0},
 +     .fp = (int (*)(int ))0,
 +     .x = 0U};
-+  __retres = ((((((((int)u.u64[0] + (int)v.c) + (lp == (int *)0)) + (int)la[0]) + (
-+                 gp == (int *)0)) + (gfp == (int (*)(int ))0)) + ga[0][0]) + (
-+              gcp == (char const *)0)) + (gap[0] == (char *)0);
++  __retres = (((((((((int)u.u64[0] + (int)v.c) + (lp == (int *)0)) + (int)la[0]) + (
++                  gp == (int *)0)) + (gfp == (int (*)(int ))0)) + ga[0][0]) + (
++               gcp == (char const *)0)) + (gap[0] == (char *)0)) + (gvap == (__builtin_va_list *)0);
 +  return __retres;
 +}
 +
@@ -344,5 +369,5 @@ index b7054f7e7e..472b086614 100644
    
    First declaration was at alignas_typing_constrains.c:334
 -- 
-2.56.0.windows.4
+2.47.3
 

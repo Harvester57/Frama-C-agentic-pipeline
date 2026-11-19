@@ -101,7 +101,8 @@ def substitute(text: str, nn: str, led: dict[str, dict[str, Any]]) -> str:
 
 
 def parse(kind: str, nn: str, led: dict[str, dict[str, Any]]) -> dict[str, str]:
-    raw = text_file(kind, nn).read_text(encoding="utf-8")
+    # Bytes, not read_text: text mode turns CRLF into LF before the check below can see it.
+    raw = text_file(kind, nn).read_bytes().decode("utf-8")
     if "\r" in raw:
         sys.exit("CRLF in the filing text")
     lines = raw.split("\n")
@@ -190,14 +191,17 @@ def do_mr(nn: str) -> None:
     closes = sorted(i["iid"] for i in api("GET", f"{base}/closes_issues"))
     own = [led[nn]["issue"]] if re.search(r"^Closes #\d+", sent["description"], re.M) else []
     print(f"  closes: {closes} (allowed: [] or {own})")
-    commits = api("GET", f"{base}/commits")
-    print(f"  commits: {len(commits)} (patch has {ncommits})")
+    commits: list[Any] = []
     changed = 0
-    for _ in range(6):  # GitLab computes the diff a few seconds after the creation
+    # GitLab computes the commit list and the diff a few seconds after the creation: read at once,
+    # !58 (package 41) showed 0 commits, and the check below failed on a correct merge request.
+    for _ in range(6):
+        commits = api("GET", f"{base}/commits")
         changed = len(api("GET", f"{base}/diffs?per_page=100"))
-        if changed:
+        if commits and changed:
             break
         time.sleep(5)
+    print(f"  commits: {len(commits)} (patch has {ncommits})")
     print(f"  files changed: {changed} (patch has {nfiles})")
     if closes not in ([], own) or len(commits) != ncommits or changed != nfiles:
         sys.exit("CHECK FAILED after creation: look at the merge request before going on")

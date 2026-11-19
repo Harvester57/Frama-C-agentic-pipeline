@@ -62,6 +62,20 @@ int f_struct(struct S s, int k)
 The store comes from `inject_in_stmt` (`plugins/e-acsl/src/code_generator/injector.ml:470`), which
 calls `Memory_observer.store` on the formals. That function emits `__e_acsl_store_block` only.
 
+For `main`, `inject_in_stmt` intentionally skips `Memory_observer.store` and delegates tracking of
+`argc` and `argv` to `__e_acsl_memory_init(&argc, &argv, ...)` -> `argv_alloca(argc_ref, argv_ref)`
+in the runtime observation models. Both observation models had the exact same omission for
+`argc_ref` and `argv_ref` (even though they initialized `argv[]`, `*argv`, and `*environ`
+immediately below):
+
+- `plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c`:
+  called `shadow_alloca` on `argc_ref` and `argv_ref` without `initialize_static_region`;
+- `plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c`:
+  called `eacsl_store_block` on `argc_ref` and `argv_ref` without `eacsl_initialize`.
+
+As a result, checking `\initialized(p)` or `\initialized(q)` with `int *p = &argc; char ***q = &argv;`
+inside `main(int argc, char **argv)` aborted with exit 134 in both the segment and bittree models.
+
 The rest of E-ACSL assumes formals are initialized:
 
 - `add_initializer` (`injector.ml:161-168`) emits no `__e_acsl_full_init` for an assignment to a
@@ -80,11 +94,12 @@ E-ACSL emits `__e_acsl_full_init` at each of their assignments.
 
 ## Versions
 
-- Reproduced on `master` at `3dff90fc70` (2026-11-13, `35.0~~dev (Bromine)`), Debian 13,
-  gcc 14.2.0, with [`./repro/13-eacsl-formal-params-initialized.sh`](./repro/13-eacsl-formal-params-initialized.sh)
-  (2026-11-15: the `requires \initialized(&s.len)` program `c.c`, and the scalar `k = 7; pk = &k`
-  program with `-F "-rte -rte-initialized @all"`). First reproduced on `ad24dca` (2026-11-02), with
-  gcc and clang 19.1.7, with and without `-M` (full memory tracking).
+- Reproduced on `master` at `b80fcac74f` (`35.0~~dev (Bromine)`), Debian 13, gcc 14.2.0, with
+  [`./repro/13-eacsl-formal-params-initialized.sh`](./repro/13-eacsl-formal-params-initialized.sh)
+  (struct formal `requires \initialized(&s.len)`, scalar formal `k = 7; pk = &k` with
+  `-F "-rte -rte-initialized @all"`, and `main(int argc, char **argv)` with `int *p = &argc; char ***q = &argv;`
+  in both segment and bittree models). Earlier reproduced on `3dff90fc70` (2026-11-15) and
+  `ad24dca` (2026-11-02), with gcc and clang 19.1.7, with and without `-M` (full memory tracking).
 - Same output on `34.0~beta (Selenium)` (2026-11-15). Earlier also on `34.0~~dev (Selenium)`
   (#177's program, gcc and clang, with and without `-M`).
 - #177 was closed in 2022 as no longer failing. I cannot tell which release brought it back.
@@ -158,17 +173,43 @@ Aborted
 ## Fix
 
 Patch: [`./patches/13-eacsl-formal-params-initialized.patch`](./patches/13-eacsl-formal-params-initialized.patch),
-one commit on `fix/e-acsl-formals-initialized` from `3dff90fc70`, "[e-acsl] mark formal parameters
-as initialized on function entry" (63 files, 410 lines added, 1 removed). Besides the source change
-below, it contains the 57 promoted `gen_*.c` oracles (see the validation) and the regression test
-`plugins/e-acsl/tests/bts/issue-framac-177.c` (`requires \initialized(&s.len)` and
-`assert \initialized(&s.t)` on a by-value struct, `assert \initialized(pk)` on `&k` after `k = 7`)
-with its default-configuration oracles.
+one squashed commit on `b80fcac74f`, "[e-acsl] mark formal parameters as initialized on function
+entry" (65 files changed, 517 insertions, 1 deletion). Besides the five source files below, it
+contains the 57 promoted `gen_*.c` oracles (210 lines added, none removed) and the clang-formatted
+regression test `plugins/e-acsl/tests/bts/issue-framac-177.c` (`requires \initialized(&s.len)` and
+`assert \initialized(&s.t)` on a by-value struct, `assert \initialized(pk)` on `&k` after `k = 7`,
+and `assert \initialized(p)` / `assert \initialized(q)` on `&argc` / `&argv` in `main`) with its
+default-configuration oracles.
 
 Where E-ACSL stores the formals, also mark each one fully initialized, as `global_observer.ml` does
-for globals:
+for globals, and mark `argc_ref` and `argv_ref` initialized in `argv_alloca` in both observation
+models:
 
 ```diff
+--- a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+@@ -546,7 +546,9 @@ extern char **environ;
+ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+   /* Track a top-level containers */
+   eacsl_store_block((void *)argc_ref, sizeof(int));
++  eacsl_initialize((void *)argc_ref, sizeof(int));
+   eacsl_store_block((void *)argv_ref, sizeof(char **));
++  eacsl_initialize((void *)argv_ref, sizeof(char **));
+   int argc = *argc_ref;
+   char **argv = *argv_ref;
+   /* Track argv */
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+@@ -242,7 +242,9 @@ extern char **environ;
+ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+   /* Track a top-level containers */
+   shadow_alloca((void *)argc_ref, sizeof(int));
++  initialize_static_region((uintptr_t)argc_ref, sizeof(int));
+   shadow_alloca((void *)argv_ref, sizeof(char **));
++  initialize_static_region((uintptr_t)argv_ref, sizeof(char **));
+   int argc = *argc_ref;
+   char **argv = *argv_ref;
+   /* Track argv */
 --- a/plugins/e-acsl/src/code_generator/injector.ml
 +++ b/plugins/e-acsl/src/code_generator/injector.ml
 @@ -467,7 +467,8 @@ and inject_in_stmt env kf stmt =
@@ -249,6 +290,30 @@ the argument's init bits when the argument is a tracked lvalue, and fall back to
 initialization otherwise. Only struct and union formals need it. I have not implemented it.
 
 ## Validation of the fix
+
+### On `b80fcac74f` (remediated single-commit patch)
+
+Validated end-to-end inside a fresh `framac-master-audit:b80fcac` container (`JOBS=4`, Debian 13,
+OCaml 5.5 switch, gcc 14.2.0) using `revalidate.sh before 13` and `revalidate.sh package 13`:
+
+| Step / Check | Result |
+|---|---|
+| `reproducer 13 (before)` on pristine `b80fcac74f` | `struct`, `scalar`, `main-seg`, `main-bittree` all abort with `exit 134` |
+| `git am --keep-non-patch` | `exit=0`, 1 single commit, 65 files changed (517 insertions, 1 deletion), no mode changes or executable files |
+| `A0` build with `master` sources | `exit=0` |
+| `A1` default `bts/issue-framac-177.c` with `master` sources | `exit=1` (fails as expected: missing `__e_acsl_full_init` on `s` and `k`) |
+| `A2` `dev` `bts/issue-framac-177.c` with `master` sources | `exit=1` (fails as expected at runtime) |
+| `B0` build with patched sources | `exit=0` |
+| `B1` default `bts/issue-framac-177.c` patched | `exit=0` |
+| `B2` `dev` `bts/issue-framac-177.c` patched | `exit=0` |
+| `C1` default `plugins/e-acsl` full suite | `exit=0` (57 promoted existing `gen_*.c` oracles: `memory` 13, `bts` 12, `temporal` 8, `constructs` 6, `builtin` 4, `concurrency` 4, `special` 4, `libc` 3, `format` 2, `inductive` 1; 210 lines added, 0 removed) |
+| `D` `./dev/check-files.sh -p HEAD~1` (clang-format 19.1.7, ocp-indent, headers) | `exit=0` (`Lint 65 file(s)`) |
+| `E0` `dune install` + `reproducer 13 (after)` | `exit=0` (`struct`, `scalar`, `main-seg`, `main-bittree` all exit 0) |
+
+Note on the bittree model: `main-bittree` passes standalone because `argv_alloca` calls
+`eacsl_initialize` (which uses `bt_find`); testing `f_struct` / `f_scalar` under `-m bittree`
+exercises `__e_acsl_full_init` (which calls `bt_lookup` / `pt_lookup`) and also depends on the
+separate `pt_lookup` fix ([`./patches/37-eacsl-bittree-lookup-uninitialized.patch`](./patches/37-eacsl-bittree-lookup-uninitialized.patch)).
 
 ### On `3dff90fc70` (2026-11-15)
 

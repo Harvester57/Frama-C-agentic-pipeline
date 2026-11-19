@@ -30,8 +30,9 @@ e-acsl-gcc: fatal error: aborted by Frama-C
 - `static` does not matter: a non-static `const union u zero_block;` fails the same way, and so does a
   `static const` union local to `main` (Frama-C turns it into the global `main_zero_block`).
 - An initializer does not matter: `= { { 0 } }` fails the same way.
-- A `static const` struct with the same members instruments and runs. So does a non-const `static`
-  union.
+- A `static const` struct with the same members instruments and runs without `--rt-debug` (though
+  per-field marking writes read-only shadow bits past the end of the struct and aborts under
+  `--rt-debug`; see Issue 27). A non-const `static` union instruments and runs.
 - Without `-M`, E-ACSL does not monitor the global in this program, emits nothing for it, and the
   program runs.
 - `frama-c -print` on the same file is clean: the cast comes from E-ACSL's generated code.
@@ -45,14 +46,15 @@ In the pipeline, 10 libnettle modules lost their E-ACSL build to `static const u
 array or a struct, it passes the global itself (`Cil.evar ~loc vi`,
 `plugins/e-acsl/src/code_generator/global_observer.ml:130`) to `Smart_stmt.mark_readonly`, which builds
 `__e_acsl_mark_readonly((void *)zero_block)`. Converting a union to `void *` is not a valid C cast, and
-the kernel's check of the generated code rejects it. Structs have their own branch (each field's
-address, `global_observer.ml:123-129`, from e-acsl#223), which is why a const struct is fine. The full
-analysis, which also covers scalars, pointers and structs with bitfields, is in
-[frama-c-eacsl-readonly-scalar-global-address.md](./frama-c-eacsl-readonly-scalar-global-address.md#cause).
+the kernel's check of the generated code rejects it. Structs avoid the cast error because they have a
+per-field branch (`global_observer.ml:123-129`, from e-acsl#223), which itself triggers an out-of-bounds
+read-only shadow write on multi-field structs (aborting under `--rt-debug`) and crashes on bitfields.
+The full analysis, which also covers scalars, pointers, multi-field structs and structs with bitfields,
+is in [frama-c-eacsl-readonly-scalar-global-address.md](./frama-c-eacsl-readonly-scalar-global-address.md#cause).
 
 ## Versions
 
-- Reproduced on Frama-C `35.0~~dev (Bromine)`, `master` at `3dff90fc70` (2026-11-13), and on
+- Reproduced on Frama-C `35.0~~dev (Bromine)`, `master` at `b80fcac74f` (also `3dff90fc70`) and on
   `34.0~beta (Selenium)`, Debian 13, gcc 14.2.0. Same output on both.
 
 ## Reproduction
@@ -102,24 +104,26 @@ frama-c: exit 0
 
 ## Fix
 
-Pass the address of the global (`Cil.mkAddrOfVi vi`) for every type but arrays. This is the patch of
-Issue 27: [`./patches/27-eacsl-readonly-scalar-global-address.patch`](./patches/27-eacsl-readonly-scalar-global-address.patch).
+Remove the per-field struct branch and pass the base address of the global (`Cil.mkAddrOfVi vi`) for
+every type but arrays. This is the patch of Issue 27:
+[`./patches/27-eacsl-readonly-scalar-global-address.patch`](./patches/27-eacsl-readonly-scalar-global-address.patch).
 
 ### Validation
 
-`master` at `3dff90fc70` in `framac-master-audit:3dff90f`, then the same tree with the Issue 27 patch,
-rebuilt with dune and installed (Debian 13, gcc 14.2.0).
+`master` at `b80fcac74f` in `framac-master-audit:b80fcac`, then the same tree with the Issue 27 patch,
+rebuilt with dune and installed via [`../../../tools/upstream_audit/revalidate.sh`](../../../tools/upstream_audit/revalidate.sh)
+(Debian 13, gcc 14.2.0).
 
-| Check | `master` | Patched |
+| Check | `master` (`b80fcac74f`) | Patched |
 |---|---|---|
 | `DEFAULT` (`static const union u zero_block;`), `-M` | `implicit cast: cast from union u to void *`, build exit 1 | `__e_acsl_mark_readonly((void *)(& zero_block));`, runs, exit 0 |
 | `LOCAL_STATIC`, `-M` | same error, build exit 1 | `(void *)(& main_zero_block)`, runs, exit 0 |
 | `INITIALIZED`, `-M` | same error, build exit 1 | `(void *)(& zero_block)`, runs, exit 0 |
 | `NON_STATIC`, `-M` | same error, build exit 1 | `(void *)(& zero_block)`, runs, exit 0 |
-| `CONST_STRUCT`, `-M` | per-field calls, runs, exit 0 | unchanged |
+| `CONST_STRUCT`, `-M` | per-field calls (`& zero_block.b`, `& zero_block.w`), runs, exit 0 | single call `(void *)(& zero_block)`, runs, exit 0 |
 | `NON_CONST_UNION`, `-M` | runs, exit 0 | unchanged |
 | `DEFAULT` without `-M`; `frama-c -print` | exit 0 | exit 0 |
-| Regression test `full-mtracking/const_globals.c` (Issue 27 patch), which has an initialized const union and a `static` one without initializer | `implicit cast` error (line 16, the first union) | passes; both unions are `\valid_read` and not `\valid` at run time |
+| Regression test `full-mtracking/const_globals.c` (Issue 27 patch), which has an initialized const union and a `static` one without initializer | `implicit cast` error (line 25, the first union) | passes in default and `dev` (`--rt-debug`); both unions are `\valid_read` and not `\valid` at run time |
 
 The ptests run of the Issue 27 patch is in
 [frama-c-eacsl-readonly-scalar-global-address.md](./frama-c-eacsl-readonly-scalar-global-address.md#validation-of-the-proposed-fix).

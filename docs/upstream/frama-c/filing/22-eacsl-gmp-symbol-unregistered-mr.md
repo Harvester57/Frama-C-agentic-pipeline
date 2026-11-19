@@ -11,7 +11,7 @@ Before submitting the merge request, please confirm (by adding a X in the [ ]):
 - [ ] if the size of the PR requires it, you have signed the
   [Contributor Licensing Agreement](https://git.frama-c.com/pub/frama-c/-/blob/master/CLA.md)
 
-Closes #ISSUE-22.
+Closes #2816.
 
 ## Problem
 
@@ -29,10 +29,11 @@ generated code then calls the program's declaration of the same function; `Smart
 casts the arguments to its parameter types, e.g. `__gmpz_clear((struct my_mpz *)(__gen_e_acsl_mul));`.
 
 `Rtl.Symbols.mem_vi` is now also true for those names. Its only user,
-`Memory_tracking.must_never_monitor`, tests variables by name: a local variable named like one of these
-functions (for instance a local `printf`, if the RTL and the program both declare `printf`) would no
-longer be monitored. Keeping a separate table for these functions would avoid that, at the cost of a
-second lookup in `rtl_call`; tell me if you prefer it.
+`Memory_tracking.must_never_monitor`, tests variables by name: across translation units, a local
+variable in a second TU with the same name as an RTL-linked function declared in another TU (where
+no file-scope declaration in the second TU triggers CIL alpha-renaming) would no longer be
+monitored. Keeping a separate table for these functions would avoid that, at the cost of a second
+lookup in `rtl_call`; tell me if you prefer it.
 
 New test `bts/rtl_user_gmp_symbols.c`: the program declares `__gmpz_init` and `__gmpz_clear` with its own
 struct type, calls them, and asserts `a * b + 1 > 0` on two `unsigned long`.

@@ -16,6 +16,82 @@ on 2026-11-09. It predates Issues 15 to 40, so do not rely on it alone for dedup
 
 ---
 
+## Status update (2026-11-19)
+
+This section is newer than the ones below and wins where they differ.
+
+- **Full reassessment and local remediation of filed reports (`#2793` to `#2832`):** All 39 filed
+  issues, their merge requests, patches, and reproducers (plus the overview `#2832`) were
+  re-audited against upstream `master` (`b80fcac74f`) in `framac-master-audit:b80fcac`. Zero
+  reports were questionable; 30 filed bugs plus `#2832` were solid; 9 items (8 filed + 1 local
+  unfiled MR draft) needed revision and were remediated locally and re-validated end-to-end with
+  [`../../../tools/upstream_audit/revalidate.sh`](../../../tools/upstream_audit/revalidate.sh) on
+  `b80fcac74f` (`git am --keep-non-patch`, fail-before / pass-after tests, `plugins/e-acsl` +
+  touched suites, `./dev/check-files.sh -p HEAD~1`, and installed reproducers):
+  - **27 & 23 (`#2794`, `#2795`, `!26`):** Removed the preserved per-field `TComp` branch in
+    `global_observer.ml` (`TArray _` -> `Cil.evar`, `_` -> `Cil.mkAddrOfVi`). Marking a non-first
+    field (`&cs.b`) passed `_block_length(&cs.b) == sizeof(cs)` to `mark_readonly_region`, writing
+    past the end of any multi-field `const struct` (aborts under `--rt-debug`) and emitting zero
+    calls for an empty `const struct {}`. Updated `const_globals.c` (with `run.config_dev`
+    `--full-mtracking --rt-debug`), the single affected existing oracle
+    (`concurrency/oracle/gen_sequential_threads.0.c`), both reproducers, and the filing/draft texts.
+  - **24 (`#2793`, `!25`):** Added `?(in_lhs=false)` to `visit_quantif_relations` in
+    `bound_variables.ml`, closing both multi-variable nested implications inside a `\forall`
+    hypothesis (`(0 <= i < n ==> 0 <= j < m) ==> i < n`) and a newly spotted sibling soundness bug
+    (conjunction outside any implication hypothesis while unguarded variables remain, e.g.
+    `0 <= i < n ==> 0 <= j && (j < m ==> i < n)`). Extended `quantif_conjunctions.c`, the
+    reproducer, and the filing/draft texts.
+  - **39 (`#2828`, `!56`):** Added `assigns errno` on all 9 `epoll_*` and `inotify_*` functions
+    (preventing unsound dead-code elimination of `errno == EINTR` loops), replaced
+    `#include <signal.h>` with `../__fc_define_sigset_t.h` in `sys/epoll.h`, added
+    `initialization:sigmask` and `indirect:*sigmask` to `epoll_pwait`, added
+    `indirect:event, indirect:event->events` to `epoll_ctl`, updated `sys_epoll_h.c` (both `x86_32`
+    and `x86_64`, `EPOLL_CTL_DEL` with `NULL`, `EINTR` check, host glibc syntax check) and
+    `sys_inotify_h.c`, noted intentional omission of `epoll_pwait2`, and synced
+    [`../../../templates/fc_stubs/sys/epoll.h`](../../../templates/fc_stubs/sys/epoll.h) and
+    [`../../../templates/fc_stubs/sys/inotify.h`](../../../templates/fc_stubs/sys/inotify.h).
+  - **05 (`#2805`, `!36`):** Guarded `TSizeOfE` and `TAlignOfE` in `typing.ml` alongside
+    `TSizeOf`/`TAlignOf`, tightened comments to cover incomplete arrays and enums, and added
+    `TSizeOfE` cases (`sizeof(g)`, `sizeof(a)`) to `incomplete_type.c` and the reproducer.
+  - **13 (`#2797`, `!28`):** Initialized `argc_ref` and `argv_ref` in `argv_alloca` in both
+    segment (`initialize_static_region`) and bittree (`eacsl_initialize`) observation models so
+    `\initialized(&argc)` / `\initialized(&argv)` via pointers no longer abort, squashed the patch
+    into 1 clean commit on `b80fcac74f`, and added `main(int argc, char **argv)` to
+    `issue-framac-177.c` and the reproducer.
+  - **20 (`#2812`, `!43`):** Added `palignas true` to `TBuiltin_va_list` in `cil_printer.ml` so
+    `_Alignas` on `__builtin_va_list` and `__builtin_va_list *` is not dropped under
+    `-no-variadic-translation`; extended `tests/pretty_printing/alignas.c` and the reproducer.
+  - **42 (`#2831`, `!59`):** Added optional leading sign `[-+]?` to `re_hexadecimal` in
+    `Cfloat.ml` (for `Logic_const.treal` / `-float-print hex` negative literals) plus an explicit
+    empty-digit guard (because Zarith `Z.of_string_base 16` silently returns `0` on `""`/`"-"`/`"+"`);
+    extended `wp_acsl/float_literals.i` (non-exact `0.1f32`/`0.1F64` and `eva + reduc -float-print hex`
+    run, 6 oracles across default and `qualif`).
+  - **36 (`#2825`, `!53`):** Fixed the unclosed Markdown code fence on line 59 of
+    [`./filing/36-eacsl-heap-zone-size-overflow-issue.md`](./filing/36-eacsl-heap-zone-size-overflow-issue.md)
+    and parenthesized `(E_ACSL_HEAP_SIZE)` / `(E_ACSL_TLS_SIZE)` in
+    [`./patches/36-eacsl-heap-zone-size-overflow.patch`](./patches/36-eacsl-heap-zone-size-overflow.patch).
+  - **22 (`#2816` local MR draft), 14 (`#2800`), 00 (`#2832`):** Replaced `#ISSUE-22` with `#2816`
+    and fixed the cross-TU shadowing example in
+    [`./filing/22-eacsl-gmp-symbol-unregistered-mr.md`](./filing/22-eacsl-gmp-symbol-unregistered-mr.md);
+    fixed the `Piff` interlang citation in
+    [`./filing/14-eacsl-iff-labelled-term-issue.md`](./filing/14-eacsl-iff-labelled-term-issue.md);
+    corrected three editorial lines (23, 38, 159) in
+    [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md).
+- **Synced to GitLab (2026-11-19, on the owner's go-ahead):**
+  - All 8 MR branches were built on `b80fcac74f` via
+    [`../../../tools/upstream_audit/make_branches.sh`](../../../tools/upstream_audit/make_branches.sh)
+    and force-pushed with `--force-with-lease` to `Harvester57/frama-c`: `!36` (`05`, `392ea01113`),
+    `!28` (`13`, `74af5e0224`, squashed to 1 commit), `!43` (`20`, `1004c15a56`), `!25` (`24`,
+    `add5b2bd60`), `!26` (`27`, `4e596579ef`), `!53` (`36`, `2deb0251ba`), `!56` (`39`,
+    `0dc79ec324`), and `!59` (`42`, `5a98c87bac`).
+  - All 8 MR descriptions (plus `!26`'s title) and all 9 changed issues (`#2793`, `#2794`, `#2795`,
+    `#2797`, `#2800`, `#2805`, `#2812`, `#2825`, `#2832`) were updated via `glab api` and read back
+    identical, preserving the live checkbox states (`['x', ' ']` on `!25`, `!26`, `!28`, `!36`,
+    `!43`, `!53`, `!56`; `[' ', ' ']` on `!59`), with each MR verified at 1 commit and the exact
+    file count of its patch. `#2828` (`39`) and `#2831` (`42`) were unchanged and untouched.
+
+---
+
 ## Status update (2026-11-18)
 
 This section is newer than the ones below and wins where they differ.
@@ -25,9 +101,6 @@ This section is newer than the ones below and wins where they differ.
   was read as "file".
   Every package up to 40 now has its issue filed; 22's merge request still waits for the
   maintainers' answer.
-- **Drafted, not filed: 41** (later on 2026-11-18, from libmodbus `run-1`): `<sys/ioctl.h>` defines
-  `TIOCMGET`/`TIOCMSET` but not the `TIOCM_*` modem-line bits. A draft and a reproducer only (no
-  filing texts, no patch); its draft asks whether it should be a note on #2828 instead.
   - **Issues:** 28 to 31 as #2817 to #2820, 33 as #2821, 32 as #2822, 34 to 40 as #2823 to #2829
     (33 went before 32 so that 32's text could cite it; 37 before 38). 34 is an issue only.
   - **Merge requests:** 28 to 33 as !46 to !51, 35 to 39 as !52 to !56, and 40's manual fix as !57.
@@ -38,6 +111,163 @@ This section is newer than the ones below and wins where they differ.
   - **Checks on each item:** the stored title and description were read back and are identical to
     the filing text; each merge request shows one commit and the file count of its patch, and
     GitLab reports all twelve as mergeable, without conflict.
+- **Filed: 41** (later on 2026-11-18, from libmodbus `run-1`), as
+  [#2830](https://git.frama-c.com/pub/frama-c/-/work_items/2830) with merge request
+  [!58](https://git.frama-c.com/pub/frama-c/-/merge_requests/58), on the owner's go-ahead ("File
+  issue + MR", chosen over a note on #2828): `<sys/ioctl.h>` defines `TIOCMGET`/`TIOCMSET` but not
+  the `TIOCM_*` modem-line bits. The package (issue text, MR text, reproducer, patch) was written
+  and checked the same day:
+  - **Base:** upstream `master` moved to `b80fcac74f` on 2026-11-17 (one WP merge, nothing under
+    `share/libc` or `tests/`). The audit container's tree was moved to it, rebuilt and reinstalled;
+    the image itself is still `95408044f7`.
+  - **Eleven names, not fourteen:** the patch adds the names glibc's `<sys/ioctl.h>` defines.
+    `TIOCM_OUT1`, `TIOCM_OUT2` and `TIOCM_LOOP` exist only in Linux `<asm-generic/termios.h>` (gcc
+    with glibc rejects them after `<sys/ioctl.h>`), so they are named in the texts and left out.
+  - **Validated** with `revalidate.sh package 41`: the new test fails on `master`'s header and
+    passes with the patch; `plugins/e-acsl/tests`, `tests/libc` and `tests/variadic` pass; lint
+    passes; the reproducer goes from 11 failures of 11 to `RESULT: fixed`.
+  - **Duplicates:** the tracker was searched live (read-only API); none. #2828 has no reply yet.
+  - **As filed:** branch `fix/libc-ioctl-modem-lines` on the fork, one commit (`03a454ea4b`) on
+    `b80fcac74f`, with the settings of the earlier merge requests and the two checkboxes left for
+    the owner. Both stored texts were read back (identical) and rendered (no mention, links to
+    #2828, #2830, !45 and !56). GitLab reports !58 as mergeable, one commit, three files.
+- **Filed: 42** (2026-11-18), as [#2831](https://git.frama-c.com/pub/frama-c/-/work_items/2831)
+  with [!59](https://git.frama-c.com/pub/frama-c/-/merge_requests/59): WP reads only decimal
+  floating-point literals.
+  - **Three symptoms, one function** (`Cfloat.parse_literal`): a hexadecimal literal without
+    suffix, such as `DBL_MAX` from Frama-C's `<float.h>`, is rejected (a hypothesis is lost, a
+    lemma stops WP); with `-wp-model +real` a suffixed one (`0x1.8p1f`) is read as 0 and
+    `0x1.8p1f == 0.0` is proved; the `f32` and `f64` suffixes are rejected.
+  - **Package:** issue text, MR text, a prover-free reproducer and a patch (21 lines added and 4
+    removed in `Cfloat.ml`, and a test with four oracles), validated on `master` `b80fcac74f`.
+    The checks that ran are in
+    [`./frama-c-wp-hexadecimal-float-literals.md`](./frama-c-wp-hexadecimal-float-literals.md).
+  - **As filed:** on the owner's go-ahead ("check expf now and then fill the issue and merge
+    request"). Branch `fix/wp-hexadecimal-float-literals` on the fork, one commit (`e49fe7c9f2`,
+    tree `27772c3d1c`) on `b80fcac74f`, with the settings of the earlier merge requests and the
+    two checkboxes left for the owner. Both stored texts were read back (identical) and rendered
+    (no mention, no strikethrough). GitLab reports !59 as mergeable, one commit, six files.
+  - **Credit:** both texts name the `frama-c-discuss` report (2026-10) that showed the first
+    symptom, and link it. The link was not opened from the filing session (the archive sits
+    behind an anti-harvesting button).
+- **Filed on 2026-11-18: an overview issue** for the maintainers,
+  [#2832](https://git.frama-c.com/pub/frama-c/-/work_items/2832), text
+  [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md), title
+  "Discussion: priorities for the reports #2793 to #2831, and how to send further findings".
+  39 issues and 35 merge requests went up in four days, so it ranks them (first #2793, #2800,
+  #2797, #2831 and #2798 with #2799), indexes them by component and asks three questions: whether
+  bittree is still supported, how to send further findings, and whether to combine or draft merge
+  requests. It also says the CLA is not signed yet: the owner said to post without confirming
+  that sentence, so correct it by editing the issue if it is wrong.
+  - **Filing is paused** until the maintainers answer on content. The first proposal made to the
+    owner on 2026-11-18 kept an exception for a finding where an analysis gives a wrong verdict.
+    Later that day the owner asked to discuss in this main issue before proposing any other
+    issue or merge request, so the exception is gone: 43 and the candidates of the hunt wait
+    too. The owner then asked for another title and said to post it: the go-ahead covered this
+    issue only. The tracker was read just before: 39 issues and 35 merge requests, all open.
+  - **It now lists the findings that are not filed** (added on 2026-11-18 by the session that
+    ran the hunt): the question on enumeration constants (N1, a deliberate upstream change), a
+    table of the wrong-answer findings by component, a sentence on the smaller ones, and an
+    annex at the end with every unfiled finding in one line (45 lines, by component, with the
+    labels of the candidates file so that an answer maps back to it).
+    Question 2 asks which of them the maintainers want and in what form. The compilation
+    database finding (H13) is left out of that public text: from a reading of the code it may
+    allow command execution, which was not demonstrated, so its channel is the owner's call.
+  - **Grouping on the tracker:** `git.frama-c.com` runs GitLab 19.4.6 Community Edition. An issue
+    can only have tasks as children (no epic, no issue under an issue), and merge requests have
+    no hierarchy. The account Harvester57 is not a project member: on its own issues it can edit
+    the text and comment, but cannot set labels, link items or add child items. So the grouping
+    we can do ourselves is the list of references in the overview text.
+  - **Checkboxes as of 2026-11-18:** !25 to !58 have the CONTRIBUTING box ticked and the CLA box
+    unticked; !59 has neither.
+- **Drafted, not filed, no number yet** (2026-11-18, libmodbus `run-1`):
+  [`./frama-c-eacsl-old-term-under-guard.md`](./frama-c-eacsl-old-term-under-guard.md). E-ACSL
+  evaluates `\old(p->f)` at function entry even when `\old(p) == \null ||` makes the clause true,
+  and aborts a valid call. Reproduced on `34.0~beta` and on `35.0~~dev` (`b80fcac`).
+  - **Reassessed the same day: confirmed, and wider.** Default options are enough. The `==>`
+    form, the behavior form (`assumes p != \null`), a division and a labelled `\at` in the body
+    fail the same way: any `\at` term is evaluated at its label with blocking RTE checks.
+  - **It contradicts the reference manual** (lazy `||`, `&&`, `==>`), the user manual lists no
+    such limit, and the live tracker has no duplicate.
+  - **Cause read:** `Translate_ats.for_stmt`. No patch.
+  - **Frama-C's libc has the shape:** with `e-acsl-gcc -L`,
+    `recvfrom(fd, buf, n, flags, NULL, NULL)` aborts.
+  - **It is not in the annex of #2832.** Adding a line there is an edit of a public text, so it
+    needs the owner's go-ahead.
+- **Drafted, not filed: 43** (2026-11-18): E-ACSL and real constants that are not exactly a
+  `double`. Found while looking for siblings of 42. The go-ahead of that day covered 42 only.
+  - **Two symptoms, one function** (`Gmp.Q.normalize_str`): with an exponent or in hexadecimal
+    notation (`1e-9`), Frama-C stops with
+    `Unexpected error (E_ACSL__Gmp.Q.Not_a_decimal("1e-9"))`; a `long double` constant (`0.1L`)
+    is 0 at run time without any message, so `0.1L == 0` holds and `0.1L > 0.05` aborts. The
+    second one is a wrong verdict, which matters for the pause proposed above.
+  - **Package:** issue text, MR text, a reproducer and a patch (12 lines added and 20 removed in
+    `gmp.ml`, one sentence in `gmp.mli`, and a test with two oracles), validated on `master`
+    `b80fcac74f` with `revalidate.sh package 43`. The checks that ran are in
+    [`./frama-c-eacsl-real-constant-notation.md`](./frama-c-eacsl-real-constant-notation.md).
+  - **Not done:** no branch pushed, no issue, no merge request. The MR text holds `#<issue>`.
+- **Drafted, not filed: 44** (2026-11-18): the contract of `strlcat` in `share/libc/string.h`.
+  Found by the session that proved reference bodies of the pipeline's own `strlcpy` and
+  `strlcat` contracts. Prepared during the pause, without a go-ahead to file.
+  - **Two wrong clauses.** `ensures \result == strlen(dest) + strlen(src)` reads the length of
+    `dest` after the call, and `assigns dest[strlen(dest)..n]` includes one byte past the `n`
+    bytes.
+  - **Wrong verdicts from ordinary calls:** Eva gives `{7}` for a call that returns 4, with no
+    alarm (two checks of the reproducer are invalid), and loses a structure field that follows
+    the buffer. WP proves a postcondition that the compiled program violates.
+  - **A weak precondition too:** `separation` covers only the first `strnlen(src, n-1)` bytes
+    of `src`, so a call that writes over the NUL of `src` is accepted. The owner said to add
+    the stronger form to the patch ("Yes, add it") once it was measured to change no oracle of
+    `tests/libc` or of the E-ACSL suite.
+  - **Package:** issue text, MR text, a reproducer (9 checks: 9 fail before, 0 after, on
+    `master` `b80fcac74f` and on `34.0~beta`) and a patch (four clauses, a `tests/libc` test
+    with its oracle, and the `string_h` oracle, which gets more precise), validated with
+    `revalidate.sh package 44`. The checks that ran are in
+    [`./frama-c-libc-strlcat-contract.md`](./frama-c-libc-strlcat-contract.md).
+  - **Side effect:** with the patched header, `frama-c -e-acsl` no longer fails on a `strlcat`
+    call (candidate L4 of the hunt). The E-ACSL defect itself is not fixed.
+  - **Listed in #2832** since 2026-11-18, 21:56 UTC, on the owner's request ("update the main
+    discussion but don't fill a unitary issue for this yet"): a dated note, a Libc row in the
+    table of wrong-answer findings, a row `44` in the annex (46 lines now) and one sentence in
+    the annex row L4. The stored description was read back and is identical to
+    [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md).
+  - **Not done:** no branch pushed, no issue of its own, no merge request. The MR text holds
+    `#<issue>`.
+- **Drafted, not filed: 45** (2026-11-18): MetAcsl refuses `\result` in a `\postcond` property
+  (`\result meaningless`). It is a report for the MetAcsl tracker,
+  [`pub/meta`](https://git.frama-c.com/pub/meta/-/issues) (project id 869), kept in this folder
+  because its drafts follow the same layout. Found by package R of
+  `docs/plans/metacsl-exploitation-plan.md` (on the branch `metacsl-integ` until it is merged).
+  - **Package:** issue text and a reproducer (2 cases refused, on `34.0~beta` with MetAcsl
+    0.12~beta; not run on `master`, where `meta_parse.ml` is the same file). No MR text and no
+    patch file: the draft patch in
+    [`./frama-c-metacsl-result-in-postcond.md`](./frama-c-metacsl-result-in-postcond.md) was
+    never built.
+  - **Listed in #2832** since 2026-11-18, on the owner's request ("Draft upstream report, but
+    don't fill it, update main discussion"): a dated note and a row `45` in a new MetAcsl table
+    at the end of the annex. The stored description was read back and is identical to
+    [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md).
+  - **Not done:** no issue on `pub/meta`, no branch, no merge request.
+    `tools/upstream_audit/file_upstream.py` files on `pub/frama-c` only.
+- **Drafted, not filed: 46** (2026-11-19). The libc's `<sched.h>` has no `cpu_set_t`, no `CPU_*`
+  macros and no `sched_setaffinity`/`sched_getaffinity` under `_GNU_SOURCE`. This stopped
+  nginx-1.31.9 run-1 at Phase 0 (`no_unit_parsed`).
+  - **Package:** issue text
+    ([`./filing/46-libc-sched-cpu-set-issue.md`](./filing/46-libc-sched-cpu-set-issue.md)) and a
+    reproducer ([`./repro/46-libc-sched-cpu-set.c`](./repro/46-libc-sched-cpu-set.c)). Frama-C
+    rejects it (rc 1) on `34.0~beta` and on `master` `b80fcac74f`; gcc accepts it (rc 0). The
+    analysis is in [`./frama-c-libc-sched-cpu-set.md`](./frama-c-libc-sched-cpu-set.md).
+  - **Pipeline workaround:** `templates/fc_stubs/fc_compat_types.h` (`cb78e8b`).
+  - **Not done:** no patch, no MR text, no issue, and not listed in #2832.
+- **Candidates from the hunt of 2026-11-18, not drafted:** more defects of the same families
+  (a literal read twice, hand-written text matching, WP's constant folding, the contracts of
+  Frama-C's libc), found by the session that drafted 43 and its four subagents, and every one
+  re-run on `master` `b80fcac74f`. Six reviewer subagents on another model then gave a second
+  opinion on each (25 candidates: 23 confirmed, 2 not bugs to report, no duplicate on the
+  tracker) and found 21 more. Several give a wrong proof or a wrong verdict from ordinary
+  input; the most serious is that an enumeration constant is typed unsigned (N1). They are
+  listed, ranked, with their reproducers, in
+  [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md).
 - **40 now has a patch:** a manual-only fix of the two sentences about the JSON report
   (`"time"` is in seconds; `"cached"` counts prover results read from the cache, never Qed), in
   [`./patches/40-wp-report-per-prover-results.patch`](./patches/40-wp-report-per-prover-results.patch).
@@ -56,6 +286,13 @@ This section is newer than the ones below and wins where they differ.
   creates an issue or a merge request from its filing text, refuses a leftover placeholder or an
   existing title or branch, reads the item back, and records the number in `ledger.json` beside
   it. Neither retries, and both act only when run: filing still needs the owner's go-ahead.
+  - **Seen with 41:** `make_branches.sh` builds on the container's `master`, which is
+    `95408044f7` in the image, so fast-forward it first when upstream has moved (41's draft has
+    the commands). Two defects of `file_upstream.py` were corrected after the filing
+    (uncommitted): its "CRLF in the filing text" check could never fire, because `read_text`
+    converts line endings (it now reads bytes; the texts of 41 were checked byte by byte, no CR);
+    and `mr` read the commit list at once, got 0 commits for !58 and ended with "CHECK FAILED" on
+    a correct merge request (it now waits for the commits as for the diff).
 - **`closes_issues` is empty for every merge request** of `pub/frama-c`, old and new: the project
   has `autoclose_referenced_issues` off. "Closes #N" still links the two, but merging will not
   close the issue.
@@ -253,7 +490,7 @@ All paths below are relative to this folder.
 - **Draft:** the long analysis.
 - **Repro:** `repro/<NN>-<slug>.sh` plus its `.c` files.
 - **Patch:** `patches/<NN>-<slug>.patch`. "Validated" means built, and the reproducer run before and
-  after on `master` `3dff90fc70` (01 to 27) or `95408044f7` (28 to 40).
+  after on `master` `3dff90fc70` (01 to 27), `95408044f7` (28 to 40) or `b80fcac74f` (41 to 44).
 
 | # | Component | Bug | Draft | Issue | MR | Repro | Patch |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -294,9 +531,13 @@ All paths below are relative to this folder.
 | 38 | E-ACSL | bittree model: `stdin`, `stdout`, `stderr` and `errno` are not tracked | [draft](./frama-c-eacsl-bittree-standard-streams-untracked.md) | [issue](./filing/38-eacsl-bittree-standard-streams-untracked-issue.md), filed [#2827](https://git.frama-c.com/pub/frama-c/-/work_items/2827) | [MR](./filing/38-eacsl-bittree-standard-streams-untracked-mr.md), opened [!55](https://git.frama-c.com/pub/frama-c/-/merge_requests/55) | [sh](./repro/38-eacsl-bittree-standard-streams-untracked.sh) | [validated](./patches/38-eacsl-bittree-standard-streams-untracked.patch) (one line; complete under `-G clang` only with 37) |
 | 39 | Libc | Linux `<sys/epoll.h>` and `<sys/inotify.h>` are missing (feature request) | [draft](./frama-c-libc-linux-header-gaps.md) | [issue](./filing/39-libc-linux-header-gaps-issue.md), filed [#2828](https://git.frama-c.com/pub/frama-c/-/work_items/2828) | [MR](./filing/39-libc-linux-header-gaps-mr.md), opened [!56](https://git.frama-c.com/pub/frama-c/-/merge_requests/56) | [sh](./repro/39-libc-linux-header-gaps.sh) | [validated](./patches/39-libc-linux-header-gaps.patch) (two headers with contracts, 10 files) |
 | 40 | WP | `-wp-report-json` keeps one prover per goal (feature request); two errors in the manual | [draft](./frama-c-wp-report-per-prover-results.md) | [issue](./filing/40-wp-report-per-prover-results-issue.md), filed [#2829](https://git.frama-c.com/pub/frama-c/-/work_items/2829) | [MR](./filing/40-wp-report-per-prover-results-mr.md), opened [!57](https://git.frama-c.com/pub/frama-c/-/merge_requests/57) (manual only; does not close the issue) | [sh](./repro/40-wp-report-per-prover-results.sh) | [manual only](./patches/40-wp-report-per-prover-results.patch) (two sentences; lint run, manual not built) |
-| 41 | Libc | `<sys/ioctl.h>`: `TIOCMGET`/`TIOCMSET` without the `TIOCM_*` modem-line bits | [draft](./frama-c-libc-ioctl-modem-bits.md) | not filed | none | [sh](./repro/41-libc-ioctl-modem-bits.sh) | none (the draft lists the fourteen definitions) |
+| 41 | Libc | `<sys/ioctl.h>`: `TIOCMGET`/`TIOCMSET` without the `TIOCM_*` modem-line bits | [draft](./frama-c-libc-ioctl-modem-bits.md) | [issue](./filing/41-libc-ioctl-modem-bits-issue.md), filed [#2830](https://git.frama-c.com/pub/frama-c/-/work_items/2830) | [MR](./filing/41-libc-ioctl-modem-bits-mr.md), opened [!58](https://git.frama-c.com/pub/frama-c/-/merge_requests/58) | [sh](./repro/41-libc-ioctl-modem-bits.sh) | [validated](./patches/41-libc-ioctl-modem-bits.patch) on `b80fcac74f` (eleven macros and a test, 3 files) |
+| 42 | WP | Hexadecimal floating-point literals not read: `DBL_MAX` bound dropped, lemma stops WP, and `0x1.8p1f` read as 0 under `-wp-model +real` (**soundness**); `f32`/`f64` suffixes rejected | [draft](./frama-c-wp-hexadecimal-float-literals.md) | [issue](./filing/42-wp-hexadecimal-float-literals-issue.md), filed [#2831](https://git.frama-c.com/pub/frama-c/-/work_items/2831) | [MR](./filing/42-wp-hexadecimal-float-literals-mr.md), opened [!59](https://git.frama-c.com/pub/frama-c/-/merge_requests/59) | [sh](./repro/42-wp-hexadecimal-float-literals.sh) | [validated](./patches/42-wp-hexadecimal-float-literals.patch) on `b80fcac74f` (one function and a test, 6 files) |
+| 43 | E-ACSL | Real constants that are not exactly a `double`: unexpected error with an exponent or in hexadecimal (`1e-9`), and a `long double` one (`0.1L`) is 0 at run time | [draft](./frama-c-eacsl-real-constant-notation.md) | [issue](./filing/43-eacsl-real-constant-notation-issue.md), **not filed** | [MR](./filing/43-eacsl-real-constant-notation-mr.md), **not opened** | [sh](./repro/43-eacsl-real-constant-notation.sh) | [validated](./patches/43-eacsl-real-constant-notation.patch) on `b80fcac74f` (one function and a test, 5 files) |
+| 44 | Libc | `strlcat`: the result is stated against `dest` after the call, and `assigns` covers a byte past `n`; Eva gives a wrong result without an alarm, WP proves a false postcondition (**soundness**) | [draft](./frama-c-libc-strlcat-contract.md) | [issue](./filing/44-libc-strlcat-contract-issue.md), **not filed** | [MR](./filing/44-libc-strlcat-contract-mr.md), **not opened** | [sh](./repro/44-libc-strlcat-contract.sh) | [validated](./patches/44-libc-strlcat-contract.patch) on `b80fcac74f` (four clauses and a test, 4 files) |
 
-Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11.
+Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11. 43 and 44 wait for the owner's
+go-ahead.
 
 ## How to file
 
@@ -359,7 +600,8 @@ Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11.
 ## Open questions for the owner
 
 28 to 40 were filed on 2026-11-18 with the option each row calls "current"; their rows stay as
-points the maintainers may raise, and are no longer blocking.
+points the maintainers may raise, and are no longer blocking. 41 and 42 were filed the same day.
+43 and 44 are drafted and wait for the owner.
 
 | # | Question |
 | :-- | :-- |
@@ -385,6 +627,12 @@ points the maintainers may raise, and are no longer blocking.
 | 37 / 38 | Is the bittree model still supported upstream? Every `free` has aborted there since 25.0, and the manual recommends the model for targets other than x86-64. Its other defects are listed under "Seen during the audit, not drafted". |
 | 39 | Keep the packed attribute on `struct epoll_event` (Frama-C then warns `addr-of-packed-field`)? Report `pipe2`, `dup3` and `accept4` (POSIX.1-2024) as a separate issue? |
 | 40 | Decided on 2026-11-18: the issue keeps the feature request and names the two manual errors, and a manual-only merge request (!57) corrects them. |
+| 41 | Decided on 2026-11-18: a new issue with its merge request, not a note on #2828. Still open for the maintainers: eleven names, as glibc's `<sys/ioctl.h>` (as filed), or also the three Linux-only ones (`TIOCM_OUT1`, `TIOCM_OUT2`, `TIOCM_LOOP`)? Both texts offer the three. |
+| 42 | Filed on 2026-11-18 as one issue for the three symptoms. Still open for the maintainers: the wrong proof under `-wp-model +real` on its own issue? A `plugins/wp/Changelog` entry? The patch has none, as 19's. |
+| 43 | File it? If so: one issue for the two symptoms (current), or the silent 0 of `0.1L` on its own? Report a suffixed constant as not yet supported (current), or give it the value of the target's `long double`? A `plugins/e-acsl/doc/Changelog` entry? The patch has none. |
+| 44 | File it? Decided on 2026-11-18: the patch also strengthens the `separation` precondition to `src+(0..strlen(src))` (measured: no oracle of `tests/libc` or of the E-ACSL suite changes with it; both texts say it can be dropped). Rename the check `imprecise` of `tests/libc/string_h.c`, which becomes valid? |
+| 45 | File it on `pub/meta`? If so: issue only (current), or build the draft patch first and send a merge request with it? |
+| hunt | Which of the candidates of [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md) to turn into packages, and in which order? That document ranks them ("Order of criticity"); N1 (enumeration constants), L2 (`pclose`) and L1 (`void` objects under WP) come first. N1 reverts a deliberate upstream change, so it needs the argument from C11 and gcc. |
 
 ## Identified, not filed
 
@@ -421,6 +669,14 @@ Each of these is worked around or documented in the pipeline. None is a defect t
   `strcpy` reports "strlen" and `strncat` reports "strcat". Mentioned in issue 17 as a follow-up.
 - **Kernel accepts `sizeof x` on an incomplete struct** in a file-scope initializer. Seen while
   probing `ip_mreqn`; not confirmed.
+- **E-ACSL crashes on a real literal with an exponent** (seen on 2026-11-18, looking for siblings
+  of 42): now package 43, see the coverage table.
+- **The hunt of 2026-11-18** (siblings of 42 and 43, by four subagents and the parent session,
+  then a second opinion by six reviewers): candidates, none drafted, in
+  [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md). Among
+  them, the three defects that 43's draft names: floating-point constants printed with 12
+  significant digits, a rational cast to `double` by truncation, and `inf` printed as a C
+  constant.
 
 Drafted since this list was written: the bittree crash on `int main(void)` is package 37, and the
 literal format string rejected without `-M` is package 33.

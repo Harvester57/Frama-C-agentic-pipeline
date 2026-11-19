@@ -271,7 +271,7 @@ Each unit's files are also partitioned by directory into smaller **directory mod
 - or the threat model's `trusted_callers` overrode an untrusted mark on it;
 - or an untrusted function reaches it in the call graph.
 
-Each function records `tier`, `tier_reasons` and `untrusted_path`. A module (link unit, directory module, split sub-module) takes the most demanding tier among its functions, with that tier's `run_*` flags, `tier_counts` and `deferred_profiles`. The DAG's `tiers` block counts the functions per tier. `python3 /opt/framac-pipeline/scripts/tiers.py summary` lists each module's tier and every Tier 3 function with its reason. Check them: a Tier 3 function is not analysed under `quick`.
+Each function records `tier`, `tier_reasons` and `untrusted_path`. A module (link unit, directory module, split sub-module) takes the most demanding tier among its functions, with that tier's `run_*` flags, `tier_counts` and `deferred_profiles`. The DAG's `tiers` block counts the functions per tier. `python3 /opt/framac-pipeline/scripts/tiers.py summary` lists each module's tier and every Tier 3 function with its reason. Check them: under `quick`, a Tier 3 module is skipped and no Tier 3 function gets WP, though a Tier 3 function inside a higher-tier module is still fuzzed and run through Eva with that module.
 
 **Unit split** (`scripts/unit_split.py`): a link unit whose entry points reach more than 400 functions or 15,000 lines of function bodies (what one harness driving its whole API gives Eva) is split into sub-modules for Eva and harnesses:
 - each API entry point starts a cluster of the functions it reaches;
@@ -289,8 +289,8 @@ Review `workspace/reports/callgraph_dag.json`:
 
 | Risk Tier (checked in this order) | Function rule (`tiers.py`) | Verification Route |
 | :--- | :--- | :--- |
-| **Tier 3** | No untrusted path; or an internal scalar helper on one: not on the trust boundary, no loop, no pointer parameter, pointer return or pointer cast, no indirect call, not variadic, cyclomatic complexity at most 2 | Phase 2 (`Eva`) only, no fuzzing; `rte` units `planned` and Layers 2-6 `deferred` in `standard`/`deep`. **Deferred under `quick`:** a Tier 3 module is excluded from the Make phases and every unit of a Tier 3 function is seeded `deferred` |
-| **Tier 2** | On an untrusted path, and allocates on the heap or is recursive | Phase 1 (`E-ACSL + Fuzz` with dictionary) + Phase 2 (`Eva`) + WP on non-allocating validators |
+| **Tier 3** | No untrusted path; or an internal scalar helper on one: not on the trust boundary, no loop, no pointer parameter, pointer return or pointer cast, no indirect call, not variadic, cyclomatic complexity at most 2 | Phase 2 (`Eva`) and Phase 3 WP on `rte` units, no fuzzing; `rte` units `planned` and Layers 2-6 `deferred` in `standard`/`deep`. **Deferred under `quick`:** a Tier 3 module is excluded from the Make phases and every unit of a Tier 3 function is seeded `deferred` |
+| **Tier 2** | On an untrusted path, and allocates on the heap or is recursive | Phase 1 (`E-ACSL + Fuzz` with dictionary) + Phase 2 (`Eva`) + Phase 3 WP, queued for every Tier 2 function |
 | **Tier 1B** | On an untrusted path, and writes a bounded output buffer it does not read from, or formats into one (emitter) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layer 5 Sanitization) |
 | **Tier 1A** | Any other function on an untrusted path (parsers, validators, the trust boundary itself) | Phase 1 (`E-ACSL + Fuzz`) -> Phase 2 (`Eva`) -> Phase 3 (`Full Wavefront WP` + Layers 1-6) |
 

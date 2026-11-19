@@ -56,7 +56,9 @@ bash: line 6: 72103 Aborted                 ./big.e-acsl
 stack:2048: exit 139
 bash: line 6: 72157 Segmentation fault      ./big.e-acsl
 .../segment_model/e_acsl_shadow_layout.h:59:41: warning: integer overflow in expression of type ‘int’ results in ‘-2147483648’ [-Woverflow]
-``` The same with `-G clang`, which prints no warning because `e-acsl-gcc` drops the warning flags there (#2810). heap:4095 crashes like heap:2048; stack:4096, 8192 and 65536 run but leave the stack limit unchanged. With `--concurrency`, `thread-stack:2048` makes `pthread_create` fail and `thread-stack:4096` is ignored.
+```
+
+The same with `-G clang`, which prints no warning because `e-acsl-gcc` drops the warning flags there (#2810). heap:4095 crashes like heap:2048; stack:4096, 8192 and 65536 run but leave the stack limit unchanged. With `--concurrency`, `thread-stack:2048` makes `pthread_create` fail and `thread-stack:4096` is ignored.
 
 ### Contextual information
 

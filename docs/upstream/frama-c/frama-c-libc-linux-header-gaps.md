@@ -32,9 +32,9 @@ Frama-C stops earlier, at the missing file.
 
 | | Result |
 |---|---|
-| `35.0~~dev (Bromine)`, `master` at `95408044f7` (image `framac-master-audit:9540804`) | **both headers missing** (2 of 2 reproducer checks fail) |
+| `35.0~~dev (Bromine)`, `master` at `b80fcac74f` (image `framac-master-audit:b80fcac`, also checked earlier on `95408044f7`) | **both headers missing** (2 of 2 reproducer checks fail) |
 | `34.0~beta (Selenium)` (image `framac-analysis:latest`) | **both missing**, identical output |
-| `master` + patch (commit `732f33be36`, built and installed in a container from the master image) | `RESULT: fixed` |
+| `master` (`b80fcac74f`) + patch (commit `884b8a1268`, built and installed in a fresh container from `framac-master-audit:b80fcac`) | `RESULT: fixed` |
 
 ## Inventory
 
@@ -106,41 +106,54 @@ With the patch, both Eva checks print `ok`, Eva reports no alarm on either file,
 ## Fix
 
 [`./patches/39-libc-linux-header-gaps.patch`](./patches/39-libc-linux-header-gaps.patch) is one
-commit on `feature/libc-epoll-inotify` from `95408044f7`, "[libc] add Linux headers sys/epoll.h and
+commit on `feature/libc-epoll-inotify` from `b80fcac74f`, "[libc] add Linux headers sys/epoll.h and
 sys/inotify.h". It follows `sys/sendfile.h` and `sys/prctl.h` (licence header, `// Non-POSIX;
-Linux-specific`, `__PUSH_FC_STDLIB`, `__BEGIN_DECLS`).
+Linux-specific`, `__PUSH_FC_STDLIB`, `__BEGIN_DECLS`, `#include <errno.h>`).
 
 **`share/libc/sys/epoll.h`**
 
+- Includes `../__fc_define_sigset_t.h` instead of `<signal.h>` (avoiding namespace pollution) and
+  `<errno.h>`.
 - Every `EPOLL*` event bit, `EPOLL_CTL_ADD/DEL/MOD` and `EPOLL_CLOEXEC`, with the Linux values.
 - The `epoll_data` union and `struct epoll_event`. The struct is packed under `__x86_64__`, as
   glibc does (12 bytes on x86_64).
-- `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait` and `epoll_pwait`.
+- `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait` and `epoll_pwait` (`epoll_pwait2` is
+  intentionally omitted to keep the initial header minimal).
 - The contracts cover:
   - descriptor ranges (`__FC_MAX_OPEN_FILES`);
   - `valid_read(event)` unless the op is `EPOLL_CTL_DEL`;
   - `\valid(events + (0 .. maxevents - 1))`;
-  - a null or readable `sigmask`;
-  - `assigns`/`\from`;
+  - a null or readable and initialized `sigmask` (`sigmask == \null || \initialized(sigmask)`) on
+    `epoll_pwait`;
+  - `assigns`/`\from` including `errno` on all 5 functions, `indirect:event, indirect:event->events`
+    on `epoll_ctl` (verified alarm-free in Eva and WP when `event == NULL` on `EPOLL_CTL_DEL`, and
+    avoiding dependency on uninitialized union padding in `event->data`), and
+    `indirect:sigmask, indirect:*sigmask` on `epoll_pwait`;
   - for `epoll_wait` and `epoll_pwait`, the `full` / `partial_timeout_or_error` behaviours of
     `read()` (on `Frama_C_entropy_source`), which state which events are initialized.
 - The kernel's interest list is a `//missing:` comment.
 
 **`share/libc/sys/inotify.h`**
 
+- Includes `<errno.h>`.
 - `struct inotify_event` with a flexible `name[]` member.
 - Every `IN_*` constant, including `IN_CLOEXEC` and `IN_NONBLOCK` (the `O_*` values of
   `fcntl.h`).
 - `inotify_init`, `inotify_init1`, `inotify_add_watch` (`valid_read_string(pathname)`) and
-  `inotify_rm_watch`.
+  `inotify_rm_watch`, all assigning `\result, errno`.
 - The watch list is a `//missing:` comment.
 
 **Other files**
 
 - Both headers are added to `share/libc/__fc_libc.h` and `tests/libc/fc_libc.c`, which
   `tests/libc/check_full_libc.sh` requires.
-- New Eva tests `tests/libc/sys_epoll_h.c` and `sys_inotify_h.c`, with their oracles. Every
-  precondition and every assertion is valid, with no alarm.
+- New Eva tests `tests/libc/sys_epoll_h.c` (run on both `x86_32` and `-machdep x86_64`, guarding
+  `sizeof(struct epoll_event) == 12` under `#ifdef __x86_64__`, including `<signal.h>`, testing
+  `EPOLL_CTL_DEL` with `NULL`, and confirming `errno == EINTR` reachability after `epoll_wait`) and
+  `tests/libc/sys_inotify_h.c` (confirming `errno == ENOENT` reachability after `inotify_add_watch`),
+  with their oracles (`sys_epoll_h.{0,1}.res.oracle`, `sys_inotify_h.0.res.oracle`). Both test files
+  also pass `gcc -fsyntax-only` against system glibc. Every precondition and every assertion is
+  valid, with no alarm.
 - `tests/libc/oracle/fc_libc.0.res.oracle` and `fc_libc.2.res.oracle` each gain two lines, the new
   `#include` and `Parsing` lines.
 
@@ -162,7 +175,7 @@ the patch.
 - **`__attribute__((__packed__))` under `#ifdef __x86_64__`.** This matches glibc's
   `__EPOLL_PACKED` and the kernel ABI. Frama-C warns `kernel:typing:addr-of-packed-field` only when
   code takes `offsetof` or the address of `data`, which gcc accepts silently. That is why the new
-  test checks `sizeof` and not `offsetof`.
+  test checks `sizeof` (under `#ifdef __x86_64__`) and not `offsetof`.
 - **Initialization after `epoll_wait`.** Eva still reports an initialization alarm when reading
   `evs[i]` after a full `epoll_wait` (`n == maxevents`), because the two behaviours are joined.
   Upstream's own `read()` gives the same alarm on the same pattern (checked on master with a
@@ -170,22 +183,24 @@ the patch.
 
 ## Validation
 
-`master` `95408044f7` with the patch, built and installed in the container
-`upstream-libc-wp` (image `framac-master-audit:9540804`).
+`master` `b80fcac74f` with the patch (`884b8a1268`), validated end-to-end in a fresh container from
+`framac-master-audit:b80fcac` via `JOBS=4 /w/revalidate.sh before 39` and `package 39`.
 
-| Check | `master` | Patched |
+| Check | `master` (`b80fcac74f`) | Patched (`884b8a1268`) |
 |---|---|---|
-| Reproducer (Eva on `-epoll.c`, `-inotify.c`) | `fatal error` x2, `RESULT: bug present` | `ok` x2, `RESULT: fixed` |
-| New tests `sys_epoll_h.c`, `sys_inotify_h.c` (ptests, patch commit's tests on `95408044f7`) | `fatal error: sys/epoll.h: No such file or directory`, same for `sys/inotify.h` | pass |
-| `dune build @tests/libc/ptests_config` | — | only `fc_libc.0` and `fc_libc.2` move (two lines each) plus the two new oracles; passes after promotion (rc 0, empty output) |
-| `tests/libc/check_full_libc.sh ../../share/libc` | — | rc 0 |
-| `git grep` of every oracle for libc header lists | — | only the two `fc_libc` oracles list headers |
-| `@tests/ptests_config` (1149 results), `@plugins/eva/tests/builtins/ptests_config` (62), `@plugins/e-acsl/tests/ptests_config` (197, default configuration), one `dune build -j 6` | — | rc 0, no difference, in 1 min 20 s. Unchanged results may come from dune's cache |
-| Other plugins' default ptests, E-ACSL `dev`, cram | — | not run |
-| `./dev/check-files.sh -p HEAD~1` | — | `Lint 10 file(s)`, rc 0 |
+| `git am --keep-non-patch` | — | `exit=0`, 1 commit, no mode changes / executable files |
+| Reproducer (Eva on `-epoll.c`, `-inotify.c`) | `fatal error` x2, `RESULT: bug present` (`exit=1`) | `ok` x2, `RESULT: fixed` (`exit=0`) |
+| Step A/B: `tests/libc/sys_epoll_h.c` (`x86_32` + `x86_64`) and `sys_inotify_h.c` | `A1 default` fails (`exit=1`, `fatal error: sys/epoll.h` and `sys/inotify.h`) | `B1 default` pass (`exit=0`) |
+| Host glibc check (`gcc -fsyntax-only` on both test `.c` files) | — | pass (`exit=0`) |
+| Step C1: `plugins/e-acsl` (default) | — | pass (`exit=0`) |
+| Step C2: `tests/libc` (default, including `fc_libc` / `check_full_libc.sh`) | — | pass (`exit=0`); only `fc_libc.0` and `fc_libc.2` move (two lines each) plus the three new oracles |
+| Step D: `./dev/check-files.sh -p HEAD~1` | — | `Lint 11 file(s)`, `exit=0` |
+| Step E: `dune install` + reproducer | — | `E0 install` `exit=0`, reproducer `exit=0` (`RESULT: fixed`) |
 
-`ulimit -c 1` was not applied before the ptests: the container's hard core limit is already 0, so
-the call fails with `Operation not permitted`.
+Earlier validation on `95408044f7` also ran `@tests/ptests_config` (1149 results) and
+`@plugins/eva/tests/builtins/ptests_config` (62 results) with no diff. Other plugins' default
+ptests, E-ACSL `dev`, and cram tests were not run (`git grep` for `__fc_libc.h`, `sys/epoll.h`, and
+`sys/inotify.h` hits only `tests/libc`).
 
 ## Workaround
 

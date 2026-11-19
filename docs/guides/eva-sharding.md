@@ -37,12 +37,12 @@ Shard plan (deterministic, in `pipeline_make.py`, like the ladder):
 
 - Cost of a case: its share of the module's last base-run `flamegraph.txt`. That is the inclusive
   time of the depth-1 callees of `eva_main` that the case calls (`api_cases[*].calls` and `inits`),
-  with a callee shared by several cases split evenly between them. With no profile yet, every case
+  with a callee shared by several cases split in proportion to how many calls each case makes. With no profile yet, every case
   costs the same.
 - Packing: longest-processing-time first into *k* shards. Ties break on the case number, so the same
   profile always gives the same shards.
 - Choosing *k*: the smallest *k* whose largest shard is predicted to be under the tuning-skip
-  threshold (`TRIAL_TIMEOUT_CEILING_S / TUNING_SKIP_MARGIN`, 5,760 s), so tuning can run again. *k*
+  threshold (the module's `eva_timeout` / `TUNING_SKIP_MARGIN`, or 5,760 s when no `eva_timeout` is set), so tuning can run again. *k*
   goes higher only while the predicted makespan still falls by at least 10%. *k* is recorded with the
   shard plan. It changes what each run analyses, so, like `LADDER_VERSION`, it is part of the
   settings digest and never comes from the machine size.
@@ -207,14 +207,14 @@ the design above:
   `FRAMAC_EVA_SHARD` and the cases it keeps, which is about 22 defines for a 179-case harness in 8
   shards instead of about 157. A build without `FRAMAC_EVA_SHARD` (the fuzz build, an unsharded Eva
   run) keeps every case. Harnesses generated before this have no guards and are never sharded.
-- **When.** A module is sharded only when its last single run was too slow for the ladder
+- **When.** A module is sharded only when its last single run timed out or was too slow for the ladder
   (`tuning_skip_reason`), or when `params set --eva-shards <k>` asks for it (1 means never, 0 means
   automatic). There is no ladder per shard yet, so a module that can still be tuned stays one run:
   sharding it would trade precision for wall time.
 - **The plan** is recorded in `workspace/reports/eva-shards/<mod>/plan.json`, with the settings digest
   and case count it is valid for. It is recomputed only when those change, or when the forced count
   changes. Case costs come from the slow run's `flamegraph.txt`: depth-1 callees of `eva_main`, shared
-  callees split evenly, and `eva_main`'s own time and calls outside the switch spread over every case.
+  callees split by each case's share of the calls, and `eva_main`'s own time and calls outside the switch spread over every case.
   Without a profile, every case costs the same. A case a timed-out run never reached is counted at the
   mean sampled case's cost (`basis.imputed_cases`).
 - **Not here.** A shard has no say on an obligation when the function is missing from its
@@ -223,9 +223,13 @@ the design above:
   single run reports it, where the table above said Dead.
 - **Rows.** For each obligation key, the merged CSV keeps the rows of the shard with the worst status:
   invalid, then other, unknown, assumed, valid, dead.
-- **A failed shard** makes the module's report not ok, with the shard named in `reason` and
-  `error_summary`, the same as a failed single run. Its obligations are not reported as Unknown one by
-  one.
+- **A shard that times out** first retries the cheaper timeout-fallback tiers, when the module's
+  settings allow them. If a tier completes, the shard is merged at that lower precision and listed in
+  `timeout_fallback_shards`.
+- **A failed shard** (no fallback tier completed, or it failed otherwise) makes the module's report not
+  ok, with the shard named in `reason` and `error_summary`, the same as a failed single run. The report
+  has no merged rows, so the results of the other shards are lost. Its obligations are not reported as
+  Unknown one by one.
 - **Identity.** Shards must agree on `main_fn`, sources, reduced checks and assumption options.
   One reduced check is exempt: `-eva-warn-key assigns:missing=warning (recursive calls use
   kernel-inferred assigns)` (`eva_shards.RECURSION_REDUCED_CHECK`). `run_eva_slice.py` adds it only

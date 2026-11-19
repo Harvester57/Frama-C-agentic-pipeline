@@ -70,7 +70,7 @@ Memory estimates learn from history. Each container records its peak memory, OOM
 | Guardrail / replay | single process | `-rss_limit_mb 2048`, per-input `-timeout`, deterministic `-seed` |
 | Eva | 1 CPU; parallelism comes from running modules side by side | `--timeout` from the profile |
 | Eva tuning (`eva-tune`) | 1 CPU per trial; rungs run side by side, loop trials one after another | which trials run. A rung's limit is 8 × the base run's time, a loop trial's 2 × the selected rung's (600 s to 7200 s), so a slower machine gets proportionally longer |
-| Parent re-check (`merge-batch`) | per-function WP runs in a pool: workers = min(n, CPUs, memory / 1768 MiB), each `-wp-par = min(CPUs / workers, (memory / workers − 768 MiB) / 1000 MiB)` | as WP |
+| Parent re-check (`merge-batch`) | per-function WP runs in a pool: workers = min(n, CPUs, memory / 3072 MiB when a module guardrail is in the batch, else memory / 1768 MiB), each `-wp-par = min(CPUs / workers, (memory / workers − 768 MiB) / 1000 MiB)` | as WP |
 | Make | `-j` = container CPUs; each recipe is admitted by CPU and memory, running against a stage-private copy of `Makefile` and `modules.mk` rendered directly from memory | — |
 
 The fuzz budget is CPU-seconds per module: quick 60, standard 120, deep 900. A bigger node finishes sooner with the same or more effort. `--max-time` stays as a wall-clock override.
@@ -154,7 +154,7 @@ python3 scripts/resources.py status        # each lease shows its repo, run and 
 
 Inside one container (a Make phase, a `merge-batch`), recipes and sub-jobs go through `resources.py run --class C --key K [--output REPORT] -- cmd`. The pool is that container's own budget, re-read from its cgroup on every acquire. With `--output`, the recipe succeeds whenever the report exists, so Make keeps an `analysis_error` report instead of deleting it. A report left over from an earlier run, untouched by the command, does not count. A `run` nested inside another leased `run` passes through instead of waiting for itself.
 
-An OOM-killed job of an idempotent class (`wp`, `eva`, `build`, `replay`) is retried once with twice the memory when the pool allows. Non-idempotent jobs (fuzz campaigns, merges) are never retried automatically:
+An OOM-killed job of an idempotent class (`light`, `wp`, `eva`, `parse`, `build`, `replay`, `selftest`) is retried once with twice the memory when the pool allows. Non-idempotent jobs (fuzz campaigns, merges) are never retried automatically:
 - A retried campaign would treat the first attempt's crash artifacts as pre-existing.
 - A merge has its own journal (Section 8).
 
@@ -191,7 +191,7 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_ALLOW_UNENFORCED_LIMITS` | Allow target-executing classes without memory/pids limits | off |
 | `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE` | Run-lock wait and heartbeat staleness (seconds) | 1800, 120 |
 | `FRAMAC_WP_WALL_TIMEOUT` | Wall-clock limit for one WP run (seconds) | 3600 |
-| `FRAMAC_PROVER_WALL_BUDGET_S` | Wall-clock budget for one prover subagent session across retries (seconds) | 600 (`quick`), 900 (`standard`), 1800 (`deep`) |
+| `FRAMAC_PROVER_WALL_BUDGET_S` | Wall-clock budget for one prover subagent session across retries (seconds) | 600 (`quick`), 900 (`standard`), 1800 (`deep`); 300 for a `shell_unverifiable_wp` function when this variable is unset |
 | `FRAMAC_PROVER_CONTEXT` | `off` renders prover briefs without function facts and reading slice and with every conditional part, for A/B comparisons | on |
 | `FRAMAC_FRAME_SKELETON` | `off` drops the frame skeleton (AST-projected `assigns`/`\from`) from function facts, for A/B comparisons | on |
 | `FRAMAC_LOOP_TEMPLATES` | `off` drops the loop templates and loop dependence graph from function facts, for A/B comparisons | on |
@@ -443,11 +443,11 @@ Dead is never counted as a proof, since it is a harness gap. A red status beats 
 
 **A prove task becomes ready once all of these are done:**
 - its callees have an initial contract in `workspace/work/` (speculative contract-first dispatch; callers do not wait for callee body proofs; internal static callees without contracts are proven first via Option A);
-- the architects of its own module and of every callee's module (leaf and internal static functions run concurrently with architects via 3-way AST header declaration splicing);
+- the architects of its own module and of the module of each callee that has no visible contract yet (leaf and internal static functions run concurrently with architects via 3-way AST header declaration splicing);
 - the gate of every fuzz/Eva slice that covers its file, where verify tasks gate only functions within their call cone;
 - a contract for each callee it calls: for a callee left without a contract the caller can see, the scheduler files a request itself (`origin: scheduler`, reason `caller needs a contract`) and the caller waits on the `negotiate:<callee>` task it opens. When no negotiation can run, the caller is tagged `callees_without_contract` instead, and its brief ends with a "Calls Without a Contract" section.
 
-**Priority:** provers tagged `callees_without_contract` come after every other ready task. Otherwise the tasks with the longest chains of callers waiting on them go first, followed by Eva unknown count, then function name.
+**Priority:** provers tagged `callees_without_contract` come after every other ready task. Within the tagged and the untagged tasks, `shell_unverifiable_wp` leaves come last. Otherwise the tasks with the longest chains of callers waiting on them go first, followed by Eva unknown count, then task id.
 
 **The orchestrator's loop (continuous reactive sliding window):**
 
@@ -460,7 +460,7 @@ python3 $S/wp_scheduler.py step --complete <id1> <id2>... --slots auto --prepare
 
 Granular individual subcommands (`complete`, `merge-pending`, `next`) remain fully supported for specialized or step-by-step control.
 
-- **`--slots auto`:** `recommend().max_agents` minus running tasks, recomputed dynamically from the measured pool. On high-spec hardware, agent concurrency scales up to 32 on $\ge 32$ CPUs and 64 on $\ge 64$ CPUs; `wp.max_cpus` scales up to 16, and `guardrail.max_cpus` scales up to 4.
+- **`--slots auto`:** `recommend().max_agents` minus running tasks, recomputed dynamically from the measured pool. On high-spec hardware, agent concurrency scales up to 32 on $\ge 32$ CPUs and 64 on $\ge 64$ CPUs. On 32 or more CPUs, `resources.py recommend` reports up to 16 CPUs for `wp` and 4 for `guardrail`; the job classes themselves stay at a maximum of 8 and 2.
 - **Fixed limits invariant:** per-process limits that decide proof and finding outcomes remain strictly constant regardless of pool scale (`WP_MEMLIMIT_MB=1000`, `FUZZ_RSS_LIMIT_MB=2048`).
 - **Parallel snapshot preparation and re-checks:** `next --prepare` and `merge-pending` execute agent snapshotting and contract re-checks in parallel via a thread pool under the `merge` lock, strictly observing the `ledger` $\rightarrow$ `merge` lock hierarchy.
 - **Breakers** never block callers. No task waits on a breaker, so a quarter of the slots of each round (at least one) is reserved for ready breakers; reserved slots no breaker needs go to the normal order.
@@ -471,6 +471,7 @@ Granular individual subcommands (`complete`, `merge-pending`, `next`) remain ful
 - **`analysis_error`** (a killed or timed-out WP run) is retried once with a larger lease, then the units become `blocked`, never stuck `in_progress`.
 - **Commands for interruptions:**
   - `requeue --stale-minutes N` resumes after an interrupted orchestrator.
+  - `requeue --memory-refused`, `--locate-failed`, `--guardrail-hung` and `--frame-refused` restore tasks ended by a parent WP re-check refused for memory, by `could not locate definition of function`, by a guardrail that hung on a corpus input, and by a frame-check refusal the result now passes.
   - `init --reconcile` adopts an existing run.
   - `refresh --module M` re-syncs after a harness repair. It closes `repair:M` only when the module's fuzz and Eva reports rest on the repaired harness: each carries the current `harness_digest` (a report that records none counts only when it is newer than the harness). Otherwise it exits 1 with `repair: "stale_evidence"`, the stale reports in `stale_evidence`, the Make targets still to run in `targets` (`fuzz-<h>`, `eva-<h>`, `facts-<h>`) and the commands in `actions`. Facts older than the Eva report are listed in `targets` but do not hold the repair.
 - **Fallback:** `FRAMAC_SCHEDULER=waves` restores wave-by-wave dispatch with barriers between topological waves for comparison and regression testing.
@@ -497,6 +498,7 @@ Every container of a run shares the run directory, so shared state is protected 
 | A command waits with "queue position N" | `resources.py status`: the pool is busy. Lower `FRAMAC_MAX_AGENTS`, raise the node's resources, or wait. Leases of killed wrappers are released once their container exits (`resources.py gc`). |
 | WP report `analysis_error`, `reason: oom_killed` | The prover set exceeded the container's memory. History raises the next lease; the scheduler retries once. Repeated: check `resources.py budget` inside the container. |
 | WP report `analysis_error`, `reason: insufficient_memory` | The job was limited to less than 1768 MiB, usually by a fixed `--memory` / `-Memory` or a very small engine VM. Drop the fixed size or give the engine more memory. |
+| `merge_deferred` from `wp_scheduler.py`, exit code 1 | The parent WP re-check could not start because its container has under 1768 MiB. Nothing was rejected and the work stays queued: rerun the command with `-Class verify`, or without `-Class`. |
 | `analysis_timeout` from Eva | The module exceeded the profile's wall-clock limit. Lower the slevel in `params.json` or raise the timeout. |
 | `eva-tune` leaves a module unchanged | Read `tuning.runs` in `workspace/reports/eva/<mod>.json`: each run has a verdict and, if rejected, its reasons. Eva options often cannot help when the harness itself is imprecise, for example a symbolic input length. |
 | Results differ between cache on and off | Run with `FRAMAC_CACHE=off`, compare, and report it: keys are meant to be sound. `cache.py clear` removes entries. |

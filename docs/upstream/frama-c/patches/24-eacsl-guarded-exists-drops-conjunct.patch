@@ -1,6 +1,6 @@
-From 6e3fd224efa46457a087ab84dba2003f6bdb209a Mon Sep 17 00:00:00 2001
-From: Florian Stosse <florian.stosse@gmail.com>
-Date: Sun, 15 Nov 2026 18:09:10 +0100
+From 30ee967aacce74c50b4080bb370450a78367fd75 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Wed, 18 Nov 2026 23:55:17 +0000
 Subject: [PATCH] [e-acsl] check every conjunct after the guard of a
  quantification
 
@@ -14,76 +14,141 @@ goal: every conjunct but the last one was dropped, even when parenthesized
 `\exists integer n; 0 <= n < 5 && n == 1000 && n >= 0` then passed.
 
 The goal is now the conjunction of the goal found in the left operand and
-the right operand. For an implication whose hypothesis already contains the
-whole guard, as in `\forall integer n; (0 <= n < size ==> P) ==> Q`, the
-guard does not bound the quantification: the predicate is now rejected
-instead of being checked as `\forall integer n; 0 <= n < size ==> Q`.
+the right operand.
+
+In universal quantifications, visit_quantif_relations also accepted an
+implication inside the hypothesis of an outer implication, as in
+`\forall integer n; (0 <= n < size ==> P) ==> Q` or
+`\forall integer i, j; (0 <= i < n ==> 0 <= j < m) ==> i < n`, and a
+conjunction outside an implication hypothesis, as in
+`\forall integer i, j; 0 <= i < n ==> 0 <= j && (j < m ==> i < n)`,
+turning false predicates into valid ones. An `in_lhs` flag now tracks
+whether the traversal is inside the hypothesis of an implication: nested
+implications inside a hypothesis and conjunctions outside a hypothesis are
+rejected, while right-nested implications such as
+`\forall integer i, j; 0 <= i < n ==> 0 <= j < m ==> P` remain accepted.
 
 Regression test: tests/constructs/quantif_conjunctions.c.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../e-acsl/src/analyses/bound_variables.ml    |  25 +-
- .../oracle/gen_quantif_conjunctions.0.c       | 214 ++++++++++++++++++
- .../oracle/quantif_conjunctions.0.res.oracle  |  12 +
- .../tests/constructs/quantif_conjunctions.c   |  19 ++
- 4 files changed, 266 insertions(+), 4 deletions(-)
+ .../e-acsl/src/analyses/bound_variables.ml    |  66 ++++-
+ .../oracle/gen_quantif_conjunctions.0.c       | 273 ++++++++++++++++++
+ .../oracle/quantif_conjunctions.0.res.oracle  |  34 +++
+ .../tests/constructs/quantif_conjunctions.c   |  30 ++
+ 4 files changed, 389 insertions(+), 14 deletions(-)
  create mode 100644 plugins/e-acsl/tests/constructs/oracle/gen_quantif_conjunctions.0.c
  create mode 100644 plugins/e-acsl/tests/constructs/oracle/quantif_conjunctions.0.res.oracle
  create mode 100644 plugins/e-acsl/tests/constructs/quantif_conjunctions.c
 
 diff --git a/plugins/e-acsl/src/analyses/bound_variables.ml b/plugins/e-acsl/src/analyses/bound_variables.ml
-index 8cca06fd5d..2e270b742e 100644
+index 8cca06fd5d..72e1bb1df1 100644
 --- a/plugins/e-acsl/src/analyses/bound_variables.ml
 +++ b/plugins/e-acsl/src/analyses/bound_variables.ml
-@@ -578,8 +578,18 @@ let extract_constraint ctxt t1 r t2 =
- let rec visit_quantif_relations ~is_forall ctxt p =
+@@ -561,13 +561,17 @@ let extract_constraint ctxt t1 r t2 =
+     in
+     Constraints.raise_error msg ctxt
+ 
+-(** [visit_quantif_relations ~is_forall ctxt p] traverses the predicate [p] of
+-    the quantification being analyzed in the context [ctxt] from left to right
+-    as long as the predicate is [Pimplies], [Pand] or [Prel(Rlt | Rle)], and
+-    calls [extract_constraint] on each relation [Rlt] or [Rle] it encounters
++(** [visit_quantif_relations ~is_forall ?in_lhs ctxt p] traverses the predicate
++    [p] of the quantification being analyzed in the context [ctxt] from left to
++    right as long as the predicate is [Pimplies], [Pand] or [Prel(Rlt | Rle)],
++    and calls [extract_constraint] on each relation [Rlt] or [Rle] it encounters
+     until all the guards of the quantification have been found or the predicate
+     is finished. If [is_forall] is [true] then the predicate being traversed is
+     a universal quantification, otherwise it is an existential quantification.
++    If [in_lhs] is [true] then [p] is inside the hypothesis of an implication in
++    a universal quantification, where conjunctions of guards are expected and
++    nested implications are rejected; otherwise, in a universal quantification,
++    only right-nested implications may guard the variables.
+     The function returns a tuple [ctxt, goal_opt] where [ctxt] is the
+     quantification context and [goal_opt] is either [None] if the goal of the
+     quantification has not been found yet or [Some goal] if [goal] is the
+@@ -575,11 +579,22 @@ let extract_constraint ctxt t1 r t2 =
+     @raises Typing_error if the predicate contains something other than
+     [Pimplies], [Pand] or [Prel] with a relation that is neither [Rlt] nor
+     [Rle]. *)
+-let rec visit_quantif_relations ~is_forall ctxt p =
++let rec visit_quantif_relations ~is_forall ?(in_lhs=false) ctxt p =
    match p.pred_content with
    | Pimplies(lhs, rhs) ->
 -    let ctxt, _ = visit_quantif_relations ~is_forall ctxt lhs in
 -    if is_forall then begin
-+    let ctxt, lhs_goal = visit_quantif_relations ~is_forall ctxt lhs in
-+    if Option.is_some lhs_goal then begin
-+      (* the guards end inside [lhs], as in [(0 <= i < n ==> p) ==> q]: they do
-+         not guard the whole predicate *)
++    if in_lhs then begin
++      (* An implication inside the hypothesis of an implication, as in
++         [(0 <= i < n ==> p) ==> q] or [(0 <= i < n ==> 0 <= j < m) ==> q],
++         does not guard the whole quantification. *)
 +      let msg =
 +        Format.asprintf
 +          "@[invalid quantification guard, found '%t'@ \
-+           after the end of the guard of an hypothesis@]"
++           inside the hypothesis of an implication@]"
 +          Unicode.pp_implies
 +      in
 +      Constraints.raise_error msg ctxt
 +    end else if is_forall then begin
++      let ctxt, _ = visit_quantif_relations ~is_forall ~in_lhs:true ctxt lhs in
        if Constraints.has_unguarded_bounded_vars ctxt then
          visit_quantif_relations ~is_forall ctxt rhs
        else
-@@ -593,11 +603,18 @@ let rec visit_quantif_relations ~is_forall ctxt p =
+@@ -593,19 +608,42 @@ let rec visit_quantif_relations ~is_forall ctxt p =
        in
        Constraints.raise_error msg ctxt
    | Pand(lhs, rhs) ->
 -    let ctxt, _ = visit_quantif_relations ~is_forall ctxt lhs in
-+    let ctxt, lhs_goal = visit_quantif_relations ~is_forall ctxt lhs in
-     if Constraints.has_unguarded_bounded_vars ctxt then
-       visit_quantif_relations ~is_forall ctxt rhs
-     else if not is_forall then
+-    if Constraints.has_unguarded_bounded_vars ctxt then
+-      visit_quantif_relations ~is_forall ctxt rhs
+-    else if not is_forall then
 -      ctxt, Some rhs
-+      (* The parser associates conjunctions to the left:
-+         [0 <= i < n && p && q] is [((0 <= i < n) && p) && q]. If the goal
-+         started inside [lhs] ([p] here), [rhs] is its last conjunct. *)
-+      let goal = match lhs_goal with
-+        | None -> rhs
-+        | Some lhs_goal -> Logic_const.pand ~loc:p.pred_loc (lhs_goal, rhs)
-+      in
-+      ctxt, Some goal
-     else
+-    else
++    if is_forall && not in_lhs then
++      (* A conjunction outside the hypothesis of an implication in a universal
++         quantification, as in
++         [\forall integer i, j; 0 <= i < n ==> 0 <= j && (j < m ==> q)],
++         does not guard the quantification. *)
        let msg =
          Format.asprintf
+-          "@[invalid quantification predicate, expecting '%t' to@ \
++          "@[invalid quantification guard, expecting '%t' to@ \
+            separate the hypotheses from the goal, found '%t'@]"
+           Unicode.pp_implies Unicode.pp_and
+       in
+       Constraints.raise_error msg ctxt
++    else begin
++      let ctxt, lhs_goal =
++        visit_quantif_relations ~is_forall ~in_lhs ctxt lhs
++      in
++      if Constraints.has_unguarded_bounded_vars ctxt then
++        visit_quantif_relations ~is_forall ~in_lhs ctxt rhs
++      else if not is_forall then
++        (* The parser associates conjunctions to the left:
++           [0 <= i < n && p && q] is [((0 <= i < n) && p) && q]. If the goal
++           started inside [lhs] ([p] here), [rhs] is its last conjunct. *)
++        let goal = match lhs_goal with
++          | None -> rhs
++          | Some lhs_goal -> Logic_const.pand ~loc:p.pred_loc (lhs_goal, rhs)
++        in
++        ctxt, Some goal
++      else
++        let msg =
++          Format.asprintf
++            "@[invalid quantification predicate, expecting '%t' to@ \
++             separate the hypotheses from the goal, found '%t'@]"
++            Unicode.pp_implies Unicode.pp_and
++        in
++        Constraints.raise_error msg ctxt
++    end
+   | Prel((Rlt | Rle) as r, t1, t2) ->
+     let ctxt = extract_constraint ctxt t1 r t2 in
+     ctxt, None
 diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_quantif_conjunctions.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_quantif_conjunctions.0.c
 new file mode 100644
-index 0000000000..ccf6bf3d2a
+index 0000000000..b263c9a7b1
 --- /dev/null
 +++ b/plugins/e-acsl/tests/constructs/oracle/gen_quantif_conjunctions.0.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,273 @@
 +/* Generated by Frama-C */
 +#include "pthread.h"
 +#include "stddef.h"
@@ -291,7 +356,66 @@ index 0000000000..ccf6bf3d2a
 +    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
 +  }
 +  /*@ assert \forall integer n; 0 <= n < size ==> n >= 0 && n < 5; */ ;
++  {
++    int __gen_e_acsl_forall_2;
++    int __gen_e_acsl_i;
++    int __gen_e_acsl_j;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __gen_e_acsl_forall_2 = 1;
++    __gen_e_acsl_i = 0;
++    while (1) {
++      if (__gen_e_acsl_i < size) ; else break;
++      __gen_e_acsl_j = 0;
++      while (1) {
++        if (__gen_e_acsl_j < size) ; else break;
++        if (__gen_e_acsl_i + (long)__gen_e_acsl_j < 2L * size) ;
++        else {
++          __gen_e_acsl_forall_2 = 0;
++          goto e_acsl_end_loop6;
++        }
++        __gen_e_acsl_j ++;
++      }
++      __gen_e_acsl_i ++;
++    }
++    e_acsl_end_loop6: ;
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,
++                                 "\\forall integer i, integer j;\n  0 <= i < size ==> 0 <= j < size ==> i + j < 2 * size",
++                                 0,__gen_e_acsl_forall_2);
++    __gen_e_acsl_assert_data_6.blocking = 1;
++    __gen_e_acsl_assert_data_6.kind = "Assertion";
++    __gen_e_acsl_assert_data_6.pred_txt = "\\forall integer i, integer j;\n  0 <= i < size ==> 0 <= j < size ==> i + j < 2 * size";
++    __gen_e_acsl_assert_data_6.file = "quantif_conjunctions.c";
++    __gen_e_acsl_assert_data_6.fct = "main";
++    __gen_e_acsl_assert_data_6.line = 18;
++    __e_acsl_assert(__gen_e_acsl_forall_2,& __gen_e_acsl_assert_data_6);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++  }
++  /*@
++  assert
++    \forall integer i, integer j;
++      0 <= i < size ==> 0 <= j < size ==> i + j < 2 * size;
++   */
++  ;
 +  /*@ assert \forall integer n; (0 <= n < size ==> n >= 0) ==> n == n; */ ;
++  /*@
++  assert
++    \forall integer i, integer j;
++      (0 <= i < size ==> 0 <= j < size) ==> i < size;
++   */
++  ;
++  /*@
++  assert
++    \forall integer i, integer j, integer k;
++      (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size;
++   */
++  ;
++  /*@
++  assert
++    \forall integer i, integer j;
++      0 <= i < size ==> 0 <= j && (j < size ==> i < size);
++   */
++  ;
 +  __retres = 0;
 +  __e_acsl_memory_clean();
 +  return __retres;
@@ -300,32 +424,54 @@ index 0000000000..ccf6bf3d2a
 +
 diff --git a/plugins/e-acsl/tests/constructs/oracle/quantif_conjunctions.0.res.oracle b/plugins/e-acsl/tests/constructs/oracle/quantif_conjunctions.0.res.oracle
 new file mode 100644
-index 0000000000..c022e38989
+index 0000000000..a3039eb8ce
 --- /dev/null
 +++ b/plugins/e-acsl/tests/constructs/oracle/quantif_conjunctions.0.res.oracle
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,34 @@
 +[e-acsl] beginning translation.
-+[e-acsl] quantif_conjunctions.c:17: Warning: 
++[e-acsl] quantif_conjunctions.c:20: Warning: 
 +  invalid E-ACSL construct
 +  `invalid quantification guard, found '==>'
-+  after the end of the guard of an hypothesis in quantification \forall integer n; (0 <= n < size ==> n >= 0) ==> n == n'.
++  inside the hypothesis of an implication in quantification \forall integer n; (0 <= n < size ==> n >= 0) ==> n == n'.
++  Ignoring annotation.
++[e-acsl] quantif_conjunctions.c:22: Warning: 
++  invalid E-ACSL construct
++  `invalid quantification guard, found '==>'
++  inside the hypothesis of an implication in quantification
++  \forall integer i, integer j; (0 <= i < size ==> 0 <= j < size) ==> i < size'.
++  Ignoring annotation.
++[e-acsl] quantif_conjunctions.c:24: Warning: 
++  invalid E-ACSL construct
++  `invalid quantification guard, found '==>'
++  inside the hypothesis of an implication in quantification
++  \forall integer i, integer j, integer k;
++    (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size'.
++  Ignoring annotation.
++[e-acsl] quantif_conjunctions.c:27: Warning: 
++  invalid E-ACSL construct
++  `invalid quantification guard, expecting '==>' to
++  separate the hypotheses from the goal, found '&&' in quantification
++  \forall integer i, integer j;
++    0 <= i < size ==> 0 <= j && (j < size ==> i < size)'.
 +  Ignoring annotation.
 +[e-acsl] translation done in project "e-acsl".
 +[eva:alarm] quantif_conjunctions.c:9: Warning: 
 +  function __e_acsl_assert, behavior blocking: precondition got status unknown.
 +[eva:alarm] quantif_conjunctions.c:14: Warning: 
 +  function __e_acsl_assert, behavior blocking: precondition got status unknown.
-+[eva:alarm] quantif_conjunctions.c:17: Warning: assertion got status unknown.
++[eva:alarm] quantif_conjunctions.c:20: Warning: assertion got status unknown.
++[eva:alarm] quantif_conjunctions.c:22: Warning: 
++  assertion got status invalid (stopping propagation).
 diff --git a/plugins/e-acsl/tests/constructs/quantif_conjunctions.c b/plugins/e-acsl/tests/constructs/quantif_conjunctions.c
 new file mode 100644
-index 0000000000..0b3020dd89
+index 0000000000..df13df6d8f
 --- /dev/null
 +++ b/plugins/e-acsl/tests/constructs/quantif_conjunctions.c
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,30 @@
 +/* run.config
 +   COMMENT: every conjunct after the guard of an existential quantification
-+   COMMENT: is checked, and a guard that ends inside the hypothesis of an
-+   COMMENT: implication is rejected
++   COMMENT: is checked, and invalid implication or conjunction guards in
++   COMMENT: universal quantifications are rejected
 +*/
 +
 +int main(void) {
@@ -338,9 +484,20 @@ index 0000000000..0b3020dd89
 +        \exists integer n, m;
 +          0 <= n < size && 0 <= m < size && n == 1 && m == 2 && n < m; */
 +  /*@ assert \forall integer n; 0 <= n < size ==> n >= 0 && n < 5; */
++  /*@ assert
++        \forall integer i, j;
++          0 <= i < size ==> 0 <= j < size ==> i + j < 2 * size; */
 +  /*@ assert \forall integer n; (0 <= n < size ==> n >= 0) ==> n == n; */
++  /*@ assert
++        \forall integer i, j; (0 <= i < size ==> 0 <= j < size) ==> i < size; */
++  /*@ assert
++        \forall integer i, j, k;
++          (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size; */
++  /*@ assert
++        \forall integer i, j;
++          0 <= i < size ==> 0 <= j && (j < size ==> i < size); */
 +  return 0;
 +}
 -- 
-2.56.0.windows.4
+2.47.3
 

@@ -4,7 +4,7 @@
 # to __e_acsl_mark_readonly instead of its address. Same root cause as
 # 27-eacsl-readonly-scalar-global-address, fixed by the same patch.
 #
-# Images: framac-master-audit:3dff90f (master 3dff90fc70, before),
+# Images: framac-master-audit:b80fcac (master b80fcac74f, before),
 #         the same image with the patch (after), framac-analysis:fc34 (34.0~beta).
 # Command, from the repro directory:
 #   docker run --rm -v "$PWD:/w" -w /w --entrypoint sh <image> 23-eacsl-static-const-union-cast.sh
@@ -12,7 +12,7 @@
 # error lines of the build log (Frama-C errors and e-acsl-gcc's own verdict),
 # not the warnings, the backtrace or the compiler command lines.
 #
-# Output before the fix (master 3dff90fc70; 34.0~beta prints the same with
+# Output before the fix (master b80fcac74f; 34.0~beta prints the same with
 # "34.0~beta (Selenium)"):
 #   35.0~~dev (Bromine)
 #   --- e-acsl-gcc -q -X  -e -DDEFAULT -E -DDEFAULT 23-eacsl-static-const-union-cast.c
@@ -49,11 +49,13 @@
 #   --- frama-c -print 23-eacsl-static-const-union-cast.c (no E-ACSL)
 #   frama-c: exit 0
 #
-# Output after the fix (master 3dff90fc70 + patches/27-eacsl-readonly-scalar-global-address.patch):
-# every variant builds and runs (exit 0); the union variants print
+# Output after the fix (master b80fcac74f + patches/27-eacsl-readonly-scalar-global-address.patch):
+# every variant builds and runs (exit 0); the union variants and CONST_STRUCT print
 #       __e_acsl_mark_readonly((void *)(& zero_block));
-# (LOCAL_STATIC: (& main_zero_block)), CONST_STRUCT and NON_CONST_UNION are
-# unchanged, and frama-c -print still exits 0.
+# (LOCAL_STATIC: (& main_zero_block)). CONST_STRUCT now emits a single call on
+# & zero_block instead of per-field calls, avoiding the out-of-bounds read-only
+# shadow write under --rt-debug. NON_CONST_UNION is unchanged, and frama-c -print
+# still exits 0.
 set -u
 n=23-eacsl-static-const-union-cast
 tmp=$(mktemp -d)

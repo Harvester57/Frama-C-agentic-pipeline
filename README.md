@@ -1,8 +1,40 @@
 # Frama-C Agentic Verification & Hybrid Fuzzing Pipeline
 
-An industrial-grade, multi-agent formal verification and dynamic bug-hunting framework for large C codebases (up to 100,000+ LoC), built on **Frama-C 34.0~beta (Selenium)** (`RTE`, `Eva`, `WP`, `E-ACSL`, `MetAcsl`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
+A multi-agent pipeline that hunts bugs in C code and proves what it can about the rest. It is built on **Frama-C 34.0~beta (Selenium)** (`RTE`, `Eva`, `WP`, `E-ACSL`, `MetAcsl`, `Mdr/SARIF`), **SMT Solvers** (`Alt-Ergo`, `Z3`, `CVC5`), and **Clang LibFuzzer**.
+
+Give it a C project that builds, and it:
+
+- fuzzes the project's API with runtime checks generated from the C semantics, without any annotations from you;
+- proves the absence of runtime errors with abstract interpretation and LLM-written ACSL contracts;
+- has an independent agent check every crash before it is reported as a bug;
+- states exactly what was proven, under which assumptions, and what was not.
 
 All verification tools execute inside reproducible, network-isolated containers (a **build image** for the target's own build and tests, an **analysis image** for everything else), orchestrated by modular **Agent Skills** ([`/framac-verify`](./skills/framac-verify/SKILL.md), [`/framac-slice`](./skills/framac-slice/SKILL.md), [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md), [`/framac-eva`](./skills/framac-eva/SKILL.md), [`/framac-wp`](./skills/framac-wp/SKILL.md)) and deterministic Python helper scripts.
+
+---
+
+## Project Status
+
+The pipeline is under active development and is tested on real open-source libraries. It has found bugs that were reported upstream ([Bugs Found](#bugs-found)), and it has produced 39 bug reports against Frama-C itself. **Complete proof coverage is not yet the usual outcome:** the latest supervised run of each target below stopped before reaching `complete`.
+
+| Target and run | Profile | How it ended | Result |
+| :--- | :---: | :--- | :--- |
+| [libmodbus run-1](./docs/runs/2026-11-18-libmodbus-run1-supervision.md) (2026-11-18) | `standard` | `incomplete` after 16 h 05 min | 87 of 215 units covered, none unconditionally. All 35 candidates verified, with no defect worth reporting upstream. |
+| [mpack run-4](./docs/runs/2026-11-17-mpack-run4-supervision.md) (2026-11-17) | `standard` | Paused in Phase 3 when the driving model ran out of context | Phases 0 to 2 finished on 476 functions. The confirmed findings at the pause are in an example program, not the library. |
+| [c-ares run-1](./docs/runs/2026-11-16-c-ares-run1-supervision.md) (2026-11-16) | `standard` | `incomplete` after 21 h 09 min, stopped by the user in Phase 3 | 13 of 1,942 units covered. Eva timed out on 4 modules. The 20 pipeline fixes it led to were merged too late to help this run. |
+| [QCBOR run-6](./docs/runs/2026-11-14-qcbor-run6-supervision.md) (2026-11-14) | `deep` | `incomplete` after 11 h 36 min | Eva discharged 91.67% of its checks. [15 of 16 confirmed records were real](./docs/runs/2026-11-15-qcbor-run6-findings-assessment.md), and they come down to 7 distinct defects. |
+| [minmea run-1](./docs/runs/2026-11-14-minmea-run1-supervision.md) (2026-11-14) | `standard` | `incomplete` | 3 confirmed findings, 1 needs validation, 19 of 37 units blocked. |
+
+These results describe the pipeline as it was on each date. Fixes from each run have landed since. Earlier campaigns are recorded in [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md), including picohttpparser, where 11 units were proven and no bug was found.
+
+### What to Expect
+
+- **Review the findings.** A `confirmed` verdict means a replayed failure that an independent agent attributed to the target. It can still be wrong: libmodbus's one confirmed finding turned out to be documented behaviour.
+- **Read proofs with their assumptions.** A `covered` unit can rest on open assumptions, such as unverified callers or stub contracts. `REPORT.md` separates unconditional proofs from conditional ones.
+- **Plan for long runs.** The libmodbus, c-ares and QCBOR runs above took 11 to 21 hours each, and a run uses many LLM subagents.
+- **Treat size as a design goal.** The architecture targets codebases of about 100,000 lines, but no run in the table reached `complete`, including c-ares (1,942 ledger units) and QCBOR (755 functions).
+- **Eva results vary by target.** On the modules it finished in recent runs, Eva discharged 73% to 93% of the runtime-error checks. Some modules time out instead.
+- **Known defects are recorded.** Open pipeline bugs are marked `**Open pipeline bug:**` in [`./docs/troubleshooting/`](./docs/troubleshooting/README.md).
 
 ---
 
@@ -12,7 +44,7 @@ All verification tools execute inside reproducible, network-isolated containers 
 flowchart LR
     Target["Read-Only Target C Repo<br/>(/target)"] --> P0["Phase 0: /framac-slice<br/>Build Capture, Frama-C Model,<br/>Link Units, Trust, Tiers & Dual Harnesses"]
     P0 --> P1["Phase 1: /framac-fuzz<br/>RTE + E-ACSL + LibFuzzer<br/>Dynamic Crash Triage"]
-    P0 --> P2["Phase 2: /framac-eva<br/>Abstract Interpretation<br/>Discharges 80-90% RTEs"]
+    P0 --> P2["Phase 2: /framac-eva<br/>Abstract Interpretation<br/>Discharges Most RTE Checks"]
     P1 & P2 --> Gate["Crash Verification Gate<br/>Independent Verifier Subagents<br/>& Sandbox Replay"]
     Gate -- "Confirmed Bug" --> Findings["findings.json<br/>(Excluded from WP)"]
     Gate -- "Surviving Unknowns" --> P3["Phase 3: /framac-wp<br/>Dependency-Driven Prover Swarm<br/>+ Dual-Oracle E-ACSL Guardrail"]
@@ -21,34 +53,46 @@ flowchart LR
     P3 & Findings --> P4["Phase 4: Audit & Reports<br/>wp-sweep, REPORT.md,<br/>report.sarif, verified_acsl.patch"]
 ```
 
-### Key Capabilities
+### Capabilities
 
-1. **Zero-ACSL Dynamic Triage (`RTE + E-ACSL + LibFuzzer`):**
-   Automatically injects ACSL runtime-error assertions (`-rte -rte-initialized`) and compiles them with E-ACSL into shadow-memory and arithmetic runtime checks linked with LibFuzzer (`e-acsl-gcc`, `-fsanitize=fuzzer`). Catches intra-struct sub-object buffer overflows, use-after-free, uninitialized reads, signed integer overflow, division by zero, invalid shifts, and functional contract violations before a single minute is spent on formal proofs.
-2. **Module-Level Abstract Interpretation (`Eva`):**
-   Simulates symbolic inputs (`0 .. MAX_INPUT_SIZE`) from per-module `eva_main()` harnesses to automatically discharge **80–90% of RTE assertions** without writing loop invariants.
-3. **Dependency-Driven Subagent WP Swarm (`/framac-wp`):**
-   A deterministic scheduler ([`./scripts/wp_scheduler.py`](./scripts/wp_scheduler.py)) dispatches a **Function Prover Subagent** (`frama-c -wp -wp-rte -wp-fct <fn>`) as soon as the function's callees are merged. Longest caller chains go first, and finished proofs merge in parallel micro-batches without global wave barriers.
-4. **Dual-Oracle Anti-Hallucination Guardrail:**
-   Every ACSL contract (`requires`, `assigns`, `ensures`, `loop invariant`) proposed by a subagent is compiled with **E-ACSL** and tested against the live fuzzer corpus before being passed to **WP**, preventing the LLM from passing proofs via vacuous or over-constrained preconditions (`requires \false`).
-5. **Adversarial Prover-vs-Breaker Dual-Play:**
-   When a WP proof stalls after `K` retries on an assertion, an **Adversarial Breaker Subagent** crafts targeted fuzzer seeds that trigger the assertion at runtime without blocking the stalled function's callers.
-6. **6 Layers of Security Properties (Beyond Memory Safety):**
-   - **Layer 1:** Absence of Run-Time Errors (`AoRTE` via `-rte`)
-   - **Layer 2:** Termination & Anti-DoS (`loop variant`, `decreases`)
-   - **Layer 3:** Memory Isolation (`assigns`, `\separated`) for every function that writes through a pointer
-   - **Layer 4:** Authentication gates (MetAcsl: only the gate writes the auth state, protected functions require it)
-   - **Layer 5:** Output sanitization at the threat model's sinks (no CR/LF in log text, no uninitialized byte)
-   - **Layer 6:** Secrets wiped on release and never handed to an output sink
+**Understanding the target (Phase 0)**
 
-   Layers 4 to 6 come from the structured threat model in `THREAT_MODEL.md`, not from patterns in the code ([`./docs/guides/security-properties.md`](./docs/guides/security-properties.md)).
-7. **Self-Sizing Resource Broker & Content-Addressed Caches:**
-   Before every job, [`./scripts/resources.py`](./scripts/resources.py) measures available cgroups, Slurm allocations, and Docker/Podman engine limits to lease CPUs and memory per container while keeping outcome-deciding limits (`-wp-memlimit`, `-rss_limit_mb`, seeds) fixed across machines. Deterministic per-module builds, fuzzing, and Eva runs execute via Make ([`./scripts/pipeline_make.py`](./scripts/pipeline_make.py)) backed by per-run and cross-run caches ([`./docs/guides/resources-and-caching.md`](./docs/guides/resources-and-caching.md)).
-8. **Evidence Discipline & Mechanical Validation:**
-   Tool hits are fingerprinted candidates, not findings, until independently verified into `confirmed`, `needs_validation`, or `rejected` records. A deterministic coverage ledger (`function x obligation class`) tracks unconditional proofs, proofs under open assumptions, and blocked or deferred units ([`./docs/guides/v2-design.md`](./docs/guides/v2-design.md)).
+1. **Build capture.** Runs the target's own build (make, CMake, Meson, Ninja, autotools) under `bear`, and takes its link units, per-file flags, API and headers from what the build really did.
+2. **Frama-C model and trust boundary.** Parses every link unit into a call graph with direct and indirect edges. It marks attacker-reachable functions from the build, the call graph and your threat model, and optionally from CodeQL taint queries. A unit Frama-C cannot parse falls back to GCC's call graph and is fuzzed with the sanitizers only.
+3. **Generated harnesses.** Writes one dual-use harness per module for Eva and LibFuzzer, with cases for exported functions, public header functions, object lifecycles and the target's own variadic call sites. Gates check that each harness reaches the API and builds under E-ACSL.
+4. **Seeds from what the target already has.** Records the API calls the target's tests make, imports the fuzz corpora it ships, and turns its C fuzz targets into extra fuzzed modules.
+5. **Contracts for external libraries.** Generates contract skeletons for functions declared in host headers. A subagent fills them in, and ABI, Eva and runtime checks test them against the real library.
+
+**Finding bugs (Phases 1 and 2)**
+
+6. **Zero-ACSL dynamic triage.** Injects runtime-error assertions (`-rte -rte-initialized`), compiles them with E-ACSL into shadow-memory and arithmetic checks, and fuzzes with LibFuzzer alongside an ASan and UBSan build. It catches intra-struct overflows, use-after-free, uninitialized reads, signed overflow, division by zero and invalid shifts.
+7. **Module-level abstract interpretation.** Runs Eva from each harness's `eva_main()` without hand-written loop invariants. A fixed tuning ladder and [case-level sharding](./docs/guides/eva-sharding.md) handle modules that are imprecise or slow.
+8. **Independent crash verification.** Every tool hit is a fingerprinted candidate until a fresh Crash Verifier subagent replays it in the sandbox and audits it against the API's documented preconditions. Verdicts are `confirmed`, `needs_validation` or `rejected`, and each rejection records its class, such as `harness_induced` or `toolchain_artifact`.
+
+**Proving properties (Phase 3)**
+
+9. **Dependency-driven prover swarm.** A deterministic scheduler ([`./scripts/wp_scheduler.py`](./scripts/wp_scheduler.py)) dispatches a **Function Prover Subagent** as soon as the function's callees have contracts it can see. Longest caller chains go first, and finished proofs merge in parallel micro-batches.
+10. **Dual-oracle guardrail.** Every contract a subagent proposes is compiled with **E-ACSL** and replayed on the fuzzer corpus before **WP** sees it, so a precondition that real inputs violate is rejected. Smoke tests then catch contradictory contracts, and mechanical checks refuse `admit`, axioms and any change to the C code.
+11. **Adversarial breakers and contract negotiation.** When a proof stalls after its retry limit, a **Breaker Subagent** crafts fuzzer seeds aimed at the unproven goal, without blocking the function's callers. Callers can ask callees for stronger contracts through a negotiation ledger.
+12. **Prover context.** Prover briefs carry deterministic facts: a per-function reading slice, frame skeletons, loop templates, a retrieved ACSL knowledge base and known dead ends. Proofs from earlier runs carry forward once they are re-proven on the current code.
+13. **Six layers of security properties:**
+    - **Layer 1:** Absence of Run-Time Errors (`AoRTE` via `-rte`)
+    - **Layer 2:** Termination & Anti-DoS (`loop variant`, `decreases`)
+    - **Layer 3:** Memory Isolation (`assigns`, `\separated`) for every function that writes through a pointer
+    - **Layer 4:** Authentication gates (MetAcsl: only the gate writes the auth state, protected functions require it)
+    - **Layer 5:** Output sanitization at the threat model's sinks (no CR/LF in log text, no uninitialized byte)
+    - **Layer 6:** Secrets wiped on release and never handed to an output sink
+
+    Layers 4 to 6 come from the structured threat model in `THREAT_MODEL.md`, not from patterns in the code ([`./docs/guides/security-properties.md`](./docs/guides/security-properties.md)).
+
+**Running and measuring it**
+
+14. **Self-sizing resources and caches.** Before every job, [`./scripts/resources.py`](./scripts/resources.py) measures cgroups, Slurm allocations and Docker/Podman limits to lease CPUs and memory, while limits that decide outcomes (`-wp-memlimit`, `-rss_limit_mb`, seeds) stay fixed across machines. Deterministic per-module work runs through Make ([`./scripts/pipeline_make.py`](./scripts/pipeline_make.py)) with per-run and cross-run caches ([`./docs/guides/resources-and-caching.md`](./docs/guides/resources-and-caching.md)).
+15. **Evidence discipline.** A deterministic coverage ledger (`function x obligation class`) tracks unconditional proofs, proofs under open assumptions, and blocked or deferred units ([`./docs/guides/v2-design.md`](./docs/guides/v2-design.md)).
+16. **Repeatable benchmark.** Measures a pipeline change against recorded bugs, comparison targets and seeded-bug projects ([`./docs/guides/benchmark.md`](./docs/guides/benchmark.md)). Separate tools score specification quality by mutation (`mutation_check.py`) and count the goals a finished run left unproved (`wp_residual_census.py`).
 
 > [!IMPORTANT]
-> **Security & Isolation Boundary:** The target repository is mounted **read-only** at `/target`, and all shared JSON artifacts are schema-validated on every transition. The hardened container (`--network none`, `--cap-drop ALL`, `no-new-privileges`, default seccomp/AppArmor profiles, and CPU/memory/PID limits) is the isolation boundary. Inside the container, target-controlled binaries run through [`./scripts/sandbox_exec.py`](./scripts/sandbox_exec.py) (enforcing CPU/file/process `rlimits`, an explicit environment allowlist, and process-group timeouts). There is no separate filesystem namespace inside the container; see [`./docs/guides/v2-design.md` (Section 3)](./docs/guides/v2-design.md) for the residual-risk model.
+> **Security & Isolation Boundary:** The target repository is mounted **read-only** at `/target`, and all shared JSON artifacts are schema-validated on every transition. The hardened container (`--network none`, `--cap-drop ALL`, `no-new-privileges`, default seccomp/AppArmor profiles, and CPU/memory/PID limits) is the isolation boundary. Inside the container, target-controlled binaries run through [`./scripts/sandbox_exec.py`](./scripts/sandbox_exec.py) (enforcing CPU/file/process `rlimits`, an explicit environment allowlist, and process-group timeouts). There is no separate filesystem namespace inside the container, so deliberately hostile targets are out of scope; see [`./docs/guides/v2-design.md` (Section 3)](./docs/guides/v2-design.md) for the residual-risk model.
 
 ---
 
@@ -56,6 +100,7 @@ flowchart LR
 
 - **Container Engine:** Docker or Podman (`FRAMAC_CONTAINER_ENGINE=auto|docker|podman`).
   - Allocate at least **4 GiB of RAM** to the container engine VM (**8 GiB+ recommended** for parallel WP and fuzzing). Tools refuse to run below their single-worker memory floor (`1768 MiB` for WP, `3072 MiB` for LibFuzzer) rather than producing starved or flaky results.
+- **AI coding agent:** a harness that loads skills and can spawn subagents. Skills are mirrored for Claude Code (`.claude/skills/`) and for harnesses that read `.agents/skills/`, and recent runs were driven from opencode. Phases 0 and 3 need the agent. Phases 1 and 2 run through Make.
 - **Platform:** **x86_64 Linux containers only.** The host must be x86_64, and the target's build must produce x86_64 code. A host of another architecture, or a build with `-m32`, `-mx32` or a cross compiler, stops Phase 0 with `unsupported_architecture` and instructions (see [Troubleshooting](./docs/troubleshooting/phase0-build-and-model.md)). Other architectures are not supported yet.
 - **Host Python:** Python **3.10+** (stdlib only; used on the host by the resource broker and test suite).
 - **Target C Project:** a C99/C11 source tree that builds. Phase 0 runs the target's own build (make, CMake, Meson, Ninja, autotools) under `bear` in the build image, from a recipe you give or confirm: the build command, its Debian packages, and optionally the test command. A target that does not build stops Phase 0 with `needs_build_recipe` and a diagnostic (first error, missing headers, candidate packages) until the recipe is fixed.
@@ -129,12 +174,21 @@ Invoke the skills from your AI coding assistant:
 | Skill | Stage | Purpose |
 | :--- | :---: | :--- |
 | [`/framac-verify`](./skills/framac-verify/SKILL.md) | **All (0–4)** | **End-to-end orchestrator:** slices the codebase, fuzzes with E-ACSL, prunes with Eva, verifies crash candidates, proves surviving obligations with parallel WP subagents, and emits final reports. Supports `--profile quick\|standard\|deep`. |
-| [`/framac-slice`](./skills/framac-slice/SKILL.md) | **Phase 0** | Initializes the `workspace/` shadow overlay, captures the target's build, parses each link unit with Frama-C (call graph, API, trust), records seeds from the tests, builds the DAG with link units as modules and risk tiers from trust, generates the MetAcsl security properties and dual harnesses, gates them on API reachability and on a working E-ACSL build, and seeds `coverage-ledger.json`. |
+| [`/framac-slice`](./skills/framac-slice/SKILL.md) | **Phase 0** | Initializes the `workspace/` shadow overlay, captures the target's build, parses each link unit with Frama-C (call graph, API, trust), records seeds from the tests, imports the fuzz targets and corpora the target ships, builds the DAG with link units as modules and risk tiers from trust, generates the MetAcsl security properties and dual harnesses, gates them on API reachability and on a working E-ACSL build, and seeds `coverage-ledger.json`. |
 | [`/framac-fuzz`](./skills/framac-fuzz/SKILL.md) | **Phase 1** | Runs zero-ACSL `RTE + E-ACSL + Clang LibFuzzer` campaigns per module slice via Make. |
-| [`/framac-eva`](./skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, discharging 80–90% of RTE checks and emitting per-slice SARIF. |
+| [`/framac-eva`](./skills/framac-eva/SKILL.md) | **Phase 2** | Runs `frama-c -rte -then -eva` per module slice, separates Invalid, Unknown and dead code, and emits per-slice SARIF. |
 | [`/framac-wp`](./skills/framac-wp/SKILL.md) | **Phase 3** | Dispatches the dependency-driven prover swarm (`Alt-Ergo`, `Z3`, `CVC5`) via `wp_scheduler.py`, enforcing the E-ACSL Dynamic Guardrail and spawning Adversarial Breakers on stalled goals. |
 | [`/run-supervisor`](./skills/run-supervisor/SKILL.md) | **Any (host-side)** | **Read-only supervisor of a live run:** polls progress, containers and the opencode transcript, triages stalls and failures, has fixer subagents reproduce and fix pipeline bugs in isolated worktrees with a failing regression test first, records troubleshooting entries and upstream drafts, and writes a supervision report. Never steers or stops the run, never pushes. |
+| [`/code-auditor`](./skills/code-auditor/SKILL.md) | **None (standalone)** | Security source-code audit of a repository or path: builds a threat model, then finds, triages and validates candidate findings. |
 | [`/paper-assessment`](./skills/paper-assessment/SKILL.md) | **None (planning)** | **Research papers to a ranked plan:** reads each paper with a stated coverage, weighs its evidence, generalizes its mechanisms, maps them onto the scripts and briefs, drops what the pipeline's rules exclude or earlier trials closed, has one independent challenger attack the rest, and writes a ranked plan under `docs/plans/` plus a row per paper in [`papers-assessed.md`](./docs/plans/papers-assessed.md). Changes no pipeline code. |
+
+Profiles change how much work a run does, never the evidence a finding or proof needs:
+
+| Profile | Scope | Fuzz budget per harness case (cap per link unit) | Prover budget per function | Retries before a breaker |
+| :--- | :--- | :---: | :---: | :---: |
+| `quick` | Phases 0 to 2, crash verification, and WP on Tier 1A entry chains only. Tier 3 is deferred. | 60 CPU-s (480) | 600 s | 2 |
+| `standard` (default) | All phases. Tier 3 modules get Eva and `rte` WP, without fuzzing. | 120 CPU-s (1200) | 900 s | 4 |
+| `deep` | The same scope as `standard`, with larger budgets. | 900 CPU-s (7200) | 1800 s | 6 |
 
 ---
 
@@ -147,7 +201,7 @@ Every run directory (`~/framac-pipeline/<repo>/run-<N>/`) produces a self-contai
 | `REPORT.md` | Executive summary: run status (`complete` or `incomplete`), confirmed vulnerabilities table, needs-validation candidates, assurance summary (unconditional vs. conditional proofs), and coverage metrics. |
 | `FINDINGS-DETAIL.md` | Detailed root-cause traces, reproduction commands, and candidate fix diffs for every `confirmed` finding. |
 | `NEEDS-VALIDATION.md` | Source-grounded hypotheses and unverified Eva `Invalid` alarms with concrete validation plans. |
-| `report.sarif` | SARIF v2.1.0 report containing verified records (`confirmed` as `error`, `needs_validation` as `warning`) for GitHub Code Scanning / IDE integration. |
+| `report.sarif` | SARIF v2.1.0 report containing verified records for GitHub Code Scanning / IDE integration. `confirmed` records map by severity (critical and high to `error`, medium to `warning`, low to `note`), and `needs_validation` records are `warning`. |
 | `coverage-ledger.json` | Machine-readable ledger of every `function x obligation class` unit (`covered`, `blocked`, `candidate`, `deferred`, `out_of_scope`) and its open assumptions. |
 | `findings.json` / `candidates.json` | Canonical verdict records and fingerprinted tool hits (`<file>#<function>::<kind>::<hash10>`). |
 | `workspace/reports/verified_acsl.patch` | Unified diff of all pure-ACSL contracts proven during the run (applicable to the target via `workspace_overlay.py apply-in-place`). |
@@ -158,99 +212,66 @@ Every run directory (`~/framac-pipeline/<repo>/run-<N>/`) produces a self-contai
 
 ```text
 frama-c/
-├── Dockerfile                        # Stages framac-build (Debian trixie, build systems, bear, strace), framac-opam
-│                                     # (Frama-C, MetAcsl, Why3, Alt-Ergo built with opam), framac-analysis (Debian trixie +
-│                                     # that switch: Frama-C 34.0~beta, E-ACSL, Z3/CVC5, Clang/LibFuzzer), the last stage
-├── opam/                             # Local opam repository: Frama-C and MetAcsl releases not yet in opam-repository
-├── Dockerfile.codeql                 # Optional CodeQL image, built from framac-build
-├── docker-compose.yml                # Manual container service definition & volume mappings
-├── wrappers/
-│   ├── framac-docker.ps1             # Windows PowerShell wrapper (host broker, image choice, scratch volume, hardening)
-│   ├── framac-docker.sh              # POSIX/Bash wrapper (same options)
-│   └── codeql-derived.Dockerfile     # framac-codeql:<repo key>: the target's build image plus the CodeQL CLI
-├── skills/                           # Modular Agent Skills (single source of truth; .agents/skills/ and .claude/skills/ mirror them)
-│   ├── framac-verify/SKILL.md        # Umbrella end-to-end orchestrator (/framac-verify)
-│   ├── framac-slice/SKILL.md         # Phase 0: Slicing, Call-Graph DAG, stubs & harnesses (/framac-slice)
-│   ├── framac-fuzz/SKILL.md          # Phase 1: Zero-ACSL RTE + E-ACSL + LibFuzzer triage (/framac-fuzz)
-│   ├── framac-eva/SKILL.md           # Phase 2: Module-level abstract interpretation (/framac-eva)
-│   └── framac-wp/                    # Phase 3: Dependency-driven parallel WP swarm (/framac-wp)
-│       ├── SKILL.md
-│       └── *_brief.md                # Subagent briefs (header_architect, prover, breaker, crash_verifier)
-│   ├── run-supervisor/SKILL.md       # Read-only supervisor of a live run (/run-supervisor)
-│   ├── paper-assessment/SKILL.md     # Research papers to a ranked improvement plan (/paper-assessment)
-│   ├── python-patterns/SKILL.md      # Conventions for the pipeline's Python scripts
-│   └── python-testing/SKILL.md       # Pytest conventions for tests/
-├── scripts/                          # Stdlib-only Python 3.10+ pipeline scripts
-│   ├── build_capture.py              # Phase 0: Runs the build under bear; link units, flags, API, snapshot
-│   ├── phase0_model.py               # Phase 0: Frama-C parse per link unit (phase0_dump.ml), GCC fallback, optional Alias
-│   ├── trust.py, codeql_trust.py     # Phase 0: Trust boundary from the build, call graph & threat model (+ optional CodeQL)
-│   ├── seed_harvest.py               # Phase 0/1: Seeds recorded from the API calls the target's tests make
-│   ├── build_callgraph_dag.py        # Phase 0: DAG view of the model: link-unit modules, waves, tiers, unit split
-│   ├── tiers.py, unit_split.py       # Phase 0: Risk tiers from trust; split of units too large for one Eva run
-│   ├── module_map.py                 # Harness modules and sub-modules mapped to their link unit
-│   ├── security_props.py             # Phase 0/3: MetAcsl Layer 3-6 properties from the threat model
-│   ├── generate_harness.py           # Phase 0: Dual-use Eva + LibFuzzer harness & sidecar generator
-│   ├── harness_reach.py              # Phase 0/1: Harness reachability gate (static, and dynamic from coverage)
-│   ├── pipeline_make.py              # Phases 1-4: Generates & runs Makefile for deterministic module work
-│   ├── run_eacsl_fuzz.py             # Phase 1 & 3: E-ACSL + LibFuzzer campaigns, replays, selftest & guardrail
-│   ├── run_eva_slice.py              # Phase 2: Frama-C Eva + RTE runner, read/write sets & SARIF exporter
-│   ├── eva_tuning.py                 # Phase 2: Eva ladder selection, guards and per-obligation combination
-│   ├── eva_options.py                # Phase 2: allowlisted Eva options and the fixed ladder
-│   ├── eva_loops.py                  # Phase 2: per-loop unrolling on a scratch mirror of the sources
-│   ├── kernel_ast.py                 # Frama-C kernel AST facts & call graph (with kernel_ast_dump.ml)
-│   ├── function_facts.py             # Per-function prover facts (kernel AST + Eva flows) & brief assembly
-│   ├── function_slice.py             # Per-function reading slice from the real compile flags
-│   ├── prover_candidates.py          # A prover's best candidate across iterations
-│   ├── wp_scheduler.py               # Phase 3: Dependency-driven WP task scheduler, micro-batch merges & gates
-│   ├── run_wp_function.py            # Phase 3: Per-function Frama-C WP + RTE runner & goal bucketer
-│   ├── contract_negotiator.py        # Phase 3: Cross-function Caller-Callee contract strengthening ledger
-│   ├── workspace_overlay.py          # Shadow overlay, per-agent scratch trees, & pure-ACSL structural splicing
-│   ├── acsl_ast.py                   # C/ACSL lexical analyzer & token-stream verifier
-│   ├── ledger.py                     # Coverage ledger seeding, phase ingestion, & hypothesis auditing
-│   ├── generate_report.py            # Phase 4: Derives REPORT.md, FINDINGS-DETAIL.md, NEEDS-VALIDATION.md, report.sarif
-│   ├── resources.py, cache.py        # Host/container resource broker & content-addressed build/proof caches
-│   ├── sandbox_exec.py               # Inner rlimits, environment allowlist, & process-group timeout runner
-│   ├── benchmark.py, benchmark_*.py  # Repeatable benchmark: recall replay, Eva metrics, baseline comparison, brief A/B
-│   └── validate_artifacts.py, ...    # Schema & semantic validators, checkpointing, fingerprinting, & shared helpers
-├── schemas/                          # JSON Schemas, one per shared artifact (findings, candidates, coverage-ledger,
-│                                     # run-metadata, agent-result, benchmark-run, build_capture, build_check,
-│                                     # callgraph_dag, harness_reach_dynamic, harness_sidecar, phase0_model,
-│                                     # security_props, seed_harvest, seed_trace, threat_model)
-├── templates/
-│   ├── pipeline.mk                   # Make rules for build, selftest, fuzz, eva, ingest, replay, wp-sweep, report
-│   ├── harness_dual.c.template       # Dual-use Eva + LibFuzzer C harness template
-│   ├── eacsl_runtime/fuzz_init.c     # LLVMFuzzerInitialize hook initializing E-ACSL shadow memory
-│   ├── eacsl_canary/canary.c         # Self-test canary for `run_eacsl_fuzz.py selftest`
-│   ├── fc_stubs/                     # Bodyless ACSL-annotated prototypes for third-party/host headers
-│   ├── acsl/                         # ACSL vocabulary and external-function stubs
-│   ├── metacsl/                      # MetAcsl meta-property templates for Layers 4-6
-│   └── codeql/                       # CodeQL trust query
-├── benchmark/                        # Benchmark manifest, harness assets, fixed brief sample & stored baseline
-├── tests/                            # Pytest unit and integration test suite
-└── docs/                             # Documentation hub (README.md, AGENTS.md, and category folders)
-    ├── guides/                       # Living architecture, onboarding, security layers, swarm, caching & benchmark guides
-    ├── troubleshooting/              # Thematic troubleshooting guides, master README & agent update guide
-    ├── plans/                        # Active engineering plans, backlog, formal-discovery tiers & historical archive/
-    ├── runs/                         # Chronological target run logs, postmortems & findings assessments
-    ├── bugs-found/                   # Public vulnerability advisories & verification reports per target
-    ├── upstream/                     # Upstream bug drafts & source references (frama-c/, qcbor/, sources/)
-    └── references/                   # Frama-C RTE, Eva, WP, ACSL, and E-ACSL reference manuals (33.0 editions; re-extract from the 35.0 PDFs when published)
+├── Dockerfile                  # Stages framac-build, framac-opam (Frama-C, MetAcsl, Why3, Alt-Ergo) and framac-analysis
+├── Dockerfile.codeql           # Optional CodeQL image, built from framac-build
+├── docker-compose.yml          # Manual container service definition & volume mappings
+├── opam/                       # Local opam repository: Frama-C and MetAcsl releases not yet in opam-repository
+├── wrappers/                   # framac-docker.ps1 / .sh (broker, image choice, hardening), CodeQL derived image
+├── skills/                     # Agent Skills (single source of truth; .agents/skills/ and .claude/skills/ mirror them)
+│   ├── framac-verify/          # End-to-end orchestrator
+│   ├── framac-slice/           # Phase 0, with the stub author brief
+│   ├── framac-fuzz/            # Phase 1
+│   ├── framac-eva/             # Phase 2
+│   ├── framac-wp/              # Phase 3, with the architect, prover, breaker and crash verifier briefs
+│   ├── run-supervisor/         # Read-only supervisor of a live run
+│   ├── code-auditor/           # Standalone security source-code audit
+│   ├── paper-assessment/       # Research papers to a ranked improvement plan
+│   └── python-patterns/, python-testing/   # Conventions for scripts/ and tests/
+├── scripts/                    # Stdlib-only Python 3.10+ pipeline scripts, the main ones by phase:
+│   │                           # Phase 0: build_capture, phase0_model, trust, codeql_trust, seed_harvest, fuzz_assets,
+│   │                           #   variadic_calls, build_callgraph_dag, tiers, unit_split, security_props, stub_gen,
+│   │                           #   stub_check, generate_harness, api_harness, harness_reach, phase0_gates
+│   │                           # Phase 1: run_eacsl_fuzz, fuzz_build, fuzz_coverage, fuzz_dictionary, crash_replay
+│   │                           # Phase 2: run_eva_slice, eva_tuning, eva_options, eva_loops, eva_shards
+│   │                           # Phase 3: wp_scheduler, run_wp_function, workspace_overlay, acsl_ast, contract_negotiator,
+│   │                           #   function_facts, function_slice, frame_skeleton, spec_kb, proof_carry,
+│   │                           #   decision_point_check
+│   │                           # Phase 4: ledger, validate_artifacts, generate_report
+│   │                           # Measurement: benchmark*, mutation_check, wp_residual_census
+│   └──                         # Infrastructure: pipeline_make, resources, cache, sandbox_exec
+├── schemas/                    # JSON Schemas, one per shared artifact
+├── templates/                  # pipeline.mk, the dual harness template, E-ACSL runtime and canary, fc_stubs/, acsl/,
+│                               # metacsl/ (Layers 4-6) and codeql/
+├── benchmark/                  # Benchmark manifest, harness assets, fixed brief sample & stored baseline
+├── tests/                      # Pytest unit and integration test suite
+├── tools/                      # Repository guardrails, skill mirror sync, and upstream filing tools
+└── docs/                       # Documentation hub
+    ├── guides/                 # How the pipeline works today
+    ├── troubleshooting/        # Symptom, cause and fix catalogs
+    ├── plans/                  # Active engineering plans, backlog & archive
+    ├── runs/                   # Chronological target run logs and postmortems
+    ├── bugs-found/             # Confirmed target vulnerabilities, per target
+    ├── upstream/               # Upstream bug drafts, filing packages & source references
+    └── references/             # Frama-C RTE, Eva, WP, ACSL and E-ACSL reference manuals (33.0 editions)
 ```
 
 ---
 
 ## Bugs Found
 
-See [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md) for the master vulnerability index, disclosure statuses, upstream GitHub ticket links, standalone reproducers, and candidate fix diffs across evaluated open-source C targets:
+See [`./docs/bugs-found/README.md`](./docs/bugs-found/README.md) for the master vulnerability index, disclosure statuses, upstream ticket links, standalone reproducers, and candidate fix diffs across evaluated open-source C targets:
 
 | Target | Upstream Repository | Confirmed Bugs | Details |
 | :--- | :--- | :---: | :--- |
-| **minmea** | [`kosma/minmea`](https://github.com/kosma/minmea) | **3** (2 Medium, 1 Low) | [`./docs/bugs-found/minmea/README.md`](./docs/bugs-found/minmea/README.md) |
+| **minmea** | [`kosma/minmea`](https://github.com/kosma/minmea) | **4** (2 Medium, 2 Low) | [`./docs/bugs-found/minmea/README.md`](./docs/bugs-found/minmea/README.md) |
 | **QCBOR** | [`laurencelundblade/QCBOR`](https://github.com/laurencelundblade/QCBOR) | **3** (1 Medium, 2 Low) | [`./docs/bugs-found/qcbor/README.md`](./docs/bugs-found/qcbor/README.md) |
 | **CryptoLib** | [`nasa/CryptoLib`](https://github.com/nasa/CryptoLib) | **1** (1 Medium; +1 C11 hygiene note) | [`./docs/bugs-found/cryptolib/README.md`](./docs/bugs-found/cryptolib/README.md) |
 | **libmnl** | [`netfilter/libmnl`](https://git.netfilter.org/libmnl) | **5** (1 Medium, 4 Low) | [`./docs/bugs-found/libmnl/README.md`](./docs/bugs-found/libmnl/README.md) |
 | **picohttpparser** | [`h2o/picohttpparser`](https://github.com/h2o/picohttpparser) | **0** (11 units proven) | [`./docs/bugs-found/picohttpparser/README.md`](./docs/bugs-found/picohttpparser/README.md) |
-| **Frama-C 33.0 – 35.0~~dev (E-ACSL, `e-acsl-gcc`, Variadic)** | [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) | **9** to file (8 Bugs, 1 Limitation; 4 more not filed) | [`./docs/upstream/frama-c/frama-c-e-acsl-issues.md`](./docs/upstream/frama-c/frama-c-e-acsl-issues.md) |
+
+The QCBOR reviews of run-5 and run-6 also produced 10 upstream report packages, listed in [`./docs/upstream/qcbor/README.md`](./docs/upstream/qcbor/README.md).
+
+Building and running the pipeline also exposed defects in the tools it depends on. As of 2026-11-18, **39 reports** are filed against [`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) (#2793 to #2831). Two more are drafted for Frama-C, and one for MetAcsl (`pub/meta`). See [`./docs/upstream/frama-c/README.md`](./docs/upstream/frama-c/README.md).
 
 ---
 
@@ -261,7 +282,7 @@ All helper scripts in `scripts/` use the Python 3.10+ standard library only and 
 ```powershell
 # Windows (PowerShell)
 $env:PYTHONIOENCODING="utf-8"
-python -m pytest tests
+python -m pytest tests -n auto
 python -m ruff check scripts tests
 python -m ruff format --check scripts tests
 python -m mypy scripts tests
@@ -269,13 +290,13 @@ python -m mypy scripts tests
 
 ```bash
 # Linux / macOS (POSIX)
-python3 -m pytest tests
+python3 -m pytest tests -n auto
 python3 -m ruff check scripts tests
 python3 -m ruff format --check scripts tests
 python3 -m mypy scripts tests
 ```
 
-Add `-n auto` to run the tests in parallel (pytest-xdist); see [`tests/README.md`](./tests/README.md).
+`-n auto` runs the tests in parallel (pytest-xdist); see [`tests/README.md`](./tests/README.md).
 
 > [!NOTE]
 > Edit skills only under `skills/`. The harness mirrors `.agents/skills/` and `.claude/skills/` are plain tracked copies of it (no symlinks). After an edit, run `python tools/sync_skill_mirrors.py` to refresh both. The pre-commit hook, CI and `tests/test_sync_skill_mirrors.py` run `python tools/sync_skill_mirrors.py --check`, which fails when a mirror differs from `skills/` by a single byte.
@@ -289,7 +310,7 @@ Start at [`./docs/README.md`](./docs/README.md) for the full documentation map a
 - **Core Living Guides ([`./docs/guides/README.md`](./docs/guides/README.md)):**
   - [Architecture & Dataflow (`./docs/guides/architecture.md`)](./docs/guides/architecture.md)
   - [Pipeline v2 Design & Evidence Discipline (`./docs/guides/v2-design.md`)](./docs/guides/v2-design.md)
-  - [Slicing & Onboarding 90k+ LoC Codebases (`./docs/guides/slicing-and-onboarding.md`)](./docs/guides/slicing-and-onboarding.md)
+  - [Slicing & Onboarding Large Codebases (`./docs/guides/slicing-and-onboarding.md`)](./docs/guides/slicing-and-onboarding.md)
   - [Proving Security Properties Beyond Memory Safety (`./docs/guides/security-properties.md`)](./docs/guides/security-properties.md)
   - [Multi-Agent Swarm & Dual-Oracle Guardrail (`./docs/guides/agentic-swarm.md`)](./docs/guides/agentic-swarm.md)
   - [Resources, Scheduling & Caching (`./docs/guides/resources-and-caching.md`)](./docs/guides/resources-and-caching.md)
@@ -297,7 +318,7 @@ Start at [`./docs/README.md`](./docs/README.md) for the full documentation map a
   - [Benchmark: Measuring Changes to Filters, Eva Configuration & Briefs (`./docs/guides/benchmark.md`)](./docs/guides/benchmark.md)
 - **Troubleshooting ([`./docs/troubleshooting/README.md`](./docs/troubleshooting/README.md)):** thematic operational runbooks and [`./docs/troubleshooting/AGENTS.md`](./docs/troubleshooting/AGENTS.md)
 - **Bugs Found & Target Verification Reports ([`./docs/bugs-found/README.md`](./docs/bugs-found/README.md))**
-- **Upstream Reports & Reference Sources ([`./docs/upstream/README.md`](./docs/upstream/README.md)):** [Frama-C E-ACSL & Variadic Issues (`./docs/upstream/frama-c/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c/frama-c-e-acsl-issues.md), [QCBOR Run-5 Reports (`./docs/upstream/qcbor/README.md`)](./docs/upstream/qcbor/README.md), and [Vendored Upstream Sources (`./docs/upstream/sources/README.md`)](./docs/upstream/sources/README.md)
+- **Upstream Reports & Reference Sources ([`./docs/upstream/README.md`](./docs/upstream/README.md)):** [Frama-C E-ACSL & Variadic Issues (`./docs/upstream/frama-c/frama-c-e-acsl-issues.md`)](./docs/upstream/frama-c/frama-c-e-acsl-issues.md), [QCBOR Reports (`./docs/upstream/qcbor/README.md`)](./docs/upstream/qcbor/README.md), and [Vendored Upstream Sources (`./docs/upstream/sources/README.md`)](./docs/upstream/sources/README.md)
 - **Engineering Plans & Backlog ([`./docs/plans/README.md`](./docs/plans/README.md)):** [Implementation Backlog (`./docs/plans/backlog.md`)](./docs/plans/backlog.md), active roadmaps, formal-discovery tiers, and archived Phase 0 plans
 - **Run Logs & Postmortems ([`./docs/runs/README.md`](./docs/runs/README.md))**
 - **Frama-C Reference Manuals ([`./docs/references/README.md`](./docs/references/README.md)):** [E-ACSL Quick Reference (`./docs/references/e-acsl-quickref.md`)](./docs/references/e-acsl-quickref.md) & [`INDEX.md`](./docs/references/INDEX.md)

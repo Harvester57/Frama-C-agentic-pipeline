@@ -17,6 +17,8 @@ _Alignas(16) int *gp;          /* global pointer */
 _Alignas(16) int (*gfp)(int);  /* global function pointer */
 _Alignas(8) char *gap[2];      /* global array of pointers */
 _Alignas(16) uint64_t ga[2];   /* global array: already printed validly */
+_Alignas(16) __builtin_va_list gva;
+_Alignas(16) __builtin_va_list *gvap = &gva;
 
 int main(void)
 {
@@ -24,5 +26,5 @@ int main(void)
   union blk u = { .b = { 0 } };
   struct s v = { 0 };
   return (int)u.u64[0] + v.c + (lp == 0) + (gp == 0) + (gfp == 0)
-    + (gap[0] == 0) + (int)ga[0];
+    + (gap[0] == 0) + (int)ga[0] + (gvap == 0);
 }
