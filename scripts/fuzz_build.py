@@ -1890,6 +1890,118 @@ def repair_sources_for_link(
     return [*sources, *added], info
 
 
+# Where a run keeps its call graph; run-relative, as the Make recipes run in the run directory.
+DEFAULT_DAG_PATH = Path("workspace/reports/callgraph_dag.json")
+
+
+def default_dag_path(dag: Path | str | None = None) -> Path | None:
+    """`dag` when given, else the run's DAG (DEFAULT_DAG_PATH) when it exists, else None: no link repair."""
+    if dag is not None:
+        return Path(dag)
+    return DEFAULT_DAG_PATH if DEFAULT_DAG_PATH.is_file() else None
+
+
+def repair_link_rounds(
+    comp: dict,
+    sources: list[str],
+    rebuild,
+    dag_path: Path | str | None,
+    out_bin: Path,
+    *,
+    link_module: str | None = None,
+    before_retry=None,
+) -> tuple[dict, list[str], dict | None]:
+    """
+    The link repair of a module build whose first attempt `comp` (from `sources`) failed: while the
+    build fails and a round of `repair_sources_for_link` changes the sources, `rebuild(sources)`
+    compiles again (`before_retry(comp)` first, given the failed attempt). Linking takes whole files,
+    so a file added for one symbol can need still more files: each round adds at least one file the
+    DAG names or defines one global of the model, which bounds the rounds. A global of another link
+    unit is defined in the generated `<out_bin>_link_globals/link_globals.c`.
+
+    Returns (last compile, last sources, `link_repair` or None): `symbols` and `added_sources` over
+    all rounds, `rounds` one entry each, and when there are any `stubbed_globals` with `globals_file`,
+    `unresolved_globals` and `missing_sources` (defining files that do not exist, never compiled).
+    Nothing is tried without `dag_path` or when `comp` succeeded.
+    """
+    current = list(sources)
+    rounds: list[dict] = []
+    stub_dir = Path(out_bin).parent / f"{Path(out_bin).name}_link_globals"
+    stubbed: list[dict] = []
+    left: list[dict] = []
+    missing_sources: list[dict] = []
+    if comp["returncode"] != 0 and dag_path:
+        max_rounds = max(
+            1,
+            len(set(_dag_symbol_files(Path(dag_path)).values())) + len(_model_global_variables(Path(dag_path))),
+        )
+        while comp["returncode"] != 0 and len(rounds) < max_rounds:
+            log = "\n".join(str(comp.get(k) or "") for k in ("stdout", "stderr"))
+            current, info = repair_sources_for_link(
+                current,
+                log,
+                dag_path,
+                Path.cwd(),
+                module=link_module,
+                stub_dir=stub_dir,
+                stubbed=stubbed,
+                unresolved=left,
+                missing=missing_sources,
+            )
+            if not info:
+                break
+            stubbed += info.get("stubbed_globals", [])
+            rounds.append(info)
+            if before_retry is not None:
+                before_retry(comp)
+            comp = rebuild(current)
+    unresolved_globals = list({u["name"]: u for u in left}.values())
+    if not (rounds or unresolved_globals or missing_sources):
+        return comp, current, None
+    record: dict = {
+        "symbols": [sym for r in rounds for sym in r["symbols"]],
+        "added_sources": [src for r in rounds for src in r["added_sources"]],
+        "rounds": rounds,
+    }
+    if stubbed:
+        record["stubbed_globals"] = stubbed
+        record["globals_file"] = (stub_dir / LINK_GLOBALS_FILE).as_posix()
+    if unresolved_globals:
+        record["unresolved_globals"] = unresolved_globals
+    if missing_sources:
+        record["missing_sources"] = missing_sources
+    return comp, current, record
+
+
+def build_coverage_binary(
+    sources: list[str],
+    out_bin: Path,
+    cppflags: str = "-I.",
+    ldflags_extra: str = "",
+    *,
+    use_cache: bool = True,
+    dag_path: Path | str | None = None,
+    link_module: str | None = None,
+) -> dict:
+    """
+    The coverage build of a module (`compile_coverage_binary`) with the link repair of the fuzz builds
+    (`repair_link_rounds`, driven by `dag_path`, globals placed for harness module `link_module`): the
+    module's sources alone may not link (nginx run-5: ngx_core_module, ngx_modules and ngx_module_names
+    live in src/core/nginx.c and the generated objs/ngx_modules.c). Returns {compile, sources} with
+    `link_repair` after a repair; `sources` is what was compiled last.
+    """
+
+    def _compile(srcs: list[str]) -> dict:
+        return compile_coverage_binary(srcs, out_bin, cppflags, ldflags_extra, use_cache=use_cache)
+
+    comp = _compile(list(sources))
+    comp, current, repair = repair_link_rounds(comp, sources, _compile, dag_path, out_bin, link_module=link_module)
+    result: dict = {"compile": comp, "sources": current}
+    if repair is not None:
+        result["link_repair"] = repair
+    return result
+
+
 def build_module_binary(
     sources: list[str],
     out_bin: Path,
@@ -1915,7 +2027,8 @@ def build_module_binary(
     Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
     `eacsl`, and for `auto` unless a failed selftest for this Frama-C version blocks it; Clang
     ASan+UBSan for `sanitizers` and as the `auto` fallback. Both builds go through the cache.
-    On a link failure with undefined references, repair rounds append the defining sources (via
+    On a link failure with undefined references, repair rounds (`repair_link_rounds`, which the
+    coverage build shares) append the defining sources (via
     `dag_path`) and relink while a round adds a file: linking takes whole files, so a file added
     for one symbol can need still more files. The rounds are bounded by the number of files the
     DAG names plus the globals the model lists, and recorded under `link_repair` (`symbols` and
@@ -2009,41 +2122,25 @@ def build_module_binary(
         if kept:
             rec["logs"] = kept
 
-    current = list(sources)
-    comp, eacsl_attempt, fallback_reason = _attempt(current)
-    _note(comp, eacsl_attempt, fallback_reason, current)
-    rounds: list[dict] = []
-    stub_dir = Path(out_bin).parent / f"{Path(out_bin).name}_link_globals"
-    stubbed: list[dict] = []
-    left: list[dict] = []
-    missing_sources: list[dict] = []
-    if comp["returncode"] != 0 and dag_path:
-        # Each round adds at least one file the DAG names or defines one global of the model, so
-        # this many rounds always suffice.
-        max_rounds = max(
-            1,
-            len(set(_dag_symbol_files(Path(dag_path)).values())) + len(_model_global_variables(Path(dag_path))),
-        )
-        while comp["returncode"] != 0 and len(rounds) < max_rounds:
-            log = "\n".join(str(comp.get(k) or "") for k in ("stdout", "stderr"))
-            current, info = repair_sources_for_link(
-                current,
-                log,
-                dag_path,
-                Path.cwd(),
-                module=link_module,
-                stub_dir=stub_dir,
-                stubbed=stubbed,
-                unresolved=left,
-                missing=missing_sources,
-            )
-            if not info:
-                break
-            stubbed += info.get("stubbed_globals", [])
-            rounds.append(info)
-            _keep_logs(comp, eacsl_attempt)
-            comp, eacsl_attempt, fallback_reason = _attempt(current)
-            _note(comp, eacsl_attempt, fallback_reason, current)
+    last: dict[str, Any] = {}
+
+    def _noted_attempt(srcs: list[str]) -> dict:
+        comp, eacsl_attempt, fallback_reason = _attempt(srcs)
+        _note(comp, eacsl_attempt, fallback_reason, srcs)
+        last.update(eacsl_attempt=eacsl_attempt, fallback_reason=fallback_reason)
+        return comp
+
+    comp = _noted_attempt(list(sources))
+    comp, current, link_repair = repair_link_rounds(
+        comp,
+        sources,
+        _noted_attempt,
+        dag_path,
+        out_bin,
+        link_module=link_module,
+        before_retry=lambda failed: _keep_logs(failed, last["eacsl_attempt"]),
+    )
+    eacsl_attempt, fallback_reason = last["eacsl_attempt"], last["fallback_reason"]
     result = {
         "compile": comp,
         "engine_used": comp.get("engine", engine),
@@ -2055,20 +2152,8 @@ def build_module_binary(
         # `compile` and `eacsl_compile_attempt` are the last attempt's; each earlier failure stays here
         # (nginx run-3: an OOM-killed first E-ACSL attempt was reported as the retry's failure).
         result["attempts"] = attempts
-    unresolved_globals = list({u["name"]: u for u in left}.values())
-    if rounds or unresolved_globals or missing_sources:
-        result["link_repair"] = {
-            "symbols": [sym for r in rounds for sym in r["symbols"]],
-            "added_sources": [src for r in rounds for src in r["added_sources"]],
-            "rounds": rounds,
-        }
-        if stubbed:
-            result["link_repair"]["stubbed_globals"] = stubbed
-            result["link_repair"]["globals_file"] = (stub_dir / LINK_GLOBALS_FILE).as_posix()
-        if unresolved_globals:
-            result["link_repair"]["unresolved_globals"] = unresolved_globals
-        if missing_sources:
-            result["link_repair"]["missing_sources"] = missing_sources
+    if link_repair is not None:
+        result["link_repair"] = link_repair
     return result
 
 

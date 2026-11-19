@@ -2239,7 +2239,10 @@ def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -
         "--dag",
         type=Path,
         default=None,
-        help="callgraph_dag.json used to repair link failures (undefined references -> defining source, one retry)",
+        help=(
+            "callgraph_dag.json used to repair link failures (undefined references -> defining source, "
+            "bounded rounds; default: workspace/reports/callgraph_dag.json when it exists)"
+        ),
     )
     _add_security_props_arg(p)
 
@@ -2363,10 +2366,7 @@ def _security_props_kwarg(args) -> dict:
 
 
 def _build_options(args) -> dict:
-    dag = getattr(args, "dag", None)
-    if dag is None:
-        default_dag = Path("workspace/reports/callgraph_dag.json")
-        dag = default_dag if default_dag.is_file() else None
+    dag = fuzz_build.default_dag_path(getattr(args, "dag", None))
     return {
         # Only when given: the build call of a run without the option is today's.
         **_security_props_kwarg(args),
@@ -2580,6 +2580,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Crash artifacts whose inputs replay last (default: workspace/crashes/<module>; none when empty)",
     )
     p_cov.add_argument("--no-cache", action="store_true", help="Do not read or write the run/shared cache")
+    p_cov.add_argument(
+        "--dag",
+        type=Path,
+        default=None,
+        help=(
+            "callgraph_dag.json used to repair link failures as the fuzz build does "
+            "(default: workspace/reports/callgraph_dag.json when it exists)"
+        ),
+    )
     p_cov.add_argument("--out-json", type=Path, required=True)
 
     p_cands = sub.add_parser("replay-candidates", help="Replay the reproducers of every unverified candidate")
@@ -2739,6 +2748,8 @@ def main(argv: list[str] | None = None) -> int:
                 ldflags=args.ldflags,
                 rte_initialized=not args.no_rte_initialized,
                 libc_checks=not args.no_libc_checks,
+                dag_path=fuzz_build.default_dag_path(args.dag),
+                link_module=args.module,
                 **_security_props_kwarg(args),
             )
             binary = prepared.get("binary")
@@ -2808,6 +2819,8 @@ def main(argv: list[str] | None = None) -> int:
                     if args.known_crashes_dir is None
                     else args.known_crashes_dir
                 ),
+                dag_path=fuzz_build.default_dag_path(args.dag),
+                link_module=args.module,
             )
         elif args.mode == "replay":
             prepared = None

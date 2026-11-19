@@ -580,6 +580,9 @@ def _prepared_replay(
             ldflags=spec["ldflags"],
             rte_initialized=bool(spec.get("rte_initialized", True)),
             libc_checks=bool(spec.get("libc_checks", True)),
+            # The link repair of `make build` (nginx: src/core/nginx.c and objs/ngx_modules.c).
+            dag_path=fuzz_build.default_dag_path(),
+            link_module=harness_module,
             **_security_props_option(spec, security_props),
         )
     return prepared_by_key[key]
@@ -634,6 +637,8 @@ def _cross_engine_replay(
             ldflags=spec["ldflags"],
             rte_initialized=bool(spec.get("rte_initialized", True)),
             libc_checks=bool(spec.get("libc_checks", True)),
+            dag_path=fuzz_build.default_dag_path(),
+            link_module=harness_module,
             **_security_props_option(spec, security_props),
         )
     prepared = prepared_cache[key]

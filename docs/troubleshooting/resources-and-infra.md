@@ -299,6 +299,11 @@ The full resource and cache design guide is [`../guides/resources-and-caching.md
   - Possible fix: limit hook mode to files under the session's checkout or worktrees, or to files whose modification time changed during the call.
   - Workaround used: ignore the report for read-only target files and leave the target unchanged. Nothing was added to `tools/check_generated_text.allow`, because the files are not in this repository.
 
+### Symptom: `tests/test_benchmark.py::TestFetch::test_checkout_is_pinned_sparse_and_byte_exact` Fails Once in a Full `pytest -n auto` Run and Passes Alone
+- **Seen on:** worktree `sup/nginx-coverage-link-repair` (from `6217968`), 2026-11-19, full `python -m pytest -n auto` (7456 passed, 1 failed) while Git Bash on the same host was failing to fork (`child_copy: cygheap read copy failed ... Win32 error 299`). It passed when run alone, and the next full run passed (7458 passed). The test is not in the known-flaky list of `CLAUDE.md`.
+- **Cause:** not diagnosed; the assertion message of the failing run was not captured. The test creates a local git repository and runs `git` checkouts (`fetch_targets`), so host load is a plausible factor, not a confirmed one. The change under test on that branch does not touch [`../../scripts/benchmark.py`](../../scripts/benchmark.py).
+- **Fix:** none yet. **Open pipeline gap:** if it fails again, keep the full assertion output (`python -m pytest tests/test_benchmark.py -k test_checkout_is_pinned_sparse_and_byte_exact -n 0 -vv`) and record it here before rerunning.
+
 ### Symptom: `tests/test_docs_structure.py::test_markdown_links_are_explicit_relative_and_resolve` Fails in a Clean Worktree of `phase1-remediation` (16 Links Such As `docs/troubleshooting/wp-and-guardrail.md:332 -> ../upstream/frama-c/frama-c-wp-counter-examples-drops-frame.md`)
 
 - **Seen on:** a worktree cut from `phase1-remediation` at `a07c7ef`, 2026-11-16, full `python -m pytest tests -n auto` (5328 passed, 1 failed).

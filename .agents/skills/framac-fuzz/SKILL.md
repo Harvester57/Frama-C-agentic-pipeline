@@ -176,7 +176,7 @@ For E-ACSL behaviour not covered here, start with `docs/references/e-acsl-quickr
 | `insufficient_memory` | The job's memory lease is below what LibFuzzer needs at the fixed `-rss_limit_mb` (the report's `error_summary` gives both numbers). Nothing ran; never read this as clean. Give the container engine more memory, or lower the pool's concurrency. |
 | `not_run` | No report was produced for an expected module (the job was killed or excluded). Written by `ingest` so the gap is recorded, never silent. |
 
-`workspace/reports/coverage/<mod>.json` says which of the target's functions and code regions the corpus executes, measured by replaying `workspace/corpus/<mod>/` on a plain Clang source-coverage build (`run_eacsl_fuzz.py coverage`, no E-ACSL and no sanitizers). `functions[]` has `executions`, `regions` and, for a function that ran, `uncovered_lines`. `make` replays the corpus as it stands, so run `coverage` again after a corpus changes.
+`workspace/reports/coverage/<mod>.json` says which of the target's functions and code regions the corpus executes, measured by replaying `workspace/corpus/<mod>/` on a plain Clang source-coverage build (`run_eacsl_fuzz.py coverage`, no E-ACSL and no sanitizers). That build gets the same link repair as the fuzz build, so `sources` is what it compiled last and `link_repair` (with any `missing_sources`) says what the repair added. `functions[]` has `executions`, `regions` and, for a function that ran, `uncovered_lines`. `make` replays the corpus as it stands, so run `coverage` again after a corpus changes.
 
 | Status | Meaning |
 | :--- | :--- |
