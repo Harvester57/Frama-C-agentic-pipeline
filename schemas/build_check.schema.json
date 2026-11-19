@@ -22,7 +22,7 @@
           "fallback_reason": {"type": ["string", "null"]},
           "compile_log": {"type": "string"},
           "first_error": {"type": ["string", "null"]},
-          "reason_code": {"$comment": "a known E-ACSL failure (pipeline_make.KNOWN_EACSL_FAILURES): an E-ACSL bug the target's source cannot avoid, or (eacsl_static_const_union with rewrite_missed) a declaration the pipeline's E-ACSL-only rewrite does not cover; `reason` explains it", "type": "string", "enum": ["eacsl_gmp_symbol_unregistered", "eacsl_static_const_union"]},
+          "reason_code": {"$comment": "a known E-ACSL failure (pipeline_make.KNOWN_EACSL_FAILURES): an E-ACSL bug the target's source cannot avoid, (eacsl_static_const_union with rewrite_missed) a declaration the pipeline's E-ACSL-only rewrite does not cover, or (eacsl_build_timeout) an E-ACSL build killed at the fixed build time limit, typically a whole-program unit; `reason` explains it", "type": "string", "enum": ["eacsl_build_timeout", "eacsl_gmp_symbol_unregistered", "eacsl_static_const_union"]},
           "rewrite_missed": {"$comment": "with reason_code eacsl_static_const_union: the build ran with the E-ACSL-only `static const union` rewrite (O9, scripts/fc_cpp_wrapper_eacsl.py) and the failing declaration is a form it does not cover; a pipeline gap to record. Absent on reports from before O9 or with the rewrite off", "const": true},
           "next_step": {"$comment": "with reason_code: the exact command that records the sanitizers choice, the way to continue the run (also when rewrite_missed); build-check never runs it itself", "type": "string", "minLength": 1}
         },
