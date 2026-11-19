@@ -70,11 +70,14 @@ The numbering continues from the run-4 report.
 - **Fix of the report (held):** branch `sup/nginx-eacsl-build-timeout` (`20f8c53`, `90cb8cd`, `c0d9e7d`, `a28b5dc`, on `6217968`). `fuzz_build` gives reason `eacsl_build_timeout`; `KNOWN_EACSL_FAILURES` gets it first, with the limit parsed from the log and the sanitizers `next_step`; `_first_build_error` returns the limit line; the `fuzz-<mod>` gate message says a smaller unit is the fix. Tests: `tests/test_pipeline_make.py::test_build_check_names_an_eacsl_build_killed_at_the_time_limit`, `tests/test_tool_sizing.py::test_an_instrumentation_killed_at_the_build_time_limit_is_named_as_such`, and one changed assertion; 3 failed before the fix. Fixer: 7452 passed, 312 skipped, all checks clean. Supervisor: read the diff, 158 passed and 1 skipped on the two files, ruff clean.
 - **Open:** the whole-program instrumentation cost itself (the unit split), and, found by the fixer, a MetAcsl properties build killed at the limit would be followed by a second, plain E-ACSL build of another hour.
 
-### S15. The coverage build has no link repair (fix in progress, held)
+### S15. The coverage build has no link repair (fixed, held)
 
 - **Fingerprint:** `reach-dynamic` exit 2; `workspace/reports/coverage/<mod>.json` `status: compile_error`, `reason: the coverage build failed`; `cov_nginx__ngx_bpf.coverage_compile.log`: `undefined reference to 'ngx_core_module'`, `'ngx_modules'`, `'ngx_module_names'`.
 - **Cause:** `fuzz_coverage.coverage_report` calls `fuzz_build.compile_coverage_binary` once with the module's raw sources. Only the fuzz, sanitizer and replay builds run `repair_sources_for_link`. The troubleshooting entry from ptf-original run-2 (2026-11-10) said this was fixed ("uncommitted"); that fix never reached the code.
-- **Fix:** a fixer is working on branch `sup/nginx-coverage-link-repair` (cut from `6217968`); its result goes into the troubleshooting entry in `harnesses-and-seeds.md`.
+- **History:** a scan of every ref found 81 versions of `coverage_report` across 99 commits, none taking a DAG or calling `repair_sources_for_link`.
+- **Fix (held):** branch `sup/nginx-coverage-link-repair` (`acd2ef6` fix, `4703a87` and `c4385f1` docs, on `6217968`). The repair loop moves out of `build_module_binary` into `fuzz_build.repair_link_rounds`, unchanged; the new `build_coverage_binary` uses it, and `coverage_report` records the final `sources` and `link_repair`. `run_eacsl_fuzz.py coverage` gets `--dag` with the build's default (`workspace/reports/callgraph_dag.json`). The same gap is closed in `minimize --sources` and in the candidate replay builds of `crash_replay` (`replay-candidates`, `minimize-candidates`), which would have failed on nginx the same way. Tests: six in `tests/test_coverage_link_repair.py` (five failed before the fix, one guard passed) and `tests/test_harness_reach.py::test_coverage_after_link_repair_is_measured_like_any_other`. Fixer: 7458 passed, 312 skipped, all checks clean. Supervisor: read the diff, 135 passed and 5 skipped on the touched test files, ruff and mypy clean.
+- **Read-only replay on run-5:** with run-5's DAG, model and the failed compile output kept in each coverage report, round 1 adds exactly `src/core/nginx.c` and `objs/ngx_modules.c` for both modules, the same as their fuzz builds. Not verified by a real rebuild.
+- **Open:** the `guardrail` mode and the loop-seed guard (`loop_seeds.py`) still build without link repair. The fixer also saw one unexplained failure of `tests/test_benchmark.py::TestFetch::test_checkout_is_pinned_sparse_and_byte_exact` (passed alone and in two later full runs), recorded in `resources-and-infra.md`.
 
 ### S16. The report of a run stopped in Phase 1 hides its fuzz crashes (open)
 
@@ -93,7 +96,7 @@ The numbering continues from the run-4 report.
 
 - `security-properties.md`: S13 (on its branch).
 - `eacsl-and-fuzzing.md`: S14, under the heading the run's model used, so the two merge into one entry (on its branch).
-- `harnesses-and-seeds.md`: S15, correcting the false "fixed" claim of the ptf entry (on its branch).
+- `harnesses-and-seeds.md`: S15, correcting the false "fixed" claim of the ptf entry and adding the guardrail and loop-seed gap (on its branch).
 - `ledger-and-verifier.md`: S16, new open entry.
 - `resources-and-infra.md`: run-5's measured E-ACSL memory added to the open first-build estimate entry; a cross-link to S14 (on S14's branch).
 - The run's model also wrote uncommitted entries for S14 and S15 in the run checkout (`.agents/worktrees/nginx-run5-main`). They are superseded by the branch versions and were left in place.
@@ -108,6 +111,6 @@ The numbering continues from the run-4 report.
 
 ## Open items
 
-- Open pipeline bugs: O1 (unit split on callback-heavy C, root of S14), S14's whole-program E-ACSL cost and the MetAcsl double build, S15 until its branch is verified and merged, S16, S11 (automatic prelude), S12 (`__fc_` pthread tags), the exemption gate gap, no direct case for a `va_list` function, the first-build E-ACSL estimate, S13's `run_wp_function` gap, the `z_streamp` driver limit, and the errno Docker test.
-- Held branches, to merge after review with a dry run each: `docs/nginx-run4-report`, `sup/nginx-security-props-stub-assigns`, `sup/nginx-eacsl-build-timeout`, `sup/nginx-coverage-link-repair`, and this report's `docs/nginx-run5-report`.
+- Open pipeline bugs: O1 (unit split on callback-heavy C, root of S14), S14's whole-program E-ACSL cost and the MetAcsl double build, the guardrail and loop-seed builds without link repair (S15), S16, S11 (automatic prelude), S12 (`__fc_` pthread tags), the exemption gate gap, no direct case for a `va_list` function, the first-build E-ACSL estimate, S13's `run_wp_function` gap, the `z_streamp` driver limit, and the errno Docker test.
+- Held branches; a dry run merged all five onto `origin/main` without conflict: `docs/nginx-run4-report`, `sup/nginx-security-props-stub-assigns`, `sup/nginx-eacsl-build-timeout`, `sup/nginx-coverage-link-repair`, and this report's `docs/nginx-run5-report`.
 - Not verified: Eva on the 1650-function cluster (never reached), the 55 crash fingerprints, and why build-check rebuilt both modules.
