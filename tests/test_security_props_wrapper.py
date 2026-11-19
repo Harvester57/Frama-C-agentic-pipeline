@@ -298,7 +298,9 @@ def test_a_real_violation_still_has_an_instance_that_covers_it():
     assert props[WRAPPER_PROP]["instances"] == [WRAPPER]
     assert [c["candidates"] for c in props[WRAPPER_PROP]["relocated"]["checked_at"]] == [SEND_CANDIDATES]
     assert l5_properties(doc, "prog.c#ping") == ["L5_sanitized_tcp_send"]
-    text, names, _ = sp.meta_file_text(doc, "prog.c#ping")
+    meta = sp.meta_file_text(doc, "prog.c#ping")
+    assert meta is not None
+    text, names, _ = meta
     # tcp_send is also called through a pointer, so its property is its precondition, proved at this call too.
     assert names == ["L5_sanitized_tcp_send"] and "\\targets({tcp_send}), \\context(\\precond)" in text
     # Naming one backend only does not drop the other: the check is on the call, whatever it dispatches to.

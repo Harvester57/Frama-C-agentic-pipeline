@@ -1996,7 +1996,9 @@ def test_an_initializer_call_gets_an_in_code_check_per_skipped_context(tmp_path)
         ("prog.c#h_init", "after", "/*@ check L4_invariant_auth_range: 0 <= auth_ok <= 1; */")
     ]
     # The properties stay MetAcsl properties (unlike a `code` property): the statement calls need them.
-    text, names, _ = sp.meta_file_text(doc, "prog.c#h_init")
+    meta = sp.meta_file_text(doc, "prog.c#h_init")
+    assert meta is not None
+    text, names, _ = meta
     assert names == ["L4_auth_state_login", "L4_invariant_auth_range"] and "\\context(\\writing)" in text
     assert "already in the code there" in sp.brief_entries(doc, "prog.c", "f_init")[0]["discharge"]
     assert "already in the code there" not in sp.brief_entries(doc, "prog.c", "f_assign")[0]["discharge"]
@@ -2674,7 +2676,8 @@ def _wp_rows(run: Path, name: str) -> tuple[list[dict], list[dict]]:
     lines: dict[str, dict[int, str]] = {
         p.name: sp.meta_line_names(p.read_text(encoding="utf-8")) for p in wp.glob("security_meta_*.c")
     }
-    proven, unproven = [], []
+    proven: list[dict] = []
+    unproven: list[dict] = []
     for csv_path in sorted(wp.glob("*.csv")):
         for row in rwf.read_report_csv(csv_path):
             named = lines.get(Path(str(row["file"])).name, {}).get(row["line"]) == name
