@@ -3,6 +3,12 @@
   "type": "object",
   "definitions": {
     "strings": {"type": "array", "items": {"type": "string"}},
+    "case_selector": {
+      "$comment": "The index of an --api case: at most api_harness.MAX_CASES cases (generate_harness.DISPATCH_MAX_CASES_WIDE - 1), so 0..MAX_CASES - 1 with the two-byte `identity16` selector. A one-byte selector (`identity`, or the older modulo one) holds at most generate_harness.DISPATCH_MAX_CASES (256) cases, 0..255: validate_artifacts.validate_sidecar checks that against `dispatch_selector`, which this schema language cannot tie to it.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4094
+    },
     "slot": {
       "$comment": "Input bytes feeding one argument: `call` is the position of the call in the case (initializer calls of `inits` come after the case's `calls`), `param` its argument index, `size` the bytes read (null: the scalar's size is unknown). The field kinds fill one field of a struct argument that holds pointers, never a pointer itself: `field` a scalar or pointer-free field at byte `off`, `field_bytes` the storage of the (pointer, length) pair at `off`, `field_len` that pair's length, clamped to `max` bytes.",
       "type": "object",
@@ -48,7 +54,7 @@
     "single_case": {
       "type": "object",
       "properties": {
-        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "selector": {"$ref": "#/definitions/case_selector"},
         "kind": {"const": "single"},
         "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 1},
         "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
@@ -63,7 +69,7 @@
     "sequence_case": {
       "type": "object",
       "properties": {
-        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "selector": {"$ref": "#/definitions/case_selector"},
         "kind": {"const": "sequence"},
         "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 2},
         "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
@@ -78,7 +84,7 @@
       "$comment": "A synthesized call sequence on one opaque handle (api_harness.lifecycle_case): `calls` are its constructor (call 0, whose arguments are the slots; it never takes the rest of the input, so `rest` is null: an unsized input string is a `bytes` slot of api_harness.STRING_SLOT_BYTES, its last byte forced to 0) and destructor; up to `max_calls` calls of `methods`, each picked by one input byte, run on the handle in between, their arguments read from the input in the loop.",
       "type": "object",
       "properties": {
-        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "selector": {"$ref": "#/definitions/case_selector"},
         "kind": {"const": "lifecycle"},
         "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 2, "maxItems": 2},
         "handle": {"type": "string", "minLength": 1},
@@ -95,7 +101,7 @@
       "$comment": "A hand-written case (generate_harness.py --api --dispatch-case), after the generated ones: its statements are `dispatch_cases[selector]`. No calls and no slots: the seed writers make nothing for it.",
       "type": "object",
       "properties": {
-        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "selector": {"$ref": "#/definitions/case_selector"},
         "kind": {"const": "custom"},
         "calls": {"type": "array", "maxItems": 0},
         "slots": {"type": "array", "maxItems": 0},
@@ -118,7 +124,7 @@
       "$comment": "One call of a variadic API function as a call site of the target's own programs makes it (api_harness.variadic_case, from workspace/reports/variadic_calls.json): `format` is that call site's string literal (its bytes as latin-1 text), passed as parameter `format_param` (the last fixed one) and never read from the input; `varargs` are the objects passed after it. `slots` and `rest` cover the other fixed parameters, as in a single case. A function has one such case per distinct (format, varargs), all with the same `entry`.",
       "type": "object",
       "properties": {
-        "selector": {"type": "integer", "minimum": 0, "maximum": 254},
+        "selector": {"$ref": "#/definitions/case_selector"},
         "kind": {"const": "variadic"},
         "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 1},
         "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
@@ -156,8 +162,8 @@
     "call_expr": {"type": ["string", "null"]},
     "eva_expr": {"type": ["string", "null"]},
     "fuzz_expr": {"type": ["string", "null"]},
-    "dispatch_cases": {"$ref": "#/definitions/strings"},
-    "dispatch_case_count": {"type": "integer", "minimum": 0},
+    "dispatch_cases": {"$comment": "at most generate_harness.DISPATCH_MAX_CASES_WIDE cases: two selector bytes, and the most a campaign can skip at run time", "type": "array", "items": {"type": "string"}, "maxItems": 4096},
+    "dispatch_case_count": {"type": "integer", "minimum": 0, "maximum": 4096},
     "dispatch_selector": {"$comment": "how a dispatch harness's first input bytes select its case (generate_harness.py): `identity`, the first byte is the case index and a byte at or above `dispatch_case_count` runs no case; `identity16`, for more than 256 cases, the same with the first two bytes, little-endian. Absent on a dispatch harness generated before the field existed, which selects with the first byte modulo `dispatch_case_count`; every decoder (run_eacsl_fuzz.py, harness_reach.py) reads it that way.", "type": "string", "enum": ["identity", "identity16"]},
     "include_source": {"type": "boolean"},
     "stubbed_callees": {"$ref": "#/definitions/strings"},

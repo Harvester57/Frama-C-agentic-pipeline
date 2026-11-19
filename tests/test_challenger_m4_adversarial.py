@@ -414,11 +414,16 @@ class TestB8SidecarSchemaAndDispatchMetadata:
         }
 
     def test_sidecar_schema_valid_dispatch_case_counts(self, sidecar_schema, minimal_sidecar):
-        """Verify sidecar schema accepts valid dispatch_case_count values (0, positive, large)."""
-        for count in (0, 1, 5, 255, 1000000):
+        """
+        Verify sidecar schema accepts valid dispatch_case_count values (0, positive, up to the
+        generator's two-byte bound generate_harness.DISPATCH_MAX_CASES_WIDE) and refuses one above it.
+        """
+        for count in (0, 1, 5, 255, 256, 257, 4096):
             sidecar = {**minimal_sidecar, "dispatch_case_count": count}
             errs = validate(sidecar, sidecar_schema)
             assert errs == [], f"Validation failed for count={count}: {errs}"
+        errs = validate({**minimal_sidecar, "dispatch_case_count": 4097}, sidecar_schema)
+        assert any("above maximum 4096" in e for e in errs), errs
 
     def test_sidecar_schema_negative_dispatch_case_count_rejected(self, sidecar_schema, minimal_sidecar):
         """Verify negative dispatch_case_count is rejected by schema (minimum: 0)."""

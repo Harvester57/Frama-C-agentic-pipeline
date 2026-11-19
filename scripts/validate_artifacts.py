@@ -603,6 +603,12 @@ def validate_build_check(data: Any) -> Errors:
     return errors
 
 
+# The cases one selector byte holds (generate_harness.DISPATCH_MAX_CASES): a dispatch harness above
+# it selects with two bytes (`identity16`, D7). The schema bounds every selector by the two-byte
+# limit; which one applies depends on `dispatch_selector`, which minischema has no `if` to read.
+ONE_BYTE_SELECTOR_CASES = 256
+
+
 def validate_sidecar(data: Any, module: str | None = None) -> Errors:
     """A harness sidecar; `module` is the name its file gives it (harness_<module>.json)."""
     errors = _schema_check("harness_sidecar", data)
@@ -613,6 +619,14 @@ def validate_sidecar(data: Any, module: str | None = None) -> Errors:
     cases = data.get("api_cases") or []
     if [c["selector"] for c in cases] != list(range(len(cases))):
         errors.add("$.api_cases: selectors must number the cases 0, 1, ... in order")
+    if data["entry_style"] == "dispatch" and data.get("dispatch_selector") != "identity16":
+        # `identity`, or a dispatch harness from before the field (the first byte modulo the count).
+        for where, n in (("$.api_cases", len(cases)), ("$.dispatch_case_count", data.get("dispatch_case_count") or 0)):
+            if n > ONE_BYTE_SELECTOR_CASES:
+                errors.add(
+                    f"{where}: {n} cases, but one selector byte holds at most {ONE_BYTE_SELECTOR_CASES}: "
+                    "a harness above that selects with two bytes (dispatch_selector identity16)"
+                )
     if cases and data["entry_style"] != "dispatch":
         errors.add("$.api_cases: an API harness is a dispatch harness")
     if data.get("entry_style") == "dispatch" and cases and len(cases) != len(data.get("dispatch_cases") or []):
