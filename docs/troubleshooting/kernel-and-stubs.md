@@ -207,6 +207,48 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
   - **Also checked:** nothing under `templates/` and no other generator in `scripts/` writes a function `assigns` without `\from`. `frame_skeleton.py` always emits one, and `loop_seeds` writes only `loop assigns`.
 - **Still open:** Phase 2 may hide such a frame instead of aborting. See "A Stub Frame Without `\from` Is Downgraded in Phase 2 Under a Recursion Label" in [`./eva.md`](./eva.md).
 
+### Symptom: `stub-check` Fails `pcre2.h` on All Three Checks With `#error PCRE2_CODE_UNIT_WIDTH must be defined before including pcre2.h.` and Blocks Every Module
+- **Seen on:** nginx 1.31.9 run-3, 2026-11-19, `pipeline_make.py run stubs stub-check`.
+  - `abi: failed: /framac-run/workspace/snapshot/root/usr/include/pcre2.h:1047:2: error: #error PCRE2_CODE_UNIT_WIDTH must be defined before including pcre2.h.`
+  - The command was `gcc -fsyntax-only -DFC_STUB_DRAFT -I/framac-run/workspace/stubs -idirafter .../snapshot/root/usr/include/x86_64-linux-gnu -idirafter .../snapshot/root/usr/include -idirafter .../snapshot/generated/objs fc_stub_abi.c`.
+  - `eva` reported `error` (`[kernel] User Error: failed to run: gcc -E ...`), and `dynamic` reported `build_failed` on the same preprocessing failure.
+  - `stub_check.json` `blocked_modules` listed every nginx module because of `pcre2.h`: `core`, `event`, `http`, `os`, `nginx`, `nginx__ngx_event_openssl`, `nginx__ngx_files`. The Phase 0 build-check gate would refuse the whole run.
+- **Cause (pipeline bug):** [`../../scripts/stub_check.py`](../../scripts/stub_check.py) included the overlay header bare in all three probes (`fc_stub_abi.c`, `fc_stub_smoke.c`, `fc_stub_driver.c`), with only the overlay and the snapshot's system directories.
+  - The probes never had the macros the target defines before it includes the header.
+  - nginx sets `#define PCRE2_CODE_UNIT_WIDTH  8` in `src/core/ngx_regex.h`, before `#include <pcre2.h>`. The macro's value picks the function names (`pcre2_compile_8`).
+  - The stub author cannot fix this. Rule 2 of the brief forbids a `#define` in the overlay, and the context belongs to the target, not to the stub.
+  - A stub author confirmed by hand that the three probes pass with `-DPCRE2_CODE_UNIT_WIDTH=8`.
+- **Fix (fixed on branch `sup/nginx-stub-check-include-context`, not yet merged):** commit `129e3c2`. `stub_check.py run` derives each header's include context from the build.
+  - **Which compile:** up to `CONTEXT_COMPILES` (4) compiles of the files calling the header's functions. The callers come from `stubs.json` `callers`, the compiles from `build_capture.json` `compiles`, in sorted order.
+  - **How:** each compile runs `gcc -E -dD` with its own flags in the target's tree (the DAG's `target_dir`, `workspace/work`), with the snapshot's system and generated include directories.
+  - **What is kept:**
+    - A macro is a candidate when the command line or the target's own files define it before the header is first entered. Generated headers such as `objs/ngx_auto_config.h` count as the target's own; system headers do not.
+    - A candidate is kept when the header, or a target-package header it pulls in, names it. A target macro that a kept macro's body names is kept too.
+    - A file's include guard is never kept.
+  - **How the probes use it:** each of the three probes gets the kept macros as `#define` lines before `#include <header>`.
+  - **What `stub_check.json` records:** the context goes under the header's `include_context`: `status`, `defines`, `compile`, `command`, plus `differing` when another caller compile disagrees.
+  - **Unchanged cases:** a header with no caller compile, or one whose target defines nothing the header reads, is probed byte for byte as before.
+  - **No regeneration needed:** the fix needs no new field in `stubs.json` and no rewrite of `workspace/stubs/`.
+  - **Brief:** [`../../skills/framac-slice/stub_author_brief.md`](../../skills/framac-slice/stub_author_brief.md) says the probes define the target's macros, and that the author never adds them to the overlay.
+  - **Tests** (the fixture got run-3's shape in the follow-up commit `b838ce6`):
+    - `tests/test_stub_check.py::test_a_header_that_needs_the_targets_macros_passes_all_three_checks[source]` and `[command_line]` (Docker). Before the fix both failed exactly as run-3 did: `abi` failed, `eva` error, `dynamic` build_failed. After the fix all three pass.
+    - The `source` case has run-3's shape. The target's header defines the width and includes the library header behind `#if (USE_FIX)`. `USE_FIX` and the width's value come from a generated header that only the snapshot has (`snapshot/generated/objs`, through `-I objs`, a directory missing from `workspace/work`).
+    - `::test_the_probes_get_the_macros_the_target_defines_before_the_header` (both cases)
+    - `::test_a_header_without_a_compile_gets_no_context_and_the_same_probes`
+    - `::test_the_context_scan_drops_undefined_guards_and_system_macros`
+- **Feature-test macros, fixed** by commit `50310f6` on branch `sup/nginx-harness-feature-macros` (not merged): macros such as `_GNU_SOURCE` and `_FILE_OFFSET_BITS` that glibc's `features.h` reads at the first system header are now carried.
+  - The scan in [`../../scripts/include_context.py`](../../scripts/include_context.py) keeps a macro the target defines before its first system header when a system header the compile enters tests it. Include guards are excluded.
+  - All three probes get them as `-D` flags on the command line (a `#define` in the probe would come after `features.h`). `stub_check.json` records them under `include_context.feature_macros` and `feature_flags`, plus `feature_not_carried` for a macro that cannot be a flag.
+  - The same mechanism feeds the harness cppflags; see [`./harnesses-and-seeds.md`](./harnesses-and-seeds.md).
+  - Test: `tests/test_stub_check.py::test_a_header_that_needs_the_targets_macros_passes_all_three_checks[feature]` (Docker). With the flags removed, `abi` fails with `invalid application of 'sizeof' to incomplete type 'struct in6_pktinfo'` and `dynamic` is `build_failed`; with them, all three pass. Unit: `::test_the_probes_get_the_macros_the_target_defines_before_the_header[feature]`.
+- **Open pipeline gap:** a non-feature macro is still missed when the library header consults it only through a header the unit already included earlier.
+  - The scan reads only the files the compile enters while the header is open, and an already-included header is not entered again.
+  - Example: a macro that a nested OpenSSL header reads when the unit included that header before.
+  - The probes then include the header without that macro, as they did before the fix.
+- **Recovering run-3:** once the fix is in the pipeline checkout whose wrapper runs the command, rerun `pipeline_make.py run stubs stub-check`. `pcre2.h`'s `include_context` should read `#define PCRE2_CODE_UNIT_WIDTH 8`, from `src/core/ngx_regex.c`.
+  - Read the other headers' `include_context` one by one. A header that passed bare may now get defines from the target, for example OpenSSL headers if nginx defines a macro they read.
+- **Not affected:** [`../../scripts/stub_gen.py`](../../scripts/stub_gen.py) takes the prototypes from the Phase 0 model's `external_decls`. Frama-C printed those from the target's own parse, so they already carry the target's context (`pcre2_compile_8`). `entry_header` only reads quoted sibling includes.
+
 ### Symptom: The Ledger Has No `stub_contract` Assumptions Although `stubs.json` Has Filled Overlay Contracts
 - **Seen on:** c-ares run-1, 2026-11-16 ([`../runs/2026-11-16-c-ares-run1-supervision.md`](../runs/2026-11-16-c-ares-run1-supervision.md)).
   - Phase 0 Step 5 was run by hand, following `skills/framac-slice/SKILL.md`: `ledger.py seed`, `validate_artifacts.py`, `checkpoint.py init`, `pipeline_make.py gen`.

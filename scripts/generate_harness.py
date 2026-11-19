@@ -1977,6 +1977,118 @@ def _drop_pre_c99_std(module_name: str, cppflags: str) -> str:
     return " ".join(shlex.quote(t) for t in tokens if not is_pre_c99_std(t)) or "-I."
 
 
+FEATURE_MACROS_WHY = (
+    "the macros the target's command line and own files define before its compiles first enter a system "
+    "header, and that a system header tests (glibc's features.h reads _GNU_SOURCE once): -D flags in the "
+    "cppflags, so every compile of the harness has them before its first system header, whatever it "
+    "force-includes (fc_compat_types.h for Eva and the E-ACSL frontend)"
+)
+_FEATURE_WARNED: set[tuple[str, str]] = set()
+
+
+def _feature_warn(module_name: str, text: str) -> None:
+    """Say `text` on stderr once per process: an --api generation writes the harness many times."""
+    if (module_name, text) not in _FEATURE_WARNED:
+        _FEATURE_WARNED.add((module_name, text))
+        print(f"[generate_harness] {module_name}: {text}", file=sys.stderr)
+
+
+def _includes_header(compile_rec: dict, header: str) -> bool:
+    """Whether a capture compile's dependency list (`headers`, tree-relative) names the harness header `header`."""
+    name = header.replace("\\", "/").strip().lstrip("./")
+    return any(h == name or h.endswith("/" + name) for h in (str(x) for x in compile_rec.get("headers") or []))
+
+
+def _target_feature_macros(
+    module_name: str, out_dir: Path, sources: Sequence[str], cppflags: str, headers: Sequence[str] = ()
+) -> tuple[str, dict[str, Any] | None]:
+    """
+    `cppflags` with the target's feature-test macros (scripts/include_context.py `feature_macros_of`) as
+    `-D` flags, and the sidecar's `feature_macros` record, or None when there is none. They come from
+    `gcc -E -dD` of the build capture's compiles of the harness's `sources` in the DAG's `target_dir`
+    that include one of the harness's `headers` (all of them when none does): the macros every one of
+    those defines identically before it first enters a system header, and that a system header tests
+    (nginx's `_GNU_SOURCE` and `_FILE_OFFSET_BITS`, from ngx_linux_config.h). Those are the translation
+    units whose context the harness, which includes the same headers, must have. The flags reach the
+    other sources' compiles too (one cppflags per module): `other_sources` lists them. A macro the
+    flags already define the same way is `given`; one they define otherwise is the caller's: kept,
+    listed in `conflicts` and said on stderr. A compile that cannot be preprocessed (no gcc, an error,
+    a timeout) is said on stderr and listed in `failed`; the macros come from the others. Without a
+    capture, a compile of the sources or a tree, or with no such macro and no failure, `cppflags` is
+    returned unchanged and nothing is recorded.
+    """
+    import include_context as ic
+
+    reports = next(
+        (d for d in (out_dir.parent / "reports", Path("workspace/reports")) if (d / "build_capture.json").is_file()),
+        None,
+    )
+    if reports is None or not sources:
+        return cppflags, None
+    capture = load_json_optional(reports / "build_capture.json", None)
+    dag = load_json_optional(reports / "callgraph_dag.json", None)
+    if not isinstance(capture, dict):
+        return cppflags, None
+    dag = dag if isinstance(dag, dict) else {}
+    target_dir = str(dag.get("target_dir") or "").replace("\\", "/")
+    prefixes = [target_dir, target_dir[len("/framac-run/") :] if target_dir.startswith("/framac-run/") else ""]
+    compiles = ic.compiles_of_sources(capture, sources, [p for p in prefixes if p])
+    if not compiles:
+        return cppflags, None
+    with_headers = [c for c in compiles if any(_includes_header(c, h) for h in headers)]
+    scanned = with_headers or compiles
+    derived = ic.feature_macros_of(scanned, ic.context_tree(dag, capture))
+    if derived["failed"]:
+        first = derived["failed"][0]
+        _feature_warn(
+            module_name,
+            f"{len(derived['failed'])} of the module's compiles could not be preprocessed for the target's "
+            f"feature-test macros, which are derived from the others only (sidecar feature_macros.failed); "
+            f"first: {first['source']}: {first['error']}",
+        )
+    if not derived["macros"] and not derived["differing"] and not derived["failed"]:
+        return cppflags, None
+    merged = ic.merge_feature_macros(_split_cppflags(cppflags), derived["macros"])
+    for flag in merged["flags"]:
+        cppflags = _append_cppflag(cppflags, flag)
+    record: dict[str, Any] = {
+        "source": "build_capture",
+        "why": FEATURE_MACROS_WHY,
+        "compiles": derived["compiles"],
+        "command": derived.get("command"),
+        "macros": derived["macros"],
+        "flags": merged["flags"],
+    }
+    others = sorted({str(c["source"]) for c in compiles if c not in scanned})
+    for key, value in (
+        ("headers", list(headers) if with_headers else []),
+        ("other_sources", others),
+        ("late", derived.get("late") or {}),
+        ("given", merged["given"]),
+        ("conflicts", merged["conflicts"]),
+        ("not_carried", merged["not_carried"]),
+        ("differing", derived["differing"]),
+        ("failed", derived["failed"]),
+    ):
+        if value:
+            record[key] = value
+    for c in merged["conflicts"]:
+        _feature_warn(
+            module_name,
+            f"the cppflags give {c['given']}, the target's compiles `{c['derived']}` before their first system "
+            "header: kept the cppflags' (sidecar feature_macros.conflicts)",
+        )
+    for d in derived["differing"]:
+        _feature_warn(
+            module_name,
+            f"{d['macro']} is not defined the same way before the first system header in every compile of the "
+            f"harness's sources, so it is left out of the cppflags: {d['compiles']}",
+        )
+    for n in merged["not_carried"]:
+        _feature_warn(module_name, f"feature macro {n['macro']} cannot be passed as a flag ({n['why']}): `{n['line']}`")
+    return cppflags, record
+
+
 def _merge_dag_module_ldflags(module_name: str, out_dir: Path, ldflags: str, unit: str | None = None) -> str:
     """
     `ldflags` followed by the libraries the module's link unit links from outside the project (the
@@ -2469,6 +2581,11 @@ def _generate_module_harness(
         if nh and nh not in norm_compat_includes and nh != norm_header and nh not in norm_extra_includes:
             norm_compat_includes.append(nh)
 
+    # Before any probe reads them: the prelude probe, the --api layout and case probes, every build.
+    norm_cppflags, feature_macros = _target_feature_macros(
+        module_name, out_dir, sources, norm_cppflags, [h for h in (norm_header, *norm_extra_includes) if h]
+    )
+
     norm_static_includes: list[str] = []
     for sa_inc in static_analysis_includes or []:
         raw_sa = (sa_inc or "").replace("\\", "/").strip()
@@ -2797,6 +2914,9 @@ def _generate_module_harness(
         sidecar["dispatch_selector"] = dispatch_selector_for(len(norm_dispatch_cases))
     if target_fuzzer_record is not None:
         sidecar["target_fuzzer"] = dict(target_fuzzer_record)
+    if feature_macros is not None:
+        # What _target_feature_macros added to `cppflags`, and from which compiles. Absent without one.
+        sidecar["feature_macros"] = feature_macros
     write_sidecar(harness_meta_file, sidecar)
 
     if (

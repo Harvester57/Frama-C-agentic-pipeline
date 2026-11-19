@@ -84,7 +84,14 @@ byte selects it), with arguments built from the model's signature of each functi
     `enum __anonenum_ares_dns_class_t_7 *` for c-ares's `typedef enum { ... } ares_dns_class_t`)
     declares its object through the header's typedef, as the layout probe saw the parameter written
     (`enum_pointer_spellings`); with no typedef name the function is skipped. A pointer to an
-    anonymous struct or union is always skipped. A pointer to a qualified pointer (c-ares's
+    anonymous struct or union (the model's `struct __anonstruct_ngx_str_t_13 *` for nginx's
+    `typedef struct { size_t len; u_char *data; } ngx_str_t`) declares and casts its object through
+    the header's typedef (`anon_record_tags`, from the parameters the layout probe saw written
+    through it) and is laid out, initialized, filled and released as a named struct of its shape;
+    with no typedef name (a struct declared in a parameter list) the function is skipped, and so is a
+    typedef the harness's headers do not declare. A length field before a byte pointer (`{len,
+    data}`) is paired with it as a (pointer, length) pair is; one before a pointer to wider elements
+    (GMP's `{_mp_alloc, _mp_size, _mp_d}`) stays 0. A pointer to a qualified pointer (c-ares's
     `const char **name`, which the model spells `char **`) is cast and its object declared as the
     header writes it (`qualified_pointer_spellings`: `const char *c0a2[1]`, `(const char **)c0a2`),
     so the call keeps the nested `const` the compiler checks;
@@ -130,8 +137,8 @@ writers make nothing for them, and a later `--api` run without the flag keeps th
 The layout of every case (which input bytes feed which argument) goes to the sidecar as `api_cases`,
 which seed_harvest.py write reads to turn recorded calls (and, for a `variadic` case, the literal
 data of its call sites) into seeds for each case. Functions the generator cannot call (static, a
-variadic function with no usable call site, an anonymous struct by value or behind a pointer, a
-pointer to an anonymous enum the headers name no typedef for, a case the compiler
+variadic function with no usable call site, an anonymous struct by value, a pointer to an
+anonymous struct, union or enum the headers name no typedef for, a case the compiler
 refuses, with the compiler's first error) go to `api_skipped` with the reason, and the reach gate
 reports an entry point the harness does not call directly as a gap. A variadic function leaves
 `api_skipped` once one of its cases is in the harness.
@@ -145,7 +152,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -156,6 +163,7 @@ from framac_common import load_json_optional  # noqa: E402
 from generate_harness import DISPATCH_MAX_CASES_WIDE  # noqa: E402
 from seed_harvest import (  # noqa: E402
     _CHAR_POINTEES,
+    _LEN_NAME_RE,
     _QUALIFIERS_RE,
     _norm_type,
     classify_type,
@@ -447,6 +455,10 @@ class ApiInfo:
     # {type, pointee} as the declaration writes them (`const char **`, `const char *`). The model drops
     # the nested `const` (`char **`), which a compiler refuses to pass (gcc 14) or warns about (clang).
     qual_ptrs: dict[str, dict[int, dict[str, str]]] = field(default_factory=dict)
+    # Anonymous structs and unions a header names by a typedef (`anon_record_tags`): the model's tag
+    # -> the typedef name (`struct __anonstruct_ngx_str_t_13` -> `ngx_str_t`). An object of such a
+    # type is declared, cast and sized only through these; `structs` holds its layout under both.
+    anon_tags: dict[str, str] = field(default_factory=dict)
     # Struct objects (`struct_destructors`): per struct type, the destructor that releases what an
     # initializer set up in it, and every function named like a destructor of it.
     struct_dtors: dict[str, str] = field(default_factory=dict)
@@ -698,11 +710,41 @@ def _len_field(f: dict) -> bool:
     return f.get("kind") == "int" and is_length({"kind": "int", "ctype": f.get("ctype")}, f.get("name"))
 
 
+_BYTE_POINTEES = frozenset({"char", "signed char", "unsigned char", "void"})
+
+
+def _len_before_ptr(fields: list[dict], i: int) -> bool:
+    """
+    Whether field `i` is a length the field's name says (`len`, `size`, `count`, ...: an unsigned
+    field before a pointer is not always its length) followed by a pointer no length follows: a
+    (pointer, length) pair keeps its own (`{size_t n; char *buf; size_t buf_len;}` pairs `buf` with
+    `buf_len`).
+    """
+    if i + 1 >= len(fields) or not _len_field(fields[i]) or fields[i + 1]["kind"] != "ptr":
+        return False
+    if not _LEN_NAME_RE.search(str(fields[i].get("name") or "")):
+        return False
+    return not (i + 2 < len(fields) and _len_field(fields[i + 2]))
+
+
+def _len_ptr_pair(fields: list[dict], i: int) -> bool:
+    """
+    Whether fields `i`, `i + 1` are a (length, pointer) pair: nginx's `ngx_str_t { size_t len; u_char
+    *data; }` (`_len_before_ptr`), the pointer a byte pointer, so a length clamped to its storage in
+    bytes keeps every access inside it. A length before a pointer to wider elements (GMP's
+    `__mpz_struct { int _mp_alloc; int _mp_size; mp_limb_t *_mp_d; }`) counts elements of a size the
+    layout does not give: `_fill_fields` leaves it 0 rather than read it from the input.
+    """
+    return _len_before_ptr(fields, i) and bool(fields[i + 1].get("bytes"))
+
+
 def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base: int) -> None:
     """
     Fill the fields of a struct with pointers (`expr`, already zeroed) without putting an input byte
-    into a pointer: (pointer, length) pairs get generator-owned storage, other pointers a zeroed spare
-    buffer, function pointers stay NULL, scalars and pointer-free members come from the input.
+    into a pointer: (pointer, length) pairs, and (length, byte pointer) pairs (`_len_ptr_pair`), get
+    generator-owned storage and a length clamped to it, other pointers a zeroed spare buffer,
+    function pointers stay NULL, scalars and pointer-free members come from the input, except the
+    length of a pointer to wider elements before it (`_len_before_ptr`), which stays 0.
     """
     fields = list(lay.get("fields") or [])
     i = 0
@@ -714,19 +756,34 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
         # The storage of a pointer field, named after the field's path. The path of an object in an
         # array is `c0a0[0]`: every character an identifier cannot hold becomes `_` (`c0a0_0_f2`).
         tag = f"{re.sub(r'[^A-Za-z0-9_]', '_', expr)}f{i}"
+        pair: tuple[dict, dict, int] | None = None  # (pointer field, length field, pointer index)
         if f["kind"] == "ptr" and nxt is not None and _len_field(nxt):
-            lx = f"{expr}.{nxt['name']}"
-            if f.get("const") and case.rest is None:
-                case.rest = {"call": call, "param": param, "kind": "bytes", "off": off}
-                case.post.append(f"{fx} = (void *)(fuzz_buf + fuzz_off); {lx} = ({nxt['ctype']})(fuzz_len - fuzz_off);")
+            pair = (f, nxt, i)
+        elif nxt is not None and _len_ptr_pair(fields, i):
+            pair = (nxt, f, i + 1)
+        elif nxt is not None and _len_before_ptr(fields, i):
+            # The length of a pointer to elements of a size the layout does not give (GMP's `_mp_size`
+            # before `_mp_d`): a value read from the input could reach past the pointer's spare buffer.
+            case.note(
+                call, param, f"field {f['name']}: the length of {nxt['name']}, whose elements have no known size: 0"
+            )
+            i += 1
+            continue
+        if pair is not None:
+            pf, lf, k = pair
+            px, lx, poff = f"{expr}.{pf['name']}", f"{expr}.{lf['name']}", base + int(pf["off"])
+            ptag = f"{re.sub(r'[^A-Za-z0-9_]', '_', expr)}f{k}"
+            if pf.get("const") and case.rest is None:
+                case.rest = {"call": call, "param": param, "kind": "bytes", "off": poff}
+                case.post.append(f"{px} = (void *)(fuzz_buf + fuzz_off); {lx} = ({lf['ctype']})(fuzz_len - fuzz_off);")
             else:
-                size = PAIR_BYTES if f.get("const") else case.spare
-                case.decls.append(_byte_buffer(_storage(None), case.declare(tag), size))
-                if f.get("const"):
-                    case.slot(tag, size, call, param, "field_bytes", addr=False, off=off)
-                case.slot(lx, int(nxt["size"]), call, param, "field_len", off=off, max=size)
+                size = PAIR_BYTES if pf.get("const") else case.spare
+                case.decls.append(_byte_buffer(_storage(None), case.declare(ptag), size))
+                if pf.get("const"):
+                    case.slot(ptag, size, call, param, "field_bytes", addr=False, off=poff)
+                case.slot(lx, int(lf["size"]), call, param, "field_len", off=poff, max=size)
                 case.decls.append(
-                    f"if ((unsigned long long){lx} > {size}ULL) {{ {lx} = ({nxt['ctype']}){size}; }} {fx} = (void *){tag};"
+                    f"if ((unsigned long long){lx} > {size}ULL) {{ {lx} = ({lf['ctype']}){size}; }} {px} = (void *){ptag};"
                 )
             i += 2
             continue
@@ -1137,7 +1194,8 @@ def _bind_call(
     from `params` as they are (the objects behind a variadic call, `variadic_case`).
     """
     shared = shared or {}
-    params = _respell_qualified_pointers(case.api, name, _respell_enum_pointers(case.api, name, params))
+    params = _respell_anon_records(case.api, _respell_enum_pointers(case.api, name, params))
+    params = _respell_qualified_pointers(case.api, name, params)
     varlen = _variable_length(params, formals, rec, shared)
     args: list[str] = []
     before: list[str] = []
@@ -1268,12 +1326,12 @@ def _bind_call(
                 # free only the harness made. With no initializer nothing sets up an object on the
                 # stack; the case of a constructor that returns one releases it (`_made_struct`).
                 raise _CaseError(
-                    f"frees its argument: a zeroed {pointee} on the stack would be an invalid free only the "
+                    f"frees its argument: a zeroed {p.get('decl') or pointee} on the stack would be an invalid free only the "
                     "harness makes (no initializer of the struct); a constructor's case releases what it returns"
                 )
             if allow_init and pointee in case.api.inits and not own_init:
                 # A context object: its initializer runs first, never a zeroed or input-filled object.
-                case.decls.append(f"{pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                case.decls.append(f"{p.get('decl') or pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
                 before.append(_init_call(case, pointee, f"&{v}", call, i))
                 args.append(f"&{v}")
                 release = _struct_release(api, pointee, name, f"&{v}")
@@ -1469,7 +1527,8 @@ def _bind_call(
         # The call under test makes a struct object its caller frees (libmodbus's modbus_mapping_new*).
         r = f"c{call}r"
         freer = api.struct_freers[made_struct]
-        own = f"{{ {made_struct} * {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){freer}({r}); }} }}"
+        made_c = _anon_record_spelling(api, made_struct)
+        own = f"{{ {made_c} * {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){freer}({r}); }} }}"
         case.notes.append(f"call {call} result: a {made_struct} the caller owns, released with {freer}")
     elif realloc_old is not None:
         # Rule E: the result is freed; on failure (a new size of at least 1) the old pointer still is the caller's.
@@ -1515,6 +1574,7 @@ def plan_params(signature: str, formals: Sequence[Any] | None = None) -> tuple[l
 
 _ANON_TAG_RE = re.compile(r"\b(struct|union|enum)\s+__anon\w*")
 _ANON_ENUM_RE = re.compile(r"enum\s+__anon\w*")
+_ANON_RECORD_RE = re.compile(r"\b(struct|union)\s+__anon\w*")
 
 
 def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | None]:
@@ -1522,7 +1582,9 @@ def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | Non
     The parameter types of a model signature as the generator spells them, or why it cannot. A pointer
     to an anonymous enum (Frama-C's `enum __anonenum_cls_t_7 *` for a header's `cls_t *`) is accepted
     and flagged `anon_enum`: `_bind_call` spells it through the header's typedef, or skips the case.
-    A pointer to an anonymous struct or union is refused: no object of it can be declared.
+    A pointer to an anonymous struct or union (`struct __anonstruct_ngx_str_t_13 *` for nginx's
+    `ngx_str_t *`) is accepted and flagged `anon_record`: `_bind_call` declares its object through
+    the header's typedef (`ApiInfo.anon_tags`), or skips the case when the headers name none.
     """
     params: list[dict] = []
     for t in params_s:
@@ -1535,6 +1597,8 @@ def _spell_params(params_s: Sequence[str]) -> tuple[list[dict] | None, str | Non
         if c["kind"] == "ptr" and "__anon" in pointee:
             if _ANON_ENUM_RE.fullmatch(pointee):
                 c["anon_enum"] = True
+            elif _ANON_RECORD_RE.search(pointee) and not _ANON_ENUM_RE.search(pointee):
+                c["anon_record"] = True
             else:
                 m = _ANON_TAG_RE.search(pointee)
                 return None, f"pointer to an anonymous {m.group(1) if m else 'struct'}"
@@ -1569,6 +1633,86 @@ def _respell_enum_pointers(api: ApiInfo, name: str, params: list[dict]) -> list[
             p = {**p, "pointee": s["pointee"], "type": s["type"]}
         out.append(p)
     return out
+
+
+def _anon_record_spelling(api: ApiInfo, t: str) -> str:
+    """
+    `t`, a type of the model, with each anonymous struct or union tag Frama-C made up
+    (`struct __anonstruct_ngx_str_t_13`) spelled by the header's typedef name (`ngx_str_t`,
+    `ApiInfo.anon_tags`). A tag no typedef names cannot be declared: the case is skipped.
+    """
+
+    def spell(m: re.Match[str]) -> str:
+        tag = " ".join(m.group(0).split())
+        name = api.anon_tags.get(tag)
+        if name is None:
+            why = "the headers name no typedef for it" if api.probed else "no layout probe to read its typedef"
+            raise _Unbuildable(f"pointer to an anonymous {m.group(1)} (`{tag}`): {why}")
+        return name
+
+    return _ANON_RECORD_RE.sub(spell, t)
+
+
+def _respell_anon_records(api: ApiInfo, params: list[dict]) -> list[dict]:
+    """
+    `params` with each pointer to an anonymous struct or union spelled as the header declares it: the
+    object behind it (`decl`, `ngx_str_t`) and the cast (`type`, `ngx_str_t *`). `pointee` stays the
+    model's tag, so the object is classified (a record), laid out (`ApiInfo.structs` holds the
+    typedef's layout under the tag too), initialized and released as a named struct of its shape.
+    """
+    if not any(p.get("anon_record") for p in params):
+        return params
+    out: list[dict] = []
+    for p in params:
+        if p.get("anon_record"):
+            decl = _anon_record_spelling(api, str(p.get("pointee") or ""))
+            p = {**p, "decl": decl, "type": _anon_record_spelling(api, str(p["type"]))}
+        out.append(p)
+    return out
+
+
+def anon_record_tags(model_functions: dict, visible: set[str] | None) -> dict[str, str]:
+    """
+    Frama-C's tag of each anonymous struct or union a header names by a typedef: `struct
+    __anonstruct_ngx_str_t_13` -> `ngx_str_t`. Read from the declarations the layout probe saw
+    (`Declared.anon_record_pointers`): a parameter (or return) the model types as a pointer to the
+    tag and the header writes as a pointer to the typedef. A tag two records claim is left out.
+    """
+    spelled = getattr(visible, "anon_record_pointers", None) or {}
+    anon = getattr(visible, "anon_records", None) or {}
+    seen: dict[str, set[str]] = {}
+    for key, rec in model_functions.items():
+        if not isinstance(rec, dict):
+            continue
+        written = spelled.get(str(rec.get("name") or str(key).split("#")[-1]))
+        parts = split_signature(str(rec.get("signature") or "")) if written else None
+        if not written or parts is None:
+            continue
+        for i, t in [(-1, parts[0]), *enumerate(parts[1])]:
+            tags = {" ".join(m.group(0).split()): m.group(1) for m in _ANON_RECORD_RE.finditer(t)}
+            tname = written.get(i)
+            if len(tags) != 1 or tname not in anon:
+                continue
+            ((tag, what),) = tags.items()
+            if anon[tname].get("what") == what:
+                seen.setdefault(tag, set()).add(tname)
+    out: dict[str, str] = {}
+    for tag, names in seen.items():
+        if len({anon[n].get("id") for n in names}) == 1:
+            out[tag] = min(names)
+    return out
+
+
+def _unspelled_anon_record(rec: dict, tags: dict[str, str]) -> bool:
+    """
+    Whether a parameter of a model record points to an anonymous struct or union no typedef spells
+    (`anon_record_tags`). Such a function has no case, so it is no initializer, destructor or
+    constructor either, as when `plan_params` refused every such pointer.
+    """
+    parts = split_signature(str(rec.get("signature") or ""))
+    return parts is not None and any(
+        " ".join(m.group(0).split()) not in tags for t in parts[1] for m in _ANON_RECORD_RE.finditer(t)
+    )
 
 
 def _respell_qualified_pointers(api: ApiInfo, name: str, params: list[dict]) -> list[dict]:
@@ -2198,7 +2342,8 @@ def _sequence_case(
                 n_bytes = str(size or spare)
                 if is_record:
                     # Room for the whole object, whatever size the call sites showed.
-                    n_bytes = f"({n_bytes} > sizeof({pointee}) ? {n_bytes} : sizeof({pointee}))"
+                    obj = _anon_record_spelling(case.api, pointee)
+                    n_bytes = f"({n_bytes} > sizeof({obj}) ? {n_bytes} : sizeof({obj}))"
                 case.decls.append(_byte_buffer(_storage(size or None), case.declare(var), n_bytes))
                 # Filled from the input when its first use reads it, its size is known, and it holds
                 # no pointer.
@@ -2376,6 +2521,9 @@ def plan(
     names: list[str] = []
     variadic_made: list[tuple[str, dict]] = []
     dropped: list[dict] = []
+    # Anonymous structs and unions the headers name by a typedef (nginx's `ngx_str_t`): a function
+    # pointing to one no typedef names has no case, so it builds no object for another case either.
+    anon_tags = anon_record_tags(model.get("functions") or {}, visible)
     # Initializers: the module's callable entry points, and header functions the harness sees.
     entry_names = {str((functions.get(k) or {}).get("name") or k.split("#")[-1]) for k in entries}
     init_pool = {
@@ -2383,6 +2531,7 @@ def plan(
         for k, rec in (model.get("functions") or {}).items()
         if isinstance(rec, dict)
         and (str(rec.get("name") or k.split("#")[-1]) in entry_names or (rec.get("static") and rec.get("header")))
+        and not _unspelled_anon_record(rec, anon_tags)
     }
     handles, ctors, dtors, dtor_names, ctor_records, returns = handle_functions(init_pool, visible)
     outp = outparam_constructors(init_pool, visible, handles, traces)
@@ -2400,6 +2549,7 @@ def plan(
         for k, rec in (model.get("functions") or {}).items()
         if isinstance(rec, dict)
         and (str(rec.get("name") or k.split("#")[-1]) in unit_names or (rec.get("static") and rec.get("header")))
+        and not _unspelled_anon_record(rec, anon_tags)
     }
     inits, candidates, init_records = initializers(unit_pool, traces, visible)
     struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible)
@@ -2407,8 +2557,11 @@ def plan(
     helper_pool = (set(inits.values()) | set(struct_dtors.values()) | set(freers.values())) - entry_names
     # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
     out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
+    structs = dict(struct_layouts or {})
+    # The typedef's layout under the model's tag too: a case looks an object up by the model's type.
+    structs.update({tag: structs[n] for tag, n in anon_tags.items() if n in structs})
     api = ApiInfo(
-        structs=dict(struct_layouts or {}),
+        structs=structs,
         probed=struct_layouts is not None,
         inits=inits,
         candidates=candidates,
@@ -2426,6 +2579,7 @@ def plan(
         callbacks=dict(getattr(visible, "callbacks", None) or {}) if callback_stubs else {},
         enum_ptrs=dict(getattr(visible, "enum_pointers", None) or {}),
         qual_ptrs=dict(getattr(visible, "qualified_pointers", None) or {}),
+        anon_tags=anon_tags,
         struct_dtors=struct_dtors,
         struct_dtor_names=struct_dtor_names,
         struct_freers=freers,
@@ -2610,6 +2764,81 @@ def _walk_records(tree: dict) -> tuple[dict[str, dict], set[str]]:
     return records, functions
 
 
+# The spelling older clangs give an anonymous record (`struct (unnamed struct at x.h:2:9)`, `(anonymous
+# union at ...)`); clang 19 spells a typedef's anonymous record by the typedef's name (`struct str_t`).
+_UNNAMED_RECORD_RE = re.compile(r"\((?:unnamed|anonymous)\b[^()]*\)")
+
+
+def _anon_record_nodes(tree: dict) -> dict[str, tuple[str, str, dict]]:
+    """
+    The typedef names of anonymous structs and unions (`typedef struct { size_t len; u_char *data; }
+    ngx_str_t;`): name -> (struct or union, the record's AST id, its RecordDecl). A typedef names the
+    record itself, never a pointer to it or an array of it (`typedef struct { ... } *p_t;` is left
+    out); a typedef of such a typedef (`typedef str_t text_t;`) names the same record.
+    """
+    nameless: dict[str, tuple[str, dict]] = {}
+    typedefs: list[dict] = []
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        kind = node.get("kind")
+        if kind == "FunctionDecl":
+            continue
+        if kind == "RecordDecl" and node.get("completeDefinition") and not node.get("name"):
+            if isinstance(node.get("id"), str):
+                nameless.setdefault(node["id"], (str(node.get("tagUsed") or "struct"), node))
+        elif kind == "TypedefDecl" and isinstance(node.get("name"), str):
+            typedefs.append(node)
+        stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+    out: dict[str, tuple[str, str, dict]] = {}
+    for node in typedefs:
+        qual = _UNNAMED_RECORD_RE.sub("X", str((node.get("type") or {}).get("qualType") or ""))
+        if any(c in qual for c in "*[("):
+            continue
+        rid = _decl_ref(node, "RecordDecl")
+        if rid in nameless:
+            what, rec = nameless[rid]
+            out.setdefault(node["name"], (what, rid, rec))
+    grown = True
+    while grown:
+        grown = False
+        for node in typedefs:
+            target = _spelled(str((node.get("type") or {}).get("qualType") or ""))
+            if node["name"] not in out and target in out:
+                out[node["name"]] = out[target]
+                grown = True
+    return out
+
+
+def anon_record_pointers(tree: dict, anon: Collection[str]) -> dict[str, dict[int, str]]:
+    """
+    Per declared function, the parameters (index) and the return (index -1) that point to an
+    anonymous struct or union through one of its typedef names (`anon`), as the declaration writes
+    them: `const ngx_str_t *s` gives "ngx_str_t". The model spells that pointer with Frama-C's tag
+    (`struct __anonstruct_ngx_str_t_13 *`), which no header defines; `anon_record_tags` joins the two.
+    """
+    out: dict[str, dict[int, str]] = {}
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if node.get("kind") != "FunctionDecl":
+            stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+            continue
+        name = node.get("name")
+        qual = str((node.get("type") or {}).get("qualType") or "")
+        if not isinstance(name, str) or "(" not in qual:
+            continue
+        written = [(-1, qual[: qual.index("(")])]
+        parms = [n for n in node.get("inner") or [] if isinstance(n, dict) and n.get("kind") == "ParmVarDecl"]
+        written += [(i, str((p.get("type") or {}).get("qualType") or "")) for i, p in enumerate(parms)]
+        for i, t in written:
+            bare = _spelled(t)
+            base = bare.rstrip("* ").strip()
+            if bare.endswith("*") and base in anon:
+                out.setdefault(name, {})[i] = base
+    return out
+
+
 class Declared(set):  # type: ignore[type-arg]
     """
     The function names a probe saw declared. `prototypes` gives, for each, the opaque handle types in
@@ -2623,6 +2852,8 @@ class Declared(set):  # type: ignore[type-arg]
     enum_params: dict[str, dict[int, list[str]]]
     const_returns: set[str]
     bound_forwards: dict[str, dict[int, tuple[str, str]]]
+    anon_records: dict[str, dict[str, str]]
+    anon_record_pointers: dict[str, dict[int, str]]
 
     def __init__(
         self,
@@ -2634,6 +2865,8 @@ class Declared(set):  # type: ignore[type-arg]
         enum_params: dict[str, dict[int, list[str]]] | None = None,
         const_returns: set[str] | None = None,
         bound_forwards: dict[str, dict[int, tuple[str, str]]] | None = None,
+        anon_records: dict[str, dict[str, str]] | None = None,
+        anon_record_pointers: dict[str, dict[int, str]] | None = None,
     ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
@@ -2650,6 +2883,11 @@ class Declared(set):  # type: ignore[type-arg]
         self.const_returns = set(const_returns or ())
         # `bound_forwards`: per function, parameter index -> (">=" or "<=", constant) of a lone range bound.
         self.bound_forwards = bound_forwards or {}
+        # `_anon_record_nodes`: the typedef names of anonymous structs and unions -> {what, id}.
+        self.anon_records = anon_records or {}
+        # `anon_record_pointers`: per function, parameter index (-1: the return) -> the typedef name
+        # through which it points to an anonymous struct or union.
+        self.anon_record_pointers = anon_record_pointers or {}
 
 
 def _spelled(t: str) -> str:
@@ -2838,11 +3076,16 @@ def qualified_pointer_spellings(tree: dict) -> dict[str, dict[int, dict[str, str
 
 def _enum_ref(node: Any) -> str | None:
     """The id of the first EnumDecl a typedef's type nodes refer to (`ownedTagDecl`, `decl`), if any."""
+    return _decl_ref(node, "EnumDecl")
+
+
+def _decl_ref(node: Any, kind: str) -> str | None:
+    """The id of the first declaration of `kind` (EnumDecl, RecordDecl) a typedef's type nodes refer to."""
     stack = [node]
     while stack:
         cur = stack.pop()
         if isinstance(cur, dict):
-            if cur.get("kind") == "EnumDecl" and isinstance(cur.get("id"), str):
+            if cur.get("kind") == kind and isinstance(cur.get("id"), str):
                 return cur["id"]
             stack.extend(reversed([v for k, v in cur.items() if k in ("inner", "ownedTagDecl", "decl")]))
         elif isinstance(cur, list):
@@ -3142,13 +3385,15 @@ def callback_stub(stub: str, proto: dict[str, Any]) -> str:
     return f"static {ret} {stub}({params}) {{ {body.strip()} }} /* {CALLBACK_STUB_MARKER} */"
 
 
-def handle_prototypes(tree: dict, complete: set[str]) -> dict[str, dict[str, Any]]:
+def handle_prototypes(tree: dict, complete: set[str], anon: Collection[str] = ()) -> dict[str, dict[str, Any]]:
     """
     Per declared function, where its declaration names an opaque handle type: a typedef that resolves
     to `void *`, or a pointer to a struct or union with no definition in the translation unit
     (`complete` holds the defined ones). A handle type is named as written when it is a typedef of
     `void *` (`scmp_filter_ctx`), else by the pointer type (`struct foo *`, also through a typedef).
-    A plain `void *` is not a handle: nothing says what it points to.
+    A plain `void *` is not a handle: nothing says what it points to. Nor is a pointer to an
+    anonymous struct or union through its typedef name (`anon`, `_anon_record_nodes`): it is
+    defined, though clang 19 writes the typedef's type as `struct ngx_str_t`, a tag no header defines.
     """
     typedefs: dict[str, str] = {}
     decls: list[dict] = []
@@ -3166,7 +3411,7 @@ def handle_prototypes(tree: dict, complete: set[str]) -> dict[str, dict[str, Any
     def resolve(t: str) -> str:
         seen: set[str] = set()
         t = _spelled(t)
-        while t in typedefs and t not in seen:
+        while t in typedefs and t not in seen and t not in anon:
             seen.add(t)
             t = _spelled(typedefs[t])
         return t
@@ -3219,9 +3464,22 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
     A record with a bit-field, a packed or aligned attribute, an anonymous member or a type the
     generator does not know has no layout. The functions are a `Declared`, which also carries the
     opaque handle types of their declarations (`handle_prototypes`).
+
+    An anonymous struct or union a typedef names (`typedef struct { size_t len; u_char *data; }
+    ngx_str_t;`, `_anon_record_nodes`) is laid out under the typedef's name (`ngx_str_t`, no
+    `struct ` before it: no header defines a tag for it), and a member of that type is a record of
+    that name, so a named struct holding an `ngx_str_t` has a layout too.
     """
     raw, functions = _walk_records(tree)
+    anon_nodes = _anon_record_nodes(tree)
+    for tname, (_, _, node) in anon_nodes.items():
+        raw.setdefault(tname, node)
     memo: dict[str, dict | None] = {}
+
+    def anon_name(t: str) -> str | None:
+        """The typedef name of an anonymous record `t` spells (`const str_t`, `str_t [2]`), if any."""
+        base = _spelled(re.sub(r"\s*\[\d*\]", "", t))
+        return base if base in anon_nodes else None
 
     def type_info(t: str) -> dict | None:
         t = " ".join(t.split())
@@ -3251,6 +3509,8 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
                 "align": POINTER_BYTES,
                 "pointers": True,
                 "const": bool(re.search(r"\bconst\b", base)),
+                # A byte pointer: a length beside it counts what it points to in bytes (`_len_ptr_pair`).
+                **({"bytes": True} if _spelled(base) in _BYTE_POINTEES else {}),
             }
         n = " ".join(_QUALIFIERS_RE.sub(" ", t).split())
         if n in SCALAR_BYTES:
@@ -3259,9 +3519,9 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
             info = {"kind": kind, "size": size, "align": size, "pointers": False, "ctype": n}
             return {**info, "bools": True} if n == "_Bool" else info
         m = _RECORD_TYPE_RE.match(n)
-        if not m:
+        if n not in anon_nodes and not m:
             return None
-        if m.group(1) == "enum":
+        if m and m.group(1) == "enum":
             return {"kind": "enum", "size": 4, "align": 4, "pointers": False}
         sub = layout(n)
         if sub is None:
@@ -3297,7 +3557,10 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
             name = f.get("name")
             if f.get("isBitfield") or not name:
                 return None
-            info = type_info(str(ftype.get("desugaredQualType") or ftype.get("qualType") or ""))
+            # A member written through the typedef of an anonymous record keeps that name: desugared,
+            # an older clang spells it `struct (unnamed struct at ...)`, which has no layout.
+            qual = str(ftype.get("qualType") or "")
+            info = type_info(qual if anon_name(qual) else str(ftype.get("desugaredQualType") or qual))
             if info is None:
                 return None
             a = int(info.pop("align"))
@@ -3321,13 +3584,15 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
     layouts = {k: lay for k in raw if (lay := layout(k)) is not None}
     return layouts, Declared(
         functions,
-        handle_prototypes(tree, set(raw)),
+        handle_prototypes(tree, set(raw), set(anon_nodes)),
         callback_prototypes(tree),
         enum_pointer_spellings(tree),
         qualified_pointer_spellings(tree),
         param_enums(tree),
         const_returns(tree),
         bound_forwards(tree),
+        {name: {"what": what, "id": rid} for name, (what, rid, _) in anon_nodes.items()},
+        anon_record_pointers(tree, set(anon_nodes)),
     )
 
 
