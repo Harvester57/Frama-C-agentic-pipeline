@@ -236,10 +236,15 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
     - `::test_the_probes_get_the_macros_the_target_defines_before_the_header` (both cases)
     - `::test_a_header_without_a_compile_gets_no_context_and_the_same_probes`
     - `::test_the_context_scan_drops_undefined_guards_and_system_macros`
-- **Open pipeline gap:** some macros are still not carried into the probes.
-  - The scan reads only the files the compile enters while the header is open. A header the unit already included earlier is not entered again, so a macro the library header consults only through such a header is missed.
-  - Examples: feature-test macros (`_GNU_SOURCE`, `_FILE_OFFSET_BITS`) that glibc's `features.h` reads, or a macro that a nested OpenSSL header reads when the unit included that header before.
-  - The probes then include the header without those macros, as they did before the fix.
+- **Feature-test macros, fixed** on branch `sup/nginx-harness-feature-macros` (not merged): macros such as `_GNU_SOURCE` and `_FILE_OFFSET_BITS` that glibc's `features.h` reads at the first system header are now carried.
+  - The scan in [`../../scripts/include_context.py`](../../scripts/include_context.py) keeps a macro the target defines before its first system header when a system header the compile enters tests it. Include guards are excluded.
+  - All three probes get them as `-D` flags on the command line (a `#define` in the probe would come after `features.h`). `stub_check.json` records them under `include_context.feature_macros` and `feature_flags`, plus `feature_not_carried` for a macro that cannot be a flag.
+  - The same mechanism feeds the harness cppflags; see [`./harnesses-and-seeds.md`](./harnesses-and-seeds.md).
+  - Test: `tests/test_stub_check.py::test_a_header_that_needs_the_targets_macros_passes_all_three_checks[feature]` (Docker). With the flags removed, `abi` fails with `invalid application of 'sizeof' to incomplete type 'struct in6_pktinfo'` and `dynamic` is `build_failed`; with them, all three pass. Unit: `::test_the_probes_get_the_macros_the_target_defines_before_the_header[feature]`.
+- **Open pipeline gap:** a non-feature macro is still missed when the library header consults it only through a header the unit already included earlier.
+  - The scan reads only the files the compile enters while the header is open, and an already-included header is not entered again.
+  - Example: a macro that a nested OpenSSL header reads when the unit included that header before.
+  - The probes then include the header without that macro, as they did before the fix.
 - **Recovering run-3:** once the fix is in the pipeline checkout whose wrapper runs the command, rerun `pipeline_make.py run stubs stub-check`. `pcre2.h`'s `include_context` should read `#define PCRE2_CODE_UNIT_WIDTH 8`, from `src/core/ngx_regex.c`.
   - Read the other headers' `include_context` one by one. A header that passed bare may now get defines from the target, for example OpenSSL headers if nginx defines a macro they read.
 - **Not affected:** [`../../scripts/stub_gen.py`](../../scripts/stub_gen.py) takes the prototypes from the Phase 0 model's `external_decls`. Frama-C printed those from the target's own parse, so they already carry the target's context (`pcre2_compile_8`). `entry_header` only reads quoted sibling includes.

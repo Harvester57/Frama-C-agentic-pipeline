@@ -245,6 +245,34 @@
       "required": ["id", "source", "initialize"],
       "additionalProperties": false
     },
+    "feature_macros": {
+      "$comment": "The target's feature-test macros (generate_harness.py _target_feature_macros, scripts/include_context.py): from `gcc -E -dD` of the build capture's compiles of the harness's sources that include one of its `headers` (all of them when none does; `compiles`, the first one's `command`; `other_sources` are the sources left out, which the flags reach too), the macros a system header tests in a conditional, that one compile at least defines before it first enters a system header, and that every one defines identically (`macros`, name -> `#define` line; `late` names, per macro, the sources that define it only after their first system header, as nginx's generated ngx_event_quic_bpf_code.c does). `flags` are the -D flags added to `cppflags`; `given` the macros the cppflags already defined the same way; `conflicts` those they define otherwise (the cppflags' flag is kept); `not_carried` those no flag can spell; `differing` those the compiles disagree on (left out); `failed` the compiles that could not be preprocessed. Absent when the target sets no such macro.",
+      "type": "object",
+      "properties": {
+        "source": {"type": "string", "enum": ["build_capture"]},
+        "why": {"type": "string", "minLength": 1},
+        "compiles": {"$ref": "#/definitions/strings"},
+        "command": {"type": ["string", "null"]},
+        "macros": {"type": "object", "additionalProperties": {"type": "string"}},
+        "flags": {"$ref": "#/definitions/strings"},
+        "headers": {"$ref": "#/definitions/strings"},
+        "other_sources": {"$ref": "#/definitions/strings"},
+        "late": {"type": "object", "additionalProperties": {"$ref": "#/definitions/strings"}},
+        "given": {"$ref": "#/definitions/strings"},
+        "conflicts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {"macro": {"type": "string"}, "given": {"type": "string"}, "derived": {"type": "string"}},
+            "required": ["macro", "given", "derived"]
+          }
+        },
+        "not_carried": {"type": "array", "items": {"type": "object"}},
+        "differing": {"type": "array", "items": {"type": "object"}},
+        "failed": {"type": "array", "items": {"type": "object"}}
+      },
+      "required": ["source", "compiles", "macros", "flags"]
+    },
     "warnings": {"$ref": "#/definitions/strings"}
   },
   "required": ["module", "harness_file", "sources", "cppflags", "entry_fn", "entry_style"]

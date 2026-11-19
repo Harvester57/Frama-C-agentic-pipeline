@@ -471,7 +471,29 @@ FIX_CASES: dict[str, dict[str, Any]] = {
         "use_h": "#define USE_ALSO_UNRELATED 2\n#include <fix/fixlib.h>\n",
         "context": ["#define FIX_CODE_UNIT_WIDTH 8"],
     },
+    # A feature-test macro read by a header the unit entered before the library header (glibc's features.h,
+    # through <stddef.h>... <netinet/in.h>): the library header needs `struct in6_pktinfo`, which glibc
+    # declares only under _GNU_SOURCE. The `#define` lines come after fc_compat_types.h's force include, too
+    # late for features.h: the macro reaches the probes as -D (`feature_flags`).
+    "feature": {
+        "flags": ["-I", "src"],
+        "generated": "",
+        "use_h": "#define _GNU_SOURCE\n#include <stddef.h>\n#include <fix/fixlib.h>\n",
+        "context": [],
+        "features": {"_GNU_SOURCE": "#define _GNU_SOURCE"},
+        "real": """#ifndef FIXLIB_H
+#define FIXLIB_H
+#include <stddef.h>
+#include <netinet/in.h>
+typedef char fix_pktinfo_size[sizeof(struct in6_pktinfo)];
+size_t fix_len_8(const unsigned char *s, size_t n);
+#endif
+""",
+    },
 }
+# What the fake `-dD` output of the `feature` case enters as glibc's features.h: a system header outside the
+# snapshot's root (so it is on no include path of the Docker test) that tests _GNU_SOURCE.
+FIX_FAKE_FEATURES = "fake-sys/features.h"
 FIX_USE_C = '#include "use.h"\nsize_t use(const unsigned char *s, size_t n) { return fix_len(s, n); }\n'
 
 
@@ -483,7 +505,11 @@ def _fix_run(run: Path, case: str, snap_in: str, work_in: str) -> None:
     snap = run / "workspace" / "snapshot"
     (snap / "root" / "usr" / "include" / "fix").mkdir(parents=True)
     (snap / "root" / "usr" / "lib").mkdir(parents=True)
-    (snap / "root" / "usr" / "include" / "fix" / "fixlib.h").write_text(FIX_REAL_TEXT, encoding="utf-8", newline="\n")
+    real_text = spec.get("real", FIX_REAL_TEXT)
+    (snap / "root" / "usr" / "include" / "fix" / "fixlib.h").write_text(real_text, encoding="utf-8", newline="\n")
+    if spec.get("features"):
+        (snap / FIX_FAKE_FEATURES).parent.mkdir(parents=True)
+        (snap / FIX_FAKE_FEATURES).write_text("#ifdef _GNU_SOURCE\n#define __USE_GNU 1\n#endif\n", encoding="utf-8")
     write_json(snap / "manifest.json", {"digest": "test", "generated_dirs": ["objs"], "files": {
         "/usr/include/fix/fixlib.h": "x", "/usr/lib/libfix.so": "x"}})  # fmt: skip
     (snap / "generated" / "objs").mkdir(parents=True)
@@ -528,6 +554,12 @@ def _fix_dd_output(case: str, tree: str, snap: str) -> str:
             f'# 1 "{snap}/generated/objs/use_auto.h" 1 3 4\n#define USE_FIX 1\n#define USE_WIDTH 8\n'
             f'# 2 "{tree}/src/use.h" 2\n#define USE_UNRELATED 1\n#define FIX_CODE_UNIT_WIDTH USE_WIDTH\n'
             f'# 6 "{tree}/src/use.h"\n{header}# 7 "{tree}/src/use.h" 2\n'
+        )
+    elif case == "feature":
+        cmdline = ""
+        use_h = (
+            f'#define _GNU_SOURCE \n# 1 "{snap}/{FIX_FAKE_FEATURES}" 1 3 4\n#define __USE_GNU 1\n'
+            f'# 2 "{tree}/src/use.h" 2\n{header}# 3 "{tree}/src/use.h" 2\n'
         )
     else:
         cmdline = "#define FIX_CODE_UNIT_WIDTH 8\n#define USE_UNRELATED 1\n"
@@ -584,6 +616,14 @@ def test_the_probes_get_the_macros_the_target_defines_before_the_header(run_dir,
             assert 0 <= text.find(line + "\n") < at, (probe, text)
         for absent in ("USE_UNRELATED", "USE_ALSO_UNRELATED", "USE_FIX", "USE_AFTER", "_STDC_PREDEF_H", "linux"):
             assert absent not in text, (absent, text)
+        assert "_GNU_SOURCE" not in text, (probe, text)  # a feature-test macro is a flag, never a line
+    # Feature-test macros: on each probe's command line (-D precedes every force-included header).
+    features = FIX_CASES[case].get("features") or {}
+    assert ctx.get("feature_macros", {}) == features, ctx
+    probes = [c for c in calls if c[:2] == ["gcc", "-fsyntax-only"] or c[0] in ("frama-c", "e-acsl-gcc")]
+    assert {c[0] for c in probes} == {"gcc", "frama-c", "e-acsl-gcc"}, calls
+    for cmd in probes:
+        assert ("-D_GNU_SOURCE=" in " ".join(cmd)) == bool(features), cmd
 
 
 @pytest.mark.unit
@@ -792,5 +832,6 @@ def test_a_header_that_needs_the_targets_macros_passes_all_three_checks(tmp_path
     assert rec["eva"]["functions"]["fix_len_8"]["status"] == "passed", rec
     assert rec["dynamic"]["functions"]["fix_len_8"]["status"] == "passed", rec
     assert rec["include_context"]["defines"] == FIX_CASES[case]["context"], rec
+    assert rec["include_context"].get("feature_macros", {}) == FIX_CASES[case].get("features", {}), rec
     assert rec["status"] == "passed" and report["blocked_modules"] == {}, rec
     assert "rc=0" in out, out
