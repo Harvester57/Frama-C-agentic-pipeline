@@ -2292,6 +2292,23 @@ def security_props_warnings(record: dict | None) -> list[str]:
             f"unplanned instances: {name} is also checked in {', '.join(str(f) for f in functions)}, which "
             "security_props.json does not list as its instances (a violation there links no ledger unit)"
         )
+    libc = record.get("libc_contracts")
+    if isinstance(libc, dict) and libc.get("status") in ("dropped", "missing") and status == "loaded":
+        names = ", ".join(str(n) for n in libc.get("functions") or []) or "the libc writers"
+        log = f"; log: {libc['log']}" if libc.get("log") else ""
+        out.append(
+            f"libc contracts {libc['status']}: the assigns of {names} are not in this build "
+            f"({libc.get('reason') or 'no reason recorded'}){log}"
+        )
+    unchecked = record.get("libc_unchecked")
+    calls = sorted(unchecked.items()) if isinstance(unchecked, dict) else []
+    if calls and status == "loaded":
+        out.append(
+            "libc unchecked: "
+            + "; ".join(f"{lib} (called in {', '.join(str(f) for f in fns)})" for lib, fns in calls)
+            + ": no contract in this build, so no \\writing or \\reading property is checked on what these "
+            "calls write or read (WP and Eva, which parse Frama-C's libc, check them)"
+        )
     return out
 
 

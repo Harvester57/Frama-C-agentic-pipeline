@@ -468,6 +468,133 @@ def eacsl_meta_file_text(text: str, include_line: str) -> str:
     return f"{EACSL_META_INCLUDE_NOTE}{sep}{rest}" if first.strip() == include_line else text
 
 
+# The guard each \writing / \reading property gets in an E-ACSL meta file (eacsl_meta_guarded_text).
+# E-ACSL evaluates `\separated(\written, &x)` only on valid memory and stops the run with
+# `<unknown>:0: Error: E-ACSL RTE failed` when \written is not: a write through memcpy past its
+# destination was then reported by that guard, before the call, instead of by E-ACSL's memcpy
+# replacement (`eacsl_libc_error`, `memcpy: insufficient space in destination space`), and an
+# ordinary overflow changed fingerprint once the libc contracts gave such calls an instance. With
+# `\valid(\written) ==> (P)` the instance holds on invalid memory and the call reports the defect as
+# the build without properties does. Measured in framac-analysis (Frama-C 34.0~beta, MetAcsl
+# 0.12~beta, 2026-11-19, docs/troubleshooting/eacsl-and-fuzzing.md). WP and Eva keep the property
+# as written: their meta files are not the E-ACSL build's.
+EACSL_META_ACCESS_GUARDS = {"writing": "\\valid(\\written)", "reading": "\\valid_read(\\read)"}
+_META_ANNOT_RE = re.compile(r"/\*@\s*meta\s+\\prop\b(?P<body>.*?)\*/", re.DOTALL)
+_META_CONTEXT_ITEM_RE = re.compile(r"\s*\\context\(\s*\\(?P<context>\w+)\s*\)\s*$")
+_META_PREDICATE_RE = re.compile(r"(?P<lead>\s*)(?P<pred>.*?)(?P<tail>\s*;\s*)$", re.DOTALL)
+
+
+def _top_level_commas(text: str) -> list[int]:
+    """The offsets of the commas of `text` outside any (), [], {} or string literal."""
+    depth, out, quote = 0, [], ""
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote and text[i - 1] != "\\":
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append(i)
+    return out
+
+
+def eacsl_meta_guarded_text(text: str) -> str:
+    """
+    A meta file for the E-ACSL build in which the predicate P of each `\\writing` property becomes
+    `\\valid(\\written) ==> (P)`, and of each `\\reading` one `\\valid_read(\\read) ==> (P)`
+    (EACSL_META_ACCESS_GUARDS). The guard is written on P's own lines: every line keeps its number,
+    so the sidecar's line map is unchanged. Other contexts, and an annotation whose items cannot be
+    split, are left as they are.
+    """
+
+    def guard(m: re.Match[str]) -> str:
+        body = m.group("body")
+        cuts = _top_level_commas(body)
+        if not cuts:
+            return m.group(0)
+        items = [body[a + 1 : b] for a, b in zip([-1, *cuts], cuts, strict=False)]
+        context = next((c.group("context") for item in items if (c := _META_CONTEXT_ITEM_RE.match(item))), None)
+        access = EACSL_META_ACCESS_GUARDS.get(context or "")
+        pm = _META_PREDICATE_RE.match(body[cuts[-1] + 1 :])
+        if access is None or pm is None or not pm.group("pred").strip():
+            return m.group(0)
+        head = m.group(0)[: m.start("body") - m.start()]
+        return f"{head}{body[: cuts[-1] + 1]}{pm.group('lead')}{access} ==> ({pm.group('pred')}){pm.group('tail')}*/"
+
+    return _META_ANNOT_RE.sub(guard, text)
+
+
+# The libc writers whose assigns the E-ACSL meta file carries (templates/metacsl/eacsl_libc_writers.h,
+# appended by fuzz_build.write_security_meta). Keep equal to the functions that file declares.
+EACSL_META_LIBC_WRITERS = ("memcpy", "memmove", "memset", "strncpy")
+EACSL_META_LIBC_FILE = "eacsl_libc_writers.h"
+# libc functions that write or read through a pointer argument and get no contract in the E-ACSL
+# build: MetAcsl checks no \writing or \reading property on what they touch there. strcpy and strcat
+# need strlen-bounded assigns, which abort E-ACSL 34.0~beta ("invalid label 'Old' within statement
+# annotation"); the others were not tried. The build lists their calls (libc_writer_calls).
+EACSL_META_LIBC_UNCHECKED = (
+    "strcpy", "stpcpy", "strcat", "strncat", "stpncpy", "memccpy", "mempcpy", "bzero", "explicit_bzero",
+    "sprintf", "snprintf", "vsprintf", "vsnprintf", "read", "pread", "recv", "recvfrom", "recvmsg",
+    "fread", "fgets", "getline", "getdelim", "scanf", "sscanf", "fscanf", "readlink", "getcwd",
+    "realpath", "strerror_r", "wmemcpy", "wmemmove", "wmemset", "wcscpy", "wcsncpy",
+)  # fmt: skip
+
+
+def eacsl_meta_libc_text(directory: Path | None = None) -> str | None:
+    """
+    The text appended to an E-ACSL meta file after its last property: the assigns of
+    EACSL_META_LIBC_WRITERS (templates/metacsl/eacsl_libc_writers.h). None when the file is not found.
+    """
+    if directory is None:
+        stubs = resolve_fc_stubs_dir()
+        directory = Path(stubs).parent / "metacsl" if stubs else None
+    path = directory / EACSL_META_LIBC_FILE if directory else None
+    if path is None or not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+_C_DEFINITION_NAME_RE = re.compile(r"(?P<name>[A-Za-z_]\w*)\s*\(")
+_GEN_PREFIX = "__gen_e_acsl_"
+
+
+def libc_writer_calls(instrumented_text: str, functions: Sequence[str], names: Sequence[str]) -> dict[str, list[str]]:
+    """
+    {libc function: the functions among `functions` whose body calls it} in a file Frama-C printed
+    (a definition's body opens with `{` and closes with `}`, each alone on its line). A call E-ACSL
+    redirected to its replacement (`__e_acsl_builtin_strcpy`) counts as a call of the function.
+    """
+    if not names:
+        return {}
+    wanted = set(functions)
+    call_re = re.compile(r"\b(?:__e_acsl_builtin_)?(" + "|".join(map(re.escape, names)) + r")\s*\(")
+    lines = instrumented_text.splitlines()
+    found: dict[str, set[str]] = {}
+    i = 0
+    while i < len(lines):
+        if lines[i] != "{":
+            i += 1
+            continue
+        j = i - 1
+        while j >= 0 and lines[j].strip() and not lines[j].rstrip().endswith((";", "}", "*/")):
+            j -= 1
+        head = _C_DEFINITION_NAME_RE.search(" ".join(lines[j + 1 : i]))
+        end = i + 1
+        while end < len(lines) and lines[end] != "}":
+            end += 1
+        name = head.group("name") if head else ""
+        name = name[len(_GEN_PREFIX) :] if name.startswith(_GEN_PREFIX) else name
+        if name in wanted:
+            for m in call_re.finditer("\n".join(lines[i + 1 : end])):
+                found.setdefault(m.group(1), set()).add(name)
+        i = end + 1
+    return {lib: sorted(fns) for lib, fns in sorted(found.items())}
+
+
 # MetAcsl aborts the whole translation on a property it cannot type in one function (a global this
 # module's parse does not declare): `[meta] User Error: Error during the typing of a HILARE!` then
 # `What: the HILARE named '<property>' (<meta file>:<line>)`.

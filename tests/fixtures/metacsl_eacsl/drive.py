@@ -24,8 +24,15 @@ import fingerprint  # noqa: E402
 import fuzz_build  # noqa: E402
 from run_wp_function import goal_obligation_class  # noqa: E402
 
-VIOLATIONS = "-DVIOLATE_WRITE -DVIOLATE_PRECOND -DVIOLATE_INIT -DVIOLATE_WIPE -DVIOLATE_TEXT -DVIOLATE_LEAK -DRTE_BUG"
+VIOLATIONS = (
+    "-DVIOLATE_WRITE -DVIOLATE_PRECOND -DVIOLATE_INIT -DVIOLATE_WIPE -DVIOLATE_TEXT -DVIOLATE_LEAK -DRTE_BUG "
+    "-DVIOLATE_MEMCPY -DRTE_MEMCPY"
+)
 INPUTS = {
+    "memcpy_ok": b"Wabcdefghij",
+    "memcpy_auth": b"Xabcd",
+    "memcpy_overflow": b"O" + b"a" * 40,
+    "memcpy_empty": b"O",
     "login": b"Lok",
     "admin": b"A",
     "backdoor": b"B",
@@ -167,9 +174,13 @@ def main() -> int:
             "added_names": sorted({k[1] for k in (after - before)}),
         }
     for tag, names in (
-        ("ok", ("login", "admin", "backdoor", "emit", "close", "text", "key", "leak", "other", "long")),
-        ("viol", ("backdoor", "admin", "emit", "close", "text", "leak", "long", "login", "other")),
-        ("viol_plain", ("long", "backdoor")),
+        ("ok", ("login", "admin", "backdoor", "emit", "close", "text", "key", "leak", "other", "long", "memcpy_ok")),
+        (
+            "viol",
+            ("backdoor", "admin", "emit", "close", "text", "leak", "long", "login", "other")
+            + ("memcpy_ok", "memcpy_auth", "memcpy_overflow", "memcpy_empty"),
+        ),
+        ("viol_plain", ("long", "backdoor", "memcpy_overflow", "memcpy_empty")),
         ("direct", ("direct", "admin", "other")),
     ):
         out["runs"][tag] = {name: run(builds[tag]["binary"], name) for name in names}

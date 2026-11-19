@@ -31,6 +31,8 @@ from eacsl_toolchain import (
     EACSL_FULL_MTRACKING_DEFINES,
     EACSL_GCC_CHECK_OPTIONS,
     EACSL_HEAP_ZONE_MB,
+    EACSL_META_LIBC_UNCHECKED,
+    EACSL_META_LIBC_WRITERS,
     EACSL_NO_LIBC_CHECKS,
     EACSL_RTE_INITIALIZED_FLAG,
     UnsafePassthroughError,
@@ -40,11 +42,14 @@ from eacsl_toolchain import (
     build_fallback_object,
     defines_fuzzer_initialize,
     eacsl_meta_file_text,
+    eacsl_meta_guarded_text,
+    eacsl_meta_libc_text,
     eacsl_share_dir,
     eacsl_zone_size_options,
     fix_readonly_scalar_globals,
     generate_errno_shim_source,
     is_eacsl_instrumented,
+    libc_writer_calls,
     mark_formals_initialized,
     mark_wrapper_results_initialized,
     meta_checks,
@@ -274,8 +279,9 @@ def _security_meta_material(plan: dict) -> dict:
     """
     What the MetAcsl properties add to the key of an E-ACSL build (plan: resolve_security_meta's
     `loaded` result), all of it known before the build:
-      text         the digest of the meta file with every selected property (write_security_meta's
-                   text; a property MetAcsl rejects during the build is part of the cached outcome);
+      text         the digest of the meta file with every selected property (eacsl_security_meta_text's
+                   text, libc writers' assigns included; a property MetAcsl rejects during the build,
+                   and contracts the build drops, are part of the cached outcome);
       stage        the Frama-C flags of the MetAcsl stage and the e-acsl-gcc options that open the
                    next one (eacsl_toolchain.meta_stage_flags);
       properties, functions, harness_functions, left_out
@@ -284,11 +290,10 @@ def _security_meta_material(plan: dict) -> dict:
     The path of security_props.json is not in it: Make names the file, a replay or the build check
     may find it by default, and the same properties must give the same entry.
     """
-    import security_props
-
     selected = plan.get("selected") or []
-    found = security_props.module_meta_file_text({"preamble": plan.get("preamble") or "", "properties": selected}, None)
-    text = eacsl_meta_file_text(found[0], security_props.META_INCLUDE) if found else ""
+    # The text the build tries first: guarded, with the libc writers' assigns (eacsl_security_meta_text).
+    built = eacsl_security_meta_text(plan)
+    text = built[0] if built else ""
     first, options = meta_stage_flags(["-rte"])
     return {
         "text": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -412,6 +417,8 @@ def _build_environ_keep_object(
 SECURITY_PROPS_ENV = "FRAMAC_SECURITY_PROPS"
 # Next to the binary: the log of a build the properties made fail (the module is then built without them).
 SECURITY_META_LOG_SUFFIX = ".security_meta.log"
+# The log of a build the libc writers' assigns made fail (redone without them, _build_with_security_meta).
+SECURITY_META_LIBC_LOG_SUFFIX = ".security_meta_libc.log"
 # How many properties MetAcsl may reject, one stage-1 run each, before the module is built without any.
 SECURITY_META_MAX_REJECTED = 3
 
@@ -553,24 +560,53 @@ def resolve_security_meta(spec: str | None, sources: list[str], out_bin: Path) -
     }
 
 
-def write_security_meta(plan: dict, out_bin: Path, without: set[str] | frozenset[str] = frozenset()) -> dict | None:
+def eacsl_security_meta_text(
+    plan: dict, without: set[str] | frozenset[str] = frozenset(), libc: bool = True
+) -> tuple[str, list[str], list[str], dict[str, str]] | None:
     """
-    Write the meta file of a loaded plan (resolve_security_meta) next to `out_bin`, without the
-    properties named in `without`, and its sidecar: {meta_file, properties, line_names}, or None when
-    no property is left. The text is security_props.module_meta_file_text's, with the libc include
-    line emptied (eacsl_toolchain.eacsl_meta_file_text), so every property keeps its line.
+    (meta file text, property names, libc writers whose assigns it carries, line -> property name)
+    for the E-ACSL build of a loaded plan without the properties named in `without`; None when no
+    property is left. The text is security_props.module_meta_file_text's with:
+      - the libc include line emptied (eacsl_toolchain.eacsl_meta_file_text);
+      - each \\writing and \\reading predicate guarded by the validity of the accessed memory
+        (eacsl_toolchain.eacsl_meta_guarded_text), on its own lines;
+      - with `libc`, the assigns of the libc writers appended after the last property
+        (eacsl_toolchain.eacsl_meta_libc_text), so a call to memcpy gets its \\writing instances.
+    Every property keeps its line; the line map is computed before the appended text.
     """
     import security_props
 
-    remaining = [p for p in plan["selected"] if str(p["name"]) not in without]
-    found = security_props.module_meta_file_text({"preamble": plan["preamble"], "properties": remaining}, None)
+    remaining = [p for p in plan.get("selected") or [] if str(p["name"]) not in without]
+    found = security_props.module_meta_file_text(
+        {"preamble": plan.get("preamble") or "", "properties": remaining}, None
+    )
     if found is None:
         return None
-    text = eacsl_meta_file_text(found[0], security_props.META_INCLUDE)
+    text = eacsl_meta_guarded_text(eacsl_meta_file_text(found[0], security_props.META_INCLUDE))
+    line_names = {str(k): v for k, v in security_props.meta_line_names(text).items()}
+    contracts = eacsl_meta_libc_text() if libc else None
+    if contracts:
+        text = text.rstrip("\n") + "\n" + contracts
+    return text, found[1], list(EACSL_META_LIBC_WRITERS) if contracts else [], line_names
+
+
+def write_security_meta(
+    plan: dict, out_bin: Path, without: set[str] | frozenset[str] = frozenset(), libc: bool = True
+) -> dict | None:
+    """
+    Write the meta file of a loaded plan (resolve_security_meta) next to `out_bin`, without the
+    properties named in `without`, and its sidecar: {meta_file, properties, line_names,
+    libc_contracts}, or None when no property is left. The text is eacsl_security_meta_text's
+    (`libc`: with the libc writers' assigns; `libc_contracts` names them).
+    """
+    built = eacsl_security_meta_text(plan, without, libc)
+    if built is None:
+        return None
+    text, names, libc_contracts, line_names = built
+    remaining = [p for p in plan["selected"] if str(p["name"]) not in without]
     meta_file = Path(out_bin).with_suffix(SECURITY_META_SUFFIX)
     meta_file.parent.mkdir(parents=True, exist_ok=True)
     meta_file.write_text(text, encoding="utf-8", newline="\n")
-    line_names = {str(k): v for k, v in security_props.meta_line_names(text).items()}
     sidecar = {
         "props": plan["props"],
         "meta_file": meta_file.as_posix(),
@@ -583,7 +619,12 @@ def write_security_meta(plan: dict, out_bin: Path, without: set[str] | frozenset
         "line_names": line_names,
     }
     meta_sidecar_path(meta_file).write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8", newline="\n")
-    return {"meta_file": meta_file.as_posix(), "properties": found[1], "line_names": line_names}
+    return {
+        "meta_file": meta_file.as_posix(),
+        "properties": names,
+        "line_names": line_names,
+        "libc_contracts": libc_contracts,
+    }
 
 
 def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | None, dict]:
@@ -598,19 +639,33 @@ def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | 
     `translated` (property -> its checks and the functions holding one), `not_translated` (no run-time
     check: decided statically by MetAcsl, no instance in the instrumented functions, or not translated
     by E-ACSL), `unplanned_instances` (functions holding a check that the property does not list as
-    instances; not for a precondition, which is checked in its target), `rejected`, `left_out`.
+    instances; not for a precondition, which is checked in its target), `rejected`, `left_out`,
+    `libc_contracts` and `libc_unchecked`.
+    The meta file first carries the assigns of the libc writers (eacsl_security_meta_text). A build
+    they make fail, for a reason other than a property MetAcsl rejects, is redone once without them:
+    `libc_contracts` is then {status: dropped, functions, reason, log} (the failed build's log kept as
+    `<out>.security_meta_libc.log`), else {status: loaded, functions}, or {status: missing, reason}
+    when the contracts file is not found. `libc_unchecked` maps each libc function that writes or
+    reads through a pointer and has no contract in this build (EACSL_META_LIBC_UNCHECKED, plus the
+    writers when their contracts are not loaded) to the module's functions that call it: MetAcsl
+    checks no \\writing or \\reading property on those calls in this binary.
     """
     record: dict = {"status": "loaded", "props": plan["props"], "left_out": plan["left_out"]}
     if plan.get("not_for_engine"):
         record["not_for_engine"] = plan["not_for_engine"]
     rejected: list[dict] = []
+    libc = True
+    libc_record: dict | None = None
     while True:
-        written = write_security_meta(plan, out_bin, {r["property"] for r in rejected})
+        written = write_security_meta(plan, out_bin, {r["property"] for r in rejected}, libc=libc)
         if rejected:
             record["rejected"] = rejected
         if written is None:
             record.update(status="dropped", reason="MetAcsl rejected every property")
             return None, record
+        if libc and not written["libc_contracts"]:
+            libc_record = {"status": "missing", "reason": "templates/metacsl/eacsl_libc_writers.h not found"}
+        record["libc_contracts"] = libc_record or {"status": "loaded", "functions": written["libc_contracts"]}
         res = build(written)
         applied = res.pop("security_meta", None) or {}
         if not applied.get("applied"):
@@ -624,6 +679,20 @@ def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | 
         hit = rejected_meta_property(log_text)
         if hit and hit[0] in written["properties"] and len(rejected) < SECURITY_META_MAX_REJECTED:
             rejected.append({"property": hit[0], "reason": hit[1]})
+            continue
+        if written["libc_contracts"] and not hit:
+            libc_log = Path(out_bin).with_suffix(SECURITY_META_LIBC_LOG_SUFFIX)
+            with contextlib.suppress(OSError):
+                libc_log.write_text(log_text, encoding="utf-8", newline="\n")
+            libc, libc_record = (
+                False,
+                {
+                    "status": "dropped",
+                    "functions": written["libc_contracts"],
+                    "reason": f"the E-ACSL build failed with them ({res.get('reason') or res.get('returncode')})",
+                    "log": libc_log.as_posix(),
+                },
+            )
             continue
         kept_log = Path(out_bin).with_suffix(SECURITY_META_LOG_SUFFIX)
         with contextlib.suppress(OSError):
@@ -656,6 +725,11 @@ def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | 
         translated={name: found for name, found in checks.items() if found["checks"]},
         not_translated=[name for name, found in checks.items() if not found["checks"]],
         unplanned_instances=unplanned,
+        libc_unchecked=libc_writer_calls(
+            text,
+            sorted(set(plan.get("functions") or {}) - set(plan.get("harness_functions") or [])),
+            [*EACSL_META_LIBC_UNCHECKED, *(n for n in EACSL_META_LIBC_WRITERS if n not in written["libc_contracts"])],
+        ),
     )
     return res, record
 

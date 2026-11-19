@@ -284,12 +284,13 @@ def test_a_build_the_properties_break_is_never_published(cached_run, monkeypatch
     first = cached_build(monkeypatch, fake)
     assert first["returncode"] == 0 and first["security_props"]["status"] == "dropped"
     assert "-meta" not in first["command"] and first["cache"]["hit"] is False
+    # Tried with the libc writers' assigns, then without them.
     with_meta = [c for c in fake.stage1_cmds if c[-1].endswith(META_SUFFIX)]
-    assert len(with_meta) == 1
+    assert len(with_meta) == 2
     # The next build tries the properties again (the plain build under it is a hit).
     again = cached_build(monkeypatch, fake)
     assert again["security_props"]["status"] == "dropped" and again["cache"]["hit"] is True
-    assert len([c for c in fake.stage1_cmds if c[-1].endswith(META_SUFFIX)]) == 2
+    assert len([c for c in fake.stage1_cmds if c[-1].endswith(META_SUFFIX)]) == 4
     # Once the toolchain takes them, the build with them is made and cached.
     fixed = CachingToolchain()
     built = cached_build(monkeypatch, fixed)
