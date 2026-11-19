@@ -63,7 +63,6 @@ def _breaker(
         "crash_artifact": f"agents/{aid}/scratch/crash-in" if crash is not None else None,
         "failing_predicate": PRED if crash is not None else None,
         "analysis": "A two-byte tag reaches the read.",
-        "suggested_requires": None,
         "fault_hypothesis": (
             {"input_condition": "tag 0x04", "predicate": PRED, "why_not_reproduced": "no session state"}
             if hypothesis

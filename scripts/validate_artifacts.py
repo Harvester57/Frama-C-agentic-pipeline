@@ -437,6 +437,18 @@ def validate_agent_result(data, run_dir: Path | None = None) -> Errors:
             errors.add("$: crash_found requires crash_artifact and failing_predicate")
         if data["status"] == "crash_found" and data["fault_hypothesis"] is not None:
             errors.add("$.fault_hypothesis: a reproduced crash is not a hypothesis; set null")
+        if data.get("line") is not None and data["status"] != "crash_found" and data["fault_hypothesis"] is None:
+            errors.add("$.line: the line of failing_predicate or of fault_hypothesis.predicate; null without either")
+        seen_other: set[str] = set()
+        for idx, entry in enumerate(data.get("other_function_crashes") or []):
+            where = f"$.other_function_crashes[{idx}]"
+            _under_agent_dir(errors, f"{where}.crash_artifact", aid, entry["crash_artifact"])
+            art = str(entry["crash_artifact"]).replace("\\", "/")
+            if art == str(data["crash_artifact"] or "").replace("\\", "/"):
+                errors.add(f"{where}.crash_artifact: already the result's crash_artifact; list it once")
+            elif art in seen_other:
+                errors.add(f"{where}.crash_artifact: listed twice")
+            seen_other.add(art)
     elif role == "architect":
         _under_agent_dir(errors, "$.patch", aid, data["patch"])
         for idx, item in enumerate(data.get("functions") or []):

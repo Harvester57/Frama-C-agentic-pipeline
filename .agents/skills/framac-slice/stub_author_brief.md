@@ -6,12 +6,15 @@ Your task is to write the ACSL contracts of the external library functions in `{
 
 ## Input Context
 
-- **Run directory (container working directory):** `/framac-run`; the target is read-only at `/target`
-- **Your file (the only file you may write):** `{header}`
+- **Run directory:** `{run_dir}` on the host, `/framac-run` (the working directory) in the container; the target `{target_dir}` is read-only at `/target`. Run every command through the wrapper, as **How to run commands** below says.
+- **Your agent id:** `{agent_id}`
+- **Your header (the only run file you may change):** `{header}`, a path relative to the run directory. Edit it on the host as `{run_dir}/{header}`; commands name it `{header}`. Your scratch directory `{run_dir}/agents/{agent_id}/scratch/` is for the script files of your commands.
 - **Functions to contract (state `draft` or `incomplete` in `workspace/reports/stubs.json`):** {functions}
 - **Their callers in the target (`file#function`):** {callers}
-- **The real header, for the types, macros and comments:** `{real_header}` (read it in the snapshot, `workspace/snapshot/root{real_header}`, when the image does not have it)
+- **The real header, for the types, macros and comments:** `{real_header}`, a path on the build's system. Read it on the host in the run's snapshot, `{run_dir}/workspace/snapshot/root{real_header}` (a libc header the build image adds is under `snapshot/libc` instead); when the snapshot has no copy, read it in the container through the wrapper (`cat {real_header}`)
 - **The library's documentation:** its man pages, the comments of the real header, its project documentation. Cite what you rely on in a C comment above the contract (`/* man 3 foo: "..." */`).
+
+<!-- run-commands -->
 
 ## What `stub_gen.py` wrote
 
@@ -42,15 +45,17 @@ The frame is a guess from the signature: a pointer followed by a length-named va
 5. **`ensures`: only what the documentation guarantees.** A return-value range (`\result == 0 || \result == -1`), what an output holds on success (`\result == 0 ==> \initialized(out + (0 .. n - 1))`), whether a returned pointer may be NULL (`\result == \null || \valid(\result)`). No `ensures` you cannot cite: an unjustified postcondition is an unproven assumption that makes the callers' proofs wrong.
 6. **No `terminates`/`exits` guesses:** write `terminates \true;` and `exits \false;` only when the documentation says the function returns and never exits.
 7. **Name every clause** (`requires valid_buf: ...;`, `ensures status: ...;`), in Frama-C's order: `requires` -> `terminates` -> `exits` -> `assigns` -> `ensures` -> `behavior`.
-8. **Write only `{header}`.** If a function needs a contract in another header (a callee of a macro, a type's helper), name it in `notes`.
+8. **Change only `{header}`** (and your own scratch directory). If a function needs a contract in another header (a callee of a macro, a type's helper), name it in `notes`.
 
 ## Before you finish
 
-Run, from `/framac-run`:
+Run, through the wrapper:
 
 ```text
 python3 /opt/framac-pipeline/scripts/pipeline_make.py run stubs stub-check
 ```
+
+The reports below are paths relative to the run directory: read them on the host under `{run_dir}/`.
 
 `stubs` re-reads the states: every block you finished must read `filled` in `workspace/reports/stubs.json`, and the header's `problems` must be empty. `stub-check` then checks `{header}` three ways (`workspace/reports/stub_check.json`, under `headers`):
 
@@ -66,4 +71,4 @@ A header with a frame lacking `\from`, a failed `abi`, an `eva` error, an E-ACSL
 
 ## Result
 
-Write `agents/<your agent id>/result.json` only if the parent asked for one; otherwise end with a short report: the functions you filled, the ones left as drafts and why, the documentation you used, and `notes` for the parent.
+Write `agents/{agent_id}/result.json` only if the parent asked for one; otherwise end with a short report: the functions you filled, the ones left as drafts and why, the documentation you used, and `notes` for the parent.

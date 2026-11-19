@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import posixpath
 import re
 import sys
@@ -487,19 +488,66 @@ def cmd_run(model_path: Path, capture_path: Path, overlay: Path, out: Path, read
 # ---------------------------------------------------------------------------
 
 
-def render_brief(header: str, report: dict, template: str | None = None) -> str:
+def default_agent_id(header: str) -> str:
+    """The stub author's agent id for an overlay header (`workspace/stubs/json-c/json.h` -> `stub-json-c_json_h`)."""
+    name = header[len(STUB_OVERLAY_REL) + 1 :] if header.startswith(STUB_OVERLAY_REL + "/") else header
+    return "stub-" + (re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "header")
+
+
+def run_command_values(run_dir: Path, agent_id: str) -> dict[str, str]:
+    """
+    The host paths of the shared "How to run commands" block, found as `workspace_overlay.prepare_agent` finds
+    them: the wrapper's environment (FRAMAC_TARGET_HOST, FRAMAC_RUN_HOST, FRAMAC_REFERENCES_HOST) first, then
+    the run's metadata. The brief may be rendered inside the container, where `run_dir` is /framac-run.
+    """
+    import workspace_overlay  # lazily: it is heavy, and it does not import this module
+
+    run_meta = load_json_optional(run_dir / "run-metadata.json", {})
+    if not isinstance(run_meta, dict):
+        run_meta = {}
+    path = workspace_overlay._brief_path
+    references_host = path(
+        os.environ.get("FRAMAC_REFERENCES_HOST") or str(Path(__file__).resolve().parent.parent / "docs" / "references")
+    )
+    return {
+        "agent_id": agent_id,
+        "target_dir": path(os.environ.get("FRAMAC_TARGET_HOST") or run_meta.get("target") or "/target"),
+        "run_dir": path(os.environ.get("FRAMAC_RUN_HOST") or run_meta.get("run_dir_host") or str(run_dir.resolve())),
+        "pipeline_dir": workspace_overlay._pipeline_host_dir(references_host),
+    }
+
+
+def render_brief(
+    header: str,
+    report: dict,
+    template: str | None = None,
+    *,
+    agent_id: str | None = None,
+    run_dir: Path | None = None,
+) -> str:
+    """
+    The stub author's brief for `header`, with the shared "How to run commands" block spliced at its sentinel:
+    the author runs on the host and reaches the container only through the wrapper.
+    """
     rec = (report.get("headers") or {}).get(header)
     if rec is None:
         raise KeyError(f"{header} is not an overlay header of {STUB_REPORT_REL}: run `pipeline_make.py run stubs`")
+    import workspace_overlay
+
     todo = sorted(fn for fn, f in rec["functions"].items() if f["state"] in ("draft", "incomplete"))
     callers = sorted({c for f in rec["functions"].values() for c in f.get("callers") or []})
     text = template if template is not None else BRIEF.read_text(encoding="utf-8")
+    text = text.replace(
+        workspace_overlay.RUN_COMMANDS_SENTINEL,
+        workspace_overlay._resolve_brief_template("run_commands").rstrip("\n"),
+    )
     values = {
         "header": header,
         "include_name": rec.get("include_name") or "",
         "real_header": rec.get("real") or "(unknown)",
         "functions": ", ".join(todo) or "(none: every block is filled)",
         "callers": ", ".join(callers) or "(none recorded)",
+        **run_command_values(Path(".") if run_dir is None else run_dir, agent_id or default_agent_id(header)),
     }
     for key, value in values.items():
         text = text.replace("{" + key + "}", value)
@@ -517,16 +565,32 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("brief", help="Print the stub-author brief for one overlay header")
     b.add_argument("--header", required=True, help=f"{STUB_OVERLAY_REL}/<name>, as the report names it")
     b.add_argument("--report", type=Path, default=Path(STUB_REPORT_REL))
+    b.add_argument(
+        "--agent-id",
+        type=_agent_id_arg,
+        default=None,
+        help="the author's agent id (default: stub-<header name>); its agents/<id>/scratch/ is created",
+    )
     args = parser.parse_args(argv)
     if args.cmd == "run":
         return cmd_run(args.model, args.capture, args.overlay, args.out)
     report = load_json_optional(args.report, {})
+    agent_id = args.agent_id or default_agent_id(args.header)
     try:
-        print(render_brief(args.header, report if isinstance(report, dict) else {}))
+        text = render_brief(args.header, report if isinstance(report, dict) else {}, agent_id=agent_id)
     except KeyError as exc:
         print(json.dumps({"ok": False, "error": str(exc.args[0])}))
         return 1
+    # The brief's command scripts go here (`-ScriptFile` / `--script-file`); the working directory is the run's.
+    (Path("agents") / agent_id / "scratch").mkdir(parents=True, exist_ok=True)
+    print(text)
     return 0
+
+
+def _agent_id_arg(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise argparse.ArgumentTypeError(f"invalid agent id {value!r}: letters, digits, '_' and '-' only")
+    return value
 
 
 if __name__ == "__main__":

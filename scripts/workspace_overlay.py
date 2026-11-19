@@ -3382,6 +3382,21 @@ def prepare_agent(
             )
         elif function and role in ("prover", "breaker"):
             harness_module_name = harness_module_for_function(mm, module, norm_c_file, function) or module
+        elif role == "verifier":
+            # A hypothesis or Eva candidate may carry its link unit: the harness the parent replays it on
+            # (wp_scheduler._verify_harness_module, crash_replay.replay_build_spec) is the one whose scope
+            # holds the candidate's location.
+            raw_loc = cand_obj.get("location")
+            cand_loc: dict = raw_loc if isinstance(raw_loc, dict) else {}
+            harness_module_name = (
+                harness_module_for_function(
+                    mm,
+                    module,
+                    str(cand_loc.get("file") or norm_c_file or "") or None,
+                    str(cand_loc.get("function") or function or "") or None,
+                )
+                or module
+            )
     brief_meta = mm.sidecars.get(harness_module_name) if harness_module_name else None
     if not isinstance(brief_meta, dict) or not brief_meta:
         brief_meta = hmeta
