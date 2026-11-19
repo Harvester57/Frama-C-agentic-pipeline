@@ -154,6 +154,87 @@ def test_a_declared_global_two_programs_define_is_recorded_unresolved():
 
 
 @pytest.mark.unit
+def test_cross_parse_address_refs_size_constructor_and_fallback_globals():
+    """C1: B1 cross-parse address_refs, B5 global size, B8 constructor and gcc_fallback globals."""
+    units = {
+        "libcore.a": {"kind": "static_lib", "files": ["lib/core.c"], "links": []},
+        "libbad.a": {"kind": "static_lib", "files": ["lib/bad.c"], "links": []},
+        "prog": {"kind": "executable", "files": ["src/app.c"], "links": ["libcore.a"]},
+        "prog_bad": {"kind": "executable", "files": ["src/app_bad.c"], "links": ["libbad.a"]},
+    }
+    b = _builder(units)
+    lib_cb = _fn("lib_cb", "lib_cb", "lib/core.c", 1)
+    lib_cb.update(address_refs=[], global_refs=[], constructor=False)
+    b.add_dump(
+        ["libcore.a"],
+        {
+            "schema": 6,
+            "functions": [lib_cb],
+            "globals": [
+                {
+                    "name": "g_buf",
+                    "kernel_name": "g_buf",
+                    "loc": "lib/core.c:10",
+                    "static": False,
+                    "type": "unsigned char [64]",
+                    "size": 64,
+                    "init_functions": [],
+                    "init_globals": [],
+                }
+            ],
+            "address_taken": [],
+        },
+    )
+    app_take = _fn("app_take", "app_take", "src/app.c", 5)
+    app_take.update(address_refs=["lib_cb"], global_refs=["g_buf"], constructor=True)
+    b.add_dump(
+        ["prog"],
+        {
+            "schema": 6,
+            "functions": [app_take],
+            "globals": [
+                {
+                    "name": "g_ops",
+                    "kernel_name": "g_ops",
+                    "loc": "src/app.c:2",
+                    "static": False,
+                    "type": "int (*[1])(int)",
+                    "size": 8,
+                    "init_functions": ["lib_cb"],
+                    "init_globals": [],
+                }
+            ],
+            "address_taken": ["lib_cb"],
+        },
+    )
+    # libbad.a fell back to GCC: prog_bad's unknown global ref cannot be assumed external/libc.
+    b.add_gcc(["libbad.a"], {"functions": {}, "indirect": [], "edges": []})
+    app_bad = _fn("app_bad", "app_bad", "src/app_bad.c", 3)
+    app_bad.update(address_refs=[], global_refs=["missing_from_bad"])
+    b.add_dump(["prog_bad"], {"schema": 6, "functions": [app_bad], "globals": []})
+    b.resolve()
+    assert b.functions["src/app.c#app_take"]["address_refs"] == ["lib/core.c#lib_cb"]
+    assert b.functions["src/app.c#app_take"]["constructor"] is True
+    assert b.functions["lib/core.c#lib_cb"]["constructor"] is False
+    assert b.functions["lib/core.c#lib_cb"]["address_taken"] is True
+    assert b.global_vars["src/app.c#g_ops"]["init_functions"] == ["lib/core.c#lib_cb"]
+    assert b.global_vars["src/app.c#g_ops"]["size"] == 8
+    assert b.global_vars["lib/core.c#g_buf"]["size"] == 64
+    assert b.functions["src/app_bad.c#app_bad"]["unresolved_global_refs"] == ["missing_from_bad"]
+    # Validate the resulting model shape against phase0_model.schema.json.
+    model = {
+        "schema_version": pm.SCHEMA_VERSION,
+        "generated_at": "2026-11-20T00:00:00Z",
+        "status": "ok",
+        "capture": "workspace/reports/build_capture.json",
+        "warnings": [],
+        "functions": {fid: {**rec, "external_calls": []} for fid, rec in sorted(b.functions.items())},
+        "global_variables": dict(sorted(b.global_vars.items())),
+    }
+    assert pm.validate_model(model) == []
+
+
+@pytest.mark.unit
 def test_a_library_call_to_a_function_its_consumer_defines_resolves_there():
     b = _builder(LIB_EXE)
     b.add_dump(["libkv.a"], {"functions": [_fn("kv_next", "kv_next", "src/lexer.c", 1, [_call("user_hook")])]})

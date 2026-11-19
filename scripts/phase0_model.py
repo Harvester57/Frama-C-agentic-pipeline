@@ -162,6 +162,11 @@ _SELFTEST_FILES = {
         "void fill(int *p, int n) { for (int i = 0; i < n; i++) p[i] = 0; counter++; }\n"
         "int (*table[1])(int) = { twice };\n"
         "int use_table(int x) { return table[0](x); }\n"
+        "struct cb_box { int (*fn)(int); };\n"
+        "int use_local_table(int x) { static int (*const sl[1])(int) = { twice }; return sl[0](x); }\n"
+        "int use_compound(int x) { const struct cb_box *b = &(struct cb_box){ .fn = twice }; return b->fn(x); }\n"
+        "void (*use_cast(void))(void) { return (void (*)(void))twice; }\n"
+        "static void __attribute__((constructor)) init_ctor(void) { counter = 1; }\n"
     ),
     "b.c": (
         "static int helper(int x) { return x - 1; }\n"
@@ -769,9 +774,15 @@ class ModelBuilder:
         self.declared_info: dict[str, dict] = {}
         # Callee id -> (caller id, call location, argument index, bytes): what the callers pass.
         self.arg_sites: dict[str, set[tuple[str, str, str, int]]] = defaultdict(set)
-        # Address flow (dump schema 6), resolved in `resolve`: (function or global id, its record, the
-        # kernel names of the functions and globals it names, that parse's function and global maps).
-        self.pending_refs: list[tuple[dict, list[str], list[str], dict[str, str], dict[str, str], str, str]] = []
+        # Units whose Frama-C parse failed (gcc_fallback / unparsed): globals defined there are missing.
+        self.failed_units: set[str] = set()
+        # Cross-parse `address_taken` names resolved in `resolve_refs`: (units, kernel_names, kmap).
+        self.pending_taken: list[tuple[list[str], list[str], dict[str, str]]] = []
+        # Address flow (dump schema 6), resolved in `resolve`: (units, target record, kernel names
+        # of functions and globals it names, that parse's function and global maps, target keys).
+        self.pending_refs: list[
+            tuple[list[str], dict, list[str], list[str], dict[str, str], dict[str, str], str, str]
+        ] = []
 
     def _record_arg_sizes(self, caller: str, callee: str, call: dict) -> None:
         sizes = call.get("arg_sizes")
@@ -804,6 +815,8 @@ class ModelBuilder:
             rec.clear()
             rec.update(record, **keep)
             rec["address_taken"] = address_taken or bool(record.get("address_taken"))
+        elif "constructor" in record:
+            rec["constructor"] = bool(rec.get("constructor")) or bool(record["constructor"])
         if unit not in rec["units"]:
             rec["units"].append(unit)
         if record.get("kernel_name"):
@@ -840,6 +853,7 @@ class ModelBuilder:
                         "lines": max(1, last - first + 1),
                         "static": bool(fn.get("static")),
                         "inline": bool(fn.get("inline")),
+                        **({"constructor": bool(fn["constructor"])} if "constructor" in fn else {}),
                         "header": rel.endswith(".h"),
                         "signature": fn.get("signature") or "",
                         "loops": int(fn.get("loops") or 0),
@@ -871,11 +885,13 @@ class ModelBuilder:
                     },
                 )
                 rec["units"] = sorted(set(rec["units"]) | set(units))
+                if isinstance(g.get("size"), int) and g["size"] > 0 and rec.get("size") is None:
+                    rec["size"] = g["size"]
                 if flow:
                     rec.setdefault("init_functions", [])
                     rec.setdefault("init_globals", [])
                     refs = (list(g.get("init_functions") or []), list(g.get("init_globals") or []))
-                    self.pending_refs.append((rec, *refs, kmap, gmap, "init_functions", "init_globals"))
+                    self.pending_refs.append((list(units), rec, *refs, kmap, gmap, "init_functions", "init_globals"))
         if flow:
             for fn in dump.get("functions") or []:
                 ref_fid = kmap.get(fn["kernel_name"])
@@ -884,7 +900,7 @@ class ModelBuilder:
                     rec.setdefault("address_refs", [])
                     rec.setdefault("global_refs", [])
                     refs = (list(fn.get("address_refs") or []), list(fn.get("global_refs") or []))
-                    self.pending_refs.append((rec, *refs, kmap, gmap, "address_refs", "global_refs"))
+                    self.pending_refs.append((list(units), rec, *refs, kmap, gmap, "address_refs", "global_refs"))
         for d in dump.get("declared") or []:
             if d.get("name") and d.get("formals") is not None:
                 self.declared_formals.setdefault(d["name"], d["formals"])
@@ -892,11 +908,15 @@ class ModelBuilder:
                 self.declared_info.setdefault(
                     d["name"], {"decl": d["decl"], "proto": d["proto"], "signature": d.get("signature") or ""}
                 )
-        for k in dump.get("address_taken") or []:
+        taken_names = list(dump.get("address_taken") or [])
+        for k in taken_names:
             if k in kmap:
                 self.functions[kmap[k]]["address_taken"] = True
                 for u in units:
                     self.taken[u].add(kmap[k])
+        unresolved_taken = [k for k in taken_names if k not in kmap]
+        if unresolved_taken:
+            self.pending_taken.append((list(units), unresolved_taken, kmap))
         for u in units:
             self.kmap[u] = kmap
         for fn in dump.get("functions") or []:
@@ -930,6 +950,7 @@ class ModelBuilder:
                     self.pending_calls.append((u, caller, {**call, "resolved_args": args}))
 
     def add_gcc(self, units: list[str], g: dict) -> None:
+        self.failed_units.update(units)
         for fid, info in g["functions"].items():
             for u in units:
                 self.add_function(
@@ -981,19 +1002,44 @@ class ModelBuilder:
 
     def resolve_refs(self) -> None:
         """
-        The address-flow facts (dump schema 6) as ids: a function's address its parse defines, a
-        global its parse defines, else the one non-static global of that name another parse defines
-        (an `extern` the parse only declares). Libc functions and globals are not the project's. A
-        declared global that several parses define (non-static) cannot be resolved: its name goes to
-        `unresolved_global_refs`, and the DAG gives no address-flow facts to the code that reads it
-        (build_callgraph_dag.model_view), so its unit's split keeps the call graph's reach.
+        The address-flow facts (dump schema 6) as ids: a function's address its parse defines or
+        another linked unit defines (`_lookup_global`, matching `resolve()`), a global its parse
+        defines, else the one non-static global of that name another parse defines (an `extern` the
+        parse only declares). Libc functions and globals are not the project's. A declared global
+        that several parses define (non-static), or an unknown global when a unit in the parse's
+        link closure failed Frama-C parsing (`gcc_fallback` / `unparsed`), cannot be resolved: its
+        name goes to `unresolved_global_refs`, and the DAG gives no address-flow facts to the code
+        that reads it (build_callgraph_dag.model_view), so its unit's split keeps the call graph's
+        reach.
         """
+        for units, names, _kmap in self.pending_taken:
+            for k in names:
+                fid: str | None = None
+                for u in units:
+                    fid = self._lookup_global(u, k)
+                    if fid is not None:
+                        break
+                if fid is not None:
+                    self.functions[fid]["address_taken"] = True
+                    for u in units:
+                        self.taken[u].add(fid)
+        self.pending_taken = []
         by_name: dict[str, list[str]] = defaultdict(list)
         for global_id, g in self.global_vars.items():
             if not g.get("static"):
                 by_name[str(g["name"])].append(global_id)
-        for rec, fnames, gnames, kmap, gmap, fkey, gkey in self.pending_refs:
-            fids = {kmap[k] for k in fnames if k in kmap}
+        for units, rec, fnames, gnames, kmap, gmap, fkey, gkey in self.pending_refs:
+            fids: set[str] = set()
+            for k in fnames:
+                fid = kmap.get(k)
+                if fid is None:
+                    for u in units:
+                        fid = self._lookup_global(u, k)
+                        if fid is not None:
+                            break
+                if fid is not None:
+                    fids.add(fid)
+            has_failed_closure = any(other in self.failed_units for u in units for other in self.closure.get(u, ()))
             gids: set[str] = set()
             unresolved: set[str] = set()
             for k in gnames:
@@ -1003,7 +1049,7 @@ class ModelBuilder:
                     found = cands[0]
                 if found is not None:
                     gids.add(found)
-                elif len(cands) > 1:
+                elif len(cands) > 1 or (not cands and has_failed_closure):
                     unresolved.add(k)
             rec[fkey] = sorted(set(rec.get(fkey) or []) | fids)
             rec[gkey] = sorted(set(rec.get(gkey) or []) | gids)
@@ -1380,6 +1426,10 @@ def selftest(runner: Runner | None = None) -> dict:
         "b.c#run_b",
         "a.c#fill",
         "a.c#use_table",
+        "a.c#use_local_table",
+        "a.c#use_compound",
+        "a.c#use_cast",
+        "a.c#init_ctor",
     }
     edges = {(a, b, k) for (a, b, k) in builder.edges}
     want_edges = {
@@ -1400,19 +1450,36 @@ def selftest(runner: Runner | None = None) -> dict:
         problems.append(f"fill writes {writes}")
     if "a.c#counter" not in builder.global_vars:
         problems.append(f"globals {sorted(builder.global_vars)}")
-    # Address flow (dump schema 6): `run_a` takes `twice`'s address, `table`'s initializer names it,
-    # `use_table` reads `table` and `fill` writes `counter`.
+    # Address flow (dump schema 6): `run_a`, `use_compound`, `use_cast` take `twice`'s address;
+    # `table` and static-local `sl` hold it in initializers; `use_table` and `use_local_table` read
+    # them; `fill` and `init_ctor` write `counter`; `init_ctor` is a constructor; globals carry size.
     flow = {
         "run_a address_refs": (builder.functions.get("a.c#run_a") or {}).get("address_refs"),
+        "use_compound address_refs": (builder.functions.get("a.c#use_compound") or {}).get("address_refs"),
+        "use_cast address_refs": (builder.functions.get("a.c#use_cast") or {}).get("address_refs"),
         "use_table global_refs": (builder.functions.get("a.c#use_table") or {}).get("global_refs"),
+        "use_local_table global_refs": (builder.functions.get("a.c#use_local_table") or {}).get("global_refs"),
         "fill global_refs": (builder.functions.get("a.c#fill") or {}).get("global_refs"),
         "table init_functions": (builder.global_vars.get("a.c#table") or {}).get("init_functions"),
+        "sl init_functions": (builder.global_vars.get("a.c#sl") or {}).get("init_functions"),
+        "counter size": (builder.global_vars.get("a.c#counter") or {}).get("size"),
+        "table size": (builder.global_vars.get("a.c#table") or {}).get("size"),
+        "init_ctor constructor": (builder.functions.get("a.c#init_ctor") or {}).get("constructor"),
+        "run_a constructor": (builder.functions.get("a.c#run_a") or {}).get("constructor"),
     }
     want_flow = {
         "run_a address_refs": ["a.c#twice"],
+        "use_compound address_refs": ["a.c#twice"],
+        "use_cast address_refs": ["a.c#twice"],
         "use_table global_refs": ["a.c#table"],
+        "use_local_table global_refs": ["a.c#sl"],
         "fill global_refs": ["a.c#counter"],
         "table init_functions": ["a.c#twice"],
+        "sl init_functions": ["a.c#twice"],
+        "counter size": 4,
+        "table size": 8,
+        "init_ctor constructor": True,
+        "run_a constructor": False,
     }
     if flow != want_flow:
         problems.append(f"address flow {flow}")

@@ -85,6 +85,9 @@ let signature t =
 
 let is_fun_var (v : varinfo) = Ast_types.is_fun v.vtype
 
+let is_constructor (v : varinfo) =
+  Ast_attributes.contains "constructor" v.vattr || Ast_attributes.contains "constructor" v.vtype.tattr
+
 (* Functions whose address is taken anywhere, collected over the whole AST. *)
 let address_taken : (string, unit) Hashtbl.t = Hashtbl.create 64
 
@@ -307,6 +310,7 @@ let function_json kf =
       ("last_line", I (max first !last));
       ("static", B (vi.vstorage = Static));
       ("inline", B vi.vinline);
+      ("constructor", B (is_constructor vi));
       ("signature", S (signature vi.vtype));
       ("loops", I !loops);
       ("cyclomatic", I (1 + !decisions));
@@ -344,10 +348,12 @@ let run () =
             let r = new_refs () in
             ignore (Visitor.visitFramacGlobal (new ref_scan r) g);
             let gvars = List.filter (fun n -> n <> vi.vname) r.gvars in
+            let size_field = match bytes_of vi.vtype with Some n -> [ ("size", I n) ] | None -> [] in
             Some
-              (O [ ("name", S vi.vorig_name); ("kernel_name", S vi.vname); ("loc", S (loc_s loc));
-                   ("static", B (vi.vstorage = Static)); ("type", S (canon vi.vtype));
-                   ("init_functions", names r.faddr); ("init_globals", names gvars) ])
+              (O ([ ("name", S vi.vorig_name); ("kernel_name", S vi.vname); ("loc", S (loc_s loc));
+                    ("static", B (vi.vstorage = Static)); ("type", S (canon vi.vtype)) ]
+                  @ size_field
+                  @ [ ("init_functions", names r.faddr); ("init_globals", names gvars) ]))
           | _ -> None)
         (Ast.get ()).globals
     in
