@@ -580,3 +580,39 @@ Entries from package C of [`../plans/metacsl-exploitation-plan.md`](../plans/met
 - **Seen on:** package F of the MetAcsl plan, 2026-11-18, writing `tests/test_metacsl_followups.py`: an f-string holding a whole MetAcsl annotation (comment opener and closer included) in which each backslash is the hole `{b}`, `b` being a one-backslash string, as in `{b}separated({b}written, &auth_ok)`.
 - **Cause:** pipeline bug in the checker, not in the file. `_python_string_values` of [`../../tools/check_generated_text.py`](../../tools/check_generated_text.py) replaces every hole of an f-string by `{}`, so the text it checks reads `{}separated(`, and `_MISSING_CALL_RE` excludes an opening brace before a builtin's name but not a closing one. The string's run-time value is correct ACSL.
 - **Fix:** none in the checker. **Open pipeline bug:** a hole that stands for the backslash is read as a missing backslash. Workaround used in the test: a raw string with the backslashes written out, and `str.replace` for the variable part.
+
+### Symptom: `/home/opam/.opam/5.5/bin/e-acsl-gcc exceeded the 3600 s build time limit` on a Large Whole-Program Slice
+- **Seen on:** nginx 1.31.9 run-5, 2026-11-19, `pipeline_make.py run build --jobs 1`, module `nginx__ngx_bpf` (`run_eacsl_fuzz.py build ... --engine=auto`).
+  - The module has 23 functions, but its `SOURCES_` list holds 135 of the unit's 137 files (`nginx__ngx_http_script` gets all 137). So the E-ACSL frontend instruments the whole program.
+  - The build container was at 10.68 GiB after 35 minutes. At 3600 s `fuzz_build._run_tool` killed `e-acsl-gcc`, and no `fuzz_nginx__ngx_bpf.instrumented.c` was written. Engine `auto` then fell back to the ASan/UBSan build.
+  - `workspace/harnesses/fuzz_nginx__ngx_bpf.compile.log` has one `Command: /home/opam/.opam/5.5/bin/e-acsl-gcc -n ...` section with `Returncode: 124`. It holds about 950 `warning: "RWF_*" redefined` / `note:` lines and ends with:
+    ```text
+    cc1: note: unrecognized command-line option '-Wno-unknown-warning-option' may have been intended to silence earlier diagnostics
+
+    /home/opam/.opam/5.5/bin/e-acsl-gcc exceeded the 3600 s build time limit
+    ```
+  - What the operator would have got before the fix:
+    - The build report said `engine_fallback_reason: eacsl_instrumentation_failed`, the same as a Frama-C error.
+    - The build-check row was a bare `"status": "eacsl_fallback", "ok": false` with `first_error: null` (checked on the run-5 log), and no `reason_code`, `reason` or `next_step`.
+    - If an earlier line had matched build-check's error pattern, that unrelated line would have been reported instead.
+- **Cause:** two parts.
+  - **The cost itself (open).** The E-ACSL instrumentation of a whole program does not fit in the build class's fixed wall time (`resources.CLASSES["build"].wall_timeout_s`, 3600 s, `fuzz_common.BUILD_TIMEOUT_S`). The time limit is fixed on purpose, so that results do not depend on the machine. The module gets the whole program because of the unit split. For the same cost as memory (run-3 OOM), see [`./resources-and-infra.md`](./resources-and-infra.md) ("`build-check` E-ACSL Build OOM-Killed: Two Whole-Program Builds Admitted at 2 GiB Each"). For the split itself, see [`./phase0-build-and-model.md`](./phase0-build-and-model.md) ("The Unit Split Leaves One Cluster With Almost the Whole Program").
+  - **The report (pipeline bug, fixed).**
+    - `compile_eacsl_binary` gave a step killed at the limit (`_run_tool`: return code 124 and the limit line) the generic reason of its stage.
+    - `pipeline_make.KNOWN_EACSL_FAILURES` had no entry for it.
+    - `_first_build_error` saw only warnings, notes and no wrap-up line, so it returned None.
+- **Fix (report):** branch `sup/nginx-eacsl-build-timeout`, commit `20f8c53`, held, not merged.
+  - [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py): an E-ACSL step killed at the limit gives reason `eacsl_build_timeout`, at stage 1 or stage 2. The build report's `engine_fallback_reason` then names it.
+  - [`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py): `KNOWN_EACSL_FAILURES` gets `eacsl_build_timeout` (schema enum in [`../../schemas/build_check.schema.json`](../../schemas/build_check.schema.json)). It matches only when the attempt has `Returncode: 124` and ends with the limit line, and it is checked first.
+    - The row's `reason` names the tool and the limit as parsed from the log. It says this is typical of a module whose sources are the whole program, and that the fix is a smaller unit, not a larger limit.
+    - `next_step` is `python3 $S/pipeline_make.py params set --module <mod> --fuzz-engine sanitizers`.
+    - As with the other known failures, the module fails until that choice is recorded. build-check never switches the engine itself.
+    - `_first_build_error` returns the limit line with "(the attempt was killed at this time limit; no error ended it)".
+  - [`../../scripts/phase0_gates.py`](../../scripts/phase0_gates.py): the `fuzz-<mod>` gate message says the build cannot finish within the fixed time limit, and that the fix is a smaller unit.
+  - On the run-5 log, the fixed code gives `first_error` = the limit line and `reason_code` `eacsl_build_timeout` with `3600 s`.
+  - Tests:
+    - `tests/test_pipeline_make.py::test_build_check_names_an_eacsl_build_killed_at_the_time_limit`: a log shaped like run-5's, with an `error:`-looking decoy line before the kill. It covers the `eacsl_fallback` and `build_failed` rows, a parsed `900.0 s` limit, no match without `Returncode: 124`, and the gate message.
+    - `tests/test_tool_sizing.py::test_an_instrumentation_killed_at_the_build_time_limit_is_named_as_such`: stage 1 killed, then the log fuzz_build writes is read by build-check.
+    - `test_compile_stages_get_the_build_class_timeout` now expects `eacsl_build_timeout`; it expected `eacsl_compile_failed` before.
+- **Open pipeline bug:** the E-ACSL instrumentation of a whole nginx program does not finish in the fixed 3600 s build limit, and it takes more than 10 GiB. Any module whose unit the split leaves whole is hit, whatever its function count. The fix belongs in the unit split: give each module only the files its functions need. Raising the limit is not the fix.
+- **Workaround on run-5:** the user recorded `params set --fuzz-engine sanitizers` for both `nginx__ngx_bpf` and `nginx__ngx_http_script` at 20:30 local, and the run rebuilt both with the sanitizers. Both modules lose the E-ACSL checks (sub-object overflow, `\initialized`), and the run report must say so.

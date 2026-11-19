@@ -40,7 +40,7 @@ The full resource and cache design guide is [`../guides/resources-and-caching.md
 - **Seen on:** nginx 1.31.9 run-3, `pipeline_make.py build-check`, 2026-11-19.
   - Container `framac-df5a91d5be63` had a 17 GiB limit (`HostConfig.Memory` 18253611008, `MemorySwap` equal), 32 host CPUs and a 30-CPU pool.
   - Make ran `resources.py run --class build --key nginx__ngx_event_openssl ... -- run_eacsl_fuzz.py build ...` and the same for `nginx__ngx_files` at the same time.
-  - Each E-ACSL instrumentation is a whole-program Frama-C, because the two `SOURCES_` lists hold 163 and 161 of the unit's 165 files. Even the 20-function cluster gets them; that unit-split gap is tracked separately.
+  - Each E-ACSL instrumentation is a whole-program Frama-C, because the two `SOURCES_` lists hold 163 and 161 of the unit's 165 files. Even the 20-function cluster gets them; that unit-split gap is tracked separately. On run-5 the same whole-program instrumentation also ran out of time: `nginx__ngx_bpf` (23 functions, 135 of 137 files) was killed at the fixed 3600 s build limit. See "`/home/opam/.opam/5.5/bin/e-acsl-gcc exceeded the 3600 s build time limit` on a Large Whole-Program Slice" in [`./eacsl-and-fuzzing.md`](./eacsl-and-fuzzing.md).
   - At 15:01:24 the container was at 98.7% (16.78/17 GiB), and the two Frama-C processes held 8.76 GB and 8.39 GB RSS.
   - Docker logged an `oom` event at 15:01:48, and the cgroup OOM killer took a Frama-C. The container's own record (`phase-static`, 14:15:31Z) says `oom_kills: 2`, `peak_mb: 17408`.
   - The job history then said `peak_mb` 17173 (rusage) for the openssl key and 8809 for the files key. Both records had `oom_killed: false` and `mem_mb: 2048`.
