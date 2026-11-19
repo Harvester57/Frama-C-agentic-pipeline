@@ -15,12 +15,14 @@
 
 | ID | Title | Location | Property / CWE | Severity | Upstream Ticket | Status |
 | :--- | :--- | :--- | :--- | :---: | :--- | :--- |
-| [`MINMEA-01`](#minmea-01-unvalidated-zda-calendar-fields-cause-signed-integer-overflow-in-minmea_getdatetime) | Unvalidated ZDA calendar fields reach `minmea_getdatetime`, where `date->month - 1` overflows | [`minmea.c:656`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L656) (`minmea_getdatetime`) | `signed_overflow` (CWE-190) | **Medium** | Filed by us on 2026-11-14: [kosma/minmea#107](https://github.com/kosma/minmea/issues/107), fix in [kosma/minmea#108](https://github.com/kosma/minmea/pull/108) (open) | Confirmed (Unreported) |
-| [`MINMEA-02`](#minmea-02-absint_min-signed-overflow-in-minmea_parse_zda-bypasses-utc-offset-validation) | `abs(INT_MIN)` signed overflow in `minmea_parse_zda` defeats the timezone-offset range check | [`minmea.c:635`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L635) (`minmea_parse_zda`) | `signed_overflow` (CWE-190 / CWE-20) | **Medium** | Reported by a third party: [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (open, 2026-11-01) | Confirmed (Unreported) |
-| [`MINMEA-03`](#minmea-03-unbounded-scale--10-signed-overflow-in-minmea_scan-fractional-field-parser) | Unbounded `scale *= 10` signed overflow in `minmea_scan` fractional (`'f'`) field parser | [`minmea.c:186`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L186) (`minmea_scan`) | `signed_overflow` (CWE-190) | **Low** | Reported by third parties: [kosma/minmea#56](https://github.com/kosma/minmea/issues/56) (open, 2020), [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (open); fix proposed in [kosma/minmea#75](https://github.com/kosma/minmea/pull/75) (open) | Confirmed (Unreported) |
-| [`MINMEA-04`](#minmea-04-signed-integer-overflow-in-minmea_rescale-on-parser-produced-values) | Unchecked 32-bit arithmetic in `minmea_rescale` overflows on values the parser accepts | [`minmea.h:274`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.h#L274), [`minmea.h:276`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.h#L276) (`minmea_rescale`) | `signed_overflow` (CWE-190) | **Low** | Partly reported: [kosma/minmea#105](https://github.com/kosma/minmea/pull/105) (open PR) fixes the rounding site (line 274) only; the multiplication (line 276) was reported by us on 2026-11-14 in a [comment on that pull request](https://github.com/kosma/minmea/pull/105#issuecomment-6882277543) | Confirmed by hand (Unreported) |
+| [`MINMEA-01`](#minmea-01-unvalidated-zda-calendar-fields-cause-signed-integer-overflow-in-minmea_getdatetime) | Unvalidated ZDA calendar fields reach `minmea_getdatetime`, where `date->month - 1` overflows | [`minmea.c:656`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L656) (`minmea_getdatetime`) | `signed_overflow` (CWE-190) | **Medium** | Filed by us on 2026-11-14: [kosma/minmea#107](https://github.com/kosma/minmea/issues/107), fix in [kosma/minmea#108](https://github.com/kosma/minmea/pull/108) (open) | Reported |
+| [`MINMEA-02`](#minmea-02-absint_min-signed-overflow-in-minmea_parse_zda-bypasses-utc-offset-validation) | `abs(INT_MIN)` signed overflow in `minmea_parse_zda` defeats the timezone-offset range check | [`minmea.c:635`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L635) (`minmea_parse_zda`) | `signed_overflow` (CWE-190 / CWE-20) | **Medium** | Reported by a third party: [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (2026-11-01; closed on 2026-11-17 with no fix on `master`) | Reported (third party) |
+| [`MINMEA-03`](#minmea-03-unbounded-scale--10-signed-overflow-in-minmea_scan-fractional-field-parser) | Unbounded `scale *= 10` signed overflow in `minmea_scan` fractional (`'f'`) field parser | [`minmea.c:186`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L186) (`minmea_scan`) | `signed_overflow` (CWE-190) | **Low** | Reported by third parties: [kosma/minmea#56](https://github.com/kosma/minmea/issues/56) (open, 2020), [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (closed 2026-11-17); fix proposed in [kosma/minmea#75](https://github.com/kosma/minmea/pull/75) (open) | Reported (third party) |
+| [`MINMEA-04`](#minmea-04-signed-integer-overflow-in-minmea_rescale-on-parser-produced-values) | Unchecked 32-bit arithmetic in `minmea_rescale` overflows on values the parser accepts | [`minmea.h:274`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.h#L274), [`minmea.h:276`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.h#L276) (`minmea_rescale`) | `signed_overflow` (CWE-190) | **Low** | Partly reported: [kosma/minmea#105](https://github.com/kosma/minmea/pull/105) (open PR) fixes the rounding site (line 274) only; the multiplication (line 276) was reported by us on 2026-11-14 in a [comment on that pull request](https://github.com/kosma/minmea/pull/105#issuecomment-6882277543) | Reported (confirmed by hand) |
 
-### Upstream status (checked 2026-11-14)
+### Upstream status (checked 2026-11-14, updated 2026-11-19)
+
+**Update, 2026-11-19:** `master` is still at `c43c9e7`, so none of the four is fixed. [kosma/minmea#107](https://github.com/kosma/minmea/issues/107), [kosma/minmea#108](https://github.com/kosma/minmea/pull/108), [kosma/minmea#105](https://github.com/kosma/minmea/pull/105), [kosma/minmea#56](https://github.com/kosma/minmea/issues/56) and [kosma/minmea#75](https://github.com/kosma/minmea/pull/75) are open. [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) was closed as completed on 2026-11-17 without a commit.
 
 All issues and pull requests of `kosma/minmea` (numbers 1 to 106) were listed and the relevant ones read. Upstream `master` is still at the evaluated revision `c43c9e7`, so none of the four is fixed.
 
@@ -40,7 +42,7 @@ All issues and pull requests of `kosma/minmea` (numbers 1 to 106) were listed an
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `minmea.c#minmea_getdatetime::signed_overflow::b7030b5601` |
-| **Status** | Confirmed (Unreported) |
+| **Status** | Reported |
 | **Upstream Ticket** | Filed by us on 2026-11-14: [kosma/minmea#107](https://github.com/kosma/minmea/issues/107), fix in [kosma/minmea#108](https://github.com/kosma/minmea/pull/108) (open) |
 | **Severity** | **Medium** (C11 signed integer overflow reachable from untrusted NMEA 0183 sentence input; corrupts `struct tm` handed to `timegm()`) |
 | **Reachability** | `untrusted_surface` |
@@ -144,8 +146,8 @@ Validate the calendar fields both when produced in `minmea_parse_zda` and when c
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `minmea.c#minmea_parse_zda::signed_overflow::7c3a91d0f2` |
-| **Status** | Confirmed (Unreported) |
-| **Upstream Ticket** | Reported by a third party: [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (open, 2026-11-01) |
+| **Status** | Reported (third party) |
+| **Upstream Ticket** | Reported by a third party: [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (2026-11-01; closed on 2026-11-17 with no fix on `master`) |
 | **Severity** | **Medium** (C11 signed integer overflow reachable from untrusted NMEA input; also bypasses the `\|hour_offset\| <= 13` validation check on two's-complement targets) |
 | **Reachability** | `untrusted_surface` |
 | **Location** | [`minmea.c:635`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L635) (`minmea_parse_zda`) |
@@ -218,8 +220,8 @@ Replace `abs(frame->hour_offset) > 13` with explicit signed range comparisons:
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `minmea.c#minmea_scan::signed_overflow::d8e58750af` |
-| **Status** | Confirmed (Unreported) |
-| **Upstream Ticket** | Reported by third parties: [kosma/minmea#56](https://github.com/kosma/minmea/issues/56) (open, 2020), [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (open); fix proposed in [kosma/minmea#75](https://github.com/kosma/minmea/pull/75) (open) |
+| **Status** | Reported (third party) |
+| **Upstream Ticket** | Reported by third parties: [kosma/minmea#56](https://github.com/kosma/minmea/issues/56) (open, 2020), [kosma/minmea#106](https://github.com/kosma/minmea/issues/106) (closed 2026-11-17); fix proposed in [kosma/minmea#75](https://github.com/kosma/minmea/pull/75) (open) |
 | **Severity** | **Low** (C11 signed integer overflow reachable from any NMEA sentence parser that scans a floating-point `'f'` field; corrupts the fixed-point scale of the parsed field) |
 | **Reachability** | `untrusted_surface` |
 | **Location** | [`minmea.c:186`](https://github.com/kosma/minmea/blob/c43c9e7c5ed788122a9d8a5445679e1594f8a030/minmea.c#L186) (`minmea_scan`) |
@@ -302,7 +304,7 @@ Bound `scale` alongside `value` before multiplying by 10 so extra fractional dig
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `minmea.h#minmea_rescale::signed_overflow::e02d0e78e8` |
-| **Status** | Confirmed by hand on 2026-11-14 (Unreported). The pipeline run that raised it (minmea run-1) left it `needs_validation`, because the module harness never calls this header inline. Not in `benchmark/manifest.json`. |
+| **Status** | Confirmed by hand on 2026-11-14; reported in a comment on the open pull request. The pipeline run that raised it (minmea run-1) left it `needs_validation`, because the module harness never calls this header inline. Not in `benchmark/manifest.json`. |
 | **Upstream Ticket** | Partly reported: [kosma/minmea#105](https://github.com/kosma/minmea/pull/105) (open PR) fixes the rounding site (line 274) only; the multiplication (line 276) was reported by us on 2026-11-14 in a [comment on that pull request](https://github.com/kosma/minmea/pull/105#issuecomment-6882277543) |
 | **Severity** | **Low** (C11 signed integer overflow on a value the parser accepts; the caller gets a wrong, sign-flipped number. No memory effect inside minmea.) |
 | **Reachability** | `untrusted_surface` for the value; the overflow needs the application to call `minmea_rescale` on it, as the target's own `example.c` does |
