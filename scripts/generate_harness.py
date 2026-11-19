@@ -2156,6 +2156,7 @@ def _merge_dag_harness_sources(
     include_source: bool,
     *invocation_snippets: str | None,
     module_name: str | None = None,
+    flow_meta: dict[str, Any] | None = None,
 ) -> list[str]:
     """
     If `callgraph_dag.json` exists next to `out_dir` and `include_source` is False,
@@ -2237,8 +2238,42 @@ def _merge_dag_harness_sources(
             if isinstance(key, str) and key in functions_map:
                 target_fns.add(key)
 
-    flow_rels = _flow_harness_sources(dag, module_name, target_fns)
-    if not target_fns and flow_rels is None:
+    global_vars_map = dag.get("global_variables") or {}
+    target_globals: set[str] = set()
+    if isinstance(global_vars_map, dict) and global_vars_map:
+        globs_by_name: dict[str, list[str]] = {}
+        for gid, grec in global_vars_map.items():
+            if not isinstance(grec, dict):
+                continue
+            gname = str(grec.get("name") or str(gid).rpartition("#")[2])
+            if gname:
+                globs_by_name.setdefault(gname, []).append(str(gid))
+        for ident in referenced_idents:
+            if ident in global_vars_map:
+                target_globals.add(ident)
+                continue
+            cands = sorted(globs_by_name.get(ident) or [])
+            if not cands:
+                continue
+            in_src = [
+                g
+                for g in cands
+                if any(
+                    s == global_vars_map[g].get("file") or s.endswith("/" + str(global_vars_map[g].get("file")))
+                    for s in norm_sources
+                )
+            ]
+            if in_src:
+                target_globals.update(in_src)
+                continue
+            ext = [g for g in cands if not global_vars_map[g].get("static")]
+            if len(ext) == 1:
+                target_globals.add(ext[0])
+            elif len(cands) == 1:
+                target_globals.add(cands[0])
+
+    flow_rels = _flow_harness_sources(dag, module_name, target_fns, target_globals, meta_out=flow_meta)
+    if not target_fns and not target_globals and flow_rels is None:
         return list(norm_sources)
 
     # Determine whether `sources` uses a prefix like `workspace/work/`
@@ -2317,13 +2352,22 @@ def _merge_dag_harness_sources(
     return merged
 
 
-def _flow_harness_sources(dag: dict[str, Any], module_name: str | None, named: set[str]) -> list[str] | None:
+def _flow_harness_sources(
+    dag: dict[str, Any],
+    module_name: str | None,
+    named: set[str],
+    extra_globals: set[str] | None = None,
+    *,
+    meta_out: dict[str, Any] | None = None,
+) -> list[str] | None:
     """
     The files (as the DAG names them) a harness of address-flow cluster `module_name` compiles: the
     `build_sources` (scripts/unit_split.py `build_plan`) of the address-flow reach of the cluster's
-    anchors and of the unit functions the harness names (`named`, DAG keys). Without such a function
-    outside the cluster, the cluster's own `build_sources`. None when `module_name` is no address-flow
-    cluster of the DAG.
+    anchors and of the unit/linked-library functions (`named`) and globals (`extra_globals`) the
+    harness names. Without any extra function or global outside the cluster, returns the cluster's
+    own `build_sources`. When widened, records `flow_build_sources` in `meta_out` (so `harness_<mod>.json`
+    stays synchronized with `fuzz_build._flow_cluster_files`) and warns on stderr if the widened
+    reach exceeds `dag["unit_split"]` thresholds. None when `module_name` is no address-flow cluster.
     """
     sub = (dag.get("submodules") or {}).get(module_name or "")
     if (
@@ -2332,18 +2376,44 @@ def _flow_harness_sources(dag: dict[str, Any], module_name: str | None, named: s
         or not isinstance(sub.get("build_sources"), list)
     ):
         return None
-    functions = dag.get("functions") or {}
-    unit = (dag.get("modules") or {}).get(sub.get("unit") or "")
-    keys = [k for k in ((unit or {}).get("functions") or []) if k in functions]
-    extra = {k for k in named if k in set(keys)} - set(sub.get("functions") or [])
-    if not extra:
-        return [str(f) for f in sub["build_sources"]]
     import unit_split
 
+    functions = dag.get("functions") or {}
     global_vars = dag.get("global_variables") or {}
-    starts = [*(sub.get("anchors") or []), *sorted(extra)]
-    fns, globs = unit_split.flow_reach(functions, global_vars, starts, set(keys))
-    return [str(f) for f in unit_split.build_plan(functions, global_vars, keys, fns, globs)["build_sources"]]
+    unit_name = str(sub.get("unit") or "")
+    own_keys, all_keys = unit_split.unit_closure_keys(dag, unit_name)
+    all_set = set(all_keys)
+    own_set = set(own_keys)
+    sub_fns = set(sub.get("functions") or [])
+    sub_globs = set(sub.get("globals") or [])
+    extra_fns = {k for k in named if k in all_set} - sub_fns
+    extra_g = {g for g in (extra_globals or ()) if g in global_vars} - sub_globs
+    if not extra_fns and not extra_g:
+        return [str(f) for f in sub["build_sources"]]
+    starts = [*(sub.get("anchors") or []), *sorted(extra_fns)]
+    fns, globs = unit_split.flow_reach(functions, global_vars, starts, all_set, extra_globals=extra_g)
+    widened = [
+        str(f)
+        for f in unit_split.build_plan(functions, global_vars, own_keys, fns, globs, closure_keys=all_keys)[
+            "build_sources"
+        ]
+    ]
+    base_set = {str(f) for f in sub["build_sources"]}
+    if set(widened) != base_set:
+        if meta_out is not None:
+            meta_out["flow_build_sources"] = widened
+        if "over_limit" not in sub:
+            limits = dag.get("unit_split") or {}
+            max_fns = int(limits.get("max_functions") or unit_split.MAX_FUNCTIONS)
+            max_lines = int(limits.get("max_lines") or unit_split.MAX_LINES)
+            n_fns, n_lines = unit_split.unit_size(functions, fns & own_set)
+            if n_fns > max_fns or n_lines > max_lines:
+                print(
+                    f"warning: harness for {module_name} widened address-flow reach to {n_fns} functions / "
+                    f"{n_lines} lines (exceeds cluster limit {max_fns} functions / {max_lines} lines)",
+                    file=sys.stderr,
+                )
+    return widened
 
 
 def _entry_file(functions: dict, entry_fn: str, sources: list[str]) -> str | None:
@@ -2726,6 +2796,7 @@ def _generate_module_harness(
     arity_expr = call_expr or eva_expr or fuzz_expr or " ".join(norm_dispatch_cases)
     if arity_expr:
         _validate_call_expr_arity(entry_fn, arity_expr, sources, norm_cppflags)
+    flow_meta: dict[str, Any] = {}
     sources = _merge_dag_harness_sources(
         out_dir,
         sources,
@@ -2738,6 +2809,7 @@ def _generate_module_harness(
         # The unit functions the target's fuzzer calls pull in their sources too.
         target_fuzzer_snippet,
         module_name=module_name,
+        flow_meta=flow_meta,
     )
 
     inc_lines: list[str] = []
@@ -2962,6 +3034,8 @@ def _generate_module_harness(
     if feature_macros is not None:
         # What _target_feature_macros added to `cppflags`, and from which compiles. Absent without one.
         sidecar["feature_macros"] = feature_macros
+    if flow_meta.get("flow_build_sources"):
+        sidecar["flow_build_sources"] = list(flow_meta["flow_build_sources"])
     write_sidecar(harness_meta_file, sidecar)
 
     if (

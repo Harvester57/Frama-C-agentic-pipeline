@@ -145,6 +145,7 @@
     "unit": {"$comment": "the link unit (DAG module) this harness module belongs to; null without link units", "type": ["string", "null"]},
     "harness_file": {"type": "string", "minLength": 1},
     "sources": {"$ref": "#/definitions/strings"},
+    "flow_build_sources": {"$comment": "widened tree-relative address-flow build_sources when harness snippets name functions or globals outside the cluster's DAG reach (synchronized with fuzz_build._flow_cluster_files)", "$ref": "#/definitions/strings"},
     "scope_files": {"$comment": "files whose functions a sub-module answers for at the reach gate (generate_harness.py --scope-file, kept on regeneration); empty means `sources`", "$ref": "#/definitions/strings"},
     "header": {"type": ["string", "null"]},
     "extra_includes": {"$ref": "#/definitions/strings"},

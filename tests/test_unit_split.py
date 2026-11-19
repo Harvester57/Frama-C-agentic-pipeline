@@ -515,3 +515,92 @@ def test_c2_producer_consumer_rescue_and_cross_cluster_unclustered():
     d_over = U.apply(_mk(), max_functions=3, min_functions=1)
     assert d_over["modules"]["lib"]["split"]["cross_cluster_unclustered"] == ["secret_cb", "secret_leaf"]
     assert any("unit-reachable callback(s) dropped into unclustered" in w for w in d_over["warnings"])
+
+
+def test_c3_harness_global_snippet_widens_sources_and_persists_flow_build_sources(tmp_path, capsys):
+    """C3 / B6 / B7: dispatch case naming &g_cfg pulls src/cfg.c and callback src/cb.c and records flow_build_sources."""
+    import json
+
+    import generate_harness as GH
+    import validate_artifacts
+
+    fns = {
+        "api_use": _ffn("api_use", indirect=["real_cb"], file="src/a.c"),
+        "real_cb": _ffn("real_cb", ["cb_leaf"], file="src/cb.c"),
+        "cb_leaf": _ffn("cb_leaf", file="src/cb.c"),
+        "api_other": _ffn("api_other", ["o1", "o2"], file="src/other.c"),
+        "o1": _ffn("o1", file="src/other.c"),
+        "o2": _ffn("o2", file="src/other.c"),
+    }
+    gv = {
+        "src/cfg.c#g_cfg": {
+            "name": "g_cfg",
+            "file": "src/cfg.c",
+            "static": False,
+            "init_functions": ["real_cb"],
+            "init_globals": [],
+        }
+    }
+    dag: dict = {
+        "module_kind": "link_unit",
+        "functions": fns,
+        "global_variables": gv,
+        "modules": {
+            "prog": {
+                "module": "prog",
+                "unit": "prog",
+                "functions": sorted(fns),
+                "candidate_entry_points": ["api_use", "api_other"],
+                "linked_modules": [],
+                "tier": T.TIER_1A,
+            }
+        },
+    }
+    U.apply(dag, max_functions=3, min_functions=1)
+    name = next(n for n, s in dag["submodules"].items() if s["anchors"] == ["api_use"])
+    assert dag["submodules"][name]["build_sources"] == ["src/a.c"]
+
+    ws = tmp_path / "workspace"
+    (ws / "reports").mkdir(parents=True)
+    (ws / "harnesses").mkdir(parents=True)
+    (ws / "work/src").mkdir(parents=True)
+    for stem in ("a", "cfg", "cb", "other"):
+        (ws / f"work/src/{stem}.c").write_text("int dummy;\n", encoding="utf-8")
+    (ws / "reports/callgraph_dag.json").write_text(json.dumps(dag), encoding="utf-8")
+
+    # Direct call to _merge_dag_harness_sources: naming &g_cfg pulls src/cfg.c and src/cb.c (via init_functions).
+    flow_meta: dict = {}
+    merged = GH._merge_dag_harness_sources(
+        ws / "harnesses",
+        ["workspace/work/src/a.c"],
+        False,
+        "(void)api_use(&g_cfg);",
+        module_name=name,
+        flow_meta=flow_meta,
+    )
+    assert merged == ["workspace/work/src/a.c", "workspace/work/src/cb.c", "workspace/work/src/cfg.c"]
+    assert flow_meta["flow_build_sources"] == ["src/a.c", "src/cb.c", "src/cfg.c"]
+
+    # End-to-end generate_module_harness persists `flow_build_sources` in harness_<mod>.json.
+    res = GH.generate_module_harness(
+        module_name=name,
+        sources=["workspace/work/src/a.c"],
+        header_include=None,
+        entry_fn="api_use",
+        max_input_size=256,
+        cppflags="-I.",
+        out_dir=ws / "harnesses",
+        entry_style="dispatch",
+        dispatch_cases=["(void)api_use(&g_cfg);"],
+        unit="prog",
+        auto_prelude=False,
+    )
+    sidecar = json.loads((ws / f"harnesses/harness_{name}.json").read_text(encoding="utf-8"))
+    assert sidecar["flow_build_sources"] == ["src/a.c", "src/cb.c", "src/cfg.c"]
+    assert set(res["sources"]) == {"workspace/work/src/a.c", "workspace/work/src/cb.c", "workspace/work/src/cfg.c"}
+    assert validate_artifacts.schema_warning("harness_sidecar", sidecar) is None
+
+    # Widening past the cluster threshold (3 -> 4 functions via api_other + o1 + o2) emits a stderr warning.
+    capsys.readouterr()
+    GH._flow_harness_sources(dag, name, {"api_other"}, set(), meta_out={})
+    assert "widened address-flow reach" in capsys.readouterr().err
