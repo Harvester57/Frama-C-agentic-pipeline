@@ -1,0 +1,9 @@
+$ fc_stub_driver.e-acsl 0  # op_answer, exit -6
+
+/w/workspace/stubs/op/oplib.h: In function 'op_answer'
+/w/workspace/stubs/op/oplib.h:19: Error: Postcondition failed:
+	The failing predicate is:
+	zero:
+		\result ≡ 0.
+	With values at failure point:
+	- \result: 42

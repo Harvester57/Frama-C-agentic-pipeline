@@ -1,0 +1,9 @@
+$ fc_stub_driver.e-acsl 1  # op_is_on, exit -6
+
+/w/workspace/stubs/op/oplib.h: In function 'op_is_on'
+/w/workspace/stubs/op/oplib.h:26: Error: Postcondition failed:
+	The failing predicate is:
+	bool_result:
+		\result ≡ 0 ∨ \result ≡ 1.
+	With values at failure point:
+	- \result: 1564352256

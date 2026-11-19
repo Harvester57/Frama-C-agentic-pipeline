@@ -61,7 +61,12 @@ The reports below are paths relative to the run directory: read them on the host
 
 - **`abi`** must be `passed`: your prototypes still match the real header.
 - **`eva`**, per function: `passed`; `too_weak` means your `requires` accept a buffer one element shorter than the length says (state the buffer's validity over the length); `valid_call_alarm` means a call with valid, initialized buffers already raises an alarm, so a `requires` demands more than the documentation does.
-- **`dynamic`**, per function, against the real library under E-ACSL: `violated` means the library broke one of your `ensures` (the report shows the values): the postcondition is wrong, fix it. `driver_rejected` means the generated arguments did not meet a `requires`; say in `notes` whether that is the documentation's precondition. `inconclusive` (a crash, a timeout, no library to link) is for `notes`.
+- **`dynamic`**, per function, against the real library under E-ACSL: `violated` means the library broke one of your `ensures` on a call with genuine arguments (the report shows the values): the postcondition is wrong, so check it against the documentation and fix it. `driver_rejected` means the generated arguments did not meet a `requires`; say in `notes` whether that is the documentation's precondition. `inconclusive` never blocks; its `reason` says why:
+  - `fabricated_argument`: an `ensures` failed, but the driver passed a handle or structure (`fabricated_params`) that it made from patterned bytes, so the library computed from garbage. An `EVP_CIPHER_CTX *`, an `SSL *` or a `char **` out parameter is one.
+  - `untracked_library_memory`: an `ensures` failed only on a memory predicate (`valid_read_string(\result)`, `\valid_read(...)`) over memory the library returned or wrote. E-ACSL cannot see memory the uninstrumented library owns, such as its static strings.
+  - `timeout`, or `exit N` for a crash.
+
+  Never weaken or drop an `ensures` that the documentation states because of an `inconclusive` result. Report it in `notes`, with the `reason` and the report's values.
 
 An `eva` with `status: error` means Frama-C refused the header or a contract; a dynamic `build_failed` whose reason is an `annot-error` in your header means E-ACSL did, and every fuzz build that includes the header would abort the same way. The reason is the tool's most fatal message, followed by the log to read: every check leaves its generated program and its logs, each starting with its command line, in `workspace/reports/stub_check/<include name with / as __>/` (`abi.log`, `fc_stub_smoke.c`, `eva.log`, `fc_stub_driver.c`, `eacsl_instrument.log`, `eacsl_build.log`, `run<N>.log`), which the header's `artifacts` lists. Read the log before you change the contract, and never drop a location from `assigns` to get past an error: a frame one location short is unsound.
 
@@ -69,7 +74,7 @@ Each probe includes the header the way the target does: when the target defines 
 
 A reason `<header>:<line>: assigns clause of <fn> lacks \from for <loc>: Eva aborts on it` comes from reading the header itself, before any tool runs: Eva aborts on that frame whenever a call reaches it, even when the `eva` check said `ok` because its valid call failed a precondition first. Give the location its `\from` (rule 4).
 
-A header with a frame lacking `\from`, a failed `abi`, an `eva` error, an E-ACSL `annot-error` in the header or a `violated` contract blocks every module that calls it, so fix those before you finish.
+A header with a frame lacking `\from`, a failed `abi`, an `eva` error, an E-ACSL `annot-error` in the header or a `violated` contract blocks every module that calls it, so fix those before you finish. An `inconclusive` dynamic result blocks nothing.
 
 ## Result
 

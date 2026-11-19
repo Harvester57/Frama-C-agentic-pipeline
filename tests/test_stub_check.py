@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -25,8 +26,10 @@ KNOWN_SHIPPED_DIVERGENCES: dict[str, str] = {}
 
 def _docker(*args: str, mounts: dict[Path, str], timeout: int = 900) -> str:
     vols = [x for host, guest in mounts.items() for x in ("-v", f"{host}:{guest}")]
+    # A label, so a run sharing the Docker host can find (and clean up) only this test's containers.
+    tag = os.environ.get("FRAMAC_RUN_TAG", "pytest-stub-check")
     proc = subprocess.run(
-        ["docker", "run", "--rm", "--network", "none", *vols,
+        ["docker", "run", "--rm", "--network", "none", "--label", f"framac.run={tag}", *vols,
          "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
          "-v", f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
          "--entrypoint", args[0], ANALYSIS_IMAGE, *args[1:]],
@@ -781,7 +784,10 @@ def test_stub_check_against_the_real_library(mode):
     """
     tests/fixtures/stub_check/scenario.sh: a snapshot with libmylib, the overlay stub_gen.py writes for it,
     filled by hand. `good` contracts pass all three checks; `bad` promises a result the library does not
-    return, so the dynamic check finds it violated and the gate blocks the module and its lexer module.
+    return, but ml_hash takes an `ml_ctx *` (an incomplete type) that the driver fabricates from patterned
+    bytes, so the failure is no evidence (nginx run-4): `inconclusive`, `fabricated_argument`, and nothing is
+    blocked. A wrong `ensures` on genuine arguments still blocks: see
+    test_dynamic_artifacts_of_the_checker_do_not_block_but_a_wrong_ensures_does.
     """
     require_docker_images(ANALYSIS_IMAGE)
     out = _docker("sh", "/fixture/scenario.sh", mode, mounts={FIXTURE: "/fixture:ro"})
@@ -798,11 +804,13 @@ def test_stub_check_against_the_real_library(mode):
         assert report["blocked_modules"] == {}, out
         assert "stub-check failed" not in out, out
     else:
-        assert "rc=1" in out, out
-        assert dyn["ml_hash"]["status"] == "violated", out
+        assert "rc=0" in out, out
+        assert dyn["ml_hash"]["status"] == "inconclusive", out
+        assert dyn["ml_hash"]["reason"] == "fabricated_argument", out
+        assert dyn["ml_hash"]["fabricated_params"] == ["ctx"], out
         assert "\\result: 0" in dyn["ml_hash"]["report"], out
-        assert report["blocked_modules"] == {"liba": [HEADER], "liba_lex": [HEADER]}, out
-        assert f"stub-check failed for {HEADER}" in out, out
+        assert report["blocked_modules"] == {}, out
+        assert rec["status"] == "passed", out
 
 
 @pytest.mark.integration
@@ -835,3 +843,316 @@ def test_a_header_that_needs_the_targets_macros_passes_all_three_checks(tmp_path
     assert rec["include_context"].get("feature_macros", {}) == FIX_CASES[case].get("features", {}), rec
     assert rec["status"] == "passed" and report["blocked_modules"] == {}, rec
     assert "rc=0" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Dynamic results that are artifacts of the checker (nginx run-4, 2026-11-19)
+# ---------------------------------------------------------------------------
+# The driver hands every pointer parameter a patterned byte buffer, whatever the pointee (an OpenSSL
+# handle reads garbage), and E-ACSL cannot see the library's own memory (`valid_read_string(\result)` is 0
+# on OpenSSL_version's static string). Both failed correct, documented contracts as `violated`, which
+# failed eight OpenSSL headers and blocked every nginx module. tests/fixtures/stub_check/oplib.c has one
+# function of each kind, and one whose wrong `ensures` the library breaks with genuine arguments.
+
+OP_HDR = "workspace/stubs/op/oplib.h"
+OP_LOGS = "workspace/reports/stub_check/op__oplib.h"
+OP_PROTOS = {
+    "op_is_on": "int op_is_on(op_ctx const *ctx)",
+    "op_version": "char const *op_version(int t)",
+    "op_name": "char const *op_name(int t)",
+    "op_answer": "int op_answer(int const x)",
+}
+OP_OVERLAY_BLOCKS = """
+/* fc-stub: op_answer */
+/*@
+  assigns \\result \\from x;
+  ensures zero: \\result == 0;
+*/
+extern int op_answer(int const x);
+
+/* fc-stub: op_is_on */
+/*@
+  assigns \\result \\from ctx;
+  ensures bool_result: \\result == 0 || \\result == 1;
+*/
+extern int op_is_on(op_ctx const *ctx);
+
+/* fc-stub: op_version */
+/*@
+  assigns \\result \\from t;
+  ensures valid_str: valid_read_string(\\result);
+*/
+extern char const *op_version(int t);
+
+/* fc-stub: op_name */
+/*@
+  assigns \\result \\from t;
+  ensures name_or_null: \\result != \\null ==> valid_read_string(\\result);
+*/
+extern char const *op_name(int t);
+"""
+
+
+def _op_run(run: Path, snap_in: str) -> None:
+    """A run directory whose target calls oplib: snapshot (header; the library is built in the container), model, DAG, overlay."""
+    import stub_gen
+
+    snap = run / "workspace" / "snapshot"
+    (snap / "root" / "usr" / "include" / "op").mkdir(parents=True)
+    (snap / "root" / "usr" / "lib").mkdir(parents=True)
+    real = (FIXTURE / "oplib.h").read_text(encoding="utf-8")
+    (snap / "root" / "usr" / "include" / "op" / "oplib.h").write_text(real, encoding="utf-8", newline="\n")
+    write_json(snap / "manifest.json", {"digest": "test", "files": {
+        "/usr/include/op/oplib.h": "x", "/usr/lib/libop.so": "x"}})  # fmt: skip
+    (run / "oplib.c").write_text((FIXTURE / "oplib.c").read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+    overlay = run / OP_HDR
+    overlay.parent.mkdir(parents=True)
+    preamble = stub_gen.header_preamble("op/oplib.h", "/usr/include/op/oplib.h")
+    overlay.write_text(preamble + OP_OVERLAY_BLOCKS, encoding="utf-8", newline="\n")
+    reports = run / "workspace" / "reports"
+    decl = f"{snap_in}/root/usr/include/op/oplib.h"
+    write_json(reports / "phase0_model.json", {
+        "status": "ok", "functions": {"src/use.c#use": {"external_calls": sorted(OP_PROTOS)}},
+        "externals": sorted(OP_PROTOS),
+        "external_formals": {"op_is_on": [{"name": "ctx", "kind": "const_pointer"}],
+                             "op_version": [{"name": "t", "kind": "value"}],
+                             "op_name": [{"name": "t", "kind": "value"}],
+                             "op_answer": [{"name": "x", "kind": "value"}]},
+        "external_decls": {fn: {"decl": f"{decl}:{i + 4}", "proto": p} for i, (fn, p) in enumerate(OP_PROTOS.items())},
+    })  # fmt: skip
+    write_json(reports / "callgraph_dag.json", {"modules": {
+        "use": {"external_callees": sorted(OP_PROTOS), "ldflags": ["-lop"]}}})  # fmt: skip
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_dynamic_artifacts_of_the_checker_do_not_block_but_a_wrong_ensures_does(tmp_path):
+    """
+    op_is_on reads a field of the fabricated object (EVP_CIPHER_CTX_is_encrypting in run-4: `\\result:
+    1294864368`), op_version returns a static string E-ACSL does not track (OpenSSL_version): both are
+    `inconclusive`, with the reason. op_answer's `ensures \\result == 0` is wrong, with a genuine argument:
+    still `violated`, and the header still blocks its module. op_answer's `int const` parameter is also
+    S9: the smoke call must not raise `valid_call_alarm`.
+    """
+    require_docker_images(ANALYSIS_IMAGE)
+    run = tmp_path / "run"
+    _op_run(run, "/w/workspace/snapshot")
+    out = _docker(
+        "sh", "-c",
+        "cd /w && export FRAMAC_SNAPSHOT_DIR=/w/workspace/snapshot FRAMAC_STUB_OVERLAY_DIR=/w/workspace/stubs "
+        "FRAMAC_CACHE=off && gcc -shared -fPIC -o workspace/snapshot/root/usr/lib/libop.so oplib.c && "
+        "timeout 120 python3 /opt/framac-pipeline/scripts/stub_gen.py run && "
+        "timeout 900 python3 /opt/framac-pipeline/scripts/stub_check.py run --trials 4; echo rc=$?",
+        mounts={run: "/w"},
+    )  # fmt: skip
+    report = json.loads((run / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))
+    rec = report["headers"][OP_HDR]
+    dump = out + json.dumps(rec, indent=1)
+    dyn = rec["dynamic"]["functions"]
+    assert dyn["op_is_on"]["status"] == "inconclusive", dump
+    assert dyn["op_is_on"]["reason"] == "fabricated_argument" and dyn["op_is_on"]["fabricated_params"] == ["ctx"], dump
+    assert "Postcondition failed" in dyn["op_is_on"]["report"], dump
+    assert dyn["op_version"]["status"] == "inconclusive", dump
+    assert dyn["op_version"]["reason"] == "untracked_library_memory", dump
+    assert "valid_read_string(\\result)" in dyn["op_version"]["report"], dump
+    # The same behind a guard, printed with E-ACSL's Unicode `≢` and `⇒` (OBJ_nid2sn's shape).
+    assert dyn["op_name"]["status"] == "inconclusive", dump
+    assert dyn["op_name"]["reason"] == "untracked_library_memory", dump
+    assert dyn["op_answer"]["status"] == "violated", dump
+    assert "\\result: 42" in dyn["op_answer"]["report"], dump
+    assert rec["eva"]["functions"]["op_answer"]["status"] == "passed", dump  # S9
+    reason = f"op_answer: postcondition failed against the real library (see {OP_LOGS}/run0.log)"
+    assert rec["reasons"] == [reason], dump
+    assert report["blocked_modules"] == {"use": [OP_HDR]}, dump
+    assert "rc=1" in out, out
+    # S9: the value local is declared without `const`, so memset's precondition holds and the call is live.
+    csv = (run / OP_LOGS / "fc_stub_smoke_report.csv").read_text(encoding="utf-8")
+    assert not [r for r in csv.splitlines() if "fc_stub_smoke.c" in r and "Invalid" in r], csv
+
+
+# E-ACSL's operators as it prints a failing predicate (`\result ≡ 0 ∨ \result ≡ 1`, see eacsl_post_*.log).
+_EQ, _NE, _OR, _AND, _GE = chr(0x2261), chr(0x2262), chr(0x2228), chr(0x2227), chr(0x2265)
+
+
+def _eacsl_post(fn: str, label: str, pred: str, values: list[str]) -> str:
+    """A run's output with one E-ACSL `Postcondition failed` report, as the analysis image prints it."""
+    return (
+        f"$ fc_stub_driver.e-acsl 0  # {fn}, exit -6\n\n/w/workspace/stubs/x.h: In function '{fn}'\n"
+        f"/w/workspace/stubs/x.h:9: Error: Postcondition failed:\n\tThe failing predicate is:\n\t{label}:\n"
+        f"\t\t{pred}.\n\tWith values at failure point:\n" + "".join(f"\t- {v}\n" for v in values)
+    )
+
+
+# function -> (prototype as the model prints it, label, predicate, value lines, status, reason). The run-4
+# cases are nginx 1.31.9 run-4's OpenSSL headers (the messages of the run's stub_check.json and run<N>.log).
+RUN4_POSTCONDITIONS: dict[str, tuple[str, str, str, list[str], str, str | None]] = {
+    "EVP_CIPHER_CTX_is_encrypting": (
+        "int EVP_CIPHER_CTX_is_encrypting(EVP_CIPHER_CTX const *ctx)", "bool_result",
+        f"\\result {_EQ} 0 {_OR} \\result {_EQ} 1", ["\\result: 1294864368"], "inconclusive", "fabricated_argument"),
+    "OPENSSL_sk_num": (
+        "int OPENSSL_sk_num(OPENSSL_STACK const *st)", "count_or_null", f"\\result {_GE} -1",
+        ["\\result: -2141109725"], "inconclusive", "fabricated_argument"),
+    "SSL_get_version": (
+        "char const *SSL_get_version(SSL const *s)", "non_null", f"\\result {_NE} \\null", ["\\result: (nil)"],
+        "inconclusive", "fabricated_argument"),
+    "ERR_peek_error_data": (
+        "unsigned long ERR_peek_error_data(char const **data, int *flags)", "data_string",
+        "valid_read_string(*\\old(data))",
+        ["data_string: valid_read_string(*\\old(data)): 0", "*\\old(data): 0xd9ba9b7c5d3e1f00"],
+        "inconclusive", "fabricated_argument"),
+    "OpenSSL_version": (
+        "char const *OpenSSL_version(int t)", "valid_str", "valid_read_string(\\result)",
+        ["valid_str: valid_read_string(\\result): 0", "\\result: 0x78675abc321d"],
+        "inconclusive", "untracked_library_memory"),
+    "OCSP_cert_status_str": (
+        "char const *OCSP_cert_status_str(long s)", "valid_str",
+        f"\\result {_EQ} \\null {_OR} valid_read_string(\\result)",
+        ["valid_read_string(\\result): 0", "\\result: 0x78675abc3300"], "inconclusive", "untracked_library_memory"),
+    "X509_verify_cert_error_string": (
+        "char const *X509_verify_cert_error_string(long n)", "valid_str",
+        f"\\result {_NE} \\null {_AND} \\valid_read(\\result)",
+        ["\\valid_read(\\result): 0", "\\result: 0x78675abc3400"], "inconclusive", "untracked_library_memory"),
+    # Genuine arguments and a value postcondition: the contract is wrong.
+    "op_answer": ("int op_answer(int const x)", "zero", f"\\result {_EQ} 0", ["\\result: 42"], "violated", None),
+    # A memory predicate on NULL is a real failure, so is one on the driver's own buffer, a negated one,
+    # and one beside a value comparison.
+    "name_or_null": (
+        "char const *name_or_null(int t)", "valid_str", "valid_read_string(\\result)",
+        ["valid_str: valid_read_string(\\result): 0", "\\result: (nil)"], "violated", None),
+    "fill": (
+        "int fill(unsigned char *buf, size_t len)", "filled", "\\initialized(buf + (0 .. len - 1))",
+        ["\\initialized(buf + (0 .. len - 1)): 0", "buf: 0x7ffd1000"], "violated", None),
+    "not_owned": (
+        "char const *not_owned(int t)", "fresh", f"{chr(0x00AC)}\\valid(\\result)",
+        ["\\valid(\\result): 1", "\\result: 0x5600aa00"], "violated", None),
+    "short_name": (
+        "char const *short_name(int t)", "short", f"valid_read_string(\\result) {_AND} \\result {_EQ} \\null",
+        ["valid_read_string(\\result): 0", "\\result: 0x78675abc3500"], "violated", None),
+    # A nested memory application goes with the outer one; what is left decides.
+    "block_of": (
+        "char const *block_of(int t)", "block", f"\\block_length(\\base_addr(\\result)) {_GE} 16",
+        ["\\block_length(\\base_addr(\\result)): 0", "\\result: 0x78675abc3600"], "inconclusive",
+        "untracked_library_memory"),
+    "block_is": (
+        "char const *block_is(int t)", "block", f"\\block_length(\\base_addr(\\result)) {_EQ} t",
+        ["\\block_length(\\base_addr(\\result)): 0", "\\result: 0x78675abc3700"], "violated", None),
+}  # fmt: skip
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fn", sorted(RUN4_POSTCONDITIONS))
+def test_a_postcondition_failure_is_violated_only_on_evidence_against_the_contract(fn):
+    """
+    nginx run-4: a driver object fabricated from patterned bytes (an OpenSSL handle), or a memory predicate
+    on memory the uninstrumented library owns, failed correct documented contracts as `violated`. Those are
+    `inconclusive` with the reason; a value failure on genuine arguments stays `violated`.
+    """
+    proto, label, pred, values, status, reason = RUN4_POSTCONDITIONS[fn]
+    out = _eacsl_post(fn, label, pred, values)
+    rec = stub_check.classify_run(_sig(proto), out, -6, False, 4)
+    assert rec["status"] == status, rec
+    assert rec.get("reason") == reason, rec
+    assert rec["report"].startswith("Postcondition failed:") and pred in rec["report"], rec
+    if reason:
+        assert rec["detail"], rec
+
+
+@pytest.mark.unit
+def test_postcondition_reports_are_read_from_the_images_output():
+    """The reports the analysis image printed for tests/fixtures/stub_check/oplib.c (the classifier aside)."""
+    blocks = {
+        name: stub_check.postcondition_failures((FIXTURE / f"eacsl_post_{name}.log").read_text(encoding="utf-8"))
+        for name in ("value", "fabricated", "untracked", "guarded")
+    }
+    assert blocks["guarded"] == [{
+        "label": "name_or_null", "predicate": "\\result != \\null ==> valid_read_string(\\result)",
+        "values": [("valid_read_string(\\result)", "0"), ("\\result", "0x73bc439d700a")]}]  # fmt: skip
+    assert blocks["value"] == [{"label": "zero", "predicate": "\\result == 0", "values": [("\\result", "42")]}]
+    assert blocks["fabricated"][0]["predicate"] == "\\result == 0 || \\result == 1"
+    assert blocks["untracked"] == [{
+        "label": "valid_str", "predicate": "valid_read_string(\\result)",
+        "values": [("valid_read_string(\\result)", "0"), ("\\result", "0x78007e6e6000")]}]  # fmt: skip
+    assert stub_check.postcondition_failures("Precondition failed:\n\tThe failing predicate is:\n") == []
+
+
+@pytest.mark.unit
+def test_fabricated_params_are_read_from_the_parameter_types():
+    sig = _sig(
+        "int f(EVP_CIPHER_CTX *ctx, struct sockaddr const *sa, char const **out, unsigned char const *data, "
+        "size_t len, char *name, void *handle, void const *buf, size_t buf_len, uint32_t *word, int x, "
+        "union u *un, BIGNUM const *bn)"
+    )
+    assert stub_check.fabricated_params(sig) == ["ctx", "sa", "out", "handle", "un", "bn"]
+    assert stub_check.fabricated_params(_sig(HASH)) == ["ctx"]  # ml_ctx is an incomplete typedef
+    assert stub_check.fabricated_params(_sig("int g(unsigned char out[32], int n)")) == []
+
+
+@pytest.mark.unit
+def test_a_const_scalar_parameter_gets_a_writable_local():
+    """S9 (nginx run-3, SSL_get_servername): `int const v_1; memset(&v_1, ...)` failed memset's precondition."""
+    sig = _sig("char const *SSL_get_servername(SSL const *s, int const type)")
+    for text in (
+        "\n".join(stub_check.call_lines(sig, "v", False)),
+        stub_check.smoke_source("openssl/tls1.h", [sig])[0],
+        stub_check.driver_source("openssl/tls1.h", [sig], trials=2),
+    ):
+        assert "  int v_1;\n  memset(&v_1, 0, sizeof v_1);" in text, text
+        assert "const v_1" not in text, text
+    volatile = "\n".join(stub_check.call_lines(_sig("int h(volatile unsigned long const n)"), "v", False))
+    assert "  unsigned long v_0;\n" in volatile, volatile
+
+
+def _op_check_inputs() -> None:
+    write_json(Path("workspace/reports/stubs.json"), {"headers": {OP_HDR: {
+        "include_name": "op/oplib.h", "digest": "o1", "problems": [],
+        "functions": {fn: {"state": "filled"} for fn in OP_PROTOS}}}})  # fmt: skip
+    write_json(Path("workspace/reports/phase0_model.json"),
+               {"external_decls": {fn: {"proto": p} for fn, p in OP_PROTOS.items()}})  # fmt: skip
+    write_json(Path("workspace/reports/callgraph_dag.json"),
+               {"modules": {"use": {"external_callees": sorted(OP_PROTOS)}}})  # fmt: skip
+
+
+@pytest.mark.unit
+def test_the_header_verdict_follows_the_dynamic_classification(run_dir, monkeypatch):
+    """
+    The image's own reports for oplib (eacsl_post_*.log), through `stub_check.py run --checks dynamic`:
+    the fabricated handle and the untracked string are `inconclusive` and do not fail the header; the
+    wrong `ensures` on genuine arguments is `violated` and alone fails it and blocks its module.
+    """
+    import sandbox_exec
+
+    logs = {
+        fn: (FIXTURE / f"eacsl_post_{kind}.log").read_text(encoding="utf-8")
+        for fn, kind in (
+            ("op_answer", "value"), ("op_is_on", "fabricated"), ("op_version", "untracked"), ("op_name", "guarded"))
+    }  # fmt: skip
+    order = sorted(OP_PROTOS)  # _signatures sorts the functions: argv[1] is the index in this order
+
+    def fake_run(cmd, **_):
+        return sandbox_exec.SandboxResult(-6, "", logs[order[int(cmd[1])]], False, "test")
+
+    monkeypatch.setattr(stub_check, "build_driver", lambda *a, **k: {"status": "built", "binary": "drv", "log": "b.log"})
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
+    _op_check_inputs()
+    assert stub_check.main(["run", "--checks", "dynamic"]) == 1
+    data = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))
+    rec = data["headers"][OP_HDR]
+    dyn = rec["dynamic"]["functions"]
+    assert {fn: (f["status"], f.get("reason")) for fn, f in dyn.items()} == {
+        "op_answer": ("violated", None),
+        "op_is_on": ("inconclusive", "fabricated_argument"),
+        "op_version": ("inconclusive", "untracked_library_memory"),
+        "op_name": ("inconclusive", "untracked_library_memory"),
+    }
+    assert dyn["op_is_on"]["fabricated_params"] == ["ctx"]
+    assert "valid_read_string(\\result)" in dyn["op_version"]["report"]
+    assert rec["reasons"] == [f"op_answer: postcondition failed against the real library (see {OP_LOGS}/run0.log)"]
+    assert data["blocked_modules"] == {"use": [OP_HDR]}
+    # Without the wrong contract, the two artifacts alone leave the header passed and block nothing.
+    logs["op_answer"] = "$ fc_stub_driver.e-acsl 0  # op_answer, exit 0\n"
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed",
+                        lambda cmd, **_: sandbox_exec.SandboxResult(
+                            0 if order[int(cmd[1])] == "op_answer" else -6, "", logs[order[int(cmd[1])]], False, "t"))  # fmt: skip
+    assert stub_check.main(["run", "--checks", "dynamic"]) == 0
+    data = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))
+    assert data["headers"][OP_HDR]["status"] == "passed" and data["blocked_modules"] == {}

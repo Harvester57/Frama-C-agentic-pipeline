@@ -23,9 +23,19 @@ Checks of stub contracts (docs/plans/templates-and-stubs-improvement-plan.md ste
            over `--trials` runs, built with E-ACSL (which checks a declared function's contract around
            each call) and linked with the libraries the modules calling it link (the DAG's `ldflags`, the
            snapshot's library directories, plus --ldflags). Each function runs in its own process, under
-           sandbox_exec.py. A failed `ensures` is a wrong contract (`violated`); a failed `requires` means
-           the generated arguments do not meet it (`driver_rejected`), a crash or a link failure leaves
-           the check `inconclusive`.
+           sandbox_exec.py. A failed `requires` means the generated arguments do not meet it
+           (`driver_rejected`); a crash or a link failure leaves the check `inconclusive`. A failed
+           `ensures` is a wrong contract (`violated`) only when it is evidence against the contract
+           (`classify_run`); it is `inconclusive`, with E-ACSL's report and the `reason`, when
+           - the call got an object the driver fabricated (`fabricated_argument`, `fabricated_params`): every
+             pointer gets patterned bytes, a genuine buffer only for a pointee of plain bytes, characters or
+             scalars; a struct, union, typedef'd or incomplete pointee (an OpenSSL handle), a pointer to
+             pointer and an unbounded `void *` are fabricated, so the library computed from garbage;
+           - every failing term is a memory predicate (`\\valid`, `\\valid_read`, `valid_read_string`,
+             `\\initialized`, `\\block_length`, ...) E-ACSL printed as 0 on memory the uninstrumented library
+             returned or wrote (`untracked_library_memory`): E-ACSL tracks only memory instrumented code
+             registered, so a static string of the library is never valid to it. On NULL, on a pointer the
+             driver passed, negated, or beside a value comparison, it stays `violated`.
 
 The three probes include the header in the macro context the target includes it in: a library header may
 `#error` without a macro the target defines first, or pick its function names from it (pcre2.h and
@@ -55,7 +65,8 @@ it would hit), or a contract is `violated`. A failed
 header blocks every module whose DAG `external_callees` name one of its functions (with the module's
 lexer modules and sub-modules): workspace/reports/stub_check.json lists them under `blocked_modules`, and
 phase0_gates.py refuses those modules until a stub-check of the unchanged header passes. Eva warnings
-(`too_weak`, `valid_call_alarm`) and inconclusive dynamic checks are reported, never blocking.
+(`too_weak`, `valid_call_alarm`) and inconclusive dynamic checks (`fabricated_argument` and
+`untracked_library_memory` included) are reported, never blocking.
 
 Each checked header leaves its generated programs and tool logs (each starting with its command line) in
 workspace/reports/stub_check/<include with / as __>/ (abi.log, fc_stub_smoke.c, eva.log, fc_stub_driver.c,
@@ -266,6 +277,45 @@ def _pairs(sig: dict) -> dict[int, int | str]:
     return out
 
 
+_QUALIFIER_WORDS = frozenset("const volatile restrict __restrict __restrict__ __const __volatile__".split())
+# The pointee words of a buffer the driver's patterned bytes stand for genuinely: plain bytes, characters and
+# scalars. Any other pointee (a struct, a union, a library typedef such as EVP_CIPHER_CTX, an incomplete type)
+# is an object the driver fabricates from those bytes (`fabricated_params`).
+_PLAIN_POINTEE_WORDS = frozenset(
+    "void char short int long float double signed unsigned _Bool bool size_t ssize_t ptrdiff_t intptr_t uintptr_t "
+    "wchar_t char16_t char32_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t "
+    "u_char u_short u_int u_long".split()
+)
+
+
+def _unqualified(ctype: str) -> str:
+    """A value parameter's type without its qualifiers (all top-level: the type has no `*`)."""
+    return " ".join(w for w in ctype.split() if w not in _QUALIFIER_WORDS) or ctype
+
+
+def fabricated_params(sig: dict) -> list[str]:
+    """
+    The pointer parameters `call_lines` hands an object it fabricates rather than a genuine buffer: every
+    pointer gets BUF patterned bytes cast to its type, which is a genuine buffer only for a pointee of plain
+    bytes, characters or scalars (`_PLAIN_POINTEE_WORDS`). Fabricated: a pointer to a struct, a union, a
+    typedef'd or incomplete type (an OpenSSL handle reads garbage fields), a pointer to pointer (in or out,
+    prefilled with garbage pointers), and a `void *` no length bounds (an untyped handle). Read from the
+    parameter's type text: the driver cannot take `sizeof` of an incomplete type, so nothing is compiled.
+    When in doubt (a word the list does not know), the parameter is fabricated.
+    """
+    pairs = _pairs(sig)
+    out: list[str] = []
+    for i, p in enumerate(sig["params"]):
+        ctype = str(p["type"])
+        if "*" not in ctype:
+            continue
+        words = [w for w in re.findall(r"[A-Za-z_]\w*", ctype) if w not in _QUALIFIER_WORDS]
+        plain = ctype.count("*") == 1 and bool(words) and all(w in _PLAIN_POINTEE_WORDS for w in words)
+        if not plain or (words == ["void"] and i not in pairs):
+            out.append(str(p["name"]))
+    return out
+
+
 def call_lines(sig: dict, tag: str, short: bool, length: str = str(BUF)) -> list[str]:
     """
     The statements of one generic call: an aligned, initialized buffer of BUF bytes (or the fixed size)
@@ -287,7 +337,10 @@ def call_lines(sig: dict, tag: str, short: bool, length: str = str(BUF)) -> list
         elif i in lengths:
             args.append(f"({p['type']})({length}{' + 1' if short else ''})")
         else:
-            lines.append(f"  {p['type']} {v};")
+            # Without its qualifiers: memset needs a writable object, and a value parameter's `const` or
+            # `volatile` is top-level (no `*`), so `int const v; memset(&v, ...)` fails memset's precondition
+            # and the call after it is dead (nginx run-3, SSL_get_servername).
+            lines.append(f"  {_unqualified(p['type'])} {v};")
             lines.append(f"  memset(&{v}, 0, sizeof {v});")
             args.append(v)
     call = f"{sig['name']}({', '.join(args)});"
@@ -768,6 +821,279 @@ def build_driver(work: Path, ldflags: str, feature_flags: Sequence[str] = ()) ->
     return {"status": "built", "binary": str(select_eacsl_binary(out_bin)), "log": BUILD_LOG}
 
 
+# ---------------------------------------------------------------------------
+# What a dynamic postcondition failure says about the contract (nginx run-4, 2026-11-19)
+# ---------------------------------------------------------------------------
+
+# The reasons of an `inconclusive` postcondition failure: the driver handed the call a fabricated object
+# (`fabricated_params`), or every failing term is a memory predicate on memory the uninstrumented library
+# returned or wrote, which E-ACSL does not track.
+FABRICATED_ARGUMENT = "fabricated_argument"
+UNTRACKED_LIBRARY_MEMORY = "untracked_library_memory"
+REPORT_MAX = 800
+# E-ACSL's memory predicates and functions: on memory no instrumented code registered they read 0 (invalid,
+# uninitialized, no block), whatever the library did (docs/troubleshooting/eacsl-and-fuzzing.md, "E-ACSL
+# Rejects a Pointer the Program Got From an Uninstrumented Library").
+_MEMORY_FUNCTIONS = frozenset(
+    (
+        "\\valid",
+        "\\valid_read",
+        "\\initialized",
+        "\\block_length",
+        "\\base_addr",
+        "\\offset",
+        "\\separated",
+        "\\freeable",
+        "\\allocable",
+        "\\object_pointer",
+        "valid_read_string",
+        "valid_string",
+        "valid_read_nstring",
+        "valid_nstring",
+        "valid_read_wstring",
+        "valid_wstring",
+    )
+)
+_APPLICATION_RE = re.compile(r"(?<![\w\\])(\\?[A-Za-z_]\w*)\s*\(")
+# E-ACSL prints the failing predicate with Frama-C's Unicode operators (`\result ≡ 0 ∨ \result ≡ 1`).
+_UNICODE_OPERATORS = {
+    chr(0x2261): "==",
+    chr(0x2262): "!=",
+    chr(0x2264): "<=",
+    chr(0x2265): ">=",
+    chr(0x2227): "&&",
+    chr(0x2228): "||",
+    chr(0x21D2): "==>",
+    chr(0x21D4): "<==>",
+    chr(0x00AC): "!",
+}
+_POSTCONDITION_RE = re.compile(r"Postcondition failed:?[ \t]*\n", re.IGNORECASE)
+_NULL_VALUES = frozenset(("(nil)", "\\null", "NULL"))
+
+
+def _ascii_operators(text: str) -> str:
+    for uni, ascii_op in _UNICODE_OPERATORS.items():
+        text = text.replace(uni, f" {ascii_op} ")
+    return " ".join(text.split())
+
+
+def postcondition_failures(out: str) -> list[dict]:
+    """
+    Each E-ACSL `Postcondition failed` block of a run's output: {label, predicate, values: [(term,
+    value)]}, the predicate with ASCII operators. E-ACSL prints, one level indented:
+
+        The failing predicate is:
+        valid_str:
+            valid_read_string(\\result).
+        With values at failure point:
+        - valid_str: valid_read_string(\\result): 0
+        - \\result: 0x78675abc321d
+
+    A value line may carry the predicate's label (`- valid_str: ...`), which is dropped from its term.
+    """
+    blocks: list[dict] = []
+    for m in _POSTCONDITION_RE.finditer(out):
+        pred_lines: list[str] = []
+        values: list[tuple[str, str]] = []
+        section = "head"
+        for line in out[m.end() :].split("\n"):
+            text = line.strip()
+            if not line[:1].isspace() or not text:
+                break
+            low = text.lower()
+            if low.startswith("the failing predicate is"):
+                section = "predicate"
+            elif low.startswith("with values at failure point"):
+                section = "values"
+            elif section == "predicate":
+                pred_lines.append(text)
+            elif section == "values" and text.startswith("- ") and ": " in text:
+                term, value = text[2:].rsplit(": ", 1)
+                labelled = re.match(r"^[A-Za-z_][\w/-]*: (.+)$", term)
+                values.append(((labelled.group(1) if labelled else term).strip(), value.strip()))
+        label = ""
+        if len(pred_lines) >= 2 and pred_lines[0].endswith(":"):
+            label, pred_lines = pred_lines[0][:-1].strip(), pred_lines[1:]
+        predicate = _ascii_operators(" ".join(pred_lines)).rstrip(".").strip()
+        blocks.append({"label": label, "predicate": predicate, "values": values})
+    return blocks
+
+
+def _matching_paren(text: str, open_at: int) -> int:
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] in "([{":
+            depth += 1
+        elif text[i] in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _top_split(expr: str, op: str) -> list[str]:
+    """`expr` split at the occurrences of `op` outside parentheses (`==>` never inside `<==>`)."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and expr.startswith(op, i) and not (op == "==>" and i > 0 and expr[i - 1] == "<"):
+            parts.append(expr[start:i])
+            i += len(op)
+            start = i
+            continue
+        i += 1
+    parts.append(expr[start:])
+    return [p.strip() for p in parts]
+
+
+def _strip_parens(expr: str) -> str:
+    expr = expr.strip()
+    while expr.startswith("(") and _matching_paren(expr, 0) == len(expr) - 1:
+        expr = expr[1:-1].strip()
+    return expr
+
+
+def _is_null(value: str) -> bool:
+    return value in _NULL_VALUES or re.fullmatch(r"(?:0x)?0+", value) is not None
+
+
+def _memory_atom(atom: str, values: list[tuple[str, str]]) -> bool:
+    """
+    Whether `atom` is a memory predicate (or a comparison of a memory function with constants) on memory
+    the library returned or wrote: its argument names `\\result` or a dereference, and no printed value of
+    a term in it is NULL (`valid_read_string(\\result)` with `\\result: (nil)` is a real failure).
+    """
+    # The outermost memory applications, removed from the atom (one nested in another goes with it).
+    pieces: list[str] = []
+    apps: list[str] = []
+    pos = 0
+    for m in _APPLICATION_RE.finditer(atom):
+        if m.start() < pos or m.group(1) not in _MEMORY_FUNCTIONS:
+            continue
+        close = _matching_paren(atom, m.end() - 1)
+        if close < 0:
+            return False
+        apps.append(atom[m.end() : close])
+        pieces.append(atom[pos : m.start()])
+        pos = close + 1
+    rest = "".join(pieces) + atom[pos:]
+    if not apps:
+        return False
+    # What is left beside the memory applications: constants and comparisons only. A negation (`!\valid`)
+    # stays a real failure: E-ACSL under-approximates what is valid, never over.
+    if not re.fullmatch(r"[\s\d()+\-<>=]*", rest.replace("!=", "==")):
+        return False
+    for arg in apps:
+        if "\\result" not in arg and "*" not in arg:
+            return False  # a pointer the driver passed: E-ACSL tracks the driver's own buffers
+        for term, value in values:
+            if term in arg and not _APPLICATION_RE.match(term) and _is_null(value):
+                return False
+    return True
+
+
+def _held(atom: str, values: list[tuple[str, str]]) -> bool:
+    """`T != \\null` whose printed value of T is not NULL: a conjunct that held at the failure point."""
+    m = re.fullmatch(r"(.+?)\s*!=\s*\\null|\\null\s*!=\s*(.+)", atom)
+    if not m:
+        return False
+    term = (m.group(1) or m.group(2)).strip()
+    return any(t == term and not _is_null(v) for t, v in values)
+
+
+def _memory_explained(pred: str, values: list[tuple[str, str]]) -> bool:
+    """
+    Whether the failure of `pred` can be E-ACSL's view of untracked memory alone. `A ==> B` failed on B;
+    `A || B` failed on every disjunct, one memory predicate is enough to explain it; `A && B` needs every
+    conjunct to be a memory predicate or one that held (`\\result != \\null` with a non-NULL value).
+    Anything else (a value comparison, a quantifier, a negation) is not explained.
+    """
+    expr = _strip_parens(pred)
+    parts = _top_split(expr, "==>")
+    if len(parts) > 1:
+        return _memory_explained(" ==> ".join(parts[1:]), values)
+    parts = _top_split(expr, "||")
+    if len(parts) > 1:
+        return any(_memory_explained(p, values) for p in parts)
+    parts = _top_split(expr, "&&")
+    if len(parts) > 1:
+        explained = [_memory_explained(p, values) for p in parts]
+        return any(explained) and all(e or _held(_strip_parens(p), values) for e, p in zip(explained, parts, strict=True))
+    return _memory_atom(expr, values)
+
+
+def _untracked_memory_failure(block: dict) -> bool:
+    """A postcondition block every failing term of which is a memory predicate that E-ACSL printed as 0."""
+    values = block["values"]
+    printed_false = any(
+        (m := _APPLICATION_RE.match(term)) is not None and m.group(1) in _MEMORY_FUNCTIONS and value == "0"
+        for term, value in values
+    )
+    return printed_false and bool(block["predicate"]) and _memory_explained(block["predicate"], values)
+
+
+def classify_run(sig: dict, out: str, returncode: int, timed_out: bool, trials: int) -> dict:
+    """
+    The dynamic check's record of one function's run (its output `out`, E-ACSL's reports included):
+
+    - `passed`: exit 0, no failed contract.
+    - `driver_rejected`: the first failure is a `requires` (the generated arguments do not meet it).
+    - `violated`: a postcondition failed on a call whose arguments are genuine (scalars, byte buffers),
+      and the failure is not only E-ACSL's view of untracked memory: the contract is wrong. Blocking.
+    - `inconclusive`, never blocking, with a `reason`:
+      `fabricated_argument` (a postcondition failed, but the call got an object the driver fabricated from
+      patterned bytes: `fabricated_params`), `untracked_library_memory` (every failing term is a memory
+      predicate E-ACSL evaluated to 0 on memory the library returned or wrote), `timeout` or `exit N`.
+    A postcondition record keeps E-ACSL's report (`report`) and says why it is not blocking (`detail`).
+    """
+    fail = _EACSL_FAIL_RE.search(out)
+    if returncode == 0 and not fail:
+        return {"status": "passed", "trials": trials}
+    if fail is None:
+        return {
+            "status": "inconclusive",
+            "reason": "timeout" if timed_out else f"exit {returncode}",
+            "output_tail": out[-REPORT_MAX:],
+        }
+    report = out[fail.start() : fail.start() + REPORT_MAX].strip()
+    if fail.group(1).lower() != "postcondition":
+        return {"status": "driver_rejected", "report": report}
+    fabricated = fabricated_params(sig)
+    if fabricated:
+        types = {str(p["name"]): str(p["type"]) for p in sig["params"]}
+        named = ", ".join(f"{n} ({types.get(n, '?')})" for n in fabricated)
+        return {
+            "status": "inconclusive",
+            "reason": FABRICATED_ARGUMENT,
+            "fabricated_params": fabricated,
+            "detail": (
+                f"the driver passed {named} an object fabricated from {BUF} patterned bytes, not one the "
+                "library made: what the library returned or wrote from it says nothing about the contract"
+            ),
+            "report": report,
+        }
+    blocks = postcondition_failures(out)
+    if blocks and all(_untracked_memory_failure(b) for b in blocks):
+        preds = "; ".join(dict.fromkeys(b["predicate"] for b in blocks))
+        return {
+            "status": "inconclusive",
+            "reason": UNTRACKED_LIBRARY_MEMORY,
+            "detail": (
+                f"E-ACSL evaluated {preds} to 0 on memory the uninstrumented library returned or wrote, which "
+                "it does not track (docs/troubleshooting/eacsl-and-fuzzing.md)"
+            ),
+            "report": report,
+        }
+    return {"status": "violated", "report": report}
+
+
 def check_dynamic(
     include: str,
     sigs: list[dict],
@@ -800,22 +1126,7 @@ def check_dynamic(
         (work / f"run{idx}.log").write_text(
             f"$ {binary.name} {idx}  # {sig['name']}, exit {res.returncode}\n{out}", encoding="utf-8"
         )
-        fail = _EACSL_FAIL_RE.search(out)
-        if res.returncode == 0 and not fail:
-            functions[sig["name"]] = {"status": "passed", "trials": trials}
-        elif fail and fail.group(1).lower() == "postcondition":
-            functions[sig["name"]] = {"status": "violated", "report": out[fail.start() : fail.start() + 800].strip()}
-        elif fail:
-            functions[sig["name"]] = {
-                "status": "driver_rejected",
-                "report": out[fail.start() : fail.start() + 800].strip(),
-            }
-        else:
-            functions[sig["name"]] = {
-                "status": "inconclusive",
-                "reason": "timeout" if res.timed_out else f"exit {res.returncode}",
-                "output_tail": out[-800:],
-            }
+        functions[sig["name"]] = classify_run(sig, out, res.returncode, res.timed_out, trials)
     for idx, sig in enumerate(sigs):
         if sig["name"] in functions:
             functions[sig["name"]]["log"] = f"run{idx}.log"
