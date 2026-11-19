@@ -5,7 +5,7 @@ what the reports show, and how `ledger.py ingest-fuzz` files a violated property
 
 The unit tests run the real functions on the fake toolchain of tests/test_metacsl_eacsl.py. The
 acceptance test drives tests/fixtures/metacsl_eacsl through run_eacsl_fuzz.py in the analysis image
-(tests/fixtures/metacsl_eacsl_wiring/drive.py, FRAMAC_DOCKER_TESTS=1) and ingests its reports here.
+(tests/fixtures/metacsl_eacsl_wiring/drive_wiring.py, FRAMAC_DOCKER_TESTS=1) and ingests its reports here.
 """
 
 from __future__ import annotations
@@ -1003,7 +1003,7 @@ ACCEPTANCE_UNITS = {
 
 @pytest.fixture(scope="module")
 def wiring_result(tmp_path_factory):
-    """drive.py in the analysis image: (its RESULT document, the directory holding the reports it wrote)."""
+    """drive_wiring.py in the analysis image: (its RESULT document, the directory holding the reports it wrote)."""
     require_docker_images(ANALYSIS_IMAGE)
     inputs = tmp_path_factory.mktemp("metacsl_wiring_inputs")
     out = tmp_path_factory.mktemp("metacsl_wiring_out")
@@ -1033,7 +1033,7 @@ def wiring_result(tmp_path_factory):
         "-v", f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
         ANALYSIS_IMAGE, "-c",
         "mkdir -p /tmp/run && cd /tmp/run && "
-        f"timeout 3300 python3 /wiring/drive.py /fixture /wiring /inputs /out {pm.MAKEFILE}",
+        f"timeout 3300 python3 /wiring/drive_wiring.py /fixture /wiring /inputs /out {pm.MAKEFILE}",
     ]  # fmt: skip
     res = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600, check=False

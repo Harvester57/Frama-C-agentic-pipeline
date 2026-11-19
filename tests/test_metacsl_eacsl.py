@@ -443,6 +443,7 @@ def test_the_cache_key_does_not_know_the_properties(run_dir):
             "rte_initialized",
             "no_constfold",
             "concurrency",
+            "ignored_annotations",
             "check_options",
             "runtime_patches",
             "zone_sizes",

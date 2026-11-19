@@ -21,6 +21,7 @@ import pytest
 
 import generate_report as G
 import ledger as L
+import security_props as sp
 import test_security_props as tsp
 import test_security_props_wrapper as tw
 from conftest import write_json
@@ -36,8 +37,9 @@ DIRECT_CALLER = "prog.c#ping::l5_sanitized"
 
 
 def _before() -> dict:
-    """The property at the callers of `send_frame`, as before `checked_at`."""
-    return tw.wrapper_doc(tw.PLAIN_SINK, tw.TCP_SINK, tw.RTU_SINK)
+    """The property at the callers of `send_frame`, as a run recorded it before the move."""
+    sinks = [tw.CHECKED_AT_SINK, tw.TCP_SINK, tw.RTU_SINK]
+    return sp.generate(tw.wrapper_model(), tsp.threat(output_sinks=sinks), keep_at_callers={"send_frame": "not applied"})
 
 
 def _unproven_report(function: str, annotation: str) -> dict:

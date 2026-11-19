@@ -176,7 +176,9 @@ LLMs fail when trying to write all ACSL annotations in a single pass. You MUST s
 <!-- if: floats -->
    - **Floating-point comparisons:** always guard floating-point arguments with `requires !\is_NaN(x) && \is_finite(x);`.
 <!-- endif -->
+<!-- if: pointer_params -->
    - **`void *` in an annotation:** cast a `void *` to `char *` before you use it in `\block_length` or in pointer arithmetic inside an annotation (`\block_length((char *)p)`, `(char *)p + n`). WP gives `void` the size of an `int`, prints `Warning: void object`, and can then prove a false bound. The WP report lists the lines WP warned on in `void_object_warnings`, with a hint, on an `all_proven` run too. A line in your own annotations must be fixed; a line in a libc header or on a `pointer_value` alarm is usually not yours to fix.
+<!-- endif -->
    - **Vacuous Contracts:** once all goals are proven, `run_wp_function.py` checks by itself whether your `requires` clauses contradict each other, and returns `unsound_proof` if they do. A defensive branch that your `requires` makes unreachable is not a failure, and neither is a deliberate `assert unreachable_branch: \false;`.
 <!-- if: structs -->
    - **Say What Stays Unchanged:** `assigns` and `\separated` are often not enough for a caller to keep a fact about memory `{function_name}` does not write, when `assigns` names a whole struct or range, or when the write goes through a pointer chain (a list or tree node). For each field or range a caller relies on and `{function_name}` leaves alone, add a named postcondition (`ensures keep_len: q->len == \old(q->len);`, `ensures keep_tail: \forall integer k; n <= k < cap ==> a[k] == \old(a[k]);`). They are ordinary clauses, proven like the others, and they are not trivial clauses.

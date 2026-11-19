@@ -3,7 +3,7 @@ In-image driver of tests/test_metacsl_eacsl_wiring.py (plan package C2): the fix
 tests/fixtures/metacsl_eacsl through `run_eacsl_fuzz.py`, as Make runs it, in a run-directory layout
 (cwd). It prints one `RESULT <json>` line and copies the reports and crash inputs to OUT_DIR.
 
-usage: drive.py C_FIXTURE_DIR WIRING_FIXTURE_DIR INPUT_DIR OUT_DIR MAKEFILE
+usage: drive_wiring.py C_FIXTURE_DIR WIRING_FIXTURE_DIR INPUT_DIR OUT_DIR MAKEFILE
 INPUT_DIR holds on.json (the `eacsl` engine on), changed.json (the same with one property's text
 changed), off.json (the engine off), and the Make run directories mk_off and mk_on with `before/`, the
 templates without this package's change. MAKEFILE is the generated makefile's run-relative path.

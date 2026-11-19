@@ -178,8 +178,8 @@ For each boundary crossing and each asset, ask what breaks its confidentiality, 
 "Carried by" says who will check the property, in one of these forms:
 
 - `default checks`: memory safety, arithmetic and termination, which the verification checks on every function without any block item;
-- the block item that carries it (`secrets: session_key`, `auth_gates: en_check_token`, `output_sinks: en_log`);
-- `not checked by the verification`, with the reason: no block item can express it (a writer set, a condition or a call order of the state table while the block has no list for it: name the row, `ST-NNN`), or it is outside what the verification looks at (timing side channels, cryptographic strength, protocol logic, races between threads, resource exhaustion other than non-termination, behaviour of the embedding application).
+- the block item that carries it (`secrets: session_key`, `auth_gates: en_check_token`, `output_sinks: en_log`, `assets: session_table`, `invariants: count_bound`, `call_rules: en_send`);
+- `not checked by the verification`, with the reason: no block item can express it (a state row the `assets`, `invariants` or `call_rules` lists cannot state: name the row, `ST-NNN`), or it is outside what the verification looks at (timing side channels, cryptographic strength, protocol logic, races between threads, resource exhaustion other than non-termination, behaviour of the embedding application).
 
 Only a block item, or the default checks, counts as carried. The rows marked `not checked by the verification` are the residual risk of the model. Repeat them under "Unknowns And Evidence Limits".
 
@@ -209,9 +209,12 @@ The block restates the model; it never extends it.
 - Every `secrets` item matches a row of "Secrets".
 - Every `auth_gates` item matches a row of "Authorization Gates".
 - Every `output_sinks` item matches a row of "Output Sinks".
-- Every empty list is backed by the `None:` sentence of its table.
+- Every `assets` item matches the "Allowed Writers" or "Allowed Readers" of a row of "State, Invariants And Call Order".
+- Every `invariants` item matches the "Condition That Always Holds" of a row of that table.
+- Every `call_rules` item matches the "Required Call Order" of a row of that table.
+- Every empty list is backed by the `None:` sentence of its table. `assets`, `invariants` and `call_rules` are optional: leave one out when its column is empty.
 
-Count them: the ledger's "Inventory Counts" must show, per kind, the rows found, the rows in the model, the items in the block and the rows dropped with their reason. A row that the block's schema cannot express (a returned secret, a state row when the schema has no list for it) stays in the prose and is counted as dropped with that reason.
+Count them: the ledger's "Inventory Counts" must show, per kind, the rows found, the rows in the model, the items in the block and the rows dropped with their reason. A row that the block's schema cannot express (a returned secret, a state row the `assets`, `invariants` or `call_rules` lists cannot state) stays in the prose and is counted as dropped with that reason.
 
 ## Updating an existing model
 
