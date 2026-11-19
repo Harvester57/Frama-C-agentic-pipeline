@@ -601,18 +601,19 @@ Entries from package C of [`../plans/metacsl-exploitation-plan.md`](../plans/met
     - `compile_eacsl_binary` gave a step killed at the limit (`_run_tool`: return code 124 and the limit line) the generic reason of its stage.
     - `pipeline_make.KNOWN_EACSL_FAILURES` had no entry for it.
     - `_first_build_error` saw only warnings, notes and no wrap-up line, so it returned None.
-- **Fix (report):** branch `sup/nginx-eacsl-build-timeout`, commit `20f8c53`, held, not merged.
+- **Fix (report):** branch `sup/nginx-eacsl-build-timeout`, commits `20f8c53` and `c0d9e7d`, held, not merged.
   - [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py): an E-ACSL step killed at the limit gives reason `eacsl_build_timeout`, at stage 1 or stage 2. The build report's `engine_fallback_reason` then names it.
   - [`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py): `KNOWN_EACSL_FAILURES` gets `eacsl_build_timeout` (schema enum in [`../../schemas/build_check.schema.json`](../../schemas/build_check.schema.json)). It matches only when the attempt has `Returncode: 124` and ends with the limit line, and it is checked first.
     - The row's `reason` names the tool and the limit as parsed from the log. It says this is typical of a module whose sources are the whole program, and that the fix is a smaller unit, not a larger limit.
     - `next_step` is `python3 $S/pipeline_make.py params set --module <mod> --fuzz-engine sanitizers`.
     - As with the other known failures, the module fails until that choice is recorded. build-check never switches the engine itself.
-    - `_first_build_error` returns the limit line with "(the attempt was killed at this time limit; no error ended it)".
+    - `_first_build_error` returns the limit line with "(the attempt was killed at this time limit; no error ended it)". It requires the same `Returncode: 124` (commit `c0d9e7d`).
   - [`../../scripts/phase0_gates.py`](../../scripts/phase0_gates.py): the `fuzz-<mod>` gate message says the build cannot finish within the fixed time limit, and that the fix is a smaller unit.
   - On the run-5 log, the fixed code gives `first_error` = the limit line and `reason_code` `eacsl_build_timeout` with `3600 s`.
   - Tests:
-    - `tests/test_pipeline_make.py::test_build_check_names_an_eacsl_build_killed_at_the_time_limit`: a log shaped like run-5's, with an `error:`-looking decoy line before the kill. It covers the `eacsl_fallback` and `build_failed` rows, a parsed `900.0 s` limit, no match without `Returncode: 124`, and the gate message.
+    - `tests/test_pipeline_make.py::test_build_check_names_an_eacsl_build_killed_at_the_time_limit`: a log shaped like run-5's, with an `error:`-looking decoy line before the kill. It covers the `eacsl_fallback` and `build_failed` rows, a parsed `900.0 s` limit, neither a reason code nor a "killed" `first_error` without `Returncode: 124`, and the gate message.
     - `tests/test_tool_sizing.py::test_an_instrumentation_killed_at_the_build_time_limit_is_named_as_such`: stage 1 killed, then the log fuzz_build writes is read by build-check.
     - `test_compile_stages_get_the_build_class_timeout` now expects `eacsl_build_timeout`; it expected `eacsl_compile_failed` before.
 - **Open pipeline bug:** the E-ACSL instrumentation of a whole nginx program does not finish in the fixed 3600 s build limit, and it takes more than 10 GiB. Any module whose unit the split leaves whole is hit, whatever its function count. The fix belongs in the unit split: give each module only the files its functions need. Raising the limit is not the fix.
+- **Open pipeline bug (found while fixing this, not seen on run-5):** with the run's MetAcsl properties on for E-ACSL (`security_props.meta_engines`), a properties build killed at the limit is treated like any failed properties build. `fuzz_build._build_with_security_meta` marks it `dropped`, and `compile_eacsl_binary` then runs the plain E-ACSL build. That plain build would most likely spend a second full hour before the fallback. Run-5's command has no MetAcsl stage, so it was not hit. A fix would skip the plain rebuild when the properties build failed with `eacsl_build_timeout`.
 - **Workaround on run-5:** the user recorded `params set --fuzz-engine sanitizers` for both `nginx__ngx_bpf` and `nginx__ngx_http_script` at 20:30 local, and the run rebuilt both with the sanitizers. Both modules lose the E-ACSL checks (sub-object overflow, `\initialized`), and the run report must say so.
