@@ -67,6 +67,7 @@ known-first-party = [
     "generate_report",
     "harness_reach",
     "image_toolchain",
+    "include_context",
     "kernel_ast",
     "ledger",
     "libc_gap_report",

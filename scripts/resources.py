@@ -89,6 +89,7 @@ PROBE_MEMO_S = 5.0
 ENGINE_INFO_MAX_AGE_S = 30.0
 HISTORY_DIR = Path("state") / "resource-history"
 CONTAINER_CACHE_MOUNT = "/framac-cache"
+CONTAINER_RUN_DIR = Path("/framac-run")  # the run dir inside every pipeline container
 
 
 @dataclass(frozen=True)
@@ -1914,6 +1915,146 @@ def history_estimate(
     return None
 
 
+def history_run_dir() -> Path | None:
+    """
+    The run dir whose state/resource-history/ a `run` job reads and writes: the cwd when it is a run
+    dir (Make recipes), else the container's run dir (/framac-run). A Phase 0 parse lease runs with
+    the scratch tree as its cwd, and its record must still reach the run (nginx run-3 had none).
+    """
+    for d in (Path.cwd(), CONTAINER_RUN_DIR):
+        with contextlib.suppress(OSError):
+            if (d / "run-metadata.json").is_file():
+                return d
+    return None
+
+
+# Floor of every `build` lease (a first build has no history; a short aborted attempt records a tiny
+# peak): sized from Phase 0's measured parse of the link unit(s) its sources come from. nginx run-3: the parse of the 165-file unit peaked at 10471 MiB (the
+# model container's record); two E-ACSL builds of 163 and 161 of those files, admitted at the class's
+# 2048 MiB, held 8.76 and 8.39 GB each when the 17 GiB container's OOM killer struck. An E-ACSL build
+# parses the same files again before instrumenting them, so the parse peak scaled by the share of the
+# unit's sources compiled is the measured base; EACSL_BUILD_MARGIN is history_estimate's margin over a
+# measured peak (the observed 8.4-8.8 GB were still growing when killed, so they are lower bounds).
+PHASE0_MODEL = Path("workspace") / "reports" / "phase0_model.json"
+WORK_TREE_PREFIX = "workspace/work/"
+EACSL_BUILD_MARGIN = 1.25
+MODEL_RECORD_WINDOW_S = 120.0  # the model container records on exit: run-3's landed 1.1 s after the model ended
+_MODEL_MAX_BYTES = 512 << 20
+
+
+def command_sources(cmd: list[str]) -> list[str]:
+    """The files after `--sources` (run_eacsl_fuzz.py build), up to the next option."""
+    out: list[str] = []
+    for i, arg in enumerate(cmd):
+        if arg == "--sources":
+            for item in cmd[i + 1 :]:
+                if item.startswith("-"):
+                    break
+                out.append(item)
+    return out
+
+
+def _tree_relative(path: str, tree: str | None) -> str:
+    p = path.replace("\\", "/")
+    if WORK_TREE_PREFIX in p:
+        return p.rsplit(WORK_TREE_PREFIX, 1)[1]
+    if tree and p.startswith(tree.rstrip("/") + "/"):
+        return p[len(tree.rstrip("/")) + 1 :]
+    return p[2:] if p.startswith("./") else p
+
+
+def _parse_ts(value: Any) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
+def _model_container_peak(run_dir: Path, model: dict) -> tuple[int, str] | None:
+    """
+    Peak (MiB) of the container that built the Phase 0 model: its `phase-static` record (null key,
+    container scope) is the first one written after the model ended (generated_at + seconds). Later
+    containers, such as build-check itself, are other jobs and never count.
+    """
+    start, seconds = _parse_ts(model.get("generated_at")), model.get("seconds")
+    if start is None or isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    end = start + float(seconds)
+    best: tuple[float, int, str] | None = None
+    with contextlib.suppress(OSError):
+        for path in (run_dir / HISTORY_DIR / "phase-static").glob("*.json"):
+            rec = _load_json(path, max_bytes=64 * 1024)
+            if not isinstance(rec, dict) or rec.get("scope") != "container":
+                continue
+            ts, peak = _parse_ts(rec.get("ts")), rec.get("peak_mb")
+            if ts is None or isinstance(peak, bool) or not isinstance(peak, (int, float)) or peak <= 0:
+                continue
+            if end - 5.0 <= ts <= end + MODEL_RECORD_WINDOW_S and (best is None or ts < best[0]):
+                best = (ts, int(peak), str(rec.get("ts")))
+    return (best[1], best[2]) if best else None
+
+
+def first_build_estimate(
+    run_dir: Path | str | None, cmd: list[str], cache_dir: Path | str | None = None
+) -> tuple[int, str] | None:
+    """
+    (MiB, basis) for a module's build (cmd_run takes the larger of it and the key's history), or None
+    when Phase 0 measured nothing usable:
+    EACSL_BUILD_MARGIN x sum over the model's parse jobs of (the job's parse peak x the share of its
+    sources the build compiles). A job's parse peak comes from its own `parse` lease history
+    (`p0-<job>`, already with history_estimate's margin), else from the model container's record, split
+    across the parse jobs by their number of sources. Only admission changes, never the analysis.
+    """
+    if run_dir is None:
+        return None
+    run_dir = Path(run_dir)
+    sources = command_sources(cmd)
+    if not sources:
+        return None
+    model = _load_json(run_dir / PHASE0_MODEL, max_bytes=_MODEL_MAX_BYTES)
+    if not isinstance(model, dict):
+        return None
+    jobs = [j for j in model.get("parse_jobs") or [] if isinstance(j, dict) and isinstance(j.get("sources"), list)]
+    total = sum(len(j["sources"]) for j in jobs)
+    if not total:
+        return None
+    tree = model.get("tree") if isinstance(model.get("tree"), str) else None
+    wanted = {_tree_relative(s, tree) for s in sources}
+    container: tuple[int, str] | None = None
+    container_read = False  # the model container's record is looked up once, on demand
+    estimate = 0.0
+    basis: list[str] = []
+    for job in jobs:
+        job_sources = {str(s) for s in job["sources"]}
+        overlap = len(wanted & job_sources)
+        if not overlap:
+            continue
+        key = f"p0-{job.get('key')}"
+        hist = history_estimate(run_dir, "parse", key, cache_dir=cache_dir)
+        if hist is not None:
+            estimate += hist * overlap / len(job_sources)
+            basis.append(f"{overlap}/{len(job_sources)} of parse {key} ({hist} MiB from its history)")
+            continue
+        if not container_read:
+            container, container_read = _model_container_peak(run_dir, model), True
+        if container is None:
+            continue
+        peak = container[0] * len(job_sources) / total
+        estimate += EACSL_BUILD_MARGIN * peak * overlap / len(job_sources)
+        basis.append(
+            f"{overlap}/{len(job_sources)} of parse job {job.get('key')} "
+            f"({peak:.0f} of the model container's {container[0]} MiB peak at {container[1]})"
+        )
+    if estimate <= 0:
+        return None
+    return int(math.ceil(estimate)), "; ".join(basis)
+
+
 # ---------------------------------------------------------------------------
 # Locks and leases
 # ---------------------------------------------------------------------------
@@ -2848,26 +2989,65 @@ def _output_rc(rc: int, output: str | None, before: tuple[int, int, int] | None)
     return rc
 
 
-def _oom_killed(rc: int, before: dict, after: dict) -> bool:
-    """SIGKILL (directly, or as a shell reports it) together with a new oom_kill in memory.events."""
-    if rc not in (-9, 137):
-        return False
+def oom_kills_during(before: dict, after: dict) -> int | None:
+    """New oom_kill events in this container's cgroup between two cgroup_stats() reads (None: unknown)."""
     b, a = before.get("oom_kill"), after.get("oom_kill")
-    return a is not None and b is not None and a > b
+    if a is None or b is None:
+        return None
+    return max(0, int(a) - int(b))
+
+
+def oom_evidence(
+    rc: int,
+    before: dict,
+    after: dict,
+    *,
+    single: bool,
+    peak_mb: int | None,
+    lease_mb: int,
+    gated: bool = True,
+) -> str | None:
+    """
+    Why the cgroup's OOM kills during a job are charged to it, or None. The kill can hit a grandchild
+    (E-ACSL's Frama-C under run_eacsl_fuzz.py), after which the job exits with its own code, so a
+    kill is charged when the job was SIGKILLed itself (`sigkill`), when it held the only lease from
+    grant to release (`alone`: nothing else of the broker ran), or when its own peak overran its
+    lease (`overran_lease`: gated grants never exceed the pool, so only jobs above their grant can
+    push the container over it; an ungated `light` lease is outside that sum, so it never qualifies).
+    A job that stayed within its lease beside others is not charged: the kill may be a neighbour's,
+    and its record keeps only `oom_kills_during`.
+    """
+    if not oom_kills_during(before, after):
+        return None
+    if rc in (-9, 137):
+        return "sigkill"
+    if single:
+        return "alone"
+    if gated and peak_mb is not None and peak_mb > lease_mb:
+        return "overran_lease"
+    return None
+
+
+def retry_memory(lease: Lease, peak_mb: int | None) -> int:
+    """Memory for the one retry of an OOM-killed job: max(2 x its lease, 1.25 x its peak), capped at the pool."""
+    want = max(2 * lease.mem_mb, int(math.ceil(1.25 * peak_mb)) if peak_mb else 0)
+    return min(want, lease.pool_mem_mb) if lease.pool_mem_mb > 0 else want
 
 
 def _record_run_history(
+    run_dir: Path | None,
     cls_name: str,
     key: str | None,
     lease: Lease,
     rc: int,
-    oom: bool,
+    oom: str | None,
+    kills: int | None,
     peak: int | None,
     source: str | None,
     wall: float,
     attempt: int,
 ) -> None:
-    if not Path("run-metadata.json").is_file():
+    if run_dir is None:
         return
     rec = {
         "class": cls_name,
@@ -2875,7 +3055,9 @@ def _record_run_history(
         "ts": _utc_now(),
         "rc": rc,
         "peak_mb": peak,
-        "oom_killed": oom,
+        "oom_killed": oom is not None,
+        "oom_evidence": oom,
+        "oom_kills_during": kills,
         "cpus": lease.cpus,
         "mem_mb": lease.mem_mb,
         "wall_seconds": round(wall, 3),
@@ -2884,7 +3066,7 @@ def _record_run_history(
         "attempt": attempt,
     }
     with contextlib.suppress(OSError):
-        write_history(Path.cwd(), rec)
+        write_history(run_dir, rec)
 
 
 def cmd_run(argv: list[str], root: Path | str = "/") -> int:
@@ -2912,15 +3094,29 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
     if problem:
         _say(problem)
         return 2
-    run_dir = Path.cwd()
+    run_dir = history_run_dir()
+    floor: int | None = None
+    attempt = 0
+
+    def estimate(c: str, k: str | None) -> int | None:
+        if attempt > 1:
+            return None  # the retry's floor already holds what the first attempt measured
+        hist = history_estimate(run_dir, c, k)
+        if c == "build":
+            # The Phase 0 estimate stays a floor: a build that aborted in seconds (run-3's missing
+            # objs/ngx_modules.c) records a tiny peak, which must not shrink the next whole-program build.
+            phase0 = first_build_estimate(run_dir, cmd)
+            if phase0 is not None and phase0[0] > (hist or 0):
+                _say(f"build of {k or 'this module'}: {phase0[0]} MiB from Phase 0's parse ({phase0[1]})")
+                return phase0[0]
+        return hist
+
     broker = Broker(
         broker_dir,
         lambda: job_budget(root_p, use_available=False),
-        history_fn=lambda c, k: history_estimate(run_dir, c, k),
+        history_fn=estimate,
         log=sys.stderr,
     )
-    floor: int | None = None
-    attempt = 0
     while True:
         attempt += 1
         lease = broker.acquire(cls_name, args.key, mem_floor_mb=floor)
@@ -2941,16 +3137,26 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
             single = broker.release(lease)
         wall = time.monotonic() - start
         after = cgroup_stats(root_p)
-        oom = _oom_killed(rc, before, after)
         peak, source = maxrss, ("rusage" if maxrss else None)
         cg_peak, cg_before = after.get("peak_mb"), before.get("peak_mb")
         if single and cg_peak and (cg_before is None or cg_peak > cg_before) and cg_peak > (peak or 0):
             peak, source = cg_peak, "cgroup"  # alone in the container: its new memory.peak is this job's
-        _record_run_history(cls_name, args.key, lease, rc, oom, peak, source, wall, attempt)
-        if oom and CLASSES[cls_name].idempotent and attempt == 1:
-            floor = 2 * lease.mem_mb
-            _say(f"{cls_name} job was OOM-killed with {lease.mem_mb} MiB; retrying once with {floor} MiB")
+        oom = oom_evidence(rc, before, after, single=single, peak_mb=peak, lease_mb=lease.mem_mb, gated=lease.gated)
+        kills = oom_kills_during(before, after)
+        _record_run_history(run_dir, cls_name, args.key, lease, rc, oom, kills, peak, source, wall, attempt)
+        # A job that still exited 0 (say, a sanitizer build after its E-ACSL attempt was killed) is not
+        # re-run in place; its record says oom_killed, so its next lease doubles.
+        if oom and rc != 0 and CLASSES[cls_name].idempotent and attempt == 1:
+            floor = retry_memory(lease, peak)
+            _say(
+                f"{cls_name} job was OOM-killed ({oom}, peak {peak or 'unknown'} MiB) with {lease.mem_mb} MiB; "
+                f"retrying once with {floor} MiB"
+            )
             continue
+        if kills and oom is None:
+            _say(
+                f"{kills} OOM kill(s) in this container during the {cls_name} job, not charged to it (within its lease)"
+            )
         return _output_rc(_shell_rc(rc), args.output, before_out)
 
 

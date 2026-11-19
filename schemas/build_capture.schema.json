@@ -194,11 +194,13 @@
         "packages": {"type": "array", "items": {"type": "string"}},
         "extra": {"type": "array", "items": {"type": "string"}},
         "generated": {
-          "$comment": "Headers the build generated (named by cc -M, absent from the target), copied into the snapshot.",
+          "$comment": "Headers the build generated (named by cc -M, absent from the target), copied into the snapshot. `sources`: the C sources the build generated and compiled (a compile's source absent from the target, nginx's objs/ngx_modules.c), copied into the snapshot (manifest `generated_sources`) and installed in workspace/baseline and workspace/work (target_env.install_generated_sources). `sources_deleted`: generated sources the build removed after compiling them, which nothing can keep. Both absent in an older capture.",
           "type": "object",
           "properties": {
             "headers": {"type": "array", "items": {"type": "string"}},
-            "include_dirs": {"type": "array", "items": {"type": "string"}}
+            "include_dirs": {"type": "array", "items": {"type": "string"}},
+            "sources": {"type": "array", "items": {"type": "string"}},
+            "sources_deleted": {"type": "array", "items": {"type": "string"}}
           }
         },
         "framac_libc_gaps": {

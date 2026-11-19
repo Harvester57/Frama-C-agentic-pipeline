@@ -50,7 +50,7 @@ Every container invocation belongs to a class. The class sets its CPU range, its
 | `wp` | no | 1–8 | 768 MiB + 1000 MiB per prover | `run_wp_function.py` |
 | `eva` | no | 1 | 2 GiB | `run_eva_slice.py`, a direct `frama-c` call (parse or annotation check) |
 | `parse` | no | 1 | 2 GiB | one Frama-C parse of a link unit by `phase0_model.py run` (it takes the lease itself), `phase0_model.py selftest` |
-| `build` | no | 1–4 | 2 GiB | `run_eacsl_fuzz.py build` |
+| `build` | no | 1–4 | 2 GiB, or the Phase 0 parse estimate for a module's first build (below) | `run_eacsl_fuzz.py build` |
 | `guardrail` | yes | 1–2 | 2 GiB | `run_eacsl_fuzz.py guardrail` |
 | `fuzz` | yes | 1–16 | 512 MiB + 2.5 GiB per worker | `run_eacsl_fuzz.py campaign` |
 | `replay`, `selftest` | yes | 1 | 1 GiB | crash replays, corpus coverage (`run_eacsl_fuzz.py coverage`), the E-ACSL canary, other `sandbox_exec.py run` commands |
@@ -60,6 +60,14 @@ Every container invocation belongs to a class. The class sets its CPU range, its
 The wrapper infers the class from the command; `--class` (`-Class`) overrides it. Inference only sizes jobs. It is never a security decision (Section 5). A command the inference does not recognise runs as `light`, with 1 CPU and 1 GiB; give a heavy ad-hoc command an explicit `--class`.
 
 Memory estimates learn from history. Each container records its peak memory, OOM kills and CPU time in `state/resource-history/` (and mirrors them into `/framac-cache/resource-history/` when the shared store is mounted read-write). The next lease for the same class and module gets 1.25 × the largest of the last five peaks across per-run and shared history, counting an OOM-killed run twice. History only ever raises a lease above the class model, never lowers it, so `-wp-memlimit` and `-rss_limit_mb` always fit.
+
+A build's own history can understate it: a first build has none, and an attempt that aborted in seconds records a tiny peak. So the container broker also sizes every `build` from what Phase 0 measured (`first_build_estimate` in `scripts/resources.py`), and the lease takes the larger of that estimate and the build's own history:
+- **Formula:** 1.25 × the parse peak of the Phase 0 parse job(s) that the build's `--sources` come from, scaled by the share of each job's sources that the build compiles.
+- **Where the parse peak comes from:** the job's own `parse` lease history (`p0-<job>`) when it exists. Otherwise the `phase-static` record of the container that built the model, which is the first record within 120 s after `generated_at` + `seconds`, split across the model's parse jobs by number of sources.
+- **What it changes:** admission and concurrency only, never the build. A build that really needs less than the estimate still waits for its estimate.
+- **Example:** on nginx, where one 165-file unit parsed at 10471 MiB, two builds of 163 and 161 of those files ask for 12931 and 12772 MiB. They queue one behind the other in a 17 GiB container instead of running together into the OOM killer.
+- **Small units:** the estimate changes nothing while the scaled parse peak stays at or below 1638 MiB (1.25 × 1638 ≤ 2048), because the class's 2 GiB then applies. Above that, a build asks for more than 2 GiB. For example, a whole-unit build whose model container peaked at 2050 MiB asks for 2563 MiB.
+- **Parse history location:** `resources.py run` reads and writes history in its cwd when that is a run directory, else in `/framac-run`. This is how a parse lease, whose cwd is the scratch tree, records its peak.
 
 ### How tools size themselves
 
@@ -154,7 +162,16 @@ python3 scripts/resources.py status        # each lease shows its repo, run and 
 
 Inside one container (a Make phase, a `merge-batch`), recipes and sub-jobs go through `resources.py run --class C --key K [--output REPORT] -- cmd`. The pool is that container's own budget, re-read from its cgroup on every acquire. With `--output`, the recipe succeeds whenever the report exists, so Make keeps an `analysis_error` report instead of deleting it. A report left over from an earlier run, untouched by the command, does not count. A `run` nested inside another leased `run` passes through instead of waiting for itself.
 
-An OOM-killed job of an idempotent class (`light`, `wp`, `eva`, `parse`, `build`, `replay`, `selftest`) is retried once with twice the memory when the pool allows. Non-idempotent jobs (fuzz campaigns, merges) are never retried automatically:
+An OOM-killed job of an idempotent class (`light`, `wp`, `eva`, `parse`, `build`, `replay`, `selftest`) that failed is retried once. The retry asks for max(2 × its lease, 1.25 × its measured peak), capped at the pool.
+
+The cgroup OOM killer often takes a grandchild: E-ACSL's Frama-C under `run_eacsl_fuzz.py`, which then falls back and exits 1. A new `oom_kill` in the container during the job is therefore charged to the job in three cases:
+- The job was SIGKILLed itself (`oom_evidence: sigkill`).
+- It held the only lease from grant to release (`alone`).
+- Its own peak overran its gated lease (`overran_lease`). Gated grants never exceed the pool, so only a job above its grant can push the container over it. An ungated `light` lease is outside that sum and never qualifies.
+
+A charged job records `oom_killed: true`, so its next lease doubles the peak. One that still exited 0 (for example a sanitizer build after its E-ACSL attempt was killed) is kept, not re-run. A job that stayed within its lease beside others is not charged: its record keeps `oom_kills_during` with `oom_killed: false`, and nothing is retried.
+
+Non-idempotent jobs (fuzz campaigns, merges) are never retried automatically:
 - A retried campaign would treat the first attempt's crash artifacts as pre-existing.
 - A merge has its own journal (Section 8).
 

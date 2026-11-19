@@ -182,9 +182,13 @@ def test_an_anonymous_enum_without_a_typedef_name_is_skipped_as_an_enum():
 
 
 @pytest.mark.unit
-def test_pointers_to_anonymous_structs_keep_their_reason():
-    assert ah.plan_params("int(struct __anonstruct_opts_t_3 *)") == (None, "pointer to an anonymous struct")
-    assert ah.plan_params("int(union __anonunion_val_t_4 *)") == (None, "pointer to an anonymous union")
+def test_pointers_to_anonymous_structs_are_flagged_not_taken_for_enums():
+    # A pointer to an anonymous struct or union is spelled through its typedef, or skipped, by
+    # `_bind_call` (test_api_harness_anon_struct.py); never as an enum.
+    for sig in ("int(struct __anonstruct_opts_t_3 *)", "int(union __anonunion_val_t_4 *)"):
+        params, why = ah.plan_params(sig)
+        assert why is None and params is not None, sig
+        assert params[0].get("anon_record") is True and not params[0].get("anon_enum"), sig
     assert ah.plan_params("int(struct __anonstruct_opts_t_3)")[1] == "anonymous struct by value"
     params, why = ah.plan_params(f"int({AE_CLS} *,char *)")
     assert why is None and params is not None and params[0].get("anon_enum") is True

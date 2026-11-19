@@ -27,6 +27,25 @@ Checks of stub contracts (docs/plans/templates-and-stubs-improvement-plan.md ste
            the generated arguments do not meet it (`driver_rejected`), a crash or a link failure leaves
            the check `inconclusive`.
 
+The three probes include the header in the macro context the target includes it in: a library header may
+`#error` without a macro the target defines first, or pick its function names from it (pcre2.h and
+PCRE2_CODE_UNIT_WIDTH, which nginx defines in src/core/ngx_regex.h). The context is derived from the build,
+never assumed: one compile of a caller of the header's functions (stubs.json `callers`, build_capture.json
+`compiles`, at most CONTEXT_COMPILES of them, in sorted order) is preprocessed with its own flags in the
+target's tree (`gcc -E -dD`); the macros its command line and the target's own files (generated headers
+included) define before the header is first entered, and that the header or the target-package headers it
+pulls in name (or that the body of such a macro names), except their include guards, are written as
+`#define` lines before `#include <header>` in each probe. The header's `include_context` records them, the
+compile and the command (`status`: derived, no_compile, no_tree or not_included; `differing` when another
+caller compile defines them otherwise). The same compile gives the target's feature-test macros
+(scripts/include_context.py `scan_feature_macros`): those its command line and own files define before the
+compile first enters a system header and that a system header tests (`_GNU_SOURCE`, which glibc's
+features.h reads once, at the first system header, so a `#define` line after fc_compat_types.h's force
+include is too late). They reach every probe as `-D` flags (the ABI compile, Eva's `-cpp-extra-args`, the
+E-ACSL frontend), except the names the `#define` lines already give; `include_context.feature_macros` and
+`feature_flags` record them. A header without a caller compile, or whose target defines nothing it reads
+and no feature-test macro, is probed exactly as before.
+
 A header fails when an active contract has an `assigns` location other than \\result without `\\from`
 (read statically, whatever the checks: Eva aborts on it with `assigns:missing`, Phase 2 Eva too, but only
 when a call reaches the contract, and a valid call that fails its own precondition never does), its ABI
@@ -65,6 +84,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +126,15 @@ from framac_common import (  # noqa: E402
     stub_overlay_dir,
     utc_now,
 )
+from include_context import (  # noqa: E402
+    context_tree,
+    macro_flag,
+    preprocess_command,
+    scan_feature_macros,
+    scan_preprocessed,
+    select_context,
+    select_feature_macros,
+)
 
 STUB_CHECK_REL = "workspace/reports/stub_check.json"
 DEFAULT_DAG = "workspace/reports/callgraph_dag.json"
@@ -139,6 +168,10 @@ _TYPE_WORDS = frozenset(
     "void char short int long float double signed unsigned _Bool const volatile size_t ssize_t".split()
 )
 _EACSL_FAIL_RE = re.compile(r"(Precondition|Postcondition) failed", re.IGNORECASE)
+# The include context (`include_context`): caller compiles preprocessed per header, and their timeout.
+CONTEXT_COMPILES = 4
+CONTEXT_TIMEOUT_S = 120
+CONTEXT_COMMENT = "/* include context: macros the target defines before it includes the header (stub_check.py) */"
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +300,17 @@ def call_lines(sig: dict, tag: str, short: bool, length: str = str(BUF)) -> list
 # ---------------------------------------------------------------------------
 
 
-def smoke_source(include: str, sigs: list[dict]) -> tuple[str, dict[int, tuple[str, str]]]:
+def context_prelude(context: Sequence[str] = ()) -> list[str]:
+    """The lines a probe starts with before `#include <header>`: none without an include context."""
+    return [CONTEXT_COMMENT, *context] if context else []
+
+
+def smoke_source(
+    include: str, sigs: list[dict], context: Sequence[str] = ()
+) -> tuple[str, dict[int, tuple[str, str]]]:
     """(the Eva smoke program, line -> (function, `ok` | `short`) of each call)."""
     out = [
+        *context_prelude(context),
         f"#include <{include}>",
         "#include <string.h>",
         "volatile int fc_stub_pick;",
@@ -299,9 +340,9 @@ def smoke_source(include: str, sigs: list[dict]) -> tuple[str, dict[int, tuple[s
     return "\n".join(out), lines_of
 
 
-def driver_source(include: str, sigs: list[dict], trials: int) -> str:
+def driver_source(include: str, sigs: list[dict], trials: int, context: Sequence[str] = ()) -> str:
     """One process per function (argv[1] = its index): `trials` valid calls with varied lengths and contents."""
-    out = [f"#include <{include}>", "#include <stdlib.h>", "#include <string.h>"]
+    out = [*context_prelude(context), f"#include <{include}>", "#include <stdlib.h>", "#include <string.h>"]
     for idx, sig in enumerate(sigs):
         out.append(f"static void fc_drive_{idx}(unsigned seed, unsigned long n) {{")
         out.extend(call_lines(sig, "v", False, length="n"))
@@ -469,10 +510,109 @@ def system_include_flags(capture: dict) -> list[str]:
     return target_env.include_flags(root, system) + target_env.generated_include_flags()
 
 
-def check_abi(include: str, overlay: Path, sys_flags: list[str], work: Path) -> dict:
+# ---------------------------------------------------------------------------
+# The include context: the macros the target defines before it includes the header
+# ---------------------------------------------------------------------------
+
+
+def caller_compiles(rec: dict, capture: dict) -> list[dict]:
+    """
+    The capture's compiles of the files calling the header's functions (`callers` as `file#function`),
+    drafts included: per caller file in sorted order, the compiles of that source, else the compiles
+    whose dependency list names it (a caller defined in a header); one per source, flags and system flags.
+    """
+    files = sorted(
+        {
+            str(c).split("#", 1)[0]
+            for f in (rec.get("functions") or {}).values()
+            if isinstance(f, dict)
+            for c in f.get("callers") or []
+        }
+    )
+    compiles = [c for c in capture.get("compiles") or [] if isinstance(c, dict) and c.get("source")]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for f in files:
+        direct = [c for c in compiles if c["source"] == f]
+        for c in sorted(
+            direct or [c for c in compiles if f in (c.get("headers") or [])],
+            key=lambda c: (str(c["source"]), str(c.get("object") or "")),
+        ):
+            key = json.dumps([c["source"], c.get("flags") or [], c.get("system_flags") or []])
+            if key not in seen:
+                seen.add(key)
+                out.append(c)
+    return out
+
+
+def include_context(rec: dict, include: str, capture: dict, tree: Path | None) -> dict:
+    """
+    The macro context the target includes `include` in (see the module docstring): {status, defines,
+    compile, command, differing?, feature_macros?, feature_flags?, feature_not_carried?}, or {status:
+    no_compile | no_tree | not_included, defines: [], ...}. Runs nothing when no compile of the capture
+    calls the header's functions. The feature-test macros are the first compile's, less the names
+    `defines` already gives; the keys are absent when there are none.
+    """
+    compiles = caller_compiles(rec, capture)
+    if not compiles:
+        return {"status": "no_compile", "defines": []}
+    if tree is None:
+        return {"status": "no_tree", "defines": [], "reason": "neither the DAG's target_dir nor a capture tree exists"}
+    snapshot = target_env.snapshot_dir()
+    root = (snapshot / "root").as_posix() if snapshot else None
+    generated = (snapshot / target_env.GENERATED_REL).as_posix() if snapshot else None
+    found: list[tuple[dict, list[str], list[str], dict[str, str]]] = []
+    tried: list[dict] = []
+    for c in compiles[:CONTEXT_COMPILES]:
+        cmd = preprocess_command(c, tree, snapshot)
+        if cmd is None:
+            tried.append({"source": c["source"], "reason": "source not found in the tree"})
+            continue
+        rc, out = _run(cmd, tree, timeout=CONTEXT_TIMEOUT_S)
+        scan = scan_preprocessed(out, include, tree.as_posix(), generated)
+        if not scan["entered"]:
+            why = f"never enters <{include}>" if rc == 0 else _first_error(out) or f"gcc exited {rc}"
+            tried.append({"source": c["source"], "reason": why})
+            continue
+        features = select_feature_macros(scan_feature_macros(out, tree.as_posix(), generated), tree)
+        found.append((c, cmd, select_context(scan, root, tree), features))
+    if not found:
+        return {"status": "not_included", "defines": [], "tried": tried}
+    first, cmd, defines, features = found[0]
+    ctx: dict[str, Any] = {
+        "status": "derived",
+        "defines": defines,
+        "compile": {"source": first["source"], "object": first.get("object")},
+        "command": shlex.join(cmd),
+    }
+    differing = [
+        {"source": c["source"], "object": c.get("object"), "defines": d} for c, _, d, _ in found[1:] if d != defines
+    ]
+    if differing:
+        ctx["differing"] = differing
+    given = {m.group(1) for m in (re.match(r"#define\s+([A-Za-z_]\w*)", line) for line in defines) if m}
+    features = {n: line for n, line in features.items() if n not in given}
+    if features:
+        ctx["feature_macros"] = features
+        flags = {n: macro_flag(line) for n, line in features.items()}
+        ctx["feature_flags"] = [f for f in flags.values() if f]
+        missing = sorted(n for n, f in flags.items() if not f)
+        if missing:
+            ctx["feature_not_carried"] = missing
+    return ctx
+
+
+def check_abi(
+    include: str,
+    overlay: Path,
+    sys_flags: list[str],
+    work: Path,
+    context: Sequence[str] = (),
+    feature_flags: Sequence[str] = (),
+) -> dict:
     src = work / ABI_SRC
-    src.write_text(f"#include <{include}>\n", encoding="utf-8")
-    cmd = ["gcc", "-fsyntax-only", "-DFC_STUB_DRAFT", f"-I{overlay.as_posix()}", *sys_flags, src.name]
+    src.write_text("".join(f"{line}\n" for line in context_prelude(context)) + f"#include <{include}>\n", encoding="utf-8")
+    cmd = ["gcc", "-fsyntax-only", "-DFC_STUB_DRAFT", *feature_flags, f"-I{overlay.as_posix()}", *sys_flags, src.name]
     rc, log = _run(cmd, work)
     (work / ABI_LOG).write_text(f"$ {shlex.join(cmd)}\n{log}", encoding="utf-8")
     if rc == 0:
@@ -483,9 +623,16 @@ def check_abi(include: str, overlay: Path, sys_flags: list[str], work: Path) -> 
     return {"status": "failed", "reason": _first_error(log), "command": shlex.join(cmd), "log": ABI_LOG}
 
 
-def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
+def _probe_cppflags(feature_flags: Sequence[str] = ()) -> str:
+    """The preprocessor flags of the Eva and E-ACSL probes: `-I.`, then the target's feature-test macros."""
+    return shlex.join(["-I.", *feature_flags])
+
+
+def check_eva(
+    include: str, sigs: list[dict], work: Path, context: Sequence[str] = (), feature_flags: Sequence[str] = ()
+) -> dict:
     """{status, functions: {name: {status, alarms}}}: `error` when Frama-C cannot parse the program."""
-    text, lines_of = smoke_source(include, sigs)
+    text, lines_of = smoke_source(include, sigs, context)
     (work / SMOKE).write_text(text, encoding="utf-8")
     csv_path = work / EVA_CSV
     cmd = [
@@ -493,7 +640,7 @@ def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
         "-no-unicode",
         "-machdep",
         "gcc_x86_64",
-        f"-cpp-extra-args={augment_framac_cppflags('-I.')}",
+        f"-cpp-extra-args={augment_framac_cppflags(_probe_cppflags(feature_flags))}",
         SMOKE,
         "-eva",
         "-main",
@@ -569,7 +716,7 @@ def check_eva(include: str, sigs: list[dict], work: Path) -> dict:
     return {"status": "ok", "functions": functions, "log": EVA_LOG}
 
 
-def build_driver(work: Path, ldflags: str) -> dict:
+def build_driver(work: Path, ldflags: str, feature_flags: Sequence[str] = ()) -> dict:
     """
     E-ACSL build of the driver, in the two stages of run_eacsl_fuzz.py, without `-e-acsl-functions`:
     E-ACSL checks a declared function's contract around each call only when no selection leaves it out,
@@ -587,7 +734,7 @@ def build_driver(work: Path, ldflags: str) -> dict:
         select_eacsl_binary,
     )
 
-    flags = build_eacsl_flag_sets(target_env.with_include_flags("-I."), fuzzer=False)
+    flags = build_eacsl_flag_sets(target_env.with_include_flags(_probe_cppflags(feature_flags)), fuzzer=False)
     instrumented = work / "fc_stub_driver.instrumented.c"
     out_bin = work / "fc_stub_driver"
     fc_flags = "-machdep gcc_x86_64"
@@ -621,12 +768,20 @@ def build_driver(work: Path, ldflags: str) -> dict:
     return {"status": "built", "binary": str(select_eacsl_binary(out_bin)), "log": BUILD_LOG}
 
 
-def check_dynamic(include: str, sigs: list[dict], ldflags: str, trials: int, work: Path) -> dict:
+def check_dynamic(
+    include: str,
+    sigs: list[dict],
+    ldflags: str,
+    trials: int,
+    work: Path,
+    context: Sequence[str] = (),
+    feature_flags: Sequence[str] = (),
+) -> dict:
     """E-ACSL build of the driver against the real library, then one sandboxed process per function."""
     from sandbox_exec import Limits, SandboxUnavailable, run_sandboxed
 
-    (work / DRIVER).write_text(driver_source(include, sigs, trials), encoding="utf-8")
-    build = build_driver(work, ldflags)
+    (work / DRIVER).write_text(driver_source(include, sigs, trials, context), encoding="utf-8")
+    build = build_driver(work, ldflags, feature_flags)
     if build["status"] != "built":
         return {**build, "ldflags": ldflags}
     binary = Path(build["binary"])
@@ -768,7 +923,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     capture = load_json_optional(Path(stub_gen.DEFAULT_CAPTURE), {}) or {}
     overlay = stub_overlay_dir() or Path(STUB_OVERLAY_REL).resolve()
     checks = [c for c in args.checks.split(",") if c]
-    sys_flags = system_include_flags(capture if isinstance(capture, dict) else {})
+    capture = capture if isinstance(capture, dict) else {}
+    sys_flags = system_include_flags(capture)
+    tree = context_tree(dag if isinstance(dag, dict) else {}, capture)
     headers = report.get("headers") or {}
     wanted = args.header or sorted(headers)
     artifacts_root = Path(args.out).parent / ARTIFACTS_DIR
@@ -789,16 +946,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         # Whatever the checks and whether a call reaches the contract: Eva aborts on such a frame.
         reasons += frame_reasons(header, text or "")
         dest = artifacts_root / artifact_slug(include)
+        # The macros the target defines before it includes the header: every probe defines them first.
+        context: list[str] = []
+        # The target's feature-test macros (_GNU_SOURCE), as -D: they must precede the first system header.
+        features: list[str] = []
+        if checks:
+            res["include_context"] = include_context(rec, include, capture, tree)
+            context = list(res["include_context"]["defines"])
+            features = list(res["include_context"].get("feature_flags") or [])
         with tempfile.TemporaryDirectory(prefix="stub-check-") as tmp:
             work = Path(tmp)
             try:
                 if "abi" in checks:
-                    res["abi"] = check_abi(include, overlay, sys_flags, work)
+                    res["abi"] = check_abi(include, overlay, sys_flags, work, context, features)
                 if "eva" in checks and sigs:
-                    res["eva"] = check_eva(include, sigs, work)
+                    res["eva"] = check_eva(include, sigs, work, context, features)
                 if "dynamic" in checks and sigs:
                     ld = " ".join([*module_ldflags(dag, [s["name"] for s in sigs]), args.ldflags or ""]).strip()
-                    res["dynamic"] = check_dynamic(include, sigs, ld, args.trials, work)
+                    res["dynamic"] = check_dynamic(include, sigs, ld, args.trials, work, context, features)
             finally:
                 # Kept even when a check raised: the logs are what the agent reads to fix the header.
                 res["artifacts"] = persist_artifacts(work, dest)
