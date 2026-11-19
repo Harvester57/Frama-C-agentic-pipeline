@@ -62,7 +62,8 @@ def assert_kept_at_callers(doc: dict, why: str) -> None:
     """The wrapper's property is where it was before `checked_at` existed, and the report says why."""
     prop = by_name(doc)[WRAPPER_PROP]
     assert prop["instances"] == ["prog.c#request_rtu", "prog.c#request_tcp"], prop
-    assert "relocated" not in prop and "code" not in prop
+    # A declared wrapper never falls back on the forwarding inference: the warning below says where it is checked.
+    assert "relocated" not in prop and "code" not in prop and "forwarded_to" not in prop
     assert "\\context(\\calling)" in prop["acsl"] and "\\called == send_frame" in prop["acsl"]
     refused = [w for w in doc["warnings"] if w.startswith("output sink send_frame: `checked_at` not applied")]
     assert len(refused) == 1 and why in refused[0], doc["warnings"]
@@ -95,7 +96,8 @@ def test_a_wrapper_sink_is_checked_at_its_hand_off_not_at_its_callers(tmp_path):
     props = by_name(doc)
     prop = props[WRAPPER_PROP]
     # No instance at the callers any more: the frame is not complete there (the hook writes two bytes).
-    assert prop["instances"] == [WRAPPER]
+    # `checked_at` decides over the forwarding inference, which would also apply to this shape.
+    assert prop["instances"] == [WRAPPER] and "forwarded_to" not in prop
     assert l5_properties(doc, "prog.c#request_tcp") == [] and l5_properties(doc, "prog.c#request_rtu") == []
     assert l5_properties(doc, WRAPPER) == [WRAPPER_PROP]
     assert sp.meta_file_text(doc, "prog.c#request_tcp") is None
@@ -197,11 +199,15 @@ def test_the_threat_model_schema_takes_checked_at(tmp_path):
 
 
 @pytest.mark.unit
-def test_without_checked_at_nothing_moves():
-    """A wrapper is never guessed: the same sinks without the field give the callers' property."""
+def test_without_checked_at_nothing_is_relocated_and_the_sink_forwards():
+    """
+    No check is written into a wrapper nobody declared. The same sinks without the field are a forwarding
+    sink (`forwarded_to`): the bytes are checked at the inner sinks, which keep their instance in the wrapper.
+    """
     doc = wrapper_doc(PLAIN_SINK, TCP_SINK, RTU_SINK)
     props = by_name(doc)
-    assert props[WRAPPER_PROP]["instances"] == ["prog.c#request_rtu", "prog.c#request_tcp"]
+    assert props[WRAPPER_PROP]["instances"] == [] and props[WRAPPER_PROP]["forwarded_to"] == ["rtu_send", "tcp_send"]
+    assert "code" not in props[WRAPPER_PROP]
     assert "relocated" not in props[WRAPPER_PROP] and "relocated" not in doc["summary"]
     assert props["L5_sanitized_tcp_send"]["instances"] == ["prog.c#ping", "prog.c#poll_tcp", WRAPPER]
     assert not [w for w in doc["warnings"] if "checked_at" in w]
@@ -292,7 +298,8 @@ def test_a_real_violation_still_has_an_instance_that_covers_it():
     assert [c["candidates"] for c in props[WRAPPER_PROP]["relocated"]["checked_at"]] == [SEND_CANDIDATES]
     assert l5_properties(doc, "prog.c#ping") == ["L5_sanitized_tcp_send"]
     text, names, _ = sp.meta_file_text(doc, "prog.c#ping")
-    assert names == ["L5_sanitized_tcp_send"] and "\\called == tcp_send" in text
+    # tcp_send is also called through a pointer, so its property is its precondition, proved at this call too.
+    assert names == ["L5_sanitized_tcp_send"] and "\\targets({tcp_send}), \\context(\\precond)" in text
     # Naming one backend only does not drop the other: the check is on the call, whatever it dispatches to.
     one = by_name(wrapper_doc({**PLAIN_SINK, "checked_at": ["tcp_send"]}, TCP_SINK, RTU_SINK))[WRAPPER_PROP]
     assert one["relocated"]["checked_at"][0]["candidates"] == SEND_CANDIDATES

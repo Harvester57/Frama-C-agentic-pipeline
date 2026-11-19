@@ -2219,6 +2219,125 @@ def _add_build_args(p: argparse.ArgumentParser, sources_required: bool = True) -
         default=None,
         help="callgraph_dag.json used to repair link failures (undefined references -> defining source, one retry)",
     )
+    _add_security_props_arg(p)
+
+
+def _add_security_props_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--security-props",
+        default=None,
+        metavar="PATH|none",
+        help=(
+            "security_props.json whose MetAcsl properties the E-ACSL build checks at run time, when its "
+            "meta_engines holds eacsl (default: $FRAMAC_SECURITY_PROPS, else workspace/reports/security_props.json; "
+            "'none': no property). The guardrail and the selftest never load them"
+        ),
+    )
+
+
+# Why a module's build loaded no property although the run's file turns the engine on: not a warning.
+_SECURITY_PROPS_NO_INSTANCE = "no property has an instance in a function of these sources"
+
+
+def build_security_props(build: dict) -> dict | None:
+    """
+    The `security_props` record of a module build (fuzz_build.build_module_binary's result): the
+    E-ACSL build's, or the one of the E-ACSL attempt the sanitizer build replaced. None when the run's
+    MetAcsl properties are off for the E-ACSL build, which is every run without `eacsl` in `meta_engines`.
+    """
+    for comp in (build.get("compile"), build.get("eacsl_compile_attempt")):
+        record = comp.get("security_props") if isinstance(comp, dict) else None
+        if isinstance(record, dict):
+            return record
+    return None
+
+
+def security_props_warnings(record: dict | None) -> list[str]:
+    """
+    What the user must see about the MetAcsl properties of an E-ACSL build (its `security_props`): a
+    build that lost them all (`dropped`, `error`, a toolchain that cannot take them), then each
+    property that is not checked at run time or is checked where the plan did not expect it. Empty
+    for a build that checks every property it loaded, and for a module no property has an instance in.
+    """
+    if not isinstance(record, dict):
+        return []
+    out: list[str] = []
+    status, reason = record.get("status"), str(record.get("reason") or "no reason recorded")
+    props = record.get("props") or "the security properties file"
+    if status == "dropped":
+        names = ", ".join(str(n) for n in record.get("properties") or []) or "every property"
+        log = f"; log: {record['log']}" if record.get("log") else ""
+        out.append(f"dropped: this binary checks NO MetAcsl property at run time ({reason}); not checked: {names}{log}")
+    elif status == "error":
+        out.append(f"error: {props} could not be loaded ({reason}); this binary checks no MetAcsl property")
+    elif status == "skipped" and reason != _SECURITY_PROPS_NO_INSTANCE:
+        out.append(f"skipped: this binary checks no MetAcsl property at run time ({reason})")
+    for item in record.get("rejected") or []:
+        out.append(
+            f"rejected: MetAcsl could not type {item.get('property')} in this module ({item.get('reason')}); "
+            "it is not checked at run time"
+        )
+    for item in record.get("left_out") or []:
+        out.append(f"left out: {item.get('property')} is not checked at run time ({item.get('reason')})")
+    not_translated = [str(n) for n in record.get("not_translated") or []]
+    if not_translated:
+        out.append(
+            "not translated: no run-time check for "
+            + ", ".join(not_translated)
+            + " (decided statically, no instance in the instrumented functions, or not translated by E-ACSL)"
+        )
+    unplanned = record.get("unplanned_instances")
+    for name, functions in sorted(unplanned.items()) if isinstance(unplanned, dict) else []:
+        out.append(
+            f"unplanned instances: {name} is also checked in {', '.join(str(f) for f in functions)}, which "
+            "security_props.json does not list as its instances (a violation there links no ledger unit)"
+        )
+    return out
+
+
+def harness_induced_failures(artifacts: object) -> list[dict]:
+    """
+    The artifacts whose failure is a MetAcsl precondition the harness itself broke
+    (failure_identity: `harness_induced`): {artifact, property, function, caller, fingerprint}.
+    `ledger.py ingest-fuzz` makes no candidate of them; the campaign report lists them here.
+    """
+    out: list[dict] = []
+    for art in artifacts if isinstance(artifacts, list) else []:
+        failure = art.get("failure") if isinstance(art, dict) else None
+        if isinstance(failure, dict) and failure.get("meta_property") and failure.get("harness_induced") is True:
+            out.append(
+                {
+                    "artifact": art.get("artifact"),
+                    "property": failure.get("meta_property"),
+                    "function": failure.get("function"),
+                    "caller": failure.get("caller"),
+                    "fingerprint": art.get("fingerprint"),
+                }
+            )
+    return out
+
+
+def note_security_props(res: dict, record: dict | None) -> None:
+    """
+    Put a build's `security_props` record and its warnings (`security_props_warnings`) at the top of
+    report `res`, and print each warning on stderr. Nothing is added without a record, so the report
+    of a run without the engine has the keys it always had.
+    """
+    if not isinstance(record, dict):
+        return
+    res["security_props"] = record
+    warnings = security_props_warnings(record)
+    if warnings:
+        res["security_props_warnings"] = warnings
+    module = res.get("module") or "module"
+    for line in warnings:
+        print(f"security props [{module}]: {line}", file=sys.stderr)
+
+
+def _security_props_kwarg(args) -> dict:
+    """`security_props=<--security-props>` for a builder, {} when the option was not given."""
+    value = getattr(args, "security_props", None)
+    return {"security_props": value} if value is not None else {}
 
 
 def _build_options(args) -> dict:
@@ -2227,6 +2346,8 @@ def _build_options(args) -> dict:
         default_dag = Path("workspace/reports/callgraph_dag.json")
         dag = default_dag if default_dag.is_file() else None
     return {
+        # Only when given: the build call of a run without the option is today's.
+        **_security_props_kwarg(args),
         "engine": args.engine,
         "selftest_json": args.selftest_json,
         "machdep": args.machdep,
@@ -2471,6 +2592,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also replay each candidate's reproducers on the other engine's binary (index.json: cross_engine)",
     )
+    _add_security_props_arg(p_cands)
 
     p_min = sub.add_parser("minimize", help="Minimize crash input(s) with cvise/creduce on a given or built binary")
     _add_build_args(p_min, sources_required=False)
@@ -2496,6 +2618,7 @@ def main(argv: list[str] | None = None) -> int:
     p_minc.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_minc.add_argument("--max-time", type=int, default=600, help="Wall-clock seconds per reproducer (default: 600)")
     p_minc.add_argument("--jobs", type=int, default=4)
+    _add_security_props_arg(p_minc)
 
     p_int = sub.add_parser("minimize-interest", help="cvise interest test (called by the generated interest.sh)")
     p_int.add_argument("--binary", type=Path, required=True)
@@ -2542,6 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
             inputs=args.inputs,
             out_json=args.out_json,
             cross_engine=args.cross_engine,
+            **_security_props_kwarg(args),
         )
         print(json.dumps(summary, indent=2))
         return 0 if summary["status"] == "ok" else 1
@@ -2572,6 +2696,7 @@ def main(argv: list[str] | None = None) -> int:
             per_input_timeout=args.per_input_timeout,
             max_time_s=args.max_time,
             jobs=args.jobs,
+            **_security_props_kwarg(args),
         )
         print(json.dumps(summary, indent=2))
         return 0 if summary["status"] == "ok" else 1
@@ -2592,6 +2717,7 @@ def main(argv: list[str] | None = None) -> int:
                 ldflags=args.ldflags,
                 rte_initialized=not args.no_rte_initialized,
                 libc_checks=not args.no_libc_checks,
+                **_security_props_kwarg(args),
             )
             binary = prepared.get("binary")
         else:
@@ -2617,6 +2743,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "ok" if any(r["status"] == "ok" for r in runs) else "error",
             "runs": runs,
         }
+        note_security_props(res, (prepared or {}).get("security_props"))
         args.out_json.parent.mkdir(parents=True, exist_ok=True)
         args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(_summary(res), indent=2))
@@ -2679,7 +2806,11 @@ def main(argv: list[str] | None = None) -> int:
                 binary=args.binary,
                 per_input_timeout=args.per_input_timeout,
             )
+            # The record is in the report already (crash_replay.replay_report); here its warnings.
+            note_security_props(res, res.get("security_props"))
         else:
+            # The guardrail checks one function's contract on a prover's copy: its build never loads
+            # the run's MetAcsl properties (WP proves them for that function), like the selftest canary.
             use_cache = not getattr(args, "no_cache", False)
             comp = fuzz_build.compile_eacsl_binary(
                 args.sources,
@@ -2788,6 +2919,7 @@ def _run_build_mode(args) -> dict:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
     if build.get("link_repair"):
         res["link_repair"] = build["link_repair"]
+    note_security_props(res, build_security_props(build))
     if args.engine == "auto" and build["engine_used"] == "eacsl":
         # The campaign falls back to the sanitizers when the selftest fails: build them now, with the
         # campaign's arguments, so that it restores them from the cache.
@@ -2990,6 +3122,17 @@ def _run_campaign_mode(args) -> dict:
         res["eacsl_compile_attempt"] = build["eacsl_compile_attempt"]
     if build.get("link_repair"):
         res["link_repair"] = build["link_repair"]
+    note_security_props(res, build_security_props(build))
+    induced = harness_induced_failures(res.get("artifacts"))
+    if induced:
+        res["security_props_harness_induced"] = induced
+        for item in induced:
+            print(
+                f"security props [{args.module or 'module'}]: harness-induced: {item['property']} failed in "
+                f"{item['function']}, called by harness function {item['caller']} ({item['artifact']}): "
+                "not a candidate against the target",
+                file=sys.stderr,
+            )
     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
 

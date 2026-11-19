@@ -1,0 +1,43 @@
+/*
+ * L4, invariants (threat model `invariants`): a predicate over globals that the functions in scope
+ * keep. The targets are listed by name (scripts/security_props.py computes the set).
+ *   weak         context \weak_invariant: a `requires` and an `ensures` on each function in scope.
+ *                WP proves the `requires` at every call, so the callers of a function in scope
+ *                carry the obligation too.
+ *   strong       context \strong_invariant: the same, and an assertion after each statement that
+ *                may break the predicate.
+ *   conditional  context \conditional_invariant: a behavior on each function in scope (`assumes`
+ *                the predicate, `ensures` it). Nothing is required of the callers: the form for an
+ *                entry point, which is called from outside the target.
+ *   monotonic    a state that only moves one way (context \writing): at each write, either the
+ *                written location is separated from the state or its value did not move back.
+ *                It uses \at(x, Before) and \at(x, After), which Eva does not evaluate: the
+ *                property's `engines` leave `eva` out.
+ *   monotonic_formal  the same for a state that hangs off a parameter (`c->phase`): checked in the
+ *                functions that have a parameter of that name (\tguard: \true elsewhere).
+ * A call placed in an initializer gets no \strong_invariant instance (MetAcsl 0.12, with its default
+ * simplification): security_props.py writes `init_strong` as a `check` into the work tree after the
+ * declaration.
+ */
+//# weak
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\weak_invariant),
+      ${predicate};
+*/
+//# strong
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\strong_invariant),
+      ${predicate};
+*/
+//# conditional
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\conditional_invariant),
+      ${predicate};
+*/
+//# monotonic
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\writing),
+      \separated(\written, &${lvalue}) || \at(${lvalue}, Before) ${order} \at(${lvalue}, After);
+*/
+//# monotonic_formal
+/*@ meta \prop, \name(${name}), \targets(${targets}), \context(\writing),
+      \tguard(\separated(\written, &${lvalue}) || \at(${lvalue}, Before) ${order} \at(${lvalue}, After));
+*/
+//# init_strong
+/*@ check ${name}: ${predicate}; */

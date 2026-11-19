@@ -1,0 +1,138 @@
+{
+ "schema_version": 1,
+ "generated_at": "2026-11-18T00:00:00+00:00",
+ "threat_model": {
+  "status": "ok",
+  "path": "/target/THREAT_MODEL.md",
+  "sha256": "7dc6d4707fddf7395d42d37351d453b075b0a61e3136296f7611eb83c3f2aa3d",
+  "reason": null
+ },
+ "preamble": "/*@\n  predicate no_crlf_string(char *s) =\n    \\forall integer i; 0 <= i < strlen(s) ==> (s[i] != '\\r' && s[i] != '\\n');\n*/",
+ "properties": [
+  {
+   "name": "L4_auth_state_login",
+   "layer": 4,
+   "kind": "auth_state",
+   "obligation_class": "l4_auth_state",
+   "acsl": "/*@ meta \\prop, \\name(L4_auth_state_login), \\targets(\\diff(\\ALL, {login})), \\context(\\writing),\n      \\separated(\\written, &auth_ok);\n*/",
+   "instances": [
+    "prog.c#backdoor",
+    "prog.c#get_level"
+   ],
+   "sources": [
+    "prog.c"
+   ],
+   "notes": [],
+   "threat_model": {
+    "auth_gate": "login",
+    "state": "auth_ok"
+   },
+   "targets": "every function but login",
+   "direct_writers": [
+    "prog.c#backdoor"
+   ]
+  },
+  {
+   "name": "L4_auth_required_login",
+   "layer": 4,
+   "kind": "auth_required",
+   "obligation_class": "l4_auth_required",
+   "acsl": "/*@ meta \\prop, \\name(L4_auth_required_login), \\targets({admin}), \\context(\\precond),\n      auth_ok != 0;\n*/",
+   "instances": [
+    "prog.c#handle"
+   ],
+   "sources": [
+    "prog.c"
+   ],
+   "notes": [],
+   "threat_model": {
+    "auth_gate": "login",
+    "state": "auth_ok",
+    "protects": [
+     "admin"
+    ]
+   },
+   "targets": "admin",
+   "entry_points": []
+  },
+  {
+   "name": "L5_sanitized_send_bytes",
+   "layer": 5,
+   "kind": "sanitized",
+   "obligation_class": "l5_sanitized",
+   "acsl": "/*@ meta \\prop, \\name(L5_sanitized_send_bytes), \\targets(\\ALL), \\context(\\calling),\n      \\tguard(\\called == send_bytes ==> (\\fguard(\\initialized(\\called_arg(buf) + (0 .. \\called_arg(n) - 1)))));\n*/",
+   "instances": [
+    "prog.c#emit"
+   ],
+   "sources": [],
+   "notes": [],
+   "threat_model": {
+    "output_sink": "send_bytes",
+    "kind": "network",
+    "params": [
+     "buf"
+    ]
+   },
+   "targets": "send_bytes"
+  }
+ ],
+ "frame": [
+  {
+   "function": "prog.c#get_level",
+   "reason": "writes through parameter(s) out"
+  }
+ ],
+ "obligations": {
+  "prog.c#backdoor": [
+   {
+    "class": "l4_auth_state",
+    "property": "L4_auth_state_login",
+    "reason": "L4_auth_state_login (auth state, layer 4)"
+   }
+  ],
+  "prog.c#emit": [
+   {
+    "class": "l5_sanitized",
+    "property": "L5_sanitized_send_bytes",
+    "reason": "L5_sanitized_send_bytes (sanitized, layer 5)"
+   }
+  ],
+  "prog.c#get_level": [
+   {
+    "class": "l3_frame",
+    "property": "L3_frame",
+    "reason": "writes through parameter(s) out"
+   },
+   {
+    "class": "l4_auth_state",
+    "property": "L4_auth_state_login",
+    "reason": "L4_auth_state_login (auth state, layer 4)"
+   }
+  ],
+  "prog.c#handle": [
+   {
+    "class": "l4_auth_required",
+    "property": "L4_auth_required_login",
+    "reason": "L4_auth_required_login (auth required, layer 4)"
+   }
+  ]
+ },
+ "summary": {
+  "properties": 3,
+  "by_kind": {
+   "auth_required": 1,
+   "auth_state": 1,
+   "sanitized": 1
+  },
+  "functions_by_class": {
+   "l3_frame": 1,
+   "l4_auth_required": 1,
+   "l4_auth_state": 2,
+   "l5_sanitized": 1
+  }
+ },
+ "warnings": [],
+ "meta_engines": [
+  "eva"
+ ]
+}

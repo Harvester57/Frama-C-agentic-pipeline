@@ -293,6 +293,31 @@ EACSL_FULL_MTRACKING_DEFINES = ("-Dregister=",)
 # Reads of memory written outside instrumented code (libFuzzer's `data`, external libraries) fail
 # these checks: harnesses must copy the input into their own buffer, as generated harnesses do.
 EACSL_RTE_INITIALIZED_FLAG = "-rte-initialized @all"
+# MetAcsl in the E-ACSL build (docs/plans/metacsl-exploitation-plan.md, package C): the module's meta
+# file (scripts/security_props.py) is parsed with the sources and translated in a stage of its own,
+# before RTE and E-ACSL:
+#   frama-c <kernel and E-ACSL options> EACSL_META_FLAGS <sources> <meta file>
+#           -then-last <RTE options> -e-acsl ... -then-last -print
+# `e-acsl-gcc --then-last` writes the first `-then-last`, and `--e-acsl-extra` puts the RTE options
+# behind it (meta_stage_flags). Measured in framac-analysis (Frama-C 34.0~beta, MetAcsl 0.12~beta,
+# 2026-11-18, docs/troubleshooting/eacsl-and-fuzzing.md):
+# - without the stage switch the printed file holds no check at all, and e-acsl-gcc exits 0;
+# - with `-rte` left before the switch, a generated assertion runs before its statement's RTE
+#   assertions: an out-of-bounds write is then reported by the E-ACSL guard of `\separated`
+#   (`<unknown>:0: Error: E-ACSL RTE failed`) and a known defect changes fingerprint;
+# - with the RTE options behind the switch, every assertion of the plain build is kept in its place
+#   and the generated ones follow their statement's RTE assertions.
+# `unknown-func=inactive`: a property may name a function this module's parse does not hold.
+EACSL_META_FLAGS = ("-meta", "-meta-warn-key unknown-func=inactive")
+EACSL_META_STAGE_OPTIONS = ("--then-last", "--e-acsl-extra")
+# What takes the place of the meta file's `#include "__fc_string_axiomatic.h"` in an E-ACSL build, on
+# the same line (the report maps a line of the meta file to its property). e-acsl-gcc parses with
+# -no-frama-c-stdlib, so that header of __fc_libc is not on the include path ("fatal error:
+# __fc_string_axiomatic.h: No such file or directory"); the frontend's force-included
+# fc_compat_types.h gives E-ACSL its own `strlen` and the vocabulary instead.
+EACSL_META_INCLUDE_NOTE = (
+    "/* __fc_string_axiomatic.h: not on the include path of an E-ACSL build (fc_compat_types.h) */"
+)
 _FUZZER_INITIALIZE_DEF_RE = FUZZER_INIT_DEF_RE
 EACSL_BINARY_MARKERS = (b"__e_acsl_", b"eacsl_assert")
 
@@ -420,6 +445,65 @@ def build_eacsl_flag_sets(
     return {
         "frontend": normalize_passthrough(shlex.join(front)),
         "backend": normalize_passthrough(shlex.join(backend)),
+    }
+
+
+def meta_stage_flags(fc_flags: Sequence[str]) -> tuple[list[str], list[str]]:
+    """
+    Split the stage-1 Frama-C flags of a build that loads MetAcsl properties: (`-F` flags of the
+    MetAcsl stage, e-acsl-gcc options that open the next stage with the RTE flags). See EACSL_META_FLAGS.
+    """
+    rte = [f for f in fc_flags if f.startswith("-rte")]
+    first = [f for f in fc_flags if not f.startswith("-rte")] + list(EACSL_META_FLAGS)
+    return first, [EACSL_META_STAGE_OPTIONS[0], EACSL_META_STAGE_OPTIONS[1], " ".join(rte)]
+
+
+def eacsl_meta_file_text(text: str, include_line: str) -> str:
+    """
+    A meta file (security_props.module_meta_file_text) for the E-ACSL frontend: its `include_line`
+    (security_props.META_INCLUDE), when it is the first line, becomes EACSL_META_INCLUDE_NOTE. Every
+    other line keeps its number.
+    """
+    first, sep, rest = text.partition("\n")
+    return f"{EACSL_META_INCLUDE_NOTE}{sep}{rest}" if first.strip() == include_line else text
+
+
+# MetAcsl aborts the whole translation on a property it cannot type in one function (a global this
+# module's parse does not declare): `[meta] User Error: Error during the typing of a HILARE!` then
+# `What: the HILARE named '<property>' (<meta file>:<line>)`.
+_META_REJECTED_RE = re.compile(r"the HILARE named '(?P<name>[A-Za-z_]\w*)'")
+_META_WHY_RE = re.compile(r"^\s*Why:\s*(?P<why>.+)$", re.MULTILINE)
+
+
+def rejected_meta_property(log: str) -> tuple[str, str] | None:
+    """(property, reason) of the meta-property MetAcsl stopped on in a stage-1 log, or None."""
+    m = _META_REJECTED_RE.search(log or "")
+    if not m:
+        return None
+    why = _META_WHY_RE.search(log, m.end())
+    return m.group("name"), (why.group("why").strip() if why else "MetAcsl could not type it")
+
+
+# The assertion data E-ACSL prints before each check: `<d>.fct = "<function>"; <d>.line = <n>;
+# <d>.name = "<property>/meta";` (a check of an annotation MetAcsl generated carries `/meta`).
+_META_CHECK_RE = re.compile(
+    r'\.fct\s*=\s*"(?P<fct>[^"]*)"\s*;\s*\w+\.line\s*=\s*\d+\s*;\s*\w+\.name\s*=\s*"(?P<name>[A-Za-z_]\w*)/meta"\s*;'
+)
+
+
+def meta_checks(instrumented_text: str, names: Sequence[str]) -> dict[str, dict]:
+    """
+    The run-time checks of each property in an instrumented file: `{property: {"checks": n,
+    "functions": [...]}}`, the functions being the ones whose code holds a check (a `requires` is
+    checked in its own function's wrapper). 0 checks: MetAcsl decided every instance statically, the
+    property has no instance in the instrumented functions, or E-ACSL did not translate it.
+    """
+    functions: dict[str, set[str]] = {}
+    for m in _META_CHECK_RE.finditer(instrumented_text):
+        functions.setdefault(m.group("name"), set()).add(m.group("fct"))
+    return {
+        name: {"checks": instrumented_text.count(f'"{name}/meta"'), "functions": sorted(functions.get(name, ()))}
+        for name in names
     }
 
 

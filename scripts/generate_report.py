@@ -39,6 +39,7 @@ from ledger import (  # noqa: E402
     GUARDRAIL_PASSED_STATUS,
     IDENTITY_NOT_COMPARED,
     INDUCTIVE_LEMMA_GAP,
+    METACSL_CLASSES,
     PROPERTY_RELOCATED,
     relocated_properties,
     unchecked_clause_text,
@@ -46,15 +47,18 @@ from ledger import (  # noqa: E402
 from mutation_check import classify_open_unit  # noqa: E402
 from phase0_gates import dynamic_gaps  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
-from workspace_overlay import map_work_to_baseline_line  # noqa: E402
+from workspace_overlay import load_function_wp_report, map_work_to_baseline_line  # noqa: E402
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 CLASSES = [
     "rte",
     "l2_termination",
     "l3_frame",
+    "l3_isolation",
     "l4_auth_state",
     "l4_auth_required",
+    "l4_invariant",
+    "l4_call_rule",
     "l5_sanitized",
     "l6_wiped",
     "l6_no_leak",
@@ -354,10 +358,12 @@ def load_inputs(run_dir: Path) -> dict:
     if errors:
         raise ArtifactError("inputs failed validation:\n  " + "\n  ".join(errors))
     raw_findings = load_json_optional(run_dir / "findings.json", [])
+    ledger = load_json_strict(run_dir / "coverage-ledger.json")
     return {
         "run_dir": run_dir,
         "meta": load_json_strict(run_dir / "run-metadata.json"),
-        "ledger": load_json_strict(run_dir / "coverage-ledger.json"),
+        "ledger": ledger,
+        "wp_meta_runs": load_wp_meta_runs(run_dir, ledger),
         "findings": dedupe_findings_for_report(raw_findings, run_dir=run_dir),
         "candidates": load_json_optional(run_dir / "candidates.json", []),
         "coverage": load_coverage_reports(run_dir),
@@ -365,6 +371,7 @@ def load_inputs(run_dir: Path) -> dict:
         "model": load_json_optional(run_dir / "workspace/reports/phase0_model.json", None),
         "security_props": load_json_optional(run_dir / "workspace/reports/security_props.json", None),
         "merge_notes": load_merge_notes(run_dir),
+        "fuzz_security_props": load_fuzz_security_props(run_dir),
     }
 
 
@@ -648,6 +655,97 @@ def const_union_rewrite_lines(run_dir: Path) -> list[str]:
     ]
 
 
+def load_fuzz_security_props(run_dir: Path) -> list[dict]:
+    """
+    What each fuzzed module's E-ACSL build did with the run's MetAcsl properties, one row per module
+    whose report says anything: {module, report, record, warnings, harness_induced}. Read from the
+    campaign report workspace/reports/fuzz/<mod>.json (`security_props`, `security_props_warnings`,
+    `security_props_harness_induced`, written by run_eacsl_fuzz.py), and from the build report
+    workspace/build/<mod>.build.json for a module without a campaign report. The other reports of
+    the fuzz directory (replays) are not a module's campaign and are not read. Empty for a run
+    without `eacsl` in `meta_engines`: no report has those fields then.
+    """
+    run_dir = Path(run_dir)
+    found: dict[str, tuple[Path, dict]] = {}
+    for directory, suffix, mode in (
+        ("workspace/reports/fuzz", ".json", "campaign"),
+        ("workspace/build", ".build.json", "build"),
+    ):
+        for path in sorted((run_dir / directory).glob("*" + suffix)):
+            module = path.name.removesuffix(suffix)
+            if module in found:
+                continue  # the campaign's build is the one that was fuzzed
+            try:
+                report = load_json_optional(path, None)
+            except (ArtifactError, OSError, ValueError):
+                report = None
+            if not isinstance(report, dict):
+                report = {}  # unreadable: nothing to print, and a campaign report still hides the build's
+            if report.get("mode") in (None, mode):
+                found[module] = (path, report)
+    rows: list[dict] = []
+    for module, (path, report) in sorted(found.items()):
+        record = report.get("security_props")
+        warnings = report.get("security_props_warnings")
+        induced = report.get("security_props_harness_induced")
+        row = {
+            "module": str(report.get("module") or module),
+            "report": path.relative_to(run_dir).as_posix(),
+            "record": record if isinstance(record, dict) else {},
+            "warnings": [str(w) for w in warnings] if isinstance(warnings, list) else [],
+            "harness_induced": [i for i in induced if isinstance(i, dict)] if isinstance(induced, list) else [],
+        }
+        if row["record"] or row["warnings"] or row["harness_induced"]:
+            rows.append(row)
+    return rows
+
+
+# `security_props.status` of a build that checks none of the properties it was given (fuzz_build.py).
+FUZZ_META_LOST = ("dropped", "error")
+
+
+def fuzz_meta_inactive_lines(rows: list[dict]) -> list[str]:
+    """
+    A warning per module whose fuzz binary lost the MetAcsl properties (`dropped`: the build failed
+    with them and was redone without; `error`: the properties file could not be loaded): fuzzing
+    checked no security property there, which the absence of a candidate must not hide.
+    """
+    out: list[str] = []
+    for row in rows:
+        record = row["record"]
+        if record.get("status") not in FUZZ_META_LOST:
+            continue
+        reason = md_escape(str(record.get("reason") or "no reason recorded"))
+        log = md_escape(str(record.get("log") or row["report"]))
+        out += [
+            "> [!WARNING]",
+            f"> MetAcsl run-time checks: NOT ACTIVE for module {md_escape(row['module'])} ({reason}). "
+            f"No Layer 3-6 property was checked by fuzzing; see {log}.",
+            "",
+        ]
+    return out
+
+
+def fuzz_meta_note_lines(rows: list[dict]) -> list[str]:
+    """
+    The properties a fuzz binary does not check, or checks elsewhere than planned (one line per
+    warning of a build that kept its properties), and the precondition failures the harness caused
+    itself (`ledger.py ingest-fuzz` makes no candidate of them).
+    """
+    lines: list[str] = []
+    for row in rows:
+        if row["record"].get("status") not in FUZZ_META_LOST:
+            lines += [f"- MetAcsl run-time checks, {md_escape(row['module'])}: {md_escape(w)}" for w in row["warnings"]]
+        lines += [
+            f"- {md_escape(str(i.get('property')))} failed in {md_escape(str(i.get('function')))}, called by harness "
+            f"function {md_escape(str(i.get('caller')))}: not a finding against the target."
+            for i in row["harness_induced"]
+        ]
+    if not lines:
+        return []
+    return ["### MetAcsl run-time checks in the fuzz builds", "", *lines, ""]
+
+
 def open_work(data: dict) -> dict:
     unverified = [c for c in data["candidates"] if c["status"] == "unverified"]
     open_units = [u for u in data["ledger"] if u["status"] in ("planned", "in_progress")]
@@ -908,25 +1006,271 @@ def relocated_props_lines(props: dict, ledger: list[dict] | None = None) -> list
     return [*out, ""]
 
 
+# How many rows a list of the MetAcsl sections shows, and how many callers one of its rows names.
+META_LIST_MAX = 30
+META_CALLERS_MAX = 8
+# The warnings about a threat-model item (security_props.WARNING_PREFIX).
+_NEW_KIND_PREFIXES = ("asset ", "invariant ", "call rule ")
+_ITEM_PREFIXES = ("secret ", "auth gate ", "output sink ", *_NEW_KIND_PREFIXES)
+_INITIALIZER_WARNING = "the model's call sites do not say which calls are initializers"
+# What a `\writing` property's `declared_callees` lists mean, in the order they are shown.
+_DECLARED_CALLEE_KINDS = (
+    ("set_assigns", "its `assigns` holds a set, which stops MetAcsl: the callers are left out of the property"),
+    ("no_assigns", "it has no `assigns`: MetAcsl checks nothing it writes"),
+    ("unknown", "its declaration could not be read"),
+)
+# The evidence of a unit the ledger refused a credit (scripts/ledger.py).
+_LEDGER_BARS = frozenset(
+    {
+        "wp_meta_unchecked",
+        "wp_meta_check_not_reported",
+        "wp_meta_simplified_eva_open",
+        "wp_meta_initializers_unknown",
+        "eva_no_goal_credit_withdrawn",
+    }
+)
+_METACSL_SET_ASSIGNS = "metacsl_set_assigns"
+
+
+def _capped(rows: list[str], where: str) -> list[str]:
+    """At most META_LIST_MAX rows, and where the others are."""
+    if len(rows) <= META_LIST_MAX:
+        return rows
+    return [*rows[:META_LIST_MAX], f"- ... and {len(rows) - META_LIST_MAX} more ({where})"]
+
+
+def _names(items: list[str]) -> str:
+    """Code-quoted names, at most META_CALLERS_MAX of them."""
+    shown = ", ".join(f"`{md_escape(i)}`" for i in items[:META_CALLERS_MAX])
+    return shown + (f" and {len(items) - META_CALLERS_MAX} more" if len(items) > META_CALLERS_MAX else "")
+
+
 def security_props_lines(props: dict | None, ledger: list[dict] | None = None) -> list[str]:
     """
-    Threat-model items security_props.py turned into no property (a returned secret, a name the build
-    lacks, an unusable sink parameter), from its warnings, so the report says what was not checked;
-    then the properties it moved (`relocated_props_lines`).
+    What security_props.json says is not checked. From its warnings: the threat-model items that became
+    no property (a returned secret, a name the build lacks, an unusable sink parameter, a text the
+    generator refused); a forwarding sink whose property was kept (`output sink <name>: it forwards to
+    ...`), checked at a weaker place than the threat model allows; the properties of the newer kinds
+    generated with a warning; and the properties blind to what a declared function writes. From the
+    properties: the sites each leaves `unchecked` and its `declared_callees`.
+    Then the properties it moved (`relocated_props_lines`).
     """
     if not isinstance(props, dict):
         return []
-    items = [
-        str(w) for w in props.get("warnings") or [] if str(w).startswith(("secret ", "auth gate ", "output sink "))
-    ]
+    properties = [p for p in props.get("properties") or [] if isinstance(p, dict)]
+    names = {str(p.get("name")) for p in properties}
+    items: list[str] = []
+    kept: list[str] = []
+    warned: list[str] = []
+    declared: list[str] = []
+    for raw in props.get("warnings") or []:
+        w = str(raw)
+        if not w.startswith(_ITEM_PREFIXES):
+            continue
+        if _is_kept_forwarding_sink(w):
+            kept.append(w)
+        elif _is_declared_callee_warning(w, names):
+            declared.append(w)
+        elif w.startswith(_NEW_KIND_PREFIXES) and _kept_its_property(w, names):
+            warned.append(w)
+        else:
+            items.append(w)
     out: list[str] = []
-    if items:
-        out = ["### Threat-model items without a property", ""]
-        out += [f"- {md_escape(w)}" for w in items[:30]]
-        if len(items) > 30:
-            out.append(f"- ... and {len(items) - 30} more (`workspace/reports/security_props.json`, `warnings`)")
+    for heading, intro, found in (
+        ("### Threat-model items without a property", None, items),
+        (
+            "### Output sinks whose property is checked before their buffer is complete",
+            "Each of these sinks has its property, checked at its own calls: it forwards to a declared sink, "
+            "and one of its calls through a pointer also reaches a function that reaches no declared sink.",
+            kept,
+        ),
+        ("### Properties generated with a warning", None, warned),
+        (
+            "### Properties that do not see what declared functions write",
+            "Each of these properties exists. MetAcsl takes what a declared function writes from its `assigns`.",
+            declared,
+        ),
+    ):
+        if not found:
+            continue
+        out += [heading, ""]
+        if intro:
+            out += [intro, ""]
+        out += _capped([f"- {md_escape(w)}" for w in found], "`workspace/reports/security_props.json`, `warnings`")
         out.append("")
+    out += _unchecked_lines(properties) + _declared_callee_lines(properties)
     return out + relocated_props_lines(props, ledger)
+
+
+def _is_kept_forwarding_sink(warning: str) -> bool:
+    """security_props.py's warning for a forwarding sink it could not move to the innermost sinks."""
+    head, sep, rest = warning.partition(": ")
+    return bool(sep) and head.startswith("output sink ") and rest.startswith("it forwards to ")
+
+
+def _names_a_property(head: str, names: set[str]) -> bool:
+    """`<item> (<property>)`, the head of a warning about a property that was generated."""
+    return head.endswith(")") and head.rpartition(" (")[2][:-1] in names
+
+
+def _is_declared_callee_warning(warning: str, names: set[str]) -> bool:
+    """security_props.py's warning about the declared functions a `\\writing` property calls."""
+    head, _, rest = warning.partition(": ")
+    return _names_a_property(head, names) and (
+        rest.startswith("the declared function(s) ") or " assign(s) a set (`assigns " in rest
+    )
+
+
+def _kept_its_property(warning: str, names: set[str]) -> bool:
+    """
+    Whether a warning about an asset, invariant or call rule leaves its property generated. Any other
+    form counts as an item without a property: the report then claims less than was checked, never more.
+    """
+    head, _, rest = warning.partition(": ")
+    return (
+        _names_a_property(head, names)
+        or rest.startswith("the predicate names ")
+        or rest.endswith(("MetAcsl targets them all by name", ": that name is left out"))
+        or (head.endswith((" writers", " readers", " scope")) and rest.endswith("nor called by one"))
+    )
+
+
+def _unchecked_lines(properties: list[dict]) -> list[str]:
+    """Per property, what its `unchecked` says it does not check: function, callee, line and reason."""
+    rows: list[str] = []
+    for prop in properties:
+        for site in prop.get("unchecked") or []:
+            if not isinstance(site, dict):
+                continue
+            call = f", call of `{md_escape(str(site['callee']))}`" if site.get("callee") else ""
+            line = f" at line {site['line']}" if call and site.get("line") else ""
+            reason = md_escape(str(site.get("reason") or "not checked"))
+            where = f"`{md_escape(str(prop.get('name')))}` in `{md_escape(str(site.get('function')))}`"
+            rows.append(f"- {where}{call}{line}: {reason}")
+    if not rows:
+        return []
+    source = "`workspace/reports/security_props.json`, `unchecked`"
+    return ["### Where a property does not check its function", "", *_capped(rows, source), ""]
+
+
+def _declared_callee_lines(properties: list[dict]) -> list[str]:
+    """Per `\\writing` property, the declared functions it cannot see into, with their callers."""
+    rows: list[str] = []
+    for prop in properties:
+        declared = prop.get("declared_callees")
+        if not isinstance(declared, dict):
+            continue
+        for kind, meaning in _DECLARED_CALLEE_KINDS:
+            for entry in declared.get(kind) or []:
+                if isinstance(entry, dict):
+                    callers = _names([str(c) for c in entry.get("callers") or []]) or "none"
+                    rows.append(
+                        f"- `{md_escape(str(prop.get('name')))}`: `{md_escape(str(entry.get('callee')))}`, {meaning}; "
+                        f"callers: {callers}"
+                    )
+    if not rows:
+        return []
+    where = "`workspace/reports/security_props.json`, `declared_callees`"
+    return ["### Declared functions the write-checking properties call", "", *_capped(rows, where), ""]
+
+
+def initializer_flags_lines(props: dict | None) -> list[str]:
+    """
+    A warning when the Phase 0 model does not say which calls are initializers: MetAcsl generates no
+    instance of several contexts at such a call, and nothing else checks it there.
+    """
+    if not isinstance(props, dict):
+        return []
+    flags = props.get("initializer_flags")
+    unknown = isinstance(flags, dict) and flags.get("known") is False
+    said = next((str(w) for w in props.get("warnings") or [] if str(w).startswith(_INITIALIZER_WARNING)), None)
+    if not unknown and said is None:
+        return []
+    text = said or f"{_INITIALIZER_WARNING}: MetAcsl generates no instance of some properties at such a call"
+    return ["> [!WARNING]", f"> MetAcsl initializer calls: NOT CHECKED. {md_escape(text)}.", ""]
+
+
+def ledger_bar_lines(ledger: list[dict]) -> list[str]:
+    """The open units the ledger refused a credit, each with its latest refusal and the reason it gives."""
+    rows: list[str] = []
+    for u in sorted(ledger, key=lambda unit: str(unit.get("coverage_id"))):
+        if u.get("status") in ("covered", "candidate", "out_of_scope", "not_applicable"):
+            continue
+        bars = [e for e in u.get("evidence") or [] if isinstance(e, dict) and e.get("result") in _LEDGER_BARS]
+        if bars:
+            rows.append(
+                f"- `{md_escape(str(u.get('coverage_id')))}` (`{md_escape(str(u.get('status')))}`), "
+                f"`{bars[-1]['result']}`: {md_escape(str(bars[-1].get('summary') or ''))}"
+            )
+    if not rows:
+        return []
+    return ["### Units the ledger refused a credit", "", *_capped(rows, "`coverage-ledger.json`, `evidence`"), ""]
+
+
+def load_wp_meta_runs(run_dir: Path, ledger: list[dict]) -> list[dict]:
+    """
+    The latest WP report of each function with a MetAcsl unit (workspace_overlay.load_function_wp_report:
+    the canonical report, else the baseline's report of its file) when MetAcsl stopped the run on a
+    set-valued `assigns` or in-code check rows stayed unnamed: {function, file, stopped, callees, unnamed}.
+    """
+    functions = {
+        (str(u.get("file")), str(u.get("function"))) for u in ledger if u.get("obligation_class") in METACSL_CLASSES
+    }
+    rows: list[dict] = []
+    for file, function in sorted(functions):
+        try:
+            report = load_function_wp_report(Path(run_dir) / "workspace", file, function)
+        except (ArtifactError, OSError, ValueError):
+            continue
+        failure = report.get("metacsl_failure")
+        section = report.get("security_props")
+        unnamed = section.get("code_checks_unnamed") if isinstance(section, dict) else None
+        stopped = report.get("reason") == _METACSL_SET_ASSIGNS
+        if stopped or unnamed:
+            rows.append(
+                {
+                    "function": function,
+                    "file": file,
+                    "stopped": stopped,
+                    "callees": [str(c) for c in (failure.get("callees") or [])] if isinstance(failure, dict) else [],
+                    "unnamed": [u for u in unnamed or [] if isinstance(u, dict)],
+                }
+            )
+    return rows
+
+
+def _unnamed_check_text(entry: dict) -> str:
+    """
+    One row of a WP report's `code_checks_unnamed`: a property whose in-code check the source audit
+    refused (`property`, `reason`), or a line whose check rows do not match the checks written there.
+    """
+    if entry.get("property"):
+        at = f" at line {entry['line']}" if entry.get("line") else ""
+        why = md_escape(str(entry.get("reason") or "not named"))
+        return f"`{md_escape(str(entry['property']))}`{at} ({why})"
+    return f"line {entry.get('line')} ({entry.get('checks')} check(s), {entry.get('rows')} row(s))"
+
+
+def wp_meta_run_lines(runs: list[dict]) -> list[str]:
+    """What load_wp_meta_runs found: each WP run MetAcsl stopped, and each with check rows left unnamed."""
+    rows: list[str] = []
+    for run in runs:
+        where = f"`{md_escape(run['function'])}` (`{md_escape(run['file'])}`)"
+        if run["stopped"]:
+            named = f"called function(s) {_names(run['callees'])}" if run["callees"] else "no callee could be named"
+            rows.append(
+                f"- {where}: MetAcsl stopped on an `assigns` that holds a set (`{_METACSL_SET_ASSIGNS}`), {named}. "
+                "Write one `assigns` term per location; running it again does not help."
+            )
+        if run["unnamed"]:
+            lines = ", ".join(_unnamed_check_text(u) for u in run["unnamed"])
+            rows.append(
+                f"- {where}: in-code check rows stayed unnamed (`code_checks_unnamed`) at {lines}, so they credit "
+                "no property."
+            )
+    if not rows:
+        return []
+    return ["### WP runs MetAcsl stopped or left unnamed", "", *_capped(rows, "`workspace/reports/wp/`"), ""]
 
 
 def trust_lines(model: dict | None) -> list[str]:
@@ -1192,6 +1536,9 @@ def render_report(data: dict) -> str:
             + "do not read the absence of findings outside the covered units as evidence of safety."
         )
         out.append("")
+    fuzz_meta = data.get("fuzz_security_props") or []
+    out += fuzz_meta_inactive_lines(fuzz_meta)
+    out += initializer_flags_lines(data.get("security_props"))
     if work["unverified"]:
         out.append(
             f"**{len(work['unverified'])} candidate(s) have not been independently verified.** They are not findings and are listed here only so the gap is visible:"
@@ -1207,6 +1554,9 @@ def render_report(data: dict) -> str:
         out.append("")
     out += trust_lines(data.get("model"))
     out += security_props_lines(data.get("security_props"), ledger)
+    out += ledger_bar_lines(ledger)
+    out += wp_meta_run_lines(data.get("wp_meta_runs") or [])
+    out += fuzz_meta_note_lines(fuzz_meta)
     out += fallback_lines(data.get("model"), ledger)
 
     out += ["## 2. Summary", ""]

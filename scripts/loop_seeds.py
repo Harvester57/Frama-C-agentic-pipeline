@@ -996,6 +996,10 @@ def default_guard_runner(
         swapped[index] = str(copy)
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
+            # A plain build on purpose: it checks one seeded loop annotation of `function` on a copy,
+            # and never loads the run's MetAcsl properties (only fuzz_build.build_module_binary does,
+            # with `eacsl` in security_props.json's meta_engines). A property failing on a corpus
+            # input would otherwise be read as the seed not holding.
             comp = fuzz_build.compile_eacsl_binary(
                 swapped,
                 out_dir / "guard",

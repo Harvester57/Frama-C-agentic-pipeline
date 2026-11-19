@@ -10,6 +10,7 @@ caller. No module here imports run_eacsl_fuzz.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import cache
 import fc_cpp_wrapper_eacsl
@@ -37,6 +39,7 @@ from eacsl_toolchain import (
     build_errno_shim_object,
     build_fallback_object,
     defines_fuzzer_initialize,
+    eacsl_meta_file_text,
     eacsl_share_dir,
     eacsl_zone_size_options,
     fix_readonly_scalar_globals,
@@ -44,6 +47,8 @@ from eacsl_toolchain import (
     is_eacsl_instrumented,
     mark_formals_initialized,
     mark_wrapper_results_initialized,
+    meta_checks,
+    meta_stage_flags,
     normalize_passthrough,
     order_literal_registrations,
     parse_ignored_annotations,
@@ -51,6 +56,7 @@ from eacsl_toolchain import (
     parse_undefined_fallbacks,
     prepare_patched_eacsl_share,
     preprocess_source,
+    rejected_meta_property,
     reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
     rewrite_sound_verdict_resets,
@@ -60,7 +66,8 @@ from eacsl_toolchain import (
     slice_has_pthread,
     uses_full_mtracking,
 )
-from failure_identity import is_harness_fuzz_function
+from failure_identity import SECURITY_META_SUFFIX, is_harness_fuzz_function, meta_sidecar_path
+from fingerprint import normalize_file
 from framac_common import compile_inputs, load_json_optional, scan_undeclared_functions
 from fuzz_common import (
     BUILD_TIMEOUT_S,
@@ -210,8 +217,14 @@ def _eacsl_cache_material(
     rte_initialized: bool,
     concurrency: bool | None = None,
     libc_checks: bool = True,
+    security_meta: dict | None = None,
 ) -> dict | None:
-    """Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse)."""
+    """
+    Everything an E-ACSL build depends on besides file contents (None: flags the build would refuse).
+    `security_meta` is the loaded plan of a build with MetAcsl properties (resolve_security_meta): the
+    key `security_meta` (`_security_meta_material`) is there only then, so a build without properties
+    keeps the material it always had and is never restored for one with them, nor the reverse.
+    """
     has_pthread = concurrency if concurrency is not None else slice_has_pthread(sources)
     eacsl_bin, is_modern = _resolve_eacsl_gcc()
     try:
@@ -253,6 +266,41 @@ def _eacsl_cache_material(
         "zone_sizes": _zone_size_options(is_modern),
         # A build stored before its result listed the annotations E-ACSL ignored must not be restored.
         "ignored_annotations": IGNORED_ANNOTATIONS_VERSION,
+        **({"security_meta": _security_meta_material(security_meta)} if security_meta else {}),
+    }
+
+
+def _security_meta_material(plan: dict) -> dict:
+    """
+    What the MetAcsl properties add to the key of an E-ACSL build (plan: resolve_security_meta's
+    `loaded` result), all of it known before the build:
+      text         the digest of the meta file with every selected property (write_security_meta's
+                   text; a property MetAcsl rejects during the build is part of the cached outcome);
+      stage        the Frama-C flags of the MetAcsl stage and the e-acsl-gcc options that open the
+                   next one (eacsl_toolchain.meta_stage_flags);
+      properties, functions, harness_functions, left_out
+                   what the sidecar and the result's `security_props` are written from;
+      max_rejected SECURITY_META_MAX_REJECTED, which bounds the rejections one build absorbs.
+    The path of security_props.json is not in it: Make names the file, a replay or the build check
+    may find it by default, and the same properties must give the same entry.
+    """
+    import security_props
+
+    selected = plan.get("selected") or []
+    found = security_props.module_meta_file_text({"preamble": plan.get("preamble") or "", "properties": selected}, None)
+    text = eacsl_meta_file_text(found[0], security_props.META_INCLUDE) if found else ""
+    first, options = meta_stage_flags(["-rte"])
+    return {
+        "text": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "stage": [first, options],
+        "properties": {
+            str(p["name"]): {"obligation_class": p.get("obligation_class"), "instances": list(p.get("instances") or [])}
+            for p in selected
+        },
+        "functions": plan.get("functions") or {},
+        "harness_functions": plan.get("harness_functions") or [],
+        "left_out": plan.get("left_out") or [],
+        "max_rejected": SECURITY_META_MAX_REJECTED,
     }
 
 
@@ -356,6 +404,262 @@ def _build_environ_keep_object(
     }
 
 
+# ---------------------------------------------------------------------------------------------------
+# MetAcsl properties checked at run time (docs/plans/metacsl-exploitation-plan.md, package C)
+# ---------------------------------------------------------------------------------------------------
+
+# The run's property file when no path is given (plan section 3.2), as run_wp_function.SECURITY_PROPS_ENV.
+SECURITY_PROPS_ENV = "FRAMAC_SECURITY_PROPS"
+# Next to the binary: the log of a build the properties made fail (the module is then built without them).
+SECURITY_META_LOG_SUFFIX = ".security_meta.log"
+# How many properties MetAcsl may reject, one stage-1 run each, before the module is built without any.
+SECURITY_META_MAX_REJECTED = 3
+
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_C_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_META_CONTEXT_RE = re.compile(r"\\context\(\s*\\(?P<context>\w+)\s*\)")
+
+
+def _meta_targets(acsl: str) -> tuple[bool, set[str]]:
+    r"""(`\targets` is a plain list of functions, the names it lists) of one meta-property's text."""
+    start = acsl.find("\\targets(")
+    if start < 0:
+        return False, set()
+    depth, end = 0, len(acsl)
+    for i in range(start + len("\\targets"), len(acsl)):
+        depth += {"(": 1, ")": -1}.get(acsl[i], 0)
+        if depth == 0:
+            end = i
+            break
+    arg = acsl[start + len("\\targets(") : end].strip()
+    return arg.startswith("{") and "\\" not in arg, set(_C_IDENT_RE.findall(arg.replace("\\", " ")))
+
+
+def _harness_induced(acsl: str, harness_words: set[str]) -> str | None:
+    r"""
+    Why a harness could make this meta-property fail on a correct target, or None. Only a `\precond`
+    property can: its `requires` is checked in the protected function itself, whoever calls it, and a
+    harness that calls the function directly does not go through the gate its callers in the target
+    pass. The other contexts are checked in code the harness does not own: the build instruments the
+    target's functions only (`-e-acsl-functions`), so a write, read or call the harness makes is not
+    checked, and a postcondition speaks of the function's own work.
+    """
+    m = _META_CONTEXT_RE.search(acsl)
+    if not m or m.group("context") != "precond":
+        return None
+    listed, names = _meta_targets(acsl)
+    if not listed:
+        return "its targets are not a list of functions: a direct call from the harness cannot be ruled out"
+    called = sorted(names & harness_words)
+    if called:
+        return f"the harness names its target{'s' if len(called) > 1 else ''} {', '.join(called)}"
+    return None
+
+
+def resolve_security_meta(spec: str | None, sources: list[str], out_bin: Path) -> dict | None:
+    r"""
+    The MetAcsl properties (scripts/security_props.py) the E-ACSL build of `sources` checks at run
+    time, or None when it loads none. `spec` is a path, `none`/`off`, or None for
+    $FRAMAC_SECURITY_PROPS, else workspace/reports/security_props.json when it exists (as
+    run_wp_function.resolve_security_meta). The file acts only when its `meta_engines` holds `eacsl`.
+
+    Returns {status, props, left_out, ...}:
+      error    the file is unreadable, or `spec` names a file that does not exist (`reason`);
+      skipped  no property applies to this module (`reason`);
+      loaded   `properties` (names) are for compile_eacsl_binary, which writes the meta file
+               `<out_bin>.security_meta.c` and its sidecar (failure_identity.meta_sidecar_path).
+    The properties are the ones with an instance in a function of the non-harness sources (ids
+    `file#name` whose file ends a source's path). MetAcsl instantiates each of them in every function
+    of the parse. `left_out` lists the `\precond` properties a harness could make fail on a correct
+    target (`_harness_induced`), with the reason: they are not compiled as `check` either, because a
+    printed check would be parsed before the real failure of the same input, and a campaign never
+    sees one. The properties' own `sources` are not added to the build: it compiles the module as it is.
+    A property whose `engines` leave E-ACSL out (security_props.for_engine) is not considered; the
+    names are listed under `not_for_engine` (absent when there are none).
+    """
+    import security_props
+
+    if spec is not None and spec.strip().lower() in ("none", "off", ""):
+        return None
+    path = Path(spec) if spec else Path(os.environ.get(SECURITY_PROPS_ENV) or security_props.DEFAULT_OUT)
+    if not path.is_file():
+        return {"status": "error", "props": str(path), "reason": "security properties file not found"} if spec else None
+    try:
+        props = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"status": "error", "props": str(path), "reason": f"unreadable: {exc}"}
+    if not isinstance(props, dict) or "eacsl" not in security_props.meta_engines(props):
+        return None
+
+    every = [p for p in props.get("properties") or [] if isinstance(p, dict) and p.get("name")]
+    # A property whose `engines` leave E-ACSL out never reaches the build (security_props.for_engine).
+    listed = security_props.for_engine({**props, "properties": every}, "eacsl")["properties"]
+    not_for_engine = sorted({str(p["name"]) for p in every} - {str(p["name"]) for p in listed})
+    all_ids = set(props.get("obligations") or {}) | {str(i) for p in listed for i in p.get("instances") or []}
+    ids: set[str] = set()
+    functions: dict[str, set[str]] = {}
+    harness_words: set[str] = set()
+    harness_functions: set[str] = set()
+    for src in sources:
+        p = Path(src)
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        try:
+            defined = {str(fn.get("name") or "") for fn in extract_functions_from_code(text, path=str(p))}
+        except Exception:  # noqa: BLE001 - a source the scanner cannot read names no function here
+            defined = set()
+        defined -= {""} | set(TYPE_MODIFIERS_AND_PRIMITIVES)
+        if p.name.startswith("harness_") or "LLVMFuzzerTestOneInput" in text:
+            harness_words |= set(_C_IDENT_RE.findall(_C_COMMENT_RE.sub(" ", text)))
+            harness_functions |= defined
+            continue
+        posix = str(src).replace("\\", "/")
+        mine = {
+            fid for fid in all_ids if posix == fid.rpartition("#")[0] or posix.endswith("/" + fid.rpartition("#")[0])
+        }
+        ids |= mine
+        # The file as the run's ids name it (the ledger's), else the path without its overlay prefix.
+        rel = max((fid.rpartition("#")[0] for fid in mine), key=len, default=normalize_file(posix))
+        for name in defined:
+            functions.setdefault(name, set()).add(rel)
+
+    left_out: list[dict] = []
+    kept: list[dict] = []
+    for prop in listed:
+        reason = _harness_induced(str(prop.get("acsl") or ""), harness_words)
+        if reason and ids & set(prop.get("instances") or []) and not prop.get("code"):
+            left_out.append({"property": str(prop["name"]), "reason": reason})
+        else:
+            kept.append(prop)
+    base = {
+        "props": str(path),
+        "left_out": left_out,
+        **({"not_for_engine": not_for_engine} if not_for_engine else {}),
+    }
+    found = security_props.module_meta_file_text({**props, "properties": kept}, ids)
+    if found is None:
+        return {"status": "skipped", **base, "reason": "no property has an instance in a function of these sources"}
+    names = found[1]
+    return {
+        "status": "loaded",
+        **base,
+        "properties": names,
+        "selected": [p for p in kept if str(p["name"]) in names],
+        "preamble": str(props.get("preamble") or ""),
+        "functions": {name: sorted(files) for name, files in sorted(functions.items())},
+        "harness_functions": sorted(harness_functions),
+    }
+
+
+def write_security_meta(plan: dict, out_bin: Path, without: set[str] | frozenset[str] = frozenset()) -> dict | None:
+    """
+    Write the meta file of a loaded plan (resolve_security_meta) next to `out_bin`, without the
+    properties named in `without`, and its sidecar: {meta_file, properties, line_names}, or None when
+    no property is left. The text is security_props.module_meta_file_text's, with the libc include
+    line emptied (eacsl_toolchain.eacsl_meta_file_text), so every property keeps its line.
+    """
+    import security_props
+
+    remaining = [p for p in plan["selected"] if str(p["name"]) not in without]
+    found = security_props.module_meta_file_text({"preamble": plan["preamble"], "properties": remaining}, None)
+    if found is None:
+        return None
+    text = eacsl_meta_file_text(found[0], security_props.META_INCLUDE)
+    meta_file = Path(out_bin).with_suffix(SECURITY_META_SUFFIX)
+    meta_file.parent.mkdir(parents=True, exist_ok=True)
+    meta_file.write_text(text, encoding="utf-8", newline="\n")
+    line_names = {str(k): v for k, v in security_props.meta_line_names(text).items()}
+    sidecar = {
+        "props": plan["props"],
+        "meta_file": meta_file.as_posix(),
+        "properties": {
+            str(p["name"]): {"obligation_class": p.get("obligation_class"), "instances": list(p.get("instances") or [])}
+            for p in remaining
+        },
+        "functions": plan["functions"],
+        "harness_functions": plan["harness_functions"],
+        "line_names": line_names,
+    }
+    meta_sidecar_path(meta_file).write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8", newline="\n")
+    return {"meta_file": meta_file.as_posix(), "properties": found[1], "line_names": line_names}
+
+
+def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | None, dict]:
+    """
+    Build with the plan's properties: (result, record), the record being the result's `security_props`.
+    `build(meta)` is the uncached E-ACSL build with `meta` = write_security_meta's result. A property
+    MetAcsl cannot type in this module (eacsl_toolchain.rejected_meta_property) is dropped and stage 1
+    run again, SECURITY_META_MAX_REJECTED times at most. (None, record) when the build fails with the
+    properties: the caller builds the module without them, so that they never cost it its E-ACSL
+    binary, and the record says why (`status` dropped, `log` the failed build's log).
+    Record of a build that holds them (`status` loaded): `meta_file`, `properties`, `line_names`,
+    `translated` (property -> its checks and the functions holding one), `not_translated` (no run-time
+    check: decided statically by MetAcsl, no instance in the instrumented functions, or not translated
+    by E-ACSL), `unplanned_instances` (functions holding a check that the property does not list as
+    instances; not for a precondition, which is checked in its target), `rejected`, `left_out`.
+    """
+    record: dict = {"status": "loaded", "props": plan["props"], "left_out": plan["left_out"]}
+    if plan.get("not_for_engine"):
+        record["not_for_engine"] = plan["not_for_engine"]
+    rejected: list[dict] = []
+    while True:
+        written = write_security_meta(plan, out_bin, {r["property"] for r in rejected})
+        if rejected:
+            record["rejected"] = rejected
+        if written is None:
+            record.update(status="dropped", reason="MetAcsl rejected every property")
+            return None, record
+        res = build(written)
+        applied = res.pop("security_meta", None) or {}
+        if not applied.get("applied"):
+            # Built, as a plain build: this toolchain or module cannot take the properties.
+            record.update(status="skipped", reason=applied.get("reason") or "the build did not take the meta file")
+            return res, record
+        if res.get("returncode") == 0:
+            break
+        log = Path(res["compile_log"])
+        log_text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
+        hit = rejected_meta_property(log_text)
+        if hit and hit[0] in written["properties"] and len(rejected) < SECURITY_META_MAX_REJECTED:
+            rejected.append({"property": hit[0], "reason": hit[1]})
+            continue
+        kept_log = Path(out_bin).with_suffix(SECURITY_META_LOG_SUFFIX)
+        with contextlib.suppress(OSError):
+            kept_log.write_text(log_text, encoding="utf-8", newline="\n")
+        record.update(
+            status="dropped",
+            reason=f"the E-ACSL build failed with the properties ({res.get('reason') or res.get('returncode')})",
+            properties=written["properties"],
+            log=kept_log.as_posix(),
+        )
+        return None, record
+    instrumented = Path(res["instrumented_source"])
+    text = instrumented.read_text(encoding="utf-8", errors="replace") if instrumented.is_file() else ""
+    checks = meta_checks(text, written["properties"])
+    by_name = {str(p["name"]): p for p in plan["selected"]}
+    unplanned: dict[str, list[str]] = {}
+    for name, found in checks.items():
+        prop = by_name.get(name) or {}
+        context = _META_CONTEXT_RE.search(str(prop.get("acsl") or ""))
+        if context and context.group("context") == "precond":
+            continue
+        planned = {str(i).rpartition("#")[2] for i in prop.get("instances") or []}
+        extra = [fn for fn in found["functions"] if fn not in planned]
+        if extra:
+            unplanned[name] = extra
+    record.update(
+        meta_file=written["meta_file"],
+        properties=written["properties"],
+        line_names=written["line_names"],
+        translated={name: found for name, found in checks.items() if found["checks"]},
+        not_translated=[name for name, found in checks.items() if not found["checks"]],
+        unplanned_instances=unplanned,
+    )
+    return res, record
+
+
 def compile_eacsl_binary(
     sources: list[str],
     out_bin: Path,
@@ -373,6 +677,7 @@ def compile_eacsl_binary(
     enable_l2: bool | None = None,
     concurrency: bool | None = None,
     libc_checks: bool = True,
+    security_meta: dict | None = None,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL (see `_compile_eacsl_binary_uncached`).
@@ -381,13 +686,44 @@ def compile_eacsl_binary(
     cached under its effective flags, output path, cwd and dependency manifest: a hit restores
     the binary, `<out>.instrumented.c`, the variadic fallback object and the compile log (which
     then names the cache entry). The result carries `cache: {"hit": bool, "key": str | None}`.
+
+    `security_meta` (resolve_security_meta's result; None: no MetAcsl property, the build of every
+    caller but build_module_binary) adds the run's MetAcsl properties to stage 1, so the binary stops
+    on an input that violates one (`_build_with_security_meta`). The result then carries
+    `security_props`. Such a build is cached under a key of its own (`_security_meta_material`: the
+    meta text, the MetAcsl stage flags and what the sidecar is written from), with the meta file
+    `<out>.security_meta.c` and its sidecar among the restored files: without the sidecar a restored
+    binary would report its violations without their file and class. A build whose toolchain cannot
+    take the properties (`status` skipped) is cached the same way. A build the properties make fail
+    (`status` dropped) is never published: it is redone without them, through the cache as any plain
+    build, and tried again with them the next time.
     """
     out_bin = Path(out_bin)
+    # The same build without the properties (the arguments as given: the flags below are completed once).
+    plain = functools.partial(
+        compile_eacsl_binary,
+        sources,
+        out_bin,
+        machdep=machdep,
+        cppflags=cppflags,
+        rte_flags=rte_flags,
+        fuzzer_flag=fuzzer_flag,
+        functions=functions,
+        ldflags_extra=ldflags_extra,
+        variadic_translation=variadic_translation,
+        warn_unsigned_downcast=warn_unsigned_downcast,
+        rte_initialized=rte_initialized,
+        runner=runner,
+        use_cache=use_cache,
+        enable_l2=enable_l2,
+        concurrency=concurrency,
+        libc_checks=libc_checks,
+    )
     cppflags = target_env.with_include_flags(cppflags)
     ldflags_extra = target_env.with_link_flags(ldflags_extra)
     target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
 
-    def _build() -> dict:
+    def _build(meta: dict | None = None) -> dict:
         return _compile_eacsl_binary_uncached(
             sources,
             out_bin,
@@ -404,7 +740,45 @@ def compile_eacsl_binary(
             target_fns=target_fns,
             concurrency=concurrency,
             libc_checks=libc_checks,
+            **({"security_meta": meta} if meta else {}),
         )
+
+    plan: dict | None = None
+    if security_meta:
+        if security_meta.get("status") == "loaded":
+            plan = security_meta
+        else:
+            res = plain()
+            res["security_props"] = {
+                k: v
+                for k, v in security_meta.items()
+                if k in ("status", "props", "reason", "left_out", "not_for_engine")
+            }
+            return res
+
+    # The record of a build the properties made fail: it is not a result to publish.
+    dropped: dict = {}
+
+    def _meta_build() -> dict:
+        assert plan is not None
+        built, record = _build_with_security_meta(plan, out_bin, _build)
+        if built is None:
+            dropped.update(record)
+            return {"returncode": 1, "reason": "security_meta_dropped"}
+        built["security_props"] = record
+        return built
+
+    def _with_properties(res: dict) -> dict:
+        assert plan is not None
+        if dropped:
+            res = plain()
+            if res.get("returncode") != 0:
+                dropped["reason"] = f"{dropped.get('reason')}; the build without them fails too"
+            res["security_props"] = dict(dropped)
+        elif isinstance(res.get("security_props"), dict):
+            # The entry may come from a build that named the same properties file another way.
+            res["security_props"]["props"] = plan["props"]
+        return res
 
     material = None
     if use_cache and not _in_agent_scratch(out_bin):
@@ -422,11 +796,12 @@ def compile_eacsl_binary(
             rte_initialized,
             concurrency=concurrency,
             libc_checks=libc_checks,
+            security_meta=plan,
         )
     if material is None:
-        res = _build()
+        res = _meta_build() if plan else _build()
         res["cache"] = {"hit": False, "key": None}
-        return res
+        return _with_properties(res) if plan else res
 
     instrumented_c = out_bin.with_suffix(".instrumented.c")
     compile_log = out_bin.with_suffix(".compile.log")
@@ -445,17 +820,22 @@ def compile_eacsl_binary(
         if (res.get("environ_keep") or {}).get("status") == "built":
             files["env_keep.o"] = env_keep_dir / "eacsl_env_keep.o"
             files["env_keep.c"] = env_keep_dir / "eacsl_env_keep.c"
+        if res.get("security_props"):
+            # The meta file is no input of the key (its text is): the rejection loop rewrites it.
+            meta_file = out_bin.with_suffix(SECURITY_META_SUFFIX)
+            files["security_meta.c"] = meta_file
+            files["security_meta.json"] = meta_sidecar_path(meta_file)
         return files
 
     if enable_l2 is None:
         enable_l2 = bool(target_fns)
     l2_functions = target_fns if target_fns else None
-    return cache.memoize(
+    cached = cache.memoize(
         "eacsl-build",
         material,
         sources=sources,
         dep_flags=shlex.split(material["frontend"]),
-        build=_build,
+        build=_meta_build if plan else _build,
         outputs=_outputs,
         ok=lambda res: res.get("returncode") == 0,
         runner=runner,
@@ -463,6 +843,7 @@ def compile_eacsl_binary(
         enable_l2=enable_l2,
         l2_target_functions=l2_functions,
     )
+    return _with_properties(cached) if plan else cached
 
 
 def _compile_eacsl_binary_uncached(
@@ -481,6 +862,7 @@ def _compile_eacsl_binary_uncached(
     target_fns: list[str] | None = None,
     concurrency: bool | None = None,
     libc_checks: bool = True,
+    security_meta: dict | None = None,
 ) -> dict:
     """
     Instrument and compile a slice with E-ACSL.
@@ -510,6 +892,13 @@ def _compile_eacsl_binary_uncached(
     and generates no check. The result lists them in `ignored_annotations`, each with the function it
     belongs to when that can be read from the sources (eacsl_toolchain.attribute_ignored_annotations),
     and counts the ignored `assigns` clauses, which E-ACSL never checks, in `ignored_frame_clauses`.
+
+    With `security_meta` ({meta_file, ...}, write_security_meta's result) stage 1 also parses the meta
+    file and runs MetAcsl in a stage of its own before RTE and E-ACSL (eacsl_toolchain.EACSL_META_FLAGS):
+      `e-acsl-gcc -n --no-constfold <checks> --then-last --e-acsl-extra <rte flags> -G clang
+       -F <other frama-c flags> -meta -meta-warn-key unknown-func=inactive -E <frontend> -o ... <sources> <meta file>`
+    The result's `security_meta` says whether it did (`applied`), and why not (`reason`): the build is
+    then the plain one. The meta file is no source of the module: only stage 1 reads it.
     """
     out_bin = Path(out_bin)
     out_bin.parent.mkdir(parents=True, exist_ok=True)
@@ -610,6 +999,25 @@ def _compile_eacsl_binary_uncached(
     if target_fns is None:
         target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
 
+    meta_file: str | None = None
+    if security_meta:
+        if not is_modern:
+            why_not = "e-acsl-gcc.sh (Frama-C <= 32) has no option to run MetAcsl in a stage of its own"
+        elif "fc_compat_types.h" not in flags["frontend"]:
+            why_not = (
+                "the frontend does not force-include fc_stubs/fc_compat_types.h, which gives the meta file "
+                "its vocabulary in an E-ACSL build"
+            )
+        elif not target_fns:
+            why_not = "no target function is listed: without -e-acsl-functions the harness's own code is checked too"
+        else:
+            why_not = None
+            meta_file = str(security_meta["meta_file"])
+        result["security_meta"] = {"meta_file": str(security_meta["meta_file"]), "applied": why_not is None}
+        if why_not:
+            result["security_meta"]["reason"] = why_not
+            log_parts.append(f"MetAcsl properties not loaded: {why_not}.\n")
+
     if not is_modern:
         cmd = [
             eacsl_bin,
@@ -657,6 +1065,13 @@ def _compile_eacsl_binary_uncached(
                 fn_csv = ",".join(fns)
                 fc_flags.append(f"-rte-select {fn_csv}")
                 fc_flags.append(f"-e-acsl-functions {fn_csv}")
+            # MetAcsl properties (security_meta): their stage first, the RTE flags behind it. Never
+            # without a function list, which is what keeps the harness's own code unchecked.
+            stage_options: list[str] = []
+            meta_sources: list[str] = []
+            if meta_file and fns:
+                fc_flags, stage_options = meta_stage_flags(fc_flags)
+                meta_sources = [meta_file]
             # Pass --no-constfold so Frama-C's CIL constant folder does not zero-fold
             # hoisted block-scope `static const` arrays indexed by variables.
             cmd1 = [
@@ -664,6 +1079,7 @@ def _compile_eacsl_binary_uncached(
                 "-n",
                 "--no-constfold",
                 *check_options,
+                *stage_options,
                 "-G",
                 "clang",
                 "-F",
@@ -673,6 +1089,7 @@ def _compile_eacsl_binary_uncached(
                 "-o",
                 str(instrumented_c),
                 *sources,
+                *meta_sources,
             ]
             return (cmd1, *_run_tool(cmd1, runner))
 
@@ -682,7 +1099,12 @@ def _compile_eacsl_binary_uncached(
             missing = [f for f in parse_missing_functions(out + "\n" + err) if f in target_fns]
             if missing:
                 result["rte_select_dropped"] = missing
-                cmd1, rc, out, err = _stage1([f for f in target_fns if f not in missing])
+                remaining = [f for f in target_fns if f not in missing]
+                if meta_file and not remaining:
+                    result["security_meta"].update(
+                        applied=False, reason="Frama-C knows none of the listed target functions"
+                    )
+                cmd1, rc, out, err = _stage1(remaining)
                 _record(cmd1, rc, out, err)
         _note_const_unions(out, err)  # the last frontend run only: a retry preprocesses the same files again
         frontend.update(output=out + "\n" + err, instrumented=rc == 0 and instrumented_c.is_file())
@@ -1420,6 +1842,7 @@ def build_module_binary(
     use_cache: bool = True,
     dag_path: Path | str | None = None,
     link_module: str | None = None,
+    security_props: str | None = None,
 ) -> dict:
     """
     Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
@@ -1440,6 +1863,11 @@ def build_module_binary(
     `sources` is what was compiled last (the input plus any repair).
     With `apply_selftest` False, the selftest result is not read: `auto` tries E-ACSL as `eacsl` does
     (D8). The campaign applies the selftest, and it restores these builds from the cache.
+    `security_props` (`--security-props PATH|none`; None: $FRAMAC_SECURITY_PROPS, else
+    workspace/reports/security_props.json) names the run's MetAcsl properties. When that file turns
+    the `eacsl` engine on (`meta_engines`), the E-ACSL build checks them at run time
+    (`resolve_security_meta`, per attempt: a link repair changes the sources) and its result carries
+    `security_props`. The sanitizer build never does. Without `eacsl` in `meta_engines` nothing changes.
     """
 
     def _attempt(srcs: list[str]) -> tuple[dict, dict | None, str | None]:
@@ -1451,6 +1879,9 @@ def build_module_binary(
             if blocked:
                 fallback_reason = blocked
             else:
+                meta = resolve_security_meta(security_props, srcs, Path(out_bin))
+                # Only when the run's properties are on: the call of a run without them is today's.
+                meta_kwargs: dict[str, Any] = {"security_meta": meta} if meta is not None else {}
                 comp = compile_eacsl_binary(
                     srcs,
                     out_bin,
@@ -1465,6 +1896,7 @@ def build_module_binary(
                     rte_initialized=rte_initialized,
                     libc_checks=libc_checks,
                     use_cache=use_cache,
+                    **meta_kwargs,
                 )
                 if comp["returncode"] != 0 and engine == "auto":
                     eacsl_attempt = comp

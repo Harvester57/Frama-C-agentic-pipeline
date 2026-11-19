@@ -8,6 +8,12 @@
  *             bytes  (a `length` parameter) every byte handed over is initialized: no disclosure of
  *                    uninitialized memory (CWE-457, CWE-200);
  *             object (no length) the object the parameter points to is initialized.
+ *   entry   the same obligation for a sink the target defines and calls through a function pointer,
+ *           as a precondition of the sink (context \precond), which WP proves at every call, the
+ *           calls through a pointer included (they need a `calls` annotation naming the sink). At
+ *           such a call MetAcsl cannot name the arguments: \called_arg has no callee to read the
+ *           formals from, so an `emit` instance there is `!(pointer == &sink)`, which never proves.
+ *           Clauses: text_formal, bytes_formal, object_formal.
  *   buffer  a sink that returns its output in a buffer: the out-parameters are initialized when it
  *           returns (a postcondition of the sink, which the target must define).
  *   handoff a wrapper sink (threat model `checked_at`): it completes the buffer itself, then hands it
@@ -17,10 +23,16 @@
  *           function pointer \called_arg is refused, and \fguard turns the instance into \false.
  * The clauses use \fguard: a parameter of the wrong type makes the property \false (unproven), never
  * silently \true.
+ * A bytes sink that only forwards its buffer to other declared sinks gets no MetAcsl text at all
+ * (scripts/security_props.py, `forwarded_to`): its bytes are checked at those sinks.
  */
 //# emit
 /*@ meta \prop, \name(${name}), \targets(\ALL), \context(\calling),
       \tguard(\called == ${sink} ==> (${predicate}));
+*/
+//# entry
+/*@ meta \prop, \name(${name}), \targets({${sink}}), \context(\precond),
+      ${predicate};
 */
 //# buffer
 /*@ meta \prop, \name(${name}), \targets({${sink}}), \context(\postcond),
@@ -32,6 +44,12 @@
 \fguard(\initialized(\called_arg(${param}) + (0 .. \called_arg(${length}) - 1)))
 //# object
 \fguard(\initialized(\called_arg(${param})))
+//# text_formal
+\fguard(no_crlf_string(\formal(${param})))
+//# bytes_formal
+\fguard(\initialized(\formal(${param}) + (0 .. \formal(${length}) - 1)))
+//# object_formal
+\fguard(\initialized(\formal(${param})))
 //# out_object
 \fguard(\initialized(\formal(${param})))
 //# handoff

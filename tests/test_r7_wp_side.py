@@ -143,4 +143,13 @@ def test_hand_named_layer_clauses_take_the_class_of_their_kind(annotation, expec
 
 
 def test_old_layer_classes_are_gone():
-    assert R.LAYER_CLASSES == {"l4_auth_state", "l4_auth_required", "l5_sanitized", "l6_wiped", "l6_no_leak"}
+    assert R.LAYER_CLASSES == {
+        "l3_isolation",
+        "l4_auth_state",
+        "l4_auth_required",
+        "l4_invariant",
+        "l4_call_rule",
+        "l5_sanitized",
+        "l6_wiped",
+        "l6_no_leak",
+    }

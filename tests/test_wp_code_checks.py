@@ -301,7 +301,8 @@ def test_a_hand_named_check_is_still_an_rte_goal(run_dir, monkeypatch):
     write_json(run_dir / CODE_CHECK_PROPS, doc)
     res, _ = _replay(monkeypatch, run_dir, "local_derive", c_file, "derive")
     assert "security_props" not in res and "l6_wiped" not in res["by_obligation_class"]
-    assert res["by_obligation_class"]["rte"]["proven"] == 7
+    # The two `check` rows, the five others, and two loop invariants (no l2_termination goal: "invariant" is no variant).
+    assert res["by_obligation_class"]["rte"]["proven"] == 9
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -385,8 +386,8 @@ def test_a_name_is_seen_in_code_only():
     before = tw.wrapper_doc(tw.PLAIN_SINK, tw.TCP_SINK, tw.RTU_SINK)
     names = ["L5_sanitized_tcp_send", "L5_sanitized_rtu_send", "L5_sanitized_send_frame"]
     seen = W.call_targets(before, names, [tw.WRAPPER_DIR / "l5_wrapper.c"])
+    # send_frame forwards to the two others: it has no MetAcsl text, so nothing is stated on its calls.
     assert seen == {
-        "L5_sanitized_send_frame": {"function": "send_frame", "seen": True},
         "L5_sanitized_tcp_send": {"function": "tcp_send", "seen": True},
         "L5_sanitized_rtu_send": {"function": "rtu_send", "seen": True},
     }
@@ -401,3 +402,24 @@ def test_a_name_is_seen_in_code_only():
     both = [UNSEEN_SINK_DIR / "relay.c", UNSEEN_SINK_DIR / "sink.c"]
     assert W.call_targets(unseen, ["L5_sanitized_tcp_send"], both)["L5_sanitized_tcp_send"]["seen"] is True
     assert W.call_targets(unseen, [], both) == {}
+
+
+def test_a_precondition_on_a_sink_the_parse_lacks_is_not_decided_statically():
+    """
+    A sink called through a pointer carries its property as a precondition (`entry`): when the file that
+    defines it is not parsed, MetAcsl generates nothing there either, and the run looks decided.
+    """
+    acsl = (
+        "/*@ meta \\prop, \\name(L5_sanitized_tcp_send), \\targets({tcp_send}), \\context(\\precond),\n"
+        "      \\fguard(\\initialized(\\formal(req) + (0 .. \\formal(req_length) - 1)));\n*/"
+    )
+    doc = {"properties": [{"name": "L5_sanitized_tcp_send", "acsl": acsl}]}
+    relay = UNSEEN_SINK_DIR / "relay.c"
+    assert W.call_targets(doc, ["L5_sanitized_tcp_send"], [relay]) == {
+        "L5_sanitized_tcp_send": {"function": "tcp_send", "seen": False}
+    }
+    both = [relay, UNSEEN_SINK_DIR / "sink.c"]
+    assert W.call_targets(doc, ["L5_sanitized_tcp_send"], both)["L5_sanitized_tcp_send"]["seen"] is True
+    # Several targets name no one function the property depends on.
+    several = {"properties": [{"name": "P", "acsl": acsl.replace("{tcp_send}", "{tcp_send, rtu_send}")}]}
+    assert W.call_targets(several, ["P"], [relay]) == {}

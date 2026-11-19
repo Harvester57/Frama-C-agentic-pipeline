@@ -834,7 +834,7 @@ def merge(
     flamegraph_out: Path | None = None,
 ) -> dict:
     """The module's report from its shards' reports (one per plan shard, None when missing)."""
-    from run_eva_slice import summarize_rows
+    from run_eva_slice import summarize_runs
 
     shards = [load_shard(i, cases, reports[i], entry_fn) for i, cases in enumerate(plan["shards"])]
     elapsed = [float(s.run.report.get("elapsed_s") or 0.0) for s in shards]
@@ -874,7 +874,9 @@ def merge(
     reach = merge_reach(shards, entry_fn)
     base = shards[0].run.report
     report = {k: v for k, v in base.items() if not k.startswith("_")}
-    report.update(summarize_rows(rows))
+    # The shards' MetAcsl rows (run_eva_slice.py --security-props) are filed again from the merged
+    # rows; without security properties this is summarize_rows.
+    report.update(summarize_runs(rows, [s.run.report.get("security_props") for s in shards]))
     report.update(reach)
     digests = [str(s.run.report.get("input_digest") or "") for s in shards]
     report.update(
