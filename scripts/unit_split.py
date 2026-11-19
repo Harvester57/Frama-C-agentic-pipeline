@@ -70,6 +70,7 @@ import json
 import re
 import sys
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -118,49 +119,141 @@ def reach(functions: dict[str, dict], start: str, within: set[str]) -> set[str]:
     return seen
 
 
+def _defining_c_files(rec: dict | None) -> list[str]:
+    """The .c translation unit(s) compiling a function or global (direct `.c` file or `compiled_in`)."""
+    if not isinstance(rec, dict):
+        return []
+    file = str(rec.get("file") or "")
+    if file.endswith(".c"):
+        return [file]
+    return [str(f) for f in rec.get("compiled_in") or [] if str(f).endswith(".c")]
+
+
+def unit_closure_modules(dag: dict, unit: str) -> list[str]:
+    """`unit` plus every project module it transitively links (`linked_modules`)."""
+    modules: dict[str, dict] = dag.get("modules") or {}
+    if unit not in modules:
+        return []
+    order: list[str] = []
+    seen: set[str] = set()
+    stack = [unit]
+    while stack:
+        cur = stack.pop(0)
+        if cur in seen or cur not in modules:
+            continue
+        seen.add(cur)
+        order.append(cur)
+        for lk in modules[cur].get("linked_modules") or []:
+            if isinstance(lk, str) and lk not in seen and lk in modules:
+                stack.append(lk)
+    return order
+
+
+def unit_closure_keys(dag: dict, unit: str) -> tuple[list[str], list[str]]:
+    """(own_keys, all_keys): functions of `unit`, and functions of `unit` plus its linked modules."""
+    functions: dict[str, dict] = dag.get("functions") or {}
+    modules: dict[str, dict] = dag.get("modules") or {}
+    rec = modules.get(unit) or {}
+    own = [k for k in rec.get("functions") or [] if k in functions]
+    seen = set(own)
+    all_keys = list(own)
+    for mod in unit_closure_modules(dag, unit)[1:]:
+        for k in (modules.get(mod) or {}).get("functions") or []:
+            if k in functions and k not in seen:
+                seen.add(k)
+                all_keys.append(k)
+    return own, all_keys
+
+
 def has_flow_facts(functions: dict[str, dict], keys: list[str]) -> bool:
     """Whether every function of `keys` carries the model's address-flow facts (schema 6 dumps)."""
     return bool(keys) and all(isinstance((functions.get(k) or {}).get("address_refs"), list) for k in keys)
 
 
 def flow_reach(
-    functions: dict[str, dict], global_vars: dict[str, dict], starts: list[str], within: set[str]
+    functions: dict[str, dict],
+    global_vars: dict[str, dict],
+    starts: list[str],
+    within: set[str],
+    extra_globals: Iterable[str] | None = None,
+    *,
+    include_constructors: bool = True,
 ) -> tuple[set[str], set[str]]:
     """
     The address-flow reach of `starts` within `within` (module docstring): the functions reached and
     the globals they name, with those the globals' initializers name.
+
+    - Direct calls (everything in `internal_callees` outside `indirect_callees`) are always followed.
+    - Function-body `address_refs` are followed unconditionally (decision D1(b): structurally covers
+      callbacks stored in locals/structs passed to external libraries and function-pointer casts).
+    - Global initializers (`init_functions`) feed the signature-filtered `pool`, except callbacks
+      whose signature matches no indirect site in `within` (external-library tables such as nginx's
+      `signals[]` -> `sigaction`, or cast targets), which are followed directly.
+    - When `include_constructors` is True, any `__attribute__((constructor))` function in `within`
+      compiled by a `.c` file of a reached function or global joins the reach to a fixpoint.
     """
     reached: set[str] = set()
     pool: set[str] = set()  # function addresses the reached code and data hold
     globs: set[str] = set()
     with_sites: list[str] = []  # reached functions with indirect callees
+    all_indirect: set[str] = {c for k in within for c in (functions.get(k) or {}).get("indirect_callees") or []}
+    ctors_by_file: dict[str, list[str]] = {}
+    if include_constructors:
+        for k in within:
+            rec = functions.get(k)
+            if isinstance(rec, dict) and rec.get("constructor"):
+                for cf in _defining_c_files(rec):
+                    ctors_by_file.setdefault(cf, []).append(k)
+
     work = [s for s in starts if s in within]
     gwork: list[str] = []
-    while work:
+    if extra_globals:
+        for g in extra_globals:
+            if g in global_vars and g not in globs:
+                globs.add(g)
+                gwork.append(g)
+
+    def _enqueue_file_ctors(rec: dict | None) -> None:
+        if not ctors_by_file:
+            return
+        for cf in _defining_c_files(rec):
+            for ctor in ctors_by_file.get(cf) or ():
+                if ctor not in reached:
+                    work.append(ctor)
+
+    while work or gwork:
         while work:
             f = work.pop()
             if f in reached:
                 continue
             reached.add(f)
             rec = functions.get(f) or {}
+            _enqueue_file_ctors(rec)
             indirect = set(rec.get("indirect_callees") or [])
             for c in rec.get("internal_callees") or []:
                 if c in within and c not in reached and c not in indirect:
                     work.append(c)
-            pool.update(rec.get("address_refs") or [])
+            for a in rec.get("address_refs") or []:
+                pool.add(a)
+                if a in within and a not in reached:
+                    work.append(a)
             for g in rec.get("global_refs") or []:
                 if g not in globs:
                     globs.add(g)
                     gwork.append(g)
             if indirect:
                 with_sites.append(f)
-            while gwork:
-                grec = global_vars.get(gwork.pop()) or {}
-                pool.update(grec.get("init_functions") or [])
-                for g2 in grec.get("init_globals") or []:
-                    if g2 not in globs:
-                        globs.add(g2)
-                        gwork.append(g2)
+        while gwork:
+            grec = global_vars.get(gwork.pop()) or {}
+            _enqueue_file_ctors(grec)
+            for fn in grec.get("init_functions") or []:
+                pool.add(fn)
+                if fn in within and fn not in reached and fn not in all_indirect:
+                    work.append(fn)
+            for g2 in grec.get("init_globals") or []:
+                if g2 not in globs:
+                    globs.add(g2)
+                    gwork.append(g2)
         for f in with_sites:
             for c in (functions.get(f) or {}).get("indirect_callees") or []:
                 if c in pool and c in within and c not in reached:
@@ -199,35 +292,54 @@ def cluster(
     max_lines: int = MAX_LINES,
     global_vars: dict[str, dict] | None = None,
     flow: bool | None = None,
+    closure_keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Clusters [{anchors, functions, globals}] of one unit, deterministic (see the module docstring).
-    `flow` None: the address-flow reach when every function of `keys` has its facts.
+    Clusters [{anchors, functions, globals, all_functions}] of one unit, deterministic (see the
+    module docstring). `flow` None: the address-flow reach when every function of `closure_keys`
+    (default `keys`) has its facts. When `closure_keys` includes linked libraries, reach runs over
+    the full link closure while cluster membership and limits stay on `keys` (`own_set`).
     """
-    within = set(keys)
+    own_set = set(keys)
+    all_keys = list(closure_keys) if closure_keys is not None else list(keys)
+    within_all = set(all_keys) | own_set
     if flow is None:
-        flow = has_flow_facts(functions, keys)
-    reacher = _Reacher(functions, within, global_vars or {}, flow)
+        flow = has_flow_facts(functions, all_keys)
+    gv = global_vars or {}
+    reacher = _Reacher(functions, within_all if flow else own_set, gv, flow)
     clusters: dict[int, dict[str, Any]] = {}  # creation order -> cluster (merged ones keep the lower)
-    for seq, e in enumerate(dict.fromkeys(e for e in entries if e in within)):
-        fs, gs = reacher([e])
-        clusters[seq] = {"anchors": [e], "functions": fs, "globals": gs, "version": 0}
+    own_entries = list(dict.fromkeys(e for e in entries if e in own_set))
+    for seq, e in enumerate(own_entries):
+        all_fs, gs = reacher([e])
+        clusters[seq] = {
+            "anchors": [e],
+            "functions": all_fs & own_set,
+            "all_functions": all_fs,
+            "globals": gs,
+            "version": 0,
+        }
 
     def fits(fs: set[str]) -> bool:
         n, lines = unit_size(functions, fs)
         return n <= max_functions and lines <= max_lines
 
     def merged(a: dict, b: dict) -> tuple[set[str], set[str]]:
-        fa, fb = a["functions"], b["functions"]
+        fa, fb = a["all_functions"], b["all_functions"]
         if fa <= fb and a["anchors"][0] in fb:
             return fb, b["globals"]  # a's anchor is reached from b: the closure is b's
         if fb <= fa and b["anchors"][0] in fa:
             return fa, a["globals"]
         return reacher(a["anchors"] + b["anchors"])
 
-    def merge(i: int, j: int, fs: set[str], gs: set[str]) -> None:
+    def merge(i: int, j: int, all_fs: set[str], gs: set[str]) -> None:
         a, b = clusters[i], clusters.pop(j)
-        a.update(anchors=a["anchors"] + b["anchors"], functions=fs, globals=gs, version=a["version"] + 1)
+        a.update(
+            anchors=a["anchors"] + b["anchors"],
+            functions=all_fs & own_set,
+            all_functions=all_fs,
+            globals=gs,
+            version=a["version"] + 1,
+        )
 
     # Step 2: overlap merging, the most overlapping pair first (ties: earlier clusters first), within
     # the limits. A pair whose merge does not fit stays apart; it is tried again only after one of
@@ -256,13 +368,65 @@ def cluster(
         if i not in clusters or j not in clusters or clusters[i]["version"] != vi or clusters[j]["version"] != vj:
             continue
         a, b = clusters[i], clusters[j]
-        if not (fits(a["functions"] | b["functions"])):
+        if not fits(a["functions"] | b["functions"]):
             continue  # the closure holds the union: it cannot fit either
-        fs, gs = merged(a, b)
-        if not fits(fs):
+        all_fs, gs = merged(a, b)
+        if not fits(all_fs & own_set):
             continue
-        merge(i, j, fs, gs)
+        merge(i, j, all_fs, gs)
         push_pairs(i)
+
+    # Step 2b (decision D3): rescue producer-consumer splits that drop unit-reachable callbacks into
+    # `unclustered` (e.g. one cluster reads a global table with `cb`, another calls `cb`'s signature),
+    # merging within the limits.
+    if flow and len(clusters) > 1 and own_entries:
+        unit_reached = reacher(own_entries)[0] & own_set
+        while len(clusters) > 1:
+            covered = set().union(*(c["functions"] for c in clusters.values()))
+            lost = unit_reached - covered
+            if not lost:
+                break
+            producers: dict[int, set[str]] = {}
+            consumers: dict[int, set[str]] = {}
+            for cid, c in clusters.items():
+                prod: set[str] = set()
+                cons: set[str] = set()
+                for fk in c["all_functions"]:
+                    rec = functions.get(fk) or {}
+                    prod.update(rec.get("address_refs") or [])
+                    cons.update(rec.get("indirect_callees") or [])
+                for gk in c["globals"]:
+                    prod.update((gv.get(gk) or {}).get("init_functions") or [])
+                producers[cid] = prod & lost
+                consumers[cid] = cons & lost
+            best: tuple[tuple[int, int, int, int], int, int, set[str], set[str]] | None = None
+            seen_pairs: set[tuple[int, int]] = set()
+            for f in sorted(lost):
+                p_ids = [cid for cid, p in producers.items() if f in p]
+                c_ids = [cid for cid, cs in consumers.items() if f in cs]
+                for pi in p_ids:
+                    for ci in c_ids:
+                        if pi == ci:
+                            continue
+                        lo, hi = (pi, ci) if pi < ci else (ci, pi)
+                        if (lo, hi) in seen_pairs:
+                            continue
+                        seen_pairs.add((lo, hi))
+                        a, b = clusters[lo], clusters[hi]
+                        if not fits(a["functions"] | b["functions"]):
+                            continue
+                        all_fs, gs = merged(a, b)
+                        own_fs = all_fs & own_set
+                        rescued = len(own_fs & lost)
+                        if rescued == 0 or not fits(own_fs):
+                            continue
+                        score = (-rescued, len(own_fs), lo, hi)
+                        if best is None or score < best[0]:
+                            best = (score, lo, hi, all_fs, gs)
+            if best is None:
+                break
+            _, lo, hi, all_fs, gs = best
+            merge(lo, hi, all_fs, gs)
 
     # Step 3: pack small clusters, within the limits.
     def file_of(c: dict) -> str:
@@ -287,17 +451,19 @@ def cluster(
             options.append(((-shared, not same_file, not other_small, len(other["functions"]), j), j))
         target = None
         for _key, j in sorted(options):
-            fs, gs = merged(c, clusters[j]) if j > i else merged(clusters[j], c)
-            if fits(fs):
-                target = (j, fs, gs)
+            all_fs, gs = merged(c, clusters[j]) if j > i else merged(clusters[j], c)
+            if fits(all_fs & own_set):
+                target = (j, all_fs, gs)
                 break
         if target is None:
             stuck.add(c["anchors"][0])
             continue
-        j, fs, gs = target
+        j, all_fs, gs = target
         lo, hi = (j, i) if j < i else (i, j)
-        merge(lo, hi, fs, gs)
-    return [{k: c[k] for k in ("anchors", "functions", "globals")} for _seq, c in sorted(clusters.items())]
+        merge(lo, hi, all_fs, gs)
+    return [
+        {k: c[k] for k in ("anchors", "functions", "globals", "all_functions")} for _seq, c in sorted(clusters.items())
+    ]
 
 
 def _name(unit: str, c: dict, functions: dict[str, dict], taken: set[str]) -> str:
@@ -321,22 +487,30 @@ def _over_limit(n_fns: int, n_lines: int, max_functions: int, max_lines: int) ->
 
 
 def build_plan(
-    functions: dict[str, dict], global_vars: dict[str, dict], unit_keys: list[str], fns: set[str], globs: set[str]
+    functions: dict[str, dict],
+    global_vars: dict[str, dict],
+    unit_keys: list[str],
+    fns: set[str],
+    globs: set[str],
+    closure_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     What a cluster's builds compile and link (address-flow reach only): `build_sources`, the .c files
-    defining its functions and the globals it reads; `link_stubs`, the functions and globals of the
-    unit those files name (calls, addresses, globals, initializers) without defining them. By the
-    reach, none of them is reachable from the cluster's harness: a reached function's file and a
-    read global's file are compiled.
+    defining its reached functions (including reached linked-library functions and `.inc`/header
+    definitions via `compiled_in`) and the globals it reads; `link_stubs`, the functions and globals
+    of the unit's link closure those files name (calls, addresses, globals, initializers) without
+    defining them. Reached functions and reached globals are never listed in `link_stubs`.
     """
-    files = {str(functions[k]["file"]) for k in fns if str(functions[k].get("file") or "").endswith(".c")}
-    files |= {
-        str(global_vars[g]["file"]) for g in globs if str((global_vars.get(g) or {}).get("file") or "").endswith(".c")
-    }
-    in_files = [k for k in unit_keys if str(functions[k].get("file") or "") in files]
-    defined = set(in_files) | {k for k in unit_keys if functions[k].get("header")}
-    unit_set = set(unit_keys)
+    all_keys = list(closure_keys) if closure_keys is not None else list(unit_keys)
+    files: set[str] = set()
+    for k in fns:
+        if k in functions:
+            files.update(_defining_c_files(functions[k]))
+    for g in globs:
+        files.update(_defining_c_files(global_vars.get(g)))
+    in_files = [k for k in all_keys if set(_defining_c_files(functions.get(k))) & files]
+    defined = set(in_files) | {k for k in all_keys if functions[k].get("header")} | set(fns)
+    all_set = set(all_keys)
     named: set[str] = set()
     named_globals: set[str] = set()
     for k in in_files:
@@ -345,13 +519,14 @@ def build_plan(
         named.update(c for c in rec.get("internal_callees") or [] if c not in indirect)
         named.update(rec.get("address_refs") or [])
         named_globals.update(rec.get("global_refs") or [])
-    file_globals = {g for g, r in global_vars.items() if str(r.get("file") or "") in files}
+    file_globals = {g for g, r in global_vars.items() if set(_defining_c_files(r)) & files}
     for g in file_globals:
         named.update(global_vars[g].get("init_functions") or [])
         named_globals.update(global_vars[g].get("init_globals") or [])
-    stub_fns = sorted(k for k in named - defined if k in unit_set and not functions[k].get("is_static"))
+    defined_globals = file_globals | set(globs)
+    stub_fns = sorted(k for k in named - defined if k in all_set and not functions[k].get("is_static"))
     stub_globals = sorted(
-        g for g in named_globals - file_globals if g in global_vars and not global_vars[g].get("static")
+        g for g in named_globals - defined_globals if g in global_vars and not global_vars[g].get("static")
     )
     return {
         "build_sources": sorted(files),
@@ -375,13 +550,17 @@ def apply(
     if dag.get("module_kind") == "link_unit":
         taken = set(modules) | set(dag.get("lexer_modules") or {})
         for unit, rec in sorted(modules.items()):
-            keys = [k for k in rec.get("functions") or [] if k in functions]
+            keys, all_keys = unit_closure_keys(dag, unit)
             entries = [e for e in rec.get("candidate_entry_points") or [] if e in functions]
-            flow = has_flow_facts(functions, keys)
+            closure_mods = unit_closure_modules(dag, unit)
+            flow = has_flow_facts(functions, all_keys) and not any(
+                (modules.get(m) or {}).get("callgraph_fallback") for m in closure_mods
+            )
             # The size a whole-unit harness gives Eva: what the entry points reach (all without any).
-            within = set(keys)
+            own_set = set(keys)
+            within = set(all_keys) if flow else own_set
             reacher = _Reacher(functions, within, global_vars, flow)
-            reached = reacher([e for e in entries if e in within])[0] if entries else set(keys)
+            reached = (reacher([e for e in entries if e in own_set])[0] & own_set) if entries else set(keys)
             n_fns, n_lines = unit_size(functions, reached)
             row: dict[str, Any] = {
                 "functions": len(keys),
@@ -394,7 +573,16 @@ def apply(
             if n_fns <= max_functions and n_lines <= max_lines:
                 continue
             clusters = cluster(
-                functions, keys, entries, max_functions, overlap, min_functions, max_lines, global_vars, flow
+                functions,
+                keys,
+                entries,
+                max_functions,
+                overlap,
+                min_functions,
+                max_lines,
+                global_vars,
+                flow,
+                closure_keys=all_keys,
             )
             if len(clusters) < 2:
                 row["note"] = "above the threshold, but its entry points form a single cluster"
@@ -426,16 +614,37 @@ def apply(
                     over.append(name)
                 if flow:
                     sub["globals"] = sorted(c["globals"])
-                    sub.update(build_plan(functions, global_vars, keys, c["functions"], c["globals"]))
+                    sub.update(
+                        build_plan(
+                            functions,
+                            global_vars,
+                            keys,
+                            c["all_functions"],
+                            c["globals"],
+                            closure_keys=all_keys,
+                        )
+                    )
                 submodules[name] = sub
                 names.append(name)
             unclustered = sorted(set(keys) - covered)
+            cross_unclustered = sorted(reached - covered) if flow else []
             why = []
             if n_fns > max_functions:
                 why.append(f"{n_fns} reached functions > {max_functions}")
             if n_lines > max_lines:
                 why.append(f"{n_lines} lines > {max_lines}")
             rec["split"] = {"reason": ", ".join(why), "submodules": names, "unclustered": unclustered}
+            if cross_unclustered:
+                rec["split"]["cross_cluster_unclustered"] = cross_unclustered
+                dag.setdefault("warnings", []).append(
+                    f"unit {unit}: {len(cross_unclustered)} unit-reachable callback(s) dropped into unclustered "
+                    f"because producer and consumer clusters exceeded the split limits ({', '.join(cross_unclustered[:5])})"
+                )
+            if not flow:
+                dag.setdefault("warnings", []).append(
+                    f"unit {unit}: split used call_graph reach (missing dump-schema-6 address-flow facts); "
+                    "re-run phase0_model.py to narrow clusters"
+                )
             if over:
                 rec["split"]["over_limit"] = over
             row.update(split=True, submodules=len(names), unclustered=len(unclustered), over_limit=len(over))

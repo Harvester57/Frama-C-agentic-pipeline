@@ -248,7 +248,9 @@ def test_the_split_uses_address_flow_reach_when_every_function_has_the_facts():
     assert run_table["link_stubs"] == {"functions": [], "globals": []}
     # `run`'s files call `register1`, defined in its own file: compiled, no stub; h4 is a type match only.
     assert subs[("run",)]["link_stubs"] == {"functions": [], "globals": []}
-    assert subs[("elsewhere",)]["link_stubs"] == {"functions": ["h4"], "globals": []}
+    # Under D1(b), `elsewhere`'s own body takes `&h4`, so `h4` and `h4_leaf` join `elsewhere`'s reach.
+    assert subs[("elsewhere",)]["functions"] == ["elsewhere", "h4", "h4_leaf"]
+    assert subs[("elsewhere",)]["link_stubs"] == {"functions": [], "globals": []}
     # Without the facts of one function, the unit falls back to the call graph's reach.
     d = flow_dag()
     del d["functions"]["w1"]["address_refs"]
@@ -360,3 +362,156 @@ def test_the_seeded_policy_harnesses_each_cluster():
     assert plans["libbig_a__tc"]["entries"] == ["tc_apply", "tc_process", "get_a", "get_b"]
     assert plans["libbig_a__tc"]["submodule"] and plans["libbig_a__tc"]["unit"] == "libbig_a"
     assert plans["libbig_a__tm"]["run_flags"] == {"run_eva": True, "run_eacsl_fuzz": False}
+
+
+def test_c2_linked_library_is_included_in_build_sources_and_not_stubbed():
+    """CE-1 / B1: direct calls and callbacks into linked_modules enter build_sources, not link_stubs."""
+    fns = {
+        "api_a": _ffn("api_a", ["a1"], file="src/a.c"),
+        "a1": _ffn("a1", ["lib_compute"], file="src/a.c"),
+        "unused_in_a": _ffn("unused_in_a", ["lib_unused"], file="src/a.c"),
+        "api_b": _ffn("api_b", ["b1"], file="src/b.c"),
+        "b1": _ffn("b1", file="src/b.c"),
+        "lib_compute": _ffn("lib_compute", file="lib/core.c"),
+        "lib_unused": _ffn("lib_unused", file="lib/extra.c"),
+    }
+    fns["lib_compute"]["module"] = "libcore_a"
+    fns["lib_unused"]["module"] = "libcore_a"
+    dag: dict = {
+        "module_kind": "link_unit",
+        "functions": fns,
+        "global_variables": {},
+        "modules": {
+            "libcore_a": {
+                "module": "libcore_a",
+                "unit": "libcore.a",
+                "functions": ["lib_compute", "lib_unused"],
+                "candidate_entry_points": ["lib_compute", "lib_unused"],
+                "linked_modules": [],
+                "tier": T.TIER_1A,
+            },
+            "prog": {
+                "module": "prog",
+                "unit": "prog",
+                "functions": ["a1", "api_a", "api_b", "b1", "unused_in_a"],
+                "candidate_entry_points": ["api_a", "api_b"],
+                "linked_modules": ["libcore_a"],
+                "tier": T.TIER_1A,
+            },
+        },
+    }
+    U.apply(dag, max_functions=3, min_functions=1)
+    sub_a = dag["submodules"]["prog__a"]
+    assert sub_a["functions"] == ["a1", "api_a"]
+    assert sub_a["build_sources"] == ["lib/core.c", "src/a.c"]
+    assert sub_a["link_stubs"] == {"functions": ["lib_unused"], "globals": []}
+    # Small library stayed unsplit.
+    assert "split" not in dag["modules"]["libcore_a"]
+
+
+def test_c2_external_callbacks_casts_inc_globals_and_constructors():
+    """CE-2, CE-3, CE-4 (.inc), CE-7 (constructor): sound reach and compiled_in build_sources."""
+    fns = {
+        "api_ext": _ffn("api_ext", addr=["real_cmp"], file="src/a.c"),
+        "real_cmp": _ffn("real_cmp", file="src/cmp.c"),
+        "api_cast": _ffn("api_cast", indirect=[], addr=["real_cleanup"], file="src/cast.c"),
+        "real_cleanup": _ffn("real_cleanup", file="src/cleanup.c"),
+        "api_sig": _ffn("api_sig", globs=["src/sig.c#signals"], file="src/sig.c"),
+        "sig_handler": _ffn("sig_handler", file="src/sigh.c"),
+        "api_inc": _ffn("api_inc", globs=["src/table.inc#g_tbl"], file="src/inc_user.c"),
+        "inc_cb": _ffn("inc_cb", file="src/inc_cb.c"),
+        "api_ctor": _ffn("api_ctor", file="src/ctor_user.c"),
+        "init_ctor": {**_ffn("init_ctor", addr=["ctor_cb"], file="src/ctor_user.c"), "constructor": True},
+        "ctor_cb": _ffn("ctor_cb", file="src/ctor_cb.c"),
+        "other_ctor": {**_ffn("other_ctor", addr=["unused_cb"], file="src/other.c"), "constructor": True},
+        "unused_cb": _ffn("unused_cb", file="src/unused_cb.c"),
+    }
+    gv = {
+        "src/sig.c#signals": {
+            "name": "signals",
+            "file": "src/sig.c",
+            "static": True,
+            "init_functions": ["sig_handler"],
+            "init_globals": [],
+        },
+        "src/table.inc#g_tbl": {
+            "name": "g_tbl",
+            "file": "src/table.inc",
+            "static": False,
+            "compiled_in": ["src/table.c"],
+            "init_functions": ["inc_cb"],
+            "init_globals": [],
+        },
+    }
+    within = set(fns)
+    # CE-2: local/struct external callback
+    assert U.flow_reach(fns, gv, ["api_ext"], within)[0] == {"api_ext", "real_cmp"}
+    # CE-3: function-pointer cast across differing signatures
+    assert U.flow_reach(fns, gv, ["api_cast"], within)[0] == {"api_cast", "real_cleanup"}
+    # Global table external callback (signals[] -> sigaction, no project indirect site)
+    assert U.flow_reach(fns, gv, ["api_sig"], within)[0] == {"api_sig", "sig_handler"}
+    # CE-4 (.inc global): compiled_in puts src/table.c in build_sources, never in link_stubs
+    r_inc, g_inc = U.flow_reach(fns, gv, ["api_inc"], within)
+    assert r_inc == {"api_inc", "inc_cb"} and g_inc == {"src/table.inc#g_tbl"}
+    plan_inc = U.build_plan(fns, gv, sorted(fns), r_inc, g_inc)
+    assert plan_inc["build_sources"] == ["src/inc_cb.c", "src/inc_user.c", "src/table.c"]
+    assert plan_inc["link_stubs"] == {"functions": [], "globals": []}
+    # CE-7: constructor in compiled file runs; constructor in uncompiled file does not
+    r_ctor, g_ctor = U.flow_reach(fns, gv, ["api_ctor"], within)
+    assert r_ctor == {"api_ctor", "init_ctor", "ctor_cb"}
+    assert "other_ctor" not in r_ctor and "unused_cb" not in r_ctor
+    plan_ctor = U.build_plan(fns, gv, sorted(fns), r_ctor, g_ctor)
+    assert plan_ctor["build_sources"] == ["src/ctor_cb.c", "src/ctor_user.c"]
+    assert plan_ctor["link_stubs"] == {"functions": [], "globals": []}
+
+
+def test_c2_producer_consumer_rescue_and_cross_cluster_unclustered():
+    """D3 / B8: rescue merge recovers global-table producer-consumer callbacks within limits; warns when over."""
+    fns = {
+        "api_prod": _ffn("api_prod", globs=["src/tbl.c#g_tbl"], file="src/prod.c"),
+        "api_cons": _ffn("api_cons", indirect=["secret_cb"], file="src/cons.c"),
+        "secret_cb": _ffn("secret_cb", ["secret_leaf"], file="src/secret.c"),
+        "secret_leaf": _ffn("secret_leaf", file="src/secret.c"),
+        "api_other": _ffn("api_other", ["o1", "o2"], file="src/other.c"),
+        "o1": _ffn("o1", file="src/other.c"),
+        "o2": _ffn("o2", file="src/other.c"),
+    }
+    gv = {
+        "src/tbl.c#g_tbl": {
+            "name": "g_tbl",
+            "file": "src/tbl.c",
+            "static": False,
+            "init_functions": ["secret_cb"],
+            "init_globals": [],
+        }
+    }
+
+    def _mk() -> dict:
+        return {
+            "module_kind": "link_unit",
+            "functions": {k: dict(v) for k, v in fns.items()},
+            "global_variables": gv,
+            "warnings": [],
+            "modules": {
+                "lib": {
+                    "module": "lib",
+                    "unit": "lib.a",
+                    "functions": sorted(fns),
+                    "candidate_entry_points": ["api_prod", "api_cons", "api_other"],
+                    "tier": T.TIER_1A,
+                }
+            },
+        }
+
+    # Fits limit (4 <= 4): rescue merges api_prod + api_cons and recovers secret_cb + secret_leaf.
+    d_fit = U.apply(_mk(), max_functions=4, min_functions=1)
+    assert d_fit["modules"]["lib"]["split"]["unclustered"] == []
+    assert "cross_cluster_unclustered" not in d_fit["modules"]["lib"]["split"]
+    merged_sub = next(s for s in d_fit["submodules"].values() if "api_prod" in s["anchors"])
+    assert set(merged_sub["anchors"]) == {"api_prod", "api_cons"}
+    assert {"secret_cb", "secret_leaf"} <= set(merged_sub["functions"])
+
+    # Over limit (4 > 3): cannot merge; records cross_cluster_unclustered and emits a DAG warning.
+    d_over = U.apply(_mk(), max_functions=3, min_functions=1)
+    assert d_over["modules"]["lib"]["split"]["cross_cluster_unclustered"] == ["secret_cb", "secret_leaf"]
+    assert any("unit-reachable callback(s) dropped into unclustered" in w for w in d_over["warnings"])

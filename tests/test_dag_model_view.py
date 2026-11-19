@@ -509,3 +509,121 @@ def test_harness_reach_follows_keys_and_aliases(target: Path) -> None:
     # The colliding static helper is named by its key in the edges and reached under it.
     assert {"src/a.c#helper", "cb", "hin"} <= reached
     assert "src/b.c#helper" not in reached
+
+
+def test_c2_dag_records_linked_modules_compiled_in_size_constructor_and_validates(target: Path) -> None:
+    """C2: DAG schema, linked_modules, compiled_in (.inc / MPACK_INLINE), constructor, size, and fallback closure."""
+    import validate_artifacts
+
+    model = {
+        "status": "ok",
+        "schema_version": 2,
+        "generated_at": "2026-11-20T00:00:00Z",
+        "units": {
+            "libcore.a": {
+                "kind": "static_lib",
+                "test": False,
+                "files": ["lib/core.c"],
+                "links": [],
+                "parse": {"status": "ok"},
+                "entry_points": ["lib/core.c#lib_fn"],
+            },
+            "prog": {
+                "kind": "executable",
+                "test": False,
+                "files": ["src/a.c", "src/table.c"],
+                "links": ["libcore.a"],
+                "parse": {"status": "ok"},
+                "entry_points": ["src/a.c#api_run"],
+            },
+            "libbad.a": {
+                "kind": "static_lib",
+                "test": False,
+                "files": ["lib/bad.c"],
+                "links": [],
+                "parse": {"status": "unparsed", "error": "syntax error", "gcc_error": "cc1 failed"},
+            },
+            "prog_bad": {
+                "kind": "executable",
+                "test": False,
+                "files": ["src/b.c"],
+                "links": ["libbad.a"],
+                "parse": {"status": "ok"},
+                "entry_points": ["src/b.c#api_other"],
+            },
+        },
+        "functions": {
+            "lib/core.c#lib_fn": _fn("lib/core.c", "lib_fn", 1, units=["libcore.a"], address_refs=[], global_refs=[]),
+            "src/a.c#api_run": _fn(
+                "src/a.c",
+                "api_run",
+                4,
+                units=["prog"],
+                address_refs=[],
+                global_refs=["src/table.inc#g_tbl"],
+                constructor=True,
+            ),
+            "include/mpack.h#mp_emit": _fn(
+                "include/mpack.h",
+                "mp_emit",
+                2,
+                static=False,
+                header=True,
+                units=["prog"],
+                address_refs=[],
+                global_refs=[],
+            ),
+            "src/b.c#api_other": _fn("src/b.c", "api_other", 2, units=["prog_bad"], address_refs=[], global_refs=[]),
+        },
+        "global_variables": {
+            "src/table.inc#g_tbl": {
+                "name": "g_tbl",
+                "file": "src/table.inc",
+                "static": False,
+                "size": 16,
+                "units": ["prog"],
+                "init_functions": ["lib/core.c#lib_fn"],
+                "init_globals": [],
+            }
+        },
+        "edges": [{"caller": "src/a.c#api_run", "callee": "lib/core.c#lib_fn", "kind": "direct"}],
+        "entry_points": ["lib/core.c#lib_fn", "src/a.c#api_run", "src/b.c#api_other"],
+    }
+    capture = {
+        "units": {
+            "libcore.a": {"kind": "static_lib", "test": False, "objects": ["core.o"], "files": ["lib/core.c"]},
+            "prog": {
+                "kind": "executable",
+                "test": False,
+                "objects": ["a.o", "table.o"],
+                "files": ["src/a.c", "src/table.c"],
+            },
+            "prog_bad": {"kind": "executable", "test": False, "objects": ["b.o"], "files": ["src/b.c"]},
+        },
+        "compiles": [
+            {"source": "lib/core.c", "object": "core.o", "headers": [], "defined_functions": ["lib/core.c#lib_fn"]},
+            {
+                "source": "src/a.c",
+                "object": "a.o",
+                "headers": ["include/mpack.h"],
+                "defined_functions": ["src/a.c#api_run"],
+            },
+            {
+                "source": "src/table.c",
+                "object": "table.o",
+                "headers": ["src/table.inc", "include/mpack.h"],
+                "defined_functions": ["src/table.c#mp_emit"],
+            },
+            {"source": "src/b.c", "object": "b.o", "headers": [], "defined_functions": ["src/b.c#api_other"]},
+        ],
+    }
+    dag = bcd.build_dag(target, model, capture)
+    assert dag["modules"]["prog"]["linked_modules"] == ["libcore_a"]
+    assert dag["modules"]["libcore_a"]["linked_modules"] == []
+    assert dag["functions"]["api_run"]["constructor"] is True
+    assert dag["functions"]["mp_emit"]["compiled_in"] == ["src/table.c"]
+    assert dag["global_variables"]["src/table.inc#g_tbl"]["compiled_in"] == ["src/table.c"]
+    assert dag["global_variables"]["src/table.inc#g_tbl"]["size"] == 16
+    # prog_bad links unparsed libbad.a: address_refs stripped so unit_split falls back to call_graph.
+    assert "address_refs" not in dag["functions"]["api_other"]
+    assert validate_artifacts.schema_warning("callgraph_dag", dag) is None

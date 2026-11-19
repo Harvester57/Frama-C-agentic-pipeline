@@ -814,23 +814,74 @@ def missing_model_features(model: dict) -> dict[str, str]:
 TYPE_MATCH_SOURCES = frozenset({"type-match", "alias"})
 
 
-def _flow_globals(model: dict, key_of: dict[str, str]) -> dict[str, dict]:
+def _compiled_in_maps(capture: dict | None) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """
+    Map included non-.c file -> compiling .c source(s), and function name -> compiling .c source(s)
+    whose object defines that symbol (from `build_capture.json` `compiles[].headers` and
+    `compiles[].defined_functions`), excluding test-only compiles.
+    """
+    cap_units = (capture or {}).get("units") or {}
+    analysed = {
+        o for u in cap_units.values() if isinstance(u, dict) and not u.get("test") for o in u.get("objects") or []
+    }
+    includers: dict[str, set[str]] = defaultdict(set)
+    definers: dict[str, set[str]] = defaultdict(set)
+    for c in (capture or {}).get("compiles") or []:
+        if not isinstance(c, dict) or (cap_units and c.get("object") not in analysed):
+            continue
+        src = str(c.get("source") or "").replace("\\", "/")
+        if not src.endswith(".c"):
+            continue
+        for dep in c.get("headers") or []:
+            inc = str(dep).replace("\\", "/")
+            if inc and not inc.endswith(".c"):
+                includers[inc].add(src)
+        for fid in c.get("defined_functions") or []:
+            _f, _, name = str(fid).rpartition("#")
+            if name:
+                definers[name].add(src)
+    return {k: sorted(v) for k, v in includers.items()}, {k: sorted(v) for k, v in definers.items()}
+
+
+def _narrow_to_unit_files(cands: list[str], unit_names: list[str], units: dict[str, dict]) -> list[str]:
+    if not cands or not unit_names:
+        return cands
+    ufiles = {str(f).replace("\\", "/") for u in unit_names for f in (units.get(u) or {}).get("files") or []}
+    narrowed = [f for f in cands if f in ufiles]
+    return narrowed or cands
+
+
+def _flow_globals(
+    model: dict,
+    key_of: dict[str, str],
+    includers: dict[str, list[str]] | None = None,
+) -> dict[str, dict]:
     """
     The model's global variables with what their initializers name (dump schema 6), function ids as
     DAG keys: the unit split's address-flow reach reads them (scripts/unit_split.py). Empty for a
     model without those facts.
     """
+    units: dict[str, dict] = model.get("units") or {}
+    inc_map = includers or {}
     out: dict[str, dict] = {}
     for gid, g in sorted((model.get("global_variables") or {}).items()):
         if not isinstance(g, dict) or not isinstance(g.get("init_functions"), list):
             continue
-        out[gid] = {
+        file = str(g.get("file") or "").replace("\\", "/")
+        entry: dict = {
             "name": g.get("name"),
             "file": g.get("file"),
             "static": bool(g.get("static")),
             "init_functions": sorted({key_of[f] for f in g["init_functions"] if f in key_of}),
             "init_globals": sorted(str(x) for x in g.get("init_globals") or []),
         }
+        if isinstance(g.get("size"), int) and g["size"] > 0:
+            entry["size"] = g["size"]
+        if file and not file.endswith(".c"):
+            compiled_in = _narrow_to_unit_files(inc_map.get(file, []), [str(u) for u in g.get("units") or []], units)
+            if compiled_in:
+                entry["compiled_in"] = compiled_in
+        out[gid] = entry
     return out
 
 
@@ -931,6 +982,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             if e.get("kind") != "indirect" or set(e.get("sources") or []) - TYPE_MATCH_SOURCES:
                 called[caller].add(callee)
     incomplete_globals = _incomplete_globals(model)
+    includers, definers = _compiled_in_maps(capture)
     site_exprs: dict[str, list[str]] = defaultdict(list)
     for site in model.get("indirect_sites") or []:
         expr = str(site.get("expr") or "")
@@ -962,6 +1014,20 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             "units": list(m.get("units") or []),
             "header": bool(m.get("header")),
         }
+        if m.get("constructor"):
+            rec["constructor"] = True
+        m_file = str(m["file"]).replace("\\", "/")
+        if not m_file.endswith(".c") and (not m.get("static") or not m.get("header")):
+            inc_cands = includers.get(m_file, [])
+            def_cands = definers.get(str(m["name"]), []) if not m.get("static") else []
+            if inc_cands and def_cands:
+                both = sorted(set(inc_cands) & set(def_cands))
+                cands = both or inc_cands
+            else:
+                cands = inc_cands or def_cands
+            compiled_in = _narrow_to_unit_files(cands, [str(u) for u in m.get("units") or []], units)
+            if compiled_in:
+                rec["compiled_in"] = compiled_in
         text = sources.span(str(m["file"]), int(rec["line"]), int(rec["end_line"])) if sources else None
         if text is not None:
             rec.update(source_facts(text))
@@ -1059,7 +1125,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             ),
         ],
         **({"model_only_functions": dict(sorted(model_only_by_file.items()))} if model_only_by_file else {}),
-        **({"global_variables": flow_globals} if (flow_globals := _flow_globals(model, key_of)) else {}),
+        **({"global_variables": flow_globals} if (flow_globals := _flow_globals(model, key_of, includers)) else {}),
         "modules": _path_module_records(functions, file_module, flags_of, compiled),
         "waves": [{"wave": i, "count": len(w), "functions": w} for i, w in enumerate(waves)],
         "recursion_cycles": cycles,
@@ -1350,6 +1416,8 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             path_votes[path_mod][names[u]] += 1
 
     modules: dict[str, dict] = {}
+    linked_units_of: dict[str, list[str]] = {}
+    closure_failed: set[str] = set()
     folded: list[str] = []
     link_options = unit_link_options(capture)
     gen = ((capture or {}).get("snapshot") or {}).get("generated") or {}
@@ -1358,13 +1426,18 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
         rec = units[u]
         name = names[u]
         sources, seen, stack = list(rec.get("files") or []), {u}, list(rec.get("links") or [])
+        linked_units: list[str] = []
         while stack:
             lk = stack.pop()
             if lk in seen or lk not in units:
                 continue
             seen.add(lk)
+            linked_units.append(lk)
             sources += [f for f in units[lk].get("files") or [] if f not in sources]
             stack += units[lk].get("links") or []
+        linked_units_of[u] = linked_units
+        if any((units[lk].get("parse") or {}).get("status") in FRAMAC_FAILED for lk in seen):
+            closure_failed.add(name)
         fns = sorted(members.get(u, []))
         if not fns:
             if (rec.get("parse") or {}).get("status") == PARSE_UNPARSED:
@@ -1396,6 +1469,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             ),
             "files": sorted(f for f in sources if unit_of_file.get(f) == u),
             "required_sources": sources,
+            "linked_modules": [],
             "external_callees": sorted({c for k in fns for c in functions[k].get("external_callees") or []}),
             "cppflags": flags,
             "force_includes": forced,
@@ -1407,6 +1481,28 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             # Step I7: the threat model's status for the unit (each function's `trust` holds its own).
             "threat_model": (rec.get("trust") or {}).get("threat_model"),
         }
+    for u in order:
+        name = names[u]
+        if name not in modules:
+            continue
+        linked_mods: set[str] = set()
+        for lk in linked_units_of.get(u) or []:
+            mod_name = names.get(lk)
+            if mod_name and mod_name in modules and mod_name != name:
+                linked_mods.add(mod_name)
+            else:
+                for f in units[lk].get("files") or []:
+                    owner = unit_of_file.get(f)
+                    owner_mod = names.get(owner) if owner else None
+                    if owner_mod and owner_mod in modules and owner_mod != name:
+                        linked_mods.add(owner_mod)
+        modules[name]["linked_modules"] = sorted(linked_mods)
+        if name in closure_failed:
+            # A linked unit failed Frama-C parsing (gcc_fallback / unparsed): drop address-flow facts
+            # on this module's functions so unit_split falls back cleanly to call_graph reach.
+            for k in modules[name]["functions"]:
+                for field in ("address_refs", "indirect_callees", "global_refs"):
+                    functions[k].pop(field, None)
     # Functions no unit compiles (none in a successful model) keep their path module.
     for key, rec in functions.items():
         if rec["module"] not in modules:
