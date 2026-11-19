@@ -236,7 +236,7 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
     - `::test_the_probes_get_the_macros_the_target_defines_before_the_header` (both cases)
     - `::test_a_header_without_a_compile_gets_no_context_and_the_same_probes`
     - `::test_the_context_scan_drops_undefined_guards_and_system_macros`
-- **Feature-test macros, fixed** by commit `50310f6` on branch `sup/nginx-harness-feature-macros` (not merged): macros such as `_GNU_SOURCE` and `_FILE_OFFSET_BITS` that glibc's `features.h` reads at the first system header are now carried.
+- **Feature-test macros, fixed** by commit `50310f6` on branch `sup/nginx-harness-feature-macros`, merged into `phase1-remediation` in `aa65c16` and into main in `fd40b66`: macros such as `_GNU_SOURCE` and `_FILE_OFFSET_BITS` that glibc's `features.h` reads at the first system header are now carried.
   - The scan in [`../../scripts/include_context.py`](../../scripts/include_context.py) keeps a macro the target defines before its first system header when a system header the compile enters tests it. Include guards are excluded.
   - All three probes get them as `-D` flags on the command line (a `#define` in the probe would come after `features.h`). `stub_check.json` records them under `include_context.feature_macros` and `feature_flags`, plus `feature_not_carried` for a macro that cannot be a flag.
   - The same mechanism feeds the harness cppflags; see [`./harnesses-and-seeds.md`](./harnesses-and-seeds.md).
@@ -303,8 +303,7 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
     - Affected: `OpenSSL_version` (int argument), `OBJ_nid2sn` (int), `OCSP_cert_status_str` (long), `OCSP_response_status_str` (long) and `X509_verify_cert_error_string` (long).
     - For example `valid_str: valid_read_string(\result) ... valid_read_string(\result): 0 ... \result: 0x78675abc321d`.
   - The [`../../skills/framac-slice/stub_author_brief.md`](../../skills/framac-slice/stub_author_brief.md) said `violated` "means the library broke one of your `ensures` ...: the postcondition is wrong, fix it".
-- **Open pipeline bug:** until the branch below is merged, the pipeline's stub-check still blocks on these artifacts.
-- **Fix (on branch `sup/nginx-stub-check-dynamic-artifacts`, held there until merged):** commits `65bff62` (tests), `ba2cba0` (fix) and `facc5d0` (nested applications, guarded Docker case). `classify_run` in `stub_check.py` decides each function's dynamic record.
+- **Fix (fixed, branch `sup/nginx-stub-check-dynamic-artifacts`, merged into main in `6217968` on 2026-11-19):** commits `65bff62` (tests), `ba2cba0` (fix) and `facc5d0` (nested applications, guarded Docker case). `classify_run` in `stub_check.py` decides each function's dynamic record.
   - **`inconclusive`, `reason: fabricated_argument`:** a postcondition failed and `fabricated_params` names a pointer parameter whose pointee is not a plain buffer. A plain buffer is one `*` over the words `void char short int long float double signed unsigned _Bool bool size_t ssize_t ptrdiff_t intptr_t uintptr_t wchar_t char16_t char32_t int8_t..uint64_t u_char u_short u_int u_long`, qualifiers aside. Anything else is fabricated: a struct, union, typedef'd or incomplete pointee, a pointer to pointer, or a `void *` that no length bounds. When in doubt the parameter counts as fabricated. It is read from the type text, so nothing takes `sizeof` of an incomplete type.
   - **`inconclusive`, `reason: untracked_library_memory`:** every `Postcondition failed` block of the run is explained by memory predicates alone.
     - The failing predicate is read from E-ACSL's report, whose Unicode operators (`≡`, `∨`, `∧`, `⇒`) are read as ASCII.
@@ -329,7 +328,13 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
   - A memory predicate on `\result` counts as untracked even when the library returns a pointer into a buffer the driver passed, which E-ACSL does track (a `strchr`-like function). A real out-of-bounds result there reads `inconclusive`.
   - The `stub_check.py run` gate CLI is no longer exercised on a `violated` header in the mylib Docker scenario. The oplib Docker test checks `blocked_modules`, but not `phase0_gates.py check`.
   - The [`./eacsl-and-fuzzing.md`](./eacsl-and-fuzzing.md) entry has no back-reference to this one: the main checkout had uncommitted edits to that file.
-- **Recovering run-4:** once the fix is in the checkout the wrapper runs, rerun `pipeline_make.py run stubs stub-check`. Then compare each OpenSSL overlay contract with the OpenSSL documentation: authors may already have weakened an `ensures` to get past the old `violated`.
+- **What run-4 did with it:** the run sent the eight headers back to their authors, and each weakened a documented contract to pass, naming the artifact in its own diagnosis. The user stopped run-4 in Phase 0 for this reason (`run_status` `incomplete`). Its overlay keeps the weakened contracts, so a later run must start from a fresh overlay, not from run-4's:
+  - `crypto.h` `OpenSSL_version`, `ocsp.h` `OCSP_cert_status_str` and `OCSP_response_status_str`, `x509.h` `X509_verify_cert_error_string`: `valid_read_string(\result)` became `\result != \null`.
+  - `evp.h` `EVP_CIPHER_CTX_is_encrypting`: `\result == 0 || \result == 1` removed.
+  - `ssl.h` `SSL_get_version`: `\result != \null` removed.
+  - `stack.h` `OPENSSL_sk_num`: `\result >= -1` removed.
+  - `objects.h` `OBJ_nid2sn`: its `ensures` removed.
+  - `err.h` `ERR_peek_error_data`: now `(\result != 0 && data != \null) ==> \initialized(data)`. The `\result != 0` guard is a genuine correction; dropping the validity of `*data` was the artifact.
 
 ### Symptom: `test_errno_in_a_stub_contract_against_eva_and_eacsl[assigns errno, \result;...]` Fails: Eva Says `ok` Where the Test Expects `[eva:assigns:missing]`
 - **Seen on:** 2026-11-19, `framac-analysis:latest`, with `FRAMAC_DOCKER_TESTS=1`, on `2c6c699` (before the S10 change) and after it. No target run.
