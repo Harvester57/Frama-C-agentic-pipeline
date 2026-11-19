@@ -1369,14 +1369,19 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
         )
     # Earlier attempts of a repaired build: their failure differs from the last one's (`build_attempts`).
     for attempt in (res.get("build_attempts") or [])[:-1]:
-        killed = [part for part in (attempt, attempt.get("eacsl") or {}) if part.get("killed")]
-        if killed:
-            logs = ", ".join(attempt.get("logs") or []) or "overwritten"
-            _add(
-                f"Build attempt {attempt.get('attempt')} was killed (return code {killed[0].get('returncode')}): out "
-                "of memory or a hard limit, not a compile error. The report's `compile` is the last attempt's; "
-                f"this attempt's logs: {logs}."
-            )
+        parts = (attempt, attempt.get("eacsl") or {})
+        logs = ", ".join(attempt.get("logs") or []) or "overwritten"
+        if any(part.get("killed") for part in parts):
+            what = "was killed (SIGKILL)"
+        elif any(part.get("killed_suspected") for part in parts):
+            what = "stopped in Frama-C without a Frama-C error message (`aborted by Frama-C` only)"
+        else:
+            continue
+        _add(
+            f"Build attempt {attempt.get('attempt')} {what}: most likely out of memory or a hard limit, not a "
+            f"compile error; check `docker events` for an `oom` event. The report's `compile` is the last attempt's; "
+            f"this attempt's logs: {logs}."
+        )
 
     if status == "rejected_overconstrained":
         failure = res.get("failure") or {}

@@ -2061,16 +2061,32 @@ def build_module_binary(
     return result
 
 
+# A diagnostic Frama-C prints when it stops on its own (`[kernel] User Error`, `[e-acsl] Failure`, an
+# uncaught OCaml exception, OCaml's own `Out of memory`).
+_FRAMAC_DIAGNOSTIC_RE = re.compile(
+    r"^\[[\w.-]+\][^\n]*\b(?:Error|Failure|error)\b|^Fatal error|Unexpected error|Stack overflow|Out of memory",
+    re.MULTILINE,
+)
+
+
 def _attempt_failure(comp: dict) -> dict:
-    """The failure of one build attempt as a report keeps it: reason, a killed process, the end of stderr."""
+    """
+    The failure of one build attempt as a report keeps it: reason, a killed process, the end of stderr.
+    `killed`: SIGKILL seen directly (return code 137 or -9, a `Killed` line). `killed_suspected`: E-ACSL
+    stopped with `aborted by Frama-C` and Frama-C printed no diagnostic of its own. e-acsl-gcc exits 1
+    whatever Frama-C's status, and bash prints no `Killed` for a process killed inside `$(...)`, so an
+    out-of-memory kill (nginx run-3: Frama-C at 8.7 GB, docker `oom` event) shows only that way.
+    """
     out: dict[str, Any] = {}
     if comp.get("reason"):
         out["reason"] = comp["reason"]
     rc = comp.get("returncode")
     stderr = str(comp.get("stderr") or "")
-    if rc in (-9, 137) or any("Killed" in line for line in stderr.splitlines()[-5:]):
-        # SIGKILL: the kernel's OOM killer or a hard limit (run-3: Frama-C at 8.7 GB, docker `oom` event).
+    text = f"{comp.get('stdout') or ''}\n{stderr}"
+    if rc in (-9, 137) or any("Killed" in line for line in text.splitlines()[-8:]):
         out["killed"] = True
+    elif "aborted by Frama-C" in text and not _FRAMAC_DIAGNOSTIC_RE.search(text):
+        out["killed_suspected"] = True
     if stderr.strip():
         out["stderr_tail"] = stderr[-1500:]
     if comp.get("compile_log"):

@@ -24,9 +24,12 @@ import pytest
 
 import build_capture as bc
 import fuzz_build
+import pipeline_make as pm
 import run_eacsl_fuzz as R
 import target_env
+import validate_artifacts
 import workspace_overlay as wo
+from test_pipeline_make import ACSL, _failed_build, _make_run
 
 _GEN_C = "gen/modules.c"
 _GEN_TEXT = "int gen_modules[] = { 1, 2, 3 };\nint gen_module_count(void) { return 3; }\n"
@@ -286,17 +289,26 @@ def test_the_build_keeps_every_attempts_failure(tmp_path, monkeypatch):
     (tmp_path / "workspace/work" / _GEN_C).write_bytes(_GEN_TEXT.encode())
     monkeypatch.chdir(tmp_path)
     out_bin = tmp_path / "workspace/harnesses/fuzz_m"
+    # What e-acsl-gcc gives (checked in framac-analysis): it exits 1 on any Frama-C failure, and bash prints
+    # no `Killed` for a Frama-C killed inside its `$(...)`. The killed attempt has no Frama-C error line.
+    aborted = "e-acsl-gcc: fatal error: aborted by Frama-C\n"
     eacsl_results = [
-        {"returncode": 137, "reason": "eacsl_instrumentation_failed", "stderr": "Killed\n"},
-        {"returncode": 1, "reason": "eacsl_instrumentation_failed", "stderr": "[kernel] User Error: x\n"},
+        {"stdout": "[kernel] Parsing nginx.c (with preprocessing)\n", "stderr": aborted},
+        {"stdout": "[kernel] User Error: source file 'x.c' does not exist\n", "stderr": aborted},
     ]
 
     def fake_eacsl(srcs, out, *a, **k):
         log = Path(out).with_suffix(".compile.log")
         log.parent.mkdir(parents=True, exist_ok=True)
         res = eacsl_results.pop(0)
-        log.write_text(f"attempt rc={res['returncode']}\n", encoding="utf-8")
-        return {"engine": "eacsl", "compile_log": str(log), **res}
+        log.write_text(res["stdout"], encoding="utf-8")
+        return {
+            "engine": "eacsl",
+            "compile_log": str(log),
+            "returncode": 1,
+            "reason": "eacsl_instrumentation_failed",
+            **res,
+        }
 
     def fake_sanitizer(srcs, out, *a, **k):
         log = Path(out).with_suffix(".sanitizer_compile.log")
@@ -316,10 +328,86 @@ def test_the_build_keeps_every_attempts_failure(tmp_path, monkeypatch):
     assert out["compile"]["returncode"] == 0 and out["engine_used"] == "sanitizers"
     attempts = out["attempts"]
     assert [a["attempt"] for a in attempts] == [1, 2]
-    assert attempts[0]["eacsl"]["returncode"] == 137 and "Killed" in attempts[0]["eacsl"]["stderr_tail"]
+    assert attempts[0]["eacsl"]["killed_suspected"] is True
+    assert "killed_suspected" not in attempts[1]["eacsl"]  # a Frama-C error of its own
     assert attempts[0]["returncode"] == 1 and attempts[1]["returncode"] == 0
-    assert attempts[1]["eacsl"]["returncode"] == 1
     # The first attempt's logs are kept beside the last ones.
     first_logs = [Path(p) for p in attempts[0]["logs"]]
-    assert any(p.read_text(encoding="utf-8") == "attempt rc=137\n" for p in first_logs), first_logs
-    assert Path(out_bin).with_suffix(".compile.log").read_text(encoding="utf-8") == "attempt rc=1\n"
+    assert any("Parsing nginx.c" in p.read_text(encoding="utf-8") for p in first_logs), first_logs
+    assert "User Error" in Path(out_bin).with_suffix(".compile.log").read_text(encoding="utf-8")
+    res = {"mode": "build", "status": "built", "build_attempts": attempts}
+    assert R.derive_eacsl_diagnostic_hints(res) == []  # a built module needs no hint
+    hints = R.derive_eacsl_diagnostic_hints({**res, "status": "compile_error"})
+    assert any("attempt 1" in h and "out of memory" in h for h in hints), hints
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("rc", "stdout", "killed"),
+    [
+        (137, "", "killed"),
+        (1, "bash: line 3: 4242 Killed frama-c ...\n", "killed"),
+        (1, "[kernel] Parsing a.c\n", "killed_suspected"),
+        (1, "[kernel] User Error: bad\n", None),
+        (1, "Fatal error: exception Not_found\n", None),
+        (1, "Out of memory\n", None),  # OCaml's own: the reason is in the log
+    ],
+)
+def test_a_killed_attempt_is_told_from_a_frama_c_error(rc, stdout, killed):
+    failure = fuzz_build._attempt_failure(
+        {"returncode": rc, "stdout": stdout, "stderr": "e-acsl-gcc: fatal error: aborted by Frama-C\n"}
+    )
+    assert {k for k in ("killed", "killed_suspected") if failure.get(k)} == ({killed} if killed else set())
+
+
+# ------------------------------------------------------------------------------ run-3's own shape
+
+
+@pytest.mark.unit
+def test_a_global_from_a_missing_generated_source_is_reported_not_added(tmp_path):
+    """
+    `ngx_modules` is a global variable: link repair places it through the model (`_place_global`) and the
+    executable's link unit, not through the DAG's functions.
+    """
+    dag = _repair_run(tmp_path, captured=True)
+    model = {
+        "global_variables": {
+            f"{_GEN_C}#gen_modules": {"name": "gen_modules", "file": _GEN_C, "type": "int [3]", "units": ["app"]}
+        }
+    }
+    (dag.parent / "phase0_model.json").write_text(json.dumps(model), encoding="utf-8")
+    missing: list[dict] = []
+    unresolved: list[dict] = []
+    log = "/usr/bin/ld: main.o: undefined reference to `gen_modules'\n"
+    sources, info = fuzz_build.repair_sources_for_link(
+        ["workspace/work/main.c"], log, dag, tmp_path, missing=missing, unresolved=unresolved
+    )
+    assert sources == ["workspace/work/main.c"] and info == {} and unresolved == []
+    assert [(m["file"], m["symbols"], m["kind"]) for m in missing] == [
+        (_GEN_C, ["gen_modules"], "generated_source_missing")
+    ]
+
+
+@pytest.mark.unit
+def test_build_check_names_the_missing_generated_source(tmp_path):
+    """The run-3 fingerprint is build-check: its row says which file is missing and which step keeps it."""
+    run = _make_run(tmp_path)
+    _failed_build(run, "log", "Returncode: 1\n--- STDERR ---\nclang: error: no such file or directory\n", False)
+    path = run / pm.BUILD_DIR / "log.build.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    why = f"{_GEN_C} is a source the build compiles ... run the build capture again"
+    report["link_repair"] = {
+        "symbols": [],
+        "added_sources": [],
+        "rounds": [],
+        "missing_sources": [
+            {"file": _GEN_C, "path": f"workspace/work/{_GEN_C}", "symbols": ["gen_modules"],
+             "kind": "generated_source_missing", "reason": why}
+        ],
+    }  # fmt: skip
+    path.write_text(json.dumps(report), encoding="utf-8")
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    row = out["modules"]["log"]
+    assert (row["status"], row["ok"]) == ("build_failed", False)
+    assert row["reason"] == f"link repair could not add a source that does not exist: {why}"
+    assert not validate_artifacts.validate_build_check(out)
