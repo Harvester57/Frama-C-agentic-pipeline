@@ -394,11 +394,18 @@ def coverage_report(
     max_time: int = COVERAGE_MAX_TIME_S,
     use_cache: bool = True,
     known_crash_dirs: list[Path] | None = None,
+    dag_path: Path | str | None = None,
+    link_module: str | None = None,
 ) -> dict:
     """
     Which target functions and regions the corpus executes. `partial` means some inputs failed or
     were not replayed, so reached counts are lower bounds. The report says what the corpus reached;
     it decides no verdict and nothing in the ledger reads it.
+
+    The build gets the link repair of the fuzz builds (`fuzz_build.build_coverage_binary`, driven by
+    `dag_path`, globals placed for harness module `link_module`): a module whose sources alone do not
+    link (nginx run-5, ngx_core_module in src/core/nginx.c) is measured on the sources that link.
+    `sources` in the report is what was compiled last, and `link_repair` says what the repair added.
 
     Corpus directories replay in the order given. An input whose content is a file under
     `known_crash_dirs` (the campaign's crash artifacts) replays last, in batches of its own, so
@@ -438,8 +445,16 @@ def coverage_report(
     pre_included: list[str] = []
     while True:
         flags = " ".join([cppflags, *(f"-include {shlex.quote(h)}" for h in pre_included)])
-        comp = fuzz_build.compile_coverage_binary(sources, out_bin, flags, ldflags, use_cache=use_cache)
+        built = fuzz_build.build_coverage_binary(
+            sources, out_bin, flags, ldflags, use_cache=use_cache, dag_path=dag_path, link_module=link_module
+        )
+        comp = built["compile"]
         report["compile"] = comp
+        # A rebuild below starts from the sources that linked, so it never repeats the failing link.
+        sources = built["sources"]
+        report["sources"] = list(sources)
+        if built.get("link_repair"):
+            report["link_repair"] = built["link_repair"]
         if comp["returncode"] != 0:
             report.update(status="compile_error", reason="the coverage build failed")
             return report

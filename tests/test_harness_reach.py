@@ -824,6 +824,33 @@ def test_replayed_corpus_with_failing_inputs_is_a_measurement(tmp_path, monkeypa
     assert phase0_gates.check(run, "api", ("reach",)) == []
 
 
+def test_coverage_after_link_repair_is_measured_like_any_other(tmp_path, monkeypatch):
+    # nginx run-5: the coverage build linked src/core/nginx.c through link repair. Its functions are
+    # rows of the report too (here a never-run `main` and a same-named `rec_put`): they add rows, and
+    # the entry points of the module are still counted from their own file.
+    run = _run_dir(tmp_path, monkeypatch)
+    hdir = _write_harness(run, "rec_parse(fuzz_buf, fuzz_len); rec_put(fuzz_buf, fuzz_len, 1);")
+    harness_reach.record_exempt(hdir, "api", "rec_print", "debug output")
+    harness_reach.record_exempt(hdir, "tools", None, "examples")
+    assert harness_reach.main(["check", "--harness-dir", str(hdir)]) == 0
+    cdir = _coverage(run, {"rec_parse": 40, "rec_put": 2})
+    doc = json.loads((cdir / "api.json").read_text())
+    doc["functions"] += [
+        {"function": "main", "file": "src/core/nginx.c", "line": 1, "executions": 0},
+        {"function": "rec_put", "file": "src/core/nginx.c", "line": 9, "executions": 5},
+    ]
+    doc["sources"] = ["workspace/work/src/api.c", "workspace/work/src/core/nginx.c"]
+    doc["link_repair"] = {
+        "symbols": ["ngx_core_module"],
+        "added_sources": ["workspace/work/src/core/nginx.c"],
+        "rounds": [{"symbols": ["ngx_core_module"], "added_sources": ["workspace/work/src/core/nginx.c"]}],
+    }
+    (cdir / "api.json").write_text(json.dumps(doc))
+    assert harness_reach.main(["dynamic", "--module", "api"]) == 0
+    row = _dynamic_doc(run)["modules"]["api"]
+    assert row["passed"] is True and row["executions"]["rec_put"] == 2
+
+
 def test_unresolved_prelude_fails_the_static_gate(tmp_path, monkeypatch):
     # QCBOR run-4: generate_harness wrote harness and sidecar, then raised; the gate passed the harness.
     import phase0_gates

@@ -536,6 +536,9 @@ TODAYS_REPLAY_KEYWORDS = {
     "ldflags",
     "rte_initialized",
     "libc_checks",
+    # The link repair of `make build` (nginx run-5): the DAG (None without one) and the harness module.
+    "dag_path",
+    "link_module",
 }
 
 
