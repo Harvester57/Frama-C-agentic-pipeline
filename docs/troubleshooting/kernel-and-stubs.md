@@ -230,12 +230,18 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
   - **Unchanged cases:** a header with no caller compile, or one whose target defines nothing the header reads, is probed byte for byte as before.
   - **No regeneration needed:** the fix needs no new field in `stubs.json` and no rewrite of `workspace/stubs/`.
   - **Brief:** [`../../skills/framac-slice/stub_author_brief.md`](../../skills/framac-slice/stub_author_brief.md) says the probes define the target's macros, and that the author never adds them to the overlay.
-  - **Tests:**
+  - **Tests** (the fixture got run-3's shape in the follow-up commit `b838ce6`):
     - `tests/test_stub_check.py::test_a_header_that_needs_the_targets_macros_passes_all_three_checks[source]` and `[command_line]` (Docker). Before the fix both failed exactly as run-3 did: `abi` failed, `eva` error, `dynamic` build_failed. After the fix all three pass.
+    - The `source` case has run-3's shape. The target's header defines the width and includes the library header behind `#if (USE_FIX)`. `USE_FIX` and the width's value come from a generated header that only the snapshot has (`snapshot/generated/objs`, through `-I objs`, a directory missing from `workspace/work`).
     - `::test_the_probes_get_the_macros_the_target_defines_before_the_header` (both cases)
     - `::test_a_header_without_a_compile_gets_no_context_and_the_same_probes`
     - `::test_the_context_scan_drops_undefined_guards_and_system_macros`
-- **Recovering run-3:** once the fix is in the run's pipeline checkout, rerun `pipeline_make.py run stubs stub-check`. `pcre2.h`'s `include_context` should read `#define PCRE2_CODE_UNIT_WIDTH 8`, from `src/core/ngx_regex.c`.
+- **Open pipeline gap:** some macros are still not carried into the probes.
+  - The scan reads only the files the compile enters while the header is open. A header the unit already included earlier is not entered again, so a macro the library header consults only through such a header is missed.
+  - Examples: feature-test macros (`_GNU_SOURCE`, `_FILE_OFFSET_BITS`) that glibc's `features.h` reads, or a macro that a nested OpenSSL header reads when the unit included that header before.
+  - The probes then include the header without those macros, as they did before the fix.
+- **Recovering run-3:** once the fix is in the pipeline checkout whose wrapper runs the command, rerun `pipeline_make.py run stubs stub-check`. `pcre2.h`'s `include_context` should read `#define PCRE2_CODE_UNIT_WIDTH 8`, from `src/core/ngx_regex.c`.
+  - Read the other headers' `include_context` one by one. A header that passed bare may now get defines from the target, for example OpenSSL headers if nginx defines a macro they read.
 - **Not affected:** [`../../scripts/stub_gen.py`](../../scripts/stub_gen.py) takes the prototypes from the Phase 0 model's `external_decls`. Frama-C printed those from the target's own parse, so they already carry the target's context (`pcre2_compile_8`). `entry_header` only reads quoted sibling includes.
 
 ### Symptom: The Ledger Has No `stub_contract` Assumptions Although `stubs.json` Has Filled Overlay Contracts
