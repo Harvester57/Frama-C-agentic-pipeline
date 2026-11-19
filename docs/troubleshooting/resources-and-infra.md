@@ -36,6 +36,33 @@ The full resource and cache design guide is [`../guides/resources-and-caching.md
   - Workaround for a run on an older checkout without the fix: `docker kill framac-<lease>` for an orphan whose agent has finished. The broker drops the lease on its next pass.
 - **Still open:** ad-hoc wrapper commands have no default wall-clock cap. A cap in `exec` would also apply to the Make, Eva and fuzz phases, which decide results.
 
+### Symptom: `build-check` E-ACSL Build OOM-Killed: Two Whole-Program Builds Admitted at 2 GiB Each
+- **Seen on:** nginx 1.31.9 run-3, `pipeline_make.py build-check`, 2026-11-19.
+  - Container `framac-df5a91d5be63` had a 17 GiB limit (`HostConfig.Memory` 18253611008, `MemorySwap` equal), 32 host CPUs and a 30-CPU pool.
+  - Make ran `resources.py run --class build --key nginx__ngx_event_openssl ... -- run_eacsl_fuzz.py build ...` and the same for `nginx__ngx_files` at the same time.
+  - Each E-ACSL instrumentation is a whole-program Frama-C, because the two `SOURCES_` lists hold 163 and 161 of the unit's 165 files. Even the 20-function cluster gets them; that unit-split gap is tracked separately.
+  - At 15:01:24 the container was at 98.7% (16.78/17 GiB), and the two Frama-C processes held 8.76 GB and 8.39 GB RSS.
+  - Docker logged an `oom` event at 15:01:48, and the cgroup OOM killer took a Frama-C (the supervisor attributed it to openssl). The container's own record (`phase-static`, 14:15:31Z) says `oom_kills: 2`, `peak_mb: 17408`.
+  - The job history then said `peak_mb` 17173 (rusage) for the openssl key and 8809 for the files key. Both records had `oom_killed: false` and `mem_mb: 2048`.
+- **Cause:** pipeline bug in [`../../scripts/resources.py`](../../scripts/resources.py), in three parts.
+  - **Lease size.** `CLASSES["build"]` is 2048 MiB with no per-CPU memory, and `history_estimate` cannot help the first build of a key. So the broker granted 2 GiB to each job and admitted both. Phase 0 had already measured 10471 MiB for the whole-unit parse of the same files: the model container's record `state/resource-history/phase-static/20261119T121611091611Z-0b01b5a0.json`, written 1.1 s after the model ended. That record has a null key, so nothing linked it to the unit.
+  - **Missing parse history.** The parse leases (`resources.py run --class parse --key p0-<job>`) ran with the scratch tree as their cwd, and `cmd_run` read and wrote history only in the cwd. No `parse` record was ever written: run-3 has no `state/resource-history/parse/`.
+  - **OOM detection and retry.** `_oom_killed` required rc -9/137. Under engine `auto` the killed E-ACSL compile fell back to the sanitizer build, so the job exited 1, the retry never fired and the record said `oom_killed: false`. Even if the retry had fired, it asked for 2 × the lease (4096 MiB), far below the need.
+  - **Hidden in the report.** `build.json` hid the OOM: it reports only the last attempt (`eacsl_instrumentation_failed` from the post-repair attempt, which stopped at once on the missing `objs/ngx_modules.c`). That reporting half is handled on branch `sup/nginx-generated-sources`.
+- **Fix:** fixed on branch `sup/nginx-build-memory` (commit `c35dfb0`, not merged), all in [`../../scripts/resources.py`](../../scripts/resources.py).
+  - **First-build estimate.** `first_build_estimate`: a `build` job with no history for its key asks for 1.25 × the parse peak of the parse job(s) its `--sources` come from, scaled by the share of each job's sources it compiles.
+    - The peak comes from the job's `parse/p0-<job>` history, else from the model container's `phase-static` record. That is the first record within 120 s after `generated_at` + `seconds`. It is split across parse jobs by number of sources, so later containers, such as build-check's own OOM record, never count.
+    - Run-3 data gives 12931 and 12772 MiB. Together they exceed the 17408 MiB pool, so the second build queues. A demand above the pool is granted alone with the existing "clamped to the pool" warning.
+    - The 1.25 is `history_estimate`'s margin over a measured peak. The observed 8.39 and 8.76 GB, read at kill time, are 0.82-0.86 of the scaled parse peak: lower bounds, not a measured E-ACSL factor.
+    - Small units stay under the class's 2048 MiB, which then applies.
+  - **History location.** `history_run_dir`: `run` uses the cwd when it is a run dir, else `/framac-run`, so parse leases now record `parse/p0-<job>`.
+  - **OOM attribution.** `oom_evidence` charges an `oom_kill` delta during the job when the job was SIGKILLed, held the only lease (`alone`), or overran its own lease (`overran_lease`). A job within its lease beside others is not charged, because the kill may be a neighbour's. Records add `oom_evidence` and `oom_kills_during`, so a kill that hit a grandchild doubles the next estimate.
+  - **Retry size.** `retry_memory`: the one retry asks max(2 × lease, 1.25 × peak), capped at the pool.
+  - Tests: [`../../tests/test_resources_build_memory.py`](../../tests/test_resources_build_memory.py). `test_first_builds_of_two_whole_unit_modules_run_one_at_a_time` and `test_an_oom_kill_below_the_job_is_retried_from_its_observed_peak_and_recorded` failed on `973e519`: both builds got 2048 MiB, and the rc-1 OOM was not retried.
+- **Still open:**
+  - The 17173 MiB rusage peak of the openssl job exceeds what it could hold beside the files job. One reading fits both `oom_kills: 2` and the two peaks: the first kill took the files Frama-C at about 8.8 GB, then the openssl Frama-C grew alone to the 17 GiB limit and was killed too. If so, the openssl E-ACSL instrumentation alone needs more than this 17 GiB container. The fix then serializes the builds, but the build still fails until the build-check container gets more memory. Not verified, because the compile log keeps only the last attempt.
+  - `eva` (also 2048 MiB fixed) has no Phase 0 estimate. A whole-unit Eva on such a module would meet the same first-run gap.
+
 ### Symptom: Static Command Classification Fails Open on Unknown Make Targets
 - **Seen:** 2026-11-11, regex audit (Milestone M2). `resources.is_known_static_command` returned `True` for arbitrary target arguments such as `pipeline_make.py run unknown_target` or commands without the pipeline directory prefix.
 - **Cause:** `is_known_static_command` in [`../../scripts/resources.py`](../../scripts/resources.py) used a denylist against `_DYNAMIC_MAKE_TARGETS` and optional prefix matching `(?:/opt/framac-pipeline/scripts/)?`, allowing untrusted or unrecognized target commands to pass as static analysis.
