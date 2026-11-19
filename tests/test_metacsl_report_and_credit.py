@@ -315,6 +315,19 @@ def test_an_open_in_code_check_withdraws_the_credit_without_a_meta_instance(run_
     assert unit["status"] == "planned" and unit["evidence"][-1]["result"] == WITHDRAWN
 
 
+def test_the_verdict_of_an_open_in_code_check_ends_with_the_modules_next_report(run_dir):
+    credited_flush(run_dir)
+    doc = new_kinds_doc()
+    doc["code_checks"] = [{"file": "prog.c", "line": 12, "function": "prog.c#flush", "property": NK_CALL, "index": 0}]
+    write_json(Path("workspace/reports/security_props.json"), doc)
+    eva_ingest(unknown_obligations_by_function={"flush": [RC_ROW]})
+    assert units()[cid("flush")]["bookkeeping"]["eva_verdicts"] == {NK_MODULE: "unknown"}
+    eva_ingest()
+    assert not units()[cid("flush")]["bookkeeping"]["eva_verdicts"]
+    L.cmd_ingest_wp([wp_report("flush", {}, loaded=[NK_CALL])])
+    assert units()[cid("flush")]["evidence"][-1]["result"] == "wp_meta_check_not_reported"
+
+
 def test_after_a_withdrawal_eva_or_the_same_wp_report_can_close_the_unit_again(run_dir):
     credited_flush(run_dir)
     eva_ingest({f"{NK_CALL}@flush": {"unknown": 1}})
@@ -549,6 +562,22 @@ def test_an_unreadable_wp_report_is_no_row(run_dir):
     path.parent.mkdir(parents=True)
     path.write_text("{not json", encoding="utf-8", newline="\n")
     assert gr.load_wp_meta_runs(run_dir, [_unit("flush", "planned")]) == []
+
+
+def test_a_wp_report_that_is_not_an_object_is_no_row(run_dir):
+    write_json(Path("workspace/reports/wp/flush.json"), [1])
+    assert gr.load_wp_meta_runs(run_dir, [_unit("flush", "planned")]) == []
+
+
+def test_a_run_before_phase_3_has_no_wp_report_and_still_gets_its_report(run_dir):
+    seed(run_dir, _synthetic_doc())
+    state = units()
+    Path("workspace/reports/callgraph_dag.json").unlink()
+    build_run(run_dir)
+    ledger = json.loads(Path("coverage-ledger.json").read_text(encoding="utf-8"))
+    write_json(Path("coverage-ledger.json"), sorted([*ledger, *state.values()], key=lambda u: u["coverage_id"]))
+    gr.generate(run_dir, run_dir)
+    assert HEAD_WP_RUNS not in Path("REPORT.md").read_text(encoding="utf-8")
     assert gr.wp_meta_run_lines([]) == []
 
 
