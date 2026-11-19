@@ -4,5 +4,7 @@ struct op_ctx { int flags; };
 int op_is_on(const struct op_ctx *ctx) { return ctx->flags; }
 /* OpenSSL_version in miniature: a string in the library's own read-only data. */
 const char *op_version(int t) { (void)t; return "oplib 1.0"; }
+/* OBJ_nid2sn in miniature, behind a guard: a static string, or NULL for a negative argument. */
+const char *op_name(int t) { return t < 0 ? 0 : "oplib"; }
 /* A function with genuine arguments only, whose documented ensures (`\result == 0`) is wrong. */
 int op_answer(const int x) { (void)x; return 42; }

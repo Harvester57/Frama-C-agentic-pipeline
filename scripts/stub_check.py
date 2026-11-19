@@ -970,16 +970,20 @@ def _memory_atom(atom: str, values: list[tuple[str, str]]) -> bool:
     the library returned or wrote: its argument names `\\result` or a dereference, and no printed value of
     a term in it is NULL (`valid_read_string(\\result)` with `\\result: (nil)` is a real failure).
     """
-    rest = atom
+    # The outermost memory applications, removed from the atom (one nested in another goes with it).
+    pieces: list[str] = []
     apps: list[str] = []
-    for m in reversed(list(_APPLICATION_RE.finditer(atom))):
-        if m.group(1) not in _MEMORY_FUNCTIONS:
+    pos = 0
+    for m in _APPLICATION_RE.finditer(atom):
+        if m.start() < pos or m.group(1) not in _MEMORY_FUNCTIONS:
             continue
         close = _matching_paren(atom, m.end() - 1)
         if close < 0:
             return False
         apps.append(atom[m.end() : close])
-        rest = rest[: m.start()] + rest[close + 1 :]
+        pieces.append(atom[pos : m.start()])
+        pos = close + 1
+    rest = "".join(pieces) + atom[pos:]
     if not apps:
         return False
     # What is left beside the memory applications: constants and comparisons only. A negation (`!\valid`)

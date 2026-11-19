@@ -859,6 +859,7 @@ OP_LOGS = "workspace/reports/stub_check/op__oplib.h"
 OP_PROTOS = {
     "op_is_on": "int op_is_on(op_ctx const *ctx)",
     "op_version": "char const *op_version(int t)",
+    "op_name": "char const *op_name(int t)",
     "op_answer": "int op_answer(int const x)",
 }
 OP_OVERLAY_BLOCKS = """
@@ -882,6 +883,13 @@ extern int op_is_on(op_ctx const *ctx);
   ensures valid_str: valid_read_string(\\result);
 */
 extern char const *op_version(int t);
+
+/* fc-stub: op_name */
+/*@
+  assigns \\result \\from t;
+  ensures name_or_null: \\result != \\null ==> valid_read_string(\\result);
+*/
+extern char const *op_name(int t);
 """
 
 
@@ -908,6 +916,7 @@ def _op_run(run: Path, snap_in: str) -> None:
         "externals": sorted(OP_PROTOS),
         "external_formals": {"op_is_on": [{"name": "ctx", "kind": "const_pointer"}],
                              "op_version": [{"name": "t", "kind": "value"}],
+                             "op_name": [{"name": "t", "kind": "value"}],
                              "op_answer": [{"name": "x", "kind": "value"}]},
         "external_decls": {fn: {"decl": f"{decl}:{i + 4}", "proto": p} for i, (fn, p) in enumerate(OP_PROTOS.items())},
     })  # fmt: skip
@@ -946,6 +955,9 @@ def test_dynamic_artifacts_of_the_checker_do_not_block_but_a_wrong_ensures_does(
     assert dyn["op_version"]["status"] == "inconclusive", dump
     assert dyn["op_version"]["reason"] == "untracked_library_memory", dump
     assert "valid_read_string(\\result)" in dyn["op_version"]["report"], dump
+    # The same behind a guard, printed with E-ACSL's Unicode `≢` and `⇒` (OBJ_nid2sn's shape).
+    assert dyn["op_name"]["status"] == "inconclusive", dump
+    assert dyn["op_name"]["reason"] == "untracked_library_memory", dump
     assert dyn["op_answer"]["status"] == "violated", dump
     assert "\\result: 42" in dyn["op_answer"]["report"], dump
     assert rec["eva"]["functions"]["op_answer"]["status"] == "passed", dump  # S9
@@ -1016,6 +1028,14 @@ RUN4_POSTCONDITIONS: dict[str, tuple[str, str, str, list[str], str, str | None]]
     "short_name": (
         "char const *short_name(int t)", "short", f"valid_read_string(\\result) {_AND} \\result {_EQ} \\null",
         ["valid_read_string(\\result): 0", "\\result: 0x78675abc3500"], "violated", None),
+    # A nested memory application goes with the outer one; what is left decides.
+    "block_of": (
+        "char const *block_of(int t)", "block", f"\\block_length(\\base_addr(\\result)) {_GE} 16",
+        ["\\block_length(\\base_addr(\\result)): 0", "\\result: 0x78675abc3600"], "inconclusive",
+        "untracked_library_memory"),
+    "block_is": (
+        "char const *block_is(int t)", "block", f"\\block_length(\\base_addr(\\result)) {_EQ} t",
+        ["\\block_length(\\base_addr(\\result)): 0", "\\result: 0x78675abc3700"], "violated", None),
 }  # fmt: skip
 
 
@@ -1039,11 +1059,14 @@ def test_a_postcondition_failure_is_violated_only_on_evidence_against_the_contra
 
 @pytest.mark.unit
 def test_postcondition_reports_are_read_from_the_images_output():
-    """The three reports the analysis image printed for tests/fixtures/stub_check/oplib.c (before the fix)."""
+    """The reports the analysis image printed for tests/fixtures/stub_check/oplib.c (the classifier aside)."""
     blocks = {
         name: stub_check.postcondition_failures((FIXTURE / f"eacsl_post_{name}.log").read_text(encoding="utf-8"))
-        for name in ("value", "fabricated", "untracked")
+        for name in ("value", "fabricated", "untracked", "guarded")
     }
+    assert blocks["guarded"] == [{
+        "label": "name_or_null", "predicate": "\\result != \\null ==> valid_read_string(\\result)",
+        "values": [("valid_read_string(\\result)", "0"), ("\\result", "0x73bc439d700a")]}]  # fmt: skip
     assert blocks["value"] == [{"label": "zero", "predicate": "\\result == 0", "values": [("\\result", "42")]}]
     assert blocks["fabricated"][0]["predicate"] == "\\result == 0 || \\result == 1"
     assert blocks["untracked"] == [{
@@ -1100,8 +1123,9 @@ def test_the_header_verdict_follows_the_dynamic_classification(run_dir, monkeypa
 
     logs = {
         fn: (FIXTURE / f"eacsl_post_{kind}.log").read_text(encoding="utf-8")
-        for fn, kind in (("op_answer", "value"), ("op_is_on", "fabricated"), ("op_version", "untracked"))
-    }
+        for fn, kind in (
+            ("op_answer", "value"), ("op_is_on", "fabricated"), ("op_version", "untracked"), ("op_name", "guarded"))
+    }  # fmt: skip
     order = sorted(OP_PROTOS)  # _signatures sorts the functions: argv[1] is the index in this order
 
     def fake_run(cmd, **_):
@@ -1118,6 +1142,7 @@ def test_the_header_verdict_follows_the_dynamic_classification(run_dir, monkeypa
         "op_answer": ("violated", None),
         "op_is_on": ("inconclusive", "fabricated_argument"),
         "op_version": ("inconclusive", "untracked_library_memory"),
+        "op_name": ("inconclusive", "untracked_library_memory"),
     }
     assert dyn["op_is_on"]["fabricated_params"] == ["ctx"]
     assert "valid_read_string(\\result)" in dyn["op_version"]["report"]

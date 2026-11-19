@@ -1,0 +1,10 @@
+$ fc_stub_driver.e-acsl 2  # op_name, exit -6
+
+/w/workspace/stubs/op/oplib.h: In function 'op_name'
+/w/workspace/stubs/op/oplib.h:40: Error: Postcondition failed:
+	The failing predicate is:
+	name_or_null:
+		\result ≢ \null ⇒ valid_read_string(\result).
+	With values at failure point:
+	- valid_read_string(\result): 0
+	- \result: 0x73bc439d700a
