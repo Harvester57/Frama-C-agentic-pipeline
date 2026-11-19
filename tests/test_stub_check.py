@@ -454,20 +454,25 @@ FIX_OVERLAY_BLOCK = """
 */
 extern size_t fix_len_8(unsigned char const *s, size_t n);
 """
-# Where the target sets the width: its own header (as nginx does), or its compile line.
+# Where the target sets the width: its own header, as nginx does (src/core/ngx_regex.h, behind
+# `#if (NGX_PCRE2)` from the generated objs/ngx_auto_config.h, which only the snapshot has: `-I objs` names
+# a directory the work tree lacks), or its compile line.
 FIX_CASES: dict[str, dict[str, Any]] = {
     "source": {
-        "flags": ["-I", "src"],
-        "use_h": "#define USE_UNRELATED 1\n#define USE_WIDTH 8\n#define FIX_CODE_UNIT_WIDTH USE_WIDTH\n",
+        "flags": ["-I", "src", "-I", "objs"],
+        "generated": "#define USE_FIX 1\n#define USE_WIDTH 8\n",
+        "use_h": "#include <use_auto.h>\n#define USE_UNRELATED 1\n#define FIX_CODE_UNIT_WIDTH USE_WIDTH\n"
+        "#if (USE_FIX)\n#include <fix/fixlib.h>\n#endif\n",
         "context": ["#define FIX_CODE_UNIT_WIDTH USE_WIDTH", "#define USE_WIDTH 8"],
     },
     "command_line": {
         "flags": ["-I", "src", "-DFIX_CODE_UNIT_WIDTH=8", "-DUSE_UNRELATED=1"],
-        "use_h": "#define USE_ALSO_UNRELATED 2\n",
+        "generated": "",
+        "use_h": "#define USE_ALSO_UNRELATED 2\n#include <fix/fixlib.h>\n",
         "context": ["#define FIX_CODE_UNIT_WIDTH 8"],
     },
 }
-FIX_USE_C = '#include "use.h"\n#include <fix/fixlib.h>\nsize_t use(const unsigned char *s, size_t n) { return fix_len(s, n); }\n'
+FIX_USE_C = '#include "use.h"\nsize_t use(const unsigned char *s, size_t n) { return fix_len(s, n); }\n'
 
 
 def _fix_run(run: Path, case: str, snap_in: str, work_in: str) -> None:
@@ -479,8 +484,11 @@ def _fix_run(run: Path, case: str, snap_in: str, work_in: str) -> None:
     (snap / "root" / "usr" / "include" / "fix").mkdir(parents=True)
     (snap / "root" / "usr" / "lib").mkdir(parents=True)
     (snap / "root" / "usr" / "include" / "fix" / "fixlib.h").write_text(FIX_REAL_TEXT, encoding="utf-8", newline="\n")
-    write_json(snap / "manifest.json", {"digest": "test", "files": {"/usr/include/fix/fixlib.h": "x",
-                                                                     "/usr/lib/libfix.so": "x"}})  # fmt: skip
+    write_json(snap / "manifest.json", {"digest": "test", "generated_dirs": ["objs"], "files": {
+        "/usr/include/fix/fixlib.h": "x", "/usr/lib/libfix.so": "x"}})  # fmt: skip
+    (snap / "generated" / "objs").mkdir(parents=True)
+    if spec["generated"]:
+        (snap / "generated" / "objs" / "use_auto.h").write_text(spec["generated"], encoding="utf-8", newline="\n")
     (run / "fixlib.c").write_text(FIX_LIB_SOURCE, encoding="utf-8", newline="\n")
     src = run / "workspace" / "work" / "src"
     src.mkdir(parents=True)
@@ -504,21 +512,31 @@ def _fix_run(run: Path, case: str, snap_in: str, work_in: str) -> None:
 
 
 def _fix_dd_output(case: str, tree: str, snap: str) -> str:
-    """What `gcc -E -dD` prints for src/use.c up to the end of fixlib.h (trimmed; gcc 12's layout)."""
-    cmdline = "#define FIX_CODE_UNIT_WIDTH 8\n#define USE_UNRELATED 1\n" if case == "command_line" else ""
-    use_h = FIX_CASES[case]["use_h"]
+    """What `gcc -E -dD` prints for src/use.c up to the end of fixlib.h (trimmed; the image's gcc layout)."""
     real = f"{snap}/root/usr/include/fix/fixlib.h"
-    return (
-        f'# 0 "{tree}/src/use.c"\n# 0 "<built-in>"\n#define __STDC__ 1\n#define __GNUC__ 12\n'
-        f'# 0 "<command-line>"\n{cmdline}# 1 "/usr/include/stdc-predef.h" 1 3 4\n#define _STDC_PREDEF_H 1\n'
-        f'# 0 "<command-line>" 2\n# 1 "{tree}/src/use.c"\n# 1 "{tree}/src/use.h" 1\n{use_h}'
-        f'# 2 "{tree}/src/use.c" 2\n# 1 "{real}" 1 3 4\n#define FIXLIB_H \n'
-        '# 1 "/usr/lib/gcc/x86_64-linux-gnu/12/include/stddef.h" 1 3 4\n#define _STDDEF_H \n'
+    header = (
+        f'# 1 "{real}" 1 3 4\n#define FIXLIB_H \n'
+        '# 1 "/usr/lib/gcc/x86_64-linux-gnu/14/include/stddef.h" 1 3 4\n#define _STDDEF_H \n'
         "typedef long unsigned int size_t;\n"
         f'# 4 "{real}" 2 3 4\n#define FIX_GLUE_(a,b) a ##_ ##b\n#define FIX_GLUE(a,b) FIX_GLUE_(a, b)\n'
         "#define fix_len FIX_GLUE(fix_len, FIX_CODE_UNIT_WIDTH)\n"
         "size_t fix_len_8(const unsigned char *s, size_t n);\n"
-        f'# 3 "{tree}/src/use.c" 2\n#define USE_AFTER 1\n'
+    )
+    if case == "source":
+        cmdline = ""
+        use_h = (
+            f'# 1 "{snap}/generated/objs/use_auto.h" 1 3 4\n#define USE_FIX 1\n#define USE_WIDTH 8\n'
+            f'# 2 "{tree}/src/use.h" 2\n#define USE_UNRELATED 1\n#define FIX_CODE_UNIT_WIDTH USE_WIDTH\n'
+            f'# 6 "{tree}/src/use.h"\n{header}# 7 "{tree}/src/use.h" 2\n'
+        )
+    else:
+        cmdline = "#define FIX_CODE_UNIT_WIDTH 8\n#define USE_UNRELATED 1\n"
+        use_h = f'#define USE_ALSO_UNRELATED 2\n{header}# 3 "{tree}/src/use.h" 2\n'
+    return (
+        f'# 0 "{tree}/src/use.c"\n# 0 "<built-in>"\n#define __STDC__ 1\n#define __GNUC__ 14\n#define linux 1\n'
+        f'# 0 "<command-line>"\n{cmdline}# 1 "/usr/include/stdc-predef.h" 1 3 4\n#define _STDC_PREDEF_H 1\n'
+        f'# 0 "<command-line>" 2\n# 1 "{tree}/src/use.c"\n# 1 "{tree}/src/use.h" 1\n{use_h}'
+        f'# 2 "{tree}/src/use.c" 2\n#define USE_AFTER 1\n'
         "size_t use(const unsigned char *s, size_t n) { return fix_len_8(s, n); }\n"
     )
 
@@ -557,12 +575,15 @@ def test_the_probes_get_the_macros_the_target_defines_before_the_header(run_dir,
     assert f"-I{(tree / 'src').as_posix()}" in pre or (tree / "src").as_posix() in pre, pre
     if case == "command_line":
         assert "-DFIX_CODE_UNIT_WIDTH=8" in pre, pre
+    else:  # the generated header comes from the snapshot, as nginx's objs/ngx_auto_config.h does
+        assert (snap / "generated" / "objs").as_posix() in pre, pre
     for probe in ("fc_stub_abi.c", "fc_stub_smoke.c", "fc_stub_driver.c"):
         text = (run_dir / FIX_LOGS / probe).read_text(encoding="utf-8")
         at = text.index("#include <fix/fixlib.h>")
         for line in ctx["defines"]:
             assert 0 <= text.find(line + "\n") < at, (probe, text)
-        assert "USE_UNRELATED" not in text and "USE_AFTER" not in text and "_STDC_PREDEF_H" not in text, text
+        for absent in ("USE_UNRELATED", "USE_ALSO_UNRELATED", "USE_FIX", "USE_AFTER", "_STDC_PREDEF_H", "linux"):
+            assert absent not in text, (absent, text)
 
 
 @pytest.mark.unit
