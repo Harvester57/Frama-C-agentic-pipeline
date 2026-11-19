@@ -208,6 +208,41 @@ def test_fallback_link_units_are_fuzzed_with_sanitizers_and_blocked_for_eva_and_
     assert any("libb" in w and "sanitizers" in w for w in dag["warnings"])
 
 
+def test_an_unparsed_unit_is_blocked_and_reported_without_claiming_a_gcc_call_graph(target: Path) -> None:
+    """
+    A unit neither Frama-C nor the GCC fallback parsed (phase0_model `unparsed`, nginx-1.31.9 run-1) has
+    no function in the model, so no module: the DAG warns that it was not parsed, does not list it among
+    the units whose call graph comes from GCC, and does not say it compiles another unit's sources.
+    """
+    model = _model()
+    model["units"]["probe"] = {
+        "kind": "executable",
+        "test": False,
+        "files": ["objs/autotest.c"],
+        "parse": {"status": "unparsed", "error": "no such file", "gcc_error": "cc1: fatal error"},
+    }
+    dag = bcd.build_dag(target, model)
+    assert dag["model"]["gcc_fallback_units"] == []
+    assert "probe" not in dag["modules"]
+    warnings = [w for w in dag["warnings"] if w.startswith("unit probe:")]
+    assert len(warnings) == 1, warnings
+    assert "neither Frama-C nor the GCC fallback" in warnings[0] and "no function or edge" in warnings[0]
+    assert "no such file" in warnings[0] and "cc1: fatal error" in warnings[0]
+    assert "comes from GCC" not in warnings[0]
+    # A function of the unparsed unit's file that another unit parsed is blocked in its module all the same.
+    model["units"]["probe"]["files"] = ["src/b.c"]
+    model["units"]["lib"]["files"] = ["src/a.c"]
+    for fid in ("src/b.c#helper", "src/b.c#api_other"):
+        model["functions"][fid]["units"] = ["lib"]
+    dag = bcd.build_dag(target, model)
+    assert dag["modules"]["probe"]["callgraph_fallback"] == "no such file"
+    assert dag["modules"]["probe"]["run_eva"] is False and dag["modules"]["probe"]["run_wp_full"] is False
+    # The two scripts agree on the statuses of a unit Frama-C could not parse.
+    import phase0_model
+
+    assert bcd.FRAMAC_FAILED == phase0_model.FRAMAC_FAILED
+
+
 def test_link_options_name_the_build_libraries() -> None:
     assert bcd.link_option("-lm") == "-lm"
     assert bcd.link_option("/usr/lib/x86_64-linux-gnu/libz.so") == "-lz"

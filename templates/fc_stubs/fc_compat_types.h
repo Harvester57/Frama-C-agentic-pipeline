@@ -774,6 +774,400 @@ extern int getservbyport_r(int port, const char *proto, struct servent *result_b
 #endif /* IN6_IS_ADDR_UNSPECIFIED */
 #endif /* FC_STUBS_NO_NETDB_DECLS */
 
+/*
+ * glibc <sched.h> CPU affinity names __fc_libc's <sched.h> lacks (34.0~beta and 35.0~dev): cpu_set_t,
+ * the CPU_* macros, sched_setaffinity and sched_getaffinity, found on nginx (run-1, 2026-11-19).
+ * configure ran against glibc and set NGX_HAVE_SCHED_SETAFFINITY, so src/os/unix/ngx_setaffinity.h
+ * stopped the parse of every nginx source at `typedef cpu_set_t ngx_cpuset_t;` ("syntax error").
+ * glibc declares them under _GNU_SOURCE; here they are declared whatever the target defines, because
+ * this header is read before the target's own `#define _GNU_SOURCE`.
+ *
+ * Layout as glibc x86_64: 1024 CPUs in sixteen unsigned longs, same names (`__cpu_mask`, `__bits`).
+ * The macros keep glibc's semantics: each argument is evaluated once, and a CPU number at or past
+ * setsize * 8 is ignored (CPU_SET and CPU_CLR write nothing and give 0, CPU_ISSET gives 0). They reach
+ * a word through `&__bits[0]` (__FC_CPU_WORD), with no cast for WP's Typed model to refuse. In the
+ * contracts below, `set->__bits[0 .. n - 1]` is what the logic typer makes of any spelling (it folds
+ * `*(set->__bits + k)` back into `set->__bits[k]`): Eva and WP read it as the words at those offsets,
+ * past word 15 too (Eva checked on a 32-word set), while E-ACSL checks `__bits[k]` as an index of the
+ * sixteen-word member and stops ("index out of bounds") on a larger set. No E-ACSL build reads them.
+ * CPU_COUNT calls glibc's own __sched_cpucount. glibc's CPU_ZERO and CPU_ZERO_S are a memset of the
+ * set, which WP's Typed model refuses (the set converted to `void *`: "Cast with incompatible pointers
+ * types"). CPU_ZERO, whose size is sizeof(cpu_set_t), is therefore an assignment of a zero cpu_set_t,
+ * the same bytes, which both Eva and WP follow exactly; CPU_ZERO_S calls __fc_sched_cpuzero, a declared
+ * model (below) that WP proves callers against but that Eva follows only as "initialized, any value"
+ * (it reduces no form of its postcondition).
+ * Not declared: CPU_EQUAL, CPU_AND, CPU_OR, CPU_XOR and their _S forms, CPU_ALLOC and CPU_FREE (glibc's
+ * __sched_cpualloc / __sched_cpufree), sched_getcpu, getcpu, and <sched.h>'s clone, unshare and setns.
+ *
+ * Skipped when CPU_SETSIZE is already defined (a later libc that has them). Define
+ * FC_STUBS_NO_SCHED_AFFINITY_DECLS for a target with its own cpu_set_t or CPU_* macros.
+ */
+#ifndef FC_STUBS_NO_SCHED_AFFINITY_DECLS
+#include <sched.h>
+#ifndef CPU_SETSIZE
+typedef unsigned long int __cpu_mask;
+#define __CPU_SETSIZE 1024
+#define __NCPUBITS (8 * sizeof(__cpu_mask))
+typedef struct {
+  __cpu_mask __bits[__CPU_SETSIZE / __NCPUBITS];
+} cpu_set_t;
+
+#define CPU_SETSIZE __CPU_SETSIZE
+#define __FC_CPU_ELT(cpu) ((cpu) / __NCPUBITS)
+#define __FC_CPU_MASK(cpu) ((__cpu_mask)1 << ((cpu) % __NCPUBITS))
+/* The word of `cpu`, through a pointer to the first word: a set of CPU_ALLOC_SIZE(n) bytes has more
+ * words than the sixteen the member declares when n > 1024. glibc reaches it through a
+ * `(__cpu_mask *)` cast, which Frama-C folds back into `__bits[i]`, an index of the sixteen-word
+ * member (Eva: "accessing out of bounds index" from word 16 on); `*(&__bits[0] + i)` stays pointer
+ * arithmetic, checked against the object the set lives in. */
+#define __FC_CPU_WORD(cpusetp, cpu) ((&(cpusetp)->__bits[0])[__FC_CPU_ELT(cpu)])
+#define CPU_SET_S(cpu, setsize, cpusetp)                                                               \
+  (__extension__({                                                                                     \
+    size_t __fc_cpu = (cpu);                                                                           \
+    __fc_cpu / 8 < (setsize) ? (__FC_CPU_WORD(cpusetp, __fc_cpu) |= __FC_CPU_MASK(__fc_cpu)) : 0;      \
+  }))
+#define CPU_CLR_S(cpu, setsize, cpusetp)                                                               \
+  (__extension__({                                                                                     \
+    size_t __fc_cpu = (cpu);                                                                           \
+    __fc_cpu / 8 < (setsize) ? (__FC_CPU_WORD(cpusetp, __fc_cpu) &= ~__FC_CPU_MASK(__fc_cpu)) : 0;     \
+  }))
+#define CPU_ISSET_S(cpu, setsize, cpusetp)                                                             \
+  (__extension__({                                                                                     \
+    size_t __fc_cpu = (cpu);                                                                           \
+    __fc_cpu / 8 < (setsize) ? (__FC_CPU_WORD(cpusetp, __fc_cpu) & __FC_CPU_MASK(__fc_cpu)) != 0 : 0;  \
+  }))
+#define CPU_ZERO_S(setsize, cpusetp) __fc_sched_cpuzero((setsize), (cpusetp))
+#define CPU_COUNT_S(setsize, cpusetp) __sched_cpucount((setsize), (cpusetp))
+#define CPU_SET(cpu, cpusetp) CPU_SET_S(cpu, sizeof(cpu_set_t), cpusetp)
+#define CPU_CLR(cpu, cpusetp) CPU_CLR_S(cpu, sizeof(cpu_set_t), cpusetp)
+#define CPU_ISSET(cpu, cpusetp) CPU_ISSET_S(cpu, sizeof(cpu_set_t), cpusetp)
+/* All sixteen words spelled out: WP proves nothing about the words a partial initializer (`{{0}}`)
+ * leaves implicit. */
+#define CPU_ZERO(cpusetp)                                                          \
+  do {                                                                             \
+    *(cpusetp) = (cpu_set_t){{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};   \
+  } while (0)
+#define CPU_COUNT(cpusetp) CPU_COUNT_S(sizeof(cpu_set_t), cpusetp)
+#define CPU_ALLOC_SIZE(count) ((((count) + __NCPUBITS - 1) / __NCPUBITS) * sizeof(__cpu_mask))
+
+/* glibc's CPU_COUNT_S: the bits set in the first setsize / sizeof(__cpu_mask) words (whole words only,
+ * as glibc counts them). */
+/*@
+  requires valid_set: \valid_read(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
+  requires initialized_set: \initialized(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
+  assigns \result \from setp->__bits[0 .. setsize / sizeof(__cpu_mask) - 1], indirect:setsize;
+  ensures count_range: 0 <= \result <= 8 * setsize;
+*/
+extern int __sched_cpucount(size_t setsize, const cpu_set_t *setp);
+
+/* CPU_ZERO_S. glibc's is a memset of setsize bytes; this declared model zeroes the same words without
+ * converting the set to memset's `void *` (with memset, WP left every caller's memset precondition and
+ * assigns unproved). Whole words only, so that the assigns clause is exact: sizeof(cpu_set_t) and
+ * CPU_ALLOC_SIZE are whole words, and sched_getaffinity refuses any other size. Eva reduces neither
+ * postcondition on `unsigned long` words (nor through `(char *)`; checked 2026-11-19): after the call
+ * the words are initialized with any value. */
+/*@
+  requires whole_words: setsize % sizeof(__cpu_mask) == 0;
+  requires valid_set: \valid(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
+  assigns setp->__bits[0 .. setsize / sizeof(__cpu_mask) - 1] \from \nothing;
+  ensures zeroed: \forall integer k; 0 <= k < setsize / sizeof(__cpu_mask) ==> setp->__bits[k] == 0;
+  ensures zeroed_values: \subset(setp->__bits[0 .. setsize / sizeof(__cpu_mask) - 1], {0});
+  ensures initialized_set: \initialized(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
+*/
+extern void __fc_sched_cpuzero(size_t setsize, cpu_set_t *setp);
+
+/* sched_setaffinity(2). The kernel reads cpusetsize bytes of the set (at most its own mask size);
+ * the contract asks for whole words, cpusetsize rounded up, so an odd size over a buffer that ends
+ * mid-word is a false alarm, never a missed one. 0 or -1 (EINVAL for a set with no online CPU, ESRCH,
+ * EPERM). errno is not assigned, as in most of __fc_libc's <unistd.h>. */
+/*@
+  requires valid_mask:
+    \valid_read(mask->__bits + (0 .. (cpusetsize + sizeof(__cpu_mask) - 1) / sizeof(__cpu_mask) - 1));
+  requires initialized_mask:
+    \initialized(mask->__bits + (0 .. (cpusetsize + sizeof(__cpu_mask) - 1) / sizeof(__cpu_mask) - 1));
+  assigns \result \from indirect:pid, indirect:cpusetsize,
+                        indirect:mask->__bits[0 .. (cpusetsize + sizeof(__cpu_mask) - 1) / sizeof(__cpu_mask) - 1],
+                        indirect:Frama_C_entropy_source;
+  ensures result_ok_or_error: \result == 0 || \result == -1;
+*/
+extern int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask);
+
+/* sched_getaffinity(2) through glibc 2.41: on success the whole set, cpusetsize bytes, is written (the
+ * kernel's mask, then zeros); the kernel refuses (EINVAL) a size that is not whole words or holds fewer
+ * bits than it has CPUs, and on any error nothing is written. Checked against glibc in the analysis
+ * image. Stated twice, as pipe2 above: unconditionally for WP, in two behaviors for Eva. */
+/*@
+  requires valid_mask: \valid(mask->__bits + (0 .. cpusetsize / sizeof(__cpu_mask) - 1));
+  assigns mask->__bits[0 .. cpusetsize / sizeof(__cpu_mask) - 1]
+    \from indirect:pid, indirect:cpusetsize, indirect:Frama_C_entropy_source;
+  assigns \result \from indirect:pid, indirect:cpusetsize, indirect:Frama_C_entropy_source;
+  ensures result_ok_or_error: \result == 0 || \result == -1;
+  ensures initialized_on_success:
+    \result == 0 ==> \initialized(mask->__bits + (0 .. cpusetsize / sizeof(__cpu_mask) - 1));
+  behavior ok:
+    assumes nondet_ok: Frama_C_entropy_source != 0;
+    ensures result_ok: \result == 0;
+    ensures initialized_mask: \initialized(mask->__bits + (0 .. cpusetsize / sizeof(__cpu_mask) - 1));
+  behavior error:
+    assumes nondet_error: Frama_C_entropy_source == 0;
+    assigns \result \from indirect:pid, indirect:cpusetsize, indirect:Frama_C_entropy_source;
+    ensures result_error: \result == -1;
+  complete behaviors;
+  disjoint behaviors;
+*/
+extern int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask);
+#endif /* CPU_SETSIZE */
+#endif /* FC_STUBS_NO_SCHED_AFFINITY_DECLS */
+
+/*
+ * Linux names of glibc's <netinet/in.h> and <netinet/tcp.h> that __fc_libc's headers lack, found on nginx
+ * (run-1, 2026-11-19): `struct in_pktinfo` (the IP_PKTINFO control message; __fc_libc has IP_PKTINFO and
+ * struct in6_pktinfo), `struct tcp_info` (what TCP_INFO reads; __fc_libc has TCP_INFO), and every IP_,
+ * IPV6_, TCP_ and TCPI_OPT_ constant of glibc 2.41's two headers that __fc_libc does not define, with
+ * glibc's x86_64 values. nginx stopped on "field 'pkt' is declared with incomplete type 'struct
+ * in_pktinfo'" (src/event/ngx_event_udp.h), "Cannot resolve variable IP_BIND_ADDRESS_NO_PORT"
+ * (ngx_event_connect.c) and "sizeof on incomplete type 'struct tcp_info'" (ngx_http_variables.c).
+ * Same layouts as glibc (checked against it by tests/test_fc_stub_repairs.py). Each constant steps aside
+ * when already defined; the two structures cannot, so a later libc that adds one makes this header fail
+ * with "redefinition of 'in_pktinfo'": drop it here then. Define FC_STUBS_NO_NETINET_LINUX_DECLS for a
+ * target with its own (it also keeps <netinet/in.h> and <netinet/tcp.h> out of the force-include).
+ * Not declared: IP_MSFILTER_SIZE (struct ip_msfilter), the MCAST_* requests, IN_CLASS*, and the AF_, SO_,
+ * SOL_, SCM_ and MSG_ names of glibc's <sys/socket.h> that __fc_libc lacks.
+ */
+#ifndef FC_STUBS_NO_NETINET_LINUX_DECLS
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+struct in_pktinfo {
+  int ipi_ifindex;
+  struct in_addr ipi_spec_dst;
+  struct in_addr ipi_addr;
+};
+struct tcp_info {
+  uint8_t tcpi_state;
+  uint8_t tcpi_ca_state;
+  uint8_t tcpi_retransmits;
+  uint8_t tcpi_probes;
+  uint8_t tcpi_backoff;
+  uint8_t tcpi_options;
+  uint8_t tcpi_snd_wscale : 4, tcpi_rcv_wscale : 4;
+  uint32_t tcpi_rto;
+  uint32_t tcpi_ato;
+  uint32_t tcpi_snd_mss;
+  uint32_t tcpi_rcv_mss;
+  uint32_t tcpi_unacked;
+  uint32_t tcpi_sacked;
+  uint32_t tcpi_lost;
+  uint32_t tcpi_retrans;
+  uint32_t tcpi_fackets;
+  uint32_t tcpi_last_data_sent;
+  uint32_t tcpi_last_ack_sent;
+  uint32_t tcpi_last_data_recv;
+  uint32_t tcpi_last_ack_recv;
+  uint32_t tcpi_pmtu;
+  uint32_t tcpi_rcv_ssthresh;
+  uint32_t tcpi_rtt;
+  uint32_t tcpi_rttvar;
+  uint32_t tcpi_snd_ssthresh;
+  uint32_t tcpi_snd_cwnd;
+  uint32_t tcpi_advmss;
+  uint32_t tcpi_reordering;
+  uint32_t tcpi_rcv_rtt;
+  uint32_t tcpi_rcv_space;
+  uint32_t tcpi_total_retrans;
+};
+/* <netinet/in.h> (glibc <bits/in.h>) */
+#ifndef IP_NODEFRAG
+#define IP_NODEFRAG 22
+#endif
+#ifndef IP_CHECKSUM
+#define IP_CHECKSUM 23
+#endif
+#ifndef IP_BIND_ADDRESS_NO_PORT
+#define IP_BIND_ADDRESS_NO_PORT 24
+#endif
+#ifndef IP_RECVFRAGSIZE
+#define IP_RECVFRAGSIZE 25
+#endif
+#ifndef IP_RECVERR_RFC4884
+#define IP_RECVERR_RFC4884 26
+#endif
+#ifndef IP_MULTICAST_ALL
+#define IP_MULTICAST_ALL 49
+#endif
+#ifndef IP_UNICAST_IF
+#define IP_UNICAST_IF 50
+#endif
+#ifndef IP_LOCAL_PORT_RANGE
+#define IP_LOCAL_PORT_RANGE 51
+#endif
+#ifndef IP_PROTOCOL
+#define IP_PROTOCOL 52
+#endif
+#ifndef IP_PMTUDISC_INTERFACE
+#define IP_PMTUDISC_INTERFACE 4
+#endif
+#ifndef IP_PMTUDISC_OMIT
+#define IP_PMTUDISC_OMIT 5
+#endif
+#ifndef IPV6_MULTICAST_ALL
+#define IPV6_MULTICAST_ALL 29
+#endif
+#ifndef IPV6_ROUTER_ALERT_ISOLATE
+#define IPV6_ROUTER_ALERT_ISOLATE 30
+#endif
+#ifndef IPV6_RECVERR_RFC4884
+#define IPV6_RECVERR_RFC4884 31
+#endif
+#ifndef IPV6_HDRINCL
+#define IPV6_HDRINCL 36
+#endif
+#ifndef IPV6_RECVPATHMTU
+#define IPV6_RECVPATHMTU 60
+#endif
+#ifndef IPV6_PATHMTU
+#define IPV6_PATHMTU 61
+#endif
+#ifndef IPV6_DONTFRAG
+#define IPV6_DONTFRAG 62
+#endif
+#ifndef IPV6_AUTOFLOWLABEL
+#define IPV6_AUTOFLOWLABEL 70
+#endif
+#ifndef IPV6_ADDR_PREFERENCES
+#define IPV6_ADDR_PREFERENCES 72
+#endif
+#ifndef IPV6_MINHOPCOUNT
+#define IPV6_MINHOPCOUNT 73
+#endif
+#ifndef IPV6_ORIGDSTADDR
+#define IPV6_ORIGDSTADDR 74
+#endif
+#ifndef IPV6_RECVORIGDSTADDR
+#define IPV6_RECVORIGDSTADDR IPV6_ORIGDSTADDR
+#endif
+#ifndef IPV6_TRANSPARENT
+#define IPV6_TRANSPARENT 75
+#endif
+#ifndef IPV6_UNICAST_IF
+#define IPV6_UNICAST_IF 76
+#endif
+#ifndef IPV6_RECVFRAGSIZE
+#define IPV6_RECVFRAGSIZE 77
+#endif
+#ifndef IPV6_FREEBIND
+#define IPV6_FREEBIND 78
+#endif
+#ifndef IPV6_PMTUDISC_INTERFACE
+#define IPV6_PMTUDISC_INTERFACE 4
+#endif
+#ifndef IPV6_PMTUDISC_OMIT
+#define IPV6_PMTUDISC_OMIT 5
+#endif
+/* <netinet/tcp.h> */
+#ifndef TCP_MSS
+#define TCP_MSS 512
+#endif
+#ifndef TCP_MAXWIN
+#define TCP_MAXWIN 65535
+#endif
+#ifndef TCP_MAX_WINSHIFT
+#define TCP_MAX_WINSHIFT 14
+#endif
+#ifndef TCP_REPAIR_WINDOW
+#define TCP_REPAIR_WINDOW 29
+#endif
+#ifndef TCP_FASTOPEN_CONNECT
+#define TCP_FASTOPEN_CONNECT 30
+#endif
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
+#ifndef TCP_MD5SIG_EXT
+#define TCP_MD5SIG_EXT 32
+#endif
+#ifndef TCP_FASTOPEN_KEY
+#define TCP_FASTOPEN_KEY 33
+#endif
+#ifndef TCP_FASTOPEN_NO_COOKIE
+#define TCP_FASTOPEN_NO_COOKIE 34
+#endif
+#ifndef TCP_ZEROCOPY_RECEIVE
+#define TCP_ZEROCOPY_RECEIVE 35
+#endif
+#ifndef TCP_INQ
+#define TCP_INQ 36
+#endif
+#ifndef TCP_CM_INQ
+#define TCP_CM_INQ TCP_INQ
+#endif
+#ifndef TCP_TX_DELAY
+#define TCP_TX_DELAY 37
+#endif
+#ifndef TCP_REPAIR_ON
+#define TCP_REPAIR_ON 1
+#endif
+#ifndef TCP_REPAIR_OFF
+#define TCP_REPAIR_OFF 0
+#endif
+#ifndef TCP_REPAIR_OFF_NO_WP
+#define TCP_REPAIR_OFF_NO_WP -1
+#endif
+#ifndef TCP_MD5SIG_FLAG_PREFIX
+#define TCP_MD5SIG_FLAG_PREFIX 1
+#endif
+#ifndef TCP_MD5SIG_FLAG_IFINDEX
+#define TCP_MD5SIG_FLAG_IFINDEX 2
+#endif
+#ifndef TCP_MD5SIG_MAXKEYLEN
+#define TCP_MD5SIG_MAXKEYLEN 80
+#endif
+#ifndef TCP_COOKIE_MIN
+#define TCP_COOKIE_MIN 8
+#endif
+#ifndef TCP_COOKIE_MAX
+#define TCP_COOKIE_MAX 16
+#endif
+#ifndef TCP_COOKIE_PAIR_SIZE
+#define TCP_COOKIE_PAIR_SIZE (2 * TCP_COOKIE_MAX)
+#endif
+#ifndef TCP_COOKIE_IN_ALWAYS
+#define TCP_COOKIE_IN_ALWAYS (1 << 0)
+#endif
+#ifndef TCP_COOKIE_OUT_NEVER
+#define TCP_COOKIE_OUT_NEVER (1 << 1)
+#endif
+#ifndef TCP_S_DATA_IN
+#define TCP_S_DATA_IN (1 << 2)
+#endif
+#ifndef TCP_S_DATA_OUT
+#define TCP_S_DATA_OUT (1 << 3)
+#endif
+#ifndef TCP_MSS_DEFAULT
+#define TCP_MSS_DEFAULT 536U
+#endif
+#ifndef TCP_MSS_DESIRED
+#define TCP_MSS_DESIRED 1220U
+#endif
+#ifndef TCPI_OPT_TIMESTAMPS
+#define TCPI_OPT_TIMESTAMPS 1
+#endif
+#ifndef TCPI_OPT_SACK
+#define TCPI_OPT_SACK 2
+#endif
+#ifndef TCPI_OPT_WSCALE
+#define TCPI_OPT_WSCALE 4
+#endif
+#ifndef TCPI_OPT_ECN
+#define TCPI_OPT_ECN 8
+#endif
+#ifndef TCPI_OPT_ECN_SEEN
+#define TCPI_OPT_ECN_SEEN 16
+#endif
+#ifndef TCPI_OPT_SYN_DATA
+#define TCPI_OPT_SYN_DATA 32
+#endif
+#endif /* FC_STUBS_NO_NETINET_LINUX_DECLS */
+
 #endif /* __FRAMAC_EACSL__ */
 
 /*

@@ -126,6 +126,10 @@ ERROR_CHARS = 400
 # Exit code when Frama-C parsed no unit (build_capture.py uses 3 for needs_build_recipe).
 NO_UNIT_PARSED_RC = 4
 STATUS_NO_UNIT_PARSED = "no_unit_parsed"
+# A unit's parse status when Frama-C failed and so did the GCC fallback: no function or edge of it is in the
+# model (`gcc_fallback` says they came from GCC). Both are units Frama-C could not parse.
+STATUS_UNPARSED = "unparsed"
+FRAMAC_FAILED = ("gcc_fallback", STATUS_UNPARSED)
 THREAD_SPAWNERS = {"pthread_create": 2, "thrd_create": 1}
 SOURCE_FRAMAC = "frama-c-kernel"
 SOURCE_GCC = "gcc-callgraph-info"
@@ -1131,7 +1135,15 @@ def build_model(
             g = res["gcc"]
             entry["gcc_fallback"] = {"status": g["status"], "errors": g["errors"][:5]}
             builder.add_gcc(job["units"], g)
-            model["warnings"].append(f"{', '.join(job['units'])}: Frama-C cannot parse ({res['error']}); GCC fallback")
+            if g["status"] == "failed":
+                model["warnings"].append(
+                    f"{', '.join(job['units'])}: Frama-C cannot parse ({res['error']}) and the GCC fallback "
+                    f"failed too ({(g['errors'] or ['no error recorded'])[0]}): unparsed, its parse contributes no function or edge"
+                )
+            else:
+                model["warnings"].append(
+                    f"{', '.join(job['units'])}: Frama-C cannot parse ({res['error']}); GCC fallback"
+                )
         parse_jobs.append(entry)
     builder.resolve()
     if alias:
@@ -1151,13 +1163,18 @@ def build_model(
             rec["parse"] = {"status": "no_sources"}
         else:
             j = by_key[unit_job[name]]
+            fallback = j.get("gcc_fallback") or {}
             rec["parse"] = {
-                "status": "ok" if j["status"] == "ok" else "gcc_fallback",
+                "status": "ok"
+                if j["status"] == "ok"
+                else (STATUS_UNPARSED if fallback.get("status") == "failed" else "gcc_fallback"),
                 "job": j["key"],
                 "seconds": j["seconds"],
             }
             if j["status"] != "ok":
                 rec["parse"]["error"] = j["error"]
+            if rec["parse"]["status"] == STATUS_UNPARSED:
+                rec["parse"]["gcc_error"] = (fallback.get("errors") or ["no error recorded"])[0]
         rec["concurrent"] = name in builder.concurrent
         units_out[name] = rec
     for fid, f in builder.functions.items():
@@ -1179,7 +1196,7 @@ def build_model(
     rc, status = 0, "ok"
     if not parsed:
         rc, status = NO_UNIT_PARSED_RC, STATUS_NO_UNIT_PARSED
-        failed = sorted(n for n, u in units_out.items() if u["parse"]["status"] == "gcc_fallback")
+        failed = sorted(n for n, u in units_out.items() if u["parse"]["status"] in FRAMAC_FAILED)
         model["error"] = (
             f"Frama-C parsed none of the units ({', '.join(failed)}): see each unit's parse.error"
             if failed
@@ -1314,11 +1331,11 @@ def selftest(runner: Runner | None = None) -> dict:
 
 
 def unit_errors(model: dict) -> dict[str, str]:
-    """Frama-C's first error per unit on the GCC fallback."""
+    """Frama-C's first error per unit it could not parse (on the GCC fallback, or unparsed)."""
     return {
         name: str((u.get("parse") or {}).get("error") or "")
         for name, u in sorted((model.get("units") or {}).items())
-        if (u.get("parse") or {}).get("status") == "gcc_fallback"
+        if (u.get("parse") or {}).get("status") in FRAMAC_FAILED
     }
 
 

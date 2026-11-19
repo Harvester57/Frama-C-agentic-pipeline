@@ -260,6 +260,10 @@ def test_parser_finds_the_known_shipped_prototypes() -> None:
         ("fc_compat_types.h", "pipe2"),
         ("fc_compat_types.h", "getservbyname_r"),
         ("fc_compat_types.h", "getservbyport_r"),
+        ("fc_compat_types.h", "sched_setaffinity"),
+        ("fc_compat_types.h", "sched_getaffinity"),
+        ("fc_compat_types.h", "__sched_cpucount"),
+        ("fc_compat_types.h", "__fc_sched_cpuzero"),
     ):
         assert key in seen, f"parser lost {key}"
     # errno.h declares an object, ip_icmp.h only types and macros.

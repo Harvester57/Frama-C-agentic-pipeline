@@ -37,6 +37,20 @@ def shape(units: dict) -> dict:
     return {n: (u["kind"], u["files"], u["links"]) for n, u in units.items()}
 
 
+def _tree_with(tmp_path: Path, *files: str) -> str:
+    """A real tree holding `files` after the build, as the posix path the capture's executions use."""
+    tree = tmp_path / "tree"
+    for f in files:
+        (tree / f).parent.mkdir(parents=True, exist_ok=True)
+        (tree / f).write_text("x", encoding="utf-8")
+    tree.mkdir(exist_ok=True)
+    return tree.as_posix()
+
+
+def _cc(tree: str, *args: str) -> dict:
+    return {"exe": "/usr/bin/cc", "args": ["cc", *args], "cwd": tree}
+
+
 # --------------------------------------------------------------------------- recorded bear events
 
 
@@ -158,6 +172,113 @@ class TestRecordedEvents:
         assert bc.is_temp_probe("/tmp/cg7zzCGG/dummy.c")
         for p in ("src/a.c", "/s/shared/b.c", "/tmpfoo/x.c", "tmp/x.c"):
             assert not bc.is_temp_probe(p), p
+
+    def test_a_probe_whose_source_and_output_are_gone_after_the_build_is_dropped(self, tmp_path):
+        # nginx-1.31.9 run-1: nginx's hand-written configure (auto/feature) compiles and links each probe as
+        # `cc ... -o objs/autotest objs/autotest.c -lz` and deletes both files afterwards. The capture made it
+        # a link unit `objs/autotest` whose source phase0_model could not find. The rule is that the files
+        # are gone after the build, not the name: the generated objs/ngx_modules.c, still there, is kept.
+        tree = _tree_with(
+            tmp_path, "src/main.c", "objs/ngx_modules.c", "objs/main.o", "objs/ngx_modules.o", "objs/nginx"
+        )
+        execs = [
+            _cc(tree, "-D_GNU_SOURCE", "-D_FILE_OFFSET_BITS=64", "-o", "objs/autotest", "objs/autotest.c", "-lz"),
+            _cc(tree, "-D_GNU_SOURCE", "-o", "objs/autotest", "objs/autotest.c", "-lcrypt"),
+            _cc(tree, "-c", "-o", "objs/probe.o", "objs/probe.c"),  # a compile-only probe, linked by nothing
+            _cc(tree, "-c", "-o", "objs/main.o", "src/main.c"),
+            _cc(tree, "-c", "-I", "objs", "-o", "objs/ngx_modules.o", "objs/ngx_modules.c"),
+            _cc(tree, "-o", "objs/nginx", "objs/main.o", "objs/ngx_modules.o", "-lz"),
+        ]
+        cap = bc.classify_executions(execs, tree)
+        dropped = bc.drop_vanished_probes(cap, tree)
+        assert dropped == [
+            {"output": "objs/autotest", "sources": ["objs/autotest.c"]},
+            {"output": "objs/probe.o", "sources": ["objs/probe.c"]},
+        ]
+        assert cap["vanished_probes"] == dropped and cap["probes_dropped"] == 2
+        assert sorted(cap["compiles"]) == ["objs/main.o", "objs/ngx_modules.o"]
+        assert shape(bc.derive_units(cap, tree)) == {
+            "objs/nginx": ("executable", ["objs/ngx_modules.c", "src/main.c"], [])
+        }
+
+    def test_a_generated_source_the_build_deleted_is_kept_when_its_output_survives(self, tmp_path):
+        # make deletes intermediate files (a yacc/lex chain): the object, the executable or the archive
+        # built from the source is still there, so the compile is the project's, not a probe.
+        tree = _tree_with(tmp_path, "parse.o", "tool", "libm.a", "kept.c", "bin/main.o")
+        execs = [
+            _cc(tree, "-c", "-o", "parse.o", "parse.c"),  # source gone, object there
+            _cc(tree, "-o", "tool", "gen.c"),  # compile-and-link: source gone, executable there
+            _cc(tree, "-c", "-o", "member.o", "member.c"),  # both gone, but a member of a surviving archive
+            {"exe": "/usr/bin/ar", "args": ["ar", "rcs", "libm.a", "member.o"], "cwd": tree},
+            _cc(tree, "-o", "gone", "kept.c"),  # output gone, source there
+            _cc(tree, "-c", "-o", "bin/main.o", "main.c"),  # source gone, object there and linked below
+            _cc(tree, "-o", "bin/app", "bin/main.o", "parse.o"),  # app removed after the build; its objects stay
+        ]
+        cap = bc.classify_executions(execs, tree)
+        before = (sorted(cap["compiles"]), sorted(cap["artifacts"]))
+        assert bc.drop_vanished_probes(cap, tree) == []
+        assert (sorted(cap["compiles"]), sorted(cap["artifacts"])) == before
+        assert cap["probes_dropped"] == 0 and cap["vanished_probes"] == []
+
+    def test_the_capture_drops_vanished_probes_before_the_analysis(self, tmp_path, monkeypatch):
+        # The whole capture, with the build replaced by its recorded executions: the nginx probe never
+        # reaches the architecture check or the analysis, and the warnings say what was dropped.
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "src").mkdir()
+        (target / "src/main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        scratch = tmp_path / "scratch"
+        seen: dict = {}
+
+        def run_sandboxed_shell(command, cwd, scratch_, timeout, env_, wrap):
+            tree = (Path(scratch_) / "tree").as_posix()
+            for f in ("objs/main.o", "objs/nginx"):
+                (Path(tree) / f).parent.mkdir(parents=True, exist_ok=True)
+                (Path(tree) / f).write_text("x", encoding="utf-8")
+            execs = [
+                ["cc", "-o", "objs/autotest", "objs/autotest.c", "-lz"],
+                ["cc", "-c", "-o", "objs/main.o", "src/main.c"],
+                ["cc", "-o", "objs/nginx", "objs/main.o"],
+            ]
+            events = "".join(
+                json.dumps(
+                    {"started": {"execution": {"executable": "/usr/bin/cc", "arguments": a, "working_dir": tree}}}
+                )
+                + "\n"
+                for a in execs
+            )
+            (Path(scratch_) / "events.jsonl").write_text(events, encoding="utf-8")
+            return argparse.Namespace(returncode=0, timed_out=False, stdout="", stderr="")
+
+        def check_architecture(compiles, artifacts, tree):
+            seen["artifacts"] = sorted(artifacts)
+            return {"files": len(artifacts), "unknown": 0, "unsupported_total": 0, "unsupported": []}
+
+        recipe: dict = {"command": "make", "workdir": ".", "packages": [], "env": {}, "test_command": None,
+                  "install_command": None, "snapshot_extra": [], "origin": "user"}  # fmt: skip
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(bc, "host_machine", lambda: bc.SUPPORTED_ARCH)
+        monkeypatch.setattr(bc, "load_recipe", lambda args: dict(recipe))
+        monkeypatch.setattr(bc, "packages_missing", lambda pkgs: [])
+        monkeypatch.setattr(bc, "job_count", lambda: 1)
+        monkeypatch.setattr(bc, "run_sandboxed_shell", run_sandboxed_shell)
+        monkeypatch.setattr(bc, "check_architecture", check_architecture)
+        monkeypatch.setattr(bc, "analyse", lambda report, cap, *a: seen.update(cap=cap))
+        ns = argparse.Namespace(target=str(target), scratch=str(scratch), timeout=30)
+        report, code = bc.capture(ns)
+        assert code == 0, report
+
+        def rel(p: str) -> str:
+            # On a Windows host str(tree) has backslashes, so the capture keeps the paths absolute.
+            return p.rsplit("/tree/", 1)[-1]
+
+        assert [rel(a) for a in seen["artifacts"]] == ["objs/nginx"]
+        assert [rel(c) for c in sorted(seen["cap"]["compiles"])] == ["objs/main.o"]
+        dropped = seen["cap"]["vanished_probes"]
+        assert [(rel(d["output"]), [rel(s) for s in d["sources"]]) for d in dropped] == [
+            ("objs/autotest", ["objs/autotest.c"])
+        ]
+        assert any("objs/autotest" in w and "vanished_probes" in w for w in report["warnings"]), report["warnings"]
 
     def test_joined_and_separate_flags(self):
         cap = capture_of("flags")

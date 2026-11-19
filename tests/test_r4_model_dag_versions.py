@@ -318,6 +318,24 @@ def test_the_report_lists_a_fallback_unit_with_its_error_and_what_was_deferred()
     assert "liba.a" not in text and "Alias" not in text
 
 
+def test_the_report_lists_an_unparsed_unit_apart_from_the_gcc_fallback_ones():
+    # nginx-1.31.9 run-1: a unit whose GCC fallback failed too has no call graph at all, so the report
+    # must neither drop it nor say its call graph comes from GCC.
+    model = _fallback_model()
+    model["units"]["libb.a"]["parse"] = {"status": "ok"}
+    model["units"]["objs/autotest"] = {
+        "kind": "executable",
+        "test": False,
+        "parse": {"status": "unparsed", "error": "no source", "gcc_error": "cc1: fatal error: gone"},
+    }
+    lines = gr.fallback_lines(model, [])
+    text = "\n".join(lines)
+    assert lines[0] == "### Phase 0 parse"
+    assert "comes from GCC" not in text
+    row = next(line for line in lines if "`objs/autotest`" in line)
+    assert "no source" in row and "cc1: fatal error: gone" in row
+
+
 def test_the_report_has_no_parse_section_without_a_fallback_and_summarizes_alias():
     model = _fallback_model()
     model["units"]["libb.a"]["parse"] = {"status": "ok"}

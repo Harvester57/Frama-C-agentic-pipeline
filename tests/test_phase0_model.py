@@ -605,6 +605,68 @@ def test_build_model_stops_when_no_unit_parses(tmp_path, monkeypatch):
 
 
 @pytest.mark.unit
+def test_a_unit_whose_gcc_fallback_failed_too_is_unparsed_not_gcc_fallback(tmp_path, monkeypatch):
+    """
+    nginx-1.31.9 run-1: Frama-C and the GCC fallback both failed on objs/autotest (its source was gone),
+    yet the unit said `gcc_fallback`, which claims its functions and edges came from GCC. A fallback that
+    ran stays `gcc_fallback`, even with no function; one that failed is `unparsed`.
+    """
+    tree = tmp_path / "tree"
+    (tree / "src").mkdir(parents=True)
+    (tree / "src" / "a.c").write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    capture = {
+        "status": "ok",
+        "scratch": {"tree": str(tree)},
+        "compiles": [
+            {"source": "src/a.c", "object": "a.o", "flags": [], "system_flags": []},
+            {"source": "objs/autotest.c", "object": "objs/autotest::objs/autotest.c", "flags": [], "system_flags": []},
+        ],
+        "units": {
+            "liba.a": {"kind": "static_lib", "test": False, "objects": ["a.o"], "files": ["src/a.c"], "links": []},
+            "objs/autotest": {
+                "kind": "executable",
+                "test": False,
+                "objects": ["objs/autotest::objs/autotest.c"],
+                "files": ["objs/autotest.c"],
+                "links": [],
+            },
+        },
+    }
+    cap = tmp_path / "cap.json"
+    cap.write_text(json.dumps(capture), encoding="utf-8")
+    gone = "cc1: fatal error: /framac-scratch/tree/objs/autotest.c: No such file or directory"
+    monkeypatch.setattr(pm, "compile_dump_module", lambda *a, **k: (tmp_path / "dump.cmxs", ""))
+    monkeypatch.setattr(pm, "macro_aliases", lambda *a, **k: [])
+    monkeypatch.setattr(
+        pm,
+        "framac_parse",
+        lambda job, *a, **k: {
+            "status": "parse_failed",
+            "error": f"{job['compiles'][0]['source']}: bad",
+            "seconds": 0.1,
+        },
+    )
+
+    def gcc(job, *a, **k):
+        if job["compiles"][0]["source"] == "objs/autotest.c":
+            return {"status": "failed", "errors": [gone], "functions": {}, "edges": [], "indirect": []}
+        return {"status": "ok", "errors": [], "functions": {}, "edges": [], "indirect": []}
+
+    monkeypatch.setattr(pm, "gcc_callgraph", gcc)
+    model, rc = pm.build_model(cap, tmp_path / "out.json", broker=False)
+    assert rc == pm.NO_UNIT_PARSED_RC
+    probe = model["units"]["objs/autotest"]["parse"]
+    assert probe["status"] == "unparsed"
+    assert probe["error"] == "objs/autotest.c: bad" and probe["gcc_error"] == gone
+    assert model["units"]["liba.a"]["parse"]["status"] == "gcc_fallback"
+    assert "objs/autotest" in model["error"] and "liba.a" in model["error"]
+    assert pm.unit_errors(model) == {"liba.a": "src/a.c: bad", "objs/autotest": "objs/autotest.c: bad"}
+    warning = next(w for w in model["warnings"] if w.startswith("objs/autotest:"))
+    assert "GCC fallback failed too" in warning and gone in warning
+    assert not pm.validate_model(model)
+
+
+@pytest.mark.unit
 def test_parse_class_and_container_class():
     assert resources.CLASSES["parse"].runs_target_code is False
     assert resources.CLASSES["parse"].max_cpus == 1

@@ -17,7 +17,9 @@ the run's named Docker volume at /framac-scratch:
      command there, under `bear intercept`, through sandbox_exec.py (rlimits, env allowlist, timeout);
   2. read compile, link and archive steps from the intercepted executions, drop build-system probes
      (CMake try-compiles and compiler identification, autoconf conftest, meson-private, and compiles
-     outside the tree in a temp dir such as config.guess's `$TMPDIR/cgXXXXXX/dummy.c`);
+     outside the tree in a temp dir such as config.guess's `$TMPDIR/cgXXXXXX/dummy.c`), and any compile
+     or link whose sources and outputs are all gone after the build (a hand-written configure's probe,
+     nginx's `objs/autotest`: build.vanished_probes);
   3. link units: every executable, shared and static library; its files are the sources of its own
      objects, `links` the project libraries it links (`.a` members followed through `ar`, `-l` resolved
      against the produced artifacts). Objects linked into nothing form one `unlinked:<dir>` unit per dir.
@@ -843,6 +845,55 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
         "probes_dropped": probes,
         "skipped_compiler_like": skipped_compiler_like,
     }
+
+
+def drop_vanished_probes(cap: dict, tree: str) -> list[dict]:
+    """
+    Drop, in place, the compiles and links whose sources and outputs are all gone after the build: a
+    build-system probe the path rules do not know (nginx's hand-written configure compiles and links
+    `objs/autotest.c` to `objs/autotest`, then deletes both). Returns what was dropped, also in
+    `cap["vanished_probes"]`, and adds it to `cap["probes_dropped"]`.
+
+    A compile is vanished when its source is gone and so is its output (the object; for a
+    compile-and-link, the executable or library). A link or archive is dropped when its output is gone
+    and every object in it is a vanished compile. A vanished compile that a kept artifact still names
+    stays: the source was an intermediate file make deleted (a yacc or lex output), not a probe. A
+    generated source still in the tree (nginx's objs/ngx_modules.c) is never vanished.
+    """
+
+    def gone(path: str) -> bool:
+        absolute_ = posixpath.isabs(path) or os.path.isabs(path)
+        return not os.path.lexists(path if absolute_ else posixpath.join(tree, path))
+
+    compiles: dict[str, dict] = cap["compiles"]
+    artifacts: dict[str, dict] = cap["artifacts"]
+    vanished = {
+        key
+        for key, c in compiles.items()
+        if gone(c["source"]) and gone(key.split("::", 1)[0] if c.get("implicit") else key)
+    }
+    removed = {
+        name: artifacts.pop(name)
+        for name in [
+            n for n, a in artifacts.items() if a["objects"] and gone(n) and all(o in vanished for o in a["objects"])
+        ]
+    }
+    named = {o for a in artifacts.values() for o in a["objects"]}
+    dropped = vanished - named
+    sources: dict[str, set[str]] = defaultdict(set)  # output -> its dropped sources
+    covered: set[str] = set()
+    for name, a in removed.items():
+        own = [o for o in a["objects"] if o in dropped]
+        covered.update(own)
+        sources[name].update(compiles[o]["source"] for o in own)
+    for o in dropped - covered:
+        sources[o.split("::", 1)[0]].add(compiles[o]["source"])
+    for o in dropped:
+        del compiles[o]
+    records = [{"output": out, "sources": sorted(srcs)} for out, srcs in sorted(sources.items())]
+    cap["vanished_probes"] = records
+    cap["probes_dropped"] = cap.get("probes_dropped", 0) + len(records)
+    return records
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1970,6 +2021,13 @@ def capture(args: argparse.Namespace) -> tuple[dict, int]:
                 report["warnings"].append(hint)
         return report, EXIT_NEEDS_RECIPE
     cap = classify_executions(execs, str(tree))
+    vanished = drop_vanished_probes(cap, str(tree))
+    if vanished:
+        shown = ", ".join(r["output"] for r in vanished[:5]) + (", ..." if len(vanished) > 5 else "")
+        report["warnings"].append(
+            f"{len(vanished)} build-system probe(s) dropped: their sources and outputs are gone after the build "
+            f"(build.vanished_probes): {shown}"
+        )
     if cap.get("skipped_compiler_like"):
         for item in cap["skipped_compiler_like"]:
             report["warnings"].append(f"skipped compiler-like executable: {item}")
@@ -2149,6 +2207,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
         for c in entries
     ]
     report["build"]["probes_dropped"] = cap["probes_dropped"]
+    report["build"]["vanished_probes"] = cap.get("vanished_probes") or []
     snapshot = Path.cwd() / target_env.SNAPSHOT_REL
     generated = generated_headers(entries, Path(report["target"]))
     report["snapshot"] = build_snapshot(
