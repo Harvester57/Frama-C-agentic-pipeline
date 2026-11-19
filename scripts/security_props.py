@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import string
 import sys
@@ -98,7 +99,7 @@ from acsl_ast import (  # noqa: E402
 )
 from framac_common import STUB_OVERLAY_REL, atomic_write_json, load_json_optional, utc_now  # noqa: E402
 from phase0_model import MODEL_FEATURES, model_features  # noqa: E402
-from stub_gen import block_state, split_blocks  # noqa: E402
+from stub_gen import block_state, classify, split_blocks  # noqa: E402
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
@@ -550,7 +551,6 @@ _SHARE: list[str | None] = []
 def _share_path() -> str | None:
     """Frama-C's share directory (FRAMAC_SHARE, else `frama-c -print-share-path`), where its libc is."""
     if not _SHARE:
-        import os  # noqa: PLC0415
         import shutil  # noqa: PLC0415
         import subprocess  # noqa: PLC0415
 
@@ -945,12 +945,29 @@ class _Gen:
                 f"{stubbed(lists['set_assigns'])}"
             )
         if lists["no_assigns"]:
+            # Where the contract goes: stub_gen.py writes an overlay skeleton for what a host header
+            # declares (or the overlay already stubs); anything else takes it at its own declaration.
+            in_overlay = sorted(
+                n
+                for n in lists["no_assigns"]
+                if self.contracts.of(n).get("stub") or classify(self.contracts.decls.get(n))[0] == "host_header"
+            )
+            elsewhere = sorted(set(lists["no_assigns"]) - set(in_overlay))
+            todo = []
+            if in_overlay:
+                todo.append(
+                    f"fill the stub of {some(in_overlay)} in {STUB_OVERLAY_REL}/ with an `assigns` (stub_gen.py "
+                    "writes the skeleton; a block under #ifdef FC_STUB_DRAFT counts for nothing)"
+                )
+            if elsewhere:
+                todo.append(
+                    f"give {some(elsewhere)} a contract with an `assigns` where it is declared (no stub skeleton: "
+                    "a project header, Frama-C's libc, or no prototype at all)"
+                )
             self.warnings.append(
                 f"{what}: the declared function(s) {some(lists['no_assigns'])} have no `assigns` at their "
                 "declaration: MetAcsl generates nothing for what they write, so the property says nothing about it"
-                f"{stubbed(lists['no_assigns'])}. Give each a contract with `assigns` in {STUB_OVERLAY_REL}/ "
-                "(stub_gen.py; a draft under #ifdef FC_STUB_DRAFT counts for nothing), then re-run "
-                "security_props.py run"
+                f"{stubbed(lists['no_assigns'])}. To check it, {' and '.join(todo)}, then re-run security_props.py run"
             )
         return {
             "excluded": {u["function"] for u in unchecked},
@@ -3592,7 +3609,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     roots = [args.work] + ([Path(str(model["tree"]))] if model.get("tree") else [])
     # The run's stub overlay, which Frama-C and MetAcsl find before the real headers: a filled stub's
     # `assigns` is the contract of its function (the model's declarations predate the overlay).
-    overlay = args.run_dir / STUB_OVERLAY_REL
+    # The same directory the Frama-C command line puts first (framac_common.framac_cpp_flags):
+    # FRAMAC_STUB_OVERLAY_DIR when set, else the run directory's.
+    named = os.environ.get("FRAMAC_STUB_OVERLAY_DIR")
+    overlay = Path(named) if named else args.run_dir / STUB_OVERLAY_REL
     doc = generate(model, threat, roots=roots, overlay=overlay)
     if note:
         doc["warnings"].insert(0, note)

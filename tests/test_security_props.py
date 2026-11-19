@@ -2668,6 +2668,7 @@ extern int deflateEnd(z_streamp strm);
 extern void pair_set(int *a, int *b);
 extern int accept4(int fd, void *addr, void *len, int flags);
 extern int hand(int *out);
+extern int eventfd_read(int fd, unsigned long *value);
 """
 
 # The run's stub overlay, in the shapes scripts/stub_gen.py writes and stub authors fill (nginx run-5):
@@ -2731,6 +2732,12 @@ _STUB_EVENTFD = """/* Stub overlay for <sys/eventfd.h> */
   assigns \\result \\from indirect:count, indirect:flags;
 */
 extern int eventfd(unsigned int count, int flags);
+
+/* fc-stub: eventfd_read */
+/*@
+  requires valid_value: \\valid(value);
+*/
+extern int eventfd_read(int fd, unsigned long *value);
 """
 
 # A stub written by hand, without the fc-stub markers (stub_gen.py records it as `manual`).
@@ -2758,7 +2765,9 @@ def _overlay_run(run_dir: Path) -> dict:
 
     def decl(name: str) -> dict:
         line = next(i for i, text in enumerate(lines, 1) if f" {name}(" in text or f"*{name}(" in text)
-        return {"decl": f"/framac-scratch/tree/host.h:{line}", "proto": f"int {name}();"}
+        # accept4 as nginx calls it: without a prototype, so stub_gen.py writes it no skeleton.
+        proto = f"int ( /* missing proto */ {name})();" if name == "accept4" else f"int {name}();"
+        return {"decl": f"/framac-scratch/tree/host.h:{line}", "proto": proto}
 
     calls = {
         "uses_crypt": "crypt_r",
@@ -2768,6 +2777,7 @@ def _overlay_run(run_dir: Path) -> dict:
         "uses_set": "pair_set",
         "uses_accept": "accept4",
         "uses_hand": "hand",
+        "uses_read": "eventfd_read",
     }
     functions = {
         "a.c#login": fn("login", writes={"pointer": 0, "params": [], "globals": ["auth_ok"]}),
@@ -2798,17 +2808,18 @@ def test_a_stub_overlay_contract_replaces_the_bare_declaration(run_dir, monkeypa
     write_json(run_dir / "workspace/reports/phase0_model.json", m)
     gate = {"function": "login", "state": "auth_ok", "protects": ["admin"], "description": "d"}
     monkeypatch.setattr(trust, "recorded_threat_model", lambda _m: (threat(auth_gates=[gate]), None))
+    monkeypatch.delenv("FRAMAC_STUB_OVERLAY_DIR", raising=False)
     assert sp.main(["run"]) == 0
     doc = json.loads((run_dir / "workspace/reports/security_props.json").read_text(encoding="utf-8"))
     assert not sp.validate(doc), sp.validate(doc)
     prop = by_name(doc)["L4_auth_state_login"]
     declared = prop["declared_callees"]
-    # Only the draft and the unstubbed function stay without `assigns`.
-    assert [c["callee"] for c in declared["no_assigns"]] == ["accept4", "deflateEnd"], declared
+    # Only the draft, the unstubbed function and an active stub without `assigns` stay without `assigns`.
+    assert [c["callee"] for c in declared["no_assigns"]] == ["accept4", "deflateEnd", "eventfd_read"], declared
     # The callers of a filled stub (and of a hand-written one) are instances of the property.
     for caller in ("uses_crypt", "uses_eventfd", "uses_deflate", "uses_hand"):
         assert f"a.c#{caller}" in prop["instances"], (caller, prop["instances"])
-    assert not {"a.c#uses_end", "a.c#uses_accept", "a.c#uses_set"} & set(prop["instances"])
+    assert not {"a.c#uses_end", "a.c#uses_accept", "a.c#uses_set", "a.c#uses_read"} & set(prop["instances"])
     # A set-valued stub stops MetAcsl: its caller leaves the targets, and the entry names the stub.
     assert [(c["callee"], c["stub"]) for c in declared["set_assigns"]] == [("pair_set", "workspace/stubs/zlib.h:28")]
     assert declared["set_assigns"][0]["assigns"] == ["\\union(*a, *b)"]
@@ -2817,8 +2828,23 @@ def test_a_stub_overlay_contract_replaces_the_bare_declaration(run_dir, monkeypa
     # The draft's entry keeps the model's declaration and names no stub; the warning says where to fill it.
     end = next(c for c in declared["no_assigns"] if c["callee"] == "deflateEnd")
     assert end["decl"] == "/framac-scratch/tree/host.h:5" and "stub" not in end
+    read = next(c for c in declared["no_assigns"] if c["callee"] == "eventfd_read")
+    assert read["stub"] == "workspace/stubs/sys/eventfd.h:17"
     warning = next(w for w in doc["warnings"] if "(L4_auth_state_login): the declared function(s)" in w)
-    assert "accept4, deflateEnd have no `assigns`" in warning and "workspace/stubs/" in warning
+    assert "accept4, deflateEnd, eventfd_read have no `assigns`" in warning, warning
+    # It names the stub whose contract was read, and where each missing contract goes.
+    assert "(contract read in their stub in workspace/stubs/: eventfd_read)" in warning, warning
+    assert "fill the stub of deflateEnd, eventfd_read in workspace/stubs/" in warning, warning
+    assert "give accept4 a contract with an `assigns` where it is declared" in warning, warning
+    set_warning = next(w for w in doc["warnings"] if "(L4_auth_state_login): pair_set assign(s) a set" in w)
+    assert set_warning.endswith("(contract read in their stub in workspace/stubs/: pair_set)"), set_warning
+    # FRAMAC_STUB_OVERLAY_DIR, which the Frama-C command line follows too, names the overlay when set.
+    empty = run_dir / "elsewhere"
+    empty.mkdir()
+    monkeypatch.setenv("FRAMAC_STUB_OVERLAY_DIR", str(empty))
+    assert sp.main(["run"]) == 0
+    doc = json.loads((run_dir / "workspace/reports/security_props.json").read_text(encoding="utf-8"))
+    assert "crypt_r" in [c["callee"] for c in by_name(doc)["L4_auth_state_login"]["declared_callees"]["no_assigns"]]
 
 
 @pytest.mark.unit
