@@ -1,0 +1,10 @@
+$ fc_stub_driver.e-acsl 2  # op_version, exit -6
+
+/w/workspace/stubs/op/oplib.h: In function 'op_version'
+/w/workspace/stubs/op/oplib.h:33: Error: Postcondition failed:
+	The failing predicate is:
+	valid_str:
+		valid_read_string(\result).
+	With values at failure point:
+	- valid_str: valid_read_string(\result): 0
+	- \result: 0x78007e6e6000
