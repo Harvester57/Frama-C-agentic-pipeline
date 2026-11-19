@@ -2012,8 +2012,10 @@ def _target_feature_macros(
     units whose context the harness, which includes the same headers, must have. The flags reach the
     other sources' compiles too (one cppflags per module): `other_sources` lists them. A macro the
     flags already define the same way is `given`; one they define otherwise is the caller's: kept,
-    listed in `conflicts` and said on stderr. Without a capture, a compile of the sources, a tree or
-    gcc, or with no such macro, `cppflags` is returned unchanged and nothing is recorded.
+    listed in `conflicts` and said on stderr. A compile that cannot be preprocessed (no gcc, an error,
+    a timeout) is said on stderr and listed in `failed`; the macros come from the others. Without a
+    capture, a compile of the sources or a tree, or with no such macro and no failure, `cppflags` is
+    returned unchanged and nothing is recorded.
     """
     import include_context as ic
 
@@ -2036,7 +2038,15 @@ def _target_feature_macros(
     with_headers = [c for c in compiles if any(_includes_header(c, h) for h in headers)]
     scanned = with_headers or compiles
     derived = ic.feature_macros_of(scanned, ic.context_tree(dag, capture))
-    if not derived["macros"] and not derived["differing"]:
+    if derived["failed"]:
+        first = derived["failed"][0]
+        _feature_warn(
+            module_name,
+            f"{len(derived['failed'])} of the module's compiles could not be preprocessed for the target's "
+            f"feature-test macros, which are derived from the others only (sidecar feature_macros.failed); "
+            f"first: {first['source']}: {first['error']}",
+        )
+    if not derived["macros"] and not derived["differing"] and not derived["failed"]:
         return cppflags, None
     merged = ic.merge_feature_macros(_split_cppflags(cppflags), derived["macros"])
     for flag in merged["flags"]:

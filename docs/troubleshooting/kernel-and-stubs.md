@@ -236,7 +236,7 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
     - `::test_the_probes_get_the_macros_the_target_defines_before_the_header` (both cases)
     - `::test_a_header_without_a_compile_gets_no_context_and_the_same_probes`
     - `::test_the_context_scan_drops_undefined_guards_and_system_macros`
-- **Feature-test macros, fixed** on branch `sup/nginx-harness-feature-macros` (not merged): macros such as `_GNU_SOURCE` and `_FILE_OFFSET_BITS` that glibc's `features.h` reads at the first system header are now carried.
+- **Feature-test macros, fixed** by commit `50310f6` on branch `sup/nginx-harness-feature-macros` (not merged): macros such as `_GNU_SOURCE` and `_FILE_OFFSET_BITS` that glibc's `features.h` reads at the first system header are now carried.
   - The scan in [`../../scripts/include_context.py`](../../scripts/include_context.py) keeps a macro the target defines before its first system header when a system header the compile enters tests it. Include guards are excluded.
   - All three probes get them as `-D` flags on the command line (a `#define` in the probe would come after `features.h`). `stub_check.json` records them under `include_context.feature_macros` and `feature_flags`, plus `feature_not_carried` for a macro that cannot be a flag.
   - The same mechanism feeds the harness cppflags; see [`./harnesses-and-seeds.md`](./harnesses-and-seeds.md).

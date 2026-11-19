@@ -25,6 +25,7 @@ import pytest
 
 import generate_harness as gh
 import include_context as ic
+import pipeline_make
 from conftest import ANALYSIS_IMAGE, ROOT, require_docker_images, write_json
 
 FM_CONFIG_H = """#ifndef FM_CONFIG_H_INCLUDED
@@ -240,7 +241,8 @@ def test_the_harness_flags_get_the_targets_feature_macros(fm_host):
     flags = shlex.split(res["cppflags"])
     assert "-D_GNU_SOURCE=" in flags and "-D_FILE_OFFSET_BITS=64" in flags, flags
     assert not [f for f in flags if "FM_HAVE_PKTINFO" in f or "INCLUDED" in f], flags
-    pre = [c for c in calls if c[:3] == ["gcc", "-E", "-dD"]]
+    assert pipeline_make.check_flags(flags) == [], "the Make builds' flag allowlist takes a valueless -DX="
+    pre =[c for c in calls if c[:3] == ["gcc", "-E", "-dD"]]
     assert len(pre) == 1 and pre[0][-1].endswith("workspace/work/src/fm.c"), calls
     meta = json.loads((run / "workspace" / "harnesses" / "harness_fm.json").read_text(encoding="utf-8"))
     fm = meta["feature_macros"]
@@ -353,6 +355,41 @@ def test_a_source_that_defines_them_after_a_system_header_agrees(fm_host, monkey
     assert fm["compiles"] == ["src/bpf.c", "src/fm.c"] and "other_sources" not in fm, fm
     assert fm["late"] == {"_FILE_OFFSET_BITS": ["src/bpf.c"], "_GNU_SOURCE": ["src/bpf.c"]}, fm
     assert "differing" not in fm, fm
+
+
+@pytest.mark.unit
+def test_a_compile_that_cannot_be_preprocessed_is_said_and_recorded(fm_host, monkeypatch, capsys):
+    """
+    No gcc, or a failing `gcc -E`, must not look like a target without feature macros: the generator says it
+    on stderr and the sidecar lists it under `failed`. When some compiles succeed, their macros are carried.
+    """
+    run, calls, _ = fm_host
+    _fm_with_bpf(run, ["src/fm.h", "src/fm_config.h"])
+    tree = (run / "workspace" / "work").as_posix()
+    sysroot = (run / "sysroot").as_posix()
+    fail_all = {"on": True}
+
+    def fake(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
+        calls.append(list(cmd))
+        if fail_all["on"] or cmd[-1].endswith("/bpf.c"):
+            return 1, "src/bpf.c:1:10: fatal error: missing.h: No such file or directory"
+        return 0, _fm_dd_output(tree, sysroot)
+
+    monkeypatch.setattr(ic, "run_preprocessor", fake)
+    flags, meta = _gen_with_bpf(run, "workspace/work/src/fm.h")
+    fm = meta["feature_macros"]
+    assert "-D_GNU_SOURCE=" not in flags, flags
+    assert fm["compiles"] == [] and fm["macros"] == {} and fm["flags"] == [], fm
+    assert [f["source"] for f in fm["failed"]] == ["src/bpf.c", "src/fm.c"], fm
+    assert "missing.h" in fm["failed"][0]["error"], fm
+    assert "could not be preprocessed" in capsys.readouterr().err
+
+    fail_all["on"] = False
+    ic.clear_cache()
+    flags, meta = _gen_with_bpf(run, "workspace/work/src/fm.h")
+    fm = meta["feature_macros"]
+    assert "-D_GNU_SOURCE=" in flags and "-D_FILE_OFFSET_BITS=64" in flags, flags
+    assert fm["compiles"] == ["src/fm.c"] and [f["source"] for f in fm["failed"]] == ["src/bpf.c"], fm
 
 
 @pytest.mark.unit
