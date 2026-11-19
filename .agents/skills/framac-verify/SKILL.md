@@ -20,7 +20,7 @@ argument-hint: "<target-dir> [--module <name>] [--profile quick|standard|deep] [
 
 # /framac-verify
 
-Umbrella orchestrator that takes a C codebase (from a single module up to 90,000+ LoC) through the 4-phase hybrid static/dynamic pipeline. Design reference: `docs/guides/v2-design.md`.
+Umbrella orchestrator that takes a C codebase (from a single module to a large multi-module project) through the 4-phase hybrid static/dynamic pipeline. Design reference: `docs/guides/v2-design.md`.
 
 The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Markdown in `docs/references/` (see `docs/references/README.md`; mounted inside the container at `/opt/framac-pipeline/docs/references`). Consult them only when a skill, a brief, and `docs/troubleshooting/README.md` don't answer the question. Grep `INDEX.md` for the topic, then read only the matching line range. `wp_scheduler.py next --prepare` automatically populates `{references_dir}` in rendered briefs.
 

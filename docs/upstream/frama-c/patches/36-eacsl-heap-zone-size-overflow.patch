@@ -1,4 +1,4 @@
-From b5296eeb81ed17904711672b0b99977e0d6e0704 Mon Sep 17 00:00:00 2001
+From 29005691a081826f341418db534e958997564745 Mon Sep 17 00:00:00 2001
 From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
 Date: Tue, 17 Nov 2026 18:30:13 +0000
 Subject: [PATCH] [e-acsl] compute the zone sizes of --zone-sizes in size_t
@@ -63,7 +63,7 @@ index 97a4875897..00d067be05 100644
    pthread_attr_setstacksize(pattr, wrapped->stack_size);
  
 diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
-index 216139be96..9a9cae7567 100644
+index 216139be96..0beefa3364 100644
 --- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
 +++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
 @@ -56,7 +56,7 @@
@@ -71,7 +71,7 @@ index 216139be96..9a9cae7567 100644
  /** Hardcoded sizes of tracked program segments {{{ */
  /*! \brief Size of a program's heap */
 -#define PGM_HEAP_SIZE (E_ACSL_HEAP_SIZE * MB)
-+#define PGM_HEAP_SIZE ((size_t)E_ACSL_HEAP_SIZE * MB)
++#define PGM_HEAP_SIZE ((size_t)(E_ACSL_HEAP_SIZE) * MB)
  
  /*! \brief Size of a program's Thread-local storage (TLS).
    Standard streams stdin, stdout and stderr are put here.
@@ -80,7 +80,7 @@ index 216139be96..9a9cae7567 100644
    default size is small enough so that both segments do not overlap. */
  #ifndef PGM_TLS_SIZE
 -#  define PGM_TLS_SIZE (E_ACSL_TLS_SIZE * MB)
-+#  define PGM_TLS_SIZE ((size_t)E_ACSL_TLS_SIZE * MB)
++#  define PGM_TLS_SIZE ((size_t)(E_ACSL_TLS_SIZE) * MB)
  #endif
  
  /*! \brief Mspace padding used by shadow segments. This is to make sure that

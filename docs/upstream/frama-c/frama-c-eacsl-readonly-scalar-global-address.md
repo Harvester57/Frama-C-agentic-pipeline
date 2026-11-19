@@ -30,16 +30,23 @@ share/e-acsl/observation_model/segment_model/e_acsl_segment_tracking.c:226: Use 
 Aborted (core dumped)
 ```
 
-The same code path fails in three more ways:
+The same code path fails in four more ways:
 
 - a const **union** global: the generated `(void *)u` is a cast from a union to a pointer, and the
   kernel rejects E-ACSL's own code: `User Error: implicit cast: cast from union u to void *`
   (Issue 23);
 - a const **struct with a bitfield** member: E-ACSL aborts with
   `Taking the address of a bitfield with &[ cb.a ]`;
+- a **multi-field const struct** (`struct pair { int a; int b; }; static const struct pair cp = { 1, 2 };`):
+  E-ACSL emits one `__e_acsl_mark_readonly` call per field (`& cp.a`, `& cp.b`). Because
+  `eacsl_mark_readonly(ptr)` calls `mark_readonly_region((uintptr_t)ptr, _block_length(ptr))` where
+  `_block_length(ptr)` is the whole enclosing block size, any non-first field writes read-only shadow
+  bits past the end of the struct: under `--rt-debug` it aborts with
+  `Attempt to mark read-only 8 bytes past block boundaries` (`e_acsl_segment_tracking.c:497`), and
+  without `--rt-debug` it silently corrupts adjacent global shadow memory. An empty `const struct {}`
+  emits zero calls;
 - a const **pointer** global (`int *const p = &x;`): E-ACSL emits `__e_acsl_mark_readonly((void *)p)`,
-  so the block `p` points to is marked read-only instead of `p`. I saw no failure from it in a small
-  program (`*p = 1` with `\valid(p)` checked passes); I did not look for a case where it shows.
+  so the block `p` points to is marked read-only instead of `p`.
 
 The globals are monitored under `-e-acsl-full-mtracking` (`e-acsl-gcc -M`), or when an annotation
 needs them. Without either, nothing is emitted for them and the programs run. In the pipeline, the scalar
@@ -66,11 +73,13 @@ and the union case cost 10 libnettle modules their E-ACSL build.
 - `Cil.evar vi` is the value of the global. That is right for an array only, which decays to its
   address (string literals are the most common case in the test oracles). For a scalar or a pointer it
   is a value; for a union it cannot be cast to `void *` at all.
-- For a struct, `Cil.mkAddrOf` on a bitfield member aborts (`src/kernel/services/ast_queries/cil.ml:4874`).
+- For a struct, `Cil.mkAddrOf` on a bitfield member aborts (`src/kernel/services/ast_queries/cil.ml:4874`),
+  an empty struct produces an empty list of calls, and every field at a non-zero offset triggers an
+  out-of-bounds shadow write because `eacsl_mark_readonly(void *ptr)` marks `_block_length(ptr)` bytes
+  starting at `ptr` (`plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c:118-122`,
+  `DVASSERT` in `mark_readonly_region` at `e_acsl_segment_tracking.c:497`).
 
-`__e_acsl_mark_readonly(void *ptr)` expects the address of the block
-(`share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c:118-122` marks
-`_block_length(ptr)` bytes from `ptr`).
+`__e_acsl_mark_readonly(void *ptr)` expects the base address of the enclosing block.
 
 The code came with [e-acsl#223](https://git.frama-c.com/frama-c/e-acsl/-/issues/223) (`dc9cf84924`,
 "[e-acsl] fix mark_readonly for structs", 2026-02-19), which fixed the same typing error for structs
@@ -79,7 +88,7 @@ by marking each field. Before it, `15b2c6f412` ("mark const globals as readonly"
 
 ## Versions
 
-- Reproduced on Frama-C `35.0~~dev (Bromine)`, `master` at `3dff90fc70` (2026-11-13), and on
+- Reproduced on Frama-C `35.0~~dev (Bromine)`, `master` at `b80fcac74f` (also `3dff90fc70`) and on
   `34.0~beta (Selenium)`, Debian 13, gcc 14.2.0. Same output on both.
 - `git tag --contains 15b2c6f412` lists 32.0 onwards; I did not run releases before 34.
 
@@ -100,9 +109,11 @@ int main(void)
 
 [`./repro/27-eacsl-readonly-scalar-global-address-bitfield.c`](./repro/27-eacsl-readonly-scalar-global-address-bitfield.c)
 is `struct B { unsigned a : 3; unsigned b : 5; }; const struct B cb = { 1, 2 };` read in `main`.
+[`./repro/27-eacsl-readonly-scalar-global-address-struct.c`](./repro/27-eacsl-readonly-scalar-global-address-struct.c)
+is `struct pair { int a; int b; }; static const struct pair cp = { 1, 2 };` read in `main`.
 [`./repro/27-eacsl-readonly-scalar-global-address.sh`](./repro/27-eacsl-readonly-scalar-global-address.sh)
 builds them with `e-acsl-gcc -X` (instrumented program only), shows the `mark_readonly` calls and runs
-them. On master (34.0~beta prints the same, with its version):
+them. On `master` at `b80fcac74f` (34.0~beta prints the same, with its version):
 
 ```text
 35.0~~dev (Bromine)
@@ -113,12 +124,21 @@ run: exit 0
 build: exit 0
     __e_acsl_mark_readonly((void *)kMaxEmbeddedInt);
 share/e-acsl/observation_model/segment_model/e_acsl_segment_tracking.c:226: Use of invalid address 0x17 in predicate
-Aborted (core dumped)
+Aborted
 run: exit 134
 --- e-acsl-gcc -q -X -M 27-eacsl-readonly-scalar-global-address-bitfield.c
 [kernel] Failure: Taking the address of a bitfield with &[ cb.a ]
 e-acsl-gcc: fatal error: aborted by Frama-C
 build: exit 1
+--- e-acsl-gcc -q -X -M --rt-debug 27-eacsl-readonly-scalar-global-address-struct.c
+build: exit 0
+    __e_acsl_mark_readonly((void *)(& cp.a));
+    __e_acsl_mark_readonly((void *)(& cp.b));
+share/e-acsl/observation_model/segment_model/e_acsl_segment_tracking.c:497: Attempt to mark read-only 8 bytes past block boundaries
+starting at 0x41-500c with block length 8 at base address 0x41-5008
+...
+Aborted
+run: exit 134
 ```
 
 The union case is reproduced by
@@ -127,67 +147,73 @@ The union case is reproduced by
 ## Proposed fix
 
 [`./patches/27-eacsl-readonly-scalar-global-address.patch`](./patches/27-eacsl-readonly-scalar-global-address.patch)
-(one commit on `fix/eacsl-readonly-global-address` from `3dff90fc70`, "[e-acsl] mark const globals
-read-only through their address"). It also fixes Issue 23.
+(one commit on `fix/eacsl-readonly-global-address` from `b80fcac74f`, "[e-acsl] mark const globals
+read-only through their base address"). It also fixes Issue 23.
 
 ```diff
             let rec mark_readonly ty = match ty.tnode with
               | TNamed {ttype} -> mark_readonly ttype
 -             | TComp {cstruct = true; cfields = Some fields} ->
-+             | TComp {cstruct = true; cfields = Some fields}
-+               when List.for_all (fun f -> f.fbitfield = None) fields ->
-                List.map
-                  (fun field ->
-                     let lval = Var vi, Field (field, NoOffset) in
-                     Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOf ~loc lval)
- 
-                  fields
+-               List.map
+-                 (fun field ->
+-                    let lval = Var vi, Field (field, NoOffset) in
+-                    Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOf ~loc lval)
+-
+-                 fields
 -             | _ -> [Smart_stmt.mark_readonly ~loc @@ Cil.evar ~loc vi]
 +             | TArray _ ->
 +               (* the array decays to its address *)
-+               [Smart_stmt.mark_readonly ~loc @@ Cil.evar ~loc vi]
++               Smart_stmt.mark_readonly ~loc @@ Cil.evar ~loc vi
 +             | _ ->
-+               (* scalars, pointers, unions and structures with a bitfield
-+                  (which has no address): the runtime expects the address of
-+                  the global, not its value *)
-+               [Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOfVi vi]
++               (* scalars, pointers, unions and structs: the runtime expects
++                  the base address of the global block *)
++               Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOfVi vi
+            in
+            let stmts =
+              if Ast_types.C.is_const vi.vtype then
+                (* a const global can't be modified after initialization. *)
+-               mark_readonly vi.vtype @ stmts
++               mark_readonly vi.vtype :: stmts
+              else stmts
             in
 ```
 
+- The per-field `TComp` branch is removed completely, fixing bitfield structs, empty structs, and the
+  out-of-bounds read-only shadow write on multi-field structs.
 - Arrays keep `Cil.evar`, so the existing oracles with string literals do not change.
-- Scalars, pointers, unions, incomplete structs and structs with a bitfield member get the address of
-  the whole global: `__e_acsl_mark_readonly((void *)(& kMaxEmbeddedInt));`.
-- Structs without bitfields keep the per-field calls of e-acsl#223. I did not merge them into one call
-  on the whole struct, which would be simpler, because e-acsl#223 chose per-field marking and I do not
-  know why.
+- Every other type (scalars, pointers, unions and structs) gets `Cil.mkAddrOfVi vi`, emitting a single
+  call on the base address of the whole block:
+  `__e_acsl_mark_readonly((void *)(& kMaxEmbeddedInt));`, `(void *)(& cp)`, etc.
+
+One existing oracle changes: `plugins/e-acsl/tests/concurrency/oracle/gen_sequential_threads.0.c`
+(`__e_acsl_mark_readonly((void *)(& s.i));` -> `__e_acsl_mark_readonly((void *)(& s));`).
 
 The patch adds the regression test `plugins/e-acsl/tests/full-mtracking/const_globals.c` with its
-oracles: a const scalar, a const union (initialized and not), a const struct with bitfields and a const
-pointer. It asserts that each is `\valid_read` and not `\valid` (marked read-only), and that the
-pointee of the const pointer is still `\valid`.
+oracles: a const scalar, a const union (initialized and not), a multi-field non-bitfield const struct,
+a const struct with bitfields, and a const pointer. Its `dev` configuration runs with
+`--full-mtracking --rt-debug` and asserts that each const global is `\valid_read` and not `\valid`
+(marked read-only), and that for the const pointer `ptr`, `\valid(ptr) && \valid_read(&ptr) && !\valid(&ptr)`
+holds.
 
 ## Validation of the proposed fix
 
-`master` at `3dff90fc70` in `framac-master-audit:3dff90f`, then the same tree with the patch, rebuilt
-with dune and installed (Debian 13, gcc 14.2.0).
+`master` at `b80fcac74f` in `framac-master-audit:b80fcac`, validated with
+[`../../../tools/upstream_audit/revalidate.sh`](../../../tools/upstream_audit/revalidate.sh)
+(`JOBS=4 /w/revalidate.sh before 27 23` and `JOBS=4 /w/revalidate.sh package 27`, plus reproducer 23 on
+the installed patched tree; Debian 13, gcc 14.2.0):
 
-| Check | `master` | Patched |
+| Check | `master` (`b80fcac74f`) | Patched |
 |---|---|---|
 | `27-eacsl-readonly-scalar-global-address.c`, `-X` | runs, exit 0 | runs, exit 0 |
 | Same, `-X -M` | `(void *)kMaxEmbeddedInt`, "Use of invalid address 0x17", exit 134 | `(void *)(& kMaxEmbeddedInt)`, runs, exit 0 |
 | `27-...-bitfield.c`, `-X -M` | "Taking the address of a bitfield", build exit 1 | `(void *)(& cb)`, runs, exit 0 |
+| `27-...-struct.c`, `-X -M --rt-debug` | per-field calls (`& cp.a`, `& cp.b`), "Attempt to mark read-only 8 bytes past block boundaries", exit 134 | `(void *)(& cp)`, runs, exit 0 |
 | Issue 23 union variants (4), `-X -M` | "implicit cast: cast from union u to void *", build exit 1 | `(void *)(& zero_block)` / `(& main_zero_block)`, runs, exit 0 |
-| Issue 23 const struct and non-const union variants | run, exit 0 | unchanged |
-| New test `full-mtracking/const_globals.c` | "implicit cast" (line 16) | passes, default and `dev` configurations |
-| ptests `plugins/e-acsl/tests`, default configuration (198 results) | — | only the new oracles; every other test matches its oracle (string literals keep `Cil.evar`) |
-| ptests, `dev` configuration (compiled and run) in every directory but `libc/` and `format/` (188 results) | — | all match `oracle_dev` |
-| `git diff --check` | — | clean in the source and the test; the generated oracles have the trailing space after `Warning:` and the final blank line that every E-ACSL oracle has |
-| `ocp-indent` 1.9.0, repository `.ocp-indent` | — | `global_observer.ml` unchanged |
-| `make check-lint`, `make check-headers` | — | not run: the image's tree is not a git checkout |
-
-Not completed: the `dev` configuration of `libc/` and `format/`. Their tests abort child processes on
-purpose, and the crash handler of the Docker host (`core_pattern` piped to a WSL crash collector) made
-`format/printf.c` exceed a 40-minute timeout. Their default configuration ran and matches the oracles.
+| Issue 23 `CONST_STRUCT`, `-X -M` | per-field calls (`& zero_block.b`, `& zero_block.w`), runs, exit 0 | single call `(void *)(& zero_block)`, runs, exit 0 |
+| Issue 23 `NON_CONST_UNION`, `-X -M` | runs, exit 0 | unchanged |
+| New test `full-mtracking/const_globals.c` | fails in default (`exit=1`, `implicit cast` on line 25) and `dev` (`exit=1`) | passes in default (`exit=0`) and `dev` (`--full-mtracking --rt-debug`, `exit=0`) |
+| `./dev/test.sh -p plugins/e-acsl` (default suite) | — | passes (`exit=0`); only `const_globals` (new) and `concurrency/oracle/gen_sequential_threads.0.c` (1 line) updated; `concurrency/sequential_threads.c` also passes in `dev` |
+| `./dev/check-files.sh -p HEAD~1` (lint + headers) | — | passes (`exit=0`) on all 5 files |
 
 ## Workaround
 

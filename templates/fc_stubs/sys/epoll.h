@@ -37,10 +37,11 @@
 
 #include <features.h>
 #include <stdint.h>
-#include <signal.h>
 __BEGIN_DECLS
 
 #include <__fc_define_max_open_files.h>
+#include <__fc_define_sigset_t.h>
+#include <errno.h>
 
 extern volatile int Frama_C_entropy_source;
 
@@ -87,13 +88,13 @@ struct epoll_event {
 
 /*@
   requires valid_size: size > 0;
-  assigns \result \from indirect:size;
+  assigns \result, errno \from indirect:size;
   ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 */
 extern int epoll_create(int size);
 
 /*@
-  assigns \result \from indirect:flags;
+  assigns \result, errno \from indirect:flags;
   ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 */
 extern int epoll_create1(int flags);
@@ -105,8 +106,9 @@ extern int epoll_create1(int flags);
     op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL || op == EPOLL_CTL_MOD;
   requires valid_event: op == EPOLL_CTL_DEL || \valid_read(event);
   //missing: assigns 'interest list of epfd' \from fd, op, event->events, event->data;
-  assigns \result \from indirect:epfd, indirect:op, indirect:fd,
-                        indirect:Frama_C_entropy_source;
+  assigns \result, errno \from indirect:epfd, indirect:op, indirect:fd,
+                               indirect:event, indirect:event->events,
+                               indirect:Frama_C_entropy_source;
   ensures result_ok_or_error: \result == 0 || \result == -1;
 */
 extern int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
@@ -115,8 +117,9 @@ extern int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
   requires valid_epfd: 0 <= epfd < __FC_MAX_OPEN_FILES;
   requires valid_maxevents: maxevents > 0;
   requires valid_events: \valid(events + (0 .. maxevents - 1));
-  assigns \result \from indirect:epfd, indirect:maxevents, indirect:timeout,
-                        indirect:Frama_C_entropy_source;
+  assigns \result, errno \from indirect:epfd, indirect:maxevents,
+                               indirect:timeout,
+                               indirect:Frama_C_entropy_source;
   assigns events[0 .. maxevents - 1]
     \from indirect:epfd, indirect:maxevents, indirect:timeout,
           indirect:Frama_C_entropy_source;
@@ -141,11 +144,15 @@ extern int epoll_wait(int epfd, struct epoll_event *events,
   requires valid_maxevents: maxevents > 0;
   requires valid_events: \valid(events + (0 .. maxevents - 1));
   requires valid_sigmask_or_null: sigmask == \null || \valid_read(sigmask);
-  assigns \result \from indirect:epfd, indirect:maxevents, indirect:timeout,
-                        indirect:sigmask, indirect:Frama_C_entropy_source;
+  requires initialization:sigmask: sigmask == \null || \initialized(sigmask);
+  assigns \result, errno \from indirect:epfd, indirect:maxevents,
+                               indirect:timeout, indirect:sigmask,
+                               indirect:*sigmask,
+                               indirect:Frama_C_entropy_source;
   assigns events[0 .. maxevents - 1]
     \from indirect:epfd, indirect:maxevents, indirect:timeout,
-          indirect:sigmask, indirect:Frama_C_entropy_source;
+          indirect:sigmask, indirect:*sigmask,
+          indirect:Frama_C_entropy_source;
   ensures result_bounded: -1 <= \result <= maxevents; // pipeline addition (not in !56)
   behavior full:
     assumes nondet_full: Frama_C_entropy_source != 0;

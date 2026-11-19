@@ -17,6 +17,18 @@ void swapped(int size) { }
 /*@ requires \forall integer n; (0 <= n < size ==> n == 1000) ==> n < size; */
 void forall_guard_in_hypothesis(int size) { }
 
+/* false for i == size, j == 0: the hypothesis holds, i < size does not */
+/*@ requires \forall integer i, j; (0 <= i < size ==> 0 <= j < size) ==> i < size; */
+void forall_nested_implication(int size) { }
+
+/* false for i == size, j == 0, k == 0 */
+/*@ requires \forall integer i, j, k; (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size; */
+void forall_nested_implication_conj(int size) { }
+
+/* false for i == 0, j == -1: 0 <= j is false in the consequent */
+/*@ requires \forall integer i, j; 0 <= i < size ==> 0 <= j && (j < size ==> i < size); */
+void forall_conj_after_implication(int size) { }
+
 int main(int argc, char **argv)
 {
   (void)argv;
@@ -25,7 +37,10 @@ int main(int argc, char **argv)
   case 2: three_conjuncts(5); break;
   case 3: parenthesized(5); break;
   case 4: swapped(5); break;
-  default: forall_guard_in_hypothesis(5); break;
+  case 5: forall_guard_in_hypothesis(5); break;
+  case 6: forall_nested_implication(5); break;
+  case 7: forall_nested_implication_conj(5); break;
+  default: forall_conj_after_implication(5); break;
   }
   return 0;
 }

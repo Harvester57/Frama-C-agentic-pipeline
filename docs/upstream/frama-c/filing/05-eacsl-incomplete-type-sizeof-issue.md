@@ -4,7 +4,7 @@
 
 ### Summary
 
-When an annotation involves a pointer to an incomplete (opaque) struct type, E-ACSL generates `sizeof` and `__alignof__` of that type, so the instrumented file does not compile with gcc or clang. Opaque handles (`typedef struct ctx ctx;`) are common in C APIs.
+When an annotation involves an incomplete non-void, non-function type (an opaque struct or union, an unsized array such as `extern int a[]`, or a forward-declared enum), E-ACSL generates `sizeof` or `__alignof__` of that type, so the instrumented file does not compile with gcc or clang. Opaque handles (`typedef struct ctx ctx;`) and extern unsized arrays are common in C APIs.
 
 ### Steps to reproduce the issue
 
@@ -45,6 +45,28 @@ e-acsl-gcc -o ov.inst.c -O ov ov.c
 e-acsl-gcc -F -rte -o oc.inst.c -O oc oc.c
 ```
 
+`oe.c` (`TSizeOfE` on an opaque struct global and an unsized array):
+
+```c
+struct opaque;
+extern struct opaque g;
+extern int a[];
+
+void check_sizeof(void) {
+  /*@ assert sizeof(g) > 0; */
+  /*@ assert sizeof(a) > 0; */
+}
+
+int main(void) {
+  check_sizeof();
+  return 0;
+}
+```
+
+```sh
+e-acsl-gcc -o oe.inst.c -O oe oe.c
+```
+
 ### Expected behaviour
 
 The programs are instrumented and build. An annotation that E-ACSL cannot translate because the
@@ -72,12 +94,22 @@ oc.inst.c:325:45: error: invalid application of ‘__alignof__’ to incomplete 
 e-acsl-gcc: fatal error: fail to compile/link instrumented code
 ```
 
-`\initialized(obj)` and `\valid(obj)` fail the same way. clang rejects the code too.
+`\initialized(obj)` and `\valid(obj)` fail the same way, and `oe.c` fails with:
+
+```text
+oe.inst.c:269:43: error: invalid application of ‘sizeof’ to incomplete type ‘struct opaque’
+oe.inst.c:276:28: error: invalid application of ‘sizeof’ to incomplete type ‘struct opaque’
+oe.inst.c:284:45: error: invalid application of ‘sizeof’ to incomplete type ‘int[]’
+oe.inst.c:291:28: error: invalid application of ‘sizeof’ to incomplete type ‘int[]’
+e-acsl-gcc: fatal error: fail to compile/link instrumented code
+```
+
+clang rejects the code too.
 
 ### Contextual information
 
 - Frama-C installation mode: from source (`master`) and opam (Docker image based on `framac/frama-c:dev`)
-- Frama-C version: 35.0~~dev (Bromine), `master` at 3dff90fc70; also 34.0~beta (Selenium)
+- Frama-C version: 35.0~~dev (Bromine), `master` at `b80fcac74f` (originally reported on `3dff90fc70`); also 34.0~beta (Selenium)
 - Plug-in used: E-ACSL (`e-acsl-gcc`), RTE
 - OS name: Debian GNU/Linux
 - OS version: 13 (trixie)
@@ -91,17 +123,21 @@ e-acsl-gcc: fatal error: fail to compile/link instrumented code
 - `\valid`, `\valid_read`, `\initialized` build the size of the pointed type in
   `term_to_ptr_and_size` (`plugins/e-acsl/src/code_generator/memory_translate.ml:274-281`,
   `Smart_exp.ptr_sizeof`) and `range_to_ptr_and_size` (`:175-189`, `TSizeOf ty`);
-- `\aligned(p, alignof(json_object))`, added by `-rte` (`pointer_alignment`) for the cast, is
-  typed and translated as is (`plugins/e-acsl/src/analyses/typing.ml:343-346`).
+- `\aligned(p, alignof(json_object))`, added by `-rte` (`pointer_alignment`) for the cast, and
+  user-written `sizeof(T)`/`alignof(T)` (`TSizeOf`/`TAlignOf`) as well as expression forms
+  `sizeof(e)` (`TSizeOfE`) and `TAlignOfE` are typed and translated as is
+  (`plugins/e-acsl/src/analyses/typing.ml:346-370`).
 
 **Fix.** Ignore these annotations with the usual "not yet supported" warning:
 
-1. in typing, reject `sizeof`/`alignof` of an incomplete struct or union (covers the RTE
-   alignment assertion and user-written `sizeof`/`alignof`);
-2. in `memory_translate.ml`, reject memory predicates whose pointee is incomplete, before any
-   statement is generated (covers `\valid`, `\valid_read`, `\initialized` and their range forms).
-   The check cannot sit in typing: translating `\valid` does not consult the typing errors of the
-   predicate.
+1. in typing, reject `TSizeOf`, `TAlignOf`, `TSizeOfE` and `TAlignOfE` of an incomplete
+   non-void, non-function type (covers the RTE alignment assertion, user-written
+   `sizeof(T)`/`alignof(T)`, and `sizeof(e)`/`TAlignOfE` on expressions of incomplete struct,
+   union, array, or enum type);
+2. in `memory_translate.ml`, reject memory predicates whose pointee is an incomplete non-void,
+   non-function type, before any statement is generated (covers `\valid`, `\valid_read`,
+   `\initialized` and their range forms). The check cannot sit in typing: translating `\valid`
+   does not consult the typing errors of the predicate.
 
 `void` and function types are left out of both checks: `sizeof(void)` is accepted by gcc and clang,
 so `\valid` on a `void *` keeps working. With the fix:

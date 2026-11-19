@@ -30,7 +30,28 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
 - The scripts of 32, 33, 36, 37 and 38 print a table and always exit 0: compare their output with the
   "before" and "after" blocks in their headers. Their optional `EACSL_SHARE` points `e-acsl-gcc` at
   another copy of the runtime sources. 34 has no patch and 40's patch only changes the manual, so both have only a "before" output.
-  41 (drafted, not filed) has no patch either: only a "before" output.
+  41 prints one line per `TIOCM_*` name and exits 1 while the bug is present, 0
+  once it is fixed. Its "before" and "after" outputs were taken on `master` `b80fcac74f`: the audit
+  image's tree fast-forwarded (`git fetch https://git.frama-c.com/pub/frama-c.git master`), rebuilt
+  and reinstalled.
+  42 runs one C file four times (`-DCASE_contract`, `lemma`, `suffix`, `real`) with
+  `-wp-prover none -wp-print`, so it needs no prover; it exits 1 while the bug is present and 0
+  once it is fixed. Its outputs were taken on `master` `b80fcac74f` in the same way as 41's.
+  43 builds one C file six times with `e-acsl-gcc` (`-DCASE_exponent`, `tolerance`,
+  `exponent_false`, `hexadecimal`, `long_double`, `long_double_false`) and runs each binary. It
+  prints one line per case, and exits 1 while the bug is present (6 of 6 cases fail) and 0 once
+  it is fixed. It finds the script under either name: the audit image installs `e-acsl-gcc`,
+  other installations `e-acsl-gcc.sh`. Its outputs were taken on `b80fcac74f` too.
+  44 runs nine checks on four C files: five Eva checks compared with the compiled program,
+  two WP callers (one whose postcondition is false at run time and must not be proved), a
+  byte-loop `strlcat` that WP must prove against the contract of `<string.h>`, and an
+  overlapping call that Eva must reject. It needs gcc and
+  Alt-Ergo, prints one line per check, and exits 1 while the bug is present (9 of 9 checks
+  fail) and 0 once it is fixed. Its outputs were taken on the image
+  `framac-master-audit:b80fcac`; `34.0~beta` gives the same "before" lines.
+  45 is about the MetAcsl plug-in: it needs `framac-analysis:latest` (the audit image's MetAcsl
+  does not load) and Alt-Ergo, prints one line per case, and exits 1 while `\result` is refused
+  in a `\postcond` property. It has only a "before" output: no patched build exists.
 - Patched images `framac-master-audit:3dff90f-p28` to `-p31` held `master` with one patch each
   (the "after" runs of 28 to 31). In the master image, install a rebuilt tree with
   `dune install --release --prefix /home/opam/.opam/5.5` (plain `dune install` fails with

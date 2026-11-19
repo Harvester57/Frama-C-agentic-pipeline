@@ -4,7 +4,7 @@ Draft bug report for the Frama-C issue tracker (https://git.frama-c.com/pub/fram
 
 **Filing package:** [issue](./filing/24-eacsl-guarded-exists-drops-conjunct-issue.md), [MR](./filing/24-eacsl-guarded-exists-drops-conjunct-mr.md), [reproducer](./repro/24-eacsl-guarded-exists-drops-conjunct.sh), [patch](./patches/24-eacsl-guarded-exists-drops-conjunct.patch)
 
-**Soundness bug.** E-ACSL reports a false predicate as valid. Nothing warns.
+**Soundness bug.** E-ACSL reports false predicates as valid. Nothing warns.
 
 ## Summary
 
@@ -38,12 +38,20 @@ The generated loop tests the guard and `n >= 0` only. `n == 1000` is gone:
 - Parentheses do not help: `0 <= n < size && (n == 1000 && n >= 0)` is translated the same way.
 - With the conjuncts swapped (`0 <= n < size && n >= 0 && n == 1000`), the precondition fails, as it
   should, but only because the false conjunct happens to be the last one.
-- `\forall integer n; 0 <= n < size ==> P && Q` is translated correctly (`P && Q` is the right
-  operand of the implication).
-- A related form is translated wrongly too: `\forall integer n; (0 <= n < size ==> P) ==> Q` is
-  checked as `\forall integer n; 0 <= n < size ==> Q`. `P` is dropped, and so is every `n` outside the
-  range, for which the hypothesis is true. `\forall integer n; (0 <= n < size ==> n == 1000) ==> n < size`
-  is false for `n == size`, and passes.
+- `\forall integer n; 0 <= n < size ==> P && Q` and right-nested chains
+  `\forall integer i, j; 0 <= i < size ==> 0 <= j < size ==> P(i, j)` are translated correctly.
+- Related `\forall` forms are translated wrongly too:
+  - `\forall integer n; (0 <= n < size ==> P) ==> Q` is checked as `\forall integer n; 0 <= n < size ==> Q`,
+    dropping `P` and every `n` outside the range.
+  - Multi-variable nested implications inside a hypothesis, such as
+    `\forall integer i, j; (0 <= i < size ==> 0 <= j < size) ==> i < size` and
+    `\forall integer i, j, k; (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size`, are
+    checked as `\forall ...; 0 <= i < size && 0 <= j < size ... ==> i < size` (valid), even though the
+    original formulas are false for `i == size, j == 0` (and `k == 0`).
+  - Conjunctions outside an implication hypothesis while unguarded variables remain, such as
+    `\forall integer i, j; 0 <= i < size ==> 0 <= j && (j < size ==> i < size)`, are checked as
+    `\forall integer i, j; 0 <= i < size && 0 <= j < size ==> i < size` (valid), even though the
+    original formula is false for `i == 0, j == -1`.
 
 This form is common in contracts on buffers: "some index in range satisfies P and Q", for example
 `\exists integer i; 0 <= i < n && \valid_read(s + (0 .. i)) && s[i] == '\0'` for a NUL-terminated
@@ -65,22 +73,30 @@ if any. On `Pand(lhs, rhs)`, it visits `lhs` and ignores the goal that visit ret
 - the outer visit discards `P` and returns `Q`.
 
 `Quantif.convert` (`plugins/e-acsl/src/code_generator/quantif.ml:64`) then builds the loop for the
-goal `Q`. The `Pimplies` case (line 581) discards the goal of its left operand the same way, which gives
-the `(G ==> P) ==> Q` mistranslation.
+goal `Q`.
+
+For `\forall`, `visit_quantif_relations` also does not track whether it is currently inside the
+left-hand side (hypothesis) of a `Pimplies`. Thus:
+
+- inside `lhs` of `Pimplies`, a nested `Pimplies` is treated as if `(A ==> B) ==> C` were
+  `(A && B) ==> C`, even when `B` bounds remaining variables (so checking only `Option.is_some lhs_goal`
+  is insufficient because the inner `Pimplies` returns `None`);
+- outside `lhs` of `Pimplies` (for example on `rhs` of an outer `Pimplies` while another variable is
+  still unguarded), a `Pand` is treated as a guard conjunction rather than a consequent conjunction.
 
 ## Versions
 
-- Reproduced on Frama-C `35.0~~dev (Bromine)`, `master` at `3dff90fc70` (2026-11-13), and on
-  `34.0~beta (Selenium)`, Debian 13, gcc 14.2.0. Same output on both.
+- Reproduced on Frama-C `35.0~~dev (Bromine)`, `master` at `b80fcac74f` (and previously `3dff90fc70`),
+  and on `34.0~beta (Selenium)`, Debian 13, gcc 14.2.0. Same output on all of them.
 - The code has not changed in this area since 34. I did not check older releases.
 
 ## Reproduction
 
 [`./repro/24-eacsl-guarded-exists-drops-conjunct.c`](./repro/24-eacsl-guarded-exists-drops-conjunct.c)
-has five functions whose precondition is false for `size == 5`. `main` calls one of them, chosen by the
+has eight functions whose precondition is false for `size == 5`. `main` calls one of them, chosen by the
 number of arguments. [`./repro/24-eacsl-guarded-exists-drops-conjunct.sh`](./repro/24-eacsl-guarded-exists-drops-conjunct.sh)
-builds it with `e-acsl-gcc -X` (instrumented program only) and runs each case. On master (34.0~beta
-prints the same, with its version), only `swapped` fails:
+builds it with `e-acsl-gcc -X` (instrumented program only) and runs each case. On `master` (`b80fcac74f`),
+only `swapped` fails:
 
 ```text
 35.0~~dev (Bromine)
@@ -90,55 +106,83 @@ three_conjuncts(5): exit 0
 parenthesized(5): exit 0
 swapped(5): exit 134 24-eacsl-guarded-exists-drops-conjunct.c:13: Error: Precondition failed:
 forall_guard_in_hypothesis(5): exit 0
+forall_nested_implication(5): exit 0
+forall_nested_implication_conj(5): exit 0
+forall_conj_after_implication(5): exit 0
 ```
 
 ## Proposed fix
 
 [`./patches/24-eacsl-guarded-exists-drops-conjunct.patch`](./patches/24-eacsl-guarded-exists-drops-conjunct.patch)
-(one commit on `fix/eacsl-guarded-quantifier-goal` from `3dff90fc70`, "[e-acsl] check every conjunct
+(one commit on `fix/eacsl-guarded-quantifier-goal` from `b80fcac74f`, "[e-acsl] check every conjunct
 after the guard of a quantification"). In `visit_quantif_relations`:
 
-- `Pand`: when the visit of the left operand returned a goal, the goal is that goal and the right
-  operand, `Logic_const.pand (lhs_goal, rhs)`. On `((G && P) && Q)`, the goal is `P && Q`; with more
-  conjuncts the recursion builds `(P && Q) && R`, and so on.
-- `Pimplies`: when the left operand already contains the end of the guard, as in
-  `(G ==> P) ==> Q`, the guard does not bound the quantification. The predicate is rejected with
-  "invalid quantification guard, found '⇒' after the end of the guard of an hypothesis", like the
-  other unsupported guards: E-ACSL warns and does not check the annotation, instead of checking a
-  weaker predicate.
+- Add an optional `?(in_lhs=false)` flag tracking whether traversal is inside the hypothesis of an
+  implication in a universal quantification.
+- `Pimplies`: when `in_lhs` is `true`, reject unconditionally with `"invalid quantification guard,
+  found '⇒' inside the hypothesis of an implication"`. Otherwise, for `\forall`, visit `lhs` with
+  `~in_lhs:true`, and if unguarded variables remain, recurse on `rhs` with `in_lhs = false` (so
+  right-associative chained implications `0 <= i < n ==> 0 <= j < m ==> P(i, j)` remain accepted).
+- `Pand`: when `is_forall && not in_lhs`, reject with `"invalid quantification guard, expecting '⇒' to
+  separate the hypotheses from the goal, found '∧'"`. Otherwise propagate `~in_lhs` to both operands of
+  `Pand`. For `\exists`, when the visit of `lhs` returned a goal, the goal is
+  `Logic_const.pand ~loc:p.pred_loc (lhs_goal, rhs)`. On `((G && P) && Q)`, the goal is `P && Q`; with
+  more conjuncts the recursion builds `(P && Q) && R`, and so on.
 
 ```diff
+-let rec visit_quantif_relations ~is_forall ctxt p =
++let rec visit_quantif_relations ~is_forall ?(in_lhs=false) ctxt p =
+   match p.pred_content with
    | Pimplies(lhs, rhs) ->
 -    let ctxt, _ = visit_quantif_relations ~is_forall ctxt lhs in
 -    if is_forall then begin
-+    let ctxt, lhs_goal = visit_quantif_relations ~is_forall ctxt lhs in
-+    if Option.is_some lhs_goal then begin
-+      (* the guards end inside [lhs], as in [(0 <= i < n ==> p) ==> q]: they do
-+         not guard the whole predicate *)
++    if in_lhs then begin
++      (* An implication inside the hypothesis of an implication, as in
++         [(0 <= i < n ==> p) ==> q] or [(0 <= i < n ==> 0 <= j < m) ==> q],
++         does not guard the whole quantification. *)
 +      let msg =
 +        Format.asprintf
 +          "@[invalid quantification guard, found '%t'@ \
-+           after the end of the guard of an hypothesis@]"
++           inside the hypothesis of an implication@]"
 +          Unicode.pp_implies
 +      in
 +      Constraints.raise_error msg ctxt
 +    end else if is_forall then begin
++      let ctxt, _ = visit_quantif_relations ~is_forall ~in_lhs:true ctxt lhs in
+       if Constraints.has_unguarded_bounded_vars ctxt then
+         visit_quantif_relations ~is_forall ctxt rhs
+       else
+         ctxt, Some rhs
+     end else
  ...
    | Pand(lhs, rhs) ->
 -    let ctxt, _ = visit_quantif_relations ~is_forall ctxt lhs in
-+    let ctxt, lhs_goal = visit_quantif_relations ~is_forall ctxt lhs in
-     if Constraints.has_unguarded_bounded_vars ctxt then
-       visit_quantif_relations ~is_forall ctxt rhs
-     else if not is_forall then
+-    if Constraints.has_unguarded_bounded_vars ctxt then
+-      visit_quantif_relations ~is_forall ctxt rhs
+-    else if not is_forall then
 -      ctxt, Some rhs
-+      (* The parser associates conjunctions to the left:
-+         [0 <= i < n && p && q] is [((0 <= i < n) && p) && q]. If the goal
-+         started inside [lhs] ([p] here), [rhs] is its last conjunct. *)
-+      let goal = match lhs_goal with
-+        | None -> rhs
-+        | Some lhs_goal -> Logic_const.pand ~loc:p.pred_loc (lhs_goal, rhs)
+-    else
++    if is_forall && not in_lhs then
++      ...
++      Constraints.raise_error msg ctxt
++    else begin
++      let ctxt, lhs_goal =
++        visit_quantif_relations ~is_forall ~in_lhs ctxt lhs
 +      in
-+      ctxt, Some goal
++      if Constraints.has_unguarded_bounded_vars ctxt then
++        visit_quantif_relations ~is_forall ~in_lhs ctxt rhs
++      else if not is_forall then
++        (* The parser associates conjunctions to the left:
++           [0 <= i < n && p && q] is [((0 <= i < n) && p) && q]. If the goal
++           started inside [lhs] ([p] here), [rhs] is its last conjunct. *)
++        let goal = match lhs_goal with
++          | None -> rhs
++          | Some lhs_goal -> Logic_const.pand ~loc:p.pred_loc (lhs_goal, rhs)
++        in
++        ctxt, Some goal
++      else
++        ...
++    end
 ```
 
 The goal is stored in the `Quantifier` table, which typing, interval inference, label analysis and
@@ -146,29 +190,27 @@ The goal is stored in the `Quantifier` table, which typing, interval inference, 
 
 The patch adds the regression test `plugins/e-acsl/tests/constructs/quantif_conjunctions.c` with its
 oracles. It asserts true predicates whose translation was wrong: `!(\exists ...)` with a false
-conjunct before the last one fails at run time without the change. It also covers two bound variables,
-the `\forall ... ==> P && Q` form (unchanged) and the rejected implication form.
+conjunct before the last one fails at run time without the change. It also covers two bound variables
+for `\exists`, positive controls for `\forall ... ==> P && Q` and right-nested chained implications
+`0 <= i < size ==> 0 <= j < size ==> i + j < 2 * size`, and the rejected `\forall` forms
+(single-variable and multi-variable nested implications inside a hypothesis, nested implication in a
+hypothesis conjunction, and conjunction outside a hypothesis).
 
 ## Validation of the proposed fix
 
-`master` at `3dff90fc70` in `framac-master-audit:3dff90f`, then the same tree with the patch, rebuilt
-with dune and installed (Debian 13, gcc 14.2.0).
+`master` at `b80fcac74f` in a fresh `framac-master-audit:b80fcac` container, validated with
+`JOBS=4 /w/revalidate.sh before 24` and `JOBS=4 /w/revalidate.sh package 24` (Debian 13, gcc 14.2.0):
 
-| Check | `master` | Patched |
+| Check | `master` (`b80fcac74f`) | Patched |
 |---|---|---|
 | `two_conjuncts`, `three_conjuncts`, `parenthesized` | exit 0 (false precondition passes) | `Precondition failed`, exit 134 |
 | `swapped` | `Precondition failed`, exit 134 | `Precondition failed`, exit 134 |
-| `forall_guard_in_hypothesis` | checked as `G ==> Q`, exit 0 | rejected with "invalid quantification guard ... after the end of the guard of an hypothesis", not checked, exit 0 |
-| New test `constructs/quantif_conjunctions.c` | fails at run time (line 10) | passes, default and `dev` configurations |
-| ptests `plugins/e-acsl/tests`, default configuration (198 results) | — | only the new oracles; every other test matches its oracle |
-| ptests, `dev` configuration (compiled and run) in every directory but `libc/` and `format/` (188 results) | — | all match `oracle_dev` |
-| `git diff --check` | — | clean in the source and the test; the generated oracles have the trailing space after `Warning:` and the final blank line that every E-ACSL oracle has |
-| `ocp-indent` 1.9.0, repository `.ocp-indent` | — | `bound_variables.ml` unchanged |
-| `make check-lint`, `make check-headers` | — | not run: the image's tree is not a git checkout |
-
-Not completed: the `dev` configuration of `libc/` and `format/`. Their tests abort child processes on
-purpose, and the crash handler of the Docker host (`core_pattern` piped to a WSL crash collector) made
-`format/printf.c` exceed a 40-minute timeout. Their default configuration ran and matches the oracles.
+| `forall_guard_in_hypothesis`, `forall_nested_implication`, `forall_nested_implication_conj` | checked as `G ==> Q`, exit 0 | rejected with `"invalid quantification guard, found '⇒' inside the hypothesis of an implication"`, not checked, exit 0 |
+| `forall_conj_after_implication` | checked as `G ==> Q`, exit 0 | rejected with `"invalid quantification guard, expecting '⇒' to separate the hypotheses from the goal, found '∧'"`, not checked, exit 0 |
+| New test `constructs/quantif_conjunctions.c` (default) | fails (exit 1) | passes (exit 0) |
+| New test `constructs/quantif_conjunctions.c` (`dev`, compiled and run) | fails at run time (exit 1) | passes (exit 0) |
+| Full E-ACSL suite `./dev/test.sh -p plugins/e-acsl` | — | passes (exit 0); no existing oracle changes |
+| `./dev/check-files.sh -p HEAD~1` (lint: `ocp-indent`, `clang-format` 19.1.7; headers) | — | passes on all 4 files (exit 0) |
 
 ## Workaround
 

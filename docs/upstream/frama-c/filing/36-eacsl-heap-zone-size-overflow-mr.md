@@ -1,7 +1,7 @@
 # [e-acsl] compute the zone sizes of --zone-sizes in size_t
 
 - Source branch: `fix/eacsl-zone-size-overflow` on the fork of `pub/frama-c`; target branch `master`.
-- Based on: `95408044f7`. Patch: [`../patches/36-eacsl-heap-zone-size-overflow.patch`](../patches/36-eacsl-heap-zone-size-overflow.patch)
+- Based on: `b80fcac74f`. Patch: [`../patches/36-eacsl-heap-zone-size-overflow.patch`](../patches/36-eacsl-heap-zone-size-overflow.patch)
 
 <!-- Everything below this line is the merge request description. -->
 
@@ -40,28 +40,29 @@ Not changed here: `--zone-sizes tls:N` has no effect, because `PGM_TLS_SIZE` is 
 
 ## Testing
 
-All on Debian 13 (gcc 14.2.0, clang 19.1.7), `master` at `95408044f7` built with dune, then the same
-tree with this patch, rebuilt and installed:
+All on Debian 13 (gcc 14.2.0, clang 19.1.7), originally on `master` at `95408044f7` and re-validated
+on `master` at `b80fcac74f` (rebuilt with dune and installed):
 
 - Reproducer from #2825, a program that allocates and writes 2 MB, built with gcc and with
   `-G clang` for heap:1024, 2047, 2048, 4095, 4096, 4097 and stack:2047, 2048. Before: exit 139 for
   heap:2048, heap:4095 and stack:2048, exit 134 ("Exceeded heap allocation limit") for heap:4096 and
   heap:4097, and gcc warns `integer overflow in expression of type 'int'`; same on 34.0~beta. After:
-  every run exits 0 and there is no warning.
-- By hand, with the patch: heap:8192 up to heap:1048576 and stack:4096 up to stack:65536 exit 0 with gcc
-  and clang; with `--concurrency` (gcc), `thread-stack:2048` and `thread-stack:4096` exit 0 (before:
-  `pthread_create` failed for 2048). `-G clang` cannot build the concurrency case on `master` (#2810), so
-  `thread-stack` was checked with gcc only.
-- The new test on unpatched `master`: the `dev` run exits 139. With the patch it passes.
-- `frama-c-ptests -create-missing-oracles plugins/e-acsl/tests`, then `dune build --release -j 6` on
-  `@plugins/e-acsl/tests/special/result/ptests_config` (only the new test's oracles were missing; I
-  promoted them), and on `ptests_config_dev` in `special/` and `memory/`: all pass.
-- `./dev/check-files.sh -p HEAD~1`: passes.
-- The patch applies with `git am` on `95408044f7`, alone, and with `git am --3way` together with !33 and
-  the other E-ACSL runtime fixes I am preparing (bittree model, `\object_pointer`), in three orders,
-  without conflict.
+  every run exits 0 and there is no warning (re-checked on `b80fcac74f`).
+- By hand, with the patch (on `95408044f7`): heap:8192 up to heap:1048576 and stack:4096 up to
+  stack:65536 exit 0 with gcc and clang; with `--concurrency` (gcc), `thread-stack:2048` and
+  `thread-stack:4096` exit 0 (before: `pthread_create` failed for 2048). `-G clang` cannot build the
+  concurrency case on `master` (#2810), so `thread-stack` was checked with gcc only.
+- The new test `special/e-acsl-zone-sizes.c` on unpatched `master` (`b80fcac74f`): the `dev` run
+  exits 139 (Segmentation fault). With the patch it passes in both default and `dev` configurations.
+- Full E-ACSL default test suite (`./dev/test.sh -p plugins/e-acsl`) on `b80fcac74f`: passes. On
+  `95408044f7`, `ptests_config_dev` in `special/` and `memory/` also passed.
+- `./dev/check-files.sh -p HEAD~1` on `b80fcac74f`: passes (`Lint 6 file(s)`).
+- The patch applies cleanly with `git am --keep-non-patch` on `b80fcac74f` (and applied with
+  `git am --3way` on `95408044f7` together with !33 and the other E-ACSL runtime fixes in three
+  orders without conflict).
 
-Not run: the other E-ACSL test directories; no other test uses `--zone-sizes`.
+Not run: `dev` configuration for the other E-ACSL test directories; no other test uses
+`--zone-sizes`.
 
 The analysis and fix were prepared with LLM assistance (Claude Code); I reviewed them and ran the
 reproducer and tests described above.

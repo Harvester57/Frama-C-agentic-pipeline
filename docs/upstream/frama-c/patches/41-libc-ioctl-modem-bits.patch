@@ -1,0 +1,139 @@
+From f64aad8cfd6a06e42ceca034b8743b47fecde2f2 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Wed, 18 Nov 2026 07:07:39 +0000
+Subject: [PATCH] [libc] add the TIOCM_* modem line bits to sys/ioctl.h
+
+sys/ioctl.h defines the requests TIOCMGET, TIOCMBIS, TIOCMBIC, TIOCMSET
+and TIOCMIWAIT, but none of the bits they read and write. Serial-port
+code that sets RTS or DTR, or tests CTS or the carrier, stops at
+"Cannot resolve variable TIOCM_RTS".
+
+Add the eleven names that glibc's <sys/ioctl.h> defines (in
+bits/ioctl-types.h), with the same values: TIOCM_LE, TIOCM_DTR,
+TIOCM_RTS, TIOCM_ST, TIOCM_SR, TIOCM_CTS, TIOCM_CAR, TIOCM_RNG and
+TIOCM_DSR, and the aliases TIOCM_CD and TIOCM_RI.
+
+New test: tests/libc/sys_ioctl_h.c.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ share/libc/sys/ioctl.h                     | 14 +++++++
+ tests/libc/oracle/sys_ioctl_h.0.res.oracle | 46 ++++++++++++++++++++++
+ tests/libc/sys_ioctl_h.c                   | 27 +++++++++++++
+ 3 files changed, 87 insertions(+)
+ create mode 100644 tests/libc/oracle/sys_ioctl_h.0.res.oracle
+ create mode 100644 tests/libc/sys_ioctl_h.c
+
+diff --git a/share/libc/sys/ioctl.h b/share/libc/sys/ioctl.h
+index 5b72f77779..7187883440 100644
+--- a/share/libc/sys/ioctl.h
++++ b/share/libc/sys/ioctl.h
+@@ -196,6 +196,20 @@ struct winsize
+ 
+ #define TIOCSER_TEMT 0x01
+ 
++// Modem lines, read and written by TIOCMGET, TIOCMBIS, TIOCMBIC and TIOCMSET
++// (definitions from ioctl-types.h)
++#define TIOCM_LE 0x001
++#define TIOCM_DTR 0x002
++#define TIOCM_RTS 0x004
++#define TIOCM_ST 0x008
++#define TIOCM_SR 0x010
++#define TIOCM_CTS 0x020
++#define TIOCM_CAR 0x040
++#define TIOCM_RNG 0x080
++#define TIOCM_DSR 0x100
++#define TIOCM_CD TIOCM_CAR
++#define TIOCM_RI TIOCM_RNG
++
+ __END_DECLS
+ __POP_FC_STDLIB
+ 
+diff --git a/tests/libc/oracle/sys_ioctl_h.0.res.oracle b/tests/libc/oracle/sys_ioctl_h.0.res.oracle
+new file mode 100644
+index 0000000000..058d3102d0
+--- /dev/null
++++ b/tests/libc/oracle/sys_ioctl_h.0.res.oracle
+@@ -0,0 +1,46 @@
++[kernel] Parsing sys_ioctl_h.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] 
++  computing for function __va_open_void <- main.
++  Called from sys_ioctl_h.c:7.
++[eva] using specification for function __va_open_void
++[eva:progress] sys_ioctl_h.c:7: 
++  function __va_open_void: precondition 'valid_filename' got status valid.
++[eva:progress] sys_ioctl_h.c:7: 
++  function __va_open_void: precondition 'flag_not_CREAT' got status valid.
++[eva:progress] Done for function __va_open_void
++[eva:progress] 
++  computing for function __va_ioctl_ptr <- main.
++  Called from sys_ioctl_h.c:11.
++[eva] using specification for function __va_ioctl_ptr
++[eva:progress] Done for function __va_ioctl_ptr
++[eva:progress] 
++  computing for function __va_ioctl_ptr <- main.
++  Called from sys_ioctl_h.c:17.
++[eva:progress] Done for function __va_ioctl_ptr
++[eva:progress] 
++  computing for function __va_ioctl_ptr <- main.
++  Called from sys_ioctl_h.c:20.
++[eva:progress] Done for function __va_ioctl_ptr
++[eva:progress] 
++  computing for function __va_ioctl_ptr <- main.
++  Called from sys_ioctl_h.c:21.
++[eva:progress] Done for function __va_ioctl_ptr
++[eva:progress] sys_ioctl_h.c:24: assertion 'all_lines' got status valid.
++[eva:progress] sys_ioctl_h.c:25: assertion 'aliases' got status valid.
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  fd ∈ [-1..1023]
++  lines ∈ [--..--] or UNINITIALIZED
++  carrier ∈ {0; 1} or UNINITIALIZED
++  ring ∈ {0; 1} or UNINITIALIZED
++  ready ∈ {0; 1} or UNINITIALIZED
++  rts ∈ [--..--] or UNINITIALIZED
++  all ∈ {511} or UNINITIALIZED
++  __retres ∈ {0; 1; 2; 3}
+diff --git a/tests/libc/sys_ioctl_h.c b/tests/libc/sys_ioctl_h.c
+new file mode 100644
+index 0000000000..921eeacde1
+--- /dev/null
++++ b/tests/libc/sys_ioctl_h.c
+@@ -0,0 +1,27 @@
++#include <fcntl.h>
++#include <sys/ioctl.h>
++
++// The modem lines of a serial port: TIOCMGET, TIOCMBIS, TIOCMBIC and TIOCMSET
++// read and write the TIOCM_* bits.
++int main() {
++  int fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
++  if (fd == -1)
++    return 1;
++  int lines = 0;
++  if (ioctl(fd, TIOCMGET, &lines) == -1)
++    return 1;
++  int carrier = (lines & TIOCM_CD) != 0;
++  int ring = (lines & TIOCM_RI) != 0;
++  int ready = (lines & (TIOCM_DSR | TIOCM_CTS)) == (TIOCM_DSR | TIOCM_CTS);
++  lines |= TIOCM_DTR | TIOCM_RTS;
++  if (ioctl(fd, TIOCMSET, &lines) == -1)
++    return 1;
++  int rts = TIOCM_RTS;
++  ioctl(fd, TIOCMBIC, &rts);
++  ioctl(fd, TIOCMBIS, &rts);
++  int all = TIOCM_LE | TIOCM_DTR | TIOCM_RTS | TIOCM_ST | TIOCM_SR | TIOCM_CTS |
++            TIOCM_CAR | TIOCM_RNG | TIOCM_DSR;
++  //@ assert all_lines: all == 0x1ff;
++  //@ assert aliases: TIOCM_CD == TIOCM_CAR && TIOCM_RI == TIOCM_RNG;
++  return carrier + ring + ready;
++}
+-- 
+2.47.3
+

@@ -38,7 +38,7 @@ Runs live **outside the target** by default:
 - In the container the target is mounted **read-only** at `/target` and the run directory read-write at `/framac-run` (the working directory).
 - A run directory inside the target is allowed only on explicit request and only when version control ignores it.
 - `--in-place` becomes a separate host-side apply step that runs after the final report.
-- The **parent** (orchestrator) is the only writer of `run-metadata.json`, `coverage-ledger.json`, `candidates.json`, `findings.json`, the shared work tree, and the shared corpus. Subagents write only into `agents/<agent-id>/scratch/` and return exactly one JSON object (Section 7).
+- The **parent** (orchestrator) is the only writer of `run-metadata.json`, `coverage-ledger.json`, `candidates.json`, `findings.json`, the shared work tree, and the shared corpus. Subagents write only into `agents/<agent-id>/scratch/` and return exactly one JSON object (Section 7). The exception is the Phase 0 stub author, which edits its one header in `workspace/stubs/`.
 
 ---
 
@@ -60,7 +60,7 @@ Two layers, of which only the first is an isolation boundary:
 |---|---|---|
 | `confirmed` | A reproduced E-ACSL failure through the module harness, with the fault in target code and the harness respecting the entry function's declared or documented contract. | Yes |
 | `needs_validation` | A specific, source-grounded fault hypothesis that could not be reproduced: Eva `Invalid` without a concrete witness, or a prover/breaker hypothesis (input condition + predicate + why it was not reproduced). Lists exact blockers and a validation plan. | No |
-| `rejected` | A candidate disproved by verification: harness-induced crash, dead code, toolchain artifact, contract over-constraint mistaken for a bug. Retained so later runs do not repeat it. | No |
+| `rejected` | A candidate disproved by verification, with a class: `harness_induced`, `dead_code`, `toolchain_artifact`, `contract_overconstraint`, `disproved_by_source`, `duplicate` or `other`. Retained so later runs do not repeat it. | No |
 
 Rules:
 
@@ -127,7 +127,7 @@ State table (validator-enforced):
 | `candidate` | any | non-empty | non-empty | optional |
 | `deferred`, `out_of_scope`, `not_applicable` | null | empty | empty | non-empty reason |
 
-Evidence entries name their phase (`fuzz`, `eva`, `wp`, `audit`, `verifier`), producer (script or agent id), result, and the run-relative tool output path.
+Evidence entries name their phase (`fuzz`, `eva`, `wp`, `breaker`, `verifier`, `audit`, `carry_forward`, `static`), producer (script or agent id), result, and the run-relative tool output path.
 
 **Assumptions.** A `covered` unit carries an explicit `assumptions` list: `requires` clauses whose call sites are not verified (linked to those call sites' units), stub contracts relied on, and `Valid_under_hyp` goals whose hypotheses are callee contracts. In per-function WP (`-wp-fct`), `Valid_under_hyp` is expected: callee contracts are hypotheses proven in their own sessions. They are only acceptable when every hypothesis is a callee contract whose own unit is `covered`. The proof audit (M3) resolves this; until then they are listed as open assumptions. The report separates "proven unconditionally" from "proven under N open assumptions". Verifying a caller later discharges its assumption automatically.
 
@@ -184,7 +184,7 @@ Implemented roles in [`../../schemas/agent-result.schema.json`](../../schemas/ag
 - **Current implementation** (Phase 0; [`../plans/archive/phase0-implementation-plan.md`](../plans/archive/phase0-implementation-plan.md)):
   - **Build capture** (`build_capture.py`): the target's own build under `bear`, in the build image, from a recipe the user gave or confirmed. It gives link units, per-file flags, test units, the API (exports, public headers, `main`, an executable's embedded API) and a snapshot of the target's headers and libraries. A target that does not build stops with `needs_build_recipe`; there is no inventory without a build.
   - **Frama-C model** (`phase0_model.py` with `phase0_dump.ml`): one parse per distinct set of sources and flags. Functions are named as Eva and WP name them (`file#name`), with direct calls, indirect calls matched by signature against address-taken functions, thread spawns, callbacks, macro aliases, loops and cyclomatic complexity. Every fact carries its source. A unit Frama-C cannot parse gets GCC's `-fcallgraph-info` edges (`callgraph_source: gcc_callgraph`), flagged with Frama-C's first error. Alias narrowing of indirect edges is optional and off by default: it was measured and found unsound for reassigned global pointers.
-  - **Trust** (`trust.py`): library API and functions reached from input readers are untrusted; the structured threat model (`schemas/threat_model.schema.json`) adds input sources and trusted callers. Optional CodeQL facts (`codeql_trust.py`, open-source targets only) can add untrusted marks, never remove one.
+  - **Trust** (`trust.py`): a library's exported API and functions reached from input readers are untrusted (functions defined in public headers are harnessed entry points, untrusted only when the threat model or CodeQL marks them, or an input reader reaches them); the structured threat model (`schemas/threat_model.schema.json`) adds input sources and trusted callers. Optional CodeQL facts (`codeql_trust.py`, open-source targets only) can add untrusted marks, never remove one.
   - **DAG view** (`build_callgraph_dag.py`): link units as modules, Tarjan's SCC for recursion cycles, bottom-up waves, tiers from trust (`tiers.py`), and the split of units too large for one Eva run (`unit_split.py`).
 - **Planned M4 roadmap:**
   - Parallel recon agents (entry surfaces and untrusted inputs; principals, authentication, and secret handling; build and harness feasibility) returning structured facts to override the baseline module table with source-backed reasons.
@@ -197,9 +197,9 @@ Implemented roles in [`../../schemas/agent-result.schema.json`](../../schemas/ag
 
 | Profile | Scope |
 |---|---|
-| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget per harness case, at most 480 per link unit; 600 s prover wall budget); Tier 3 deferred (`scripts/tiers.py`): Make leaves out whole Tier 3 modules (no fuzzing or Eva for them), and the ledger seeds every Tier 3 function's units `deferred` (no WP). A Tier 3 function inside a module of a higher tier is still analysed by that module's fuzz and Eva runs, but Eva results on its deferred units are skipped, except an Invalid, which makes the unit a `candidate`; WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
-| `standard` | All phases on Tier 1A, 1B, and Tier 2 validators (120 CPU-s fuzz budget per harness case, at most 1200 per link unit; 900 s prover wall budget); the parent re-verifies changed finding records before reporting. |
-| `deep` | Extended budgets (900 CPU-s fuzz budget per harness case, at most 7200 per link unit; 1800 s prover wall budget; higher retry limit `K`). Tier 3 `rte` units are scheduled in `standard` and `deep`, deferred only in `quick` (step I8). |
+| `quick` | Phases 0-2 + crash verification (60 CPU-s fuzz budget per harness case, at most 480 per link unit; 600 s prover wall budget; retry limit `K` of 2); Tier 3 deferred (`scripts/tiers.py`): Make leaves out whole Tier 3 modules (no fuzzing or Eva for them), and the ledger seeds every Tier 3 function's units `deferred` (no WP). A Tier 3 function inside a module of a higher tier is still analysed by that module's fuzz and Eva runs, but Eva results on its deferred units are skipped, except an Invalid, which makes the unit a `candidate`; WP only on Tier 1A entry chains; remaining unscheduled WP units closed via `ledger.py close-remaining`. |
+| `standard` | All phases on every Tier 1A, 1B and Tier 2 function; Tier 3 modules get Eva and `rte` WP (120 CPU-s fuzz budget per harness case, at most 1200 per link unit; 900 s prover wall budget; retry limit `K` of 4); the parent re-verifies changed finding records before reporting. |
+| `deep` | Extended budgets (900 CPU-s fuzz budget per harness case, at most 7200 per link unit; 1800 s prover wall budget; retry limit `K` of 6). Tier 3 `rte` units are scheduled in `standard` and `deep`, deferred only in `quick` (step I8). |
 
 - Profiles change breadth, never the evidence bar.
 - **Budget** (optional, in agent invocations or wall-clock budgets via `FRAMAC_PROVER_WALL_BUDGET_S`) bounds prover/breaker execution. Exhaustion sets `run_status: incomplete` with a reason.
@@ -213,7 +213,7 @@ Implemented roles in [`../../schemas/agent-result.schema.json`](../../schemas/ag
 - `findings.json` and `coverage-ledger.json` are the only sources of truth. `candidates.json` holds unverified candidates; a run with unverified candidates is `incomplete`.
 - `REPORT.md`: run status, profile, scope, and source ref first; confirmed table; needs-validation table; assurance summary (unconditional vs conditional proofs, boundary assumptions); coverage counts; hardening notes.
 - `FINDINGS-DETAIL.md` and `NEEDS-VALIDATION.md`: per-record detail.
-- `report.sarif`: verdict records only (`confirmed` = error, `needs_validation` = warning, fingerprint in `partialFingerprints`). Raw Eva/WP SARIF stays in `workspace/reports/` as tool output.
+- `report.sarif`: verdict records only (`confirmed` critical or high = error, medium = warning, low = note; `needs_validation` = warning; fingerprint in `partialFingerprints`). Raw Eva/WP SARIF stays in `workspace/reports/` as tool output.
 
 ---
 

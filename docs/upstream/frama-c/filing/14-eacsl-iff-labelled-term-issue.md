@@ -88,8 +88,8 @@ whole file and records labelled terms by identity. When the copy's `\old(b)` is 
 
 Fix: in the rewriting, both operands are always evaluated (`p1` in the first conjunct; `p2` in the
 first conjunct, or in the second one when `p1` is false). So `p1` and `p2` can be translated once
-each and combined as `!e1 == !e2`, as the interlang translation of `Piff`
-(`translate_predicates.ml:65`) already does. No copy is needed and each operand still gets its RTE
+each (as the interlang translation of `Piff` at `translate_predicates.ml:65` already does) and
+combined as `!e1 == !e2`. No copy is needed and each operand still gets its RTE
 guards, once. With this change, both programs above build and `prog.e-acsl` exits with 0; the
 E-ACSL test suites (default and `dev` configurations; `format` in the default configuration only,
 see the merge request) pass, with one existing oracle updated (`memory/oracle/gen_objects.0.c`,

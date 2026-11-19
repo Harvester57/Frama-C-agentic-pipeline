@@ -44,3 +44,33 @@ reproducer before and after.
 **2026-11-18:** 28 to 33 and 35 to 40 are filed as merge requests !46 to !57, one branch per patch
 from `95408044f7`. The branches were built with `git am --keep-non-patch` inside the audit
 container and pushed from a bundle, because the host clone converts line endings.
+
+**`41-*` (2026-11-18, filed as merge request !58)** is one commit on upstream `master` `b80fcac74f`, the head since
+2026-11-17 (it also applies on `95408044f7`: the two differ only under `plugins/wp`). It adds
+eleven macros to `share/libc/sys/ioctl.h` and a `tests/libc` test with its oracle, and changes no
+existing oracle. It was run with `revalidate.sh package 41` in a container of
+`framac-master-audit:9540804` whose tree had been fast-forwarded to `b80fcac74f` and rebuilt;
+`tests/variadic` was run by hand in addition.
+
+**`42-*` (2026-11-18, filed as !59)** is one commit on `b80fcac74f`, authored and committed with the
+GitLab noreply address. It changes `Cfloat.parse_literal` in `plugins/wp/src/Cfloat.ml` (21 lines
+added, 4 removed) and adds `plugins/wp/tests/wp_acsl/float_literals.i` with four oracles (default
+and `qualif`, Float and Real model). No existing oracle changes. `revalidate.sh package` is shaped
+for E-ACSL patches (`-c dev`, the E-ACSL suite), so the steps were run by hand in a container of
+the audit image moved to `b80fcac74f`; the long draft lists them.
+
+**`43-*` (2026-11-18, not filed)** is one commit on `b80fcac74f`, authored and committed with the
+GitLab noreply address. It changes `Gmp.Q.normalize_str` in
+`plugins/e-acsl/src/code_generator/gmp.ml` (12 lines added, 20 removed) and one sentence of
+`gmp.mli`, and adds `plugins/e-acsl/tests/arith/real_constants.c` with two oracles. No existing
+oracle changes. It was run with `revalidate.sh package 43` in a container of the audit image moved
+to `b80fcac74f`; the `dev` configuration of `plugins/e-acsl/tests/arith` was run by hand in
+addition.
+
+**`44-*` (2026-11-18, not filed)** is one commit on `b80fcac74f`, authored and committed with the
+GitLab noreply address. It rewrites four clauses of the contract of `strlcat` in
+`share/libc/string.h` (6 lines added, 4 removed; the fourth, the `separation` precondition, came
+with the second version of the patch), adds `tests/libc/strlcat.c` with its oracle, and
+updates `tests/libc/oracle/string_h.0.res.oracle` (an unknown check and two unknown preconditions
+become valid; two line numbers move). `fc_libc.0.res.oracle` does not change. It was run with
+`revalidate.sh package 44` in a container of `framac-master-audit:b80fcac`.

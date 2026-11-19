@@ -4,7 +4,9 @@
 
 ### Summary
 
-E-ACSL checks a guarded quantification such as `\exists integer n; 0 <= n < size && P && Q` as if it were `\exists integer n; 0 <= n < size && Q`: every conjunct between the guard and the last one is dropped, even inside parentheses. A false predicate can therefore pass the runtime check, with no warning, so this is a soundness issue. In `\forall integer n; (0 <= n < size ==> P) ==> Q`, `P` is dropped the same way.
+E-ACSL checks a guarded quantification such as `\exists integer n; 0 <= n < size && P && Q` as if it were `\exists integer n; 0 <= n < size && Q`: every conjunct between the guard and the last one is dropped, even inside parentheses. A false predicate can therefore pass the runtime check, with no warning, so this is a soundness issue.
+
+In universal quantifications, the same guard traversal also mis-translates nested implications inside a hypothesis such as `\forall integer n; (0 <= n < size ==> P) ==> Q`, `\forall integer i, j; (0 <= i < size ==> 0 <= j < size) ==> i < size`, and `\forall integer i, j, k; (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size`, as well as conjunctions outside a hypothesis such as `\forall integer i, j; 0 <= i < size ==> 0 <= j && (j < size ==> i < size)`, turning false predicates into valid ones with no warning.
 
 ### Steps to reproduce the issue
 
@@ -31,6 +33,18 @@ void swapped(int size) { }
 /*@ requires \forall integer n; (0 <= n < size ==> n == 1000) ==> n < size; */
 void forall_guard_in_hypothesis(int size) { }
 
+/* false for i == size, j == 0: the hypothesis holds, i < size does not */
+/*@ requires \forall integer i, j; (0 <= i < size ==> 0 <= j < size) ==> i < size; */
+void forall_nested_implication(int size) { }
+
+/* false for i == size, j == 0, k == 0 */
+/*@ requires \forall integer i, j, k; (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size; */
+void forall_nested_implication_conj(int size) { }
+
+/* false for i == 0, j == -1: 0 <= j is false in the consequent */
+/*@ requires \forall integer i, j; 0 <= i < size ==> 0 <= j && (j < size ==> i < size); */
+void forall_conj_after_implication(int size) { }
+
 int main(int argc, char **argv)
 {
   (void)argv;
@@ -39,7 +53,10 @@ int main(int argc, char **argv)
   case 2: three_conjuncts(5); break;
   case 3: parenthesized(5); break;
   case 4: swapped(5); break;
-  default: forall_guard_in_hypothesis(5); break;
+  case 5: forall_guard_in_hypothesis(5); break;
+  case 6: forall_nested_implication(5); break;
+  case 7: forall_nested_implication_conj(5); break;
+  default: forall_conj_after_implication(5); break;
   }
   return 0;
 }
@@ -47,18 +64,20 @@ int main(int argc, char **argv)
 
 ```sh
 e-acsl-gcc -q -X -o t.inst.c -O t t.c
-for args in "" "x" "x x" "x x x" "x x x x"; do ./t.e-acsl $args; echo "exit $?"; done
+for args in "" "x" "x x" "x x x" "x x x x" "x x x x x" "x x x x x x" "x x x x x x x"; do
+  ./t.e-acsl $args; echo "exit $?"
+done
 ```
 
 ### Expected behaviour
 
-All five preconditions are false, so each run stops with `Precondition failed`, or E-ACSL warns at
+All eight preconditions are false, so each run stops with `Precondition failed`, or E-ACSL warns at
 instrumentation time that it cannot translate the predicate.
 
 ### Actual behaviour
 
 Only the fourth run (`swapped`) fails. E-ACSL prints no warning at instrumentation time, and the other
-runs exit 0:
+seven runs exit 0:
 
 ```text
 exit 0
@@ -71,6 +90,9 @@ t.c:13: Error: Precondition failed:
 	With values at failure point:
 	- ∃ ℤ n; 0 ≤ n < size ∧ n ≥ 0 ∧ n ≡ 1000: 0
 exit 134
+exit 0
+exit 0
+exit 0
 exit 0
 ```
 
@@ -89,13 +111,14 @@ The loop generated for `two_conjuncts` tests the guard and `n >= 0` only; `n == 
 ```
 
 Every conjunct between the guard and the last one is dropped, even inside parentheses. `swapped` fails
-only because its false conjunct is the last one. For `forall_guard_in_hypothesis`, E-ACSL checks
-`\forall integer n; 0 <= n < size ==> n < size`.
+only because its false conjunct is the last one. For the four `\forall` functions, E-ACSL checks
+`\forall ...; <extracted guards> ==> <goal>`, treating nested implications in hypotheses and
+conjunctions outside hypotheses as if they guarded the whole quantification.
 
 ### Contextual information
 
 - Frama-C installation mode: from source (`master`) and opam (Docker image based on `framac/frama-c:dev`)
-- Frama-C version: 35.0~~dev (Bromine), `master` at 3dff90fc70; also 34.0~beta (Selenium)
+- Frama-C version: 35.0~~dev (Bromine), `master` at `b80fcac74f` (originally reproduced at `3dff90fc70`); also 34.0~beta (Selenium)
 - Plug-in used: E-ACSL (`e-acsl-gcc`)
 - OS name: Debian GNU/Linux
 - OS version: 13 (trixie)
@@ -108,14 +131,24 @@ only because its false conjunct is the last one. For `forall_guard_in_hypothesis
 `visit_quantif_relations` (`plugins/e-acsl/src/analyses/bound_variables.ml:578-615`) extracts the guard
 from the left. On `Pand(lhs, rhs)`, it discards the goal returned by the visit of `lhs`
 (`let ctxt, _ = ...`, line 596) and returns `rhs` once the guard is complete (line 600). On
-`(G && P) && Q`, the inner visit returns `P`, the outer one drops it and returns `Q`. The `Pimplies`
-case (line 581) drops the goal of its left operand the same way, which turns
-`(G ==> P) ==> Q` into `G ==> Q`.
+`(G && P) && Q`, the inner visit returns `P`, the outer one drops it and returns `Q`.
 
-**Fix.** When the visit of `lhs` returned a goal, the goal of `Pand(lhs, rhs)` is the conjunction of that
-goal and `rhs`. When the left operand of an implication already contains the whole guard, the guard does
-not bound the quantification: reject the predicate as for the other invalid guards. A merge request with
-a fix follows.
+On `Pimplies(lhs, rhs)` (line 581), `visit_quantif_relations` recurses into `lhs` without tracking
+that it is now inside an implication hypothesis. As a result, any nested `Pimplies` inside `lhs`
+(whether it finishes the guards and drops `P` in `(0 <= n < size ==> P) ==> Q`, or guards remaining
+variables in `(0 <= i < n ==> 0 <= j < m) ==> i < n` and
+`(0 <= i < n ==> 0 <= j < m) && 0 <= k < p ==> i < n`) is treated as if it were a conjunction of
+guards. Likewise, on the right-hand side of a `Pimplies` when unguarded variables remain, `Pand` is
+accepted outside any implication hypothesis, turning
+`0 <= i < n ==> 0 <= j && (j < m ==> i < n)` into `0 <= i < n && 0 <= j < m ==> i < n`.
+
+**Fix.** When the visit of `lhs` returned a goal in `\exists`, the goal of `Pand(lhs, rhs)` is the
+conjunction of that goal and `rhs`. For `\forall`, track whether traversal is inside the hypothesis
+of an implication with an `in_lhs` flag (default `false`): propagate `in_lhs = true` into `lhs` of
+`Pimplies` and through `Pand` inside `lhs`, reject any `Pimplies` when `in_lhs` is `true`, and
+reject `Pand` when `is_forall && not in_lhs`, while continuing to accept right-nested implications
+such as `\forall integer i, j; 0 <= i < n ==> 0 <= j < m ==> P(i, j)`. A merge request with a fix
+follows.
 
 The analysis and fix were prepared with LLM assistance (Claude Code); I reviewed them and ran the
 reproducer and tests described above.

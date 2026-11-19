@@ -1,7 +1,7 @@
 # [e-acsl] check every conjunct after the guard of a quantification
 
 - Source branch: `fix/eacsl-guarded-quantifier-goal` on the fork of `pub/frama-c`; target branch `master`.
-- Based on: `3dff90fc70`. Patch: [`../patches/24-eacsl-guarded-exists-drops-conjunct.patch`](../patches/24-eacsl-guarded-exists-drops-conjunct.patch)
+- Based on: `b80fcac74f`. Patch: [`../patches/24-eacsl-guarded-exists-drops-conjunct.patch`](../patches/24-eacsl-guarded-exists-drops-conjunct.patch)
 
 <!-- Everything below this line is the merge request description. -->
 
@@ -22,50 +22,58 @@ associates conjunctions to the left (`pland` in `logic_parser.mly` even re-assoc
 and returns `P` as the goal; the `Pand` case discards it (`let ctxt, _ = ...`) and returns `Q`. A false
 predicate such as `\exists integer n; 0 <= n < 5 && n == 1000 && n >= 0` passes at run time.
 
-The `Pimplies` case discards the goal of its left operand the same way:
-`\forall integer n; (0 <= n < size ==> P) ==> Q` is checked as `\forall integer n; 0 <= n < size ==> Q`,
-which drops `P` and every `n` outside the range.
+In universal quantifications, `visit_quantif_relations` also fails to distinguish guards inside the
+hypothesis of an implication from top-level/consequent positions:
+
+- An implication inside an implication hypothesis, whether single-variable
+  `\forall integer n; (0 <= n < size ==> P) ==> Q` or multi-variable
+  `\forall integer i, j; (0 <= i < size ==> 0 <= j < size) ==> i < size` and
+  `\forall integer i, j, k; (0 <= i < size ==> 0 <= j < size) && 0 <= k < size ==> i < size`, is
+  treated as if `(A ==> B) ==> C` were `(A && B) ==> C`, turning false predicates into valid ones.
+- A conjunction outside an implication hypothesis while unguarded variables remain, as in
+  `\forall integer i, j; 0 <= i < size ==> 0 <= j && (j < size ==> i < size)`, is treated as if
+  `0 <= j` were a hypothesis rather than a conjunct of the consequent.
 
 ## Change
 
 `plugins/e-acsl/src/analyses/bound_variables.ml`, `visit_quantif_relations`:
 
-- `Pand`: when the visit of the left operand returned a goal, the goal is the conjunction of that goal and
-  the right operand (`Logic_const.pand`). The goal is stored in the `Quantifier` table, which typing,
-  interval inference, label analysis and `Quantif.convert` all read, so they all see the same predicate.
-- `Pimplies`: when the left operand already contains the whole guard, the predicate is rejected with
-  "invalid quantification guard", like the other unsupported guards. E-ACSL then warns and ignores the
-  annotation instead of checking a weaker predicate.
+- Add an optional `?(in_lhs=false)` parameter tracking whether traversal is inside the hypothesis of
+  an implication in a universal quantification.
+- `Pimplies`: if `in_lhs` is `true`, reject unconditionally with `"invalid quantification guard, found
+  '==>' inside the hypothesis of an implication"`. Otherwise, when `is_forall` is `true`, visit `lhs`
+  with `~in_lhs:true` and, if unguarded variables remain, recurse on `rhs` with `in_lhs = false` so
+  right-nested chained implications (`0 <= i < n ==> 0 <= j < m ==> P(i, j)`) remain accepted.
+- `Pand`: if `is_forall && not in_lhs`, reject with `"invalid quantification guard, expecting '==>' to
+  separate the hypotheses from the goal, found '&&'"`. Otherwise propagate `~in_lhs` to both operands
+  of `Pand`; when `not is_forall` and the visit of `lhs` returned a goal, combine it with `rhs` via
+  `Logic_const.pand`. The resulting goal is stored in the `Quantifier` table, which typing, interval
+  inference, label analysis and `Quantif.convert` all read.
 
 The new test `constructs/quantif_conjunctions.c` asserts true predicates whose translation was wrong
-before (`!(\exists ...)` with a false middle conjunct fails at run time without the change), plus the
-rejected implication form.
+before (`!(\exists ...)` with a false middle conjunct fails at run time without the change), a
+positive right-nested chained-implication control (`0 <= i < size ==> 0 <= j < size ==> i + j < 2 * size`),
+and the rejected `\forall` forms (single-variable and multi-variable nested implications inside a
+hypothesis, nested implication inside a hypothesis conjunction, and conjunction outside a hypothesis).
 
 ## Testing
 
-All on Debian 13 (gcc 14.2.0), `master` at `3dff90fc70` built with dune, then the same tree with this
+All on Debian 13 (gcc 14.2.0), `master` at `b80fcac74f` built with dune, then the same tree with this
 patch:
 
-- Reproducer from the issue, built with `e-acsl-gcc -X` and run: before, only `swapped` fails (exit
-  134) and the other four runs exit 0. After, the four `\exists` preconditions fail with
-  `Precondition failed` (exit 134), and the `\forall` one is rejected at instrumentation time with the
-  "invalid quantification guard" warning (so not checked, run exit 0).
-- The new test `constructs/quantif_conjunctions.c` fails on unpatched `master` (its line 10,
-  `!(\exists ... n == 1000 && n >= 0)`, fails at run time); with the patch it passes in the default
-  configuration and in the `dev` configuration (compiled and run). Its oracle records the warning for
-  the rejected implication.
-- `frama-c-ptests -create-missing-oracles plugins/e-acsl/tests`, then `dune build --release -j 6` on
-  `@plugins/e-acsl/tests/ptests_config` (198 results) and on `ptests_config_dev` in every test directory
-  except `libc/` and `format/` (188 results). The only differences are the new oracles, which I promoted;
-  on the final run every test matches its oracle. No existing oracle changes. Not completed: the `dev`
-  configuration of `libc/` and `format/` (their tests abort child processes on purpose, and the crash
-  handler of my host made `format/printf.c` exceed a 40-minute timeout); their default configuration
-  ran and matches.
-- `git diff --check` reports nothing in the source and the test; in the generated oracles it reports
-  the trailing space after `Warning:` and the final blank line, as for the existing oracles.
-- `ocp-indent` 1.9.0 with the repository's `.ocp-indent`: `bound_variables.ml` unchanged.
-- Not run: `make check-lint` and `make check-headers` (my build tree is not a git checkout). The patch
-  adds no source file; the new test has no header, like its neighbours.
+- Reproducer from the issue, built with `e-acsl-gcc -X` and run: on pristine `master`, only `swapped`
+  fails (exit 134) and the other seven false preconditions silently exit 0. With the patch, all four
+  `\exists` preconditions fail with `Precondition failed` (exit 134), and all four invalid `\forall`
+  preconditions are rejected at instrumentation time with an `"invalid quantification guard"` warning
+  (not checked, run exit 0).
+- New test `plugins/e-acsl/tests/constructs/quantif_conjunctions.c`: fails on `master` in both the
+  default configuration (oracle diff, no warnings for the invalid `\forall` forms, dropped conjuncts)
+  and the `dev` configuration (runtime assertion failure on line 10); passes with the patch in both
+  the default and `dev` configurations.
+- Full E-ACSL default test suite (`./dev/test.sh -p plugins/e-acsl`): passes with exit 0; no existing
+  oracle changes.
+- `./dev/check-files.sh -p HEAD~1` (lint including `ocp-indent` and `clang-format` 19.1.7, plus
+  header checks): passes on all 4 files (exit 0).
 
 The analysis and fix were prepared with LLM assistance (Claude Code); I reviewed them and ran the
 reproducer and tests described above.

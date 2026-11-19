@@ -41,13 +41,15 @@ e-acsl-gcc: fatal error: aborted by Frama-C
 - `static` does not matter: a non-static `const union u zero_block;` and a `static const` union local to
   a function fail the same way.
 - An initializer (`= { { 0 } }`) does not matter.
-- A `static const` struct with the same members, and a non-const `static` union, instrument and run.
+- A `static const` struct with the same members instruments and runs without `--rt-debug` (though
+  per-field marking on a multi-field struct writes read-only shadow bits past the end of the struct and
+  aborts under `--rt-debug`; see #2794). A non-const `static` union instruments and runs.
 - `frama-c -print u.c` is clean: the cast is in the code E-ACSL generates.
 
 ### Contextual information
 
 - Frama-C installation mode: from source (`master`) and opam (Docker image based on `framac/frama-c:dev`)
-- Frama-C version: 35.0~~dev (Bromine), `master` at 3dff90fc70; also 34.0~beta (Selenium)
+- Frama-C version: 35.0~~dev (Bromine), `master` at b80fcac74f (also reproduced on 3dff90fc70 and 34.0~beta (Selenium))
 - Plug-in used: E-ACSL (`e-acsl-gcc`)
 - OS name: Debian GNU/Linux
 - OS version: 13 (trixie)
@@ -58,11 +60,12 @@ e-acsl-gcc: fatal error: aborted by Frama-C
 (`plugins/e-acsl/src/code_generator/global_observer.ml:130`) marks a const global read-only with
 `__e_acsl_mark_readonly((void *)g)`, passing the value of the global (`Cil.evar ~loc vi`) for every type
 but structs. For a union, the conversion to `void *` is not a valid cast and the kernel rejects
-E-ACSL's code. Structs are spared because they have their own branch (one call per field address,
-e-acsl#223).
+E-ACSL's code. Structs avoid the cast error because they have a per-field branch (e-acsl#223), which
+itself has an out-of-bounds shadow write on multi-field structs and crashes on bitfields (see #2794).
 
-**Fix.** Pass the address of the global (`Cil.mkAddrOfVi vi`) for every type but arrays. The merge
-request for #2794 does this and adds a const union to its regression test.
+**Fix.** Remove the per-field struct branch and pass the base address of the global (`Cil.mkAddrOfVi vi`)
+for every type but arrays. The merge request for #2794 does this and adds a const union to its regression
+test.
 
 The analysis and fix were prepared with LLM assistance (Claude Code); I reviewed them and ran the
 reproducer and tests described above.

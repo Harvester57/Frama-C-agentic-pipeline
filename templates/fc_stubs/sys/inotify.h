@@ -33,6 +33,7 @@ __BEGIN_DECLS
 
 #include <__fc_define_max_open_files.h>
 #include <__fc_string_axiomatic.h>
+#include <errno.h>
 
 struct inotify_event {
   int wd;
@@ -77,13 +78,13 @@ struct inotify_event {
 #define IN_NONBLOCK 0x800
 
 /*@
-  assigns \result \from \nothing;
+  assigns \result, errno \from \nothing;
   ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 */
 extern int inotify_init(void);
 
 /*@
-  assigns \result \from indirect:flags;
+  assigns \result, errno \from indirect:flags;
   ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 */
 extern int inotify_init1(int flags);
@@ -92,7 +93,8 @@ extern int inotify_init1(int flags);
   requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
   requires valid_pathname: valid_read_string(pathname);
   //missing: assigns 'watch list of fd' \from pathname[0 ..], mask;
-  assigns \result \from indirect:fd, indirect:pathname[0 ..], indirect:mask;
+  assigns \result, errno \from indirect:fd, indirect:pathname[0 ..],
+                               indirect:mask;
   ensures watch_descriptor_or_error: \result == -1 || \result >= 0;
 */
 extern int inotify_add_watch(int fd, const char *pathname, uint32_t mask);
@@ -100,7 +102,7 @@ extern int inotify_add_watch(int fd, const char *pathname, uint32_t mask);
 /*@
   requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
   //missing: assigns 'watch list of fd' \from wd;
-  assigns \result \from indirect:fd, indirect:wd;
+  assigns \result, errno \from indirect:fd, indirect:wd;
   ensures result_ok_or_error: \result == 0 || \result == -1;
 */
 extern int inotify_rm_watch(int fd, int wd);

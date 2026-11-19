@@ -1,8 +1,8 @@
-From d55a4f6f849b3716c7725a7ba6f53dab3baa34aa Mon Sep 17 00:00:00 2001
+From df363eb6e4b59e70f511b02c06ded5ca3210ff3a Mon Sep 17 00:00:00 2001
 From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
-Date: Sun, 15 Nov 2026 19:01:40 +0100
-Subject: [PATCH 1/2] [e-acsl] mark formal parameters as initialized on
- function entry
+Date: Thu, 19 Nov 2026 00:05:09 +0000
+Subject: [PATCH] [e-acsl] mark formal parameters as initialized on function
+ entry
 
 On function entry, E-ACSL registered each tracked formal with
 __e_acsl_store_block but never marked it initialized, although the
@@ -12,25 +12,35 @@ formal then failed on every call, whatever the caller passed:
   annotation (issue #177) or in an RTE guard with -e-acsl-rte-initialized;
 - \initialized(p) on a pointer to a scalar formal, even after an
   explicit assignment, since add_initializer emits no full_init for an
-  assignment to a whole formal.
+  assignment to a whole formal;
+- \initialized(p) on a pointer to main's argc or argv, because
+  injector.ml skips main and delegates tracking of argc/argv to
+  argv_alloca in the runtime observation models, where both segment and
+  bittree models allocated argc_ref and argv_ref without initializing
+  them (unlike argv[], *argv, and *environ right below).
 
 The rest of E-ACSL already assumes formals are initialized
 (add_initializer and needs_guard skip them), and globals are stored and
 marked initialized the same way (global_observer.ml). Emit
-__e_acsl_full_init right after the __e_acsl_store_block of each formal.
+__e_acsl_full_init right after the __e_acsl_store_block of each formal,
+and initialize argc_ref and argv_ref in argv_alloca for both the segment
+and bittree observation models.
 
-Most E-ACSL oracles (gen_*.c) change: each gets one
+57 existing E-ACSL oracles (gen_*.c) change: each gets one
 __e_acsl_full_init((void *)(& p)); line after the store_block of a
-formal. Add bts/issue-framac-177.c as a regression test.
+formal. Add bts/issue-framac-177.c as a regression test covering
+by-value struct formals, scalar formals, and main's argc/argv.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
+ .../e_acsl_bittree_observation_model.c        |   2 +
+ .../e_acsl_segment_observation_model.c        |   2 +
  plugins/e-acsl/src/code_generator/injector.ml |   3 +-
- .../src/code_generator/memory_observer.ml     |  13 ++
+ .../src/code_generator/memory_observer.ml     |  13 +
  .../src/code_generator/memory_observer.mli    |   4 +
- plugins/e-acsl/tests/bts/issue-framac-177.c   |  23 +++
+ plugins/e-acsl/tests/bts/issue-framac-177.c   |  30 +++
  .../e-acsl/tests/bts/oracle/gen_bts1304.0.c   |   1 +
- .../e-acsl/tests/bts/oracle/gen_bts1307.0.c   |  12 ++
+ .../e-acsl/tests/bts/oracle/gen_bts1307.0.c   |  12 +
  .../e-acsl/tests/bts/oracle/gen_bts1324.0.c   |   1 +
  .../e-acsl/tests/bts/oracle/gen_bts1326.0.c   |   4 +
  .../oracle/gen_bts1386_complex_flowgraph.0.c  |   3 +
@@ -41,15 +51,15 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../tests/bts/oracle/gen_issue-eacsl-139.0.c  |   2 +
  .../tests/bts/oracle/gen_issue-eacsl-40.0.c   |   5 +
  .../bts/oracle/gen_issue-framac-1119.0.c      |   1 +
- .../tests/bts/oracle/gen_issue-framac-177.0.c | 154 ++++++++++++++++++
- .../bts/oracle/issue-framac-177.0.res.oracle  |   4 +
+ .../tests/bts/oracle/gen_issue-framac-177.0.c | 246 ++++++++++++++++++
+ .../bts/oracle/issue-framac-177.0.res.oracle  |   8 +
  .../tests/builtin/oracle/gen_strcat.0.c       |   1 +
  .../tests/builtin/oracle/gen_strcmp.0.c       |   1 +
  .../tests/builtin/oracle/gen_strcpy.0.c       |   1 +
  .../tests/builtin/oracle/gen_strlen.0.c       |   1 +
- .../oracle/gen_parallel_threads.0.c           |  23 +++
+ .../oracle/gen_parallel_threads.0.c           |  23 ++
  .../oracle/gen_sequential_threads.0.c         |   8 +
- .../concurrency/oracle/gen_threads_debug.0.c  |  21 +++
+ .../concurrency/oracle/gen_threads_debug.0.c  |  21 ++
  .../oracle/gen_threads_safe_locations.0.c     |   7 +
  .../constructs/oracle/gen_acsl_check.0.c      |   1 +
  .../e-acsl/tests/constructs/oracle/gen_at.0.c |   4 +
@@ -58,11 +68,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../tests/constructs/oracle/gen_functions.0.c |   1 +
  .../tests/constructs/oracle/gen_functions.1.c |   1 +
  .../tests/format/oracle/gen_fprintf.0.c       |   2 +
- .../e-acsl/tests/format/oracle/gen_printf.0.c |  10 ++
- .../inductive/oracle/gen_stable_sort.0.c      |  10 ++
+ .../e-acsl/tests/format/oracle/gen_printf.0.c |  10 +
+ .../inductive/oracle/gen_stable_sort.0.c      |  10 +
  plugins/e-acsl/tests/libc/oracle/gen_file.0.c |   5 +
  plugins/e-acsl/tests/libc/oracle/gen_mem.0.c  |   9 +
- plugins/e-acsl/tests/libc/oracle/gen_str.0.c  |  10 ++
+ plugins/e-acsl/tests/libc/oracle/gen_str.0.c  |  10 +
  .../e-acsl/tests/memory/oracle/gen_alias.0.c  |   1 +
  .../e-acsl/tests/memory/oracle/gen_call.0.c   |   4 +
  .../memory/oracle/gen_decl_in_switch.0.c      |   1 +
@@ -88,11 +98,39 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../tests/temporal/oracle/gen_t_labels.0.c    |   2 +
  .../temporal/oracle/gen_t_local_init.0.c      |   1 +
  .../tests/temporal/oracle/gen_t_memcpy.0.c    |   6 +
- 63 files changed, 410 insertions(+), 1 deletion(-)
+ 65 files changed, 517 insertions(+), 1 deletion(-)
  create mode 100644 plugins/e-acsl/tests/bts/issue-framac-177.c
  create mode 100644 plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
  create mode 100644 plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
 
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+index af459ec298..61934eb147 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+@@ -546,7 +546,9 @@ extern char **environ;
+ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+   /* Track a top-level containers */
+   eacsl_store_block((void *)argc_ref, sizeof(int));
++  eacsl_initialize((void *)argc_ref, sizeof(int));
+   eacsl_store_block((void *)argv_ref, sizeof(char **));
++  eacsl_initialize((void *)argv_ref, sizeof(char **));
+   int argc = *argc_ref;
+   char **argv = *argv_ref;
+   /* Track argv */
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+index 3176a965ec..569018afcc 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+@@ -242,7 +242,9 @@ extern char **environ;
+ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+   /* Track a top-level containers */
+   shadow_alloca((void *)argc_ref, sizeof(int));
++  initialize_static_region((uintptr_t)argc_ref, sizeof(int));
+   shadow_alloca((void *)argv_ref, sizeof(char **));
++  initialize_static_region((uintptr_t)argv_ref, sizeof(char **));
+   int argc = *argc_ref;
+   char **argv = *argv_ref;
+   /* Track argv */
 diff --git a/plugins/e-acsl/src/code_generator/injector.ml b/plugins/e-acsl/src/code_generator/injector.ml
 index 8a6c712fc5..6d91a49ad0 100644
 --- a/plugins/e-acsl/src/code_generator/injector.ml
@@ -148,15 +186,18 @@ index bcd8bb7de3..ef4cb44dfd 100644
  
 diff --git a/plugins/e-acsl/tests/bts/issue-framac-177.c b/plugins/e-acsl/tests/bts/issue-framac-177.c
 new file mode 100644
-index 0000000000..d2e65a1807
+index 0000000000..3342862a49
 --- /dev/null
 +++ b/plugins/e-acsl/tests/bts/issue-framac-177.c
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,30 @@
 +/* run.config
 +   COMMENT: formal parameters are initialized on function entry (issue #177)
 +*/
 +
-+struct S { int t; unsigned long len; };
++struct S {
++  int t;
++  unsigned long len;
++};
 +
 +/*@ requires \initialized(&s.len); */
 +int f_struct(struct S s) {
@@ -171,8 +212,12 @@ index 0000000000..d2e65a1807
 +  return *pk;
 +}
 +
-+int main(void) {
-+  struct S full = { 1, 5 };
++int main(int argc, char **argv) {
++  int *p = &argc;
++  char ***q = &argv;
++  /*@ assert \initialized(p); */
++  /*@ assert \initialized(q); */
++  struct S full = {1, 5};
 +  return f_struct(full) + f_scalar(3) - 8;
 +}
 diff --git a/plugins/e-acsl/tests/bts/oracle/gen_bts1304.0.c b/plugins/e-acsl/tests/bts/oracle/gen_bts1304.0.c
@@ -423,10 +468,10 @@ index ced6d8f040..b8035720c0 100644
      int __gen_e_acsl_forall;
 diff --git a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
 new file mode 100644
-index 0000000000..4cafaa8b40
+index 0000000000..285d2c5e96
 --- /dev/null
 +++ b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,246 @@
 +/* Generated by Frama-C */
 +#include "pthread.h"
 +#include "stddef.h"
@@ -464,7 +509,7 @@ index 0000000000..4cafaa8b40
 +    __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.t)";
 +    __gen_e_acsl_assert_data.file = "issue-framac-177.c";
 +    __gen_e_acsl_assert_data.fct = "f_struct";
-+    __gen_e_acsl_assert_data.line = 9;
++    __gen_e_acsl_assert_data.line = 12;
 +    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
 +    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
 +  }
@@ -502,7 +547,7 @@ index 0000000000..4cafaa8b40
 +      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(pk,4)";
 +      __gen_e_acsl_assert_data_2.file = "issue-framac-177.c";
 +      __gen_e_acsl_assert_data_2.fct = "f_scalar";
-+      __gen_e_acsl_assert_data_2.line = 16;
++      __gen_e_acsl_assert_data_2.line = 19;
 +      __gen_e_acsl_assert_data_2.name = "pointer alignment";
 +      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
 +      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
@@ -519,7 +564,7 @@ index 0000000000..4cafaa8b40
 +    __gen_e_acsl_assert_data.pred_txt = "\\initialized(pk)";
 +    __gen_e_acsl_assert_data.file = "issue-framac-177.c";
 +    __gen_e_acsl_assert_data.fct = "f_scalar";
-+    __gen_e_acsl_assert_data.line = 16;
++    __gen_e_acsl_assert_data.line = 19;
 +    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
 +    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
 +  }
@@ -530,19 +575,111 @@ index 0000000000..4cafaa8b40
 +  return __retres;
 +}
 +
-+int main(void)
++int main(int argc, char **argv)
 +{
 +  int __retres;
 +  int tmp;
 +  int tmp_0;
-+  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_memory_init(& argc,& argv,8UL);
++  int *p = & argc;
++  __e_acsl_store_block((void *)(& p),8UL);
++  __e_acsl_full_init((void *)(& p));
++  char ***q = & argv;
++  __e_acsl_store_block((void *)(& q),8UL);
++  __e_acsl_full_init((void *)(& q));
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_initialized;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)p,4UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"p",(void *)p);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(p,4)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(p,4); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(p,4)";
++      __gen_e_acsl_assert_data_2.file = "issue-framac-177.c";
++      __gen_e_acsl_assert_data_2.fct = "main";
++      __gen_e_acsl_assert_data_2.line = 26;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_initialized = __e_acsl_initialized((void *)p,sizeof(int));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"p",(void *)p);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data,"sizeof(int)",
++                                   0,sizeof(int));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\\initialized(p)",0,
++                                 __gen_e_acsl_initialized);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "\\initialized(p)";
++    __gen_e_acsl_assert_data.file = "issue-framac-177.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 26;
++    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++  }
++  /*@ assert \initialized(p); */ ;
++  {
++    int __gen_e_acsl_aligned_2;
++    int __gen_e_acsl_initialized_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)q,8UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"q",(void *)q);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                 "\"pointer alignment\": \\aligned(q,8)",0,
++                                 __gen_e_acsl_aligned_2);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(q,8); */
++    {
++      __gen_e_acsl_assert_data_4.blocking = 1;
++      __gen_e_acsl_assert_data_4.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_4.pred_txt = "\\aligned(q,8)";
++      __gen_e_acsl_assert_data_4.file = "issue-framac-177.c";
++      __gen_e_acsl_assert_data_4.fct = "main";
++      __gen_e_acsl_assert_data_4.line = 27;
++      __gen_e_acsl_assert_data_4.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_4);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++    }
++    __gen_e_acsl_initialized_2 = __e_acsl_initialized((void *)q,
++                                                      sizeof(char **));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"q",(void *)q);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_3,
++                                   "sizeof(char **)",0,sizeof(char **));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                 "\\initialized(q)",0,
++                                 __gen_e_acsl_initialized_2);
++    __gen_e_acsl_assert_data_3.blocking = 1;
++    __gen_e_acsl_assert_data_3.kind = "Assertion";
++    __gen_e_acsl_assert_data_3.pred_txt = "\\initialized(q)";
++    __gen_e_acsl_assert_data_3.file = "issue-framac-177.c";
++    __gen_e_acsl_assert_data_3.fct = "main";
++    __gen_e_acsl_assert_data_3.line = 27;
++    __e_acsl_assert(__gen_e_acsl_initialized_2,& __gen_e_acsl_assert_data_3);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++  }
++  /*@ assert \initialized(q); */ ;
 +  struct S full = {.t = 1, .len = 5UL};
 +  __e_acsl_store_block((void *)(& full),16UL);
 +  __e_acsl_full_init((void *)(& full));
 +  tmp = __gen_e_acsl_f_struct(full);
 +  tmp_0 = f_scalar(3);
 +  __retres = (tmp + tmp_0) - 8;
++  __e_acsl_delete_block((void *)(& argv));
++  __e_acsl_delete_block((void *)(& argc));
 +  __e_acsl_delete_block((void *)(& full));
++  __e_acsl_delete_block((void *)(& q));
++  __e_acsl_delete_block((void *)(& p));
 +  __e_acsl_memory_clean();
 +  return __retres;
 +}
@@ -571,7 +708,7 @@ index 0000000000..4cafaa8b40
 +    __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.len)";
 +    __gen_e_acsl_assert_data.file = "issue-framac-177.c";
 +    __gen_e_acsl_assert_data.fct = "f_struct";
-+    __gen_e_acsl_assert_data.line = 7;
++    __gen_e_acsl_assert_data.line = 10;
 +    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
 +    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
 +  }
@@ -583,13 +720,17 @@ index 0000000000..4cafaa8b40
 +
 diff --git a/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
 new file mode 100644
-index 0000000000..ff49609cc8
+index 0000000000..a9cd35bd0b
 --- /dev/null
 +++ b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,8 @@
 +[e-acsl] beginning translation.
 +[e-acsl] translation done in project "e-acsl".
-+[eva:alarm] issue-framac-177.c:16: Warning: 
++[eva:alarm] issue-framac-177.c:26: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] issue-framac-177.c:27: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] issue-framac-177.c:19: Warning: 
 +  function __e_acsl_assert, behavior blocking: precondition got status unknown.
 diff --git a/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c b/plugins/e-acsl/tests/builtin/oracle/gen_strcat.0.c
 index f2b99d7626..f04d13d0f0 100644
@@ -1798,98 +1939,5 @@ index b1612002e8..9ff25d8958 100644
      __e_acsl_temporal_pull_parameter((void *)(& src),1U,8UL);
      __gen_e_acsl_at = dest;
 -- 
-2.56.0.windows.4
-
-
-From 3849f2be5f3127a7fe1929f6a9b464a9e08992d1 Mon Sep 17 00:00:00 2001
-From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
-Date: Sun, 15 Nov 2026 19:13:05 +0100
-Subject: [PATCH 2/2] [e-acsl] clang-format the new test
-
-Formatting only, as `make check-lint` requires; the oracles follow the
-new line numbers.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
----
- plugins/e-acsl/tests/bts/issue-framac-177.c               | 7 +++++--
- plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c  | 8 ++++----
- .../e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle | 2 +-
- 3 files changed, 10 insertions(+), 7 deletions(-)
-
-diff --git a/plugins/e-acsl/tests/bts/issue-framac-177.c b/plugins/e-acsl/tests/bts/issue-framac-177.c
-index d2e65a1807..c6468b362b 100644
---- a/plugins/e-acsl/tests/bts/issue-framac-177.c
-+++ b/plugins/e-acsl/tests/bts/issue-framac-177.c
-@@ -2,7 +2,10 @@
-    COMMENT: formal parameters are initialized on function entry (issue #177)
- */
- 
--struct S { int t; unsigned long len; };
-+struct S {
-+  int t;
-+  unsigned long len;
-+};
- 
- /*@ requires \initialized(&s.len); */
- int f_struct(struct S s) {
-@@ -18,6 +21,6 @@ int f_scalar(int k) {
- }
- 
- int main(void) {
--  struct S full = { 1, 5 };
-+  struct S full = {1, 5};
-   return f_struct(full) + f_scalar(3) - 8;
- }
-diff --git a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
-index 4cafaa8b40..c89dda255a 100644
---- a/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
-+++ b/plugins/e-acsl/tests/bts/oracle/gen_issue-framac-177.0.c
-@@ -35,7 +35,7 @@ int f_struct(struct S s)
-     __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.t)";
-     __gen_e_acsl_assert_data.file = "issue-framac-177.c";
-     __gen_e_acsl_assert_data.fct = "f_struct";
--    __gen_e_acsl_assert_data.line = 9;
-+    __gen_e_acsl_assert_data.line = 12;
-     __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
-     __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
-   }
-@@ -73,7 +73,7 @@ int f_scalar(int k)
-       __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(pk,4)";
-       __gen_e_acsl_assert_data_2.file = "issue-framac-177.c";
-       __gen_e_acsl_assert_data_2.fct = "f_scalar";
--      __gen_e_acsl_assert_data_2.line = 16;
-+      __gen_e_acsl_assert_data_2.line = 19;
-       __gen_e_acsl_assert_data_2.name = "pointer alignment";
-       __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data_2);
-       __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
-@@ -90,7 +90,7 @@ int f_scalar(int k)
-     __gen_e_acsl_assert_data.pred_txt = "\\initialized(pk)";
-     __gen_e_acsl_assert_data.file = "issue-framac-177.c";
-     __gen_e_acsl_assert_data.fct = "f_scalar";
--    __gen_e_acsl_assert_data.line = 16;
-+    __gen_e_acsl_assert_data.line = 19;
-     __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
-     __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
-   }
-@@ -142,7 +142,7 @@ int __gen_e_acsl_f_struct(struct S s)
-     __gen_e_acsl_assert_data.pred_txt = "\\initialized(&s.len)";
-     __gen_e_acsl_assert_data.file = "issue-framac-177.c";
-     __gen_e_acsl_assert_data.fct = "f_struct";
--    __gen_e_acsl_assert_data.line = 7;
-+    __gen_e_acsl_assert_data.line = 10;
-     __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data);
-     __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
-   }
-diff --git a/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
-index ff49609cc8..dfa5b51ec4 100644
---- a/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
-+++ b/plugins/e-acsl/tests/bts/oracle/issue-framac-177.0.res.oracle
-@@ -1,4 +1,4 @@
- [e-acsl] beginning translation.
- [e-acsl] translation done in project "e-acsl".
--[eva:alarm] issue-framac-177.c:16: Warning: 
-+[eva:alarm] issue-framac-177.c:19: Warning: 
-   function __e_acsl_assert, behavior blocking: precondition got status unknown.
--- 
-2.56.0.windows.4
+2.47.3
 

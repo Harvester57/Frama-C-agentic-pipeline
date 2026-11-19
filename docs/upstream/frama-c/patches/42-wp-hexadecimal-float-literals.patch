@@ -1,0 +1,525 @@
+From 109d417cd6184a18b7bb359941f532d1ef5e5e0a Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Wed, 18 Nov 2026 08:48:15 +0000
+Subject: [PATCH] [wp] read hexadecimal floating-point literals and the f32/f64
+ suffixes
+
+Cfloat.parse_literal only read decimal digits, and accepted any text
+ending with f, l or d after them. As a result:
+
+- a hexadecimal literal without suffix, such as 0x1.8p1 or DBL_MAX
+  from Frama-C's <float.h>, was rejected with "Unexpected constant
+  literal": in a contract the term was replaced by an unknown value (a
+  hypothesis using it was lost), and in a lemma WP stopped;
+- with -wp-model +real, a suffixed one such as 0x1.8p1f was read as 0,
+  without any message: "0x1.8p1f == 0.0" was proved by Qed;
+- the f32 and f64 suffixes, which the kernel accepts since 33.0, were
+  rejected, as in 1.5f32.
+
+The suffix is now removed with Floating_point.extract_suffix, the rest
+must be read entirely, and a hexadecimal literal (including an optional
+leading sign, matching re_mantissa for literals emitted by
+Logic_const.treal under -float-print hex) is converted to its exact
+rational value. In the Float model a suffixed literal still denotes the
+value rounded by the kernel, as before.
+
+New test: wp_acsl/float_literals.i, in both models and with
+-float-print hex.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ plugins/wp/src/Cfloat.ml                      |  28 +++-
+ plugins/wp/tests/wp_acsl/float_literals.i     |  40 ++++++
+ .../oracle/float_literals.0.res.oracle        | 122 ++++++++++++++++++
+ .../oracle/float_literals.1.res.oracle        | 122 ++++++++++++++++++
+ .../oracle/float_literals.2.res.oracle        |  12 ++
+ .../oracle_qualif/float_literals.0.res.oracle |  35 +++++
+ .../oracle_qualif/float_literals.1.res.oracle |  35 +++++
+ .../oracle_qualif/float_literals.2.res.oracle |  15 +++
+ 8 files changed, 405 insertions(+), 4 deletions(-)
+ create mode 100644 plugins/wp/tests/wp_acsl/float_literals.i
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/float_literals.0.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/float_literals.1.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/float_literals.2.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.0.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.1.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.2.res.oracle
+
+diff --git a/plugins/wp/src/Cfloat.ml b/plugins/wp/src/Cfloat.ml
+index d87f66ff5d..35c4ad4524 100644
+--- a/plugins/wp/src/Cfloat.ml
++++ b/plugins/wp/src/Cfloat.ml
+@@ -130,14 +130,35 @@ let fmake ulp value = match ulp with
+ 
+ let qmake ulp q = fmake ulp (Q.to_float q)
+ 
+-let re_float = Str.regexp ".*[fldFLD]$"
+ let re_mantissa = Str.regexp "[-+]?[0-9]*"
+ let re_decimal = Str.regexp "\\.[0-9]*"
+ let re_exponent = Str.regexp "[eE][-+]?[0-9]*"
++let re_hexadecimal = Str.regexp
++    "\\([-+]?\\)0[xX]\\([0-9a-fA-F]*\\)\\.?\\([0-9a-fA-F]*\\)[pP]\\([-+]?[0-9]+\\)$"
++
++(* Exact value of the literal last matched by [re_hexadecimal] *)
++let parse_hexadecimal r =
++  let sign = Str.matched_group 1 r in
++  let integer = Str.matched_group 2 r in
++  let fraction = Str.matched_group 3 r in
++  if integer = "" && fraction = "" then raise Not_found ;
++  let digits = Z.of_string_base 16 (sign ^ integer ^ fraction) in
++  (* each digit of the fractional part weighs four bits *)
++  let exponent =
++    int_of_string (Str.matched_group 4 r) - 4 * String.length fraction in
++  if exponent < 0 then
++    Q.make digits (Z.shift_left Z.one (-exponent))
++  else
++    Q.of_bigint (Z.shift_left digits exponent)
+ 
+ let parse_literal ~model v r =
+   try
+-    if model = Float && Str.string_match re_float r 0 then Q.of_float v
++    (* from here on, [r] is the literal without its suffix *)
++    let r, suffix = match Floating_point.extract_suffix r with
++      | Some (r, suffix, _) -> r, suffix
++      | None -> raise Not_found in
++    if model = Float && suffix <> "" then Q.of_float v
++    else if Str.string_match re_hexadecimal r 0 then parse_hexadecimal r
+     else
+       begin
+         if not @@ Str.string_match re_mantissa r 0 then
+@@ -156,8 +177,7 @@ let parse_literal ~model v r =
+             n, String.sub r (q + 1) (n - q - 1)
+           else
+             q, "0" in
+-        if n <> String.length r && not @@ Str.string_match re_float r n then
+-          raise Not_found ;
++        if n <> String.length r then raise Not_found ;
+         let digits = Z.of_string @@ mantissa ^ decimal in
+         let decades = int_of_string exponent - String.length decimal in
+         let power n =
+diff --git a/plugins/wp/tests/wp_acsl/float_literals.i b/plugins/wp/tests/wp_acsl/float_literals.i
+new file mode 100644
+index 0000000000..2c84c5ebf1
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/float_literals.i
+@@ -0,0 +1,40 @@
++/* run.config
++   OPT: -wp-prop="-real_only"
++   OPT: -wp-model +real -wp-prop="-float_only"
++PLUGIN: @PTEST_PLUGIN@,eva,scope,inout,reduc
++   OPT: -no-wp -float-print hex -main neg_hex_reduc -eva -eva-verbose 0 -then -reduc -reduc-gen-annot all -then -no-reduc -wp -wp-fct neg_hex_reduc -wp-prop=@ensures -wp-status-all
++*/
++/* run.config_qualif
++   OPT: -wp-prop="-real_only"
++   OPT: -wp-model +real -wp-prop="-float_only"
++PLUGIN: @PTEST_PLUGIN@,eva,scope,inout,reduc
++   OPT: -no-wp -float-print hex -main neg_hex_reduc -eva -eva-verbose 0 -then -reduc -reduc-gen-annot all -then -no-reduc -wp -wp-fct neg_hex_reduc -wp-prop=@ensures -wp-status-all
++*/
++
++/* Every goal is decided by Qed, in both models. */
++
++/*@ lemma hexa: 0x1.8p1 == 3.0 && 0X.8P+1 == 1.0 && 0x1.p-1 == 0.5 ; */
++/*@ lemma hexa_neg: -0x1.8p1 == -3.0 && -0x.8p0 == -0.5 && -0x0p0 == 0.0 ; */
++/*@ lemma hexa_max: 0x1.fffffffffffffp+1023 == 0x1p1024 - 0x1p971 ; */
++/*@ lemma hexa_suffix:
++      0x1.8p1f == 3.0 && 0x1.8p1d == 3.0 && 0x1.8p1L == 3.0
++      && 0x1.8p1f32 == 3.0 && 0x1.8p1F64 == 3.0 ; */
++/*@ lemma hexa_not_zero: 0x1.8p1f != 0.0 ; */
++/*@ lemma decimal_suffix: 1.5f32 == 1.5 && 1.5F64 == 1.5 ; */
++/*@ lemma non_exact_suffix:
++      0.1f32 == 0.1f && 0.1F64 == 0.1d && 0.1f32 != 0.0 ; */
++/*@ check lemma float_only:
++      0.1f32 == 0x1.99999ap-4 && 0.1f32 != 0.1
++      && 0.1F64 == 0x1.999999999999ap-4 && 0.1F64 != 0.1 ; */
++/*@ check lemma real_only: 0.1f32 == 0.1 && 0.1F64 == 0.1 ; */
++
++/*@ requires 0x1p-1 <= x <= 0x1.8p1 ;
++    ensures 0.5 <= x <= 3.0 ; */
++void contract(double x) { return; }
++
++/*@ ensures \result == 3.0 ; */
++float code(void) { return 0x1.8p1f; }
++
++/*@ requires -0x1.8p1023 <= x <= -0x1p0 ;
++    ensures x <= -1.0 ; */
++double neg_hex_reduc(double x) { return x + x; }
+diff --git a/plugins/wp/tests/wp_acsl/oracle/float_literals.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle/float_literals.0.res.oracle
+new file mode 100644
+index 0000000000..b9181d9518
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/float_literals.0.res.oracle
+@@ -0,0 +1,122 @@
++# frama-c -wp [...]
++[kernel] Parsing float_literals.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal code_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal code_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal contract_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal contract_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal neg_hex_reduc_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal neg_hex_reduc_terminates (Cfg) (Trivial)
++------------------------------------------------------------
++  Global
++------------------------------------------------------------
++
++Goal Lemma 'decimal_suffix':
++Assume Lemmas: 'hexa_not_zero' 'hexa_suffix' 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'float_only':
++Assume Lemmas: 'non_exact_suffix' 'decimal_suffix' 'hexa_not_zero'
++  'hexa_suffix' 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_max':
++Assume Lemmas: 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_neg':
++Assume Lemmas: 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_not_zero':
++Assume Lemmas: 'hexa_suffix' 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_suffix':
++Assume Lemmas: 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'non_exact_suffix':
++Assume Lemmas: 'decimal_suffix' 'hexa_not_zero' 'hexa_suffix' 'hexa_max'
++  'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function code
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_literals.i", line 36, characters 7-38) in 'code':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_literals.i", line 35, characters 13-27) in 'code':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_literals.i", line 36, characters 7-38) in 'code':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function contract
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_literals.i", line 33, characters 6-36) in 'contract':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_literals.i", line 32, characters 13-28) in 'contract':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_literals.i", line 33, characters 6-36) in 'contract':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function neg_hex_reduc
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_literals.i", line 40, characters 8-49) in 'neg_hex_reduc':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_literals.i", line 39, characters 13-22) in 'neg_hex_reduc':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_literals.i", line 40, characters 8-49) in 'neg_hex_reduc':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle/float_literals.1.res.oracle b/plugins/wp/tests/wp_acsl/oracle/float_literals.1.res.oracle
+new file mode 100644
+index 0000000000..bf6e1b75e2
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/float_literals.1.res.oracle
+@@ -0,0 +1,122 @@
++# frama-c -wp -wp-model 'Typed (Real)' [...]
++[kernel] Parsing float_literals.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal code_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal code_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal contract_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal contract_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal neg_hex_reduc_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal neg_hex_reduc_terminates (Cfg) (Trivial)
++------------------------------------------------------------
++  Global
++------------------------------------------------------------
++
++Goal Lemma 'decimal_suffix':
++Assume Lemmas: 'hexa_not_zero' 'hexa_suffix' 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_max':
++Assume Lemmas: 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_neg':
++Assume Lemmas: 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_not_zero':
++Assume Lemmas: 'hexa_suffix' 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'hexa_suffix':
++Assume Lemmas: 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Lemma 'non_exact_suffix':
++Assume Lemmas: 'decimal_suffix' 'hexa_not_zero' 'hexa_suffix' 'hexa_max'
++  'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'real_only':
++Assume Lemmas: 'non_exact_suffix' 'decimal_suffix' 'hexa_not_zero'
++  'hexa_suffix' 'hexa_max' 'hexa_neg' 'hexa'
++Prove: true.
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function code
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_literals.i", line 36, characters 7-38) in 'code':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_literals.i", line 35, characters 13-27) in 'code':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_literals.i", line 36, characters 7-38) in 'code':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function contract
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_literals.i", line 33, characters 6-36) in 'contract':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_literals.i", line 32, characters 13-28) in 'contract':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_literals.i", line 33, characters 6-36) in 'contract':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function neg_hex_reduc
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_literals.i", line 40, characters 8-49) in 'neg_hex_reduc':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_literals.i", line 39, characters 13-22) in 'neg_hex_reduc':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_literals.i", line 40, characters 8-49) in 'neg_hex_reduc':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle/float_literals.2.res.oracle b/plugins/wp/tests/wp_acsl/oracle/float_literals.2.res.oracle
+new file mode 100644
+index 0000000000..fcec439b54
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/float_literals.2.res.oracle
+@@ -0,0 +1,12 @@
++# frama-c -wp [...]
++[kernel] Parsing float_literals.i (no preprocessing)
++[eva:alarm] float_literals.i:38: Warning: 
++  function neg_hex_reduc: precondition got status unknown.
++[eva:alarm] float_literals.i:40: Warning: 
++  non-finite double value. assert \is_finite(\add_double(x, x));
++[wp] Running WP plugin...
++
++Goal Post-condition ("float_literals.i", line 39, characters 13-22) in 'neg_hex_reduc':
++Prove: true.
++
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.0.res.oracle
+new file mode 100644
+index 0000000000..1ec2b2c9bd
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.0.res.oracle
+@@ -0,0 +1,35 @@
++# frama-c -wp [...]
++[kernel] Parsing float_literals.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal code_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal code_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal contract_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal contract_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal neg_hex_reduc_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal neg_hex_reduc_terminates (Cfg) (Trivial)
++[wp] 11 goals scheduled
++[wp] [Valid] typed_lemma_decimal_suffix (Qed)
++[wp] [Valid] typed_check_lemma_float_only (Qed)
++[wp] [Valid] typed_lemma_hexa (Qed)
++[wp] [Valid] typed_lemma_hexa_max (Qed)
++[wp] [Valid] typed_lemma_hexa_neg (Qed)
++[wp] [Valid] typed_lemma_hexa_not_zero (Qed)
++[wp] [Valid] typed_lemma_hexa_suffix (Qed)
++[wp] [Valid] typed_lemma_non_exact_suffix (Qed)
++[wp] [Valid] typed_contract_ensures (Qed)
++[wp] [Valid] typed_code_ensures (Qed)
++[wp] [Valid] typed_neg_hex_reduc_ensures (Qed)
++[wp] Proved goals:   17 / 17
++  Terminating:     3
++  Unreachable:     3
++  Qed:            11
++------------------------------------------------------------
++ Axiomatics                WP     Alt-Ergo  Total   Success
++  Lemma                     8        -        8       100%
++------------------------------------------------------------
++ Functions                 WP     Alt-Ergo  Total   Success
++  contract                  3        -        3       100%
++  code                      3        -        3       100%
++  neg_hex_reduc             3        -        3       100%
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.1.res.oracle b/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.1.res.oracle
+new file mode 100644
+index 0000000000..616dd34921
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.1.res.oracle
+@@ -0,0 +1,35 @@
++# frama-c -wp -wp-model 'Typed (Real)' [...]
++[kernel] Parsing float_literals.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal code_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal code_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal contract_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal contract_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal neg_hex_reduc_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal neg_hex_reduc_terminates (Cfg) (Trivial)
++[wp] 11 goals scheduled
++[wp] [Valid] typed_real_lemma_decimal_suffix (Qed)
++[wp] [Valid] typed_real_lemma_hexa (Qed)
++[wp] [Valid] typed_real_lemma_hexa_max (Qed)
++[wp] [Valid] typed_real_lemma_hexa_neg (Qed)
++[wp] [Valid] typed_real_lemma_hexa_not_zero (Qed)
++[wp] [Valid] typed_real_lemma_hexa_suffix (Qed)
++[wp] [Valid] typed_real_lemma_non_exact_suffix (Qed)
++[wp] [Valid] typed_real_check_lemma_real_only (Qed)
++[wp] [Valid] typed_real_contract_ensures (Qed)
++[wp] [Valid] typed_real_code_ensures (Qed)
++[wp] [Valid] typed_real_neg_hex_reduc_ensures (Qed)
++[wp] Proved goals:   17 / 17
++  Terminating:     3
++  Unreachable:     3
++  Qed:            11
++------------------------------------------------------------
++ Axiomatics                WP     Alt-Ergo  Total   Success
++  Lemma                     8        -        8       100%
++------------------------------------------------------------
++ Functions                 WP     Alt-Ergo  Total   Success
++  contract                  3        -        3       100%
++  code                      3        -        3       100%
++  neg_hex_reduc             3        -        3       100%
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.2.res.oracle b/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.2.res.oracle
+new file mode 100644
+index 0000000000..6708d453e7
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle_qualif/float_literals.2.res.oracle
+@@ -0,0 +1,15 @@
++# frama-c -wp [...]
++[kernel] Parsing float_literals.i (no preprocessing)
++[eva:alarm] float_literals.i:38: Warning: 
++  function neg_hex_reduc: precondition got status unknown.
++[eva:alarm] float_literals.i:40: Warning: 
++  non-finite double value. assert \is_finite(\add_double(x, x));
++[wp] Running WP plugin...
++[wp] 1 goal scheduled
++[wp] [Valid] typed_neg_hex_reduc_ensures (Qed)
++[wp] Proved goals:    1 / 1
++  Qed:             1
++------------------------------------------------------------
++ Functions                 WP     Alt-Ergo  Total   Success
++  neg_hex_reduc             1        -        1       100%
++------------------------------------------------------------
+-- 
+2.47.3
+

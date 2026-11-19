@@ -82,7 +82,7 @@ Convert to `size_t` before the multiplication, at the four places:
 
 ```diff
 -#define PGM_HEAP_SIZE (E_ACSL_HEAP_SIZE * MB)
-+#define PGM_HEAP_SIZE ((size_t)E_ACSL_HEAP_SIZE * MB)
++#define PGM_HEAP_SIZE ((size_t)(E_ACSL_HEAP_SIZE) * MB)
 ```
 
 and the same for `PGM_TLS_SIZE`, `E_ACSL_STACK_SIZE * MB` and the two `E_ACSL_THREAD_STACK_SIZE * MB`.
@@ -91,12 +91,13 @@ With the fix, every size tried works, gcc and clang: heap up to 1048576 MB (1 Ti
 reserved, not committed) and stack up to 65536 MB. No upper limit was found. A large heap reserves
 address space (heap plus its shadows), not memory.
 
-### Patch proposed (2026-11-17)
+### Patch proposed (2026-11-17; updated 2026-11-18)
 
 [`./patches/36-eacsl-heap-zone-size-overflow.patch`](./patches/36-eacsl-heap-zone-size-overflow.patch),
-one commit on `95408044f7`, "[e-acsl] compute the zone sizes of --zone-sizes in size_t":
+one commit on `b80fcac74f`, "[e-acsl] compute the zone sizes of --zone-sizes in size_t":
 
-- the three runtime files above (5 lines);
+- the three runtime files above (5 lines; `PGM_HEAP_SIZE` and `PGM_TLS_SIZE` parenthesize the macro
+  operands `((size_t)(E_ACSL_HEAP_SIZE) * MB)` and `((size_t)(E_ACSL_TLS_SIZE) * MB)`);
 - new test `special/e-acsl-zone-sizes.c`: `malloc(16)`, a `\valid` check, `free`, run in the `dev`
   configuration with `--zone-sizes heap:2048,stack:2048`; default-configuration oracles
   `oracle/e-acsl-zone-sizes.0.res.oracle` and `oracle/gen_e-acsl-zone-sizes.0.c`. It reserves about
@@ -113,24 +114,26 @@ one commit on `95408044f7`, "[e-acsl] compute the zone sizes of --zone-sizes in 
 
 ## Validation
 
-All in container `framac-master-audit:9540804` (Debian 13, gcc 14.2.0, clang 19.1.7), `master` at
-`95408044f7`, then the commit `b5296eeb81` on it, rebuilt (`dune build --release @install`) and
-installed (`dune install --release --prefix /home/opam/.opam/5.5`).
+Originally run in container `framac-master-audit:9540804` (Debian 13, gcc 14.2.0, clang 19.1.7),
+`master` at `95408044f7`, and re-validated on 2026-11-18 in a fresh `framac-master-audit:b80fcac`
+container (`master` at `b80fcac74f`, commit `29005691a0` with parenthesized macro operands) via
+[`../../../tools/upstream_audit/revalidate.sh`](../../../tools/upstream_audit/revalidate.sh)
+`package 36`:
 
 | Check | `master` | Patched |
 | :-- | :-- | :-- |
-| Reproducer (gcc, clang × 8 sizes) | 139 for heap:2048, heap:4095, stack:2048; 134 for heap:4096, heap:4097; gcc `-Woverflow` warning | every line exit 0, no warning |
+| Reproducer (gcc, clang × 8 sizes) | 139 for heap:2048, heap:4095, stack:2048; 134 for heap:4096, heap:4097; gcc `-Woverflow` warning | every line exit 0, no warning (re-checked on `b80fcac74f`) |
 | Reproducer on 34.0~beta | same as `master` | not run (no patched 34 image) |
-| Larger sizes by hand (gcc and clang) | heap:8192 to 1048576 abort at the first malloc; stack:4096 to 65536 no-op | all exit 0 |
-| `thread-stack` by hand (gcc, `--concurrency`, one thread) | 2048: `pthread_create` fails; 4096: no-op | 2048 and 4096 exit 0 |
-| New test, `dev` configuration (`special/`) | `e-acsl-zone-sizes.0`: exit 139 | passes |
-| ptests `special/`, default configuration | — | only the new test's two oracles were missing (promoted); every other test matches |
-| ptests `special/` and `memory/`, `dev` configuration | — | all pass |
-| `./dev/check-files.sh -p HEAD~1` | — | passes ("Lint 6 file(s)") |
-| `git am` alone on `95408044f7` | — | applies |
-| `git am --3way` with patches 18, 29, 37, 38 (three orders) | — | applies, no conflict |
+| Larger sizes by hand (gcc and clang, on `95408044f7`) | heap:8192 to 1048576 abort at the first malloc; stack:4096 to 65536 no-op | all exit 0 |
+| `thread-stack` by hand (gcc, `--concurrency`, one thread, on `95408044f7`) | 2048: `pthread_create` fails; 4096: no-op | 2048 and 4096 exit 0 |
+| New test, `dev` configuration (`special/`) | `e-acsl-zone-sizes.0`: exit 139 (`b80fcac74f`) | passes (`b80fcac74f`) |
+| ptests `plugins/e-acsl`, default configuration | — | all pass (`b80fcac74f`, `./dev/test.sh -p plugins/e-acsl`) |
+| ptests `special/` and `memory/`, `dev` configuration | — | all pass (on `95408044f7`) |
+| `./dev/check-files.sh -p HEAD~1` | — | passes ("Lint 6 file(s)", `b80fcac74f`) |
+| `git am --keep-non-patch` alone on `b80fcac74f` | — | applies cleanly, no mode changes |
+| `git am --3way` with patches 18, 29, 37, 38 (three orders, on `95408044f7`) | — | applies, no conflict |
 
-Not run: ptests of the other E-ACSL directories; the change only touches sizes passed by
+Not run: `dev` configuration of the other E-ACSL directories; the change only touches sizes passed by
 `--zone-sizes`, which no other test uses. Core dumps: the container has a hard core limit of 0, so
 `prlimit --core=1:1` in the reproducer has no effect there (see the report of this package).
 

@@ -1,4 +1,4 @@
-From 732f33be360ffb5e1f7b4a17ccecc41a90a0e9d8 Mon Sep 17 00:00:00 2001
+From 884b8a12684ec11103f84b12b0f20c83c820d3df Mon Sep 17 00:00:00 2001
 From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
 Date: Tue, 17 Nov 2026 18:28:23 +0000
 Subject: [PATCH] [libc] add Linux headers sys/epoll.h and sys/inotify.h
@@ -12,33 +12,42 @@ Add both headers, in the style of sys/sendfile.h and sys/prctl.h:
   IN_CLOEXEC, IN_NONBLOCK) with the Linux values;
 - struct epoll_event, packed on x86_64 as in glibc (12 bytes), the
   epoll_data union, and struct inotify_event;
-- epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait,
-  inotify_init, inotify_init1, inotify_add_watch and inotify_rm_watch,
-  with minimal contracts: validity of the descriptors and buffers,
-  assigns clauses, the -1 error result, and for epoll_wait/epoll_pwait
-  the same full/partial behaviors as read(). The kernel-side interest
-  and watch lists are not modelled (//missing: comments).
+- epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait
+  (epoll_pwait2 intentionally omitted), inotify_init, inotify_init1,
+  inotify_add_watch and inotify_rm_watch, with minimal contracts:
+  validity of the descriptors and buffers, initialization of sigmask
+  in epoll_pwait, assigns clauses including errno (and indirect
+  dependencies on event/event->events and *sigmask), the -1 error
+  result, and for epoll_wait/epoll_pwait the same full/partial
+  behaviors as read(). The kernel-side interest and watch lists are
+  not modelled (//missing: comments).
+- sys/epoll.h includes ../__fc_define_sigset_t.h instead of <signal.h>
+  to avoid polluting the namespace, and both headers include <errno.h>.
 
 Add both headers to share/libc/__fc_libc.h and tests/libc/fc_libc.c, and
-one Eva test per header under tests/libc. The fc_libc.0 and fc_libc.2
-oracles gain the two include lines.
+one Eva test per header under tests/libc (testing both x86_32 and x86_64
+for sys_epoll_h.c, including NULL event on EPOLL_CTL_DEL and errno
+reachability). The fc_libc.0 and fc_libc.2 oracles gain the two include
+lines.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  share/libc/__fc_libc.h                       |   2 +
- share/libc/sys/epoll.h                       | 140 +++++++++++++++++++
- share/libc/sys/inotify.h                     |  94 +++++++++++++
+ share/libc/sys/epoll.h                       | 147 +++++++++++++++++++
+ share/libc/sys/inotify.h                     |  96 ++++++++++++
  tests/libc/fc_libc.c                         |   2 +
  tests/libc/oracle/fc_libc.0.res.oracle       |   2 +
  tests/libc/oracle/fc_libc.2.res.oracle       |   2 +
- tests/libc/oracle/sys_epoll_h.0.res.oracle   | 120 ++++++++++++++++
- tests/libc/oracle/sys_inotify_h.0.res.oracle |  56 ++++++++
- tests/libc/sys_epoll_h.c                     |  30 ++++
- tests/libc/sys_inotify_h.c                   |  20 +++
- 10 files changed, 468 insertions(+)
+ tests/libc/oracle/sys_epoll_h.0.res.oracle   | 127 ++++++++++++++++
+ tests/libc/oracle/sys_epoll_h.1.res.oracle   | 129 ++++++++++++++++
+ tests/libc/oracle/sys_inotify_h.0.res.oracle |  58 ++++++++
+ tests/libc/sys_epoll_h.c                     |  44 ++++++
+ tests/libc/sys_inotify_h.c                   |  25 ++++
+ 11 files changed, 634 insertions(+)
  create mode 100644 share/libc/sys/epoll.h
  create mode 100644 share/libc/sys/inotify.h
  create mode 100644 tests/libc/oracle/sys_epoll_h.0.res.oracle
+ create mode 100644 tests/libc/oracle/sys_epoll_h.1.res.oracle
  create mode 100644 tests/libc/oracle/sys_inotify_h.0.res.oracle
  create mode 100644 tests/libc/sys_epoll_h.c
  create mode 100644 tests/libc/sys_inotify_h.c
@@ -59,10 +68,10 @@ index 6cc3b0e54e..6bb667917f 100644
  #include "syslog.h"
 diff --git a/share/libc/sys/epoll.h b/share/libc/sys/epoll.h
 new file mode 100644
-index 0000000000..737046d6e8
+index 0000000000..faea968067
 --- /dev/null
 +++ b/share/libc/sys/epoll.h
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,147 @@
 +/**************************************************************************/
 +/*                                                                        */
 +/*  SPDX-License-Identifier LGPL-2.1                                      */
@@ -77,11 +86,12 @@ index 0000000000..737046d6e8
 +#define __FC_SYS_EPOLL_H
 +#include "../features.h"
 +#include <stdint.h>
-+#include <signal.h>
 +__PUSH_FC_STDLIB
 +__BEGIN_DECLS
 +
 +#include "../__fc_define_max_open_files.h"
++#include "../__fc_define_sigset_t.h"
++#include <errno.h>
 +
 +extern volatile int Frama_C_entropy_source;
 +
@@ -128,13 +138,13 @@ index 0000000000..737046d6e8
 +
 +/*@
 +  requires valid_size: size > 0;
-+  assigns \result \from indirect:size;
++  assigns \result, errno \from indirect:size;
 +  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 +*/
 +extern int epoll_create(int size);
 +
 +/*@
-+  assigns \result \from indirect:flags;
++  assigns \result, errno \from indirect:flags;
 +  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 +*/
 +extern int epoll_create1(int flags);
@@ -146,8 +156,9 @@ index 0000000000..737046d6e8
 +    op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL || op == EPOLL_CTL_MOD;
 +  requires valid_event: op == EPOLL_CTL_DEL || \valid_read(event);
 +  //missing: assigns 'interest list of epfd' \from fd, op, event->events, event->data;
-+  assigns \result \from indirect:epfd, indirect:op, indirect:fd,
-+                        indirect:Frama_C_entropy_source;
++  assigns \result, errno \from indirect:epfd, indirect:op, indirect:fd,
++                               indirect:event, indirect:event->events,
++                               indirect:Frama_C_entropy_source;
 +  ensures result_ok_or_error: \result == 0 || \result == -1;
 +*/
 +extern int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
@@ -156,8 +167,9 @@ index 0000000000..737046d6e8
 +  requires valid_epfd: 0 <= epfd < __FC_MAX_OPEN_FILES;
 +  requires valid_maxevents: maxevents > 0;
 +  requires valid_events: \valid(events + (0 .. maxevents - 1));
-+  assigns \result \from indirect:epfd, indirect:maxevents, indirect:timeout,
-+                        indirect:Frama_C_entropy_source;
++  assigns \result, errno \from indirect:epfd, indirect:maxevents,
++                               indirect:timeout,
++                               indirect:Frama_C_entropy_source;
 +  assigns events[0 .. maxevents - 1]
 +    \from indirect:epfd, indirect:maxevents, indirect:timeout,
 +          indirect:Frama_C_entropy_source;
@@ -181,11 +193,15 @@ index 0000000000..737046d6e8
 +  requires valid_maxevents: maxevents > 0;
 +  requires valid_events: \valid(events + (0 .. maxevents - 1));
 +  requires valid_sigmask_or_null: sigmask == \null || \valid_read(sigmask);
-+  assigns \result \from indirect:epfd, indirect:maxevents, indirect:timeout,
-+                        indirect:sigmask, indirect:Frama_C_entropy_source;
++  requires initialization:sigmask: sigmask == \null || \initialized(sigmask);
++  assigns \result, errno \from indirect:epfd, indirect:maxevents,
++                               indirect:timeout, indirect:sigmask,
++                               indirect:*sigmask,
++                               indirect:Frama_C_entropy_source;
 +  assigns events[0 .. maxevents - 1]
 +    \from indirect:epfd, indirect:maxevents, indirect:timeout,
-+          indirect:sigmask, indirect:Frama_C_entropy_source;
++          indirect:sigmask, indirect:*sigmask,
++          indirect:Frama_C_entropy_source;
 +  behavior full:
 +    assumes nondet_full: Frama_C_entropy_source != 0;
 +    ensures result_full: \result == maxevents;
@@ -205,10 +221,10 @@ index 0000000000..737046d6e8
 +#endif
 diff --git a/share/libc/sys/inotify.h b/share/libc/sys/inotify.h
 new file mode 100644
-index 0000000000..ce33c3b82a
+index 0000000000..8604c34ea8
 --- /dev/null
 +++ b/share/libc/sys/inotify.h
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,96 @@
 +/**************************************************************************/
 +/*                                                                        */
 +/*  SPDX-License-Identifier LGPL-2.1                                      */
@@ -228,6 +244,7 @@ index 0000000000..ce33c3b82a
 +
 +#include "../__fc_define_max_open_files.h"
 +#include "../__fc_string_axiomatic.h"
++#include <errno.h>
 +
 +struct inotify_event {
 +  int wd;
@@ -272,13 +289,13 @@ index 0000000000..ce33c3b82a
 +#define IN_NONBLOCK 0x800
 +
 +/*@
-+  assigns \result \from \nothing;
++  assigns \result, errno \from \nothing;
 +  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 +*/
 +extern int inotify_init(void);
 +
 +/*@
-+  assigns \result \from indirect:flags;
++  assigns \result, errno \from indirect:flags;
 +  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
 +*/
 +extern int inotify_init1(int flags);
@@ -287,7 +304,8 @@ index 0000000000..ce33c3b82a
 +  requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
 +  requires valid_pathname: valid_read_string(pathname);
 +  //missing: assigns 'watch list of fd' \from pathname[0 ..], mask;
-+  assigns \result \from indirect:fd, indirect:pathname[0 ..], indirect:mask;
++  assigns \result, errno \from indirect:fd, indirect:pathname[0 ..],
++                               indirect:mask;
 +  ensures watch_descriptor_or_error: \result == -1 || \result >= 0;
 +*/
 +extern int inotify_add_watch(int fd, const char *pathname, uint32_t mask);
@@ -295,7 +313,7 @@ index 0000000000..ce33c3b82a
 +/*@
 +  requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
 +  //missing: assigns 'watch list of fd' \from wd;
-+  assigns \result \from indirect:fd, indirect:wd;
++  assigns \result, errno \from indirect:fd, indirect:wd;
 +  ensures result_ok_or_error: \result == 0 || \result == -1;
 +*/
 +extern int inotify_rm_watch(int fd, int wd);
@@ -347,10 +365,10 @@ index 3bac971e7a..91a488fb28 100644
  [kernel] Parsing FRAMAC_SHARE/libc/sys/mman.h (with preprocessing)
 diff --git a/tests/libc/oracle/sys_epoll_h.0.res.oracle b/tests/libc/oracle/sys_epoll_h.0.res.oracle
 new file mode 100644
-index 0000000000..3849d6e27c
+index 0000000000..84797138a1
 --- /dev/null
 +++ b/tests/libc/oracle/sys_epoll_h.0.res.oracle
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,127 @@
 +[kernel] Parsing sys_epoll_h.c (with preprocessing)
 +[eva] Analyzing a complete application starting at main
 +[eva:progress] Computing initial state
@@ -359,106 +377,112 @@ index 0000000000..3849d6e27c
 +  
 +[eva:progress] 
 +  computing for function epoll_create1 <- main.
-+  Called from sys_epoll_h.c:6.
++  Called from sys_epoll_h.c:12.
 +[eva] using specification for function epoll_create1
 +[eva:progress] Done for function epoll_create1
-+[eva:progress] sys_epoll_h.c:9: assertion 'valid_fd' got status valid.
-+[eva:progress] sys_epoll_h.c:10: assertion 'size' got status valid.
++[eva:progress] sys_epoll_h.c:15: assertion 'valid_fd' got status valid.
 +[eva:progress] 
 +  computing for function epoll_ctl <- main.
-+  Called from sys_epoll_h.c:14.
++  Called from sys_epoll_h.c:22.
 +[eva] using specification for function epoll_ctl
-+[eva:progress] sys_epoll_h.c:14: 
++[eva:progress] sys_epoll_h.c:22: 
 +  function epoll_ctl: precondition 'valid_epfd' got status valid.
-+[eva:progress] sys_epoll_h.c:14: 
++[eva:progress] sys_epoll_h.c:22: 
 +  function epoll_ctl: precondition 'valid_fd' got status valid.
-+[eva:progress] sys_epoll_h.c:14: 
++[eva:progress] sys_epoll_h.c:22: 
 +  function epoll_ctl: precondition 'valid_op' got status valid.
-+[eva:progress] sys_epoll_h.c:14: 
++[eva:progress] sys_epoll_h.c:22: 
 +  function epoll_ctl: precondition 'valid_event' got status valid.
 +[eva:progress] Done for function epoll_ctl
-+[eva:progress] sys_epoll_h.c:15: assertion got status valid.
++[eva:progress] sys_epoll_h.c:23: assertion got status valid.
 +[eva:progress] 
 +  computing for function epoll_ctl <- main.
-+  Called from sys_epoll_h.c:16.
-+[eva:progress] sys_epoll_h.c:16: 
++  Called from sys_epoll_h.c:24.
++[eva:progress] sys_epoll_h.c:24: 
 +  function epoll_ctl: precondition 'valid_epfd' got status valid.
-+[eva:progress] sys_epoll_h.c:16: 
++[eva:progress] sys_epoll_h.c:24: 
 +  function epoll_ctl: precondition 'valid_fd' got status valid.
-+[eva:progress] sys_epoll_h.c:16: 
++[eva:progress] sys_epoll_h.c:24: 
 +  function epoll_ctl: precondition 'valid_op' got status valid.
-+[eva:progress] sys_epoll_h.c:16: 
++[eva:progress] sys_epoll_h.c:24: 
 +  function epoll_ctl: precondition 'valid_event' got status valid.
 +[eva:progress] Done for function epoll_ctl
++[eva:progress] sys_epoll_h.c:25: assertion got status valid.
 +[eva:progress] 
 +  computing for function epoll_wait <- main.
-+  Called from sys_epoll_h.c:18.
++  Called from sys_epoll_h.c:28.
 +[eva] using specification for function epoll_wait
-+[eva:progress] sys_epoll_h.c:18: 
++[eva:progress] sys_epoll_h.c:28: 
 +  function epoll_wait: precondition 'valid_epfd' got status valid.
-+[eva:progress] sys_epoll_h.c:18: 
++[eva:progress] sys_epoll_h.c:28: 
 +  function epoll_wait: precondition 'valid_maxevents' got status valid.
-+[eva:progress] sys_epoll_h.c:18: 
++[eva:progress] sys_epoll_h.c:28: 
 +  function epoll_wait: precondition 'valid_events' got status valid.
 +[eva:progress] Done for function epoll_wait
-+[eva:progress] sys_epoll_h.c:19: assertion got status valid.
++[eva:progress] sys_epoll_h.c:29: assertion got status valid.
 +[eva:progress] 
 +  computing for function sigemptyset <- main.
-+  Called from sys_epoll_h.c:21.
++  Called from sys_epoll_h.c:34.
 +[eva] using specification for function sigemptyset
-+[eva:progress] sys_epoll_h.c:21: 
++[eva:progress] sys_epoll_h.c:34: 
 +  function sigemptyset: precondition 'valid_set' got status valid.
 +[eva:progress] Done for function sigemptyset
 +[eva:progress] 
 +  computing for function epoll_pwait <- main.
-+  Called from sys_epoll_h.c:22.
++  Called from sys_epoll_h.c:35.
 +[eva] using specification for function epoll_pwait
-+[eva:progress] sys_epoll_h.c:22: 
++[eva:progress] sys_epoll_h.c:35: 
 +  function epoll_pwait: precondition 'valid_epfd' got status valid.
-+[eva:progress] sys_epoll_h.c:22: 
++[eva:progress] sys_epoll_h.c:35: 
 +  function epoll_pwait: precondition 'valid_maxevents' got status valid.
-+[eva:progress] sys_epoll_h.c:22: 
++[eva:progress] sys_epoll_h.c:35: 
 +  function epoll_pwait: precondition 'valid_events' got status valid.
-+[eva:progress] sys_epoll_h.c:22: 
++[eva:progress] sys_epoll_h.c:35: 
 +  function epoll_pwait: precondition 'valid_sigmask_or_null' got status valid.
++[eva:progress] sys_epoll_h.c:35: 
++  function epoll_pwait: precondition 'initialization,sigmask' got status valid.
 +[eva:progress] Done for function epoll_pwait
-+[eva:progress] sys_epoll_h.c:23: assertion got status valid.
++[eva:progress] sys_epoll_h.c:36: assertion got status valid.
 +[eva:progress] 
 +  computing for function epoll_pwait <- main.
-+  Called from sys_epoll_h.c:24.
-+[eva:progress] sys_epoll_h.c:24: 
++  Called from sys_epoll_h.c:37.
++[eva:progress] sys_epoll_h.c:37: 
 +  function epoll_pwait: precondition 'valid_epfd' got status valid.
-+[eva:progress] sys_epoll_h.c:24: 
++[eva:progress] sys_epoll_h.c:37: 
 +  function epoll_pwait: precondition 'valid_maxevents' got status valid.
-+[eva:progress] sys_epoll_h.c:24: 
++[eva:progress] sys_epoll_h.c:37: 
 +  function epoll_pwait: precondition 'valid_events' got status valid.
-+[eva:progress] sys_epoll_h.c:24: 
++[eva:progress] sys_epoll_h.c:37: 
 +  function epoll_pwait: precondition 'valid_sigmask_or_null' got status valid.
++[eva:progress] sys_epoll_h.c:37: 
++  function epoll_pwait: precondition 'initialization,sigmask' got status valid.
 +[eva:progress] Done for function epoll_pwait
++[eva:progress] sys_epoll_h.c:38: assertion got status valid.
 +[eva:progress] 
 +  computing for function epoll_create <- main.
-+  Called from sys_epoll_h.c:25.
++  Called from sys_epoll_h.c:39.
 +[eva] using specification for function epoll_create
-+[eva:progress] sys_epoll_h.c:25: 
++[eva:progress] sys_epoll_h.c:39: 
 +  function epoll_create: precondition 'valid_size' got status valid.
 +[eva:progress] Done for function epoll_create
 +[eva:progress] 
 +  computing for function close <- main.
-+  Called from sys_epoll_h.c:27.
++  Called from sys_epoll_h.c:41.
 +[eva] using specification for function close
-+[eva:progress] sys_epoll_h.c:27: 
++[eva:progress] sys_epoll_h.c:41: 
 +  function close: precondition 'valid_fd' got status valid.
 +[eva:progress] Done for function close
 +[eva:progress] 
 +  computing for function close <- main.
-+  Called from sys_epoll_h.c:28.
-+[eva:progress] sys_epoll_h.c:28: 
++  Called from sys_epoll_h.c:42.
++[eva:progress] sys_epoll_h.c:42: 
 +  function close: precondition 'valid_fd' got status valid.
 +[eva:progress] Done for function close
 +[eva:progress] Recording results for main
 +[eva:progress] Done for function main
 +[eva] ====== VALUES COMPUTED ======
 +[eva:final-states] Values at end of function main:
++  errno ∈ [--..--]
 +  __fc_fds[0..1023] ∈ [--..--]
 +  ep ∈ [-1..1023]
 +  ev.events ∈ {2147483649} or UNINITIALIZED
@@ -468,15 +492,151 @@ index 0000000000..3849d6e27c
 +  r ∈ {-1; 0} or UNINITIALIZED
 +  evs[0..3] ∈ [--..--] or UNINITIALIZED
 +  n ∈ {-1; 0; 1; 2; 3; 4} or UNINITIALIZED
++  eintr ∈ {0; 1} or UNINITIALIZED
++  mask ∈ [--..--] or UNINITIALIZED
++  ep2 ∈ [-1..1023] or UNINITIALIZED
++  __retres ∈ {0; 1}
+diff --git a/tests/libc/oracle/sys_epoll_h.1.res.oracle b/tests/libc/oracle/sys_epoll_h.1.res.oracle
+new file mode 100644
+index 0000000000..f9924d181d
+--- /dev/null
++++ b/tests/libc/oracle/sys_epoll_h.1.res.oracle
+@@ -0,0 +1,129 @@
++[kernel] Parsing sys_epoll_h.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] 
++  computing for function epoll_create1 <- main.
++  Called from sys_epoll_h.c:12.
++[eva] using specification for function epoll_create1
++[eva:progress] Done for function epoll_create1
++[eva:progress] sys_epoll_h.c:15: assertion 'valid_fd' got status valid.
++[eva:progress] sys_epoll_h.c:17: assertion 'size' got status valid.
++[eva:progress] 
++  computing for function epoll_ctl <- main.
++  Called from sys_epoll_h.c:22.
++[eva] using specification for function epoll_ctl
++[eva:progress] sys_epoll_h.c:22: 
++  function epoll_ctl: precondition 'valid_epfd' got status valid.
++[eva:progress] sys_epoll_h.c:22: 
++  function epoll_ctl: precondition 'valid_fd' got status valid.
++[eva:progress] sys_epoll_h.c:22: 
++  function epoll_ctl: precondition 'valid_op' got status valid.
++[eva:progress] sys_epoll_h.c:22: 
++  function epoll_ctl: precondition 'valid_event' got status valid.
++[eva:progress] Done for function epoll_ctl
++[eva:progress] sys_epoll_h.c:23: assertion got status valid.
++[eva:progress] 
++  computing for function epoll_ctl <- main.
++  Called from sys_epoll_h.c:24.
++[eva:progress] sys_epoll_h.c:24: 
++  function epoll_ctl: precondition 'valid_epfd' got status valid.
++[eva:progress] sys_epoll_h.c:24: 
++  function epoll_ctl: precondition 'valid_fd' got status valid.
++[eva:progress] sys_epoll_h.c:24: 
++  function epoll_ctl: precondition 'valid_op' got status valid.
++[eva:progress] sys_epoll_h.c:24: 
++  function epoll_ctl: precondition 'valid_event' got status valid.
++[eva:progress] Done for function epoll_ctl
++[eva:progress] sys_epoll_h.c:25: assertion got status valid.
++[eva:progress] 
++  computing for function epoll_wait <- main.
++  Called from sys_epoll_h.c:28.
++[eva] using specification for function epoll_wait
++[eva:progress] sys_epoll_h.c:28: 
++  function epoll_wait: precondition 'valid_epfd' got status valid.
++[eva:progress] sys_epoll_h.c:28: 
++  function epoll_wait: precondition 'valid_maxevents' got status valid.
++[eva:progress] sys_epoll_h.c:28: 
++  function epoll_wait: precondition 'valid_events' got status valid.
++[eva:progress] Done for function epoll_wait
++[eva:progress] sys_epoll_h.c:29: assertion got status valid.
++[eva:progress] 
++  computing for function sigemptyset <- main.
++  Called from sys_epoll_h.c:34.
++[eva] using specification for function sigemptyset
++[eva:progress] sys_epoll_h.c:34: 
++  function sigemptyset: precondition 'valid_set' got status valid.
++[eva:progress] Done for function sigemptyset
++[eva:progress] 
++  computing for function epoll_pwait <- main.
++  Called from sys_epoll_h.c:35.
++[eva] using specification for function epoll_pwait
++[eva:progress] sys_epoll_h.c:35: 
++  function epoll_pwait: precondition 'valid_epfd' got status valid.
++[eva:progress] sys_epoll_h.c:35: 
++  function epoll_pwait: precondition 'valid_maxevents' got status valid.
++[eva:progress] sys_epoll_h.c:35: 
++  function epoll_pwait: precondition 'valid_events' got status valid.
++[eva:progress] sys_epoll_h.c:35: 
++  function epoll_pwait: precondition 'valid_sigmask_or_null' got status valid.
++[eva:progress] sys_epoll_h.c:35: 
++  function epoll_pwait: precondition 'initialization,sigmask' got status valid.
++[eva:progress] Done for function epoll_pwait
++[eva:progress] sys_epoll_h.c:36: assertion got status valid.
++[eva:progress] 
++  computing for function epoll_pwait <- main.
++  Called from sys_epoll_h.c:37.
++[eva:progress] sys_epoll_h.c:37: 
++  function epoll_pwait: precondition 'valid_epfd' got status valid.
++[eva:progress] sys_epoll_h.c:37: 
++  function epoll_pwait: precondition 'valid_maxevents' got status valid.
++[eva:progress] sys_epoll_h.c:37: 
++  function epoll_pwait: precondition 'valid_events' got status valid.
++[eva:progress] sys_epoll_h.c:37: 
++  function epoll_pwait: precondition 'valid_sigmask_or_null' got status valid.
++[eva:progress] sys_epoll_h.c:37: 
++  function epoll_pwait: precondition 'initialization,sigmask' got status valid.
++[eva:progress] Done for function epoll_pwait
++[eva:progress] sys_epoll_h.c:38: assertion got status valid.
++[eva:progress] 
++  computing for function epoll_create <- main.
++  Called from sys_epoll_h.c:39.
++[eva] using specification for function epoll_create
++[eva:progress] sys_epoll_h.c:39: 
++  function epoll_create: precondition 'valid_size' got status valid.
++[eva:progress] Done for function epoll_create
++[eva:progress] 
++  computing for function close <- main.
++  Called from sys_epoll_h.c:41.
++[eva] using specification for function close
++[eva:progress] sys_epoll_h.c:41: 
++  function close: precondition 'valid_fd' got status valid.
++[eva:progress] Done for function close
++[eva:progress] 
++  computing for function close <- main.
++  Called from sys_epoll_h.c:42.
++[eva:progress] sys_epoll_h.c:42: 
++  function close: precondition 'valid_fd' got status valid.
++[eva:progress] Done for function close
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  errno ∈ [--..--]
++  __fc_fds[0..1023] ∈ [--..--]
++  ep ∈ [-1..1023]
++  ev.events ∈ {2147483649} or UNINITIALIZED
++    .data{.ptr[bits 0 to 31]; .fd; .u32; .u64[bits 0 to 31]} ∈
++    {0} or UNINITIALIZED
++    .data{.ptr[bits 32 to 63]; .fd[bits 32 to 63]; .u32[bits 32 to 63]; .u64[bits 32 to 63]} ∈
++    UNINITIALIZED
++  r ∈ {-1; 0} or UNINITIALIZED
++  evs[0..3] ∈ [--..--] or UNINITIALIZED
++  n ∈ {-1; 0; 1; 2; 3; 4} or UNINITIALIZED
++  eintr ∈ {0; 1} or UNINITIALIZED
 +  mask ∈ [--..--] or UNINITIALIZED
 +  ep2 ∈ [-1..1023] or UNINITIALIZED
 +  __retres ∈ {0; 1}
 diff --git a/tests/libc/oracle/sys_inotify_h.0.res.oracle b/tests/libc/oracle/sys_inotify_h.0.res.oracle
 new file mode 100644
-index 0000000000..eed79e385b
+index 0000000000..136ced4159
 --- /dev/null
 +++ b/tests/libc/oracle/sys_inotify_h.0.res.oracle
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,58 @@
 +[kernel] Parsing sys_inotify_h.c (with preprocessing)
 +[eva] Analyzing a complete application starting at main
 +[eva:progress] Computing initial state
@@ -485,106 +645,127 @@ index 0000000000..eed79e385b
 +  
 +[eva:progress] 
 +  computing for function inotify_init1 <- main.
-+  Called from sys_inotify_h.c:5.
++  Called from sys_inotify_h.c:6.
 +[eva] using specification for function inotify_init1
 +[eva:progress] Done for function inotify_init1
 +[eva:progress] 
 +  computing for function inotify_add_watch <- main.
-+  Called from sys_inotify_h.c:8.
++  Called from sys_inotify_h.c:10.
 +[eva] using specification for function inotify_add_watch
-+[eva:progress] sys_inotify_h.c:8: 
++[eva:progress] sys_inotify_h.c:10: 
 +  function inotify_add_watch: precondition 'valid_fd' got status valid.
-+[eva:progress] sys_inotify_h.c:8: 
++[eva:progress] sys_inotify_h.c:10: 
 +  function inotify_add_watch: precondition 'valid_pathname' got status valid.
 +[eva:progress] Done for function inotify_add_watch
-+[eva:progress] sys_inotify_h.c:9: assertion got status valid.
-+[eva:progress] sys_inotify_h.c:10: assertion got status valid.
++[eva:progress] sys_inotify_h.c:11: assertion got status valid.
++[eva:progress] sys_inotify_h.c:12: assertion got status valid.
 +[eva:progress] 
 +  computing for function inotify_rm_watch <- main.
-+  Called from sys_inotify_h.c:12.
++  Called from sys_inotify_h.c:17.
 +[eva] using specification for function inotify_rm_watch
-+[eva:progress] sys_inotify_h.c:12: 
++[eva:progress] sys_inotify_h.c:17: 
 +  function inotify_rm_watch: precondition 'valid_fd' got status valid.
 +[eva:progress] Done for function inotify_rm_watch
-+[eva:progress] sys_inotify_h.c:13: assertion got status valid.
++[eva:progress] sys_inotify_h.c:18: assertion got status valid.
 +[eva:progress] 
 +  computing for function close <- main.
-+  Called from sys_inotify_h.c:15.
++  Called from sys_inotify_h.c:20.
 +[eva] using specification for function close
-+[eva:progress] sys_inotify_h.c:15: 
++[eva:progress] sys_inotify_h.c:20: 
 +  function close: precondition 'valid_fd' got status valid.
 +[eva:progress] Done for function close
 +[eva:progress] 
 +  computing for function inotify_init <- main.
-+  Called from sys_inotify_h.c:16.
++  Called from sys_inotify_h.c:21.
 +[eva] using specification for function inotify_init
 +[eva:progress] Done for function inotify_init
 +[eva:progress] 
 +  computing for function close <- main.
-+  Called from sys_inotify_h.c:18.
-+[eva:progress] sys_inotify_h.c:18: 
++  Called from sys_inotify_h.c:23.
++[eva:progress] sys_inotify_h.c:23: 
 +  function close: precondition 'valid_fd' got status valid.
 +[eva:progress] Done for function close
 +[eva:progress] Recording results for main
 +[eva:progress] Done for function main
 +[eva] ====== VALUES COMPUTED ======
 +[eva:final-states] Values at end of function main:
++  errno ∈ [--..--]
 +  __fc_fds[0..1023] ∈ [--..--]
 +  fd ∈ [-1..1023]
 +  wd ∈ [-1..2147483647] or UNINITIALIZED
++  err ∈ {0; 1} or UNINITIALIZED
 +  __retres ∈ {0; 1}
 diff --git a/tests/libc/sys_epoll_h.c b/tests/libc/sys_epoll_h.c
 new file mode 100644
-index 0000000000..4b02b00e4a
+index 0000000000..e461b30ade
 --- /dev/null
 +++ b/tests/libc/sys_epoll_h.c
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,44 @@
++/* run.config
++   STDOPT:
++   STDOPT: +"-machdep x86_64"
++*/
++#include <errno.h>
++#include <signal.h>
 +#include <stddef.h>
 +#include <sys/epoll.h>
 +#include <unistd.h>
 +
-+int main() {
++int main(void) {
 +  int ep = epoll_create1(EPOLL_CLOEXEC);
 +  if (ep == -1)
 +    return 1;
 +  //@ assert valid_fd: 0 <= ep < 1024;
++#ifdef __x86_64__
 +  //@ assert size: sizeof(struct epoll_event) == 12; // packed on x86_64
++#endif
 +  struct epoll_event ev;
 +  ev.events = EPOLLIN | EPOLLET;
 +  ev.data.fd = 0;
 +  int r = epoll_ctl(ep, EPOLL_CTL_ADD, 0, &ev);
 +  //@ assert r == 0 || r == -1;
 +  r = epoll_ctl(ep, EPOLL_CTL_DEL, 0, NULL);
++  //@ assert r == 0 || r == -1;
 +  struct epoll_event evs[4];
++  errno = 0;
 +  int n = epoll_wait(ep, evs, 4, -1);
 +  //@ assert -1 <= n <= 4;
++  int eintr = 0;
++  if (n == -1 && errno == EINTR)
++    eintr = 1;
 +  sigset_t mask;
 +  sigemptyset(&mask);
 +  n = epoll_pwait(ep, evs, 4, 100, &mask);
 +  //@ assert -1 <= n <= 4;
 +  n = epoll_pwait(ep, evs, 4, 100, NULL);
++  //@ assert -1 <= n <= 4;
 +  int ep2 = epoll_create(1);
 +  if (ep2 != -1)
 +    close(ep2);
 +  close(ep);
-+  return 0;
++  return eintr;
 +}
 diff --git a/tests/libc/sys_inotify_h.c b/tests/libc/sys_inotify_h.c
 new file mode 100644
-index 0000000000..91e06a8532
+index 0000000000..da8277fe71
 --- /dev/null
 +++ b/tests/libc/sys_inotify_h.c
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,25 @@
++#include <errno.h>
 +#include <sys/inotify.h>
 +#include <unistd.h>
 +
-+int main() {
++int main(void) {
 +  int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 +  if (fd == -1)
 +    return 1;
++  errno = 0;
 +  int wd = inotify_add_watch(fd, "/tmp", IN_MODIFY | IN_CREATE | IN_DELETE);
 +  //@ assert wd == -1 || wd >= 0;
 +  //@ assert sizeof(struct inotify_event) == 16;
++  int err = 0;
++  if (wd == -1 && errno == ENOENT)
++    err = 1;
 +  if (wd != -1) {
 +    int r = inotify_rm_watch(fd, wd);
 +    //@ assert r == 0 || r == -1;
@@ -593,7 +774,7 @@ index 0000000000..91e06a8532
 +  fd = inotify_init();
 +  if (fd != -1)
 +    close(fd);
-+  return 0;
++  return err;
 +}
 -- 
 2.47.3

@@ -4,7 +4,7 @@ description: >-
   Phase 2 of the Frama-C verification pipeline. Runs whole-slice Abstract
   Interpretation (Frama-C Eva + RTE) from each module's eva_main() harness
   inside the hardened analysis container. Automatically discharges
-  80-90% of RTE obligations via value/octagon/symbolic-location domains,
+  most RTE obligations via value/octagon/symbolic-location domains,
   separates Invalid (red), Unknown (orange), dead, and assumed statuses, emits
   per-slice SARIF, and records results in the coverage ledger, including the
   queue of surviving Unknown functions for Phase 3 (/framac-wp).
@@ -13,7 +13,7 @@ argument-hint: "<target-dir> --run-dir <dir> [--module <name>] [--slevel <N> (pa
 
 # /framac-eva
 
-Module-level Abstract Interpretation stage that prunes the vast majority of RTE proof obligations automatically with **zero loop invariants** required from the user or LLM.
+Module-level Abstract Interpretation stage that prunes most RTE proof obligations automatically with **zero loop invariants** required from the user or LLM. How many it discharges depends on the target, and a module can time out instead.
 
 ## Step 1 — Select Module Slices
 
