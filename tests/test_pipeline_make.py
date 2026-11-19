@@ -1788,6 +1788,66 @@ def test_build_check_names_known_eacsl_failures_and_the_command_but_never_switch
     assert out["modules"]["log"]["ok"] is False
 
 
+# nginx 1.31.9 run-5, nginx__ngx_bpf (shortened): the E-ACSL frontend instrumented 135 of 137 files (the O1 unit
+# split gives every module the whole program) until fuzz_build's build time limit killed it. Only warnings and
+# notes come before the line fuzz_build adds, and an `error:`-looking line must not be blamed for the kill.
+TIMEOUT_LOG = (
+    "Frontend defines -Dregister=: full memory tracking takes the address of every local, which the kernel "
+    "refuses for a `register` local.\n\n"
+    "Command: /home/opam/.opam/5.5/bin/e-acsl-gcc -n --no-constfold -G clang -F -rte -machdep gcc_x86_64 x.c\n"
+    "Returncode: 124\n--- STDOUT ---\n\n--- STDERR ---\n"
+    "++ /home/opam/.opam/5.5/bin/frama-c -rte -machdep gcc_x86_64 x.c\n"
+    '/framac-run/workspace/stubs/sys/eventfd.h:1048:9: warning: "RWF_NOAPPEND" redefined\n'
+    "/opt/framac-pipeline/templates/acsl/acsl_vocabulary.h:1380:9: note: this is the location of the previous "
+    "definition\n"
+    '/framac-run/workspace/stubs/sys/eventfd.h:1049:9: warning: "RWF_ATOMIC" redefined\n'
+    "/opt/framac-pipeline/templates/acsl/acsl_vocabulary.h:1381:9: note: this is the location of the previous "
+    "definition\n"
+    "[kernel] src/event/ngx_event.c:12: notice: error: in a message Frama-C went on after\n"
+    "cc1: note: unrecognized command-line option '-Wno-unknown-warning-option' may have been intended to silence "
+    "earlier diagnostics\n\n"
+    "/home/opam/.opam/5.5/bin/e-acsl-gcc exceeded the 3600 s build time limit\n\n"
+)
+
+
+def test_build_check_names_an_eacsl_build_killed_at_the_time_limit(tmp_path):
+    path = tmp_path / "fuzz_m.compile.log"
+    path.write_text(TIMEOUT_LOG, encoding="utf-8")
+    first = pm._first_build_error(path)
+    assert first is not None and first.startswith(
+        "/home/opam/.opam/5.5/bin/e-acsl-gcc exceeded the 3600 s build time limit"
+    ), first
+    assert "killed" in first and "memory" not in first
+    # The limit comes from the log, whatever it was (a float limit prints as 900.0).
+    path.write_text(TIMEOUT_LOG.replace("3600 s", "900.0 s"), encoding="utf-8")
+    code, why = pm.known_eacsl_failure(path) or ("", "")
+    assert code == "eacsl_build_timeout" and "900.0 s" in why and "3600" not in why
+    # The same wording from a step that does not end the attempt (fuzz_build's shim compile) is no timeout.
+    path.write_text(TIMEOUT_LOG.replace("Returncode: 124", "Returncode: 1"), encoding="utf-8")
+    assert pm.known_eacsl_failure(path) is None
+
+    run = _make_run(tmp_path)
+    _failed_build(run, "cfg", TIMEOUT_LOG, fallback=True)  # auto fell back to the sanitizers (run-5)
+    _failed_build(run, "log", TIMEOUT_LOG, fallback=False)  # engine eacsl: no fallback, the build failed
+    _build_report(run, "snmp", "eacsl")
+    out = pm.build_check(run, runner=lambda targets, run_dir: (0, {}), templates_dir=ACSL)
+    mods = out["modules"]
+    assert out["ok"] is False
+    assert (mods["cfg"]["status"], mods["cfg"]["reason_code"]) == ("eacsl_fallback", "eacsl_build_timeout")
+    assert (mods["log"]["status"], mods["log"]["reason_code"]) == ("build_failed", "eacsl_build_timeout")
+    for mod in ("cfg", "log"):
+        row = mods[mod]
+        assert row["ok"] is False and row["fuzz_engine"] == "auto"
+        assert row["next_step"] == f"python3 $S/pipeline_make.py params set --module {mod} --fuzz-engine sanitizers"
+        assert "3600 s build time limit" in row["reason"] and "whole program" in row["reason"]
+        assert "smaller unit" in row["reason"] and "recorded choice" in row["reason"]
+        assert "exceeded the 3600 s build time limit" in row["first_error"]
+    assert not validate_artifacts.validate_build_check(out) and out["warnings"] == []
+    (reason,) = phase0_gates.check(run, "cfg", ("build_check",))
+    assert "eacsl_build_timeout" in reason and mods["cfg"]["next_step"] in reason
+    assert "within the fixed build time limit" in reason
+
+
 def test_known_eacsl_failure_codes_match_the_build_check_schema():
     schema = json.loads((REPO / "schemas" / "build_check.schema.json").read_text(encoding="utf-8"))
     row = schema["properties"]["modules"]["additionalProperties"]["properties"]

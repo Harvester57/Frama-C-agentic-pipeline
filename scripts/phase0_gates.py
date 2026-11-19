@@ -363,9 +363,11 @@ def check(
                 detail = row.get("first_error") or row.get("reason")
                 first = f" ({detail})" if detail and same else ""
                 if same and row.get("next_step"):
+                    cannot = "E-ACSL cannot instrument it"
+                    if row.get("reason_code") == "eacsl_build_timeout":
+                        cannot += " within the fixed build time limit (a smaller unit is the fix, not a larger limit)"
                     first += (
-                        f"; {row.get('reason_code')}: E-ACSL cannot instrument it, "
-                        f"to fuzz it with the sanitizers run `{row['next_step']}`"
+                        f"; {row.get('reason_code')}: {cannot}, to fuzz it with the sanitizers run `{row['next_step']}`"
                     )
                 reasons.append(f"build-check failed for {module}: {status}{first}")
     from stub_check import gate_reasons as stub_gate_reasons  # a failed stub contract blocks its callers (S3)

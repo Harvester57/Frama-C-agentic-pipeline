@@ -465,8 +465,32 @@ def test_compile_stages_get_the_build_class_timeout(tmp_path, monkeypatch):
 
     res = R.compile_eacsl_binary([str(src)], tmp_path / "fuzz_mod", runner=runner, use_cache=False)
     assert timeouts == [CLASSES["build"].wall_timeout_s] * 2
-    assert res["returncode"] == 124 and res["reason"] == "eacsl_compile_failed"
+    assert res["returncode"] == 124 and res["reason"] == "eacsl_build_timeout"
     assert "build time limit" in Path(res["compile_log"]).read_text(encoding="utf-8")
+
+
+def test_an_instrumentation_killed_at_the_build_time_limit_is_named_as_such(tmp_path, monkeypatch):
+    # nginx 1.31.9 run-5, nginx__ngx_bpf: the E-ACSL frontend instrumented 135 of 137 files for an hour and
+    # was killed; the build report said only `eacsl_instrumentation_failed`, like any Frama-C error.
+    import pipeline_make as pm
+
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    src = tmp_path / "mod.c"
+    src.write_text("int entry(int x) { return x; }\n", encoding="utf-8")
+
+    def runner(cmd, **kwargs):
+        assert "-n" in cmd  # stage 1 never finishes, so there is no stage 2
+        raise subprocess.TimeoutExpired(cmd, float(kwargs["timeout"]), output=b"", stderr=b'warning: "X" redefined\n')
+
+    res = R.compile_eacsl_binary([str(src)], tmp_path / "fuzz_mod", runner=runner, use_cache=False)
+    assert res["returncode"] == 124 and res["reason"] == "eacsl_build_timeout"
+    # The log fuzz_build writes is the one build-check reads: it names the timeout and the limit.
+    log = Path(res["compile_log"])
+    limit = CLASSES["build"].wall_timeout_s
+    code, why = pm.known_eacsl_failure(log) or ("", "")
+    assert code == "eacsl_build_timeout" and f"{limit} s" in why
+    first = pm._first_build_error(log)
+    assert first is not None and first.startswith(f"e-acsl-gcc exceeded the {limit} s build time limit")
 
 
 # ---------------------------------------------------------------------------

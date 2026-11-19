@@ -2624,10 +2624,25 @@ _WRAP_UP_RE = re.compile(r"fatal error: aborted by Frama-C|linker command failed
 # `DWARF error: mangled line number section` about clang's line tables, after which it goes on linking.
 _NOT_AN_ERROR_RE = re.compile(r"\bwarning\b\s*:|DWARF error:", re.IGNORECASE)
 _SILENT_ABORT_RE = re.compile(r"aborted by Frama-C", re.IGNORECASE)
+# The line fuzz_build._run_tool appends when it kills a build step at the build class's time limit.
+_BUILD_TIMEOUT_LINE = r"(?P<tool>[^\n]+?) exceeded the (?P<limit>\d+(?:\.\d+)?) s build time limit"
+_BUILD_TIMEOUT_RE = re.compile(rf"^{_BUILD_TIMEOUT_LINE}\s*$")
 
 # E-ACSL failures with no source-level fix (docs/troubleshooting/harnesses-and-seeds.md): build-check names the
-# failure and the command that records the sanitizers choice, and never switches the engine itself.
+# failure and the command that records the sanitizers choice, and never switches the engine itself. An
+# explanation may name the signature's groups (`{limit}`), filled in from the log.
 KNOWN_EACSL_FAILURES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    (
+        # First: when the attempt was killed at the time limit (return code 124, the limit line last), that is
+        # what ended it, whatever it printed before. docs/troubleshooting/eacsl-and-fuzzing.md (nginx run-5).
+        "eacsl_build_timeout",
+        re.compile(rf"^Returncode: 124\n(?s:.*)^{_BUILD_TIMEOUT_LINE}\s*\Z", re.MULTILINE),
+        "the E-ACSL build ({tool}) exceeded the fixed {limit} s build time limit and was killed. This is typical "
+        "of a module whose sources are the whole program: the unit split gives each module every file of its "
+        "link unit, and E-ACSL instruments them all (an open pipeline gap, "
+        "docs/troubleshooting/eacsl-and-fuzzing.md). The fix is a smaller unit, not a larger limit: the limit "
+        "is fixed so that results do not depend on the machine",
+    ),
     (
         "eacsl_gmp_symbol_unregistered",
         re.compile(r'E_ACSL__Rtl\.Symbols\.Unregistered\("__gmpz_'),
@@ -2691,7 +2706,9 @@ def _first_build_error(log_path: Path) -> str | None:
     An excerpt of the line that explains the compile log's last failed command, with the two lines
     after it, or None.
 
-    The first error line wins; warnings and GNU ld's DWARF complaints are skipped even when they
+    When the attempt was killed at the build time limit (fuzz_build's `<tool> exceeded the N s build
+    time limit`, its last line), that line wins with a note: nothing before it ended the attempt.
+    Otherwise the first error line wins; warnings and GNU ld's DWARF complaints are skipped even when they
     contain `error`. Failing that, the start of an OCaml backtrace (Frama-C crashed); failing that,
     the wrap-up line (`e-acsl-gcc: fatal error: aborted by Frama-C`). When that wrap-up is all
     Frama-C left, it was most likely killed (out of memory), and the excerpt says so.
@@ -2702,6 +2719,10 @@ def _first_build_error(log_path: Path) -> str | None:
 
     def _excerpt(at: int) -> str:
         return " ".join(s.strip() for s in section[at : at + 3] if s.strip())[:400]
+
+    last = max((i for i, line in enumerate(section) if line.strip()), default=None)
+    if last is not None and _BUILD_TIMEOUT_RE.match(section[last]):
+        return section[last].strip() + " (the attempt was killed at this time limit; no error ended it)"
 
     backtrace = wrap_up = None
     for i, line in enumerate(section):
@@ -2730,8 +2751,9 @@ def known_eacsl_failure(log_path: Path) -> tuple[str, str] | None:
         return None
     text = "\n".join(section)
     for code, signature, why in KNOWN_EACSL_FAILURES:
-        if signature.search(text):
-            return code, why
+        match = signature.search(text)
+        if match:
+            return code, why.format_map(match.groupdict()) if match.groupdict() else why
     return None
 
 
@@ -2777,7 +2799,8 @@ def build_check(
     A module whose build fell back to ASan/UBSan, or failed, fails the check with the first
     compiler error of its E-ACSL attempt. Fuzzing it would lose the E-ACSL checks without anyone
     deciding so. When the error is a known E-ACSL limitation with no source-level fix
-    (KNOWN_EACSL_FAILURES), the row adds its `reason_code` and, as `next_step`, the `params set`
+    (KNOWN_EACSL_FAILURES, including `eacsl_build_timeout`, an attempt killed at the fixed build time
+    limit), the row adds its `reason_code` and, as `next_step`, the `params set`
     command that records the sanitizers choice; the module still fails until someone runs it. The
     `eacsl_static_const_union` from a build with the E-ACSL-only `static const union` rewrite on (O9)
     also has `rewrite_missed: true`, and its `reason` names the gap to record before that command.

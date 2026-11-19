@@ -182,12 +182,19 @@ def _resolve_eacsl_gcc() -> tuple[str, bool]:
     return "e-acsl-gcc.sh", False
 
 
+# What `_run_tool` returns and appends to stderr when a build step outlives its time limit; build-check
+# (pipeline_make.KNOWN_EACSL_FAILURES, `eacsl_build_timeout`) reads the line from the compile log.
+BUILD_TIMEOUT_RC = 124
+BUILD_TIME_LIMIT_TEXT = "s build time limit"
+
+
 def _run_tool(cmd: list[str], runner=subprocess.run, timeout: float | None = BUILD_TIMEOUT_S) -> tuple[int, str, str]:
     try:
         proc = runner(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired as exc:
-        return 124, _decode(exc.stdout), _decode(exc.stderr) + f"\n{cmd[0]} exceeded the {timeout} s build time limit\n"
+        limit = f"\n{cmd[0]} exceeded the {timeout} {BUILD_TIME_LIMIT_TEXT}\n"
+        return BUILD_TIMEOUT_RC, _decode(exc.stdout), _decode(exc.stderr) + limit
     except OSError as exc:
         return 127, "", str(exc)
 
@@ -945,6 +952,10 @@ def _compile_eacsl_binary_uncached(
             ignored, instrumented_c if frontend["instrumented"] else None
         )
         result["ignored_frame_clauses"] = frame_clauses
+        if reason and rc == BUILD_TIMEOUT_RC and BUILD_TIME_LIMIT_TEXT in str(result["stderr"]):
+            # Killed at the build time limit (nginx run-5: a whole-program unit), not stopped by an error:
+            # its own reason, so the fallback and build-check do not read it as a Frama-C or clang failure.
+            reason = "eacsl_build_timeout"
         if reason:
             result["reason"] = reason
         compile_log.write_text("\n".join(log_parts) or f"Returncode: {rc}\nReason: {reason}\n", encoding="utf-8")
