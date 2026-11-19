@@ -267,6 +267,50 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
     three functions do not. If `__fc_libc` gains `pipe2` (pub/frama-c#2828 asks for it) or the netdb
     pair, the kernel prints `found two contracts ... Merging them`, which the test above rejects:
     rename the libc declaration as for `getsockopt`, or drop this one.
+- `cpu_set_t`, the `CPU_*` macros, `sched_setaffinity` and `sched_getaffinity`: glibc's `<sched.h>`
+  declares them under `_GNU_SOURCE`, `__fc_libc`'s (34.0~beta and 35.0~dev) not at all. nginx's
+  configure found them in glibc, so `typedef cpu_set_t ngx_cpuset_t;` stopped the Phase 0 parse of every
+  nginx source (run-1: `ngx_setaffinity.h:16: User Error: syntax error`). Declared whatever the target
+  defines (this header is read before its `#define _GNU_SOURCE`).
+  - **Layout and names** as glibc x86_64: `__cpu_mask` (unsigned long), `__bits[16]`, `CPU_SETSIZE`
+    1024, `CPU_ALLOC_SIZE`. The `CPU_SET`/`CPU_CLR`/`CPU_ISSET` macros and their `_S` forms keep glibc's
+    semantics (one evaluation of each argument; a CPU at or past `setsize * 8` writes nothing and reads
+    0) and reach a word through `&__bits[0]`: glibc's `(__cpu_mask *)` cast is folded by Frama-C back
+    into `__bits[i]`, an out-of-bounds index on a set larger than 1024 CPUs.
+  - **`CPU_ZERO`** assigns a zero `cpu_set_t` (all sixteen words spelled out: WP proves nothing about
+    words a partial initializer leaves implicit). glibc's memset converts the set to `void *`, which
+    WP's Typed model refuses. **`CPU_ZERO_S`** calls `__fc_sched_cpuzero`, a declared model on whole
+    words (`setsize % 8 == 0`, as `sizeof(cpu_set_t)` and `CPU_ALLOC_SIZE` are): WP proves callers, but
+    Eva reduces no form of its postcondition, so after it the words are initialized with any value.
+    **`CPU_COUNT`** calls glibc's own `__sched_cpucount`, declared with a contract.
+  - **Contracts:** `sched_getaffinity` gives 0 or -1 and, on success, the whole set initialized (the
+    kernel's mask then zeros, `cpusetsize` bytes; on error nothing is written, as glibc 2.41 does in the
+    analysis image), stated once unconditionally for WP and in `ok`/`error` behaviors for Eva, as
+    `pipe2`. `sched_setaffinity` reads the set, rounded up to whole words (an odd size over a buffer that
+    ends mid-word is a false alarm). `errno` is not assigned.
+  - **E-ACSL** reads `set->__bits[k]` in a contract as an index of the sixteen-word member and stops
+    past word 15; Eva and WP read the word at that offset. No E-ACSL build reads these contracts.
+  - **Not declared:** `CPU_EQUAL`, `CPU_AND`, `CPU_OR`, `CPU_XOR` (and `_S`), `CPU_ALLOC`, `CPU_FREE`,
+    `sched_getcpu`, `getcpu`, `clone`, `unshare`, `setns`.
+  - **Steps aside** when `CPU_SETSIZE` is already defined; `FC_STUBS_NO_SCHED_AFFINITY_DECLS` drops the
+    block (and `<sched.h>` from the force-include) for a target with its own `cpu_set_t`.
+  - **Checked** by `test_sched_affinity_in_eva_wp_and_against_glibc`: nginx's idioms in Eva (no alarm,
+    both outcomes of `sched_getaffinity`), short, uninitialized and 32-word sets, WP on callers, the
+    macros against glibc's with gcc (every CPU from -70 to 2199 and extreme values, 14 set sizes), the
+    layout as `_Static_assert`s from glibc, the prototypes, and the contracts as E-ACSL wrappers around
+    the real glibc calls.
+- `struct in_pktinfo`, `struct tcp_info`, `IP_BIND_ADDRESS_NO_PORT` and the other Linux `IP_`, `IPV6_`,
+  `TCP_` and `TCPI_OPT_` constants of glibc 2.41's `<netinet/in.h>` and `<netinet/tcp.h>` that
+  `__fc_libc` lacks (63 names; `__fc_libc` has `IP_PKTINFO`, `TCP_INFO` and `struct in6_pktinfo` but
+  not these). nginx stopped on each of the three named (run-1). glibc's layouts and x86_64 values; each
+  constant `#ifndef`-guarded, the two structures not (a later libc that has them gives `redefinition`:
+  drop them then). `FC_STUBS_NO_NETINET_LINUX_DECLS` drops the block and the two includes. Left out:
+  `IP_MSFILTER_SIZE`, `MCAST_*`, `IN_CLASS*`, and glibc's extra `AF_`, `SO_`, `SOL_`, `SCM_`, `MSG_`
+  names of `<sys/socket.h>`. Checked by `test_netinet_linux_names_in_eva_and_against_glibc` (layouts and
+  values as `_Static_assert`s from glibc; every glibc name of the four families present but the one
+  left out; nginx's uses in Eva).
+- **Force-included headers** now also include `<sched.h>`, `<netinet/in.h>` and `<netinet/tcp.h>` in every
+  Eva / WP parse.
 - All of these sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
 - The header assumes x86_64 LP64 (ioctl encoding, syscall numbers, `long` literals) and says so
   with a `_Static_assert` on `sizeof(long)` and `sizeof(void *)`: another machdep stops at parse time.

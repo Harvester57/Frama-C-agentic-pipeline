@@ -1023,7 +1023,10 @@ def test_libc_gap_names_are_declared_for_eva_and_wp_after_the_renaming_blocks():
         fc_libc.index("#endif /* FC_STUBS_NO_NETDB_DECLS */"),
     ]
     assert order == sorted(order)
-    assert fc_libc.count("#include <netdb.h>") == 1 and fc_libc.count("#include <netinet/in.h>") == 1
+    assert fc_libc.count("#include <netdb.h>") == 1
+    # The netinet/tcp block includes <netinet/in.h> again, so it still parses with FC_STUBS_NO_NETDB_DECLS.
+    netdb_block = fc_libc.split("#ifndef FC_STUBS_NO_NETDB_DECLS", 1)[1].split("#endif /* FC_STUBS_NO_NETDB_DECLS */", 1)[0]
+    assert netdb_block.count("#include <netinet/in.h>") == 1
     # E-ACSL builds take all of them from glibc.
     eacsl_branch = text.split("#if defined(__FRAMAC_EACSL__)", 1)[1].split("#else /* Frama-C __fc_libc */", 1)[0]
     assert not re.search(r"pipe2|getservby|IN6_IS_ADDR", eacsl_branch)
@@ -1535,3 +1538,698 @@ def test_libc_gap_names_in_eva_wp_and_against_glibc(tmp_path):
         out = (tmp_path / f"{case}.out").read_text(encoding="utf-8", errors="replace")
         assert f"case {case} rc=0" in log and f"{case} done" in out, (case, out, per["real"])
         assert printed in out, (case, out)
+
+
+# ---------------------------------------------------------------------------------------------------
+# glibc <sched.h> CPU affinity names __fc_libc lacks, found on nginx: cpu_set_t, CPU_*, sched_*affinity
+# ---------------------------------------------------------------------------------------------------
+
+# In the order fc_compat_types.h defines them.
+SCHED_MACROS = [
+    "CPU_SETSIZE",
+    "CPU_SET_S",
+    "CPU_CLR_S",
+    "CPU_ISSET_S",
+    "CPU_ZERO_S",
+    "CPU_COUNT_S",
+    "CPU_SET",
+    "CPU_CLR",
+    "CPU_ISSET",
+    "CPU_ZERO",
+    "CPU_COUNT",
+    "CPU_ALLOC_SIZE",
+]
+# function -> (return type, parameters, what glibc runs for it): glibc 2.41's prototypes, and for the
+# pipeline's model of CPU_ZERO_S glibc's macro itself.
+SCHED_SIGNATURES = {
+    "__sched_cpucount": ("int", "(size_t setsize, const cpu_set_t *setp)", "__sched_cpucount(setsize, setp)"),
+    "__fc_sched_cpuzero": ("void", "(size_t setsize, cpu_set_t *setp)", "CPU_ZERO_S(setsize, setp)"),
+    "sched_setaffinity": (
+        "int", "(pid_t pid, size_t cpusetsize, const cpu_set_t *mask)", "sched_setaffinity(pid, cpusetsize, mask)"
+    ),
+    "sched_getaffinity": (
+        "int", "(pid_t pid, size_t cpusetsize, cpu_set_t *mask)", "sched_getaffinity(pid, cpusetsize, mask)"
+    ),
+}  # fmt: skip
+
+
+def _sched_block() -> str:
+    block = _fc_libc_branch().split("#ifndef FC_STUBS_NO_SCHED_AFFINITY_DECLS\n", 1)[1]
+    return block.split("#endif /* FC_STUBS_NO_SCHED_AFFINITY_DECLS */", 1)[0]
+
+
+def _sched_macro_block() -> str:
+    """The CPU_* macros: from `#define CPU_SETSIZE` to the first contract after it."""
+    return "#define CPU_SETSIZE" + _sched_block().split("#define CPU_SETSIZE", 1)[1].split("/*@", 1)[0]
+
+
+def test_sched_affinity_names_are_declared_for_eva_and_wp_after_the_netdb_block():
+    text = _read("fc_compat_types.h")
+    fc_libc = _fc_libc_branch()
+    order = [
+        fc_libc.index("#endif /* FC_STUBS_NO_NETDB_DECLS */"),
+        fc_libc.index("#ifndef FC_STUBS_NO_SCHED_AFFINITY_DECLS"),
+        fc_libc.index("#include <sched.h>"),
+        fc_libc.index("#ifndef CPU_SETSIZE"),
+        fc_libc.index("} cpu_set_t;"),
+        fc_libc.index("#define CPU_SETSIZE"),
+        fc_libc.index("extern int __sched_cpucount("),
+        fc_libc.index("extern void __fc_sched_cpuzero("),
+        fc_libc.index("extern int sched_setaffinity("),
+        fc_libc.index("extern int sched_getaffinity("),
+        fc_libc.index("#endif /* CPU_SETSIZE */"),
+        fc_libc.index("#endif /* FC_STUBS_NO_SCHED_AFFINITY_DECLS */"),
+    ]
+    assert order == sorted(order)
+    assert fc_libc.count("#include <sched.h>") == 1
+    # E-ACSL builds take all of them from glibc.
+    eacsl_branch = text.split("#if defined(__FRAMAC_EACSL__)", 1)[1].split("#else /* Frama-C __fc_libc */", 1)[0]
+    assert not re.search(r"cpu_set_t|CPU_|sched_", eacsl_branch)
+    # glibc x86_64's layout: 1024 CPUs in unsigned longs.
+    block = _sched_block()
+    assert "typedef unsigned long int __cpu_mask;" in block
+    assert "__cpu_mask __bits[__CPU_SETSIZE / __NCPUBITS];" in block
+    assert re.findall(r"^#define (CPU_\w+)", _sched_macro_block(), flags=re.M) == SCHED_MACROS
+    prototypes = stub_prototypes("fc_compat_types.h", set(SCHED_SIGNATURES))
+    assert len(prototypes) == len(SCHED_SIGNATURES), prototypes
+
+
+def test_sched_macros_evaluate_the_cpu_once_and_need_no_cast():
+    macros = re.sub(r"/\*.*?\*/", "", _sched_macro_block(), flags=re.S)
+    # glibc's semantics: the CPU number is read once, and one at or past setsize * 8 is ignored.
+    assert macros.count("size_t __fc_cpu = (cpu);") == 3
+    assert macros.count("__fc_cpu / 8 < (setsize)") == 3
+    # Through `__bits` itself, the one member: no pointer cast for WP's Typed model to refuse.
+    assert not re.search(r"\(\s*(?:const\s+)?__cpu_mask\s*\*\s*\)", macros)
+    assert "__sched_cpucount(" in macros
+    # Nor a conversion to memset's `void *`: CPU_ZERO_S is a declared model on whole words.
+    assert "memset" not in macros and "__fc_sched_cpuzero(" in macros
+    # CPU_ZERO: the same bytes, which Eva follows; every word explicit, which WP needs.
+    assert "*(cpusetp) = (cpu_set_t){{" + ", ".join(["0"] * 16) + "}};" in macros
+    head, _ = _contract_parts(_contract_of(_sched_block(), "__fc_sched_cpuzero"))
+    assert "requires whole_words: setsize % sizeof(__cpu_mask) == 0;" in head
+    assert "\\subset(setp->__bits[0 .. setsize / sizeof(__cpu_mask) - 1], {0})" in head
+    # A set of CPU_ALLOC_SIZE(n) bytes has more than the member's sixteen words: the macros reach a word
+    # through a pointer to the first one, never as `__bits[i]` (Eva: an out-of-bounds index from 16 on).
+    assert macros.count("__FC_CPU_WORD(cpusetp, __fc_cpu)") == 3
+    assert "#define __FC_CPU_WORD(cpusetp, cpu) ((&(cpusetp)->__bits[0])[__FC_CPU_ELT(cpu)])" in macros
+    code = macros.split("#define __FC_CPU_WORD", 1)[1]
+    assert not re.search(r"__bits\s*\[(?!0\])", code)
+
+
+def test_sched_affinity_contracts_split_success_from_failure():
+    block = _sched_block()
+    head, behaviors = _contract_parts(_contract_of(block, "sched_getaffinity"))
+    assert tuple(behaviors) == ("ok", "error")
+    assert "ensures result_ok_or_error: \\result == 0 || \\result == -1;" in head
+    # What WP uses is stated outside the behaviors, which split on a volatile.
+    assert "Frama_C_entropy_source" not in re.sub(r"indirect:Frama_C_entropy_source", "", head)
+    assert re.search(r"ensures initialized_on_success:\s*\\result == 0 ==> \\initialized\(mask->__bits", head)
+    assert "mask" not in re.sub(r"assigns \\result[^;]*;", "", behaviors["error"])
+    head, behaviors = _contract_parts(_contract_of(block, "sched_setaffinity"))
+    assert not behaviors
+    assert re.search(r"requires valid_mask:\s*\\valid_read\(mask->__bits", head)
+    assert re.search(r"requires initialized_mask:\s*\\initialized\(mask->__bits", head)
+    assert "ensures result_ok_or_error: \\result == 0 || \\result == -1;" in head
+    head, _ = _contract_parts(_contract_of(block, "__sched_cpucount"))
+    assert "ensures count_range: 0 <= \\result <= 8 * setsize;" in head
+
+
+SCHED_EVA = r"""#define _GNU_SOURCE
+#include <sched.h>
+#include "__fc_builtin.h"
+
+typedef cpu_set_t ngx_cpuset_t; /* nginx, src/os/unix/ngx_setaffinity.h */
+
+/* nginx, src/os/unix/ngx_setaffinity.c: ngx_setaffinity */
+static int set_affinity(ngx_cpuset_t *cpu_affinity) {
+  unsigned long i, n = 0;
+  for (i = 0; i < CPU_SETSIZE; i++) {
+    if (CPU_ISSET(i, cpu_affinity)) n++; /* nginx logs "using cpu #%ui" */
+  }
+  if (sched_setaffinity(0, sizeof(cpu_set_t), cpu_affinity) == -1) return -1;
+  return n != 0;
+}
+
+/* nginx, src/core/nginx.c: worker_cpu_affinity and ngx_get_cpu_affinity */
+int masks(void) {
+  ngx_cpuset_t mask[2], result;
+  unsigned long i;
+  CPU_ZERO(&mask[0]);
+  for (i = 0; i < 8; i++) CPU_SET(i, &mask[0]);
+  CPU_ZERO(&mask[1]);
+  CPU_SET(3, &mask[1]);
+  int in = CPU_ISSET(3, &mask[1]) != 0, out = CPU_ISSET(4, &mask[1]) != 0;
+  //@ check members: in == 1 && out == 0;
+  CPU_CLR(3, &mask[1]);
+  int cleared = CPU_ISSET(3, &mask[1]) != 0;
+  //@ check cleared: cleared == 0;
+  CPU_ZERO(&result);
+  CPU_SET(5000 % CPU_SETSIZE, &result);
+  int ignored = CPU_SET(5000, &result) != 0; /* past CPU_SETSIZE: nothing written, as glibc */
+  int big = CPU_ISSET(5000, &result) != 0, low = CPU_ISSET(5000 % CPU_SETSIZE, &result) != 0;
+  //@ check out_of_range: ignored == 0 && big == 0 && low == 1;
+  int k = 0;
+  CPU_SET((k++, 7), &result);
+  //@ check evaluated_once: k == 1;
+  int c = CPU_COUNT(&mask[0]);
+  Frama_C_show_each_count(c);
+  return set_affinity(&mask[0]) + set_affinity(&result) + c;
+}
+
+int get(void) {
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof set, &set) != 0) {
+    Frama_C_show_each_error(0);
+    return -1;
+  }
+  int n = CPU_COUNT(&set); /* the set is initialized on success */
+  Frama_C_show_each_ok(n);
+  return n + (CPU_ISSET(0, &set) != 0);
+}
+
+/* A set of CPU_ALLOC_SIZE(200) bytes, with the _S forms. */
+int dynamic(void) {
+  unsigned long words[4];
+  cpu_set_t *s = (cpu_set_t *)words;
+  size_t size = CPU_ALLOC_SIZE(200);
+  CPU_ZERO_S(size, s);
+  CPU_SET_S(130, size, s);
+  int x = CPU_ISSET_S(130, size, s) != 0;
+  int far = CPU_SET_S(256, size, s) != 0; /* 256 / 8 == 32 bytes: past the set */
+  CPU_CLR_S(130, size, s);
+  int gone = CPU_ISSET_S(130, size, s) != 0;
+  /* Eva follows CPU_ZERO_S's model as "initialized, any value": x and gone are only {0; 1}. */
+  Frama_C_show_each_dynamic(x, gone);
+  //@ check dynamic_bits: size == 32 && far == 0;
+  int c = CPU_COUNT_S(size, s);
+  if (sched_getaffinity(0, size, s) == 0) c += CPU_COUNT_S(size, s);
+  return c + sched_setaffinity(0, size, s);
+}
+
+/* A set of CPU_ALLOC_SIZE(2048) bytes: thirty-two words, past the sixteen the member declares. */
+int big(void) {
+  unsigned long words[32];
+  cpu_set_t *s = (cpu_set_t *)words;
+  size_t size = CPU_ALLOC_SIZE(2048);
+  CPU_ZERO_S(size, s);
+  int far = CPU_SET_S(1500, size, s) != 0;
+  int x = CPU_ISSET_S(2047, size, s), past = CPU_ISSET_S(2048, size, s);
+  CPU_CLR_S(2047, size, s);
+  //@ check big_set: size == 256 && far == 1 && past == 0;
+  int c = CPU_COUNT_S(size, s);
+  if (sched_getaffinity(0, size, s) == 0) c += CPU_COUNT_S(size, s) + x;
+  return c + sched_setaffinity(0, size, s);
+}
+
+int short_mask(void) {
+  unsigned long w = 0;
+  return sched_getaffinity(0, sizeof(cpu_set_t), (cpu_set_t *)&w);
+}
+int uninit_mask(void) {
+  cpu_set_t s;
+  return sched_setaffinity(0, sizeof s, &s);
+}
+int uninit_count(void) {
+  cpu_set_t s;
+  return CPU_COUNT(&s);
+}
+"""
+
+SCHED_WP = r"""#define _GNU_SOURCE
+#include <sched.h>
+
+/*@ requires \valid(cpus);
+    assigns *cpus;
+    ensures \result == 0 || \result == -1;
+    ensures \result == 0 ==> \initialized(&cpus->__bits[0 .. 15]); */
+int current(cpu_set_t *cpus) { return sched_getaffinity(0, sizeof(cpu_set_t), cpus); }
+
+/*@ requires \valid_read(cpus) && \initialized(&cpus->__bits[0 .. 15]);
+    assigns \nothing;
+    ensures \result == 0 || \result == -1; */
+int apply(const cpu_set_t *cpus) { return sched_setaffinity(0, sizeof(cpu_set_t), cpus); }
+
+/*@ requires \valid_read(cpus) && \initialized(&cpus->__bits[0 .. 15]);
+    assigns \nothing;
+    ensures 0 <= \result <= 1024; */
+int count(const cpu_set_t *cpus) { return CPU_COUNT(cpus); }
+
+/*@ requires \valid(cpus);
+    assigns cpus->__bits[cpu / 64]; */
+void add(cpu_set_t *cpus, unsigned long cpu) {
+  if (cpu < CPU_SETSIZE) CPU_SET(cpu, cpus);
+}
+
+/*@ requires \valid_read(cpus);
+    assigns \nothing;
+    ensures \result == 0 || \result == 1; */
+int has(const cpu_set_t *cpus, unsigned long cpu) { return CPU_ISSET(cpu, cpus) != 0; }
+
+/*@ requires \valid(cpus);
+    assigns *cpus;
+    ensures cpus->__bits[0] == 0 && cpus->__bits[15] == 0; */
+void zero(cpu_set_t *cpus) { CPU_ZERO(cpus); }
+
+/*@ requires \valid(cpus);
+    assigns cpus->__bits[0 .. 15];
+    ensures \initialized(&cpus->__bits[0 .. 15]);
+    ensures cpus->__bits[0] == 0 && cpus->__bits[15] == 0; */
+void zero_s(cpu_set_t *cpus) { CPU_ZERO_S(sizeof(cpu_set_t), cpus); }
+"""
+
+# What the E-ACSL frontend reads is glibc: the names nginx uses must come from there, untouched.
+SCHED_HOST = r"""#include <sched.h>
+typedef cpu_set_t ngx_cpuset_t;
+int host(ngx_cpuset_t *m) {
+  unsigned long i;
+  int n = 0;
+  for (i = 0; i < CPU_SETSIZE; i++)
+    if (CPU_ISSET(i, m)) n++;
+  CPU_SET(1, m);
+  return n + sched_setaffinity(0, sizeof(cpu_set_t), m) + sched_getaffinity(0, sizeof(cpu_set_t), m);
+}
+"""
+
+# glibc's macros against the stub's, renamed FC_CPU_*, in one gcc program (both on glibc's cpu_set_t).
+SCHED_CMP = r"""#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+@@OURS@@
+/* What the contract of the CPU_ZERO_S model says, for whole words. */
+static void __fc_sched_cpuzero(size_t setsize, cpu_set_t *setp) {
+  for (size_t k = 0; k < setsize / sizeof(__cpu_mask); k++) setp->__bits[k] = 0;
+}
+static unsigned long n, bad, g[32], o[32];
+static void report(const char *what, long long cpu, size_t size, long long gv, long long ov) {
+  if (bad++ < 5) printf("MISMATCH %s cpu=%lld size=%zu glibc=%lld stub=%lld\n", what, cpu, size, gv, ov);
+}
+static void fill(unsigned seed) {
+  for (int k = 0; k < 32; k++)
+    g[k] = o[k] = (unsigned long)(seed * 2654435761u + (unsigned)k * 40503u) * 0x9e3779b97f4a7c15ul;
+}
+#define SAME(what, cpu, size, gexpr, oexpr)                                         \
+  do {                                                                              \
+    long long gv = (long long)(gexpr), ov = (long long)(oexpr);                     \
+    n++;                                                                            \
+    if (gv != ov || memcmp(g, o, sizeof g)) report(what, cpu, size, gv, ov);        \
+  } while (0)
+static void sized(long long cpu, size_t size, unsigned seed) {
+  cpu_set_t *gs = (cpu_set_t *)g, *os = (cpu_set_t *)o;
+  fill(seed);
+  SAME("ISSET_S", cpu, size, CPU_ISSET_S(cpu, size, gs) != 0, FC_CPU_ISSET_S(cpu, size, os) != 0);
+  SAME("SET_S", cpu, size, CPU_SET_S(cpu, size, gs), FC_CPU_SET_S(cpu, size, os));
+  SAME("ISSET_S", cpu, size, CPU_ISSET_S(cpu, size, gs) != 0, FC_CPU_ISSET_S(cpu, size, os) != 0);
+  SAME("COUNT_S", cpu, size, CPU_COUNT_S(size, gs), FC_CPU_COUNT_S(size, os));
+  SAME("CLR_S", cpu, size, CPU_CLR_S(cpu, size, gs), FC_CPU_CLR_S(cpu, size, os));
+  SAME("COUNT_S", cpu, size, CPU_COUNT_S(size, gs), FC_CPU_COUNT_S(size, os));
+  if (size % sizeof(__cpu_mask) == 0) { /* the model's precondition */
+    CPU_ZERO_S(size, gs);
+    FC_CPU_ZERO_S(size, os);
+    SAME("ZERO_S", cpu, size, 0, 0);
+  }
+}
+static void fixed(long long cpu, unsigned seed) {
+  cpu_set_t *gs = (cpu_set_t *)g, *os = (cpu_set_t *)o;
+  fill(seed);
+  SAME("SET", cpu, 0, CPU_SET(cpu, gs), FC_CPU_SET(cpu, os));
+  SAME("ISSET", cpu, 0, CPU_ISSET(cpu, gs) != 0, FC_CPU_ISSET(cpu, os) != 0);
+  SAME("COUNT", cpu, 0, CPU_COUNT(gs), FC_CPU_COUNT(os));
+  SAME("CLR", cpu, 0, CPU_CLR(cpu, gs), FC_CPU_CLR(cpu, os));
+  CPU_ZERO(gs);
+  FC_CPU_ZERO(os);
+  SAME("ZERO", cpu, 0, CPU_COUNT(gs), FC_CPU_COUNT(os));
+}
+int main(void) {
+  static const size_t sizes[] = {0, 1, 3, 7, 8, 9, 16, 64, 127, 128, 129, 200, 255, 256};
+  static const long long odd[] = {-1, -64, -1025, 1ll << 33, 1ll << 40, (long long)(~0ull >> 1)};
+  for (unsigned s = 0; s < sizeof sizes / sizeof sizes[0]; s++)
+    for (long long cpu = -70; cpu < 2200; cpu++) sized(cpu, sizes[s], (unsigned)(cpu + 7 * s));
+  for (unsigned s = 0; s < sizeof sizes / sizeof sizes[0]; s++)
+    for (unsigned j = 0; j < sizeof odd / sizeof odd[0]; j++) sized(odd[j], sizes[s], j);
+  for (long long cpu = -70; cpu < 2200; cpu++) fixed(cpu, (unsigned)cpu);
+  for (unsigned j = 0; j < sizeof odd / sizeof odd[0]; j++) fixed(odd[j], j);
+  for (size_t count = 0; count < 5000; count++) {
+    n++;
+    if (CPU_ALLOC_SIZE(count) != FC_CPU_ALLOC_SIZE(count)) report("ALLOC_SIZE", (long long)count, 0, 0, 0);
+  }
+  n++;
+  if (CPU_SETSIZE != FC_CPU_SETSIZE) report("SETSIZE", 0, 0, CPU_SETSIZE, FC_CPU_SETSIZE);
+  /* Each argument evaluated once. */
+  int ge = 0, oe = 0;
+  cpu_set_t gset, oset;
+  CPU_ZERO(&gset);
+  FC_CPU_ZERO(&oset);
+  (void)CPU_SET_S((ge++, 5), (ge++, sizeof gset), &gset);
+  (void)FC_CPU_SET_S((oe++, 5), (oe++, sizeof oset), &oset);
+  (void)CPU_ISSET_S((ge++, 5), (ge++, sizeof gset), &gset);
+  (void)FC_CPU_ISSET_S((oe++, 5), (oe++, sizeof oset), &oset);
+  (void)CPU_CLR((ge++, 5), &gset);
+  (void)FC_CPU_CLR((oe++, 5), &oset);
+  n++;
+  if (ge != oe || ge != 5) report("EVALUATIONS", 0, 0, ge, oe);
+  printf("SCHED_CMP n=%lu bad=%lu\n", n, bad);
+  return bad != 0;
+}
+"""
+
+SCHED_LAYOUT = [
+    "sizeof(cpu_set_t)",
+    "_Alignof(cpu_set_t)",
+    "sizeof(__cpu_mask)",
+    "(__cpu_mask)-1 > 0",
+    "offsetof(cpu_set_t, __bits)",
+    "sizeof(((cpu_set_t *)0)->__bits)",
+    "CPU_SETSIZE",
+    "__CPU_SETSIZE",
+    "__NCPUBITS",
+    "CPU_ALLOC_SIZE(1)",
+    "CPU_ALLOC_SIZE(64)",
+    "CPU_ALLOC_SIZE(65)",
+    "CPU_ALLOC_SIZE(1024)",
+    "CPU_ALLOC_SIZE(2048)",
+]
+
+# The real glibc functions behind wrappers that carry the contract text of fc_compat_types.h (as for pipe2).
+SCHED_REAL = r"""#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+@@WRAPPERS@@
+static unsigned long buf[32], buf2[32];
+/* E-ACSL does not see the kernel's writes: the \initialized clauses hold from the fill. */
+static void get(size_t size) {
+  memset(buf, 0x5a, sizeof buf);
+  memset(buf2, 0x5a, sizeof buf2);
+  int r = top_sched_getaffinity(0, size, (cpu_set_t *)buf), r2, n = -1;
+  if (r == 0) {
+    r2 = ok_sched_getaffinity(0, size, (cpu_set_t *)buf2);
+    n = top___sched_cpucount(size, (cpu_set_t *)buf);
+  } else {
+    r2 = error_sched_getaffinity(0, size, (cpu_set_t *)buf2);
+  }
+  int counted = r != 0 || (n > 0 && n == CPU_COUNT_S(size, (cpu_set_t *)buf));
+  printf("r=%d r2=%d counted=%d past=%d\n", r, r2, counted, size >= sizeof buf || ((unsigned char *)buf)[size] == 0x5a);
+}
+static void set(int empty, size_t size) {
+  cpu_set_t cur;
+  memset(buf, 0, sizeof buf);
+  if (!empty && sched_getaffinity(0, sizeof cur, &cur) == 0) memcpy(buf, &cur, sizeof cur);
+  printf("r=%d\n", top_sched_setaffinity(0, size, (cpu_set_t *)buf));
+}
+/* glibc's CPU_ZERO_S under the contract of the model. */
+static void zero(size_t size) {
+  memset(buf, 0x5a, sizeof buf);
+  top___fc_sched_cpuzero(size, (cpu_set_t *)buf);
+  printf("count=%d past=%d\n", CPU_COUNT_S(size, (cpu_set_t *)buf),
+         size >= sizeof buf || ((unsigned char *)buf)[size] == 0x5a);
+}
+int main(int argc, char **argv) {
+  const char *c = argc > 1 ? argv[1] : "";
+  if (!strcmp(c, "get_static")) get(sizeof(cpu_set_t));
+  if (!strcmp(c, "get_two_sets")) get(2 * sizeof(cpu_set_t));
+  if (!strcmp(c, "get_word")) get(8);
+  if (!strcmp(c, "get_odd_size")) get(12);
+  if (!strcmp(c, "get_zero")) get(0);
+  if (!strcmp(c, "set_current")) set(0, sizeof(cpu_set_t));
+  if (!strcmp(c, "set_empty")) set(1, sizeof(cpu_set_t));
+  if (!strcmp(c, "set_odd_size")) set(0, 12);
+  if (!strcmp(c, "zero_static")) zero(sizeof(cpu_set_t));
+  if (!strcmp(c, "zero_dynamic")) zero(CPU_ALLOC_SIZE(600));
+  if (!strcmp(c, "zero_big")) zero(CPU_ALLOC_SIZE(2048));
+  printf("%s done\n", c);
+  return 0;
+}
+"""
+
+# case -> what it prints. 8 bytes hold 64 CPUs, enough for the container (`nproc` well under 64): a
+# size the kernel refuses (not whole words, 0) is -1 with nothing written.
+SCHED_REAL_CASES = {
+    "get_static": "r=0 r2=0 counted=1 past=1",
+    "get_two_sets": "r=0 r2=0 counted=1 past=1",
+    "get_word": "r=0 r2=0 counted=1 past=1",
+    "get_odd_size": "r=-1 r2=-1 counted=1 past=1",
+    "get_zero": "r=-1 r2=-1 counted=1 past=1",
+    "set_current": "r=0",
+    "set_empty": "r=-1",
+    "set_odd_size": "r=0",
+    "zero_static": "count=0 past=1",
+    "zero_dynamic": "count=0 past=1",
+}
+# E-ACSL checks `setp->__bits[k]` in the `\forall` as an index of the sixteen-word member: on a set of more
+# words it stops there, though glibc zeroed the set (Eva and WP read the word at that offset).
+SCHED_REAL_EACSL_LIMIT = ("zero_big", "index out of bounds")
+
+SCHED_MAINS = ["masks", "get", "dynamic", "big", "short_mask", "uninit_mask", "uninit_count"]
+
+
+def _sched_wrappers() -> str:
+    block = _sched_block()
+    out = []
+    for name, (ret, params, call) in SCHED_SIGNATURES.items():
+        head, behaviors = _contract_parts(_contract_of(block, name))
+        body = f"{call};" if ret == "void" else f"return {call};"
+        for prefix, clauses in (("top", head), *behaviors.items()):
+            out.append(f"/*@{clauses}*/\n{ret} {prefix}_{name}{params} {{ {body} }}\n")
+    return "".join(out)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_sched_affinity_in_eva_wp_and_against_glibc(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    prototypes = stub_prototypes("fc_compat_types.h", set(SCHED_SIGNATURES))
+    assert len(prototypes) == len(SCHED_SIGNATURES), prototypes
+    ours = re.sub(r"\bCPU_", "FC_CPU_", _sched_macro_block())
+    pre = "#define _GNU_SOURCE\n"
+    sources = {
+        "eva.c": SCHED_EVA,
+        "wp.c": SCHED_WP,
+        "host.c": SCHED_HOST,
+        "abi.c": pre + "#include <sched.h>\n" + "\n".join(prototypes) + "\n",
+        "cmp.c": SCHED_CMP.replace("@@OURS@@", ours),
+        "gen.c": _static_assert_generator("sched.h", SCHED_LAYOUT),
+        "real.c": SCHED_REAL.replace("@@WRAPPERS@@", _sched_wrappers()),
+    }
+    for name, text in sources.items():
+        (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
+    fc = "timeout 300 frama-c -no-unicode -machdep gcc_x86_64"
+    cases = " ".join([*SCHED_REAL_CASES, SCHED_REAL_EACSL_LIMIT[0]])
+    script = "".join(
+        f'echo "@@MAIN {m}"; {fc} eva.c -cpp-extra-args="$A" -eva -eva-no-show-progress -warn-invalid-pointer '
+        f"-eva-slevel 100 -main {m} 2>&1; "
+        for m in SCHED_MAINS
+    )
+    script += (
+        f'echo "@@MAIN wp"; {fc} wp.c -cpp-extra-args="$A" -wp -wp-rte -wp-timeout 30 2>&1; '
+        # Phase 0's parse: no annotations, the whole nginx idiom must still parse.
+        f'echo "@@MAIN noannot"; {fc} -no-annot eva.c -cpp-extra-args="$A" 2>&1 && echo PARSE_OK; '
+        'echo "@@MAIN abi"; gcc -fsyntax-only -Werror abi.c 2>&1 && echo ABI_OK; '
+        'echo "@@MAIN cmp"; gcc -O1 -Wall -o cmp cmp.c 2>&1 && timeout 300 ./cmp; '
+        # glibc's values (gcc) become _Static_asserts that Frama-C checks against this header.
+        'echo "@@MAIN layout"; gcc -D_GNU_SOURCE -o gen gen.c 2>&1 && ./gen > asserts.inc && '
+        '{ printf "#include <stddef.h>\\n#include <sched.h>\\n"; cat asserts.inc; } '
+        f'> check.c && {fc} check.c -cpp-extra-args="$A" 2>&1 && echo FRAMAC_OK; '
+        f'echo "@@MAIN host"; {fc} host.c -cpp-extra-args="$F -D_GNU_SOURCE" -no-frama-c-stdlib 2>&1 && echo PARSE_OK; '
+        # -D_GNU_SOURCE: in the E-ACSL frontend the force-included fc_compat_types.h reads glibc's
+        # <features.h> before the source's own `#define _GNU_SOURCE`, which then exposes nothing (glibc's
+        # CPU_* macros would be calls to undefined functions).
+        'echo "@@MAIN real"; e-acsl-gcc --full-mtracking -G clang -E "$F -D_GNU_SOURCE" '
+        '-e "-I/opt/framac-pipeline/templates/fc_stubs" -O rb real.c > real.build.log 2>&1 || cat real.build.log; '
+        f'for k in {cases}; do timeout 60 ./rb.e-acsl $k > $k.out 2>&1; echo "case $k rc=$?"; done'
+    )
+    log = _docker(ANALYSIS_IMAGE, tmp_path, script, timeout=1800)
+    per = _per_main(log)
+    for main in [*SCHED_MAINS, "wp", "noannot"]:
+        assert "User Error" not in per[main] and "found two contracts" not in per[main], per[main]
+        assert "undeclared function" not in per[main], per[main]
+    assert "PARSE_OK" in per["noannot"], per["noannot"]
+    # nginx's idioms: every check holds, every precondition is valid.
+    for main in ("masks", "get", "dynamic", "big"):
+        _assert_clean(per[main])
+    assert re.search(r"Assertions\s+4 valid\s+0 unknown\s+0 invalid", per["masks"]), per["masks"]
+    for main in ("dynamic", "big"):
+        assert re.search(r"Assertions\s+1 valid\s+0 unknown\s+0 invalid", per[main]), per[main]
+    assert "Frama_C_show_each_dynamic: {0; 1}, {0; 1}" in per["dynamic"], per["dynamic"]
+    assert "Frama_C_show_each_count: [0..1024]" in per["masks"], per["masks"]
+    # Both outcomes of sched_getaffinity are reachable, and the set is initialized on success.
+    assert "Frama_C_show_each_error: {0}" in per["get"], per["get"]
+    assert "Frama_C_show_each_ok: [0..1024]" in per["get"], per["get"]
+    for main, failed in (
+        ("short_mask", "sched_getaffinity: precondition 'valid_mask'"),
+        ("uninit_mask", "sched_setaffinity: precondition 'initialized_mask'"),
+        ("uninit_count", "__sched_cpucount: precondition 'initialized_set'"),
+    ):
+        assert f"function {failed} got status invalid" in per[main], per[main]
+    assert all(proved == total for proved, total in wp_proved_goals(per["wp"])), per["wp"]
+    assert "ABI_OK" in per["abi"], per["abi"]
+    compared = re.search(r"SCHED_CMP n=(\d+) bad=0\b", per["cmp"])
+    assert compared and int(compared.group(1)) > 200_000, per["cmp"]
+    assert "FRAMAC_OK" in per["layout"] and "User Error" not in per["layout"], per["layout"]
+    assert (tmp_path / "asserts.inc").read_text(encoding="utf-8").count("_Static_assert") == len(SCHED_LAYOUT), log
+    assert "PARSE_OK" in per["host"] and "User Error" not in per["host"], per["host"]
+    build = (tmp_path / "real.build.log").read_text(encoding="utf-8", errors="replace")
+    # E-ACSL runs every clause but `assigns` and the one `\subset` of __fc_sched_cpuzero, whose `\forall`
+    # twin it does run.
+    skipped = re.findall(r"E-ACSL construct\s+`([^']+)'\s+is not yet supported", build)
+    assert sorted(set(skipped)) == [
+        "assigns clause",
+        "logic functions or predicates with no definition nor reads clause",
+    ], build
+    assert skipped.count("logic functions or predicates with no definition nor reads clause") == 1, build
+    for case, printed in SCHED_REAL_CASES.items():
+        out = (tmp_path / f"{case}.out").read_text(encoding="utf-8", errors="replace")
+        assert f"case {case} rc=0" in log and f"{case} done" in out, (case, out, per["real"])
+        assert printed in out, (case, out)
+    case, stopped = SCHED_REAL_EACSL_LIMIT
+    out = (tmp_path / f"{case}.out").read_text(encoding="utf-8", errors="replace")
+    assert stopped in out and "top___fc_sched_cpuzero" in out and f"{case} done" not in out, out
+
+
+# ---------------------------------------------------------------------------------------------------
+# Linux <netinet/in.h> / <netinet/tcp.h> names __fc_libc lacks, found on nginx: in_pktinfo, tcp_info, ...
+# ---------------------------------------------------------------------------------------------------
+
+# Every IP_, IPV6_, TCP_ and TCPI_OPT_ macro of glibc 2.41's <netinet/in.h> and <netinet/tcp.h> (with
+# _GNU_SOURCE) that __fc_libc (34.0~beta) lacks, in the order fc_compat_types.h defines them.
+NETINET_LINUX_CONSTANTS = [
+    "IP_NODEFRAG", "IP_CHECKSUM", "IP_BIND_ADDRESS_NO_PORT", "IP_RECVFRAGSIZE", "IP_RECVERR_RFC4884",
+    "IP_MULTICAST_ALL", "IP_UNICAST_IF", "IP_LOCAL_PORT_RANGE", "IP_PROTOCOL", "IP_PMTUDISC_INTERFACE",
+    "IP_PMTUDISC_OMIT", "IPV6_MULTICAST_ALL", "IPV6_ROUTER_ALERT_ISOLATE", "IPV6_RECVERR_RFC4884",
+    "IPV6_HDRINCL", "IPV6_RECVPATHMTU", "IPV6_PATHMTU", "IPV6_DONTFRAG", "IPV6_AUTOFLOWLABEL",
+    "IPV6_ADDR_PREFERENCES", "IPV6_MINHOPCOUNT", "IPV6_ORIGDSTADDR", "IPV6_RECVORIGDSTADDR",
+    "IPV6_TRANSPARENT", "IPV6_UNICAST_IF", "IPV6_RECVFRAGSIZE", "IPV6_FREEBIND", "IPV6_PMTUDISC_INTERFACE",
+    "IPV6_PMTUDISC_OMIT", "TCP_MSS", "TCP_MAXWIN", "TCP_MAX_WINSHIFT", "TCP_REPAIR_WINDOW",
+    "TCP_FASTOPEN_CONNECT", "TCP_ULP", "TCP_MD5SIG_EXT", "TCP_FASTOPEN_KEY", "TCP_FASTOPEN_NO_COOKIE",
+    "TCP_ZEROCOPY_RECEIVE", "TCP_INQ", "TCP_CM_INQ", "TCP_TX_DELAY", "TCP_REPAIR_ON", "TCP_REPAIR_OFF",
+    "TCP_REPAIR_OFF_NO_WP", "TCP_MD5SIG_FLAG_PREFIX", "TCP_MD5SIG_FLAG_IFINDEX", "TCP_MD5SIG_MAXKEYLEN",
+    "TCP_COOKIE_MIN", "TCP_COOKIE_MAX", "TCP_COOKIE_PAIR_SIZE", "TCP_COOKIE_IN_ALWAYS", "TCP_COOKIE_OUT_NEVER",
+    "TCP_S_DATA_IN", "TCP_S_DATA_OUT", "TCP_MSS_DEFAULT", "TCP_MSS_DESIRED", "TCPI_OPT_TIMESTAMPS",
+    "TCPI_OPT_SACK", "TCPI_OPT_WSCALE", "TCPI_OPT_ECN", "TCPI_OPT_ECN_SEEN", "TCPI_OPT_SYN_DATA",
+]  # fmt: skip
+# glibc names of the same families still missing from the Eva/WP parse (README, "Not declared").
+NETINET_LINUX_LEFT_OUT = ["IP_MSFILTER_SIZE"]
+NETINET_LINUX_LAYOUT = [
+    "sizeof(struct in_pktinfo)",
+    "_Alignof(struct in_pktinfo)",
+    "offsetof(struct in_pktinfo, ipi_ifindex)",
+    "offsetof(struct in_pktinfo, ipi_spec_dst)",
+    "offsetof(struct in_pktinfo, ipi_addr)",
+    "sizeof(struct tcp_info)",
+    "_Alignof(struct tcp_info)",
+    "offsetof(struct tcp_info, tcpi_options)",
+    "offsetof(struct tcp_info, tcpi_rto)",
+    "offsetof(struct tcp_info, tcpi_rtt)",
+    "offsetof(struct tcp_info, tcpi_rttvar)",
+    "offsetof(struct tcp_info, tcpi_snd_cwnd)",
+    "offsetof(struct tcp_info, tcpi_rcv_space)",
+    "offsetof(struct tcp_info, tcpi_total_retrans)",
+]
+
+
+def _netinet_linux_block() -> str:
+    block = _fc_libc_branch().split("#ifndef FC_STUBS_NO_NETINET_LINUX_DECLS\n", 1)[1]
+    return block.split("#endif /* FC_STUBS_NO_NETINET_LINUX_DECLS */", 1)[0]
+
+
+def test_netinet_linux_names_are_declared_for_eva_and_wp_after_the_sched_block():
+    text = _read("fc_compat_types.h")
+    fc_libc = _fc_libc_branch()
+    order = [
+        fc_libc.index("#endif /* FC_STUBS_NO_SCHED_AFFINITY_DECLS */"),
+        fc_libc.index("#ifndef FC_STUBS_NO_NETINET_LINUX_DECLS"),
+        fc_libc.index("#include <netinet/tcp.h>"),
+        fc_libc.index("struct in_pktinfo {"),
+        fc_libc.index("struct tcp_info {"),
+        fc_libc.index("#endif /* FC_STUBS_NO_NETINET_LINUX_DECLS */"),
+    ]
+    assert order == sorted(order)
+    eacsl_branch = text.split("#if defined(__FRAMAC_EACSL__)", 1)[1].split("#else /* Frama-C __fc_libc */", 1)[0]
+    assert not re.search(r"in_pktinfo|tcp_info|IP_BIND_ADDRESS_NO_PORT", eacsl_branch)
+    block = _netinet_linux_block()
+    assert re.findall(r"^#define (\w+)", block, flags=re.M) == NETINET_LINUX_CONSTANTS
+    # Each constant steps aside when a later libc (or the target) defines it.
+    for name in NETINET_LINUX_CONSTANTS:
+        assert block.count(f"#ifndef {name}\n#define {name} ") == 1, name
+
+
+NETINET_LINUX_USE = r"""#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <string.h>
+#include <sys/socket.h>
+
+/* nginx, src/http/ngx_http_variables.c: the $tcpinfo_* variables */
+int info(void) {
+  struct tcp_info ti;
+  socklen_t len = sizeof(struct tcp_info);
+  memset(&ti, 0, sizeof ti);
+  if (getsockopt(3, IPPROTO_TCP, TCP_INFO, &ti, &len) == -1) return -1;
+  return (int)(ti.tcpi_rtt / 1000 + ti.tcpi_rttvar / 1000 + (ti.tcpi_options & TCPI_OPT_SACK));
+}
+
+/* nginx, src/event/ngx_event_connect.c */
+int bind_no_port(void) {
+  int on = 1;
+  return setsockopt(3, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &on, sizeof on);
+}
+
+/* nginx, src/event/ngx_event_udp.h: the control message of a datagram's destination address */
+typedef union {
+  struct in_pktinfo pkt;
+  struct in6_pktinfo pkt6;
+} addrinfo_t;
+int pktinfo(void) {
+  addrinfo_t a;
+  memset(&a, 0, sizeof a);
+  a.pkt.ipi_ifindex = 1;
+  return a.pkt.ipi_ifindex + (int)sizeof(a) + IPV6_DONTFRAG + IP_PMTUDISC_OMIT;
+}
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_netinet_linux_names_in_eva_and_against_glibc(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    exprs = NETINET_LINUX_LAYOUT + NETINET_LINUX_CONSTANTS
+    sources = {
+        "use.c": NETINET_LINUX_USE,
+        "gen.c": _static_assert_generator("netinet/tcp.h", exprs, pre="#include <netinet/in.h>\n"),
+    }
+    for name, text in sources.items():
+        (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
+    fc = "timeout 300 frama-c -no-unicode -machdep gcc_x86_64"
+    script = "".join(
+        f'echo "@@MAIN {m}"; {fc} use.c -cpp-extra-args="$A" -eva -eva-no-show-progress -warn-invalid-pointer '
+        f"-eva-slevel 100 -main {m} 2>&1; "
+        for m in ("info", "bind_no_port", "pktinfo")
+    )
+    script += (
+        f'echo "@@MAIN noannot"; {fc} -no-annot use.c -cpp-extra-args="$A" 2>&1 && echo PARSE_OK; '
+        # glibc's values (gcc) become _Static_asserts that Frama-C checks against this header.
+        'echo "@@MAIN layout"; gcc -D_GNU_SOURCE -o gen gen.c 2>&1 && ./gen > asserts.inc && '
+        '{ printf "#include <stddef.h>\\n#include <netinet/in.h>\\n#include <netinet/tcp.h>\\n"; cat asserts.inc; } '
+        f'> check.c && {fc} check.c -cpp-extra-args="$A" 2>&1 && echo FRAMAC_OK; '
+        # Every glibc name of the four families, looked up in the Eva/WP parse.
+        'echo "@@MAIN missing"; printf "#define _GNU_SOURCE\\n#include <netinet/in.h>\\n#include <netinet/tcp.h>\\n" > g.c; '
+        "gcc -dM -E g.c | awk '{print $2}' | sed 's/(.*//' | grep -E '^(IP|IPV6|TCP|TCPI_OPT)_' | sort -u > names.txt; "
+        '{ printf "#include <netinet/in.h>\\n#include <netinet/tcp.h>\\n"; '
+        'while read -r n; do printf "#ifndef %s\\nint missing_%s;\\n#endif\\n" "$n" "$n"; done < names.txt; } > m.c; '
+        f'echo "glibc names: $(wc -l < names.txt)"; {fc} m.c -cpp-extra-args="$A" -print 2>&1 | grep -o "missing_[A-Za-z0-9_]*" | sort -u; '
+        f'echo "@@MAIN host"; {fc} use.c -cpp-extra-args="$F -D_GNU_SOURCE" -no-frama-c-stdlib 2>&1 && echo PARSE_OK'
+    )
+    log = _docker(ANALYSIS_IMAGE, tmp_path, script, timeout=1800)
+    per = _per_main(log)
+    for main in ("info", "bind_no_port", "pktinfo", "noannot"):
+        assert "User Error" not in per[main] and "undeclared function" not in per[main], per[main]
+    assert "PARSE_OK" in per["noannot"], per["noannot"]
+    for main in ("info", "bind_no_port", "pktinfo"):
+        assert re.search(r"Preconditions\s+\d+ valid\s+0 unknown\s+0 invalid", per[main]), per[main]
+    assert "FRAMAC_OK" in per["layout"] and "User Error" not in per["layout"], per["layout"]
+    assert (tmp_path / "asserts.inc").read_text(encoding="utf-8").count("_Static_assert") == len(exprs), log
+    counted = re.search(r"glibc names: (\d+)", per["missing"])
+    assert counted and int(counted.group(1)) > 150, per["missing"]
+    missing = re.findall(r"^missing_(\w+)$", per["missing"], flags=re.M)
+    assert missing == NETINET_LINUX_LEFT_OUT, per["missing"]
+    assert "PARSE_OK" in per["host"] and "User Error" not in per["host"], per["host"]
