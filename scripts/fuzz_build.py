@@ -143,7 +143,7 @@ def _discover_slice_functions(
     }
     for src in sources:
         p = Path(src)
-        if not p.is_file() or p.name.startswith("harness_"):
+        if not p.is_file() or p.name.startswith("harness_") or p.name in (LINK_STUBS_FILE, LINK_GLOBALS_FILE):
             continue
         try:
             raw = None
@@ -157,7 +157,7 @@ def _discover_slice_functions(
                 # validation ("no function 'void'"), which aborts the whole instrumentation.
                 if (
                     name
-                    and name not in ("eva_main", "main")
+                    and name not in ("eva_main", "main", "__framac_link_stub_called", "__framac_write_all")
                     and not is_harness_fuzz_function(name)
                     and name not in TYPE_MODIFIERS_AND_PRIMITIVES
                 ):
@@ -1529,29 +1529,46 @@ def parse_undefined_references(log: str) -> list[str]:
     return found
 
 
-def _dag_symbol_files(dag_path: Path) -> dict[str, str]:
+def _dag_symbol_tables(dag_path: Path) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
     """
-    Map function name -> defining source file from callgraph_dag.json: its functions, then the
-    functions only the build compiles (`build_only_functions`: code Frama-C's preprocessing hides,
-    which the sanitizer build links).
+    Return `(parsed_functions, build_only_functions)` from `callgraph_dag.json`:
+    - `parsed_functions`: non-static function name -> `(defining_file, module)` (static functions
+      are skipped so they can never shadow an `extern` function or `extern` global, B8).
+    - `build_only_functions`: build-only function name -> `defining_file` (code hidden from
+      Frama-C by compiler macros, e.g. `#ifdef __SSE2__`; never stubbed in `link_stubs.c`).
     """
     try:
         dag = json.loads(Path(dag_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return {}, {}
     dag = dag if isinstance(dag, dict) else {}
-    out: dict[str, str] = {}
+    parsed: dict[str, tuple[str, str]] = {}
     for key, rec in (dag.get("functions") or {}).items():
-        if isinstance(rec, dict):
-            name = rec.get("name") or str(key).split("#")[-1]
-            file = rec.get("file")
-            if name and file:
-                out.setdefault(str(name), str(file))
+        if not isinstance(rec, dict) or rec.get("is_static") is True:
+            continue
+        name = rec.get("name") or str(key).split("#")[-1]
+        file = rec.get("file")
+        if name and file:
+            parsed.setdefault(str(name), (str(file), str(rec.get("module") or "")))
+    build_only_out: dict[str, str] = {}
     build_only = dag.get("build_only_functions")
     for file, names in (build_only if isinstance(build_only, dict) else {}).items():
         for name in names if isinstance(names, list) else []:
-            if isinstance(name, str) and name:
-                out.setdefault(name, str(file))
+            if isinstance(name, str) and name and name not in parsed:
+                build_only_out.setdefault(name, str(file))
+    return parsed, build_only_out
+
+
+def _dag_symbol_files(dag_path: Path) -> dict[str, str]:
+    """
+    Map non-static function name -> defining source file from callgraph_dag.json: its parsed
+    functions (excluding `is_static`), then the functions only the build compiles
+    (`build_only_functions`: code Frama-C's preprocessing hides, which the sanitizer build links).
+    """
+    parsed, build_only = _dag_symbol_tables(dag_path)
+    out = {name: file for name, (file, _mod) in parsed.items()}
+    for name, file in build_only.items():
+        out.setdefault(name, file)
     return out
 
 
@@ -1597,22 +1614,34 @@ def _model_global_variables(dag_path: Path) -> dict[str, list[dict]]:
     """
     Name -> records of the global variables the project defines with external linkage, from the
     Phase 0 model next to the DAG (workspace/reports/phase0_model.json, `global_variables`: name,
-    file, type, units). The DAG does not carry them. Empty without a model, and for the units on
-    the GCC fallback, whose globals the model does not list.
+    file, type, size, units), falling back to the DAG's `global_variables` when the model is
+    absent or omits a record. Empty without either, and for GCC-fallback units.
     """
     model = load_json_optional(Path(dag_path).parent / "phase0_model.json", None)
     records = model.get("global_variables") if isinstance(model, dict) else None
+    dag = load_json_optional(Path(dag_path), None)
+    dag_records = dag.get("global_variables") if isinstance(dag, dict) else None
     out: dict[str, list[dict]] = {}
-    for key, rec in sorted(records.items()) if isinstance(records, dict) else []:
-        if not isinstance(rec, dict) or rec.get("static"):
-            continue
-        name = str(rec.get("name") or str(key).split("#")[-1])
-        file = rec.get("file") or (str(key).rpartition("#")[0] if "#" in str(key) else "")
-        if name and file:
-            units = [str(u) for u in rec.get("units") or []] if isinstance(rec.get("units"), list) else []
-            out.setdefault(name, []).append(
-                {"name": name, "file": str(file), "type": str(rec.get("type") or ""), "units": units}
-            )
+    seen_keys: set[str] = set()
+    for src_records in (records, dag_records):
+        for key, rec in sorted(src_records.items()) if isinstance(src_records, dict) else []:
+            if str(key) in seen_keys or not isinstance(rec, dict) or rec.get("static"):
+                continue
+            seen_keys.add(str(key))
+            name = str(rec.get("name") or str(key).split("#")[-1])
+            file = rec.get("file") or (str(key).rpartition("#")[0] if "#" in str(key) else "")
+            if name and file:
+                units = [str(u) for u in rec.get("units") or []] if isinstance(rec.get("units"), list) else []
+                size = rec.get("size") if isinstance(rec.get("size"), int) and rec["size"] > 0 else None
+                entry: dict[str, Any] = {
+                    "name": name,
+                    "file": str(file),
+                    "type": str(rec.get("type") or ""),
+                    "units": units,
+                }
+                if size is not None:
+                    entry["size"] = size
+                out.setdefault(name, []).append(entry)
     return out
 
 
@@ -1693,27 +1722,44 @@ def link_globals_source(stubs: list[dict]) -> str:
 
 LINK_STUBS_FILE = "link_stubs.c"
 LINK_STUB_MARKER = "FRAMAC_LINK_STUB_CALLED"
+DEFAULT_BSS_GLOBAL_SIZE = 16
 
 
-def link_stubs_source(stubs: list[dict], module: str | None = None) -> str:
+def link_stubs_source(
+    stubs: list[dict], global_stubs: list[dict] | tuple[dict, ...] = (), module: str | None = None
+) -> str:
     """
-    The generated file defining the functions an address-flow cluster's sources name and its harness
-    cannot reach (`stubbed_functions`; scripts/unit_split.py, docs/plans/unit-split-address-flow.md).
-    Each is a symbol in file-scope assembly, so it has no C type: no prototype of the project's
-    headers can conflict with it, in Frama-C's link of the E-ACSL frontend or in clang's. A call
-    prints LINK_STUB_MARKER with the function's name and aborts, so a reach the split missed is a
-    named failure, never a silent wrong value. x86-64 (the pipeline's machdep, gcc_x86_64).
+    The generated file defining the functions and globals an address-flow cluster's sources name
+    and its harness cannot reach (`stubbed_functions`, `.bss` `global_stubs`; scripts/unit_split.py,
+    docs/plans/unit-split-address-flow.md).
+    Each function is a symbol in file-scope assembly (no C type, so no project prototype can
+    conflict) that jumps to `__framac_link_stub_called(name)`, writing LINK_STUB_MARKER via
+    unbuffered `write(2, ...)` (E-ACSL-safe: no `fprintf` / `strlen` on unregistered `.rodata`) and
+    calling `abort()`. Each global is a type-free zero-initialized `.bss` symbol sized from the
+    Phase 0 model (`size`, defaulting to 16 bytes when unknown), avoiding non-self-contained
+    project headers and by-value struct rejection. x86-64 (`gcc_x86_64`).
     """
     lines = [
-        "/* Generated by run_eacsl_fuzz.py (link repair): functions of the unit the address-flow cluster"
+        "/* Generated by run_eacsl_fuzz.py (link repair): symbols of the unit the address-flow cluster"
         + (f" {module}" if module else "")
         + "'s",
-        " * sources name but its harness cannot reach (scripts/unit_split.py). A call reports itself and",
-        " * aborts: the split's reach missed it. */",
-        "#include <stdio.h>",
+        " * sources name but its harness cannot reach (scripts/unit_split.py). A function stub reports",
+        " * itself and aborts (the split's reach missed it); a global stub lives zero-initialized in .bss. */",
+        "#include <stddef.h>",
         "#include <stdlib.h>",
+        "#include <unistd.h>",
+        "static void __framac_write_all(const char *s) {",
+        "  size_t n = 0;",
+        "  while (s[n] != '\\0') {",
+        "    n++;",
+        "  }",
+        "  ssize_t _r = write(2, s, n);",
+        "  (void)_r;",
+        "}",
         "void __framac_link_stub_called(const char *name) {",
-        f'  fprintf(stderr, "{LINK_STUB_MARKER}: %s (not in the unit split\'s address-flow reach)\\n", name);',
+        f'  __framac_write_all("{LINK_STUB_MARKER}: ");',
+        "  __framac_write_all(name);",
+        '  __framac_write_all(" (not in the unit split\'s address-flow reach)\\n");',
         "  abort();",
         "}",
         "__asm__(",
@@ -1721,7 +1767,7 @@ def link_stubs_source(stubs: list[dict], module: str | None = None) -> str:
     for i, s in enumerate(stubs):
         name = s["name"]
         lines += [
-            f'  "/* {name}: defined in {s["file"]} */\\n"',
+            f'  "/* {name}: defined in {s.get("file") or "unknown"} */\\n"',
             '  ".text\\n"',
             f'  ".globl {name}\\n"',
             f'  ".type {name}, @function\\n"',
@@ -1731,16 +1777,34 @@ def link_stubs_source(stubs: list[dict], module: str | None = None) -> str:
             '  ".section .rodata\\n"',
             f'  ".Lframac_link_stub_{i}: .string \\"{name}\\"\\n"',
         ]
+    for g in global_stubs:
+        name = g["name"]
+        raw_sz = g.get("size")
+        size = int(raw_sz) if isinstance(raw_sz, int) and raw_sz > 0 else DEFAULT_BSS_GLOBAL_SIZE
+        lines += [
+            f'  "/* {name}: global defined in {g.get("file") or "unknown"} */\\n"',
+            '  ".bss\\n"',
+            '  ".balign 16\\n"',
+            f'  ".globl {name}\\n"',
+            f'  ".type {name}, @object\\n"',
+            f'  ".size {name}, {size}\\n"',
+            f'  "{name}: .zero {size}\\n"',
+        ]
     lines += ['  ".text\\n");', ""]
     return "\n".join(lines)
 
 
-def _flow_cluster_files(dag_path: Path, module: str | None) -> set[str] | None:
+def _is_generated_build_source(path: str) -> bool:
+    base = posixpath.basename(str(path).replace("\\", "/"))
+    return base.startswith("harness_") or base in (LINK_STUBS_FILE, LINK_GLOBALS_FILE) or "_link_globals/" in f"/{path}"
+
+
+def _flow_cluster_files(dag_path: Path, module: str | None, sources: list[str] | None = None) -> set[str] | None:
     """
-    The tree paths an address-flow cluster's builds compile (`build_sources` of the DAG's submodule
-    `module`, scripts/unit_split.py), or None when `module` is no such cluster. Link repair then
-    stubs what those files name outside them instead of linking more files: on nginx every file
-    leads, through `ngx_cycle` and `objs/ngx_modules.c`, to the whole program.
+    The tree paths an address-flow cluster's builds compile: the union of DAG submodule
+    `build_sources`, sidecar `harness_<module>.json` `flow_build_sources` (if widened by harness
+    snippets, B7), and the initial non-harness target `sources` passed to the build. None when
+    `module` is no such cluster.
     """
     if not module:
         return None
@@ -1752,7 +1816,15 @@ def _flow_cluster_files(dag_path: Path, module: str | None) -> set[str] | None:
         or not isinstance(sub.get("build_sources"), list)
     ):
         return None
-    return {_dag_tree_path(str(f)) for f in sub["build_sources"]}
+    files = {_dag_tree_path(str(f)) for f in sub["build_sources"]}
+    sidecar_path = Path(dag_path).parent.parent / "harnesses" / f"harness_{module}.json"
+    sidecar = load_json_optional(sidecar_path, None)
+    if isinstance(sidecar, dict) and isinstance(sidecar.get("flow_build_sources"), list):
+        files |= {_dag_tree_path(str(f)) for f in sidecar["flow_build_sources"] if isinstance(f, str)}
+    for src in sources or ():
+        if not _is_generated_build_source(src):
+            files.add(_dag_tree_path(src))
+    return files
 
 
 def _dag_tree_path(path: str) -> str:
@@ -1804,7 +1876,7 @@ def _missing_source(sym: str, file: str, norm: str, dag_path: Path, run_dir: Pat
     return {"file": rel, "path": norm, "symbols": [sym], "kind": kind, "reason": reason}
 
 
-def _link_unit_context(dag_path: Path, module: str | None) -> dict:
+def _link_unit_context(dag_path: Path, module: str | None, sources: list[str] | None = None) -> dict:
     """
     What placing a global needs from the DAG: the link unit record of harness module `module`
     (`unit`: None without link units, without a module, or for a module the DAG and the sidecars
@@ -1821,7 +1893,7 @@ def _link_unit_context(dag_path: Path, module: str | None) -> dict:
         unit = rec if isinstance(rec, dict) else None
     files = [*((unit or {}).get("files") or []), *((unit or {}).get("required_sources") or [])]
     return {
-        "flow_files": _flow_cluster_files(Path(dag_path), module),
+        "flow_files": _flow_cluster_files(Path(dag_path), module, sources=sources),
         "unit": unit,
         "unit_files": {_dag_tree_path(f) for f in files if isinstance(f, str)},
         "main_files": {
@@ -1864,6 +1936,114 @@ def _place_global(records: list[dict], ctx: dict) -> tuple[str, dict, str]:
     return "stub", records[0], ""
 
 
+def _flow_sub_stub_info(dag_path: Path, module: str | None) -> tuple[str, set[str]]:
+    """(sub_unit, explicit_stub_fn_names) for an address-flow cluster, or ('', set())."""
+    if not module:
+        return "", set()
+    dag = load_json_optional(Path(dag_path), None)
+    if not isinstance(dag, dict):
+        return "", set()
+    sub = (dag.get("submodules") or {}).get(module)
+    if not isinstance(sub, dict) or sub.get("reach") != "address_flow":
+        return "", set()
+    fns = dag.get("functions") or {}
+    explicit: set[str] = set()
+    for fk in (sub.get("link_stubs") or {}).get("functions") or []:
+        rec = fns.get(fk) if isinstance(fns, dict) else None
+        name = str((rec or {}).get("name") or str(fk).split("#")[-1])
+        if name:
+            explicit.add(name)
+    return str(sub.get("unit") or ""), explicit
+
+
+def _preseed_flow_stubs(
+    sources: list[str],
+    dag_path: Path | str | None,
+    out_bin: Path,
+    link_module: str | None,
+) -> tuple[list[str], dict | None, list[dict], list[dict]]:
+    """
+    Pre-generate `<out_bin>_link_globals/link_stubs.c` from `sub["link_stubs"]` before Attempt 1
+    for an address-flow cluster (B9: avoids running E-ACSL Stage 1 + Stage 2 twice). Returns
+    `(sources_with_stubs, preseeded_record_or_None, fn_stubs, bss_global_stubs)`.
+    """
+    if not dag_path or not link_module:
+        return list(sources), None, [], []
+    dp = Path(dag_path)
+    flow_files = _flow_cluster_files(dp, link_module, sources=sources)
+    if flow_files is None:
+        return list(sources), None, [], []
+    dag = load_json_optional(dp, None)
+    if not isinstance(dag, dict):
+        return list(sources), None, [], []
+    sub = (dag.get("submodules") or {}).get(link_module)
+    if not isinstance(sub, dict):
+        return list(sources), None, [], []
+    link_stubs = sub.get("link_stubs")
+    if not isinstance(link_stubs, dict):
+        return list(sources), None, [], []
+    dag_fns = dag.get("functions") or {}
+    dag_gvars = dag.get("global_variables") or {}
+    model_gvars = _model_global_variables(dp)
+
+    fn_stubs: list[dict] = []
+    seen_fns: set[str] = set()
+    for fk in link_stubs.get("functions") or []:
+        rec = dag_fns.get(fk) if isinstance(dag_fns, dict) else None
+        if isinstance(rec, dict) and rec.get("is_static") is True:
+            continue
+        name = str((rec or {}).get("name") or str(fk).split("#")[-1])
+        file = _dag_tree_path(str((rec or {}).get("file") or ""))
+        if not name or name in seen_fns or (file and file in flow_files):
+            continue
+        seen_fns.add(name)
+        fn_stubs.append({"name": name, "file": file})
+
+    global_stubs: list[dict] = []
+    seen_globs: set[str] = set()
+    for gk in link_stubs.get("globals") or []:
+        grec = dag_gvars.get(gk) if isinstance(dag_gvars, dict) else None
+        gname = str((grec or {}).get("name") or str(gk).rpartition("#")[2] or gk)
+        mrecs = model_gvars.get(gname) or []
+        mrec = next((r for r in mrecs if f"{r['file']}#{r['name']}" == gk), mrecs[0] if mrecs else None)
+        if isinstance(grec, dict) and grec.get("static"):
+            continue
+        file = _dag_tree_path(str((grec or {}).get("file") or (mrec or {}).get("file") or ""))
+        if not gname or gname in seen_globs or (file and file in flow_files):
+            continue
+        raw_sz = (grec or {}).get("size") or (mrec or {}).get("size")
+        size = int(raw_sz) if isinstance(raw_sz, int) and raw_sz > 0 else DEFAULT_BSS_GLOBAL_SIZE
+        seen_globs.add(gname)
+        global_stubs.append(
+            {
+                "name": gname,
+                "file": file,
+                "type": str((mrec or {}).get("type") or ""),
+                "units": list((mrec or {}).get("units") or []),
+                "size": size,
+                "assumption": LINK_GLOBALS_ASSUMPTION,
+                "bss": True,
+            }
+        )
+
+    if not fn_stubs and not global_stubs:
+        return list(sources), None, [], []
+    stub_dir = Path(out_bin).parent / f"{Path(out_bin).name}_link_globals"
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    fn_file = stub_dir / LINK_STUBS_FILE
+    fn_file.write_text(link_stubs_source(fn_stubs, global_stubs, link_module), encoding="utf-8", newline="\n")
+    out_sources = list(sources)
+    fn_posix = fn_file.as_posix()
+    if fn_posix not in {s.replace("\\", "/") for s in out_sources}:
+        out_sources.append(fn_posix)
+    record = {
+        "functions_file": fn_posix,
+        "functions": fn_stubs,
+        "globals": global_stubs,
+    }
+    return out_sources, record, fn_stubs, global_stubs
+
+
 def repair_sources_for_link(
     sources: list[str],
     log: str,
@@ -1882,57 +2062,77 @@ def repair_sources_for_link(
     defining sources via the DAG and append the missing files. Returns (sources, info).
 
     For an address-flow cluster (`module` is a DAG submodule with `build_sources`,
-    scripts/unit_split.py), a function defined outside the cluster's files is not linked from its
-    file: it is defined in the generated `stub_dir`/link_stubs.c (`link_stubs_source`, rewritten
-    with those of the earlier rounds, `stubbed_functions`), and listed in `info["stubbed_functions"]`
-    (name, file); a global outside them is stubbed as below.
+    scripts/unit_split.py), a parsed non-static function defined outside `flow_files` (of the same
+    unit, or explicitly listed in `sub["link_stubs"]["functions"]`) is not linked from its file: it
+    is defined in `<stub_dir>/link_stubs.c` (`link_stubs_source`, rewritten with earlier rounds'
+    stubs), and listed in `info["stubbed_functions"]`. An unreached cluster global outside
+    `flow_files` is emitted as a type-free `.bss` symbol in `link_stubs.c` (`bss: True` in
+    `info["stubbed_globals"]`), avoiding non-self-contained headers and by-value struct rejection.
+    `build_only_functions` are never stubbed in `link_stubs.c` (their `.c` files are linked).
 
-    A symbol that is no function of the DAG is looked up among the model's global variables
-    (`_model_global_variables`). One defined in the link unit of harness module `module` adds
-    its file like a function. One defined in another link unit is defined, zero-initialized, in
-    the generated `stub_dir`/link_globals.c (rewritten with those of the earlier rounds,
-    `stubbed`), which joins the sources: with the type of its `extern` declaration in a project
-    header the file includes (`declared_in`, `include`: the declaration keeps the qualifiers), else,
-    when no header declares it, from the model's type text (`global_definition_text`). `info["stubbed_globals"]` lists
-    the new ones (name, type, file, units, definition, assumption). The globals left undefined
-    are appended to `unresolved` (name, file, units, reason), not to `info`, which stays empty
-    for a round that repaired nothing.
-    A defining file that does not exist is never added (the compiler would stop on it: E-ACSL's
-    `source file ... does not exist`): it goes to `missing` (file, path, symbols, kind, reason;
-    one record per file), whose reason names the Phase 0 step that should have kept it
-    (`_missing_source`: nginx's generated objs/ngx_modules.c).
+    For non-flow builds, a global defined in another link unit is defined zero-initialized in
+    `<stub_dir>/link_globals.c` via `_declaring_header` or `global_definition_text`.
     """
     syms = parse_undefined_references(log)
     if not syms or not dag_path:
         return list(sources), {}
-    sym_files = _dag_symbol_files(Path(dag_path))
+    dp = Path(dag_path)
+    parsed_syms, build_only_syms = _dag_symbol_tables(dp)
     have = {s.replace("\\", "/") for s in sources}
     added: list[str] = []
     resolved: list[str] = []
-    new_stubs: list[dict] = []
+    new_c_stubs: list[dict] = []
+    new_bss_stubs: list[dict] = []
     known_stubs = {s["name"] for s in stubbed or []}
     known_fn_stubs = {s["name"] for s in stubbed_functions or []}
     new_fn_stubs: list[dict] = []
-    flow_files = _flow_cluster_files(Path(dag_path), module) if stub_dir is not None else None
+    flow_files = _flow_cluster_files(dp, module, sources=sources) if stub_dir is not None else None
+    sub_unit, explicit_fn_stubs = _flow_sub_stub_info(dp, module) if flow_files is not None else ("", set())
     global_vars: dict[str, list[dict]] | None = None
     ctx: dict = {}
     for sym in syms:
-        f = sym_files.get(sym)
-        if f and flow_files is not None and _dag_tree_path(f) not in flow_files:
-            if sym not in known_fn_stubs:
-                known_fn_stubs.add(sym)
-                new_fn_stubs.append({"name": sym, "file": _dag_tree_path(f)})
-                resolved.append(sym)
-            continue
+        parsed_hit = parsed_syms.get(sym)
+        if parsed_hit is not None:
+            f, fn_mod = parsed_hit
+            outside_flow = flow_files is not None and _dag_tree_path(f) not in flow_files
+            # B1 defense in depth: never stub a function from a linked library unit unless it is
+            # explicitly outside flow_files AND listed in sub["link_stubs"]["functions"].
+            can_stub = outside_flow and (not sub_unit or not fn_mod or fn_mod == sub_unit or sym in explicit_fn_stubs)
+            if can_stub:
+                if sym not in known_fn_stubs:
+                    known_fn_stubs.add(sym)
+                    new_fn_stubs.append({"name": sym, "file": _dag_tree_path(f)})
+                    resolved.append(sym)
+                continue
+        elif sym in build_only_syms:
+            # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed.
+            f = build_only_syms[sym]
+        else:
+            f = ""
         if not f:
             if global_vars is None:
-                global_vars = _model_global_variables(Path(dag_path))
+                global_vars = _model_global_variables(dp)
             if sym not in global_vars or sym in known_stubs:
                 continue
-            ctx = ctx or _link_unit_context(Path(dag_path), module)
+            ctx = ctx or _link_unit_context(dp, module, sources=sources)
             action, rec, reason = _place_global(global_vars[sym], ctx)
             if action == "stub" and stub_dir is None:
                 action, reason = "unresolved", "another link unit defines it and no build directory was given"
+            elif action == "stub" and stub_dir is not None and flow_files is not None:
+                raw_sz = rec.get("size")
+                size = int(raw_sz) if isinstance(raw_sz, int) and raw_sz > 0 else DEFAULT_BSS_GLOBAL_SIZE
+                known_stubs.add(sym)
+                new_bss_stubs.append(
+                    {
+                        **rec,
+                        "file": _dag_tree_path(rec["file"]),
+                        "size": size,
+                        "assumption": LINK_GLOBALS_ASSUMPTION,
+                        "bss": True,
+                    }
+                )
+                resolved.append(sym)
+                continue
             elif action == "stub" and stub_dir is not None:
                 stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION}
                 # The header that declares it comes first: it has the types and the qualifiers the
@@ -1947,7 +2147,8 @@ def repair_sources_for_link(
                 if definition is None:
                     action, reason = "unresolved", f"{reason}, and no header of the project declares it"
                 else:
-                    new_stubs.append({**stub, "definition": definition})
+                    known_stubs.add(sym)
+                    new_c_stubs.append({**stub, "definition": definition})
                     resolved.append(sym)
                     continue
             if action == "unresolved":
@@ -1958,7 +2159,7 @@ def repair_sources_for_link(
         norm = _normalize_dag_source(f, Path(run_dir))
         if norm not in have and not (Path(norm) if posixpath.isabs(norm) else Path(run_dir) / norm).is_file():
             if missing is not None:
-                record = _missing_source(sym, f, norm, Path(dag_path), Path(run_dir))
+                record = _missing_source(sym, f, norm, dp, Path(run_dir))
                 same = next((m for m in missing if m.get("path") == norm), None)
                 if same is None:
                     missing.append(record)
@@ -1969,20 +2170,27 @@ def repair_sources_for_link(
             have.add(norm)
             added.append(norm)
             resolved.append(sym)
-    if new_stubs and stub_dir is not None:
+    if new_c_stubs and stub_dir is not None:
         stub_dir.mkdir(parents=True, exist_ok=True)
         stub_file = stub_dir / LINK_GLOBALS_FILE
-        stub_file.write_text(link_globals_source([*(stubbed or []), *new_stubs]), encoding="utf-8", newline="\n")
+        prior_c = [s for s in (stubbed or []) if not s.get("bss")]
+        stub_file.write_text(link_globals_source([*prior_c, *new_c_stubs]), encoding="utf-8", newline="\n")
         if stub_file.as_posix() not in have:
+            have.add(stub_file.as_posix())
             added.append(stub_file.as_posix())
-    if new_fn_stubs and stub_dir is not None:
+    if (new_fn_stubs or new_bss_stubs) and stub_dir is not None:
         stub_dir.mkdir(parents=True, exist_ok=True)
         fn_file = stub_dir / LINK_STUBS_FILE
+        prior_bss = [s for s in (stubbed or []) if s.get("bss")]
         fn_file.write_text(
-            link_stubs_source([*(stubbed_functions or []), *new_fn_stubs], module), encoding="utf-8", newline="\n"
+            link_stubs_source([*(stubbed_functions or []), *new_fn_stubs], [*prior_bss, *new_bss_stubs], module),
+            encoding="utf-8",
+            newline="\n",
         )
         if fn_file.as_posix() not in have:
+            have.add(fn_file.as_posix())
             added.append(fn_file.as_posix())
+    new_stubs = [*new_c_stubs, *new_bss_stubs]
     info: dict = {"symbols": resolved, "added_sources": added} if added or new_stubs or new_fn_stubs else {}
     if new_stubs:
         info["stubbed_globals"] = new_stubs
@@ -2011,6 +2219,8 @@ def repair_link_rounds(
     *,
     link_module: str | None = None,
     before_retry=None,
+    initial_stubbed_functions: list[dict] | None = None,
+    initial_stubbed_globals: list[dict] | None = None,
 ) -> tuple[dict, list[str], dict | None]:
     """
     The link repair of a module build whose first attempt `comp` (from `sources`) failed: while the
@@ -2019,7 +2229,8 @@ def repair_link_rounds(
     so a file added for one symbol can need still more files: each round adds at least one file the
     DAG names or defines one global of the model, which bounds the rounds. A global of another link
     unit is defined in the generated `<out_bin>_link_globals/link_globals.c`; for an address-flow
-    cluster, a function outside its `build_sources` is stubbed in `<out_bin>_link_globals/link_stubs.c`.
+    cluster, functions and globals outside its `flow_files` are stubbed in
+    `<out_bin>_link_globals/link_stubs.c` (preserving any pre-seeded stubs).
 
     Returns (last compile, last sources, `link_repair` or None): `symbols` and `added_sources` over
     all rounds, `rounds` one entry each, and when there are any `stubbed_globals` with `globals_file`,
@@ -2030,8 +2241,10 @@ def repair_link_rounds(
     current = list(sources)
     rounds: list[dict] = []
     stub_dir = Path(out_bin).parent / f"{Path(out_bin).name}_link_globals"
-    stubbed: list[dict] = []
-    stubbed_fns: list[dict] = []
+    stubbed: list[dict] = list(initial_stubbed_globals or [])
+    stubbed_fns: list[dict] = list(initial_stubbed_functions or [])
+    round_stubbed: list[dict] = []
+    round_stubbed_fns: list[dict] = []
     left: list[dict] = []
     missing_sources: list[dict] = []
     if comp["returncode"] != 0 and dag_path:
@@ -2056,8 +2269,12 @@ def repair_link_rounds(
             )
             if not info:
                 break
-            stubbed += info.get("stubbed_globals", [])
-            stubbed_fns += info.get("stubbed_functions", [])
+            new_g = info.get("stubbed_globals", [])
+            new_f = info.get("stubbed_functions", [])
+            stubbed += new_g
+            stubbed_fns += new_f
+            round_stubbed += new_g
+            round_stubbed_fns += new_f
             rounds.append(info)
             if before_retry is not None:
                 before_retry(comp)
@@ -2070,11 +2287,14 @@ def repair_link_rounds(
         "added_sources": [src for r in rounds for src in r["added_sources"]],
         "rounds": rounds,
     }
-    if stubbed:
-        record["stubbed_globals"] = stubbed
-        record["globals_file"] = (stub_dir / LINK_GLOBALS_FILE).as_posix()
-    if stubbed_fns:
-        record["stubbed_functions"] = stubbed_fns
+    if round_stubbed:
+        record["stubbed_globals"] = round_stubbed
+        if any(not g.get("bss") for g in round_stubbed):
+            record["globals_file"] = (stub_dir / LINK_GLOBALS_FILE).as_posix()
+        if any(g.get("bss") for g in round_stubbed):
+            record["functions_file"] = (stub_dir / LINK_STUBS_FILE).as_posix()
+    if round_stubbed_fns:
+        record["stubbed_functions"] = round_stubbed_fns
         record["functions_file"] = (stub_dir / LINK_STUBS_FILE).as_posix()
     if unresolved_globals:
         record["unresolved_globals"] = unresolved_globals
@@ -2098,15 +2318,28 @@ def build_coverage_binary(
     (`repair_link_rounds`, driven by `dag_path`, globals placed for harness module `link_module`): the
     module's sources alone may not link (nginx run-5: ngx_core_module, ngx_modules and ngx_module_names
     live in src/core/nginx.c and the generated objs/ngx_modules.c). Returns {compile, sources} with
-    `link_repair` after a repair; `sources` is what was compiled last.
+    `link_repair` after a repair and `preseeded_stubs` when an address-flow cluster pre-seeded
+    `link_stubs.c`; `sources` is what was compiled last.
     """
 
     def _compile(srcs: list[str]) -> dict:
         return compile_coverage_binary(srcs, out_bin, cppflags, ldflags_extra, use_cache=use_cache)
 
-    comp = _compile(list(sources))
-    comp, current, repair = repair_link_rounds(comp, sources, _compile, dag_path, out_bin, link_module=link_module)
+    seeded_sources, preseeded, pre_fns, pre_globs = _preseed_flow_stubs(sources, dag_path, out_bin, link_module)
+    comp = _compile(list(seeded_sources))
+    comp, current, repair = repair_link_rounds(
+        comp,
+        seeded_sources,
+        _compile,
+        dag_path,
+        out_bin,
+        link_module=link_module,
+        initial_stubbed_functions=pre_fns,
+        initial_stubbed_globals=pre_globs,
+    )
     result: dict = {"compile": comp, "sources": current}
+    if preseeded is not None:
+        result["preseeded_stubs"] = preseeded
     if repair is not None:
         result["link_repair"] = repair
     return result
@@ -2240,15 +2473,18 @@ def build_module_binary(
         last.update(eacsl_attempt=eacsl_attempt, fallback_reason=fallback_reason)
         return comp
 
-    comp = _noted_attempt(list(sources))
+    seeded_sources, preseeded, pre_fns, pre_globs = _preseed_flow_stubs(sources, dag_path, out_bin, link_module)
+    comp = _noted_attempt(list(seeded_sources))
     comp, current, link_repair = repair_link_rounds(
         comp,
-        sources,
+        seeded_sources,
         _noted_attempt,
         dag_path,
         out_bin,
         link_module=link_module,
         before_retry=lambda failed: _keep_logs(failed, last["eacsl_attempt"]),
+        initial_stubbed_functions=pre_fns,
+        initial_stubbed_globals=pre_globs,
     )
     eacsl_attempt, fallback_reason = last["eacsl_attempt"], last["fallback_reason"]
     result = {
@@ -2258,6 +2494,8 @@ def build_module_binary(
         "eacsl_compile_attempt": eacsl_attempt,
         "sources": current,
     }
+    if preseeded is not None:
+        result["preseeded_stubs"] = preseeded
     if len(attempts) > 1:
         # `compile` and `eacsl_compile_attempt` are the last attempt's; each earlier failure stays here
         # (nginx run-3: an OOM-killed first E-ACSL attempt was reported as the retry's failure).
