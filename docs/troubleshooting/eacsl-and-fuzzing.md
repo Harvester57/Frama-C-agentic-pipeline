@@ -117,12 +117,13 @@ Issues encountered in E-ACSL instrumentation (`e-acsl-gcc`, `eacsl_toolchain.py`
   - `workspace/build/nginx__ngx_event_openssl.build.json` says only `engine_fallback_reason: eacsl_instrumentation_failed`, the post-repair attempt's reason (a missing generated source, see [`./phase0-build-and-model.md`](./phase0-build-and-model.md)).
   - `fuzz_nginx__ngx_event_openssl.compile.log` holds only that last attempt.
 - **Cause (pipeline bug):** in [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py), the repair loop of `build_module_binary` reassigns `compile`, `eacsl_compile_attempt` and `engine_fallback_reason` on each attempt. Each compile also rewrites the same `<out>.compile.log` and `<out>.sanitizer_compile.log`. `link_repair.rounds` records only what was added, not why each attempt failed.
-- **Fix:** **fixed** on branch `sup/nginx-generated-sources`, commit `c97e28c` (not merged).
-  - After a repair, the build result has `attempts`, which the report copies as `build_attempts`. Each attempt gives the engine, the return code, the reason, `killed` (SIGKILL: return code 137 or -9, or `Killed` at the end of stderr), the end of stderr, and the E-ACSL attempt that fell back.
+- **Fix:** **fixed** on branch `sup/nginx-generated-sources`, commits `c97e28c` and `79f49ec` (not merged).
+  - After a repair, the build result has `attempts`, which the report copies as `build_attempts`. Each attempt gives the engine, the return code, the reason, the end of stderr, and the E-ACSL attempt that fell back.
   - The logs of every earlier attempt are kept as `<log stem>.attempt<N>.log`.
-  - `diagnostic_hints` says when an earlier attempt was killed.
-  - Test: `tests/test_generated_sources.py::test_the_build_keeps_every_attempts_failure`.
-  - **Not verified:** the exit status `e-acsl-gcc` returns when the kernel kills its Frama-C. Run-3's first log is overwritten. If the wrapper reports `1` and no `Killed` line, `killed` stays unset, but the attempt's stderr tail and kept log still show the failure.
+  - `diagnostic_hints` says when an earlier attempt was killed or looks killed.
+  - **How a kill shows:** checked in `framac-analysis`, `e-acsl-gcc`'s `error()` exits 1 whatever Frama-C's status. Bash prints no `Killed` for a Frama-C killed inside its `$(...)`: a test script got return code 137 inside and printed nothing. So `killed` (return code 137 or -9, or a `Killed` line) fires only for a direct kill. For E-ACSL, `killed_suspected` marks an attempt that stopped with `aborted by Frama-C` and no Frama-C diagnostic of its own (`[kernel] User Error`, `Failure`, `Fatal error`, `Out of memory`). That is a heuristic; confirm it with `docker events` (`oom`).
+  - Tests: `tests/test_generated_sources.py::test_the_build_keeps_every_attempts_failure` and `::test_a_killed_attempt_is_told_from_a_frama_c_error`.
+  - **Not verified on run-3:** its first attempt's log was overwritten, so there is no way to check that it had no Frama-C diagnostic.
 
 ### Symptom: `call to undeclared function 'X'` or `invalid application of 'alignof' to an incomplete type`
 - **Cause:** a [`../../templates/fc_stubs/`](../../templates/fc_stubs/) header lacks a prototype the target calls, or declares an opaque handle (`struct json_object`) as incomplete. E-ACSL emits `alignof` on pointed-to types.
