@@ -271,6 +271,19 @@ Issues encountered in dual harness generation (`generate_harness.py`, `api_harne
   2. The gate's message ends with the next step: `reach gate failed for <mod>: ...; repair the harness and run python3 $S/harness_reach.py check again, or record why with python3 $S/harness_reach.py exempt --module <mod> --function <fn> --reason <why> (which re-checks the gate)`.
   3. Found while testing 1: the sidecar is part of the harness digest, so **one** exemption made the next reach check treat the harness as repaired and drop **every** dynamic gap of the module, also those not exempted (`apply_dynamic`). The gaps came back only with the next coverage measure, which may be part of run-2's "second trap". The dynamic rows now record a digest without `reach_exempt` and `warnings` (`phase0_gates.harness_digest(..., ignore_exempt=True)`); a row written before the change still matches while its sidecar is unchanged.
   Tests: `tests/test_harness_reach.py` (`test_exempting_a_dynamic_gap_reopens_the_gate_without_a_reach_gate_run` and the three after it).
+
+### Symptom: The Reach Gate Passes After Hundreds of Exemptions Whose Reason Names a Pipeline Bug
+- **Seen on:** nginx 1.31.9 run-3, 2026-11-19, 14:17-14:28, module `nginx__ngx_event_openssl` (779 entry points, 369 reach gaps).
+  - The run's agent closed about 360 gaps with `harness_reach.py exempt`, grouped under a few blanket reasons and not checked one function at a time.
+  - Examples of the reasons: `api_harness_anonymous_struct_typedef ... (open pipeline bug)` and `api_harness_omitted: ... requires nginx runtime state`.
+  - The gate then passed for those entry points.
+- **Cause:** a gate gap. `harness_reach.py exempt` accepts any non-empty reason. `framac-slice` reserves exemption for entry points that cannot be driven from bytes (see "Exemptions" above), but nothing enforces it.
+  - A reason that names a pipeline bug is the opposite case: the entry point can be driven once the generator is fixed. Here the generator was the cause (`--api` could not spell `ngx_str_t *`; see "`--api` Skips nginx's `ngx_str_t *` Parameters" in this file).
+  - About 45% of the module's entry points therefore had no fuzz case, and the gate did not record why in a form the report can tell apart.
+- **Fix:** none. **Open pipeline gap.** Proposed:
+  - `exempt` refuses a reason that cites an open pipeline bug or an `api_skipped` generator reason, and points to the troubleshooting entry instead.
+  - Or it records such exemptions under a separate status that the report counts as pipeline-caused uncovered entry points.
+- **For run-3's directory:** the fix on `sup/nginx-api-anon-struct-typedef` gives 221 of the 284 skipped functions a case. Remove the exemptions made for that reason when the harness is regenerated.
 - **Still open:** `exempt` does not refresh the module's row in `harness_reach_dynamic.json`, so the report keeps listing an exempted gap until the next `reach-dynamic-<mod>`; the gate ignores it. `benchmark.py` and `benchmark_seeded.py` call `record_exempt` directly and run the reach check afterwards themselves.
 
 ### Symptom: A variadic parser primitive's dangerous branch (`minmea_scan` `'s'` specifier, CVE-2026-29974) is never reached by any phase, though the function runs thousands of times
