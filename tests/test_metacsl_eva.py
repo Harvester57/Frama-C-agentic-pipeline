@@ -185,7 +185,12 @@ def test_engine_off_the_command_and_the_report_are_todays(meta_run, monkeypatch,
     monkeypatch.setattr(rs, "_input_digest", lambda sources, flags: "d")
     reports: list[bytes] = []
     out_json = meta_run / "workspace/reports/eva/prog.json"
-    variants = [(None, []), (props_doc(()), []), (props_doc(None), []), (props_doc(("eacsl",)), [])]
+    variants: list[tuple[dict | None, list[str]]] = [
+        (None, []),
+        (props_doc(()), []),
+        (props_doc(None), []),
+        (props_doc(("eacsl",)), []),
+    ]
     variants.append((props_doc(("eva",)), ["--security-props", "none"]))
     for doc, extra in variants:
         if doc is None:
@@ -267,7 +272,9 @@ def test_engine_on_the_meta_file_follows_the_sources_and_metacsl_runs_before_rte
     # The file: named after its text, and the text security_props.py gives for this module's functions.
     path = Path(meta_file)
     ids = {"prog.c#" + fn for fn in ("backdoor", "emit", "get_level", "handle")}
-    text = sp.module_meta_file_text(doc, functions=ids)[0]
+    found = sp.module_meta_file_text(doc, functions=ids)
+    assert found is not None
+    text = found[0]
     assert path.read_text(encoding="utf-8") == text
     assert path.parent.name == hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
     assert path.parent.parent.as_posix() == f"workspace/reports/{rs.SECURITY_META_DIR}"
@@ -292,6 +299,7 @@ def test_a_harness_that_includes_the_source_gets_the_properties_through_its_depe
     harness = ["workspace/harnesses/harness_prog.c"]
     monkeypatch.setattr(rs.cache, "dependency_manifest", fake_manifest("workspace/work/prog.c"))
     section = rs.load_security_meta(MB_PROPS, harness, [], "prog", "eva_main")
+    assert section is not None
     assert section["properties"] == [MB_AUTH_STATE, MB_AUTH_REQUIRED, MB_SANITIZED]
     # Nothing of the module in the parse: no meta file, and the run is the plain run plus a note.
     monkeypatch.setattr(rs.cache, "dependency_manifest", lambda *a, **k: None)
@@ -327,6 +335,7 @@ def test_a_propertys_sources_join_the_parse_or_the_property_is_skipped(meta_run,
     write_json(Path(MB_PROPS), doc)
     # The file that defines the global is not in the work tree: MetAcsl could not type the property.
     section = rs.load_security_meta(MB_PROPS, MB_SOURCES, [], "prog", "eva_main")
+    assert section is not None
     assert section["properties"] == [MB_AUTH_REQUIRED, MB_SANITIZED]
     assert section["skipped"] == [
         {
@@ -435,6 +444,7 @@ def test_without_a_meta_file_the_summary_is_summarize_rows(meta_run):
     static = static_section()
     rows = [meta_row(static, MB_SANITIZED, "emit", "Unknown"), rte_row("admin", "Unknown")]
     plain = rs.summarize_rows(rows)
+    section: dict | None
     for section in (None, {}, {"props": MB_PROPS, "properties": [], "meta_file": None}, {"error": "x"}):
         assert rs.summarize_report(rows, section) == plain
         assert not rs.is_meta_row(rows[0], section)
@@ -508,12 +518,8 @@ def _cache_material(monkeypatch, doc: dict | None) -> tuple[dict, list[str], lis
     else:
         write_json(Path(MB_PROPS), doc)
     props = rs.resolve_security_props(None)
-    rs.run_eva_on_slice(
-        MB_SOURCES,
-        "eva_main",
-        Path("workspace/eva/prog"),
-        **({"security_props": props, "module": "prog"} if props else {}),
-    )
+    options: dict = {"security_props": props, "module": "prog"} if props else {}
+    rs.run_eva_on_slice(MB_SOURCES, "eva_main", Path("workspace/eva/prog"), **options)
     return seen["material"], seen["sources"], seen["digest_sources"]
 
 
@@ -768,6 +774,7 @@ def test_modules_mk_names_the_file_only_with_the_engine_on(tmp_path):
 def test_the_settings_digest_follows_what_a_meta_file_is_built_from(tmp_path):
     run = _plan_run(tmp_path, props_doc())
     first = pm.eva_security_props(run)
+    assert first is not None
     regenerated = props_doc()
     regenerated["generated_at"] = "2027-01-01T00:00:00+00:00"
     regenerated["warnings"] = ["a note"]
@@ -995,6 +1002,7 @@ def test_a_report_without_filed_rows_gives_no_verdict(ledger_run):
     }
     report = {"status": "ok", "module": MB_MODULE, "sources": list(MB_SOURCES), "reduced_checks": []}
     report.update(rs.summarize_rows([rte_row(fn) for fn in MB_FUNCTIONS]))
+    section: dict
     for section in (failed, {"props": MB_PROPS, "properties": [], "meta_file": None}):
         write_json(Path(MB_EVA_REPORT), {**report, "security_props": section})
         stats = L.cmd_ingest_eva([Path(MB_EVA_REPORT)])

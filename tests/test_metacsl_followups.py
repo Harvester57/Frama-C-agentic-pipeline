@@ -268,9 +268,12 @@ def test_a_guard_failure_replayed_from_another_directory_is_still_mapped_to_its_
     sidecar = json.loads((binary.parent / Path(meta_file).with_suffix(".json").name).read_text(encoding="utf-8"))
     line = next(int(k) for k, v in sidecar["line_names"].items() if v == "L5_sanitized_logmsg")
     guard = eacsl_report(meta_file, "process", line, "E-ACSL RTE", "memory access", r"\valid_read(s + i)", "")
-    assert "meta_property" not in failure_identity.parse_runtime_failure(guard)
+    without_binary = failure_identity.parse_runtime_failure(guard)
+    assert without_binary is not None
+    assert "meta_property" not in without_binary
     for parse in (failure_identity.parse_runtime_failure, failure_identity.parse_eacsl_failure):
         failure = parse(guard, binary=binary)
+        assert failure is not None
         assert failure["meta_property"] == "L5_sanitized_logmsg" and failure["meta_guard"] == "memory access"
         assert failure["file"] == "src/prog.c"
 
@@ -283,13 +286,19 @@ def test_the_sidecar_next_to_the_binary_is_the_one_of_the_binary(replayed_elsewh
     stale.parent.mkdir(parents=True)
     shutil.copy(binary.parent / meta_file.name, meta_file)
     stale.write_text(json.dumps({"functions": {"backdoor": ["other/module.c"]}}), encoding="utf-8")
-    assert failure_identity.parse_runtime_failure(output)["file"] == "other/module.c"
-    assert failure_identity.parse_runtime_failure(output, binary=binary)["file"] == "src/prog.c"
+    from_cwd = failure_identity.parse_runtime_failure(output)
+    assert from_cwd is not None
+    assert from_cwd["file"] == "other/module.c"
+    from_binary = failure_identity.parse_runtime_failure(output, binary=binary)
+    assert from_binary is not None
+    assert from_binary["file"] == "src/prog.c"
     # A binary without a sidecar beside it (a copy): the path the binary printed is still looked up.
     copy = binary.parent.parent / "copy" / binary.name
     copy.parent.mkdir()
     shutil.copy(binary, copy)
-    assert failure_identity.parse_runtime_failure(output, binary=copy)["file"] == "other/module.c"
+    from_copy = failure_identity.parse_runtime_failure(output, binary=copy)
+    assert from_copy is not None
+    assert from_copy["file"] == "other/module.c"
 
 
 # ---------------------------------------------------------------------------------------------------

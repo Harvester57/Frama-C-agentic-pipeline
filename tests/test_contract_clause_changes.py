@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from acsl_ast import DEFAULT_BEHAVIOR, compare_function_contracts  # noqa: E402
 
 RUN1_CONTRACTS = ROOT / "tests" / "fixtures" / "libmodbus_run1_contracts"
-EMPTY_DELTA = {"baseline": [], "candidate": [], "removed": [], "added": []}
+EMPTY_DELTA: dict[str, list[str]] = {"baseline": [], "candidate": [], "removed": [], "added": []}
 
 HEADER = "int parse(const unsigned char *buf, int len, int *out);\n"
 SOURCE = "int parse(const unsigned char *data, int n, int *out)\n{\n    *out = n;\n    return 0;\n}\n"

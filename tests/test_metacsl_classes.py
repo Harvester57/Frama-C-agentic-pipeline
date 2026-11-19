@@ -126,7 +126,7 @@ def wp_report(
     predicate), named as run_wp_function.name_meta_goal names them and counted by its own class map.
     `loaded` is what MetAcsl loaded for the function (default: the names of `goals`).
     """
-    items = [
+    items: list[dict] = [
         {"file": "prog.c", "function": function, "line": 3 + i, "kind": "mem_access", "annotation": f"\\valid(p + {i})"}
         for i in range(4)
     ]

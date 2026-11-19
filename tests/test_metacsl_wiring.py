@@ -402,7 +402,9 @@ def test_the_fuzz_build_loads_only_the_properties_for_eacsl(tmp_path, monkeypatc
     assert plan["not_for_engine"] == ["L4_invariant_eva_only"]
     # Without such a property the plan is the one it was (no new key).
     write_props(EACSL_PROPS, fixture_props(["eacsl"]))
-    assert "not_for_engine" not in fuzz_build.resolve_security_meta(None, EACSL_SOURCES, EACSL_OUT)
+    plan = fuzz_build.resolve_security_meta(None, EACSL_SOURCES, EACSL_OUT)
+    assert plan is not None
+    assert "not_for_engine" not in plan
 
 
 # ---------------------------------------------------------------------------------------------------
