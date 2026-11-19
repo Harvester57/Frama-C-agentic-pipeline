@@ -18,6 +18,7 @@ import subprocess
 
 import pytest
 
+import ledger as L
 import security_props as sp
 import trust
 from conftest import ANALYSIS_IMAGE, ROOT, write_json
@@ -442,11 +443,13 @@ def _goals(report: dict, name: str) -> tuple[list, list]:
 @pytest.mark.slow
 def test_the_callers_goal_is_false_before_and_gone_after_in_the_image(model_run, tmp_path):  # noqa: F811
     """
-    libmodbus run-1 on a correct program. Before (no `checked_at`): MetAcsl asserts the wrapper's
-    property in its caller, where two bytes are still unset, and WP cannot prove it. After: the caller
-    has no such goal, and the wrapper holds the named check before its hand-off.
+    libmodbus run-1 on a correct program. Before (the wrapper declared alone, without `checked_at`, so
+    it has no inner sink to forward to): MetAcsl asserts the wrapper's property in its caller, where two
+    bytes are still unset, and WP cannot prove it. After: the caller has no such goal, and the wrapper
+    holds the named check before its hand-off. The inner sinks declared without `checked_at` are the
+    forwarding case, `test_a_forwarding_wrapper_without_calls_gets_no_credit_in_the_image`.
     """
-    m, doc, run, work = _image_target(tmp_path / "before", model_run, [PLAIN_SINK, TCP_SINK, RTU_SINK], False)
+    m, doc, run, work = _image_target(tmp_path / "before", model_run, [PLAIN_SINK], False)
     assert by_name(doc)[WRAPPER_PROP]["instances"] == ["prog.c#request_rtu", "prog.c#request_tcp"]
     before = _wp_report(run, work, "request_tcp", False)
     assert WRAPPER_PROP in before["security_props"]["properties"]
@@ -460,8 +463,8 @@ def test_the_callers_goal_is_false_before_and_gone_after_in_the_image(model_run,
     assert _goals(after, WRAPPER_PROP) == ([], []) and "l5_sanitized" not in after["by_obligation_class"]
     # In the wrapper the check is a WP goal at the hand-off. WP does not prove it here: it cannot see
     # through the call of the hook without a `calls` clause; Eva and E-ACSL evaluate it (below).
-    # Frama-C's report gives an in-code check without its name, and run_wp_function.py puts the name
-    # back for meta-file goals only, so the goal is found by its place and predicate, not by its name.
+    # Frama-C's report gives an in-code check without its name: run_wp_function.py reads the name back
+    # from the source (code_check_names), so the goal at that place carries the property and its class.
     wrapper = _wp_report(run, work, "send_frame", False)
     goals = [
         g
@@ -469,8 +472,40 @@ def test_the_callers_goal_is_false_before_and_gone_after_in_the_image(model_run,
         if int(g.get("line") or 0) == HANDOFF_LINE and "check" in str(g.get("kind"))
     ]
     assert len(goals) == 1, json.dumps(wrapper.get("wp_log_tail"), indent=1)
-    assert "\\initialized(msg + (0 .. msg_length - 1))" in goals[0]["annotation"], goals
+    assert goals[0]["annotation"] == f"{WRAPPER_PROP}: \\initialized(msg + (0 .. msg_length - 1))", goals
+    assert goals[0]["obligation_class"] == "l5_sanitized", goals
     assert "Check 'L5_sanitized_send_frame'" in str(wrapper.get("wp_log_tail")), wrapper.get("wp_log_tail")
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize("violate", [False, True], ids=["complete", "byte_unset"])
+def test_a_forwarding_wrapper_without_calls_gets_no_credit_in_the_image(
+    model_run, tmp_path, monkeypatch, violate  # noqa: F811
+):
+    """
+    The inner sinks declared too and no `checked_at`: the wrapper forwards, so its callers have no goal and
+    the bytes are the inner sinks' preconditions at the call through the pointer. Without a `calls`
+    annotation there WP has no such goal, on a correct program and on one that leaves a byte unset alike:
+    the run is flagged unsound and the ledger credits nothing, so the violation is not passed as checked.
+    """
+    m, doc, run, work = _image_target(tmp_path, model_run, [PLAIN_SINK, TCP_SINK, RTU_SINK], violate)
+    props = by_name(doc)
+    inner = ["L5_sanitized_rtu_send", "L5_sanitized_tcp_send"]
+    assert props[WRAPPER_PROP]["instances"] == [] and props[WRAPPER_PROP]["forwarded_to"] == ["rtu_send", "tcp_send"]
+    assert all(WRAPPER in props[name]["instances"] for name in inner)
+    monkeypatch.chdir(run)
+    _seed_one_file(run, m, doc)
+    caller = _wp_report(run, work, "request_tcp", violate)
+    assert not (caller.get("security_props") or {}).get("properties")
+    assert _goals(caller, WRAPPER_PROP) == ([], []) and "l5_sanitized" not in caller["by_obligation_class"]
+    wrapper = _wp_report(run, work, "send_frame", violate)
+    assert sorted(wrapper["security_props"]["properties"]) == inner
+    assert all(_goals(wrapper, name) == ([], []) for name in inner), json.dumps(wrapper.get("wp_log_tail"), indent=1)
+    assert wrapper["status"] != "all_proven" and not wrapper["soundness"]["ok"], wrapper["soundness"]
+    L.cmd_ingest_wp([run / "workspace/reports/wp/send_frame.json"])
+    unit = _ledger_units(run)[f"{WRAPPER}::l5_sanitized"]
+    assert unit["status"] != "covered" and unit["evidence"][-1]["result"] == "wp_no_credited_goals", unit
 
 
 @pytest.mark.integration
