@@ -176,6 +176,21 @@ def test_the_address_flow_facts_reach_the_dag_with_dag_keys(target: Path) -> Non
     # A model without the facts gives the DAG none, and the split falls back to the call graph.
     plain = _dag(target, _model())
     assert "address_refs" not in plain["functions"]["api_run"] and "global_variables" not in plain
+    # A global the model could not resolve, named by the code or along an initializer chain: no facts.
+    model["global_variables"]["src/b.c#table"]["init_globals"] = ["src/b.c#inner"]
+    model["global_variables"]["src/b.c#inner"] = {
+        "name": "inner",
+        "file": "src/b.c",
+        "static": False,
+        "units": ["lib"],
+        "init_functions": [],
+        "init_globals": [],
+        "unresolved_global_refs": ["shared"],
+    }
+    dag = _dag(target, model)
+    assert "address_refs" not in dag["functions"]["api_run"] and "address_refs" in dag["functions"]["api_other"]
+    model["functions"]["src/b.c#api_other"]["unresolved_global_refs"] = ["shared"]
+    assert "address_refs" not in _dag(target, model)["functions"]["api_other"]
 
 
 def test_header_functions_are_reached_only_from_entry_points(target: Path) -> None:

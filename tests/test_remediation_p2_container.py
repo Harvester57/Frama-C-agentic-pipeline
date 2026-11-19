@@ -43,6 +43,8 @@ NOT_FORWARDED = {
     # C macros of generated harnesses, not environment variables
     "FRAMAC_FUZZ_SKIP_CASES",
     "FRAMAC_EVA_SHARD",
+    # the message a link stub prints when called (fuzz_build.LINK_STUB_MARKER), not an environment variable
+    "FRAMAC_LINK_STUB_CALLED",
     # debugging switch read inside the container only (scripts/fc_cpp_wrapper.py)
     "FRAMAC_CPP_REWRITE",
     # host broker / wrapper / benchmark-driver knobs (the pool reaches the container as the broker's measurement)

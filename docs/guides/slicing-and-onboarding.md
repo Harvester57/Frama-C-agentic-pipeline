@@ -8,7 +8,7 @@ This guide explains how `/framac-slice` partitions a large multi-module codebase
 
 - the modules are the build's **link units** (each library and executable), found by running the target's own build;
 - a library with several entry families gets one harness per family, as a **sub-module** of its unit;
-- a unit whose API reaches more than 400 functions or 15,000 lines is **split** into clusters around its entry points (`scripts/unit_split.py`), each with its own harness and Eva run.
+- a unit whose API reaches more than 400 functions or 15,000 lines is **split** into clusters around its entry points (`scripts/unit_split.py`), each with its own harness and Eva run. Clusters merge only while they stay within those limits. With the Phase 0 model's address-flow facts, an indirect call follows only the candidates whose address the reached code takes or reads from a global's initializer. Each such cluster then builds from its own files (`build_sources`), and link repair stubs what those files name outside them ([`../plans/unit-split-address-flow.md`](../plans/unit-split-address-flow.md)).
 
 ---
 

@@ -983,7 +983,10 @@ class ModelBuilder:
         """
         The address-flow facts (dump schema 6) as ids: a function's address its parse defines, a
         global its parse defines, else the one non-static global of that name another parse defines
-        (an `extern` the parse only declares). Libc functions and globals are not the project's.
+        (an `extern` the parse only declares). Libc functions and globals are not the project's. A
+        declared global that several parses define (non-static) cannot be resolved: its name goes to
+        `unresolved_global_refs`, and the DAG gives no address-flow facts to the code that reads it
+        (build_callgraph_dag.model_view), so its unit's split keeps the call graph's reach.
         """
         by_name: dict[str, list[str]] = defaultdict(list)
         for global_id, g in self.global_vars.items():
@@ -992,14 +995,20 @@ class ModelBuilder:
         for rec, fnames, gnames, kmap, gmap, fkey, gkey in self.pending_refs:
             fids = {kmap[k] for k in fnames if k in kmap}
             gids: set[str] = set()
+            unresolved: set[str] = set()
             for k in gnames:
                 found = gmap.get(k)
-                if found is None and len(by_name.get(k, [])) == 1:
-                    found = by_name[k][0]
+                cands = by_name.get(k, [])
+                if found is None and len(cands) == 1:
+                    found = cands[0]
                 if found is not None:
                     gids.add(found)
+                elif len(cands) > 1:
+                    unresolved.add(k)
             rec[fkey] = sorted(set(rec.get(fkey) or []) | fids)
             rec[gkey] = sorted(set(rec.get(gkey) or []) | gids)
+            if unresolved:
+                rec["unresolved_global_refs"] = sorted(set(rec.get("unresolved_global_refs") or []) | unresolved)
         self.pending_refs = []
 
     def resolve(self) -> None:

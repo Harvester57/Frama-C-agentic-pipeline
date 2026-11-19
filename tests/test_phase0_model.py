@@ -132,6 +132,28 @@ def test_dump_schema_6_address_flow_becomes_ids_resolved_across_parses():
 
 
 @pytest.mark.unit
+def test_a_declared_global_two_programs_define_is_recorded_unresolved():
+    """A library names `shared`, which each program linking it defines: the reach cannot know which."""
+    units = {
+        **LIB_EXE,
+        "kvtool": {"kind": "executable", "files": ["tools/tool.c"], "links": ["libkv.a"]},
+    }
+    b = _builder(units)
+    reg = _fn("register", "register", "src/lexer.c", 1)
+    reg.update(address_refs=[], global_refs=["shared"])
+    b.add_dump(["libkv.a"], {"schema": 6, "functions": [reg], "globals": []})
+    for unit, file in (("kvfmt", "tools/main.c"), ("kvtool", "tools/tool.c")):
+        main = _fn("main", "main", file, 1)
+        main.update(address_refs=[], global_refs=[])
+        shared = {"name": "shared", "kernel_name": "shared", "loc": f"{file}:9", "static": False, "type": "int",
+                  "init_functions": [], "init_globals": []}  # fmt: skip
+        b.add_dump([unit], {"schema": 6, "functions": [main], "globals": [shared]})
+    b.resolve()
+    rec = b.functions["src/lexer.c#register"]
+    assert rec["global_refs"] == [] and rec["unresolved_global_refs"] == ["shared"]
+
+
+@pytest.mark.unit
 def test_a_library_call_to_a_function_its_consumer_defines_resolves_there():
     b = _builder(LIB_EXE)
     b.add_dump(["libkv.a"], {"functions": [_fn("kv_next", "kv_next", "src/lexer.c", 1, [_call("user_hook")])]})

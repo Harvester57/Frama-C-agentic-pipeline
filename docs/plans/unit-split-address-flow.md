@@ -33,10 +33,10 @@ The address-flow facts did not come from Frama-C, because run-5's model predates
 | Option | Clusters | Over a limit | Largest within limits | Unclustered | Files per build (before -> after link repair) | What a harness can no longer reach |
 | :--- | ---: | ---: | :--- | ---: | :--- | :--- |
 | A. Status quo (all edges, uncapped merge) | 2 | 1 (1650 fns, 102,784 lines) | 23 fns | 10 | 134 -> 136 (both clusters) | Nothing. The E-ACSL build of the large cluster exceeds 3600 s. |
-| B. Direct edges only (type-match edges dropped) | 15 | 1 (286 fns, 19,250 lines) | 279 fns | 858 | Lexer closures, then the whole program after link repair | 848 of the 858 unclustered functions are executable from some harness. 8 of 15 harnesses lose callees they can execute (at most 1367, median 6). Eva sees those callees without bodies. |
+| B. Direct edges only (type-match edges dropped) | 15 | 1 (286 fns, 19,250 lines) | 279 fns | 858 | Lexer closures, then the whole program after link repair | 848 of the 858 unclustered functions are in the address-flow reach of all entry points taken together (an upper bound on what the harnesses can execute). 8 of 15 harnesses lose callees in their own address-flow reach (at most 1367, median 6). Eva sees those callees without bodies. |
 | C. All edges, merges capped at the limits | 108 | 97 (about 1092 fns and 69,701 lines each) | 271 fns (median 18) | 10 | Lexer closures, then the whole program after link repair | Nothing, but 97 of the 108 clusters are still over a limit. |
 | D. Eva sharding ([`../guides/eva-sharding.md`](../guides/eva-sharding.md)) | unchanged | unchanged | - | - | unchanged | Nothing. It splits one Eva run by dispatch case, so it shortens Eva only, not the E-ACSL build, and a cluster with a single anchor has nothing to shard. |
-| **E. Address-flow reach, capped merges, narrow build sources, link stubs** | **21** | **7** (below) | **295 fns (median 91.5)** | **10** | `build_sources`: median 28.5, max 97 (131 to 134 if link repair added whole files; stubs keep it at the build files) | Nothing a generated harness can execute (section 3). Per cluster it drops 0 to 1381 signature-matched candidates whose address never reaches its code. |
+| **E. Address-flow reach, capped merges, narrow build sources, link stubs** | **21** | **7** (below) | **295 fns (median 91.5)** | **10** | `build_sources`: median 28.5 and max 97 over the 14 clusters within the limits; median 37 and max 131 over all 21. It would be 131 to 134 if link repair added whole files; the stubs keep it at the build files (not yet built, section 6). | Nothing a generated harness can execute (section 3). Per cluster it drops 0 to 1381 signature-matched candidates whose address never reaches its code. |
 
 The split itself takes 1.2 s with address-flow reach and 8.5 s with the call graph.
 
@@ -106,7 +106,13 @@ What it gives up:
 
 - **Function pointers obtained by `dlsym`, built from integers or read from input.** None of these is reachable from code the pipeline generates. Reading a pointer from input is undefined behavior that the fuzz harness never produces.
 - **A hand-written harness.** It is only covered if it follows the same rule as `api_harness`.
-- **Complete facts.** The reach is only as good as the model's facts. A unit where any function lacks them falls back to the call-graph reach (`reach: call_graph`, as before), so an old model never yields a narrower cluster.
+- **Complete facts.** The reach is only as good as the model's facts. A unit where any function lacks them falls back to the call-graph reach (`reach: call_graph`, as before), so an old model never yields a narrower cluster. The same fallback applies when a function names a global the model cannot resolve (`unresolved_global_refs`: a declared global that several parses define, non-static), or reads a global whose initializer chain names one; the DAG gives such a function no facts. A global defined only in a file no parse covers is not in the model at all, and the reach cannot see its initializer.
+
+When the reach misses something anyway, only some misses are loud:
+
+- **A missed function, in the fuzz binary:** it is a link stub, so calling it aborts with `FRAMAC_LINK_STUB_CALLED`.
+- **A missed global, in the fuzz binary:** it is defined zero-initialized in `link_globals.c`, so the miss is silent.
+- **A missed function, in Eva:** it has no body. Eva warns ("Neither code nor specification"), but no gate stops on it yet (open item 3).
 
 WP is context-free and keeps every edge. The prototype narrows none of `indirect_calls`, the candidates, the waves, or the unit and lexer `required_sources`. The new data lives only in new fields.
 
@@ -119,23 +125,23 @@ WP is context-free and keeps every edge. The prototype narrows none of `indirect
 
 By construction, a stub is never reachable. A reached function's file is compiled, and so is the file of any global the reached code reads.
 
-- **Harness sources.** `generate_harness._merge_dag_harness_sources(module_name=...)` uses the cluster's `build_sources` instead of the lexer closures. A function the harness names outside the cluster joins the reach. `_flow_harness_sources` recomputes the reach of the anchors plus those functions and takes that plan's `build_sources`.
+- **Harness sources.** For a cluster, `api_harness` passes the submodule key as `module_name` and starts from the files of the cluster's entry points; a cluster has no `modules` record, so no `required_sources` are added. `generate_harness._merge_dag_harness_sources(module_name=...)` then adds the cluster's `build_sources`, where it used to add the lexer closures (run-5's 134 sources came from those closures). A function the harness names outside the cluster joins the reach. `_flow_harness_sources` recomputes the reach of the anchors plus those functions and takes that plan's `build_sources`.
 - **Link repair.** In `fuzz_build.repair_sources_for_link`, when the harness module is an address-flow cluster, a function defined outside the cluster's files is no longer linked from its file. It is defined in the generated `<out_bin>_link_globals/link_stubs.c` (`link_stubs_source`). A global outside those files is defined zero-initialized in `link_globals.c`, as for another link unit's global. The build record lists `stubbed_functions` and `functions_file`.
 - **The stub.** Each stub is a file-scope `__asm__` symbol (x86-64, the `gcc_x86_64` machdep) that jumps to `__framac_link_stub_called(name)`, which prints `FRAMAC_LINK_STUB_CALLED: <name>` and aborts. Because the stub has no C type, no project prototype can conflict with it in Frama-C's link or in clang's. It was checked in the analysis image through `frama-c -print`, clang with ASan on the printed code, and a full `e-acsl-gcc` build. Each test program ran once without calling the stub and once calling it (`rc=134`, the marker printed).
 
-The result is that a cluster builds from its median 28.5 files instead of 136.
+The result is that a cluster within the limits builds from a median of 28.5 files (37 over all 21 clusters) instead of 136.
 
 ## 5. What Each Option Gives Up
 
 - **A:** nothing in reach. But one cluster holds the program, and its E-ACSL build does not finish in 3600 s.
-- **B:** 858 functions, nearly all executable from some harness (848), become unanalysable in any cluster, mostly the handlers that callbacks reach. 8 harnesses lose callees they can run, and Eva meets those callees without bodies.
+- **B:** 858 functions become unanalysable in any cluster. 848 of them, mostly the handlers that callbacks reach, are in the address-flow reach of the entry points taken together. 8 harnesses lose callees they can run, and Eva meets those callees without bodies.
 - **C:** nothing in reach, but 97 of the 108 clusters still exceed the limits, and every build is still the whole program.
 - **D:** nothing in reach. It shortens Eva only, and only for dispatch harnesses with several cases.
-- **E:** nothing a generated harness can execute, under the conditions of section 3.1: closed-world harnesses, complete model facts, and indirect callees matched by signature as before. Seven single-anchor clusters stay over the limits.
+- **E:** nothing a generated harness can execute, under the conditions of section 3.1: closed-world harnesses, complete model facts, and indirect callees matched by signature as before. Seven single-anchor clusters stay over the limits. If the reach is wrong anyway, a missed function aborts the fuzz binary with the marker, but a missed global goes unnoticed, and so does a body Eva lacks until open item 3 is done.
 
 ## 6. Recommendation and Open Items
 
-**Adopt E**, as prototyped on the branch. Of the four options, it is the only one that brings most of nginx within the fixed limits and removes nothing a harness can run. On a unit without indirect calls, the address-flow reach is the call graph's reach. No benchmark unit splits at the default limits, so their builds do not change.
+**Adopt E**, as prototyped on the branch. Of the five options, it is the only one that brings most of nginx within the fixed limits and removes nothing a harness can run. On a unit without indirect calls, the address-flow reach is the call graph's reach. No benchmark unit splits at the default limits, so their builds do not change.
 
 Open before merging:
 
@@ -144,4 +150,5 @@ Open before merging:
 3. **Eva gate for missing bodies.** A reached project function without a body (Eva's "Neither code nor specification") means the reach missed something. A gate on [`../../scripts/framac_common.py`](../../scripts/framac_common.py) `missing_spec_messages`, restricted to the unit's functions, would make this loud in Eva the way the stub makes it loud in the fuzz build.
 4. **The seven over-limit clusters.** These are marked `over_limit` in the DAG, and their Eva runs may reach the cap. Sharding does not apply to a single anchor. Which engine to run on them (Eva up to the cap with a partial result, or fuzzing and WP only) is a decision for the user.
 5. **Large `build_sources`.** `nginx__ngx_http_script` (97 files) and `nginx__ngx_module` (92) are within the function limit, but their builds still compile most of the program, because packing gathers 132 and 12 anchors. Whether the E-ACSL build of these fits in 3600 s has to be measured. The E-ACSL parse and pre-analysis are whole-source; only the instrumentation is limited by `-e-acsl-functions`.
-6. **No real-target run yet.** The prototype has unit tests only (`tests/test_unit_split.py`, `tests/test_link_repair_flow_stubs.py`, `tests/test_dag_model_view.py`, `tests/test_phase0_model.py`, and the selftest of `phase0_model.py` in `framac-analysis:latest`).
+6. **No cluster has been built.** The file counts after link repair hold by construction, but no address-flow cluster has gone through `repair_link_rounds` yet. A risk to check is a global with neither a declaring header nor a usable type text: it now ends `unresolved`, where the old path added its file, so such a cluster could fail to link.
+7. **No real-target run yet.** The prototype has unit tests only (`tests/test_unit_split.py`, `tests/test_link_repair_flow_stubs.py`, `tests/test_dag_model_view.py`, `tests/test_phase0_model.py`, and the selftest of `phase0_model.py` in `framac-analysis:latest`).

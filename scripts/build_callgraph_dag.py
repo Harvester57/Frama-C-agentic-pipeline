@@ -834,6 +834,23 @@ def _flow_globals(model: dict, key_of: dict[str, str]) -> dict[str, dict]:
     return out
 
 
+def _incomplete_globals(model: dict) -> set[str]:
+    """
+    The model's globals whose initializers' address flow is not fully known: one names a global the
+    model could not resolve (`unresolved_global_refs`), or a global that is itself incomplete.
+    """
+    gvars = {gid: g for gid, g in (model.get("global_variables") or {}).items() if isinstance(g, dict)}
+    out = {gid for gid, g in gvars.items() if g.get("unresolved_global_refs")}
+    changed = True
+    while changed:
+        changed = False
+        for gid, g in gvars.items():
+            if gid not in out and set(g.get("init_globals") or []) & out:
+                out.add(gid)
+                changed = True
+    return out
+
+
 def model_view(model: dict, capture: dict | None = None, root: str = "", sources: SourceLines | None = None) -> dict:
     """
     The DAG of the Phase 0 model (scripts/phase0_model.py) with path modules as its modules:
@@ -913,6 +930,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             succ[caller].add(callee)
             if e.get("kind") != "indirect" or set(e.get("sources") or []) - TYPE_MATCH_SOURCES:
                 called[caller].add(callee)
+    incomplete_globals = _incomplete_globals(model)
     site_exprs: dict[str, list[str]] = defaultdict(list)
     for site in model.get("indirect_sites") or []:
         expr = str(site.get("expr") or "")
@@ -955,8 +973,12 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
                 # No unit compiling it parses: Eva and WP cannot run on it (unit_view decides by the
                 # function's home unit instead).
                 rec["eva_wp_blocked"] = fallback_blocked_reason(errors[0])
-        if isinstance(m.get("address_refs"), list):
-            # Address flow (dump schema 6): what the unit split's reach reads.
+        if isinstance(m.get("address_refs"), list) and not (
+            m.get("unresolved_global_refs") or set(m.get("global_refs") or []) & incomplete_globals
+        ):
+            # Address flow (dump schema 6): what the unit split's reach reads. A function that names
+            # a global the model could not resolve, or one whose initializer chain does, gets none:
+            # its unit's split keeps the call graph's reach (unit_split.has_flow_facts).
             rec["indirect_callees"] = sorted(succ[key] - called[key] - {key})
             rec["address_refs"] = sorted({key_of[f] for f in m["address_refs"] if f in key_of})
             rec["global_refs"] = sorted(str(g) for g in m.get("global_refs") or [])

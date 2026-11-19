@@ -125,7 +125,7 @@ def test_an_entry_inside_an_oversized_cluster_is_not_folded_into_it():
         fns[f"h{i}"] = _fn(f"h{i}", "h.c", [])
     clusters = U.cluster(fns, sorted(fns), ["big", "small"], max_functions=5, overlap=0.5, min_functions=10)
     assert [c["anchors"] for c in clusters] == [["big"], ["small"]]
-    d = {
+    d: dict = {
         "module_kind": "link_unit",
         "functions": fns,
         "modules": {"u": {"functions": sorted(fns), "candidate_entry_points": ["big", "small"], "tier": T.TIER_1A}},
