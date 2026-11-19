@@ -74,13 +74,25 @@ def new_kinds_doc() -> dict:
             )
     # store also writes through a pointer: its plain frame obligation is another unit.
     obligations["prog.c#store"].append({"class": "l3_frame", "property": "L3_frame", "reason": "writes *p"})
-    return {"schema_version": 1, "properties": properties, "obligations": obligations, "warnings": []}
+    return {
+        "schema_version": 1,
+        "properties": properties,
+        "obligations": obligations,
+        "initializer_flags": {"known": True},
+        "warnings": [],
+    }
 
 
 def old_kinds_doc() -> dict:
     """A report without any property of the new kinds."""
     ob = {"class": "l5_sanitized", "property": NK_SANITIZED, "reason": "calls the sink"}
-    return {"schema_version": 1, "properties": [], "obligations": {"prog.c#flush": [ob]}, "warnings": []}
+    return {
+        "schema_version": 1,
+        "properties": [],
+        "obligations": {"prog.c#flush": [ob]},
+        "initializer_flags": {"known": True},
+        "warnings": [],
+    }
 
 
 def seed(run: Path, doc: dict) -> dict[str, dict]:

@@ -184,6 +184,7 @@
    "call_sites": [
     {
      "callee": "session_admin",
+     "initializer": false,
      "line": 31,
      "literals": {}
     }
@@ -385,6 +386,7 @@
    "call_sites": [
     {
      "callee": "log_line",
+     "initializer": false,
      "line": 36,
      "literals": {}
     }

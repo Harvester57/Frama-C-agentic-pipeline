@@ -135,6 +135,10 @@ WARNING_PREFIX = {
     "invariant": "invariant",
     "call_rule": "call rule",
 }
+# The contexts MetAcsl 0.12 gives no instance at a call placed in an initializer (`int n = f(x);`):
+# \calling, \writing for what the callee assigns, and \strong_invariant. \reading, \precond,
+# \postcond and the weak and conditional invariants are not concerned: they get their instance there.
+INIT_SKIPPED_CONTEXT_RE = re.compile(r"\\context\(\s*\\(?:calling|writing|strong_invariant)\b")
 
 # libc calls that write through a pointer argument: a caller writes through a pointer too.
 MEMORY_WRITERS = frozenset(
@@ -262,10 +266,13 @@ class _Model:
         self.features = model_features(model)
         self.has_writes = self.features["writes"]
         # Package E: a call site says whether it is the initializer of a local (`initializer`, dump
-        # schema 5). A model whose call sites never carry the key cannot tell.
+        # schema 5). Known only when every site says so. A model that records no call sites (a dump
+        # before schema 4) cannot tell; one that records them and has no direct call has nothing to hide.
         sites = [s for f in self.functions.values() for s in (f.get("call_sites") or []) if isinstance(s, dict)]
         self.has_call_sites = bool(sites)
-        self.has_init_flags = any("initializer" in s for s in sites)
+        self.init_flags_known = (not self.functions or self.features["call_sites"]) and all(
+            "initializer" in s for s in sites
+        )
 
     def init_sites(self, fid: str, callee: str | None = None) -> list[dict]:
         """The calls of `fid` placed in an initializer (`int n = f(x);`), of `callee` or of anything."""
@@ -620,7 +627,7 @@ class _Gen:
             for feature in ("external_calls", "formals", "writes"):
                 if not self.m.features[feature]:
                     self.warnings.append(f"the model has {MODEL_FEATURES[feature]}")
-            if block and self.m.has_call_sites and not self.m.has_init_flags:
+            if block and self.m.has_call_sites and not self.m.init_flags_known:
                 self.warnings.append(
                     "the model's call sites do not say which calls are initializers (`initializer`, dump schema 5): "
                     "MetAcsl generates no \\calling, \\writing or \\strong_invariant instance at `int n = f(x);`, "
@@ -2127,8 +2134,20 @@ def generate(
             "by_kind": dict(sorted(_count(p["kind"] for p in gen.properties).items())),
             "functions_by_class": dict(sorted(by_class.items())),
         },
+        "initializer_flags": _initializer_flags(gen),
         "warnings": gen.warnings,
     }
+
+
+def _initializer_flags(gen: _Gen) -> dict:
+    """
+    Whether the model says which calls are initializers. When it does not, the properties MetAcsl may
+    have skipped at such a call: `ledger.py` refuses them the credit of a run that left no goal.
+    """
+    if gen.m.init_flags_known:
+        return {"known": True}
+    skipped = (p["name"] for p in gen.properties if INIT_SKIPPED_CONTEXT_RE.search(p["acsl"]))
+    return {"known": False, "properties": sorted(skipped)}
 
 
 def _count(items: Any) -> dict[str, int]:

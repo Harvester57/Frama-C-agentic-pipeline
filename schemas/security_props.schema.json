@@ -238,6 +238,16 @@
       "items": {"type": "string", "enum": ["eva", "eacsl"]},
       "uniqueItems": true
     },
+    "initializer_flags": {
+      "$comment": "whether the Phase 0 model says which calls are placed in an initializer (`call_sites[].initializer`, dump schema 5). MetAcsl 0.12 generates no \\calling, \\writing (from the callee's `assigns`) or \\strong_invariant instance at such a call. `known` false: `properties` lists the properties of those contexts, and ledger.py refuses them the no-goal credit (`wp_meta_initializers_unknown`). Absent from a document older than this field: the ledger refuses that credit to every MetAcsl unit until `security_props.py run` writes it",
+      "type": "object",
+      "properties": {
+        "known": {"type": "boolean"},
+        "properties": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "required": ["known"],
+      "additionalProperties": false
+    },
     "warnings": {"type": "array", "items": {"type": "string"}}
   },
   "required": ["schema_version", "generated_at", "threat_model", "preamble", "properties", "frame", "obligations", "summary", "warnings"],

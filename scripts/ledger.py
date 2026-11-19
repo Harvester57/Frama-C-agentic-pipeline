@@ -727,15 +727,21 @@ def _meta_facts(path: Path | None = None) -> dict:
       placed  -> [line]: the in-code checks written there (`code_checks`), which a WP run of the
                  function must report as goals.
 
+    `initializers` is the document's `initializer_flags` (whether the model says which calls are
+    initializers), None when the document does not say: no such field, or no readable file.
+
     Empty without the file. Read as the generator precomputed it; nothing is derived from the model.
     """
-    out: dict[str, dict[tuple[str, str], list]] = {"gaps": {}, "placed": {}}
+    out: dict = {"gaps": {}, "placed": {}, "initializers": None}
     try:
         doc = load_json_optional(path or DEFAULT_SECURITY_PROPS, {})
     except ArtifactError:
         return out
     if not isinstance(doc, dict):
         return out
+    flags = doc.get("initializer_flags")
+    if isinstance(flags, dict) and isinstance(flags.get("known"), bool):
+        out["initializers"] = flags
 
     def fid(ref: object) -> str:
         file, _, name = str(ref or "").rpartition("#")
@@ -788,6 +794,36 @@ def _meta_unchecked(unit: dict, facts: dict | None) -> list[str]:
     return [f"{n}: {why}" for n in sorted(names) for why in facts["gaps"].get((fid, str(n))) or []]
 
 
+def _meta_initializers_unknown(unit: dict, facts: dict | None) -> str | None:
+    """
+    Why the unit's properties may have an unchecked call placed in an initializer, or None. MetAcsl
+    gives such a call no \\calling, \\writing (from the callee's `assigns`) or \\strong_invariant
+    instance, so "no goal left" proves nothing when the model cannot say where those calls are. This
+    bars the no-goal credit only: a goal WP proved, or an Eva check, is a check that did run.
+
+    A document without `initializer_flags` was written before the field: it may come from a model
+    with or without flags, so it is refused too, and re-running `security_props.py run` settles it.
+    """
+    if facts is None:
+        return None
+    flags = facts["initializers"]
+    if flags is None:
+        return (
+            "security_props.json has no `initializer_flags` (older than that field), so a call placed in an "
+            "initializer may be unchecked: re-run `security_props.py run`"
+        )
+    if flags["known"]:
+        return None
+    skipped = {str(n) for n in flags.get("properties") or []}
+    names = sorted(str(n) for n in (unit.get("bookkeeping") or {}).get("security_properties") or [] if str(n) in skipped)
+    if not names:
+        return None
+    return (
+        f"the model does not say which calls are initializers, where MetAcsl generates no instance of {', '.join(names)}: "
+        "rebuild the model (dump schema 5) and re-run `security_props.py run`"
+    )
+
+
 def _meta_no_goal_bar(unit: dict, facts: dict | None) -> tuple[str, str] | None:
     """(evidence result, why) of _meta_no_goal_credit_barred."""
     verdicts = (unit.get("bookkeeping") or {}).get("eva_verdicts") or {}
@@ -813,6 +849,9 @@ def _meta_no_goal_bar(unit: dict, facts: dict | None) -> tuple[str, str] | None:
             f"the in-code check(s) written into the function ({where}) are not among this run's goals "
             "(a work tree without them, or rows the runner could not name)",
         )
+    unknown = _meta_initializers_unknown(unit, facts)
+    if unknown:
+        return "wp_meta_initializers_unknown", unknown
     return None
 
 
@@ -831,9 +870,11 @@ def _meta_no_goal_credit_barred(unit: dict, facts: dict | None = None) -> str | 
         initializer check listed under `init_checks` that `code_checks` does not hold. `ingest-wp`
         refuses every credit to such a unit (wp_meta_unchecked), not only this one;
       - an in-code check was written into the function (`code_checks`) and the run has no goal of
-        the class: the run did not see it.
+        the class: the run did not see it;
+      - the model does not say which calls are initializers (_meta_initializers_unknown) and a property
+        of the unit has a context MetAcsl skips at such a call.
 
-    A goal WP proves is not concerned by the first and the last: it credits the unit whatever Eva left open.
+    A goal WP proves is concerned by none but the second: it credits the unit whatever Eva left open.
     """
     found = _meta_no_goal_bar(unit, facts)
     return found[1] if found else None
@@ -1794,6 +1835,58 @@ def _wp_discharged(unit: dict) -> bool:
     )
 
 
+# What the summary of the no-goal credit says. cmd_mark_carried renames a carried credit's result and
+# keeps this text.
+_NO_GOAL_CREDIT_TEXT = "decided every instance in this function statically"
+
+
+def _is_no_goal_credit(evidence: dict) -> bool:
+    """The evidence of `wp_meta_simplified`, also under the name a proof carried forward gets."""
+    result = evidence.get("result")
+    if result == "carried_forward_reproven":
+        return _NO_GOAL_CREDIT_TEXT in str(evidence.get("summary") or "")
+    return result == "wp_meta_simplified"
+
+
+def _wp_cover_is_no_goal(unit: dict) -> bool:
+    """Whether the unit's latest WP credit is the no-goal credit: no proven goal stands behind its cover."""
+    credits = [
+        e
+        for e in unit.get("evidence") or []
+        if isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging")
+    ]
+    return bool(credits) and _is_no_goal_credit(credits[-1])
+
+
+def _withdraw_no_goal_credit(unit: dict, blocking: list[str]) -> bool:
+    """
+    An Eva module left a check of the unit open, so an instance exists that the no-goal credit said did
+    not: the credit stops discharging (a rejected candidate must not fall back on it) and a cover
+    resting on it goes back to planned, as a unit Eva left open before WP ran stays. True when a cover
+    was withdrawn.
+    """
+    for e in unit["evidence"]:
+        if isinstance(e, dict) and e.get("phase") == "wp" and _is_no_goal_credit(e):
+            e["discharging"] = False
+    reopened = unit["status"] == "covered"
+    if reopened:
+        unit["status"] = "planned"
+        unit["agent_id"] = None
+        unit["unresolved"] = []
+    add_evidence(
+        unit,
+        "eva",
+        "run_eva_slice.py",
+        "eva_no_goal_credit_withdrawn",
+        False,
+        (unit["evidence"][-1] or {}).get("tool_output") if unit["evidence"] else None,
+        "MetAcsl left WP no goal here, but Eva leaves a check of this unit's properties open in module(s) "
+        + ", ".join(f"'{m}'" for m in blocking)
+        + ": the no-goal credit (`wp_meta_simplified`) is withdrawn.",
+    )
+    return reopened
+
+
 _KERNEL_RENAME_RE = KERNEL_RENAME_RE
 
 
@@ -2073,6 +2166,27 @@ def _open_code_checks(
         if any(str(c.get("property")) in names for c in lines.get(_code_key(row)) or []):
             out.append(verdict)
     return out
+
+
+def _file_open_code_checks_of_no_goal_covers(
+    units: dict[str, dict],
+    code_rows: list[tuple[str, dict]],
+    lines: dict[tuple[str, int], list[dict]],
+    module: str,
+    touched: set[str],
+) -> None:
+    """
+    An in-code check Eva left Unknown or Invalid in a unit covered by the no-goal credit is the module's
+    verdict on that unit, also when the report has no MetAcsl instance of its properties there (a
+    check placed after the credit, an Eva run that did not load the properties).
+    """
+    for u in units.values() if code_rows else ():
+        if u["obligation_class"] not in METACSL_CLASSES or u["status"] != "covered" or not _wp_cover_is_no_goal(u):
+            continue
+        found = _open_code_checks(u, code_rows, lines)
+        if "invalid" in found or "unknown" in found:
+            _unit_eva_verdicts(u).setdefault(module, "invalid" if "invalid" in found else "unknown")
+            touched.add(u["coverage_id"])
 
 
 def _taint_open(unit: dict) -> list[str]:
@@ -2453,6 +2567,7 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
             if meta_units:
                 stats["meta_units"] = stats.get("meta_units", 0) + meta_units
             stats["candidates"] += meta_candidates
+        _file_open_code_checks_of_no_goal_covers(units, code_rows, code_lines, module, touched)
 
         def by_function(rows: object, reported: str | None = None) -> dict[str, list]:
             out: dict[str, list] = {}
@@ -2713,7 +2828,12 @@ def cmd_ingest_eva(paths: list[Path]) -> dict:
                 and str(a.get("description") or "").startswith(_EVA_ASSUMPTION_PREFIXES)
             )
         ]
-        if u["status"] == "covered" and not _wp_discharged(u):
+        if blocking and u["status"] in ("covered", "candidate") and _wp_cover_is_no_goal(u):
+            # WP gave the no-goal credit before this report opened a check of the unit. An Invalid
+            # check has already made the unit a candidate: only the credit is left to take away.
+            if _withdraw_no_goal_credit(u, blocking):
+                stats["reopened"] = stats.get("reopened", 0) + 1
+        elif u["status"] == "covered" and not _wp_discharged(u):
             # Covered by Eva alone, and a module's report no longer establishes it (a repaired harness
             # reaching new contexts, or another module's harness leaving obligations open): open again.
             u["status"] = "planned"
