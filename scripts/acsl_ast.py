@@ -680,11 +680,42 @@ def _next_meaningful(tokens: list[Token], idx: int, include_acsl: bool = False) 
     return idx
 
 
+_DECL_SUFFIX_KWS = frozenset({"__attribute__", "__attribute", "__asm__", "__asm", "asm"})
+
+
+def _skip_paren_group(tokens: list[Token], idx: int) -> int:
+    """The index after the parenthesized group opening at tokens[idx] (len(tokens) when it never closes)."""
+    depth = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok.kind == "c_token" and tok.text == "(":
+            depth += 1
+        elif tok.kind == "c_token" and tok.text == ")":
+            depth -= 1
+            if depth == 0:
+                return idx + 1
+        idx += 1
+    return idx
+
+
 def _next_after_params(tokens: list[Token], idx: int) -> int:
-    """The next meaningful token after a parameter list; a conditional may stand between it and the body."""
+    """
+    The next meaningful token after a parameter list; a conditional may stand between it and the body,
+    and so may GCC attributes and an asm label (`... ) __attribute__((__leaf__));`, as Frama-C prints
+    a glibc prototype and scripts/stub_gen.py copies it into a stub).
+    """
     idx = _next_meaningful(tokens, idx)
-    while idx < len(tokens) and tokens[idx].kind == "pp_directive":
-        idx = _next_meaningful(tokens, idx + 1)
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok.kind == "pp_directive":
+            idx = _next_meaningful(tokens, idx + 1)
+            continue
+        if tok.kind == "c_token" and tok.text in _DECL_SUFFIX_KWS:
+            paren = _next_meaningful(tokens, idx + 1)
+            if paren < len(tokens) and tokens[paren].kind == "c_token" and tokens[paren].text == "(":
+                idx = _next_meaningful(tokens, _skip_paren_group(tokens, paren))
+                continue
+        break
     return idx
 
 

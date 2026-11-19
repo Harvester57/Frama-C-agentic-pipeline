@@ -90,8 +90,15 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from acsl_ast import (  # noqa: E402
+    AcslError,
+    declaration_contract_text,
+    function_declaration_spans,
+    tokenize_c_acsl,
+)
+from framac_common import STUB_OVERLAY_REL, atomic_write_json, load_json_optional, utc_now  # noqa: E402
 from phase0_model import MODEL_FEATURES, model_features  # noqa: E402
+from stub_gen import block_state, split_blocks  # noqa: E402
 
 SCHEMA_VERSION = 1
 DEFAULT_MODEL = Path("workspace/reports/phase0_model.json")
@@ -575,7 +582,15 @@ def contract_assigns(text: str, line: int, name: str) -> dict:
     found = re.search(r"/\*@((?:(?!\*/).)*)\*/[\s\w*]*$", head, re.DOTALL)
     if not found:
         return {"status": "none", "terms": []}
-    clauses = re.findall(r"\bassigns\b([^;]*);", found.group(1))
+    return assigns_of_contract(found.group(1))
+
+
+def assigns_of_contract(contract: str) -> dict:
+    """
+    {status, terms} of the `assigns` clauses of a contract's text (what `contract_assigns` reads once
+    it found the contract): `listed`, `set` or `none`, as there.
+    """
+    clauses = re.findall(r"\bassigns\b([^;]*);", contract)
     if not clauses:
         return {"status": "none", "terms": []}
     terms: list[str] = []
@@ -599,15 +614,107 @@ def contract_assigns(text: str, line: int, name: str) -> dict:
     return {"status": "set" if is_set else "listed", "terms": terms}
 
 
-class _Contracts:
-    """What each declared (external) function assigns, read at its first declaration (`external_decls`)."""
+def _acsl_contracts(text: str, path: str) -> list[tuple[int, str]]:
+    """(line, inner text) of every ACSL annotation of `text` (no doxygen comment), from the tokenizer."""
+    try:
+        tokens = tokenize_c_acsl(text, path=path)
+    except AcslError:
+        return [(text.count("\n", 0, m.start()) + 1, m.group(1)) for m in re.finditer(r"/\*@(.*?)\*/", text, re.DOTALL)]
+    return [
+        (t.line, t.text[3:-2] if t.kind == "acsl_block" else t.text[3:])
+        for t in tokens
+        if t.kind in ("acsl_block", "acsl_line") and t.text[3:4] not in ("{", "}", "*")
+    ]
 
-    def __init__(self, model: dict, roots: Iterable[Path] | None):
+
+def _declared_contract(text: str, name: str, path: str) -> tuple[int, str] | None:
+    """
+    (line, contract text) of `name`'s declarations in a header `text` that carry ACSL, or None: the
+    tokenizer finds the declaration, so an `__attribute__((...))` before the name or the name quoted in
+    a comment above the contract do not mislead it, and a block under `#if 0` is not one.
+    """
+    try:
+        found = [
+            (d.span.end_line, declaration_contract_text(d, path=path))
+            for d in function_declaration_spans(text, name, path=path)
+        ]
+    except AcslError:
+        return None
+    found = [(line, contract) for line, contract in found if contract]
+    if not found:
+        return None
+    # Frama-C merges the contracts of every declaration of a header function.
+    return found[0][0], "\n".join(contract for _, contract in found)
+
+
+class _Overlay:
+    """
+    The run's stub overlay (workspace/stubs/, scripts/stub_gen.py): the contract each declared function
+    gets there. Frama-C finds an overlay header before the real one, so a filled stub is the contract
+    MetAcsl takes the callee's writes from. A block still under `#ifdef FC_STUB_DRAFT` is no contract
+    (the guard keeps it out of every analysis). The header text decides, not workspace/reports/stubs.json,
+    which may be older than the last edit of a stub author.
+    """
+
+    def __init__(self, root: Path | None):
+        self.root = root if root is not None and root.is_dir() else None
+        # name -> (overlay header, line, contract text) of the blocks with markers; the headers without.
+        self.blocks: dict[str, tuple[str, int, str]] = {}
+        self.manual: list[tuple[str, str]] = []
+        self.drafts: set[str] = set()
+        if self.root is None:
+            return
+        for path in sorted(p for p in self.root.rglob("*.h") if p.is_file()):
+            rel = f"{STUB_OVERLAY_REL}/{path.relative_to(self.root).as_posix()}"
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            blocks = split_blocks(text)
+            if not blocks:
+                self.manual.append((rel, text))
+                continue
+            for fn, block in blocks.items():
+                if fn in self.blocks:
+                    continue
+                if block_state(block) == "draft":
+                    self.drafts.add(fn)
+                    continue
+                base = text.count("\n", 0, text.find(block)) if block in text else 0
+                got = _declared_contract(block, fn, rel)
+                if got is not None:
+                    self.blocks[fn] = (rel, base + got[0], got[1])
+                else:
+                    # The declaration was not found (a macro-built prototype): the block's annotations.
+                    self.blocks[fn] = (rel, base + 1, "\n".join(c for _, c in _acsl_contracts(block, rel)))
+
+    def of(self, name: str) -> dict | None:
+        """{status, terms, stub} of `name`'s overlay contract, or None when the overlay has no active one."""
+        if name in self.blocks:
+            rel, line, contract = self.blocks[name]
+            return {**assigns_of_contract(contract), "stub": f"{rel}:{line}"}
+        for rel, text in self.manual:
+            if not re.search(rf"\b{re.escape(name)}\s*\(", text):
+                continue
+            got = _declared_contract(text, name, rel)
+            if got is not None:
+                return {**assigns_of_contract(got[1]), "stub": f"{rel}:{got[0]}"}
+        return None
+
+
+class _Contracts:
+    """
+    What each declared (external) function assigns: read in the run's stub overlay when it gives the
+    function a contract (the one Frama-C and MetAcsl use), else at its first declaration (`external_decls`).
+    """
+
+    def __init__(self, model: dict, roots: Iterable[Path] | None, overlay: Path | None = None):
         self.decls: dict[str, dict] = model.get("external_decls") or {}
         self.tree = str(model.get("tree") or "").rstrip("/")
         self.roots = [Path(r) for r in roots or []]
         self.files: dict[str, str | None] = {}
         self.cache: dict[str, dict] = {}
+        self.overlay = _Overlay(overlay)
 
     def _read(self, file: str) -> str | None:
         if file not in self.files:
@@ -632,9 +739,16 @@ class _Contracts:
         return self.files[file]
 
     def of(self, name: str) -> dict:
-        """{status: listed | set | none | unknown, terms, decl} for the declared function `name`."""
+        """
+        {status: listed | set | none | unknown, terms, decl[, stub]} for the declared function `name`:
+        `stub` (overlay header:line) when the contract was read in the run's stub overlay.
+        """
         if name not in self.cache:
             decl = str((self.decls.get(name) or {}).get("decl") or "")
+            stub = self.overlay.of(name)
+            if stub is not None:
+                self.cache[name] = {**stub, "decl": decl}
+                return self.cache[name]
             file, _, line = decl.rpartition(":")
             text = self._read(file) if file and line.isdigit() else None
             res = contract_assigns(text, int(line), name) if text is not None else {"status": "unknown", "terms": []}
@@ -650,8 +764,9 @@ class _Gen:
         templates: _Templates,
         keep_at_callers: dict[str, str] | None = None,
         roots: Iterable[Path] | None = None,
+        overlay: Path | None = None,
     ):
-        self.contracts = _Contracts(model, roots)
+        self.contracts = _Contracts(model, roots, overlay)
         self.m = _Model(model)
         self.block = block or {}
         self.t = templates
@@ -805,6 +920,7 @@ class _Gen:
         declared = {
             k: [
                 {"callee": c, "callers": callers, **({"decl": d} if (d := self.contracts.of(c)["decl"]) else {})}
+                | ({"stub": s} if (s := self.contracts.of(c).get("stub")) else {})
                 | ({"assigns": self.contracts.of(c)["terms"]} if k == "set_assigns" else {})
                 for c, callers in sorted(v.items())
             ]
@@ -816,16 +932,25 @@ class _Gen:
             names = sorted(names)
             return ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
 
+        def stubbed(names: Iterable[str]) -> str:
+            """` (<names> in the stub overlay)` for those whose contract was read in workspace/stubs/."""
+            mine = sorted(n for n in names if self.contracts.of(n).get("stub"))
+            return f" (contract read in their stub in {STUB_OVERLAY_REL}/: {some(mine)})" if mine else ""
+
         if lists["set_assigns"]:
             self.warnings.append(
                 f"{what}: {some(lists['set_assigns'])} assign(s) a set (`assigns \\union(...)` or `{{a, b}}`), which "
                 f"stops MetAcsl: the caller(s) {some({self.m.name(u['function']) for u in unchecked})} are left "
                 "out of the property and not checked. Write one `assigns` term per location in that contract"
+                f"{stubbed(lists['set_assigns'])}"
             )
         if lists["no_assigns"]:
             self.warnings.append(
                 f"{what}: the declared function(s) {some(lists['no_assigns'])} have no `assigns` at their "
                 "declaration: MetAcsl generates nothing for what they write, so the property says nothing about it"
+                f"{stubbed(lists['no_assigns'])}. Give each a contract with `assigns` in {STUB_OVERLAY_REL}/ "
+                "(stub_gen.py; a draft under #ifdef FC_STUB_DRAFT counts for nothing), then re-run "
+                "security_props.py run"
             )
         return {
             "excluded": {u["function"] for u in unchecked},
@@ -2365,17 +2490,19 @@ def generate(
     templates: _Templates | None = None,
     keep_at_callers: dict[str, str] | None = None,
     roots: Iterable[Path] | None = None,
+    overlay: Path | None = None,
 ) -> dict:
     """
     The security properties of a model under a threat model (trust.load_threat_model's result).
     `keep_at_callers` names wrapper sinks whose `checked_at` is not applied, with why (`run`: the work
     tree has no place for the check). `roots`: where the target's files are (the work tree, the model's
     tree), to read what the declared functions assign at their declarations; without them those
-    contracts are `unknown`.
+    contracts are `unknown`. `overlay`: the run's stub overlay (workspace/stubs/), whose contracts
+    replace the declarations' for the functions it stubs.
     """
     threat = threat or {"status": "no_threat_model"}
     block = threat.get("block") if threat.get("status") == "ok" else None
-    gen = _Gen(model, block, templates or _Templates(), keep_at_callers, roots)
+    gen = _Gen(model, block, templates or _Templates(), keep_at_callers, roots, overlay)
     frame = gen.frame()
     if block:
         gen.assets()
@@ -3463,7 +3590,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # The declarations of the functions the target only declares are read from the work tree, else
     # from the tree the model was built on (their `assigns` decides what a \writing property sees).
     roots = [args.work] + ([Path(str(model["tree"]))] if model.get("tree") else [])
-    doc = generate(model, threat, roots=roots)
+    # The run's stub overlay, which Frama-C and MetAcsl find before the real headers: a filled stub's
+    # `assigns` is the contract of its function (the model's declarations predate the overlay).
+    overlay = args.run_dir / STUB_OVERLAY_REL
+    doc = generate(model, threat, roots=roots, overlay=overlay)
     if note:
         doc["warnings"].insert(0, note)
     # Plan step M3, opt in: Eva taint annotations in the work tree. The choice is sticky (the Makefile's
@@ -3479,7 +3609,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # generated at its callers again (the warning says why), and the work tree follows.
         detail = "".join(f"; {s}" for s in applied["skipped"][:2])
         keep = {sink: why + detail for sink, why in kept.items()}
-        doc = generate(model, threat, keep_at_callers=keep, roots=roots)
+        doc = generate(model, threat, keep_at_callers=keep, roots=roots, overlay=overlay)
         if note:
             doc["warnings"].insert(0, note)
         applied = apply_taint(doc, args.work, taint=enabled)

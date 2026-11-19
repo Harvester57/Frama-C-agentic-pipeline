@@ -2659,6 +2659,198 @@ def test_a_set_valued_assigns_takes_its_callers_out_of_a_writing_property(tmp_pa
     assert "\\targets(\\diff(\\ALL, {login}))" in blind["acsl"] and blind["instances"] == []
 
 
+# The real header the Phase 0 model points at: declarations without ACSL (glibc, zlib, libxcrypt).
+_HOST_HEADER = """/* host header: no contract */
+extern char *crypt_r(const char *phrase, const char *setting, struct crypt_data *data);
+extern int eventfd(unsigned int count, int flags);
+extern int deflate(z_streamp strm, int flush);
+extern int deflateEnd(z_streamp strm);
+extern void pair_set(int *a, int *b);
+extern int accept4(int fd, void *addr, void *len, int flags);
+extern int hand(int *out);
+"""
+
+# The run's stub overlay, in the shapes scripts/stub_gen.py writes and stub authors fill (nginx run-5):
+# an attribute before the name, the name quoted with `()` in the comment above the contract, a
+# multi-line `assigns ... \\from indirect:...`, a range term, a set-valued stub and a draft block.
+_STUB_CRYPT = """/* Stub overlay for <crypt.h> */
+#pragma once
+#include_next <crypt.h>
+#include <errno.h>
+
+/* fc-stub: crypt_r */
+/* man 3 crypt_r: crypt_r() returns a pointer within data->output. */
+/*@
+  requires valid_data: \\valid(__data);
+  assigns *__data \\from indirect:__data, indirect:__phrase,
+                        __phrase[0 ..], *__data;
+  assigns errno \\from indirect:__phrase;
+  assigns \\result \\from __data;
+*/
+extern  __attribute__((__nothrow__)) char *crypt_r(char const *__phrase, char const *__setting, struct crypt_data * restrict __data) __attribute__(( __leaf__));
+"""
+
+_STUB_ZLIB = """/* Stub overlay for <zlib.h> */
+#pragma once
+#include_next <zlib.h>
+#include <errno.h>
+
+/* fc-stub: deflate */
+/* deflate() returns Z_OK if some progress has been made; deflate(strm) updates next_in. */
+/*@
+  requires valid_strm: \\valid(strm);
+  assigns *strm, \\result
+    \\from indirect:strm, *strm, flush;
+  assigns strm->next_out[0 .. strm->avail_out - 1]
+    \\from indirect:strm, *strm;
+*/
+extern int deflate(z_streamp strm, int flush);
+
+/* fc-stub: deflateEnd */
+/* TODO(stub-author): write deflateEnd's contract, then delete this line, the #ifdef FC_STUB_DRAFT line and its #endif. */
+#ifdef FC_STUB_DRAFT
+/*@
+  assigns *strm \\from *strm;
+*/
+extern int deflateEnd(z_streamp strm);
+#endif
+
+/* fc-stub: pair_set */
+/*@ assigns \\union(*a, *b) \\from \\nothing; */
+extern void pair_set(int *a, int *b);
+"""
+
+_STUB_EVENTFD = """/* Stub overlay for <sys/eventfd.h> */
+#pragma once
+#include_next <sys/eventfd.h>
+#include <errno.h>
+
+/* fc-stub: eventfd */
+/*@
+  assigns errno \\from indirect:count, indirect:flags;
+  assigns \\result \\from indirect:count, indirect:flags;
+*/
+extern int eventfd(unsigned int count, int flags);
+"""
+
+# A stub written by hand, without the fc-stub markers (stub_gen.py records it as `manual`).
+_STUB_MANUAL = """#pragma once
+/*@ assigns *out \\from \\nothing; */
+extern int hand(int *out);
+"""
+
+
+def _overlay_run(run_dir: Path) -> dict:
+    """A run directory whose model points at host declarations without ACSL, and whose overlay stubs them."""
+    work = run_dir / "workspace" / "work"
+    work.mkdir(parents=True)
+    (work / "host.h").write_text(_HOST_HEADER, encoding="utf-8", newline="\n")
+    stubs = run_dir / "workspace" / "stubs"
+    for rel, text in {
+        "crypt.h": _STUB_CRYPT,
+        "zlib.h": _STUB_ZLIB,
+        "sys/eventfd.h": _STUB_EVENTFD,
+        "manual.h": _STUB_MANUAL,
+    }.items():
+        (stubs / rel).parent.mkdir(parents=True, exist_ok=True)
+        (stubs / rel).write_text(text, encoding="utf-8", newline="\n")
+    lines = _HOST_HEADER.splitlines()
+
+    def decl(name: str) -> dict:
+        line = next(i for i, text in enumerate(lines, 1) if f" {name}(" in text or f"*{name}(" in text)
+        return {"decl": f"/framac-scratch/tree/host.h:{line}", "proto": f"int {name}();"}
+
+    calls = {
+        "uses_crypt": "crypt_r",
+        "uses_eventfd": "eventfd",
+        "uses_deflate": "deflate",
+        "uses_end": "deflateEnd",
+        "uses_set": "pair_set",
+        "uses_accept": "accept4",
+        "uses_hand": "hand",
+    }
+    functions = {
+        "a.c#login": fn("login", writes={"pointer": 0, "params": [], "globals": ["auth_ok"]}),
+        "a.c#admin": fn("admin"),
+        **{f"a.c#{caller}": fn(caller, external_calls=[callee]) for caller, callee in calls.items()},
+    }
+    m = model(
+        functions,
+        tree="/framac-scratch/tree",
+        external_decls={callee: decl(callee) for callee in calls.values()},
+        global_variables={"auth_ok": {"name": "auth_ok", "file": "a.c", "type": "int"}},
+    )
+    # A model with trust: `run` takes the threat model trust recorded (patched by the test).
+    m["trust"] = {}
+    return m
+
+
+@pytest.mark.unit
+def test_a_stub_overlay_contract_replaces_the_bare_declaration(run_dir, monkeypatch):
+    """
+    nginx run-5: the Phase 0 model points the declared functions at the real headers (no ACSL), and
+    the stub authors filled their contracts in workspace/stubs/ afterwards. `security_props.py run`
+    must read those stubs, as Frama-C and MetAcsl do: a filled stub's `assigns` makes its callers
+    instances of a \\writing property, a set-valued stub takes them out, and a draft (under
+    #ifdef FC_STUB_DRAFT) or a missing stub leaves the function in `no_assigns`.
+    """
+    m = _overlay_run(run_dir)
+    write_json(run_dir / "workspace/reports/phase0_model.json", m)
+    gate = {"function": "login", "state": "auth_ok", "protects": ["admin"], "description": "d"}
+    monkeypatch.setattr(trust, "recorded_threat_model", lambda _m: (threat(auth_gates=[gate]), None))
+    assert sp.main(["run"]) == 0
+    doc = json.loads((run_dir / "workspace/reports/security_props.json").read_text(encoding="utf-8"))
+    assert not sp.validate(doc), sp.validate(doc)
+    prop = by_name(doc)["L4_auth_state_login"]
+    declared = prop["declared_callees"]
+    # Only the draft and the unstubbed function stay without `assigns`.
+    assert [c["callee"] for c in declared["no_assigns"]] == ["accept4", "deflateEnd"], declared
+    # The callers of a filled stub (and of a hand-written one) are instances of the property.
+    for caller in ("uses_crypt", "uses_eventfd", "uses_deflate", "uses_hand"):
+        assert f"a.c#{caller}" in prop["instances"], (caller, prop["instances"])
+    assert not {"a.c#uses_end", "a.c#uses_accept", "a.c#uses_set"} & set(prop["instances"])
+    # A set-valued stub stops MetAcsl: its caller leaves the targets, and the entry names the stub.
+    assert [(c["callee"], c["stub"]) for c in declared["set_assigns"]] == [("pair_set", "workspace/stubs/zlib.h:28")]
+    assert declared["set_assigns"][0]["assigns"] == ["\\union(*a, *b)"]
+    assert [u["function"] for u in prop["unchecked"]] == ["a.c#uses_set"]
+    assert "\\targets(\\diff(\\ALL, {login, uses_set}))" in prop["acsl"], prop["acsl"]
+    # The draft's entry keeps the model's declaration and names no stub; the warning says where to fill it.
+    end = next(c for c in declared["no_assigns"] if c["callee"] == "deflateEnd")
+    assert end["decl"] == "/framac-scratch/tree/host.h:5" and "stub" not in end
+    warning = next(w for w in doc["warnings"] if "(L4_auth_state_login): the declared function(s)" in w)
+    assert "accept4, deflateEnd have no `assigns`" in warning and "workspace/stubs/" in warning
+
+
+@pytest.mark.unit
+def test_overlay_contracts_by_name_and_without_an_overlay(tmp_path):
+    """The overlay reader alone: each stub's status and terms, and nothing changes when there is no overlay."""
+    m = _overlay_run(tmp_path)
+    contracts = sp._Contracts(m, [tmp_path / "workspace" / "work"], tmp_path / "workspace" / "stubs")
+    assert contracts.of("crypt_r") | {"decl": ""} == {
+        "status": "listed",
+        "terms": ["*__data", "errno"],
+        "stub": "workspace/stubs/crypt.h:15",
+        "decl": "",
+    }
+    assert contracts.of("deflate")["terms"] == ["*strm", "strm->next_out[0 .. strm->avail_out - 1]"]
+    assert contracts.of("eventfd")["terms"] == ["errno"]
+    assert contracts.of("eventfd")["stub"] == "workspace/stubs/sys/eventfd.h:11"
+    assert contracts.of("hand") | {"decl": ""} == {
+        "status": "listed",
+        "terms": ["*out"],
+        "stub": "workspace/stubs/manual.h:3",
+        "decl": "",
+    }
+    assert contracts.of("pair_set")["status"] == "set"
+    # The draft and the unstubbed function: the declaration's (bare) contract.
+    for name in ("deflateEnd", "accept4"):
+        assert contracts.of(name)["status"] == "none" and "stub" not in contracts.of(name)
+    # No overlay (or a missing directory): every contract is read at its declaration, as before.
+    for overlay in (None, tmp_path / "nowhere"):
+        bare = sp._Contracts(m, [tmp_path / "workspace" / "work"], overlay)
+        assert {bare.of(n)["status"] for n in ("crypt_r", "deflate", "pair_set", "hand")} == {"none"}
+
+
 # ---------------------------------------------------------------------------------------------------
 # Acceptance (Docker): the new kinds and the initializer checks against the real MetAcsl and WP
 # ---------------------------------------------------------------------------------------------------
