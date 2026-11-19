@@ -61,7 +61,7 @@ ALL_PROPERTY_NAMES = [row[0] for row in FIXTURE_PROPERTIES]
 
 def fixture_props(engines: list[str] | None = None, file: str = "src/prog.c") -> dict:
     """A schema-valid security_props.json for the fixture; `engines` is its `meta_engines` (None: no key)."""
-    properties = [
+    properties: list[dict] = [
         {
             "name": name,
             "layer": layer,
@@ -222,7 +222,9 @@ def test_meta_stage_flags_moves_the_rte_flags_behind_the_metacsl_stage():
 
 @pytest.mark.unit
 def test_the_eacsl_meta_file_drops_the_libc_include_and_keeps_every_line():
-    text, names, _ = sp.module_meta_file_text(fixture_props())
+    found = sp.module_meta_file_text(fixture_props())
+    assert found is not None
+    text, names, _ = found
     assert text.split("\n")[0] == sp.META_INCLUDE
     eacsl_text = eacsl_toolchain.eacsl_meta_file_text(text, sp.META_INCLUDE)
     assert eacsl_text.split("\n")[0] == eacsl_toolchain.EACSL_META_INCLUDE_NOTE
@@ -293,18 +295,21 @@ def test_the_file_is_the_option_then_the_environment_then_the_run_default(run_di
 
     write_props(DEFAULT_PROPS, fixture_props(["eacsl"]))
     by_default = fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN)
+    assert by_default is not None
     assert by_default["status"] == "loaded" and Path(by_default["props"]) == DEFAULT_PROPS
 
     other = write_props(run_dir / "other" / "props.json", fixture_props(["eva"]))
     monkeypatch.setenv(fuzz_build.SECURITY_PROPS_ENV, str(other))
     assert fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN) is None  # the environment's file: eva only
     by_option = fuzz_build.resolve_security_meta(str(DEFAULT_PROPS), SOURCES, OUT_BIN)
+    assert by_option is not None
     assert by_option["status"] == "loaded"
     monkeypatch.setenv(fuzz_build.SECURITY_PROPS_ENV, str(run_dir / "gone.json"))
     assert fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN) is None  # as run_wp_function: not an error
 
     DEFAULT_PROPS.write_text("{not json", encoding="utf-8")
     broken = fuzz_build.resolve_security_meta(str(DEFAULT_PROPS), SOURCES, OUT_BIN)
+    assert broken is not None
     assert broken["status"] == "error" and broken["reason"].startswith("unreadable: ")
 
 
@@ -330,6 +335,7 @@ def test_the_properties_are_the_ones_with_an_instance_in_the_module(run_dir):
     doc["properties"].append({**doc["properties"][4], "name": "L6_wiped_decided", "instances": []})
     write_props(DEFAULT_PROPS, doc)
     plan = fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN)
+    assert plan is not None
     assert plan["status"] == "loaded" and plan["properties"] == ALL_PROPERTY_NAMES
     assert plan["left_out"] == []
     assert plan["functions"]["process"] == ["src/prog.c"] and plan["functions"]["backdoor"] == ["src/prog.c"]
@@ -341,6 +347,7 @@ def test_the_properties_are_the_ones_with_an_instance_in_the_module(run_dir):
     other.parent.mkdir(parents=True)
     other.write_text("int unrelated(int x) { return x; }\n", encoding="utf-8")
     skipped = fuzz_build.resolve_security_meta(None, ["workspace/work/lib/unrelated.c"], OUT_BIN)
+    assert skipped is not None
     assert skipped["status"] == "skipped" and "no property has an instance" in skipped["reason"]
 
 
@@ -348,10 +355,12 @@ def test_the_properties_are_the_ones_with_an_instance_in_the_module(run_dir):
 def test_a_precondition_the_harness_can_break_itself_is_left_out(run_dir):
     write_props(DEFAULT_PROPS, fixture_props(["eacsl"]))
     plan = fuzz_build.resolve_security_meta(None, DIRECT_SOURCES, OUT_BIN)
+    assert plan is not None
     assert plan["status"] == "loaded"
     assert plan["left_out"] == [{"property": "L4_auth_required_login", "reason": "the harness names its target admin"}]
     assert plan["properties"] == [n for n in ALL_PROPERTY_NAMES if n != "L4_auth_required_login"]
     written = fuzz_build.write_security_meta(plan, OUT_BIN)
+    assert written is not None
     text = Path(written["meta_file"]).read_text(encoding="utf-8")
     assert "L4_auth_required_login" not in text and "translate:check" not in text
     # The other contexts stay: the harness's own writes and calls are not instrumented.
@@ -364,7 +373,9 @@ def test_harness_induced_reasons():
     assert fuzz_build._harness_induced(ACSL_AUTH_REQUIRED, words) == "the harness names its target admin"
     assert fuzz_build._harness_induced(ACSL_AUTH_REQUIRED, {"process"}) is None
     over_all = ACSL_AUTH_REQUIRED.replace("{admin}", r"\diff(\ALL, {login})")
-    assert "not a list of functions" in fuzz_build._harness_induced(over_all, {"process"})
+    reason = fuzz_build._harness_induced(over_all, {"process"})
+    assert reason is not None
+    assert "not a list of functions" in reason
     two = ACSL_AUTH_REQUIRED.replace("{admin}", "{admin, process}")
     assert fuzz_build._harness_induced(two, words) == "the harness names its targets admin, process"
     for other in (ACSL_AUTH_STATE, ACSL_SANITIZED_EMIT, ACSL_WIPED, ACSL_NO_LEAK):
@@ -423,6 +434,7 @@ def test_the_cache_key_does_not_know_the_properties(run_dir):
     material = fuzz_build._eacsl_cache_material(
         SOURCES, OUT_BIN, "gcc_x86_64", "-I.", "all", True, MODULE_FUNCTIONS, "", True, False, True
     )
+    assert material is not None
     assert sorted(material) == sorted(
         [
             "kind",
@@ -667,7 +679,10 @@ def built_meta(run_dir):
     """The meta file and sidecar of a build of the fixture, as write_security_meta leaves them."""
     write_props(DEFAULT_PROPS, fixture_props(["eacsl"]))
     plan = fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN)
-    return fuzz_build.write_security_meta(plan, OUT_BIN)["meta_file"]
+    assert plan is not None
+    written = fuzz_build.write_security_meta(plan, OUT_BIN)
+    assert written is not None
+    return written["meta_file"]
 
 
 @pytest.mark.unit
@@ -690,6 +705,7 @@ def test_a_violated_property_is_named_in_the_failure_and_its_fingerprint(built_m
         "meta_location": f"{built_meta}:9",
     }
     fp = failure_identity.failure_fingerprint(failure)
+    assert fp is not None
     assert fp.startswith("src/prog.c#backdoor::meta_l4_auth_state_login::") and fingerprint.is_valid_fingerprint(fp)
     assert not failure_identity.needs_attribution(failure)
     # The three other places that compute a fingerprint use the same four fields.
@@ -710,12 +726,13 @@ def test_the_identity_does_not_depend_on_where_the_meta_file_is(built_meta, tmp_
         shutil.copy(path, replay_copy.parent / path.name)
     there = eacsl_report(str(replay_copy), "session_close", 34, "Postcondition", "L6_wiped_session_key/meta", "P", "")
     first, second = (failure_identity.parse_runtime_failure(t) for t in (here, there))
+    assert first is not None and second is not None
     assert first["kind"] == "postcondition" and first["obligation_class"] == "l6_wiped"
     assert first["meta_location"] != second["meta_location"]
-    assert failure_identity.failure_fingerprint(first) == failure_identity.failure_fingerprint(second)
-    assert failure_identity.failure_fingerprint(first).startswith(
-        "src/prog.c#session_close::meta_l6_wiped_session_key::"
-    )
+    first_fp = failure_identity.failure_fingerprint(first)
+    assert first_fp is not None
+    assert first_fp == failure_identity.failure_fingerprint(second)
+    assert first_fp.startswith("src/prog.c#session_close::meta_l6_wiped_session_key::")
 
 
 @pytest.mark.unit
@@ -730,14 +747,17 @@ def test_without_the_sidecar_the_property_and_its_class_are_still_named(tmp_path
         "",
     )
     failure = failure_identity.parse_runtime_failure(text)
+    assert failure is not None
     assert failure["file"] == "unknown" and failure["meta_property"] == "L4_auth_required_login"
     assert failure["obligation_class"] == "l4_auth_required"  # from the name, as the ledger reads it
     assert "caller" not in failure and "harness_induced" not in failure
     fp = failure_identity.failure_fingerprint(failure)
+    assert fp is not None
     assert fp.startswith("unknown#admin::meta_l4_auth_required_login::") and fingerprint.is_valid_fingerprint(fp)
     assert not failure_identity.needs_attribution(failure)
     # A name that spells no class the ledger knows.
     odd = failure_identity.parse_runtime_failure(text.replace("L4_auth_required_login", "my_rule"))
+    assert odd is not None
     assert odd["obligation_class"] is None and odd["alarm_kind"] == "meta_my_rule"
 
 
@@ -746,6 +766,7 @@ def test_a_failed_precondition_names_its_caller_and_a_harness_call(built_meta):
     args = (built_meta, "admin", 12, "Precondition", "L4_auth_required_login/meta", "auth_ok ≢ 0")
     real = failure_identity.parse_runtime_failure(eacsl_report(*args, TARGET_CALL_FRAMES))
     induced = failure_identity.parse_runtime_failure(eacsl_report(*args, HARNESS_CALL_FRAMES))
+    assert real is not None and induced is not None
     assert real["function"] == induced["function"] == "admin" and real["kind"] == "precondition"
     assert (real["caller"], real["harness_induced"]) == ("process", False)
     assert (induced["caller"], induced["harness_induced"]) == ("LLVMFuzzerTestOneInput", True)
@@ -764,11 +785,12 @@ def test_a_class_the_name_does_not_spell_is_written_in_the_kind(built_meta):
         built_meta, "mix", 9, "Assertion", "L4_auth_state_login/meta", r"\separated(dst + i, &auth_ok)", ""
     )
     failure = failure_identity.parse_runtime_failure(text)
+    assert failure is not None
     assert failure["obligation_class"] == "l3_writers"
     assert failure["alarm_kind"] == "meta_l3_writers_L4_auth_state_login"
-    assert failure_identity.failure_fingerprint(failure).startswith(
-        "src/prog.c#mix::meta_l3_writers_l4_auth_state_login::"
-    )
+    fp = failure_identity.failure_fingerprint(failure)
+    assert fp is not None
+    assert fp.startswith("src/prog.c#mix::meta_l3_writers_l4_auth_state_login::")
 
 
 @pytest.mark.unit
@@ -778,10 +800,12 @@ def test_a_failed_guard_of_a_property_names_the_property(built_meta):
     line = next(int(k) for k, v in sidecar["line_names"].items() if v == "L5_sanitized_logmsg")
     args = (built_meta, "process", line, "E-ACSL RTE", "memory access", r"\valid_read(s + i)", "")
     failure = failure_identity.parse_runtime_failure(eacsl_report(*args))
+    assert failure is not None
     assert failure["meta_property"] == "L5_sanitized_logmsg" and failure["meta_guard"] == "memory access"
     assert (failure["file"], failure["line"], failure["function"]) == ("src/prog.c", 0, "process")
     assert failure["predicate"] == r"L5_sanitized_logmsg: meta: guard memory access: \valid_read(s + i)"
     fp = failure_identity.failure_fingerprint(failure)
+    assert fp is not None
     assert fp.startswith("src/prog.c#process::meta_l5_sanitized_logmsg::") and fingerprint.is_valid_fingerprint(fp)
     violated = failure_identity.parse_runtime_failure(
         eacsl_report(built_meta, "process", line, "Assertion", "L5_sanitized_logmsg/meta", "no_crlf_string(line)", "")
@@ -792,7 +816,9 @@ def test_a_failed_guard_of_a_property_names_the_property(built_meta):
         eacsl_report(built_meta, "process", 1, "E-ACSL RTE", "memory access", "P", ""),
         eacsl_report("elsewhere/fuzz_m.security_meta.c", "process", line, "E-ACSL RTE", "memory access", "P", ""),
     ):
-        assert "meta_property" not in failure_identity.parse_runtime_failure(report)
+        parsed = failure_identity.parse_runtime_failure(report)
+        assert parsed is not None
+        assert "meta_property" not in parsed
 
 
 RTE_REPORT = (
@@ -822,7 +848,9 @@ def test_other_failures_keep_their_identity():
     assert failure_identity.failure_fingerprint(failure) == "prog.c#mix::mem_access::60975404fe"
     # A hand-written annotation whose name merely ends in `meta` is no MetAcsl check.
     named = RTE_REPORT.replace("rte/mem_access", "my_meta").replace("prog.c", "harness_m.c")
-    assert "meta_property" not in failure_identity.parse_runtime_failure(named)
+    parsed = failure_identity.parse_runtime_failure(named)
+    assert parsed is not None
+    assert "meta_property" not in parsed
     assert failure_identity.needs_attribution({"file": "unknown", "line": 0, "function": "f"})
 
 

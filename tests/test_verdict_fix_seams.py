@@ -645,7 +645,7 @@ def test_the_merge_and_the_ledger_agree_on_the_frame(run_dir, monkeypatch, fn, b
     _agent(run_dir, aid, result)
     SeamTools(monkeypatch, run_dir)
     report_path = run_dir / "agents" / aid / "scratch" / "parent_wp" / f"{fn}.json"
-    header = {"header_file": SEAM_HDR_FRAME} if fn in SEAM_IN_HEADER else {}
+    header: dict = {"header_file": SEAM_HDR_FRAME} if fn in SEAM_IN_HEADER else {}
     try:
         res = workspace_overlay.merge_agent_overlay(
             run_dir=run_dir, agent_id=aid, role="prover", overlay_dir=run_dir / "workspace", c_file=SEAM_SRC_FRAME,

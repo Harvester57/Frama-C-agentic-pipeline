@@ -279,7 +279,7 @@ def test_an_unused_logic_definition_is_never_reported():
 
 
 def test_what_cannot_be_attributed_says_why(probe_run):
-    entries = [
+    entries: list[dict] = [
         {"file": "workspace/work/src/gone.c", "line": 4, "construct": None, "reason": "r", "expected_check": True},
         {"file": PROBE_C, "line": 3, "construct": None, "reason": "r", "expected_check": True},
         {"file": None, "line": None, "construct": None, "reason": "r", "expected_check": True},

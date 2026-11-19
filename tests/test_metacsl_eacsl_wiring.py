@@ -150,6 +150,7 @@ def test_a_build_with_properties_is_cached_and_a_hit_restores_the_meta_file_and_
         "",
     )
     failure = failure_identity.parse_runtime_failure(report)
+    assert failure is not None
     assert (failure["file"], failure["obligation_class"]) == (WIRING_FILE, "l4_auth_state")
 
 
@@ -227,9 +228,12 @@ def test_builds_with_and_without_the_properties_never_share_an_entry(cached_run,
     assert "-meta" not in none["command"] and "security_props" not in none
     # The key material of a build without properties is the one it always had.
     args = (SOURCES, OUT_BIN, "gcc_x86_64", "-I.", "all", True, MODULE_FUNCTIONS, "", True, False, True)
-    assert "security_meta" not in fuzz_build._eacsl_cache_material(*args)
+    plain_material = fuzz_build._eacsl_cache_material(*args)
+    assert plain_material is not None
+    assert "security_meta" not in plain_material
     plan = fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN)
     material = fuzz_build._eacsl_cache_material(*args, security_meta=plan)
+    assert material is not None
     assert sorted(material["security_meta"]) == [
         "functions",
         "harness_functions",
@@ -436,6 +440,7 @@ def test_the_reason_of_a_module_without_instances_is_the_one_the_build_gives(run
     doc["obligations"] = {}
     write_props(DEFAULT_PROPS, doc)
     found = fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN)
+    assert found is not None
     assert found["status"] == "skipped" and found["reason"] == R._SECURITY_PROPS_NO_INSTANCE
     assert L._fuzz_security_props_lost({"security_props": found}) is None
 
@@ -547,8 +552,8 @@ def test_a_candidate_replay_names_the_file_make_names_unless_told_otherwise(monk
 
     def prepared(spec_props: str | None, option: str | None, cross: bool = False) -> dict:
         spec = {**REPLAY_SPEC, **({"security_props": spec_props} if spec_props else {})}
-        common = {"attribution": False, "selftest_json": None, "machdep": "gcc_x86_64"}
-        extra = {"security_props": option} if option is not None else {}
+        common: dict = {"attribution": False, "selftest_json": None, "machdep": "gcc_x86_64"}
+        extra: dict = {"security_props": option} if option is not None else {}
         if cross:
             crash_replay._cross_engine_replay(
                 module="m", harness_module="m", spec=spec, reproducers=[], other="eacsl", bin_dir=Path("b"),
@@ -586,7 +591,7 @@ def test_a_replay_build_passes_the_option_on_and_reports_the_properties(run_dir,
             monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", compile_real)
 
     monkeypatch.setattr(fuzz_build, "build_module_binary", spy)
-    options = {"engine": "eacsl", "functions": list(MODULE_FUNCTIONS), "use_cache": False, "attribution": False}
+    options: dict = {"engine": "eacsl", "functions": list(MODULE_FUNCTIONS), "use_cache": False, "attribution": False}
     elsewhere = Path("agents/v1/scratch/out/fuzz_prog")
     prepared = crash_replay.prepare_replay_binary(
         WIRING_MODULE, SOURCES, elsewhere, security_props=str(run_dir / DEFAULT_PROPS), **options
@@ -772,7 +777,9 @@ def wired(run_dir):  # noqa: F811
     doc = wiring_props(["eacsl"], backdoor=True)
     seed_ledger(run_dir, doc)
     plan = fuzz_build.resolve_security_meta(None, SOURCES, OUT_BIN)
+    assert plan is not None
     written = fuzz_build.write_security_meta(plan, OUT_BIN)
+    assert written is not None
     lines = {name: int(line) for line, name in written["line_names"].items()}
     return written["meta_file"], lines
 
@@ -782,6 +789,7 @@ def violation(wired, function: str, prop: str, kind: str = "Assertion", frames: 
     failure = failure_identity.parse_runtime_failure(
         eacsl_report(meta_file, function, lines[prop], kind, f"{prop}/meta", "P(x)", frames)
     )
+    assert failure is not None
     assert failure["meta_property"] == prop and failure["file"] == WIRING_FILE
     return failure
 
@@ -858,6 +866,7 @@ def test_a_failed_precondition_is_the_callers_unit(wired):
     no_stack = violation(wired, "admin", "L4_auth_required_login", "Precondition")
     assert "caller" not in no_stack
     route = L._fuzz_meta_route(units, no_stack, WIRING_FILE, "admin", {})
+    assert route is not None
     assert route["linked"] == [] and "names no caller" in route["notes"][0]
 
 
@@ -897,6 +906,7 @@ def test_an_unplanned_instance_links_no_unit(wired):
     assert "mix is not an instance of L4_auth_state_login" in cand["notes"][0]
     # A function without any unit of the class, and no word of it in the report: no unit either.
     route = L._fuzz_meta_route(units, violation(wired, "login", "L4_auth_state_login"), WIRING_FILE, "login", {})
+    assert route is not None
     assert route["cls"] == "l4_auth_state" and route["linked"] == []
     assert "no ledger unit for login::l4_auth_state" in route["notes"][0]
 
@@ -908,6 +918,7 @@ def test_a_failed_guard_is_an_rte_candidate_at_the_function_not_a_violation(wire
         meta_file, "process", lines["L5_sanitized_logmsg"], "E-ACSL RTE", "memory access", r"\valid_read(s + i)", ""
     )
     failure = failure_identity.parse_runtime_failure(text)
+    assert failure is not None
     assert failure["meta_guard"] == "memory access" and failure["obligation_class"] == "l5_sanitized"
     ingest([failure])
     units, candidates = ledger_state()
@@ -930,9 +941,11 @@ def test_the_class_is_the_failures_when_the_ledger_knows_it(wired, monkeypatch):
         "obligation_class": "l3_isolation",
     }
     route = L._fuzz_meta_route(units, {**failure, "obligation_class": "l3_isolation"}, WIRING_FILE, "process", {})
+    assert route is not None
     assert (route["cls"], route["linked"]) == ("l3_isolation", [unit_id("process", "l3_isolation")])
     # A class the ledger does not know: the one the predicate's name spells, as for any failure.
     route = L._fuzz_meta_route(units, {**failure, "obligation_class": "not_a_class"}, WIRING_FILE, "process", {})
+    assert route is not None
     assert (route["cls"], route["linked"]) == ("l5_sanitized", [unit_id("process", "l5_sanitized")])
     assert L._fuzz_meta_route(units, {"function": "mix", "kind": "assertion"}, WIRING_FILE, "mix", {}) is None
 
