@@ -280,7 +280,58 @@ Issues encountered in Frama-C C/ACSL parsing, `__fc_libc` gaps, preprocessor wra
   - `fc_stub_smoke.c` lines 8-9: `int const v_1;` then `memset(&v_1, 0, sizeof v_1);`.
 - **Cause:** the smoke driver in [`../../scripts/stub_check.py`](../../scripts/stub_check.py) declares each argument with the parameter's type, top-level `const` included, and zeroes it with `memset(&v, 0, sizeof v)` (line 291 after the run-3 merges). Frama-C's libc `memset` requires a writable object, so the precondition fails and the stub call after it is dead.
 - **Effect:** the header's status is `valid_call_alarm`, but stub-check reported no failed header and blocked no module in run-3. The smoke check of that function proves nothing.
-- **Fix:** none. **Open pipeline bug:** drop the top-level `const` from the smoke variable's declaration, or initialize a `const` scalar with `= 0` instead of `memset`.
+- **Fix (fixed on branch `sup/nginx-stub-check-dynamic-artifacts`, commit `ba2cba0`; held there until merged):** `call_lines` declares a value parameter's local without its qualifiers (`_unqualified`: `int v_1;`, then the same `memset`). A value parameter has no `*`, so each of its qualifiers is top-level. The smoke and the dynamic driver both use `call_lines`.
+  - Tests: `tests/test_stub_check.py::test_a_const_scalar_parameter_gets_a_writable_local` (unit; fails on `2c6c699` with `int const v_1;` in the text).
+  - Also `::test_dynamic_artifacts_of_the_checker_do_not_block_but_a_wrong_ensures_does` (Docker), on `op_answer(int const x)`: the smoke's `fc_stub_smoke_report.csv` has no `Invalid` row. Before the fix it had `precondition of memset Invalid or unreachable valid_s: valid_or_empty(s, n)` at line 7.
+  - The constant is still not handled when it comes from a typedef (`typedef const int cint;`): the qualifier is not in the type text.
+- **Open pipeline gap:** in that Docker run before the fix, `eva` still said `passed` for `op_answer`. The alarm sits on the `memset` line, which `check_eva` does not map to the call, and the dead call then raises nothing. A valid call made unreachable by its own setup reads `passed`.
+
+### Symptom: `stub-check` Fails Correct, Documented OpenSSL Contracts as `violated` (`postcondition failed against the real library`) and Blocks Every nginx Module
+- **Seen on:** nginx 1.31.9 run-4, 2026-11-19, `pipeline_make.py run stubs stub-check`.
+  - `stub_check.json` failed eight OpenSSL overlay headers (`crypto`, `err`, `evp`, `objects`, `ocsp`, `ssl`, `stack`, `x509`), with nine functions `violated`. `blocked_modules` listed every nginx module.
+  - The reasons look like `OpenSSL_version: postcondition failed against the real library (see workspace/reports/stub_check/openssl__crypto.h/run6.log)`.
+  - The brief told the authors that `violated` means the postcondition is wrong, so the run sent correct contracts back to be weakened.
+  - By the time of the diagnosis, those `run<N>.log` files had been overwritten by later stub-checks (they exit 0), and the eight headers no longer appear in the run's `stub_check.json`. The messages below come from the logs read during the run.
+- **Cause (pipeline bug):** `check_dynamic` in [`../../scripts/stub_check.py`](../../scripts/stub_check.py) mapped every E-ACSL `Postcondition failed` to `violated`. Two classes of failure are artifacts of the checker, not evidence against the contract.
+  - **A. A fabricated object behind a pointer.** `call_lines` gives every pointer parameter 64 patterned bytes (`v[i] = i*31+seed`) cast to the parameter's type, whatever the pointee. The library then reads garbage from an opaque or structured pointee (`EVP_CIPHER_CTX *`, `SSL *`, `OPENSSL_STACK *`).
+    - `evp.h` `EVP_CIPHER_CTX_is_encrypting`: `Postcondition failed: bool_result: \result == 0 || \result == 1 ... \result: 1294864368`. The contract is right per the OpenSSL documentation.
+    - `stack.h` `OPENSSL_sk_num`: `count_or_null: \result >= -1`, `\result: -2141109725`.
+    - `ssl.h` `SSL_get_version`: `non_null: \result != \null`, `\result: (nil)`.
+    - A pointer-to-pointer out parameter is prefilled with the pattern too. `ERR_peek_error_data`'s `*\old(data)` is the driver's `0xd9ba9b7c5d3e1f00` when the library does not write it.
+    - The same fabricated handles also crash the library (exit -11 or -7). Those runs were already `inconclusive` and did not block.
+  - **B. E-ACSL cannot see memory the uninstrumented library owns.** `valid_read_string(\result)` and `\valid_read(...)` evaluate to 0 on a pointer to one of libcrypto's static strings (addresses `0x7...`), because E-ACSL tracks only the memory instrumented code registers. This is the open limitation in "E-ACSL Rejects a Pointer the Program Got From an Uninstrumented Library" in [`./eacsl-and-fuzzing.md`](./eacsl-and-fuzzing.md).
+    - Affected: `OpenSSL_version` (int argument), `OBJ_nid2sn` (int), `OCSP_cert_status_str` (long), `OCSP_response_status_str` (long) and `X509_verify_cert_error_string` (long).
+    - For example `valid_str: valid_read_string(\result) ... valid_read_string(\result): 0 ... \result: 0x78675abc321d`.
+  - The [`../../skills/framac-slice/stub_author_brief.md`](../../skills/framac-slice/stub_author_brief.md) said `violated` "means the library broke one of your `ensures` ...: the postcondition is wrong, fix it".
+- **Open pipeline bug:** until the branch below is merged, the pipeline's stub-check still blocks on these artifacts.
+- **Fix (on branch `sup/nginx-stub-check-dynamic-artifacts`, held there until merged):** commits `65bff62` (tests) and `ba2cba0` (fix). `classify_run` in `stub_check.py` decides each function's dynamic record.
+  - **`inconclusive`, `reason: fabricated_argument`:** a postcondition failed and `fabricated_params` names a pointer parameter whose pointee is not a plain buffer. A plain buffer is one `*` over the words `void char short int long float double signed unsigned _Bool bool size_t ssize_t ptrdiff_t intptr_t uintptr_t wchar_t char16_t char32_t int8_t..uint64_t u_char u_short u_int u_long`, qualifiers aside. Anything else is fabricated: a struct, union, typedef'd or incomplete pointee, a pointer to pointer, or a `void *` that no length bounds. When in doubt the parameter counts as fabricated. It is read from the type text, so nothing takes `sizeof` of an incomplete type.
+  - **`inconclusive`, `reason: untracked_library_memory`:** every `Postcondition failed` block of the run is explained by memory predicates alone.
+    - The failing predicate is read from E-ACSL's report, whose Unicode operators (`≡`, `∨`, `∧`, `⇒`) are read as ASCII.
+    - An implication fails on its consequent. A disjunction needs one explained disjunct. A conjunction needs every conjunct explained, or a `T != \null` whose printed value is not NULL.
+    - An explained atom has the shape of one or more of `\valid`, `\valid_read`, `\initialized`, `\block_length`, `\base_addr`, `\offset`, `\separated`, `\freeable`, `\allocable`, `\object_pointer` and `valid_[read_][n|w]string`, compared at most with constants.
+    - Each of those applies to memory the library returned or wrote: its argument names `\result` or a dereference.
+    - No printed term of the argument is NULL.
+    - E-ACSL printed at least one memory-predicate line as `0` (`- valid_read_string(\result): 0`, label prefix dropped).
+  - **Still `violated` (blocking):** a value failure on genuine arguments (`\result == 0`, `\result: 42`), a memory predicate on NULL, on a buffer the driver passed, negated, or beside a value comparison.
+  - **What the report keeps:** each `inconclusive` record keeps E-ACSL's `report`, a `detail` sentence and, for class A, `fabricated_params`. The header verdict is unchanged: only `violated` adds a reason.
+  - **Tests** (in `tests/test_stub_check.py`; each new test failed on `2c6c699`):
+    - `::test_a_postcondition_failure_is_violated_only_on_evidence_against_the_contract`, parametrized over the run-4 functions above plus five genuine and negative cases. Before the fix, `AttributeError: module 'stub_check' has no attribute 'classify_run'`.
+    - `::test_postcondition_reports_are_read_from_the_images_output`, on `tests/fixtures/stub_check/eacsl_post_{value,fabricated,untracked}.log`. These are the image's own reports for `tests/fixtures/stub_check/oplib.c`, captured before the fix.
+    - `::test_fabricated_params_are_read_from_the_parameter_types`.
+    - `::test_the_header_verdict_follows_the_dynamic_classification` (through `stub_check.py run --checks dynamic`). Before the fix, all three oplib functions came out `violated`.
+    - `::test_dynamic_artifacts_of_the_checker_do_not_block_but_a_wrong_ensures_does` (Docker, `framac-analysis:latest`). Before the fix it reported `violated` for `op_is_on` (`\result: 1564352256`), `op_version` (`valid_read_string(\result): 0`, `\result: 0x78007e6e6000`) and `op_answer`. After the fix the first two are `inconclusive`; `op_answer` stays `violated` and still blocks its module.
+    - `::test_stub_check_against_the_real_library[bad]` now expects `inconclusive`/`fabricated_argument`: `ml_hash` takes `ml_ctx *`, an incomplete type.
+  - **Docs updated to match:** the brief, [`../../skills/framac-slice/SKILL.md`](../../skills/framac-slice/SKILL.md) (mirrors refreshed with `tools/sync_skill_mirrors.py`), [`../guides/slicing-and-onboarding.md`](../guides/slicing-and-onboarding.md) and the `stub_check.py` docstring. Each describes the two reasons, and the brief tells authors never to weaken a documented `ensures` because of an `inconclusive` result.
+- **Limits (by design):**
+  - A wrong `ensures` on a function that takes a handle is never caught dynamically: any postcondition failure with a fabricated argument is `inconclusive`. `ml_hash`'s wrong `\result == 1` is an example.
+  - A typedef'd pointer passed by value (`typedef struct x *X_HANDLE;`) has no `*` in its text. It gets a zeroed local (NULL) and stays a value parameter.
+- **Recovering run-4:** once the fix is in the checkout the wrapper runs, rerun `pipeline_make.py run stubs stub-check`. Then compare each OpenSSL overlay contract with the OpenSSL documentation: authors may already have weakened an `ensures` to get past the old `violated`.
+
+### Symptom: `test_errno_in_a_stub_contract_against_eva_and_eacsl[assigns errno, \result;...]` Fails: Eva Says `ok` Where the Test Expects `[eva:assigns:missing]`
+- **Seen on:** 2026-11-19, `framac-analysis:latest`, with `FRAMAC_DOCKER_TESTS=1`, on `2c6c699` (before the S10 change) and after it. No target run.
+- **Cause (stale test, not a stub-check defect):** `sys/epoll.h` became a shipped stub (`templates/fc_stubs/sys/epoll.h`; `stub_gen.py` classifies its functions `pipeline_stub`). The test's own overlay for `epoll_create1` is merged with the shipped contract: `eva.log` shows `found two contracts (old location: /opt/framac-pipeline/templates/fc_stubs/sys/epoll.h:96-98). Merging them`, and Eva no longer aborts. The header still fails, because `frame_reasons` reads the missing `\from` statically.
+- **Open test gap:** the case should use a header with no shipped stub.
 
 ### Symptom: `syntax error: ... before or at token: p` on `char* __restrict__ p` When Frama-C Parses With Host Headers (`-no-frama-c-stdlib`)
 - **Seen on:** mpack run-3 (2026-11-17), every E-ACSL harness build (`build-check`, `pipeline_make.py run build-<mod>`), module sources `src/mpack/mpack-writer.c`. Exact text: `[kernel] workspace/work/src/mpack/mpack-writer.c:1274: User Error: syntax error: Location: "workspace/work/src/mpack/mpack-writer.c", line 1274, before or at token: p`, with the preprocessed line `char* __restrict__ p = writer->position;`.
