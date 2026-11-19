@@ -46,6 +46,7 @@ import function_slice  # noqa: E402
 import line_endings  # noqa: E402
 import prover_candidates  # noqa: E402
 import spec_kb  # noqa: E402
+import target_env  # noqa: E402
 from acsl_ast import (  # noqa: E402
     DEFAULT_BEHAVIOR,
     AcslError,
@@ -327,6 +328,12 @@ def init_overlay(target_dir: Path, overlay_dir: Path, force: bool = False) -> di
         "warnings": [crlf_warning] if crlf_warning else [],
     }
     (overlay_dir / "overlay_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    # A capture that already ran (a resumed or re-initialized overlay): the C sources its build generated
+    # (nginx's objs/ngx_modules.c) are in the snapshot, not in the target. Installed into baseline/ and
+    # work/ like the target's own files; the capture installs them itself when it runs after init.
+    generated = target_env.install_generated_sources(overlay_dir)
+    if any(generated.values()):
+        meta = load_json_optional(overlay_dir / "overlay_meta.json", meta)
     return meta
 
 
@@ -4082,14 +4089,23 @@ def apply_in_place(overlay_dir: Path, target_dir: Path) -> dict:
         )
     baseline_dir = overlay_dir / "baseline"
     work_dir = overlay_dir / "work"
+    # The C sources the build generated (target_env.install_generated_sources) are no file of the target:
+    # their ACSL stays in the overlay.
+    meta = load_json_optional(overlay_dir / target_env.OVERLAY_META, {})
+    generated = set(meta.get(target_env.GENERATED_SOURCES_KEY) or {}) if isinstance(meta, dict) else set()
+    generated |= set(target_env.generated_source_paths(overlay_dir / Path(target_env.SNAPSHOT_REL).name))
 
     synced: list[str] = []
+    skipped_generated: list[str] = []
     for root, _, files in os.walk(work_dir):
         for fname in sorted(files):
             work_file = Path(root) / fname
             if work_file.suffix.lower() not in SOURCE_EXTS:
                 continue
             rel_path = work_file.relative_to(work_dir)
+            if rel_path.as_posix() in generated:
+                skipped_generated.append(rel_path.as_posix())
+                continue
             base_file = baseline_dir / rel_path
             target_file = target_dir / rel_path
 
@@ -4100,7 +4116,10 @@ def apply_in_place(overlay_dir: Path, target_dir: Path) -> dict:
                 shutil.copy2(work_file, target_file)
                 synced.append(str(rel_path).replace("\\", "/"))
 
-    return {"applied_in_place": synced, "count": len(synced)}
+    out: dict[str, Any] = {"applied_in_place": synced, "count": len(synced)}
+    if skipped_generated:
+        out["skipped_generated"] = sorted(skipped_generated)
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -4111,6 +4130,12 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("--target", type=Path, required=True)
     p_init.add_argument("--overlay", type=Path, default=Path("workspace"))
     p_init.add_argument("--force", action="store_true")
+
+    p_gen = sub.add_parser(
+        "install-generated",
+        help="Install the C sources the build generated (snapshot manifest generated_sources) in baseline/ and work/",
+    )
+    p_gen.add_argument("--overlay", type=Path, default=Path("workspace"))
 
     p_agent = sub.add_parser("init-agent")
     p_agent.add_argument("--run-dir", type=Path, default=Path("."))
@@ -4206,6 +4231,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "init":
             res = init_overlay(args.target, args.overlay, args.force)
+        elif args.cmd == "install-generated":
+            res = target_env.install_generated_sources(args.overlay)
         elif args.cmd == "init-agent":
             res = init_agent_overlay(args.run_dir, args.agent_id, args.overlay)
         elif args.cmd == "prepare-agent":

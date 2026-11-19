@@ -110,6 +110,21 @@ Issues encountered in E-ACSL instrumentation (`e-acsl-gcc`, `eacsl_toolchain.py`
 - **Cause:** `_UNDEFINED_REF_RE` in `scripts/run_eacsl_fuzz.py` and `_FALLBACK_UNDEFINED_RE` in `scripts/eacsl_toolchain.py` only parsed GNU ld's `undefined reference to 'X'`, ignoring LLVM lld's `undefined symbol: X`.
 - **Fix (fixed, uncommitted, `scripts/run_eacsl_fuzz.py`, `scripts/eacsl_toolchain.py`):** Expanded regexes to match both `undefined reference to` and `undefined symbol:`.
 
+### Symptom: The Build Report Gives Only the Last Attempt's Failure After Link Repair (an OOM-Killed First E-ACSL Attempt Is Hidden)
+- **Seen on:** nginx 1.31.9 run-3, 2026-11-19, `run_eacsl_fuzz.py build` for `nginx__ngx_event_openssl`.
+  - The first E-ACSL attempt was OOM-killed: a docker `oom` event at 15:01:48, with Frama-C at 8.7 GB.
+  - Link repair then added files and built again.
+  - `workspace/build/nginx__ngx_event_openssl.build.json` says only `engine_fallback_reason: eacsl_instrumentation_failed`, the post-repair attempt's reason (a missing generated source, see [`./phase0-build-and-model.md`](./phase0-build-and-model.md)).
+  - `fuzz_nginx__ngx_event_openssl.compile.log` holds only that last attempt.
+- **Cause (pipeline bug):** in [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py), the repair loop of `build_module_binary` reassigns `compile`, `eacsl_compile_attempt` and `engine_fallback_reason` on each attempt. Each compile also rewrites the same `<out>.compile.log` and `<out>.sanitizer_compile.log`. `link_repair.rounds` records only what was added, not why each attempt failed.
+- **Fix:** **fixed** on branch `sup/nginx-generated-sources`, commits `c97e28c` and `79f49ec` (not merged).
+  - After a repair, the build result has `attempts`, which the report copies as `build_attempts`. Each attempt gives the engine, the return code, the reason, the end of stderr, and the E-ACSL attempt that fell back.
+  - The logs of every earlier attempt are kept as `<log stem>.attempt<N>.log`.
+  - `diagnostic_hints` says when an earlier attempt was killed or looks killed.
+  - **How a kill shows:** checked in `framac-analysis`, `e-acsl-gcc`'s `error()` exits 1 whatever Frama-C's status. Bash prints no `Killed` for a Frama-C killed inside its `$(...)`: a test script got return code 137 inside and printed nothing. So `killed` (return code 137 or -9, or a `Killed` line) fires only for a direct kill. For E-ACSL, `killed_suspected` marks an attempt that stopped with `aborted by Frama-C` and no Frama-C diagnostic of its own (`[kernel] User Error`, `Failure`, `Fatal error`, `Out of memory`). That is a heuristic; confirm it with `docker events` (`oom`).
+  - Tests: `tests/test_generated_sources.py::test_the_build_keeps_every_attempts_failure` and `::test_a_killed_attempt_is_told_from_a_frama_c_error`.
+  - **Not verified on run-3:** its first attempt's log was overwritten, so there is no way to check that it had no Frama-C diagnostic.
+
 ### Symptom: `call to undeclared function 'X'` or `invalid application of 'alignof' to an incomplete type`
 - **Cause:** a [`../../templates/fc_stubs/`](../../templates/fc_stubs/) header lacks a prototype the target calls, or declares an opaque handle (`struct json_object`) as incomplete. E-ACSL emits `alignof` on pointed-to types.
 - **Fix:** add the prototype and complete the handle with a single dummy member (see [`../../templates/fc_stubs/README.md`](../../templates/fc_stubs/README.md)). Tool JSONs list missing prototypes under `undeclared_functions`. For Eva/WP this is a soundness issue: Frama-C invents `int X()`.

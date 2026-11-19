@@ -2874,6 +2874,13 @@ def build_check(
                         "(sub-object overflow, \\initialized); build-check accepts it only as a recorded choice"
                     )
                     entry["next_step"] = sanitizers_command(mod.name)
+            # A source link repair needed and could not find (nginx's generated objs/ngx_modules.c): the
+            # failure to fix first, named with the Phase 0 step that should have kept the file.
+            missing = (report.get("link_repair") or {}).get("missing_sources") or []
+            why_missing = "; ".join(str(m.get("reason")) for m in missing if isinstance(m, dict) and m.get("reason"))
+            if why_missing:
+                prefix = f"link repair could not add a source that does not exist: {why_missing}"
+                entry["reason"] = f"{prefix}. {entry['reason']}" if entry.get("reason") else prefix
         results[mod.name] = entry
     out = {
         "ok": all(r["ok"] for r in results.values()),
