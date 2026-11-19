@@ -28,6 +28,7 @@ from failure_identity import (
     is_sanitizer_allocation_cap,
     needs_attribution,
     parse_eacsl_resource_abort,
+    parse_link_stub_abort,
     parse_runtime_failure,
     stack_frames,
 )
@@ -90,14 +91,16 @@ def replay_artifact(
     )
     out = res.stdout + "\n" + res.stderr
     # The binary: a MetAcsl violation is mapped to its file through the sidecar its build wrote next to it.
-    failure = parse_runtime_failure(out, binary=binary)
+    link_stub_abort = parse_link_stub_abort(out)
+    failure = None if link_stub_abort else parse_runtime_failure(out, binary=binary)
     return {
         "reproduced": res.returncode != 0 or res.timed_out,
         "returncode": res.returncode,
         "timed_out": res.timed_out,
         "failure": failure,
+        "link_stub_abort": link_stub_abort,
         # Read from the whole output: the runtime prints its message before the stack, out of the tail.
-        "resource_abort": None if failure else parse_eacsl_resource_abort(out),
+        "resource_abort": None if (failure or link_stub_abort) else parse_eacsl_resource_abort(out),
         "out_of_memory": is_libfuzzer_out_of_memory(out),
         "sandbox": res.sandbox,
         "seed": seed,
@@ -162,7 +165,8 @@ def replay_inputs(
             "seed": rep.get("seed"),
             "replay_log_tail": rep.get("log_tail", ""),
         }
-        if entry["reproducible"] and needs_attribution(failure) and attribution_builder is not None:
+        stub_abort = rep.get("link_stub_abort")
+        if entry["reproducible"] and not stub_abort and needs_attribution(failure) and attribution_builder is not None:
             san_bin = attribution_builder()
             if san_bin is not None:
                 san = replay_artifact(Path(san_bin), path, scratch, module=module, per_input_timeout=per_input_timeout)
@@ -173,11 +177,16 @@ def replay_inputs(
                     "failure": san.get("failure"),
                     "out_of_memory": bool(san.get("out_of_memory")),
                 }
-                if san.get("failure") and not needs_attribution(san["failure"]):
+                if san.get("link_stub_abort"):
+                    stub_abort = san["link_stub_abort"]
+                    failure = None
+                elif san.get("failure") and not needs_attribution(san["failure"]):
                     failure = san["failure"]
                     entry["failure_source"] = "sanitizer_replay"
         entry["failure"] = failure
-        if not failure and rep.get("resource_abort"):
+        if stub_abort:
+            entry["link_stub_abort"] = stub_abort
+        elif not failure and rep.get("resource_abort"):
             record = resource_abort_record(rep["resource_abort"], entry.get("attribution"), entry["kind"])
             if record is not None:
                 entry["eacsl_resource_abort"] = record

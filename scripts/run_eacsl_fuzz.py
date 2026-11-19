@@ -160,6 +160,7 @@ from failure_identity import (  # noqa: E402, F401
     needs_attribution,
     parse_eacsl_failure,
     parse_eacsl_resource_abort,
+    parse_link_stub_abort,
     parse_runtime_failure,
     parse_sanitizer_failure,
     stable_ubsan_message,
@@ -984,12 +985,19 @@ def run_fuzz_campaign(
                 # Never for an oom: libFuzzer's out-of-memory is no parsed failure, and an E-ACSL heap-limit
                 # abort ends its input as a deadly signal (crash-), so the log's failure or abort is another input's.
                 from_log = crash_like == 1 and kind != "oom"
-                failure = replay["failure"] or (parse_runtime_failure(combined_out) if from_log else None)
+                stub_abort = replay.get("link_stub_abort") or (
+                    parse_link_stub_abort(combined_out) if from_log else None
+                )
+                failure = (
+                    None
+                    if stub_abort
+                    else (replay["failure"] or (parse_runtime_failure(combined_out) if from_log else None))
+                )
                 entry["reproducible"] = replay["reproduced"]
                 entry["replay_log_tail"] = replay["log_tail"]
                 entry["frames"] = replay.get("frames") or []
                 entry["failure_source"] = "primary" if failure else None
-                if needs_attribution(failure):
+                if not stub_abort and needs_attribution(failure):
                     san_bin = _attribution_binary()
                     if san_bin is not None:
                         san_replay = crash_replay.replay_artifact(
@@ -1002,11 +1010,16 @@ def run_fuzz_campaign(
                             "failure": san_replay["failure"],
                             "out_of_memory": bool(san_replay.get("out_of_memory")),
                         }
-                        if san_replay["failure"] and not needs_attribution(san_replay["failure"]):
+                        if san_replay.get("link_stub_abort"):
+                            stub_abort = san_replay["link_stub_abort"]
+                            failure = None
+                        elif san_replay["failure"] and not needs_attribution(san_replay["failure"]):
                             failure = san_replay["failure"]
                             entry["failure_source"] = "sanitizer_replay"
                 entry["failure"] = failure
-                if not failure:
+                if stub_abort is not None:
+                    entry["link_stub_abort"] = stub_abort
+                elif not failure:
                     # The E-ACSL runtime stopped on its own limit (its tracked heap zone): no target
                     # check failed. Kept as a crash artifact so keep-going skips its case like any
                     # other, but marked, so ingest makes no candidate of it (ledger.cmd_ingest_fuzz).
@@ -1103,6 +1116,16 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
         }
     if returncode == 0 and not timed_out:
         return {"status": "passed_dynamic_oracle"}
+    if (stub_abort := parse_link_stub_abort(output)) is not None:
+        return {
+            "status": "guardrail_error",
+            "reason": (
+                f"Guardrail binary hit address-flow link stub {stub_abort['symbol']} "
+                f"(caller: {stub_abort.get('caller') or 'unknown'}): pipeline reach defect, not a contract violation."
+            ),
+            "failure": None,
+            "link_stub_abort": stub_abort,
+        }
     failure = parse_eacsl_failure(output)
     if failure is None and (abort := parse_eacsl_resource_abort(output)):
         return {

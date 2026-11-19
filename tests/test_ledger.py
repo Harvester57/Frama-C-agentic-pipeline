@@ -1142,3 +1142,52 @@ def test_ingest_wp_deduplicates_identical_unresolved_entries(run_dir, report_kw,
     assert u["status"] == "blocked"
     assert u["unresolved"] == expected
     assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_c5_ingest_fuzz_filters_link_stub_aborts_and_creates_no_candidates(run_dir):
+    """C5 / B4: link_stub_abort artifacts (structured or in replay_log_tail) create zero candidates and warn."""
+    seed(run_dir)
+    report = {
+        "module": "snmp",
+        "status": "crash_found",
+        "engine_used": "eacsl",
+        "artifacts": [
+            {
+                "artifact": "workspace/crashes/crash-stub-1",
+                "kind": "crash",
+                "sha256": "aaaa",
+                "reproducible": True,
+                "failure": None,
+                "fingerprint": None,
+                "link_stub_abort": {
+                    "symbol": "far_fn",
+                    "message": "FRAMAC_LINK_STUB_CALLED: far_fn (not in the unit split's address-flow reach)",
+                    "caller": "snmp_parse_pdu",
+                },
+                "replay_log_tail": "",
+            },
+            {
+                "artifact": "workspace/crashes/crash-stub-2",
+                "kind": "crash",
+                "sha256": "bbbb",
+                "reproducible": True,
+                "failure": None,
+                "fingerprint": None,
+                "replay_log_tail": (
+                    "FRAMAC_LINK_STUB_CALLED: other_fn (not in the unit split's address-flow reach)\n"
+                    "    #0 0x1 in __framac_link_stub_called link_stubs.c:16:3\n"
+                    "    #1 0x2 in ber_decode_tag src/snmp/ber.c:9:5\n"
+                ),
+            },
+        ],
+    }
+    rpt_path = run_dir / "workspace/reports/fuzz/snmp.json"
+    write_json(rpt_path, report)
+    stats = L.cmd_ingest_fuzz([rpt_path])
+    assert stats["candidates"] == 0
+    assert stats["link_stub_aborts"] == 2
+    assert any("link_stub_aborts:" in w and "far_fn" in w and "snmp_parse_pdu" in w for w in stats["warnings"])
+    assert any("other_fn" in w and "ber_decode_tag" in w for w in stats["warnings"])
+    assert load(run_dir / "candidates.json") == []
+    assert any(e["result"] == "fuzz_link_stub_abort" for e in _unit(run_dir, "rte")["evidence"])
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []

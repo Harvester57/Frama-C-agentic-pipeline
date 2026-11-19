@@ -817,7 +817,9 @@ def _is_target_frame(frame: re.Match[str]) -> bool:
     fn, file_ = frame.group("function"), frame.group("file")
     if not file_:
         return False
-    return not (is_runtime_function(fn, file_) or Path(file_).name.startswith("harness_") or is_harness_fuzz_function(fn))
+    return not (
+        is_runtime_function(fn, file_) or Path(file_).name.startswith("harness_") or is_harness_fuzz_function(fn)
+    )
 
 
 def _first_stack(frames: list[re.Match[str]], start: int) -> list[re.Match[str]]:
@@ -956,7 +958,9 @@ def parse_sanitizer_failure(text: str) -> dict | None:
                 ),
                 None,
             )
-        elif frames and frame is not frames[0] and frames[0].group("function").startswith(("__interceptor_", "__asan_")):
+        elif (
+            frames and frame is not frames[0] and frames[0].group("function").startswith(("__interceptor_", "__asan_"))
+        ):
             called = frames[0]
         if called is not None:
             pred += f" in {re.sub(r'^_+(?:interceptor|asan)_', '', called.group('function'))} from {fn}"
@@ -977,11 +981,69 @@ def parse_sanitizer_failure(text: str) -> dict | None:
     return _parse_leak_failure(text)
 
 
+# Address-flow link-stub abort (scripts/fuzz_build.py `link_stubs_source`): an aborting stub
+# emitted for a function outside the cluster's address-flow reach was reached at runtime.
+# Always a pipeline reach defect, never a target finding.
+_LINK_STUB_ABORT_RE = re.compile(
+    r"^FRAMAC_LINK_STUB_CALLED:\s+(?P<symbol>[A-Za-z_]\w*)(?P<rest>[^\r\n]*)",
+    re.MULTILINE,
+)
+
+_LINK_STUB_SKIP_FNS = frozenset(
+    {
+        "raise",
+        "abort",
+        "gsignal",
+        "__pthread_kill_implementation",
+        "pthread_kill",
+        "__framac_link_stub_called",
+        "__framac_write_all",
+    }
+)
+
+
+def parse_link_stub_abort(text: str) -> dict | None:
+    """
+    An address-flow link-stub abort (`FRAMAC_LINK_STUB_CALLED: <symbol> ...`): returns
+    `{symbol, message, caller}` or None. `caller` is the first non-runtime, non-stub,
+    non-harness target frame in the printed stack, or None when no stack was printed.
+    """
+    if not text:
+        return None
+    m = _LINK_STUB_ABORT_RE.search(text)
+    if not m:
+        return None
+    symbol = m.group("symbol")
+    message = m.group(0).strip()
+    caller: str | None = None
+    for frame in _STACK_FRAME_RE.finditer(text):
+        fn, fpath = frame.group("function"), frame.group("file") or ""
+        if (
+            is_runtime_function(fn, fpath)
+            or fn in _LINK_STUB_SKIP_FNS
+            or fn == symbol
+            or "::" in fn
+            or is_harness_fuzz_function(fn)
+            or fn in _PROCESS_FRAME_FNS
+            or (fpath and Path(fpath).name.startswith("harness_"))
+        ):
+            continue
+        cleaned = fn.removeprefix(_EACSL_GEN_PREFIX)
+        if cleaned == symbol:
+            continue
+        caller = cleaned
+        break
+    return {"symbol": symbol, "message": message, "caller": caller}
+
+
 def parse_runtime_failure(text: str, *, binary: str | Path | None = None) -> dict | None:
     """
     Parse an E-ACSL failure report, falling back to ASan/UBSan runtime failure parsing. `binary` is
-    the binary that printed `text`, when the caller ran it (parse_eacsl_failure).
+    the binary that printed `text`, when the caller ran it (parse_eacsl_failure). Returns None when
+    `parse_link_stub_abort(text)` matches so a link-stub abort never produces a target failure.
     """
+    if parse_link_stub_abort(text) is not None:
+        return None
     return parse_eacsl_failure(text, binary=binary) or parse_sanitizer_failure(text)
 
 
