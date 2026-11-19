@@ -80,6 +80,18 @@
         "tree_files": {"type": "integer", "minimum": 0},
         "executions": {"type": "integer", "minimum": 0},
         "probes_dropped": {"type": "integer", "minimum": 0},
+        "vanished_probes": {
+          "$comment": "Build-system probes dropped because their sources and outputs are all gone after the build (a hand-written configure's probe such as nginx's objs/autotest), one per output: repeated probes with the same output count once. Counted in probes_dropped.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "output": {"type": "string", "minLength": 1},
+              "sources": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["output", "sources"]
+          }
+        },
         "log": {"type": "string"},
         "events": {"type": "string"}
       },

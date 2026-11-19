@@ -100,6 +100,10 @@ CAPTURE_NAME = "build_capture.json"
 
 # phase0_model.py's fact sources -> the ledger's callgraph_source values.
 MODEL_SOURCES = {"frama-c-kernel": "frama_c", "gcc-callgraph-info": "gcc_callgraph"}
+# phase0_model.py's unit parse statuses for a unit Frama-C could not parse (its FRAMAC_FAILED): on the GCC
+# fallback, or unparsed (the fallback failed too, so the model has no function of it).
+PARSE_UNPARSED = "unparsed"
+FRAMAC_FAILED = ("gcc_fallback", PARSE_UNPARSED)
 
 
 def compute_topological_waves(
@@ -832,11 +836,14 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
     key_of = _model_key_of(model_fns)
     compiled = CompiledSources(capture)
     model_only = model_only_functions(model, capture)
+    # Units Frama-C could not parse: on the GCC fallback, or unparsed (the fallback failed too, so the
+    # model has no function of it).
     fallback_error = {
         n: (u.get("parse") or {}).get("error") or "Frama-C could not parse this unit"
         for n, u in units.items()
-        if (u.get("parse") or {}).get("status") == "gcc_fallback"
+        if (u.get("parse") or {}).get("status") in FRAMAC_FAILED
     }
+    unparsed = {n for n, u in units.items() if (u.get("parse") or {}).get("status") == PARSE_UNPARSED}
 
     # The partition: every source of a non-test unit, and every function's .c file.
     file_module: dict[str, str] = {}
@@ -983,6 +990,9 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             ),
             *(
                 f"unit {u}: Frama-C could not parse it, its call graph comes from GCC (-fcallgraph-info): {err}"
+                if u not in unparsed
+                else f"unit {u}: neither Frama-C nor the GCC fallback parsed it, so the model has no function "
+                f"of it: {err}; GCC: {(units[u].get('parse') or {}).get('gcc_error') or 'no error recorded'}"
                 for u, err in sorted(fallback_error.items())
             ),
             *(
@@ -1001,7 +1011,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
             "generated_at": model.get("generated_at"),
             "schema_version": model.get("schema_version", 1),
             "functions": len(model_fns),
-            "gcc_fallback_units": sorted(fallback_error),
+            "gcc_fallback_units": sorted(set(fallback_error) - unparsed),
             "missing_features": list(missing),
         },
         **({"trust": model["trust"]} if isinstance(model.get("trust"), dict) else {}),
@@ -1300,6 +1310,8 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             stack += units[lk].get("links") or []
         fns = sorted(members.get(u, []))
         if not fns:
+            if (rec.get("parse") or {}).get("status") == PARSE_UNPARSED:
+                continue  # no function of it in the model: model_view's warning names it
             # Every source belongs to an earlier unit (x509-parser's .so builds its .a's files).
             folded.append(f"unit {u}: compiles only sources of an earlier unit, analysed there")
             continue
@@ -1322,7 +1334,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "concurrent": bool(rec.get("concurrent")),
             **(
                 {"callgraph_fallback": (rec.get("parse") or {}).get("error") or "Frama-C could not parse this unit"}
-                if (rec.get("parse") or {}).get("status") == "gcc_fallback"
+                if (rec.get("parse") or {}).get("status") in FRAMAC_FAILED
                 else {}
             ),
             "files": sorted(f for f in sources if unit_of_file.get(f) == u),

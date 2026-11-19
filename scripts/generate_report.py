@@ -677,8 +677,9 @@ def fallback_lines(model: dict | None, ledger: list[dict]) -> list[str]:
     """
     Link units Frama-C could not parse (decision D2): their call graph comes from GCC, they are fuzzed
     with the sanitizers, and their Eva and WP units are deferred (`callgraph_fallback: ...` in the
-    ledger). One row per unit: Frama-C's first error and what was deferred. With `--alias`, the model's
-    Alias narrowing is summarized after it. Empty when no unit fell back and Alias was off.
+    ledger). One row per unit: Frama-C's first error and what was deferred. Units the GCC fallback could
+    not parse either (`unparsed`) come first, with both first errors. With `--alias`, the model's Alias
+    narrowing is summarized after it. Empty when no unit fell back or is unparsed and Alias was off.
     """
     if not isinstance(model, dict):
         return []
@@ -689,11 +690,33 @@ def fallback_lines(model: dict | None, ledger: list[dict]) -> list[str]:
         for name, u in sorted(units.items())
         if isinstance(u, dict) and (u.get("parse") or {}).get("status") == "gcc_fallback"
     }
+    # Units the GCC fallback could not parse either: no call graph at all, so nothing of them is analysed.
+    unparsed = {
+        name: (
+            str((u.get("parse") or {}).get("error") or "no error recorded"),
+            str((u.get("parse") or {}).get("gcc_error") or "no error recorded"),
+        )
+        for name, u in sorted(units.items())
+        if isinstance(u, dict) and (u.get("parse") or {}).get("status") == "unparsed"
+    }
     raw_alias = model.get("alias")
     alias: dict = raw_alias if isinstance(raw_alias, dict) else {}
-    if not fallback and not alias.get("enabled"):
+    if not fallback and not unparsed and not alias.get("enabled"):
         return []
     out = ["### Phase 0 parse", ""]
+    if unparsed:
+        out += [
+            "Link units neither Frama-C nor the GCC fallback could parse: the model has no function of them, "
+            "so nothing in them was fuzzed or analysed.",
+            "",
+            "| Unit | First Frama-C error | First GCC error |",
+            "| :--- | :--- | :--- |",
+        ]
+        out += [
+            f"| `{md_escape(name)}` | {md_escape(err)[:240]} | {md_escape(gcc)[:240]} |"
+            for name, (err, gcc) in unparsed.items()
+        ]
+        out.append("")
     if fallback:
         deferred: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for u in ledger:

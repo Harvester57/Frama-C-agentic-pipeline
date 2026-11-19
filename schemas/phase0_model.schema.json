@@ -78,10 +78,11 @@
           "parse": {
             "type": "object",
             "properties": {
-              "status": {"type": "string", "enum": ["ok", "gcc_fallback", "skipped_test", "no_sources"]},
+              "status": {"$comment": "`unparsed`: Frama-C failed and so did the GCC fallback, so the model has no function or edge of the unit (`gcc_fallback` says they came from GCC)", "type": "string", "enum": ["ok", "gcc_fallback", "unparsed", "skipped_test", "no_sources"]},
               "job": {"type": "string"},
               "seconds": {"type": "number", "minimum": 0},
-              "error": {"$comment": "Frama-C's first error, when the unit fell back to GCC", "type": "string"}
+              "error": {"$comment": "Frama-C's first error, when the unit fell back to GCC or is unparsed", "type": "string"},
+              "gcc_error": {"$comment": "The GCC fallback's first error, when the unit is unparsed", "type": "string"}
             },
             "required": ["status"]
           },
