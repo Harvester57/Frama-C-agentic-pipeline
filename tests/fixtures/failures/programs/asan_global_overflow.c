@@ -2,9 +2,11 @@
 
 int table[8];
 
+/* Through a pointer: UBSan's bounds check reports an index into the declared array first, and ASan never would. */
 static int global_overflow(int i)
 {
-    return table[i];
+    const int *p = table;
+    return p[i];
 }
 
 int main(int argc, char **argv)
