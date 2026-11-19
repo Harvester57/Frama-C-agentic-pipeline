@@ -26,7 +26,8 @@
           "callee": {"type": "string", "minLength": 1},
           "callers": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
           "decl": {"$comment": "where its first declaration is, when the model knows", "type": "string"},
-          "assigns": {"$comment": "the assigns terms read at that declaration", "type": "array", "items": {"type": "string"}}
+          "stub": {"$comment": "workspace/stubs/<header>:<line>: the contract was read in the run's stub overlay (a filled or hand-written stub, which Frama-C finds before the real header), not at `decl`", "type": "string"},
+          "assigns": {"$comment": "the assigns terms read in that contract (`stub`, else `decl`)", "type": "array", "items": {"type": "string"}}
         },
         "required": ["callee", "callers"],
         "additionalProperties": false
@@ -68,7 +69,7 @@
             "items": {"$ref": "#/definitions/site"}
           },
           "declared_callees": {
-            "$comment": "a \\writing property (asset writers, auth state, monotonic invariant) takes what a declared callee writes from its `assigns`. Per property, the declared functions its targets call: `set_assigns` (an `assigns` holding \\union(...) or {a, b}, which stops MetAcsl: their callers are left out of the targets and listed under `unchecked`), `no_assigns` (no `assigns` at the first declaration: MetAcsl generates nothing for what they write, silently), `unknown` (the declaration could not be read)",
+            "$comment": "a \\writing property (asset writers, auth state, monotonic invariant) takes what a declared callee writes from its `assigns`. Per property, the declared functions its targets call: `set_assigns` (an `assigns` holding \\union(...) or {a, b}, which stops MetAcsl: their callers are left out of the targets and listed under `unchecked`), `no_assigns` (no `assigns` in the contract: the stub overlay's when it stubs the function, else the first declaration's; MetAcsl generates nothing for what they write, silently), `unknown` (the declaration could not be read)",
             "type": "object",
             "properties": {
               "set_assigns": {"$ref": "#/definitions/callee_list"},

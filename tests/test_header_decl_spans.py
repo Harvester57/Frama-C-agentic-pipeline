@@ -243,3 +243,22 @@ def test_contract_readers_see_a_contract_on_the_definition() -> None:
 def test_contract_text_of_a_header_function_joins_both_declarations() -> None:
     text = acsl_ast.function_contract_text(on_def(on_proto(UB_H)), "Reset", True)
     assert "valid(pUOutBuf)" in text and "valid(pMe)" in text
+
+
+def test_a_prototype_with_trailing_attributes_is_a_declaration() -> None:
+    """
+    nginx run-5 stub overlay: Frama-C prints glibc's `crypt_r` as `extern __attribute__((__nothrow__)) char
+    *crypt_r(...) __attribute__((__leaf__));`, and scripts/stub_gen.py copies that prototype into the stub.
+    The attributes (and an asm label) after the parameters do not end the declaration.
+    """
+    contract = "/*@ assigns *d; */\n"
+    for suffix in (
+        " __attribute__(( __leaf__))",
+        ' __asm__ ("" "crypt_r2")',
+        " __attribute__((a)) __attribute__((b(1, 2)))",
+    ):
+        text = f"{contract}extern  __attribute__((__nothrow__)) char *crypt_r(char const *p, int *d){suffix};\n"
+        spans = function_declaration_spans(text, "crypt_r")
+        assert [d.kind for d in spans] == ["prototype"], suffix
+        assert spans[0].span.text.startswith("/*@") and spans[0].span.text.endswith(";")
+        assert acsl_ast.has_function_contract(text, "crypt_r", is_header=True)
