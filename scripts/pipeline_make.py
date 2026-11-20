@@ -422,6 +422,12 @@ class ModulePlan:
     tune_timeout: int | None = None
     # Why the ladder is not searched although the base run left Unknowns (eva_options.tuning_skip_reason).
     tune_skip: str | None = None
+    # The base run aborted on a recursive call without an assigns clause and only finished on
+    # run_eva_slice.py's retry with the downgrade (`auto_recursion_fallback`): the rungs and the loop
+    # trials of `finish` start with that same downgrade (EVA_TUNE_RECURSION_FALLBACK_<mod>) instead of
+    # repeating a first attempt bound to abort. Not a setting: it follows the last base run, never
+    # enters the settings digest, and the base run itself keeps detecting the recursion.
+    tune_recursion_fallback: bool = False
     loop_unroll: int = field(default_factory=lambda: loop_unroll_level(None))
     # A recorded decision current for these settings and the last base run's inputs: `eva-<mod>` then
     # replays the tuning (base run, recorded rungs, combination) instead of one run of the selected options.
@@ -454,6 +460,7 @@ class ModulePlan:
             **({"engine_reason": self.engine_reason} if self.engine_reason else {}),
             "tune_rungs": list(self.tune_rungs),
             **({"tune_skip": self.tune_skip} if self.tune_skip else {}),
+            **({"tune_recursion_fallback": True} if self.tune_recursion_fallback else {}),
             "eva_replay": self.eva_replay,
             **({"eva_shards": [list(s) for s in self.shards]} if self.shards else {}),
             **({"eva_security_props": self.eva_security[0]} if self.eva_security else {}),
@@ -937,6 +944,12 @@ def _plan_tuning(plan: Plan, mod: ModulePlan) -> None:
     if not isinstance(base, dict) or base.get("status") != "ok" or not _has_target_unknowns(base):
         return
     mod.tune_timeout = trial_timeout(base.get("elapsed_s"), mod.params.get("eva_timeout"))
+    # The same downgrade the base run's retry applied, so every rung and loop trial is the analysis the
+    # base run is (same reduced_checks: eva_tuning.analysis_identity) without first aborting on the
+    # recursion under the rung limit. With the module switch on, eva_args passes the flag already.
+    mod.tune_recursion_fallback = base.get("auto_recursion_fallback") is True and not mod.params.get(
+        "eva_recursion_fallback"
+    )
     record = mod.params.get("eva_tuned")
     if record is not None and record_is_current(record, mod.settings_digest, base.get("input_digest")):
         # Recorded rungs finished here before: they replay (from the cache) whatever the base run took.
@@ -1365,6 +1378,8 @@ def _eva_tuning_lines(mod: ModulePlan) -> list[str]:
         _assign(f"EVA_TUNE_RUNGS_{n}", " ".join(mod.tune_rungs)),
         _assign(f"EVA_TUNE_SKIP_{n}", mk_quote(mod.tune_skip) if mod.tune_skip else ""),
         _assign(f"EVA_REPLAY_{n}", "1" if mod.eva_replay else ""),
+        # Only when the base run needed the recursion retry: other modules get the modules.mk they always got.
+        *([_assign(f"EVA_TUNE_RECURSION_FALLBACK_{n}", "1")] if mod.tune_recursion_fallback else []),
     ]
     for rung, options in mod.tune_rungs.items():
         lines.append(_assign(f"EVA_RUNG_OPTIONS_{n}__{rung}", _option_words(options)))
