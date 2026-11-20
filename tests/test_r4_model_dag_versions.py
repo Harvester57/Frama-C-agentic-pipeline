@@ -197,6 +197,8 @@ def _v2_model() -> dict:
         writes={"pointer": 1, "params": ["p"], "globals": []},
         call_sites=[{"callee": "memcpy", "line": 3, "literals": {}}],
         trust={"value": "untrusted", "source": "default", "sources": ["default"], "boundary": True, "reasons": []},
+        address_refs=[],
+        global_refs=[],
     )
     return model
 
@@ -218,16 +220,17 @@ def test_model_features_read_a_version_1_model_by_its_fields():
         "kernel_names",
         "param_sizes",
         "call_sites",
+        "address_flow",
     ]
     old = _v1_model()
     old["functions"]["src/a.c#grow"].update(
         external_calls=[], kernel_names={}, param_sizes={"0": {"min": 1, "max": 1, "sites": 1}}
     )
     old["trust"] = {"threat_model": {"status": "no_threat_model"}}
-    assert pm.missing_features(old) == ["formals", "writes", "call_sites"]
+    assert pm.missing_features(old) == ["formals", "writes", "call_sites", "address_flow"]
     # A GCC-fallback function never has formals or writes: it does not count for them.
     old["functions"]["src/b.c#gcc"] = _model_fn("src/b.c", "gcc", source="gcc-callgraph-info", formals=[])
-    assert pm.missing_features(old) == ["formals", "writes", "call_sites"]
+    assert pm.missing_features(old) == ["formals", "writes", "call_sites", "address_flow"]
 
 
 def test_model_features_of_a_version_2_model_and_of_no_model():
@@ -261,7 +264,9 @@ def test_the_dag_records_its_schema_version_and_drops_unread_module_fields(tmp_p
     mod = dag["modules"]["liba_a"]
     assert "provable_functions" not in mod and "shell_unverifiable_functions" not in mod
     assert not {"cross_module_callees", "entry_trust"} & set(mod)
-    assert "indirect_callees" not in dag["functions"]["grow"]
+    # `indirect_callees` comes back for the unit split, only with the model's address-flow facts.
+    assert dag["functions"]["grow"]["indirect_callees"] == []
+    assert "indirect_callees" not in bcd.build_dag(tmp_path, _v1_model())["functions"]["grow"]
     # A DAG that never went through block_fallback_units (held modules) has no version.
     assert "schema_version" not in bcd.build_dag(tmp_path, _v2_model(), units=False)
     assert bcd.block_fallback_units({"modules": {}})["schema_version"] == bcd.DAG_SCHEMA_VERSION

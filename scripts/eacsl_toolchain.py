@@ -939,6 +939,55 @@ def _ends_declarator(line: str, at: int) -> bool:
     return rest[:1] in (";", ",", "=")
 
 
+_SYNC_OVERLOAD_NAMES = (
+    "__sync_add_and_fetch",
+    "__sync_and_and_fetch",
+    "__sync_bool_compare_and_swap",
+    "__sync_fetch_and_add",
+    "__sync_fetch_and_and",
+    "__sync_fetch_and_nand",
+    "__sync_fetch_and_or",
+    "__sync_fetch_and_sub",
+    "__sync_fetch_and_xor",
+    "__sync_lock_release",
+    "__sync_lock_test_and_set",
+    "__sync_nand_and_fetch",
+    "__sync_or_and_fetch",
+    "__sync_sub_and_fetch",
+    "__sync_val_compare_and_swap",
+    "__sync_xor_and_fetch",
+)
+_SYNC_OVERLOAD_TOKEN_RE = re.compile(
+    r"/\*.*?\*/|//[^\n]*|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'"
+    rf"|\b(?P<base>{'|'.join(_SYNC_OVERLOAD_NAMES)})_u?int(?:8|16|32|64)_t(?=\s*\()",
+    re.DOTALL,
+)
+
+
+def rewrite_sync_builtins(c_text: str) -> tuple[str, int]:
+    """
+    Work around Frama-C's `gcc_builtins.json` lowering of GCC's polymorphic `__sync_*` atomic
+    builtins: Frama-C resolves `__sync_bool_compare_and_swap(ptr, ...)` to a synthetic typed
+    name like `__sync_bool_compare_and_swap_uint64_t` and prints that name into E-ACSL output,
+    where clang compiles it as an undeclared/implicit call and `ld` fails with an undefined
+    reference (nginx `ngx_spinlock`). Restore the original polymorphic `__sync_*` name on calls
+    (leaving comments and string literals untouched). Returns `(new_text, rewrite_count)`.
+    """
+    if "__sync_" not in c_text:
+        return c_text, 0
+    count = 0
+
+    def _sub(m: re.Match[str]) -> str:
+        nonlocal count
+        base = m.group("base")
+        if base is None:
+            return m.group(0)
+        count += 1
+        return base
+
+    return _SYNC_OVERLOAD_TOKEN_RE.sub(_sub, c_text), count
+
+
 def rewrite_trailing_alignas(c_text: str) -> tuple[str, int]:
     """
     Work around a Frama-C kernel printer bug (35.0~~dev): it prints the alignment specifier of a

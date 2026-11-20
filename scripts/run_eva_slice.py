@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
 import phase0_gates  # noqa: E402
+import unit_split  # noqa: E402
 from eva_flamegraph import cost_profile, fold_flamegraph  # noqa: E402
 from eva_loops import LoopRef, parse_loop_ref, prepare_mirror, strip_mirror  # noqa: E402
 from eva_options import extra_domains as option_domains  # noqa: E402
@@ -100,6 +101,7 @@ from framac_common import (  # noqa: E402
     normalize_flag_args,
     parse_missing_spec,
     read_report_csv,
+    resolve_flows,
     scan_undeclared_functions,
     spill_large_flows,
     stub_repair_action,
@@ -1002,6 +1004,7 @@ def run_eva_on_slice(
     flamegraph: bool = True,
     security_props: str | None = None,
     module: str = "",
+    dag_path: Path | str | None = None,
 ) -> dict:
     """
     `eva_options` are allowlisted tuning values; `loop_unroll` analyses a mirror of the sources at
@@ -1009,7 +1012,9 @@ def run_eva_on_slice(
     False keeps a timeout a timeout (tuning trials: a less precise fallback result cannot help there).
     `flamegraph` False leaves out -eva-flamegraph (tuning trials: nobody reads their profile).
     `security_props` is the security_props.json to load MetAcsl properties from (resolve_security_props
-    gives a command line's default; None: none), `module` names the meta file written for them.
+    gives a command line's default; None: none), `module` names the meta file written for them and
+    enables the address-flow soundness gate (`dag_path`, default `workspace/reports/callgraph_dag.json`
+    when it exists) for `address_flow` unit-split clusters.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1017,6 +1022,9 @@ def run_eva_on_slice(
     problem = options_problem(options)
     if problem:
         raise ValueError(problem)
+    resolved_dag: Path | str | None = dag_path
+    if resolved_dag is None and module and DEFAULT_DAG_PATH.is_file():
+        resolved_dag = DEFAULT_DAG_PATH
     csv_path = out_dir / "alarms.csv"
     red_csv = out_dir / "red_alarms.csv"
     sav_path = out_dir / "framac.sav"
@@ -1099,7 +1107,7 @@ def run_eva_on_slice(
 
     def _run() -> dict:
         res = _attempt(active)
-        if active and res["status"] == "analysis_error" and res.get("reason") != "stub_assigns_without_from":
+        if active and res["status"] == "analysis_error" and res.get("reason") not in _NON_RETRYABLE_REASONS:
             # Frama-C failed with the properties loaded (a property MetAcsl cannot type aborts it):
             # the module still gets its RTE result, from the run without them, and the report says so.
             failed_log = _keep_meta_failed_log(out_dir)
@@ -1136,7 +1144,8 @@ def run_eva_on_slice(
         )
 
         def _exec(run_cmd: list[str], run_reduced: list[str], run_timeout: int | None) -> dict:
-            # Every run (base, recursion retry, fallback tier) fails on a contract without \from.
+            # Every run (base, recursion retry, fallback tier) fails on a contract without \from
+            # or an address-flow cluster gap (missing project body / missing project global).
             out = _execute_eva(
                 run_cmd,
                 eff_sources,
@@ -1147,7 +1156,11 @@ def run_eva_on_slice(
                 path_root=path_root,
                 **({"security_meta": loaded} if loaded else {}),
             )
-            return reject_stub_from_defects(out, out_dir)
+            out = reject_stub_from_defects(out, out_dir)
+            if module and resolved_dag is not None:
+                gate_sources = [*sources, *(loaded.get("extra_sources") or [])] if loaded else list(sources)
+                out = reject_address_flow_gaps(out, out_dir, module, resolved_dag, gate_sources)
+            return out
 
         cur_allow_rec = allow_incomplete_recursion_specs
         cur_cmd, cur_reduced = (
@@ -1162,7 +1175,7 @@ def run_eva_on_slice(
         if (
             res["status"] == "analysis_error"
             and not cur_allow_rec
-            and res.get("reason") != "stub_assigns_without_from"
+            and res.get("reason") not in _NON_RETRYABLE_REASONS
             and _recursion_retry_applies(out_dir / "eva.log")
         ):
             cur_allow_rec = True
@@ -1187,7 +1200,7 @@ def run_eva_on_slice(
                 if (
                     fb_res["status"] == "analysis_error"
                     and not cur_allow_rec
-                    and fb_res.get("reason") != "stub_assigns_without_from"
+                    and fb_res.get("reason") not in _NON_RETRYABLE_REASONS
                     and _recursion_retry_applies(out_dir / "eva.log")
                 ):
                     cur_allow_rec = True
@@ -1224,6 +1237,9 @@ def run_eva_on_slice(
             if field:
                 result[field] = str(out_dir / name) if name in restored else None
         result["sav_file"] = None
+        if module and resolved_dag is not None:
+            gate_sources = [*sources, *(active.get("extra_sources") or [])] if active else list(sources)
+            result = reject_address_flow_gaps(result, out_dir, module, resolved_dag, gate_sources)
         return result
 
     # The output files are not part of the analysis: the same analysis is one entry wherever it writes.
@@ -1517,6 +1533,191 @@ def reject_stub_from_defects(res: dict, out_dir: Path) -> dict:
     if res.get("status") in ("ok", "analysis_error"):
         res["status"] = "analysis_error"
         res["reason"] = "stub_assigns_without_from"
+    res["error_summary"] = (lines + [x for x in res.get("error_summary") or [] if x not in lines])[:20]
+    return res
+
+
+DEFAULT_DAG_PATH = Path("workspace/reports/callgraph_dag.json")
+_FLOW_BASE_IDENT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)")
+_NON_RETRYABLE_REASONS = frozenset(
+    {"stub_assigns_without_from", "address_flow_missing_body", "address_flow_missing_global"}
+)
+
+
+def _normalize_source_path(path: str, mirror_root: str | None = None) -> str:
+    """Normalize a slice source path to a repo-relative POSIX path."""
+    p = str(path or "").replace("\\", "/").strip()
+    if not p:
+        return ""
+    p = posixpath.normpath(p)
+    prefixes: list[str] = []
+    if mirror_root:
+        root = posixpath.normpath(str(mirror_root).replace("\\", "/").strip()).rstrip("/")
+        if root and root != ".":
+            prefixes.append(root + "/")
+    prefixes.extend(("/framac-run/", "/target/", "workspace/work/", "./"))
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if p.startswith(prefix):
+                p = p[len(prefix) :]
+                changed = True
+    if "/workspace/work/" in p:
+        p = p.split("/workspace/work/", 1)[1]
+    p = p.lstrip("/")
+    return "" if p == "." else p
+
+
+def _flow_read_identifiers(res: dict) -> set[str]:
+    """Base variable identifiers read in Eva's `-inout` report for `main_fn` (or all functions if absent)."""
+    flows = res.get("flows")
+    if isinstance(flows, dict) and "by_function" not in flows and flows.get("flows_file"):
+        flows = resolve_flows(flows)
+    by_function = flows.get("by_function") if isinstance(flows, dict) else None
+    if not isinstance(by_function, dict) or not by_function:
+        return set()
+    main_fn = str(res.get("main_fn") or "eva_main")
+    main_entry = by_function.get(main_fn)
+    entries = (
+        [main_entry]
+        if isinstance(main_entry, dict)
+        else [entry for entry in by_function.values() if isinstance(entry, dict)]
+    )
+    idents: set[str] = set()
+    for entry in entries:
+        for field in ("inputs", "operational_inputs", "operational_inputs_on_termination"):
+            locs = entry.get(field)
+            if not isinstance(locs, list):
+                continue
+            for loc in locs:
+                if not isinstance(loc, str):
+                    continue
+                m = _FLOW_BASE_IDENT_RE.match(loc)
+                if m:
+                    idents.add(m.group(1))
+    return idents
+
+
+def reject_address_flow_gaps(
+    res: dict,
+    out_dir: Path,
+    module: str,
+    dag_path: Path | str | None,
+    sources: list[str],
+) -> dict:
+    """
+    Soundness gate for `address_flow` unit-split clusters (correction plan step C6):
+    fail loudly when Eva calls a project function without a body or reads a non-static project
+    global whose defining `.c` file was omitted from `sources`. Active only when `module` is a DAG
+    submodule with `reach == "address_flow"`.
+    """
+    if not module or dag_path is None:
+        return res
+    path = Path(dag_path)
+    if not path.is_file():
+        return res
+    try:
+        dag = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return res
+    if not isinstance(dag, dict):
+        return res
+    submodules = dag.get("submodules")
+    if not isinstance(submodules, dict):
+        return res
+    sub = submodules.get(module)
+    if not isinstance(sub, dict) or sub.get("reach") != unit_split.REACH_FLOW:
+        return res
+
+    lines: list[str] = []
+
+    # 1. Missing project function bodies (Eva's `Neither code nor ...` on unit / linked_modules functions).
+    unit = str(sub.get("unit") or "")
+    _, closure_keys = unit_split.unit_closure_keys(dag, unit) if unit else ([], [])
+    raw_functions = dag.get("functions")
+    functions: dict = raw_functions if isinstance(raw_functions, dict) else {}
+    project_fns: dict[str, list[tuple[str, dict]]] = {}
+    for key in closure_keys:
+        rec = functions.get(key)
+        if not isinstance(rec, dict) or rec.get("is_static"):
+            continue
+        fname = str(rec.get("name") or key.rpartition("#")[2] or key)
+        if fname:
+            project_fns.setdefault(fname, []).append((key, rec))
+
+    log_text = _read_log(Path(res.get("log_file") or out_dir / "eva.log"))
+    seen_specs: dict[str, list[str]] = {}
+    for spec in missing_spec_messages(log_text):
+        if spec.benign or not spec.function or spec.function not in project_fns:
+            continue
+        bucket = seen_specs.setdefault(spec.function, [])
+        for kind in spec.missing or ("specification",):
+            if kind not in bucket:
+                bucket.append(kind)
+
+    missing_bodies: list[dict] = []
+    for fname in sorted(seen_specs):
+        entries = project_fns[fname]
+        keys = sorted({k for k, _ in entries})
+        files = sorted(
+            {
+                f
+                for _, rec in entries
+                for f in (unit_split._defining_c_files(rec) or ([str(rec["file"])] if rec.get("file") else []))
+                if f
+            }
+        )
+        missing = seen_specs[fname]
+        missing_bodies.append({"function": fname, "keys": keys, "files": files, "missing": missing})
+        where = f" (defined in {', '.join(files)})" if files else ""
+        lines.append(
+            f"address-flow cluster {module!r}: project function {fname!r}{where} has no body in Eva "
+            f"(missing {', '.join(missing)}); add its defining source to the slice or fix address_flow reach"
+        )
+
+    # 2. Missing non-static project globals read by Eva without their defining `.c` file compiled.
+    read_idents = _flow_read_identifiers(res)
+    mirror_root = res.get("mirror_root") if isinstance(res.get("mirror_root"), str) else None
+    norm_sources = {norm for s in sources if (norm := _normalize_source_path(s, mirror_root=mirror_root))}
+    global_vars = dag.get("global_variables")
+    globals_by_name: dict[str, list[tuple[str, list[str]]]] = {}
+    if isinstance(global_vars, dict) and read_idents:
+        for gid, grec in global_vars.items():
+            if not isinstance(grec, dict) or grec.get("static"):
+                continue
+            def_files = [norm for f in unit_split._defining_c_files(grec) if (norm := _normalize_source_path(f))]
+            if not def_files:
+                continue
+            gname = str(grec.get("name") or str(gid).rpartition("#")[2] or gid)
+            if gname:
+                globals_by_name.setdefault(gname, []).append((str(gid), def_files))
+
+    missing_globals: list[dict] = []
+    for gname in sorted(read_idents):
+        g_entries = globals_by_name.get(gname)
+        if not g_entries:
+            continue
+        all_def_files = sorted({f for _, dfs in g_entries for f in dfs})
+        if any(f in norm_sources for f in all_def_files):
+            continue
+        ids = sorted({gid for gid, _ in g_entries})
+        missing_globals.append({"global": gname, "ids": ids, "files": all_def_files})
+        lines.append(
+            f"address-flow cluster {module!r}: project global {gname!r} (defined in {', '.join(all_def_files)}) "
+            "is read in Eva without its defining source compiled (extern globals are silently zero-initialized); "
+            "add its defining source to the slice or fix address_flow reach"
+        )
+
+    if not missing_bodies and not missing_globals:
+        return res
+    if missing_bodies:
+        res["missing_project_bodies"] = missing_bodies
+    if missing_globals:
+        res["missing_project_globals"] = missing_globals
+    if res.get("status") == "ok":
+        res["status"] = "analysis_error"
+        res["reason"] = "address_flow_missing_body" if missing_bodies else "address_flow_missing_global"
     res["error_summary"] = (lines + [x for x in res.get("error_summary") or [] if x not in lines])[:20]
     return res
 
@@ -2054,6 +2255,13 @@ def main(argv: list[str] | None = None) -> int:
     # result describes these sources, so it gets the stamp of the harness that is current now).
     harness = phase0_gates.harness_digest(Path("."), args.module, ignore_exempt=True) if args.module else None
     props = resolve_security_props(args.security_props)
+    # Only pass security_props when a file exists; pass module whenever set so address-flow
+    # soundness checks run inside _exec before the cache decides whether to store the entry.
+    extra_slice_kwargs: dict = {}
+    if props:
+        extra_slice_kwargs["security_props"] = props
+    if props or args.module:
+        extra_slice_kwargs["module"] = args.module
     res = run_eva_on_slice(
         sources=args.sources,
         main_fn=args.main,
@@ -2073,9 +2281,14 @@ def main(argv: list[str] | None = None) -> int:
         mirror_root=args.mirror_root,
         timeout_fallback=not args.no_timeout_fallback,
         flamegraph=not args.no_flamegraph,
-        # Only with a file to load, so a run without one is called exactly as before.
-        **({"security_props": props, "module": args.module} if props else {}),
+        **extra_slice_kwargs,
     )
+    if args.module and DEFAULT_DAG_PATH.is_file():
+        sec = res.get("security_props")
+        extra_sources = list(sec.get("extra_sources") or []) if isinstance(sec, dict) else []
+        res = reject_address_flow_gaps(
+            res, args.out_dir, args.module, DEFAULT_DAG_PATH, [*args.sources, *extra_sources]
+        )
     res["module"] = args.module
     res["harness_digest"] = harness
     disk_res = spill_large_flows(res, args.out_dir / "flows.json", report_path=args.out_json)
@@ -2096,6 +2309,16 @@ def main(argv: list[str] | None = None) -> int:
                 "surviving_unknown_functions": res["surviving_unknown_functions"],
                 **({"timeout_fallback": res["timeout_fallback"]} if res.get("timeout_fallback") else {}),
                 **({"cost_profile": res["cost_profile"]} if res.get("cost_profile") else {}),
+                **(
+                    {"missing_project_bodies": res["missing_project_bodies"]}
+                    if res.get("missing_project_bodies")
+                    else {}
+                ),
+                **(
+                    {"missing_project_globals": res["missing_project_globals"]}
+                    if res.get("missing_project_globals")
+                    else {}
+                ),
                 **(
                     {
                         "security_props": {

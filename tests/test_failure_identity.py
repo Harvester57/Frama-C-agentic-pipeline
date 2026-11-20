@@ -82,3 +82,42 @@ def test_failure_identity_does_not_import_run_eacsl_fuzz() -> None:
         text = (scripts / name).read_text(encoding="utf-8")
         assert "import run_eacsl_fuzz" not in text, name
         assert "from run_eacsl_fuzz" not in text, name
+
+
+def test_c5_parse_link_stub_abort_asan_and_eacsl_excerpts() -> None:
+    """C5 / B4: FRAMAC_LINK_STUB_CALLED parses symbol/caller and returns None from parse_runtime_failure."""
+    assert R.parse_link_stub_abort is failure_identity.parse_link_stub_abort
+
+    asan_stderr = (
+        "FRAMAC_LINK_STUB_CALLED: far_fn (not in the unit split's address-flow reach)\n"
+        "==42== ERROR: libFuzzer: deadly signal\n"
+        "    #0 0x555555612340 in __sanitizer_print_stack_trace (/tmp/fuzz_m+0xbe340)\n"
+        "    #1 0x5555555aa001 in fuzzer::PrintStackTrace() (/tmp/fuzz_m+0x56001)\n"
+        "    #2 0x7ffff7c42520 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x42520)\n"
+        "    #3 0x7ffff7c28898 in abort (/lib/x86_64-linux-gnu/libc.so.6+0x28898)\n"
+        "    #4 0x555555640110 in __framac_link_stub_called workspace/build/fuzz_m_link_globals/link_stubs.c:16:3\n"
+        "    #5 0x555555640200 in api_entry workspace/work/src/a.c:12:5\n"
+        "    #6 0x555555640300 in LLVMFuzzerTestOneInput workspace/harnesses/harness_m.c:40:3\n"
+    )
+    stub = failure_identity.parse_link_stub_abort(asan_stderr)
+    assert stub == {
+        "symbol": "far_fn",
+        "message": "FRAMAC_LINK_STUB_CALLED: far_fn (not in the unit split's address-flow reach)",
+        "caller": "api_entry",
+    }
+    assert failure_identity.parse_runtime_failure(asan_stderr) is None
+
+    eacsl_stderr = (
+        "FRAMAC_LINK_STUB_CALLED: far_fn (not in the unit split's address-flow reach)\n"
+        "==99== ERROR: libFuzzer: deadly signal\n"
+        "    #0 0x555555511000 in fuzzer::PrintStackTrace() (/tmp/fuzz_m.e-acsl+0x11000)\n"
+        "    #1 0x555555540000 in __framac_link_stub_called /tmp/fuzz_m.instrumented.c:55:3\n"
+        "    #2 0x555555540050 in __gen_e_acsl_api_entry /tmp/fuzz_m.instrumented.c:120:7\n"
+        "    #3 0x555555540090 in LLVMFuzzerTestOneInput /tmp/fuzz_m.instrumented.c:200:3\n"
+    )
+    stub_eacsl = failure_identity.parse_link_stub_abort(eacsl_stderr)
+    assert stub_eacsl is not None and stub_eacsl["symbol"] == "far_fn" and stub_eacsl["caller"] == "api_entry"
+    assert failure_identity.parse_runtime_failure(eacsl_stderr) is None
+
+    # Non-anchored mention inside target text must not match.
+    assert failure_identity.parse_link_stub_abort("note: FRAMAC_LINK_STUB_CALLED: far_fn\n") is None

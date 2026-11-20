@@ -215,9 +215,7 @@ POINTER_BYTES = 8  # x86_64, as SCALAR_BYTES
 FUZZ_COPY = "FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off)"
 # Initializer names: QCBORDecode_Init, UsefulOutBuf_Init, ctx_init, foo_new, bar_create, and
 # `<lib>_new_<kind>` (libmodbus's modbus_new_tcp, modbus_new_rtu): `new`/`create` as a whole word.
-_INIT_NAME_RE = re.compile(
-    r"(?:^|(?<=[a-z0-9_]))Init(?=[A-Z0-9_]|$)|(?:^|_)(?:init|new|create)(?:$|_)"
-)
+_INIT_NAME_RE = re.compile(r"(?:^|(?<=[a-z0-9_]))Init(?=[A-Z0-9_]|$)|(?:^|_)(?:init|new|create)(?:$|_)")
 # Out-parameter constructor names (`H **` written by the call): the initializer names, and parsers and
 # adders (c-ares's ares_dns_record_create, ares_init, ares_dns_parse, ares_dns_record_rr_add).
 _OUT_CTOR_NAME_RE = re.compile(rf"{_INIT_NAME_RE.pattern}|(?:^|_)(?:create|new|alloc|parse|add)(?:$|_)")
@@ -300,6 +298,7 @@ ALLOCATORS = frozenset({"malloc", "calloc", "realloc", "reallocarray", "strdup",
 def _words(name: str | None) -> list[str]:
     """The lowercase words of an identifier (`max_message_nodes`, `maxNodes`, `mpack_expect_cstr`)."""
     return [w.lower() for w in _NAME_WORD_RE.findall(name or "")]
+
 
 # Byte size of the scalars a slot can hold (x86_64): a seed needs it to lay out the input.
 SCALAR_BYTES = {
@@ -474,6 +473,8 @@ class ApiInfo:
     const_returns: set[str] = field(default_factory=set)
     allocating: set[str] = field(default_factory=set)
     limits: dict[str, set[str]] = field(default_factory=dict)
+    # Per struct type, notes explaining cross-cluster initializers skipped for exceeding cluster limits.
+    init_skip_notes: dict[str, list[str]] = field(default_factory=dict)
     # Per function, parameter index -> (">=" or "<=", constant) of a lone range bound (`bound_forwards`).
     bounds: dict[str, dict[int, tuple[str, str]]] = field(default_factory=dict)
 
@@ -960,7 +961,9 @@ def _return_type(rec: dict) -> str:
     return " ".join(parts[0].split()) if parts else ""
 
 
-def _realloc_like(name: str, params: list[dict], formals: list[dict], rec: dict, api: ApiInfo) -> tuple[list[int], list[int]] | None:
+def _realloc_like(
+    name: str, params: list[dict], formals: list[dict], rec: dict, api: ApiInfo
+) -> tuple[list[int], list[int]] | None:
     """
     (used-size indices, new-size indices) of a realloc-like function (rule E), or None: named like
     `*_realloc`, a writable `void *` first, then only integers, at least one of them a new size, a
@@ -1034,7 +1037,11 @@ def _domain_rules(
             if params[i]["kind"] == "float":
                 case.decls.append(f"if ({a} != {a}) {{ {a} = 0; }} if ({b} != {b}) {{ {b} = {a}; }}")
             case.decls.append(f"if ({b} < {a}) {{ {ct} fc_t = {a}; {a} = {b}; {b} = fc_t; }}")
-            case.note(call, j, f"range bound: ordered after argument {i} (the API requires {_name(formals, i)} <= {_name(formals, j)})")
+            case.note(
+                call,
+                j,
+                f"range bound: ordered after argument {i} (the API requires {_name(formals, i)} <= {_name(formals, j)})",
+            )
             taken |= {i, j}
     # A': a lone bound forwarded to a range-like callee with a constant other bound (`bound_forwards`).
     for k, (op, const) in sorted((case.api.bounds.get(name) or {}).items()):
@@ -1049,7 +1056,11 @@ def _domain_rules(
         cmp = "<" if op == ">=" else ">"
         case.decls.append(f"if ({v} {cmp} {const}) {{ {v} = {const}; }}")
         side = "upper" if op == ">=" else "lower"
-        case.note(call, k, f"range bound: forwarded as the {side} bound of a range whose other bound is {const}: kept {op} {const}")
+        case.note(
+            call,
+            k,
+            f"range bound: forwarded as the {side} bound of a range whose other bound is {const}: kept {op} {const}",
+        )
     lengths = {i + 1: (ln, rest) for i, ln, rest in pairs}
     # B: a NUL-terminated output's capacity; a limit of an initializer or a limit setter.
     if set(_words(name)) & _CSTR_WORDS:
@@ -1084,7 +1095,9 @@ def _domain_rules(
         names = (case.api.enum_params.get(name) or {}).get(k)
         if not names:
             case.note(
-                call, k, "enum: its declared constants are not known (no layout probe, a flag enum, or not in the headers): passed as read"
+                call,
+                k,
+                "enum: its declared constants are not known (no layout probe, a flag enum, or not in the headers): passed as read",
             )
             continue
         v, ct, n = scalars[k], params[k]["ctype"], len(names)
@@ -1114,8 +1127,14 @@ def _realloc_rules(
         v, ct = scalars[k], params[k]["ctype"]
         case.decls.append(f"if ((unsigned long long){v} > {REALLOC_OLD_BYTES}ULL) {{ {v} = {REALLOC_OLD_BYTES}; }}")
         for m in new:
-            case.decls.append(f"if ((unsigned long long){v} > (unsigned long long){scalars[m]}) {{ {v} = ({ct}){scalars[m]}; }}")
-        case.note(call, k, f"used size of a realloc-like call: within the {REALLOC_OLD_BYTES}-byte old allocation and the new size")
+            case.decls.append(
+                f"if ((unsigned long long){v} > (unsigned long long){scalars[m]}) {{ {v} = ({ct}){scalars[m]}; }}"
+            )
+        case.note(
+            call,
+            k,
+            f"used size of a realloc-like call: within the {REALLOC_OLD_BYTES}-byte old allocation and the new size",
+        )
 
 
 def _scalar_array(p: dict) -> bool:
@@ -1339,6 +1358,9 @@ def _bind_call(
                     after.append(release)
                 i += 1
                 continue
+            if allow_init and not own_init and pointee in case.api.init_skip_notes:
+                for note_msg in case.api.init_skip_notes[pointee]:
+                    case.note(call, i, note_msg)
             j = _array_count(params, i, formals)
             # No array of the group may be an object the generator builds otherwise: shared with
             # another call, a handle, or a struct the unit initializes.
@@ -1360,7 +1382,7 @@ def _bind_call(
                     case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
                     if size and is_input:
                         case.slot(v, size, call, i, "bytes", addr=False)
-                    ln =f"c{call}a{i + 1}"
+                    ln = f"c{call}a{i + 1}"
                     case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
                     case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
                     case.decls.append(f"if ((unsigned long long){ln} > {buf}ULL) {{ {ln} = ({nxt['ctype']}){buf}; }}")
@@ -1369,8 +1391,12 @@ def _bind_call(
                     pairs.append((i, ln, False))
                 i += 2
                 continue
-            if charlike and size is None and is_input and pointee in ("char", "signed char") and (
-                case.rest is _RESERVED_REST
+            if (
+                charlike
+                and size is None
+                and is_input
+                and pointee in ("char", "signed char")
+                and (case.rest is _RESERVED_REST)
             ):
                 # A string of a call that may not take the rest (a constructor, `_construct`, or a
                 # lifecycle case's): a bounded input slot, NUL-terminated. A zeroed buffer would be the
@@ -1465,8 +1491,12 @@ def _bind_call(
                     what = f"{ARRAY_ELEMENTS} elements"
                 if is_input:
                     case.slot(f"{v}[0]", SCALAR_BYTES.get(pointee), call, i, "pointee")
-                case.note(call, i, f"{pointee} of no known size: an array of {what}, zeroed"
-                          + (", element 0 read from the input" if is_input else ""))
+                case.note(
+                    call,
+                    i,
+                    f"{pointee} of no known size: an array of {what}, zeroed"
+                    + (", element 0 read from the input" if is_input else ""),
+                )
                 bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
             else:
@@ -1929,8 +1959,72 @@ def path_parameter(rec: dict) -> str | None:
     return None
 
 
+class _ClusterInitBudget:
+    """
+    Size budget for selecting cross-cluster struct initializers/destructors on a within-limit
+    `address_flow` cluster (decision D2 / B7): prefer in-cluster candidates and reject any
+    cross-cluster helper whose combined `flow_reach(anchors + [cand])` exceeds the split limits.
+    """
+
+    def __init__(self, dag: dict, sub: dict) -> None:
+        import unit_split
+
+        self._unit_split = unit_split
+        self.dag_fns: dict[str, dict] = dag.get("functions") or {}
+        self.dag_gvars: dict[str, dict] = dag.get("global_variables") or {}
+        self.anchors: list[str] = list(sub.get("anchors") or [])
+        self.sub_fns: set[str] = set(sub.get("functions") or [])
+        self.sub_names: set[str] = {
+            str((self.dag_fns.get(k) or {}).get("name") or k.split("#")[-1]) for k in self.sub_fns
+        }
+        own_keys, all_keys = unit_split.unit_closure_keys(dag, str(sub.get("unit") or ""))
+        self.own_set: set[str] = set(own_keys)
+        self.within_all: set[str] = set(all_keys)
+        limits = dag.get("unit_split") or {}
+        self.max_functions: int = int(limits.get("max_functions") or unit_split.MAX_FUNCTIONS)
+        self.max_lines: int = int(limits.get("max_lines") or unit_split.MAX_LINES)
+        self._keys_by_name: dict[str, list[str]] = {}
+        for k in all_keys:
+            rec = self.dag_fns.get(k) or {}
+            if rec.get("is_static"):
+                continue
+            fn_name = str(rec.get("name") or k.split("#")[-1])
+            self._keys_by_name.setdefault(fn_name, []).append(k)
+        self._fits_cache: dict[str, bool] = {}
+
+    def in_cluster(self, name: str) -> bool:
+        return name in self.sub_names
+
+    def fits(self, name: str) -> bool:
+        if name in self.sub_names:
+            return True
+        if name in self._fits_cache:
+            return self._fits_cache[name]
+        cand_keys = self._keys_by_name.get(name) or []
+        if not cand_keys:
+            self._fits_cache[name] = True
+            return True
+        reached_all, _ = self._unit_split.flow_reach(
+            self.dag_fns, self.dag_gvars, [*self.anchors, *cand_keys], self.within_all
+        )
+        n_fns, n_lines = self._unit_split.unit_size(self.dag_fns, reached_all & self.own_set)
+        ok = n_fns <= self.max_functions and n_lines <= self.max_lines
+        self._fits_cache[name] = ok
+        return ok
+
+
+def _flow_cluster_budget(dag: dict, module: str) -> _ClusterInitBudget | None:
+    sub = (dag.get("submodules") or {}).get(module)
+    if not isinstance(sub, dict) or sub.get("reach") != "address_flow" or "over_limit" in sub:
+        return None
+    return _ClusterInitBudget(dag, sub)
+
+
 def struct_destructors(
-    functions: dict[str, dict], visible: set[str] | None = None
+    functions: dict[str, dict],
+    visible: set[str] | None = None,
+    *,
+    cluster_budget: _ClusterInitBudget | None = None,
 ) -> tuple[dict[str, str], dict[str, set[str]]]:
     """
     Per struct type, the destructor that releases a struct object an initializer set up, and every
@@ -1938,7 +2032,8 @@ def struct_destructors(
     parameter, a non-const pointer to that struct (`mpack_error_t mpack_writer_destroy(mpack_writer_t
     *)`). `functions` are the model's records the harness links (the unit's); a header `static` one
     counts only when the layout probe saw it declared (`visible`), and with a probe every one must be.
-    Several candidates: the first name.
+    Several candidates: in-cluster first when `cluster_budget` is set (rejecting cross-cluster ones
+    exceeding the cluster limit), else the first name.
     """
     names: dict[str, set[str]] = {}
     for key, rec in functions.items():
@@ -1959,11 +2054,24 @@ def struct_destructors(
         pointee = str(params[0].get("pointee") or "")
         if _is_record(pointee) and "*" not in pointee:
             names.setdefault(pointee, set()).add(name)
-    return {t: min(n) for t, n in names.items()}, names
+    chosen: dict[str, str] = {}
+    for t, ns in names.items():
+        if cluster_budget is not None:
+            fitting = [n for n in ns if cluster_budget.fits(n)]
+            if fitting:
+                chosen[t] = min(fitting, key=lambda n: (not cluster_budget.in_cluster(n), n))
+        else:
+            chosen[t] = min(ns)
+    return chosen, names
 
 
 def initializers(
-    functions: dict[str, dict], traces: list[list[dict]] | None = None, visible: set[str] | None = None
+    functions: dict[str, dict],
+    traces: list[list[dict]] | None = None,
+    visible: set[str] | None = None,
+    *,
+    cluster_budget: _ClusterInitBudget | None = None,
+    skipped_notes: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, str], dict[str, set[str]], dict[str, dict]]:
     """
     Per struct type, the initializer the harness calls on a pointer to it, and every candidate: a
@@ -1975,7 +2083,10 @@ def initializers(
 
     An initializer that sets up a broken object is a candidate (its own case does not call another
     first) but never chosen (`_unusable_initializer`): one named for an error (`*_init_error`) or one
-    taking a `FILE *`. Among the others, the order is: a (buffer, length) pair the call only reads
+    taking a `FILE *`. When `cluster_budget` is set (a within-limit `address_flow` cluster),
+    in-cluster candidates outrank cross-cluster ones, and cross-cluster candidates whose combined
+    `flow_reach` exceeds the cluster limits are rejected (with notes recorded in `skipped_notes`).
+    Among the others, the order is: a (buffer, length) pair the call only reads
     (`mpack_reader_init_data`: its bytes come from the input), then any (buffer, length) pair
     (`mpack_writer_init`: a spare buffer, rather than `*_init_growable`, whose buffer the caller must
     free), then the one the recorded traces call first, then the plainest name (`*_Init`/`*_init`),
@@ -2013,13 +2124,14 @@ def initializers(
             if isinstance(fn, str):
                 traced.setdefault(fn, len(traced))
 
-    def rank(n: str) -> tuple[bool, bool, int, bool, int, str]:
+    def rank(n: str) -> tuple[bool, bool, bool, int, bool, int, str]:
         rec = records[n]
         params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         formals = list(rec.get("formals") or [])
         pairs = [i for i in range(1, len(params or [])) if _is_pair(params or [], i, formals)]
         parts = split_signature(str(rec.get("signature") or ""))
         return (
+            not cluster_budget.in_cluster(n) if cluster_budget is not None else False,
             not any(_is_input(formals, i) for i in pairs),
             not pairs,
             traced.get(n, len(traced)),
@@ -2031,6 +2143,16 @@ def initializers(
     chosen: dict[str, str] = {}
     for t, names in cands.items():
         usable = [n for n in names if not _unusable_initializer(n, records[n])]
+        if cluster_budget is not None:
+            fitting: list[str] = []
+            for n in sorted(usable):
+                if cluster_budget.fits(n):
+                    fitting.append(n)
+                elif skipped_notes is not None:
+                    skipped_notes.setdefault(t, []).append(
+                        f"initializer {n} skipped: cross-cluster reach exceeds cluster limit"
+                    )
+            usable = fitting
         if usable:
             chosen[t] = min(usable, key=rank)
     return chosen, cands, records
@@ -2110,9 +2232,7 @@ def _dtor_rank(name: str) -> tuple[bool, str]:
     return (not _FREEING_DTOR_RE.search(name), name)
 
 
-def handle_closers(
-    dtors: dict[str, str], dtor_names: dict[str, set[str]], model_functions: dict
-) -> dict[str, str]:
+def handle_closers(dtors: dict[str, str], dtor_names: dict[str, set[str]], model_functions: dict) -> dict[str, str]:
     """
     Per handle type whose destructor is named for freeing, the other destructor-named function named
     `close` that runs before it (libmodbus: `modbus_close(ctx); modbus_free(ctx);`, else the socket a
@@ -2354,6 +2474,9 @@ def _sequence_case(
                 own_init = idx == 0 and name in case.api.candidates.get(pointee, set())
                 if pointee in case.api.inits and not own_init:
                     before.append(_init_call(case, pointee, var, pos, idx))
+                elif not own_init and pointee in case.api.init_skip_notes:
+                    for note_msg in case.api.init_skip_notes[pointee]:
+                        case.note(pos, idx, note_msg)
             shared[idx] = buffers[addr]
         calls.append(
             " ".join([*before, _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared)])
@@ -2551,9 +2674,15 @@ def plan(
         and (str(rec.get("name") or k.split("#")[-1]) in unit_names or (rec.get("static") and rec.get("header")))
         and not _unspelled_anon_record(rec, anon_tags)
     }
-    inits, candidates, init_records = initializers(unit_pool, traces, visible)
-    struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible)
+    cluster_budget = _flow_cluster_budget(dag, module)
+    init_skip_notes: dict[str, list[str]] = {}
+    inits, candidates, init_records = initializers(
+        unit_pool, traces, visible, cluster_budget=cluster_budget, skipped_notes=init_skip_notes
+    )
+    struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible, cluster_budget=cluster_budget)
     freers = struct_freers(struct_dtor_names)
+    if cluster_budget is not None:
+        freers = {t: fn for t, fn in freers.items() if cluster_budget.fits(fn)}
     helper_pool = (set(inits.values()) | set(struct_dtors.values()) | set(freers.values())) - entry_names
     # A constructor that returns the handle keeps its place; out-parameter ones fill the other types.
     out_ctors = {t: c for t, c in outp.ctors.items() if t not in ctors}
@@ -2587,6 +2716,7 @@ def plan(
         const_returns=set(getattr(visible, "const_returns", None) or ()),
         allocating=allocating_functions(model.get("functions") or {}),
         limits=limit_parameters(model.get("functions") or {}),
+        init_skip_notes=init_skip_notes,
         bounds=dict(getattr(visible, "bound_forwards", None) or {}),
     )
     header_entries: list[tuple[str, str]] = []
@@ -3332,7 +3462,9 @@ def limit_parameters(model_functions: dict) -> dict[str, set[str]]:
     for key, rec in model_functions.items():
         if isinstance(rec, dict):
             name = str(rec.get("name") or str(key).split("#")[-1])
-            formals[name] = {str(f.get("name")) for f in rec.get("formals") or [] if isinstance(f, dict) and f.get("name")}
+            formals[name] = {
+                str(f.get("name")) for f in rec.get("formals") or [] if isinstance(f, dict) and f.get("name")
+            }
     setters = {
         n: {f for f in fs if len(_words(f)) >= 2 and _words(f)[0] == "max"}
         for n, fs in formals.items()

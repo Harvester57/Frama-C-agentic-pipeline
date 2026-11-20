@@ -196,3 +196,156 @@ def test_an_out_of_scope_helper_is_no_reach_root(init_inline):
     old = hr.check_module("lib__api", dag, {"unit": "lib", "harness_file": "h.c"}, REACH_HARNESS, [], mm)
     assert "ctx_init" in old["roots"]
     assert old["gaps"] == ([] if init_inline else ["ctx_reset"])
+
+
+def test_c3_flow_cluster_rejects_oversized_cross_cluster_initializer_and_prefers_in_cluster():
+    """B7 / D2: within-limit address_flow clusters reject huge cross-cluster inits, allow small ones, prefer in-cluster."""
+    big_helpers = [f"big_h{i}" for i in range(6)]
+    functions: dict[str, Any] = {
+        "api_use": {
+            "name": "api_use",
+            "file": "api.c",
+            "is_static": False,
+            "module": "lib",
+            "loc": 10,
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "small_init": {
+            "name": "small_init",
+            "file": "small.c",
+            "is_static": False,
+            "module": "lib",
+            "loc": 10,
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "huge_init": {
+            "name": "huge_init",
+            "file": "huge.c",
+            "is_static": False,
+            "module": "lib",
+            "loc": 10,
+            "internal_callees": big_helpers,
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "local_init": {
+            "name": "local_init",
+            "file": "api.c",
+            "is_static": False,
+            "module": "lib",
+            "loc": 10,
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "huge_destroy": {
+            "name": "huge_destroy",
+            "file": "huge.c",
+            "is_static": False,
+            "module": "lib",
+            "loc": 10,
+            "internal_callees": big_helpers,
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        **{
+            h: {
+                "name": h,
+                "file": "huge.c",
+                "is_static": True,
+                "module": "lib",
+                "loc": 10,
+                "internal_callees": [],
+                "indirect_callees": [],
+                "address_refs": [],
+                "global_refs": [],
+            }
+            for h in big_helpers
+        },
+    }
+    model: dict[str, Any] = {
+        "status": "ok",
+        "functions": {
+            "api.c#api_use": {
+                "name": "api_use",
+                "signature": "void(struct cycle *,struct small *)",
+                "formals": [{"name": "c", "kind": "pointer"}, {"name": "s", "kind": "pointer"}],
+            },
+            "huge.c#huge_init": {
+                "name": "huge_init",
+                "signature": "void(struct cycle *)",
+                "formals": [{"name": "c", "kind": "pointer"}],
+            },
+            "huge.c#huge_destroy": {
+                "name": "huge_destroy",
+                "signature": "void(struct cycle *)",
+                "formals": [{"name": "c", "kind": "pointer"}],
+            },
+            "small.c#small_init": {
+                "name": "small_init",
+                "signature": "void(struct small *,char *,unsigned long)",
+                "formals": [
+                    {"name": "s", "kind": "pointer"},
+                    {"name": "data", "kind": "const_pointer"},
+                    {"name": "len", "kind": "value"},
+                ],
+            },
+            "api.c#local_init": {
+                "name": "local_init",
+                "signature": "void(struct small *)",
+                "formals": [{"name": "s", "kind": "pointer"}],
+            },
+        },
+    }
+
+    def _dag(with_local: bool = False, over_limit: bool = False) -> dict:
+        sub: dict[str, Any] = {
+            "unit": "lib",
+            "reach": "address_flow",
+            "anchors": ["api_use", *(["local_init"] if with_local else [])],
+            "functions": ["api_use", *(["local_init"] if with_local else [])],
+            "build_sources": ["api.c"],
+        }
+        if over_limit:
+            sub["over_limit"] = "8 functions > 4"
+        return {
+            "module_kind": "link_unit",
+            "unit_split": {"max_functions": 4, "max_lines": 1000},
+            "global_variables": {},
+            "modules": {
+                "lib": {
+                    "candidate_entry_points": ["api_use", "small_init", "huge_init", "local_init"],
+                    "functions": sorted(functions),
+                    "files": ["api.c", "small.c", "huge.c"],
+                    "linked_modules": [],
+                }
+            },
+            "submodules": {"lib__api": sub},
+            "functions": functions,
+        }
+
+    # 1. Oversized huge_init (reach 8 > 4) is rejected with a case note; small_init (reach 2 <= 4) is chosen.
+    p = ah.plan(_dag(with_local=False), model, "lib__api", "lib", 64)
+    stmt, lay = _case_and_layout(p, "api_use")
+    assert "huge_init(" not in stmt and "huge_destroy(" not in stmt
+    assert "small_init(" in stmt
+    assert any("initializer huge_init skipped: cross-cluster reach exceeds cluster limit" in n for n in lay["notes"])
+
+    # 2. In-cluster local_init beats cross-cluster small_init even though small_init has an input-backed buffer pair.
+    p_local = ah.plan(_dag(with_local=True), model, "lib__api", "lib", 64)
+    stmt_local, _ = _case_and_layout(p_local, "api_use")
+    assert "local_init(" in stmt_local and "small_init(" not in stmt_local
+
+    # 3. Over-limit clusters keep existing behavior (huge_init is allowed).
+    p_over = ah.plan(_dag(with_local=False, over_limit=True), model, "lib__api", "lib", 64)
+    stmt_over, _ = _case_and_layout(p_over, "api_use")
+    assert "huge_init(" in stmt_over

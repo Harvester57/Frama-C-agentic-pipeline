@@ -72,7 +72,12 @@ import cache  # noqa: E402
 import decision_point_check  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
-from failure_identity import is_sanitizer_allocation_cap, parse_eacsl_resource_abort, site_key  # noqa: E402
+from failure_identity import (  # noqa: E402
+    is_sanitizer_allocation_cap,
+    parse_eacsl_resource_abort,
+    parse_link_stub_abort,
+    site_key,
+)
 from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
@@ -871,7 +876,10 @@ def _meta_facts(path: Path | None = None) -> dict:
         for key, sites in listed.items():
             if len(sites) > placed_count.get(key, 0):
                 calls = ", ".join(f"{s.get('callee')} at line {s.get('line')}" for s in sites)
-                gap(key, f"its check(s) at the initializer call(s) of {calls} are listed but not written into the work tree")
+                gap(
+                    key,
+                    f"its check(s) at the initializer call(s) of {calls} are listed but not written into the work tree",
+                )
     for ref, items in (doc.get("obligations") or {}).items():
         for ob in items if isinstance(items, list) else []:
             if isinstance(ob, dict) and ob.get("unchecked") and ob.get("property"):
@@ -913,7 +921,9 @@ def _meta_initializers_unknown(unit: dict, facts: dict | None) -> str | None:
     if flags["known"]:
         return None
     skipped = {str(n) for n in flags.get("properties") or []}
-    names = sorted(str(n) for n in (unit.get("bookkeeping") or {}).get("security_properties") or [] if str(n) in skipped)
+    names = sorted(
+        str(n) for n in (unit.get("bookkeeping") or {}).get("security_properties") or [] if str(n) in skipped
+    )
     if not names:
         return None
     return (
@@ -1592,6 +1602,17 @@ def _fuzz_coverage_executions(module: str) -> tuple[dict[tuple[str, str], int] |
     return counts, ""
 
 
+def _link_stub_abort(art: dict) -> dict | None:
+    """
+    The address-flow link-stub abort of an artifact (recorded as `link_stub_abort`, or parsed from
+    `replay_log_tail`), or None. Always a pipeline reach defect, never a target candidate.
+    """
+    marked = art.get("link_stub_abort")
+    if isinstance(marked, dict) and marked.get("symbol"):
+        return marked
+    return parse_link_stub_abort(str(art.get("replay_log_tail") or ""))
+
+
 def _eacsl_resource_abort(art: dict) -> dict | None:
     """
     The E-ACSL runtime resource abort of an artifact without a failure (run_eacsl_fuzz.py marks it as
@@ -1839,8 +1860,13 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     f"Keep-going fuzz rounds stopped early, the remaining dispatch cases were not fuzzed: {kg_error}",
                 )
         resource_aborts: list[tuple[str, dict]] = []
+        link_stub_aborts: list[tuple[str, dict]] = []
         for art in report.get("artifacts", []):
             artifact_rel = rel(art["artifact"])
+            if (stub_abort := _link_stub_abort(art)) is not None:
+                # Address-flow link-stub hit: pipeline reach defect, never a target vulnerability candidate.
+                link_stub_aborts.append((artifact_rel, stub_abort))
+                continue
             failure = art.get("failure")
             if failure and art.get("fingerprint"):
                 fp = art["fingerprint"]
@@ -1981,6 +2007,35 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                 )
                 fp = cand["fingerprint"]
             stats["candidates"] += 1
+        if link_stub_aborts:
+            stats["link_stub_aborts"] = stats.get("link_stub_aborts", 0) + len(link_stub_aborts)
+            details = [
+                {
+                    "module": module,
+                    "symbol": a.get("symbol"),
+                    "caller": a.get("caller"),
+                    "artifact": art_rel,
+                    "message": a.get("message"),
+                }
+                for art_rel, a in link_stub_aborts
+            ]
+            stats.setdefault("link_stub_abort_details", []).extend(details)
+            rendered = [f"{d['module']}: {d['symbol']} (caller: {d['caller'] or 'unknown'})" for d in details]
+            stats.setdefault("warnings", []).append(f"link_stub_aborts: [{', '.join(rendered)}]")
+            shown_stubs = [r for r, _ in link_stub_aborts[:5]]
+            more_stubs = f" and {len(link_stub_aborts) - 5} more" if len(link_stub_aborts) > 5 else ""
+            for u in mod_units:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_link_stub_abort",
+                    False,
+                    tool_output,
+                    f"{len(link_stub_aborts)} input(s) called an address-flow link stub "
+                    f"({', '.join(rendered[:5])}): pipeline reach defect, no target candidate created.",
+                    {"artifacts": shown_stubs + ([more_stubs.strip()] if more_stubs else []), "stubs": details[:5]},
+                )
         if resource_aborts:
             stats["eacsl_resource_aborts"] = stats.get("eacsl_resource_aborts", 0) + len(resource_aborts)
             limits = sorted(
@@ -2118,9 +2173,7 @@ def _is_no_goal_credit(evidence: dict) -> bool:
 def _wp_cover_is_no_goal(unit: dict) -> bool:
     """Whether the unit's latest WP credit is the no-goal credit: no proven goal stands behind its cover."""
     credits = [
-        e
-        for e in unit.get("evidence") or []
-        if isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging")
+        e for e in unit.get("evidence") or [] if isinstance(e, dict) and e.get("phase") == "wp" and e.get("discharging")
     ]
     return bool(credits) and _is_no_goal_credit(credits[-1])
 
@@ -3533,7 +3586,9 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                     bar[0],
                     False,
                     tool_output,
-                    f"MetAcsl loaded {names} and left no {cls} goal in this function, but {bar[1]}; not credited."[:400],
+                    f"MetAcsl loaded {names} and left no {cls} goal in this function, but {bar[1]}; not credited."[
+                        :400
+                    ],
                 )
             elif cls in METACSL_CLASSES and all_proven and not counts and _meta_decided_statically(u, report):
                 # MetAcsl's -meta-simpl drops an instance it decides statically: no goal is left, the
@@ -4653,6 +4708,8 @@ def _replayed_failure(art: dict, placer: _FailurePlacer) -> dict:
     line: int = raw_line if isinstance(raw_line, int) else 0
     if art.get("timed_out"):
         what = "the replay timed out"
+    elif isinstance(art.get("link_stub_abort"), dict):
+        what = f"called address-flow link stub {art['link_stub_abort'].get('symbol') or '(unknown)'} (pipeline reach defect)"
     elif isinstance(art.get("eacsl_resource_abort"), dict):
         what = "the E-ACSL runtime stopped on its own resource limit"
     elif not failure and not fingerprint:

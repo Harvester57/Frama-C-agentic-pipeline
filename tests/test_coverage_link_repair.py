@@ -333,3 +333,11 @@ def test_minimize_build_repairs_the_link_from_the_dag(tmp_path, monkeypatch, cap
     assert len(seen) == 1
     assert Path(seen[0]["dag_path"]) == Path("workspace/reports/callgraph_dag.json")
     assert seen[0]["link_module"] == _NGX_MODULE
+
+
+@pytest.mark.unit
+def test_c4_coverage_file_role_excludes_link_stubs_and_globals():
+    assert fuzz_coverage._coverage_file_role("/framac-run/workspace/build/cov_m_link_globals/link_stubs.c") == "harness"
+    assert fuzz_coverage._coverage_file_role("workspace/build/fuzz_m_link_globals/link_globals.c") == "harness"
+    assert fuzz_coverage._coverage_file_role("workspace/build/fuzz_m_link_globals/helper.c") == "harness"
+    assert fuzz_coverage._coverage_file_role("/framac-run/workspace/work/src/core/ngx_bpf.c") == "target"

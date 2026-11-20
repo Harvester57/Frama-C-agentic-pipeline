@@ -94,6 +94,147 @@ def test_same_named_statics_stay_apart_and_calls_resolve_to_the_file_local_one()
 
 
 @pytest.mark.unit
+def test_dump_schema_6_address_flow_becomes_ids_resolved_across_parses():
+    """docs/plans/unit-split-address-flow.md: who takes which address, and what globals name."""
+    b = _builder(LIB_EXE)
+    reg = _fn("register_0", "register", "src/lexer.c", 1, static=True)
+    reg.update(address_refs=["on_key", "fopen"], global_refs=["handlers", "errno"])
+    b.add_dump(
+        ["libkv.a"],
+        {
+            "schema": 6,
+            "functions": [reg, _fn("on_key", "on_key", "src/emit.c", 3)],
+            "globals": [
+                {"name": "handlers", "kernel_name": "handlers", "loc": "src/emit.c:9", "static": False,
+                 "type": "int (*[2])(int)", "init_functions": ["on_key"], "init_globals": ["defaults"]},
+                {"name": "defaults", "kernel_name": "defaults", "loc": "src/emit.c:8", "static": False,
+                 "type": "int", "init_functions": [], "init_globals": []},
+            ],
+        },
+    )  # fmt: skip
+    main = _fn("main", "main", "tools/main.c", 5)
+    main.update(address_refs=[], global_refs=["handlers"])  # an `extern` the parse only declares
+    b.add_dump(["kvfmt"], {"schema": 6, "functions": [main], "globals": []})
+    b.resolve()
+    f = b.functions
+    assert f["src/lexer.c#register"]["address_refs"] == ["src/emit.c#on_key"]  # fopen: libc
+    assert f["src/lexer.c#register"]["global_refs"] == ["src/emit.c#handlers"]  # errno: libc
+    assert f["tools/main.c#main"]["global_refs"] == ["src/emit.c#handlers"]
+    g = b.global_vars["src/emit.c#handlers"]
+    assert g["init_functions"] == ["src/emit.c#on_key"] and g["init_globals"] == ["src/emit.c#defaults"]
+    assert pm.model_features({"functions": f})["address_flow"]
+    # A dump before schema 6 records none of it, and the feature is missing.
+    old = _builder(LIB_EXE)
+    old.add_dump(["libkv.a"], {"functions": [reg]})
+    old.resolve()
+    assert "address_refs" not in old.functions["src/lexer.c#register"]
+    assert "address_flow" in pm.missing_features({"schema_version": 2, "functions": old.functions})
+
+
+@pytest.mark.unit
+def test_a_declared_global_two_programs_define_is_recorded_unresolved():
+    """A library names `shared`, which each program linking it defines: the reach cannot know which."""
+    units = {
+        **LIB_EXE,
+        "kvtool": {"kind": "executable", "files": ["tools/tool.c"], "links": ["libkv.a"]},
+    }
+    b = _builder(units)
+    reg = _fn("register", "register", "src/lexer.c", 1)
+    reg.update(address_refs=[], global_refs=["shared"])
+    b.add_dump(["libkv.a"], {"schema": 6, "functions": [reg], "globals": []})
+    for unit, file in (("kvfmt", "tools/main.c"), ("kvtool", "tools/tool.c")):
+        main = _fn("main", "main", file, 1)
+        main.update(address_refs=[], global_refs=[])
+        shared = {"name": "shared", "kernel_name": "shared", "loc": f"{file}:9", "static": False, "type": "int",
+                  "init_functions": [], "init_globals": []}  # fmt: skip
+        b.add_dump([unit], {"schema": 6, "functions": [main], "globals": [shared]})
+    b.resolve()
+    rec = b.functions["src/lexer.c#register"]
+    assert rec["global_refs"] == [] and rec["unresolved_global_refs"] == ["shared"]
+
+
+@pytest.mark.unit
+def test_cross_parse_address_refs_size_constructor_and_fallback_globals():
+    """C1: B1 cross-parse address_refs, B5 global size, B8 constructor and gcc_fallback globals."""
+    units = {
+        "libcore.a": {"kind": "static_lib", "files": ["lib/core.c"], "links": []},
+        "libbad.a": {"kind": "static_lib", "files": ["lib/bad.c"], "links": []},
+        "prog": {"kind": "executable", "files": ["src/app.c"], "links": ["libcore.a"]},
+        "prog_bad": {"kind": "executable", "files": ["src/app_bad.c"], "links": ["libbad.a"]},
+    }
+    b = _builder(units)
+    lib_cb = _fn("lib_cb", "lib_cb", "lib/core.c", 1)
+    lib_cb.update(address_refs=[], global_refs=[], constructor=False)
+    b.add_dump(
+        ["libcore.a"],
+        {
+            "schema": 6,
+            "functions": [lib_cb],
+            "globals": [
+                {
+                    "name": "g_buf",
+                    "kernel_name": "g_buf",
+                    "loc": "lib/core.c:10",
+                    "static": False,
+                    "type": "unsigned char [64]",
+                    "size": 64,
+                    "init_functions": [],
+                    "init_globals": [],
+                }
+            ],
+            "address_taken": [],
+        },
+    )
+    app_take = _fn("app_take", "app_take", "src/app.c", 5)
+    app_take.update(address_refs=["lib_cb"], global_refs=["g_buf"], constructor=True)
+    b.add_dump(
+        ["prog"],
+        {
+            "schema": 6,
+            "functions": [app_take],
+            "globals": [
+                {
+                    "name": "g_ops",
+                    "kernel_name": "g_ops",
+                    "loc": "src/app.c:2",
+                    "static": False,
+                    "type": "int (*[1])(int)",
+                    "size": 8,
+                    "init_functions": ["lib_cb"],
+                    "init_globals": [],
+                }
+            ],
+            "address_taken": ["lib_cb"],
+        },
+    )
+    # libbad.a fell back to GCC: prog_bad's unknown global ref cannot be assumed external/libc.
+    b.add_gcc(["libbad.a"], {"functions": {}, "indirect": [], "edges": []})
+    app_bad = _fn("app_bad", "app_bad", "src/app_bad.c", 3)
+    app_bad.update(address_refs=[], global_refs=["missing_from_bad"])
+    b.add_dump(["prog_bad"], {"schema": 6, "functions": [app_bad], "globals": []})
+    b.resolve()
+    assert b.functions["src/app.c#app_take"]["address_refs"] == ["lib/core.c#lib_cb"]
+    assert b.functions["src/app.c#app_take"]["constructor"] is True
+    assert b.functions["lib/core.c#lib_cb"]["constructor"] is False
+    assert b.functions["lib/core.c#lib_cb"]["address_taken"] is True
+    assert b.global_vars["src/app.c#g_ops"]["init_functions"] == ["lib/core.c#lib_cb"]
+    assert b.global_vars["src/app.c#g_ops"]["size"] == 8
+    assert b.global_vars["lib/core.c#g_buf"]["size"] == 64
+    assert b.functions["src/app_bad.c#app_bad"]["unresolved_global_refs"] == ["missing_from_bad"]
+    # Validate the resulting model shape against phase0_model.schema.json.
+    model = {
+        "schema_version": pm.SCHEMA_VERSION,
+        "generated_at": "2026-11-20T00:00:00Z",
+        "status": "ok",
+        "capture": "workspace/reports/build_capture.json",
+        "warnings": [],
+        "functions": {fid: {**rec, "external_calls": []} for fid, rec in sorted(b.functions.items())},
+        "global_variables": dict(sorted(b.global_vars.items())),
+    }
+    assert pm.validate_model(model) == []
+
+
+@pytest.mark.unit
 def test_a_library_call_to_a_function_its_consumer_defines_resolves_there():
     b = _builder(LIB_EXE)
     b.add_dump(["libkv.a"], {"functions": [_fn("kv_next", "kv_next", "src/lexer.c", 1, [_call("user_hook")])]})

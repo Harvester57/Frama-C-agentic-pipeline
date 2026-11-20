@@ -221,3 +221,43 @@ def test_minimize_candidates_passes_every_fingerprint_and_the_observation_engine
     )
     joined = f"{XB_FP_SAN},{XB_FP_EAC}"
     assert sorted(seen) == sorted([("fuzz_snmp", "crash-san", joined), ("cross_eacsl_snmp", "crash-eac", joined)])
+
+
+def test_c5_replay_inputs_records_link_stub_abort_without_failure_or_attribution(tmp_path, monkeypatch):
+    """C5 / B4: replay_artifact and replay_inputs classify FRAMAC_LINK_STUB_CALLED as link_stub_abort."""
+    import sandbox_exec
+
+    stub_out = (
+        "FRAMAC_LINK_STUB_CALLED: far_fn (not in the unit split's address-flow reach)\n"
+        "    #0 0x555555640110 in __framac_link_stub_called link_stubs.c:16:3\n"
+        "    #1 0x555555640200 in api_entry src/a.c:12:5\n"
+    )
+    monkeypatch.setattr(
+        sandbox_exec,
+        "run_sandboxed",
+        lambda *a, **k: sandbox_exec.SandboxResult(
+            returncode=77, stdout="", stderr=stub_out, timed_out=False, sandbox="none"
+        ),
+    )
+    crash = tmp_path / "crash-stub"
+    crash.write_bytes(b"abcd")
+    attr_called = False
+
+    def bad_attr():
+        nonlocal attr_called
+        attr_called = True
+        return tmp_path / "san"
+
+    arts = crash_replay.replay_inputs(
+        tmp_path / "fuzz_m", [crash], tmp_path / "scratch", module="m", attribution_builder=bad_attr
+    )
+    assert len(arts) == 1
+    art = arts[0]
+    assert art["failure"] is None
+    assert art["fingerprint"] is None
+    assert art["link_stub_abort"] == {
+        "symbol": "far_fn",
+        "message": "FRAMAC_LINK_STUB_CALLED: far_fn (not in the unit split's address-flow reach)",
+        "caller": "api_entry",
+    }
+    assert attr_called is False

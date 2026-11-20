@@ -294,12 +294,20 @@ def _export_coverage(binary: Path, profile_dir: Path, scratch: Path) -> tuple[di
 
 def _coverage_file_role(path: str) -> str:
     """
-    `target`, `harness` (the generated entry point) or `external` (system and pipeline headers, and
-    the build capture's snapshot of the build image, wherever the run directory is mounted).
+    `target`, `harness` (the generated entry point or link-repair stub files) or `external`
+    (system and pipeline headers, and the build capture's snapshot of the build image, wherever
+    the run directory is mounted).
     """
-    if path.startswith(COVERAGE_EXTERNAL_PREFIXES) or f"/{COVERAGE_SNAPSHOT_ROOT}" in f"/{path}":
+    norm = path.replace("\\", "/")
+    if norm.startswith(COVERAGE_EXTERNAL_PREFIXES) or f"/{COVERAGE_SNAPSHOT_ROOT}" in f"/{norm}":
         return "external"
-    if "/workspace/harnesses/" in f"/{path}" or posixpath.basename(path).startswith("harness_"):
+    base = posixpath.basename(norm)
+    if (
+        "/workspace/harnesses/" in f"/{norm}"
+        or base.startswith("harness_")
+        or base in (fuzz_build.LINK_STUBS_FILE, fuzz_build.LINK_GLOBALS_FILE)
+        or "_link_globals/" in f"/{norm}"
+    ):
         return "harness"
     return "target"
 
