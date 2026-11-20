@@ -334,6 +334,44 @@ def test_the_first_attempt_of_a_fallback_tier_is_reported(fake_eva):
     assert res[FIRST_ATTEMPT_FIELD] == 40.0
 
 
+def test_a_fallback_tier_after_a_retry_that_timed_out_keeps_the_marker(tmp_path, monkeypatch):
+    # The first attempt aborts on the recursion, the retry times out, the first fallback tier (started
+    # downgraded) finishes: its report must still say the run needed the retry, or the plan never
+    # propagates the downgrade to the rungs.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(run_eva_slice, "_input_digest", lambda sources, flags: "d1")
+    clock = _Clock()
+    monkeypatch.setattr(run_eva_slice, "time", clock)
+    calls: list = []
+
+    def fake(cmd, sources, main_fn, out_dir, reduced_checks, timeout, path_root=None):
+        calls.append((list(cmd), timeout))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            clock.now += 50.0
+            (out_dir / "eva.log").write_text(RECURSION_ABORT_LOG, encoding="utf-8")
+            return {"status": "analysis_error", "reason": "exit_1", "error_summary": [], "sources": sources,
+                    "elapsed_s": 50.0, "reduced_checks": reduced_checks}  # fmt: skip
+        (out_dir / "eva.log").write_text("[eva] done\n", encoding="utf-8")
+        if len(calls) == 2:
+            clock.now += float(timeout)
+            return {"status": "analysis_timeout", "reason": None, "error_summary": [], "sources": sources,
+                    "elapsed_s": float(timeout), "reduced_checks": reduced_checks}  # fmt: skip
+        clock.now += 30.0
+        return {"status": "ok", "reason": None, "error_summary": [], "main_fn": main_fn, "sources": sources,
+                "elapsed_s": 30.0, "reduced_checks": reduced_checks}  # fmt: skip
+
+    monkeypatch.setattr(run_eva_slice, "_execute_eva", fake)
+    res = run_eva_slice.run_eva_on_slice(
+        ["workspace/work/pb_decode.c"], "eva_main", tmp_path / "out", use_cache=False, timeout=600
+    )
+    assert len(calls) == 3 and all("-eva-warn-key" in cmd for cmd, _ in calls[1:])
+    assert res["status"] == "ok" and res.get("timeout_fallback")
+    assert res["auto_recursion_fallback"] is True
+    assert res[FIRST_ATTEMPT_FIELD] == 50.0
+    assert run_eva_slice.RECURSION_REDUCED_CHECK in res["reduced_checks"]
+
+
 def test_merged_shards_report_their_first_attempts_not_shard_zeros(tmp_path, capsys):
     run = tmp_path
     _shard(run, 0, [_row(1, "Valid")], {"parse": 5}, reduced_checks=["-no-warn-unsigned-downcast"])

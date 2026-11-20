@@ -1216,6 +1216,13 @@ def run_eva_on_slice(
                     fb_res["auto_recursion_fallback"] = True
                     fb_res[RECURSION_FIRST_ATTEMPT_FIELD] = fb_first_s
                 if fb_res["status"] == "ok":
+                    if timed_out.get("auto_recursion_fallback") and not fb_res.get("auto_recursion_fallback"):
+                        # The tiers started downgraded because the timed-out run had retried: the
+                        # result keeps that marker and the first attempt it lost, so a tuning plan
+                        # reading it propagates the downgrade (pipeline_make._plan_tuning).
+                        fb_res["auto_recursion_fallback"] = True
+                        if RECURSION_FIRST_ATTEMPT_FIELD in timed_out:
+                            fb_res[RECURSION_FIRST_ATTEMPT_FIELD] = timed_out[RECURSION_FIRST_ATTEMPT_FIELD]
                     fb_res["eva_options"] = fb_opts
                     fb_res["timeout_fallback"] = tier_name
                     own = cost_profile(out_dir / "flamegraph.txt") if kept_fg is None else None
