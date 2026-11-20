@@ -160,8 +160,6 @@ That needs a goal filter, for example `-wp-prop` on the unproved property names.
 
 ### Considered and not proposed
 
-### Considered and not proposed
-
 - **Reduction plugin (`-reduc`).** Same Eva states as `-eva-annot`, with many more assertions and no per-function selection. See "Tier 1b" in [`./papers-generalization-plan.md`](./papers-generalization-plan.md).
 - **`-eva-secure-flow`, `-eva-taint-auto`.**
   - Secure flow needs custom attributes on the target's data. The pipeline expresses Layers 5 and 6 through MetAcsl instead.
@@ -172,3 +170,79 @@ That needs a goal filter, for example `-wp-prop` on the unproved property names.
   - The ACSL importer would keep contracts out of the sources, but splicing into the overlay is how the pipeline checks scope today.
 - **`-lib-entry`.** An alternative to harnesses for Eva. The harnesses carry the trust boundary and the seeds, so it would be a different analysis, not a tuning.
 - **WP simplification switches** (`-wp-split-cnf`, `-wp-prenex`, `-wp-simplify-forall` and similar). These are worth trying only after `-wp-auto`, on the goals it leaves.
+
+## Addendum (2026-11-19): E-ACSL and WP options not used today
+
+A second audit, against what the pipeline passes today. Option names come from `frama-c -e-acsl-h`, `frama-c -wp-h` and the `e-acsl-gcc` script in `framac-analysis:latest` (Frama-C 34.0~beta). The probes ran on single toy files in a throwaway container, with 2-second prover timeouts, not through the pipeline. They show that a mechanism works, not what it is worth on a target. Nothing below is adopted.
+
+### E-ACSL
+
+Worth a trial:
+
+| Option | What it gives | Evidence |
+| :--- | :--- | :--- |
+| `--keep-going` | One replay reports every failed check of an input | Probed: continues past failed assertions; an abort inside a libc replacement still stops the run. Fits a replay build only, because a campaign needs one failure per input |
+| `-e "-DE_ACSL_DEBUG_ASSERT"` | An `Assertion valid:` record per passing check, to show which checks an input reached | Probed |
+| `--external-assert <file.c>` | A pipeline-owned `__e_acsl_assert`, for a structured failure record in place of parsing text | Runtime source only, not run |
+| `-e-acsl-log w:<file>` | E-ACSL's warnings in their own file | Help text only |
+| `--rt-verbose`, `--rt-debug`, `--check` | Triage of a broken build | Help text only |
+| `-m bittree` | The second memory model, as a cross-check of a segment-model verdict | Builds on one file; nothing more |
+
+Checked, nothing to gain:
+
+- **`-e-acsl-rte-initialized`:** already implied by `-rte-initialized @all`. Same counts with and without it (67 assertions, 20 `initialized` calls), and an uninitialized read made only by an `ensures` is reported.
+- **`-e-acsl-rte 2`:** 67 to 111 assertions on a 20-line file.
+- **`--temporal`:** the Issue 15 reproducer still aborts with `Unreachable` under `-M`.
+- **`--zone-sizes stack:` / `tls:`:** no failure seen that they would fix.
+
+Side findings, both handled the same day: the selftest check `no_gmp_only` could not fail on Frama-C 34 (see [`../troubleshooting/eacsl-and-fuzzing.md`](../troubleshooting/eacsl-and-fuzzing.md)), and [`../references/e-acsl-quickref.md`](../references/e-acsl-quickref.md) used the Frama-C 33 option names.
+
+### WP
+
+`run_wp_function.py` passes about 23 of the 113 WP options. Since the review above, `-wp-report-json` is adopted and `-wp-smoke-tests` runs in the separate vacuity pass. `-wp-steps` and `-wp-session` are opt-in with no production caller.
+
+**The goal filter the `-wp-auto` decision asks for exists: a later stage that repeats `-wp`.** `… -wp -wp-fct f <setup 1> -then -wp -wp-fct f <setup 2>` re-sends only the properties that are not yet valid (`-wp-status-maybe` is the default). No `-wp-prop` list is needed.
+
+| Rank | Option | What it gives | What the probe showed |
+| :--- | :--- | :--- | :--- |
+| 1 | `-then -wp -wp-fct <fn>` with a stronger setup | Second pass on what is left, in the same process, with no second parse | Stage 1 left 11 goals; stage 2 re-sent 13 and closed 11. The final `-report-csv` equals the single-stage reference (14 Valid, 2 Unknown) |
+| 2 | `\wp::strategy` + `-wp-strategy` + `-wp-prover tip` | Tactic search driven by a strategy file the pipeline owns, kept out of the target's sources | Parses under `annot-error=abort`, applies tactics, works as a second stage. Closed no goal on the toy files |
+| 3 | `-wp-session` + `-wp-prover script` | Replays a saved tactic script without searching again | One script per attempted property in `<session>/script/`, also for failed attempts; replay works |
+| 4 | `-wp-run-all-provers` with `-wp-print` | Verdict, time and steps of each prover per goal, which is what `wp_residual_census.py` asks | The log lists every prover per goal; the JSON still holds one merged entry |
+| 5 | `-wp-status` | Prints only the pending obligations, for prover agents | Printed 2 goals for one function; not checked against the timeout list |
+| 6 | `-wp-warn-key` categories | Could replace part of the Tier-B regexes | Only `unsupported:union`, `unsupported:bitfield` and `pedantic-assigns` carry a category; "Skipped RTE guards" does not |
+
+What the probes say about ranks 1 to 3:
+
+- **Selection is by property, not by goal.** A loop invariant whose preservation failed was re-sent with its already-proved establishment goal.
+- **`-wp-auto` works in the second stage** (one `(Tactics 2)` goal) and closed nothing. The only evidence of value is still the libseccomp trial above.
+- **Strategies replace `-wp-auto`** according to the 33 manual, which calls `-wp-auto` deprecated. The 34 help does not say so.
+- **Do not set a warning category to `abort`.** The Bytes retry depends on seeing the union warning in a completed run.
+
+Integration costs of the second stage:
+
+- **The 33 manual is wrong for 34.** A stage holding only `-wp-prover …` does nothing. The stage must repeat `-wp -wp-fct <fn>`.
+- **Behind MetAcsl the stage needs `-then-last`** (or `-set-project-as-default` after the MetAcsl stage). Behind a plain `-then` it ran on the original project, with no RTE goals and the default cache, and reported no error.
+- **One JSON path is overwritten.** The file named in stage 1 held only stage 2's 13 goals; the reference has 21. Each stage needs its own path, or the final status must come from `-report-csv`.
+- **The log holds two summaries**, each with its own `goals scheduled` and `Proved goals` block.
+- **Tactic goals look different.** The JSON entry gains a `subgoals` key, and the log line gains tags such as `(Tactics 2) (Qed 1/3) (Alt-Ergo 1/3)`, which `_PROVER_TAG_RE` does not match.
+- **Against the tail retry:** the retry re-runs the whole function in a new process. The second stage avoids the second parse; the retry already has the prover cache, so no saving is claimed.
+
+From the help text only, untested:
+
+- **Goal shaping:** `-wp-split-conj`, `-wp-unfold-assigns`, `-wp-bound-forall-unfolding`, `-wp-prenex`, `-wp-simplify-forall`, `-wp-simplify-type`, `-wp-split-cnf`. The fair trial is a replay of a finished run's residual goals. `-wp-split-conj` renames goals (`part<n>`), which breaks the census's pairing by goal name.
+- **Cache modes:** `-wp-cache offline|replay`, to make a re-verification fail on any goal that is not in the cache.
+- **`@probe`:** prints the value of a term in a goal, for prover agents.
+- **`-wp-interactive`:** answers Step 0 of the Rocq trial from the manual: proof scripts go to `<session>/interactive`. The image has no interactive prover (Alt-Ergo 2.4.3, CVC5 1.1.2, Z3 4.13.3 only).
+
+Not proposed:
+
+- **`Region` model:** function calls are not implemented, per the 33 manual.
+- **`Eva` model:** needs Eva results in the same session, which changes the goals WP generates.
+- **`+cast`, `-wp-weak-int-model`, `-wp-no-volatile`:** unsound by their own description.
+- **Memory-model flags for cast-heavy leaves:** already tried on libmnl and failed.
+- **`-wp-fct-timeout`, `-wp-skip-fct`, `-wp-bhv`:** the pipeline runs one function per process.
+
+Help and manual disagree on `-wp-max-split` (manual: `-wp-split-max`) and on the defaults of `-wp-time-extra` and `-wp-time-margin`. The help of the installed tool is the authority.
+
+Next step, if the second pass is taken up: add the stage to `run_wp_function.py` behind an opt-in flag, with its own JSON path and `-then-last`, and replay it on the residual goals of one finished run to count how many leave the prover queue.

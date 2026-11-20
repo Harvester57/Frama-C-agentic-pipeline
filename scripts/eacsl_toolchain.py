@@ -4,7 +4,7 @@ E-ACSL toolchain contract helpers used by run_eacsl_fuzz.py.
 
 `e-acsl-gcc` (Frama-C 33+) splits the values of `-e`, `-E`, `-F` and `-l` on
 whitespace and re-parses the resulting tokens, so a standalone `-g` inside
-`-e` silently becomes `--gmp` (`-e-acsl-gmp-only`), and paths containing
+`-e` silently becomes `--gmp` (`-e-acsl-O-gmp-only` on 34), and paths containing
 spaces break. This module enforces the invocation contract:
 
   - `normalize_passthrough()` joins separated short options (`-I dir` ->

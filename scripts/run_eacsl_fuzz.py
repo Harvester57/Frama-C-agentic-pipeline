@@ -2066,6 +2066,10 @@ CANARY_UNINIT_INPUT = b"UNINX" + b"P" * 11
 # E-ACSL's unmarked formals, which every input reaches first) must not satisfy the check.
 CANARY_UNINIT_FUNCTION = "canary_pick"
 
+# GMP-only mode in a compile log. `e-acsl-gcc -g` passes `-e-acsl-gmp-only` to Frama-C up to 33
+# and `-e-acsl-O-gmp-only` from 34 on. The opposite options (`-e-acsl-O-no-gmp-only`) do not match.
+_GMP_ONLY_FLAG_RE = re.compile(r"-e-acsl-(?:O-)?gmp-only\b")
+
 
 def resolve_canary_source() -> Path:
     for base in (Path("/opt/framac-pipeline/templates"), Path(__file__).resolve().parent.parent / "templates"):
@@ -2115,7 +2119,7 @@ def run_selftest(
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
     checks = {
         "compiled": comp["returncode"] == 0,
-        "no_gmp_only": "-e-acsl-gmp-only" not in log_text,
+        "no_gmp_only": not _GMP_ONLY_FLAG_RE.search(log_text),
         "instrumented_binary": comp["returncode"] == 0 and is_eacsl_instrumented(Path(comp["binary"])),
         "benign_input_clean": False,
         "detects_overflow": False,

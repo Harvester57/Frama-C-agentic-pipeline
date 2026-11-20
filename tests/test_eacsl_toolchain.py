@@ -1456,6 +1456,33 @@ def test_selftest_with_fake_toolchain(tmp_path, modern_cli, monkeypatch):
     assert not unmarked["checks"]["detects_uninitialized"]  # an alarm in another function is not the canary's
 
 
+@pytest.mark.parametrize(
+    ("flag", "clean"),
+    [
+        ("-e-acsl-gmp-only", False),  # Frama-C up to 33
+        ("-e-acsl-O-gmp-only", False),  # Frama-C 34
+        ("-e-acsl-O-no-gmp-only", True),
+        ("-e-acsl-no-gmp-only", True),
+    ],
+)
+def test_selftest_sees_gmp_only_in_both_spellings(tmp_path, modern_cli, monkeypatch, flag, clean):
+    monkeypatch.setattr(fuzz_build, "framac_version", lambda runner=None: "34.0")
+    fake = FakeEacslGcc()
+
+    def traced(cmd, **kwargs):
+        res = fake(cmd, **kwargs)
+        if cmd[0] == "e-acsl-gcc" and "-n" in cmd:
+            res.stdout = f"+ frama-c -no-frama-c-stdlib canary.c -e-acsl {flag} -then-last -print\n"
+        return res
+
+    def quiet_replay(binary, artifact, scratch, timeout_s=60):
+        return {"reproduced": False, "failure": None}
+
+    res = R.run_selftest(tmp_path / "st", runner=traced, replay=quiet_replay)
+    assert flag in Path(res["compile"]["compile_log"]).read_text(encoding="utf-8")
+    assert res["checks"]["no_gmp_only"] is clean
+
+
 # ---------------------------------------------------------------------------
 # WS3 header environment, stubs, canary, undeclared functions
 # ---------------------------------------------------------------------------
