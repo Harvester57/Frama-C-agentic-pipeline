@@ -36,6 +36,7 @@ from eacsl_toolchain import (
     EACSL_META_LIBC_WRITERS,
     EACSL_NO_LIBC_CHECKS,
     EACSL_RTE_INITIALIZED_FLAG,
+    ERRNO_SHIM_FUNCTIONS,
     UnsafePassthroughError,
     attribute_ignored_annotations,
     build_eacsl_flag_sets,
@@ -258,7 +259,9 @@ def _eacsl_cache_material(
     return {
         "kind": "eacsl",
         # The generated libc shim is linked into the binary, and no source or flag says when its text changes.
-        "libc_shim": hashlib.sha256(generate_errno_shim_source(["close"]).encode("utf-8")).hexdigest(),
+        "libc_shim": hashlib.sha256(
+            generate_errno_shim_source([f[1] for f in ERRNO_SHIM_FUNCTIONS]).encode("utf-8")
+        ).hexdigest(),
         "eacsl_gcc": [eacsl_bin, is_modern],
         "sources": [str(s) for s in sources],
         "out_bin": out_bin.as_posix(),
@@ -1136,6 +1139,10 @@ def _compile_eacsl_binary_uncached(
         _note_const_unions(out, err)
         frontend.update(output=out + "\n" + err, instrumented=rc == 0 and instrumented_c.is_file())
         if rc != 0:
+            kill_kind = _detect_stage_kill(rc, out, err)
+            if kill_kind is not None:
+                result[kill_kind] = True
+                return _finish(rc, "eacsl_stage_killed")
             return _finish(rc, "eacsl_compile_failed")
     else:
 
@@ -1206,6 +1213,10 @@ def _compile_eacsl_binary_uncached(
         _note_const_unions(out, err)  # the last frontend run only: a retry preprocesses the same files again
         frontend.update(output=out + "\n" + err, instrumented=rc == 0 and instrumented_c.is_file())
         if rc != 0:
+            kill_kind = _detect_stage_kill(rc, out, err)
+            if kill_kind is not None:
+                result[kill_kind] = True
+                return _finish(rc, "eacsl_stage_killed")
             return _finish(rc, "eacsl_instrumentation_failed")
         if instrumented_c.is_file():
             c_text = instrumented_c.read_text(encoding="utf-8", errors="replace")
@@ -1448,6 +1459,10 @@ def _compile_eacsl_binary_uncached(
             cmd2, rc, out, err = _stage2(link_used)
             _record(cmd2, rc, out, err)
         if rc != 0:
+            kill_kind = _detect_stage_kill(rc, out, err)
+            if kill_kind is not None:
+                result[kill_kind] = True
+                return _finish(rc, "eacsl_stage_killed")
             return _finish(rc, "eacsl_compile_failed")
 
     binary = select_eacsl_binary(out_bin)
@@ -2770,12 +2785,32 @@ def build_module_binary(
     return result
 
 
-# A diagnostic Frama-C prints when it stops on its own (`[kernel] User Error`, `[e-acsl] Failure`, an
-# uncaught OCaml exception, OCaml's own `Out of memory`).
+# A diagnostic Frama-C prints when it stops on its own (`[kernel] User Error`, `[e-acsl] Failure`,
+# `[kernel:annot-error]`, an uncaught OCaml exception, OCaml's own `Out of memory`).
+# Excludes `[kernel] Parsing <path>` progress lines so filenames like `src/error.c` do not mask a kill.
 _FRAMAC_DIAGNOSTIC_RE = re.compile(
-    r"^\[[\w.-]+\][^\n]*\b(?:Error|Failure|error)\b|^Fatal error|Unexpected error|Stack overflow|Out of memory",
+    r"^\[[\w.:-]*error[\w.:-]*\]"
+    r"|^\[[\w.:-]+\](?!\s+Parsing\b)[^\n]*\b(?:Error|Failure|error)\b"
+    r"|^Fatal error|Unexpected error|Stack overflow|Out of memory",
     re.MULTILINE,
 )
+
+
+def _detect_stage_kill(rc: int | None, stdout: str, stderr: str) -> str | None:
+    """
+    Classify whether an E-ACSL build stage was externally killed (typically cgroup OOM):
+    - `killed`: SIGKILL seen directly (return code 137 or -9, or a `Killed` line near the end).
+    - `killed_suspected`: `e-acsl-gcc` stopped with `aborted by Frama-C` and Frama-C printed no
+      diagnostic of its own (`e-acsl-gcc` exits 1 whatever Frama-C's status, and bash prints no
+      `Killed` for a process killed inside `$(...)`).
+    - None: normal failure (or not a kill).
+    """
+    text = f"{stdout}\n{stderr}"
+    if rc in (-9, 137) or any("Killed" in line for line in text.splitlines()[-8:]):
+        return "killed"
+    if "aborted by Frama-C" in text and not _FRAMAC_DIAGNOSTIC_RE.search(text):
+        return "killed_suspected"
+    return None
 
 
 def _attempt_failure(comp: dict) -> dict:
@@ -2791,10 +2826,10 @@ def _attempt_failure(comp: dict) -> dict:
         out["reason"] = comp["reason"]
     rc = comp.get("returncode")
     stderr = str(comp.get("stderr") or "")
-    text = f"{comp.get('stdout') or ''}\n{stderr}"
-    if rc in (-9, 137) or any("Killed" in line for line in text.splitlines()[-8:]):
+    kill_kind = _detect_stage_kill(rc, str(comp.get("stdout") or ""), stderr)
+    if comp.get("killed") or kill_kind == "killed":
         out["killed"] = True
-    elif "aborted by Frama-C" in text and not _FRAMAC_DIAGNOSTIC_RE.search(text):
+    elif comp.get("killed_suspected") or kill_kind == "killed_suspected":
         out["killed_suspected"] = True
     if stderr.strip():
         out["stderr_tail"] = stderr[-1500:]

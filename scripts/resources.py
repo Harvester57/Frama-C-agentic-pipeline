@@ -60,7 +60,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,7 +119,9 @@ CLASSES: dict[str, JobClass] = {
     # One Frama-C parse of a link unit for the Phase 0 model (phase0_model.py): one kernel, no analysis.
     "parse": JobClass("parse", False, 1, 1, 2048, 0, idempotent=True, wall_timeout_s=1800),
     "build": JobClass("build", False, 1, 4, 2048, 0, idempotent=True, wall_timeout_s=3600),
-    "guardrail": JobClass("guardrail", True, 1, 2, 2048, 0, wall_timeout_s=1800),
+    # Stage-1 Frama-C E-ACSL over ~100-TU modules (e.g. c-ares adig, 98 TUs) OOMs at 2048 MiB
+    # and compiles cleanly at 4096 MiB; Phase 0 parse peak scaling can raise the floor further.
+    "guardrail": JobClass("guardrail", True, 1, 2, 4096, 0, wall_timeout_s=1800),
     "fuzz": JobClass(
         "fuzz",
         True,
@@ -1541,6 +1543,8 @@ _CLASS_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"(?:^|[\s;&|(/])(?:clang|gcc)\b[^;&|]*-fsanitize=[^\s;&|]*fuzzer", "build"),
     (r"workspace_overlay\.py\s+merge-(?:agent|batch)\b", "verify"),
     (r"wp_scheduler\.py\s+(?:step|complete|merge-pending)\b", "verify"),
+    # `next --prepare` loads Eva reports and prepares agent overlays/briefs in parallel like `step --prepare`.
+    (r"wp_scheduler\.py\s+next\b[^\n;|&]*\s--prepare(?![\w-])", "verify"),
     # A direct Frama-C call (parse or annotation check): one single-threaded kernel, like Eva.
     (r"(?:^|[\s;&|(/])frama-c(?:\s|$)", "eva"),
 )
@@ -1655,12 +1659,19 @@ def _extract_script_paths(cmd: str, base_dir: Path | str | None = None) -> list[
         pass
     token_lists.append(cmd.split())
 
+    container_run_prefix = CONTAINER_RUN_DIR.as_posix().rstrip("/") + "/"
+
     def resolve(cand: str) -> Path:
         path = Path(cand)
-        if base_dir and not path.is_absolute():
-            candidate = Path(base_dir) / path
-            if candidate.is_file():
-                return candidate
+        if base_dir:
+            if cand.startswith(container_run_prefix) and not path.is_file():
+                candidate = Path(base_dir) / cand[len(container_run_prefix) :]
+                if candidate.is_file():
+                    return candidate
+            elif not path.is_absolute():
+                candidate = Path(base_dir) / path
+                if candidate.is_file():
+                    return candidate
         return path
 
     seen: set[str] = set()
@@ -1937,27 +1948,62 @@ def history_run_dir() -> Path | None:
 # measured peak (the observed 8.4-8.8 GB were still growing when killed, so they are lower bounds).
 PHASE0_MODEL = Path("workspace") / "reports" / "phase0_model.json"
 WORK_TREE_PREFIX = "workspace/work/"
+SCRATCH_WORK_PREFIX = "/scratch/work/"
 EACSL_BUILD_MARGIN = 1.25
 MODEL_RECORD_WINDOW_S = 120.0  # the model container records on exit: run-3's landed 1.1 s after the model ended
 _MODEL_MAX_BYTES = 512 << 20
+_SHELL_DELIMS = frozenset({";", "&&", "||", "|", "&", ">", ">>", "<"})
 
 
 def command_sources(cmd: list[str]) -> list[str]:
-    """The files after `--sources` (run_eacsl_fuzz.py build), up to the next option."""
+    """The files after `--sources` (run_eacsl_fuzz.py build/guardrail), up to the next option."""
     out: list[str] = []
     for i, arg in enumerate(cmd):
         if arg == "--sources":
             for item in cmd[i + 1 :]:
-                if item.startswith("-"):
+                if item.startswith("-") or item in _SHELL_DELIMS or any(c in item for c in (";", "|", "&")):
                     break
                 out.append(item)
     return out
+
+
+def _command_sources_argv(cmd: str, base_dir: Path | str | None = None) -> list[str]:
+    """
+    Tokenize a shell command (or an on-disk shell script it runs) to extract `--sources` for
+    Phase 0 memory sizing (`first_build_estimate`).
+    """
+    unwrapped = _unwrap_command(cmd or "")
+    for candidate_text in _iter_command_texts(unwrapped, base_dir=base_dir):
+        flat = re.sub(r"\\\r?\n", " ", candidate_text)
+        try:
+            tokens = shlex.split(flat, posix=True)
+        except ValueError:
+            tokens = flat.split()
+        if command_sources(tokens):
+            return tokens
+    return []
+
+
+def _iter_command_texts(unwrapped: str, base_dir: Path | str | None = None) -> Iterator[str]:
+    yield unwrapped
+    for p, run_by_shell in _extract_script_paths(unwrapped, base_dir=base_dir):
+        try:
+            if p.is_file():
+                content = p.read_text(encoding="utf-8", errors="replace")[:65536]
+                if run_by_shell or p.suffix == ".sh" or _SHELL_SHEBANG_RE.match(content):
+                    yield content
+        except OSError:
+            pass
 
 
 def _tree_relative(path: str, tree: str | None) -> str:
     p = path.replace("\\", "/")
     if WORK_TREE_PREFIX in p:
         return p.rsplit(WORK_TREE_PREFIX, 1)[1]
+    if SCRATCH_WORK_PREFIX in p:
+        return p.rsplit(SCRATCH_WORK_PREFIX, 1)[1]
+    if p.startswith("scratch/work/"):
+        return p[len("scratch/work/") :]
     if tree and p.startswith(tree.rstrip("/") + "/"):
         return p[len(tree.rstrip("/")) + 1 :]
     return p[2:] if p.startswith("./") else p
@@ -3069,6 +3115,238 @@ def _record_run_history(
         write_history(run_dir, rec)
 
 
+# ---------------------------------------------------------------------------
+# Prover effort budget coordination (.prover_budget.json)
+# ---------------------------------------------------------------------------
+
+_CREDITED_LEASES_KEPT = 64
+_PROVER_BUDGET_FILENAME = ".prover_budget.json"
+_AGENT_SCRATCH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])agents[/\\]([A-Za-z0-9][A-Za-z0-9._-]*)[/\\]scratch(?=[/\\\s\"'=:,;)]|$)"
+)
+_RUN_WP_CMD_RE = re.compile(r"\brun_wp_function\.py\b")
+_IGNORE_PROVER_BUDGET_RE = re.compile(r"(?:^|\s)--ignore-prover-budget(?:\s|$)")
+_PARENT_ORCH_CMD_RE = re.compile(r"\b(?:wp_scheduler\.py|workspace_overlay\.py)\b")
+_NON_WP_HEAVY_TOOL_RE = re.compile(
+    r"\b(?:run_eacsl_fuzz\.py|run_eva_slice\.py|eva_tuning\.py|function_facts\.py|loop_seeds\.py|"
+    r"pipeline_make\.py|sandbox_exec\.py|build_capture\.py|seed_harvest\.py|codeql_trust\.py|"
+    r"phase0_model\.py|build_callgraph_dag\.py|workspace_overlay\.py|wp_scheduler\.py)\b"
+    r"|(?:^|[\s;&|(/])e-acsl-gcc(?:\.sh)?(?:\s|$)"
+)
+
+
+def _strip_shell_comments(text: str) -> str:
+    return "\n".join(line for line in (text or "").splitlines() if not line.lstrip().startswith("#"))
+
+
+def _command_texts_for_budget(cmd: str | Sequence[str], run_dir: Path | str | None = None) -> list[str]:
+    cmd_str = cmd if isinstance(cmd, str) else shlex.join(cmd)
+    if not cmd_str.strip():
+        return []
+    unwrapped = _unwrap_command(cmd_str)
+    return [_strip_shell_comments(t) for t in _iter_command_texts(unwrapped, base_dir=run_dir)]
+
+
+def _scratch_budget_from_path_parts(path_text: str) -> Path | None:
+    cand = path_text.strip("\"'")
+    if not cand:
+        return None
+    if cand.startswith("-") and "=" in cand:
+        cand = cand.split("=", 1)[1].strip("\"'")
+    parts = Path(cand).parts
+    for idx, part in enumerate(parts):
+        if part == "agents" and idx + 2 < len(parts) and parts[idx + 2] == "scratch":
+            agent_id = parts[idx + 1]
+            if agent_id and agent_id not in (".", ".."):
+                budget = Path(*parts[: idx + 3]) / _PROVER_BUDGET_FILENAME
+                if budget.is_file():
+                    return budget
+    return None
+
+
+def _locate_prover_budget_path(cmd: str | Sequence[str], run_dir: Path | str | None = None) -> Path | None:
+    """
+    Locate a unique existing `agents/<id>/scratch/.prover_budget.json` referenced by `cmd` (or an
+    invoked shell script under `run_dir`, or the current working directory). Returns None when no
+    budget file matches or when multiple distinct agents are referenced.
+    """
+    texts = _command_texts_for_budget(cmd, run_dir=run_dir)
+    if not texts:
+        return None
+
+    roots: list[Path] = []
+    if run_dir is not None:
+        roots.append(Path(run_dir))
+    with contextlib.suppress(OSError):
+        roots.append(Path.cwd())
+    roots.append(CONTAINER_RUN_DIR)
+
+    found: dict[Path, Path] = {}
+
+    def _add(p: Path) -> None:
+        try:
+            if p.is_file():
+                found[p.resolve()] = p
+        except OSError:
+            pass
+
+    # 1. Inspect explicit argv tokens directly (preserves Windows paths without POSIX shlex stripping).
+    if not isinstance(cmd, str):
+        for tok in cmd:
+            direct = _scratch_budget_from_path_parts(str(tok))
+            if direct is not None:
+                _add(direct)
+
+    # 2. Inspect command and invoked script texts for `agents/<id>/scratch` references and full paths.
+    for text in texts:
+        for m in _AGENT_SCRATCH_RE.finditer(text):
+            agent_id = m.group(1)
+            for root in roots:
+                _add(root / "agents" / agent_id / "scratch" / _PROVER_BUDGET_FILENAME)
+        for tok in text.split():
+            direct = _scratch_budget_from_path_parts(tok)
+            if direct is not None:
+                _add(direct)
+
+    # 3. Also check if cwd itself is inside `agents/<id>/scratch`.
+    if not found:
+        with contextlib.suppress(OSError):
+            cwd_budget = _scratch_budget_from_path_parts(str(Path.cwd()))
+            if cwd_budget is not None:
+                _add(cwd_budget)
+
+    if len(found) == 1:
+        return next(iter(found.values()))
+    return None
+
+
+def _credit_prover_budget_lease_wait(
+    cmd: str | Sequence[str],
+    run_dir: Path | str | None,
+    lease_id: str,
+    wait_s: float,
+    *,
+    now: float | None = None,
+) -> bool:
+    """
+    Idempotently credit a broker lease queue wait (`wait_s`) into the referenced prover's
+    `.prover_budget.json`, using the exact schema and cap (`min(since_first_s, stored + wait_s)`)
+    that `run_wp_function.py` reads. Never credits before `first_wp_at > 0` (the first WP call's
+    wait sits outside the wall budget), never double-counts a `lease_id` already in
+    `lease_wait_credited`, and never credits parent orchestration commands.
+    """
+    lid = (lease_id or "").strip()
+    if not lid or isinstance(wait_s, bool) or not math.isfinite(wait_s) or wait_s <= 0:
+        return False
+    texts = _command_texts_for_budget(cmd, run_dir=run_dir)
+    if not texts or any(_PARENT_ORCH_CMD_RE.search(t) for t in texts):
+        return False
+    budget_path = _locate_prover_budget_path(cmd, run_dir=run_dir)
+    if budget_path is None:
+        return False
+    budget_data = _load_json(budget_path)
+    if not isinstance(budget_data, dict):
+        return False
+    first_wp_at = budget_data.get("first_wp_at")
+    if (
+        isinstance(first_wp_at, bool)
+        or not isinstance(first_wp_at, (int, float))
+        or not math.isfinite(first_wp_at)
+        or first_wp_at <= 0
+    ):
+        return False
+    raw_credited = budget_data.get("lease_wait_credited")
+    credited = [x for x in raw_credited if isinstance(x, str)] if isinstance(raw_credited, list) else []
+    if lid in credited:
+        return False
+    stored = budget_data.get("lease_wait_s")
+    total = 0.0
+    if isinstance(stored, (int, float)) and not isinstance(stored, bool) and math.isfinite(stored) and stored > 0:
+        total = float(stored)
+    now_ts = time.time() if now is None else float(now)
+    since_first_s = max(0.0, now_ts - float(first_wp_at))
+    total = min(total + float(wait_s), since_first_s)
+    budget_data["lease_wait_credited"] = [*credited, lid][-_CREDITED_LEASES_KEPT:]
+    if total > 0 or "lease_wait_s" in budget_data:
+        budget_data["lease_wait_s"] = round(total, 1)
+    try:
+        _write_json(budget_path, budget_data)
+    except OSError:
+        return False
+    return True
+
+
+def _prover_budget_already_exhausted(
+    cmd: str | Sequence[str],
+    run_dir: Path | str | None = None,
+    *,
+    now: float | None = None,
+) -> tuple[bool, str | None]:
+    """
+    Pre-lease check for `wp` jobs: returns `(True, reason)` when `cmd` invokes `run_wp_function.py`
+    without `--ignore-prover-budget` (and without another heavy non-WP tool in the same script)
+    against an existing `agents/<id>/scratch/.prover_budget.json` whose next call will immediately
+    be refused for hitting `max_wp_invocations` or `max_wall_clock_s`. Callers downgrade the job
+    to ungated `light` so `run_wp_function.py` reports `budget_exhausted: True` without waiting on
+    or wasting a gated `wp` broker lease.
+    """
+    texts = _command_texts_for_budget(cmd, run_dir=run_dir)
+    if not texts:
+        return False, None
+    if not any(_RUN_WP_CMD_RE.search(t) for t in texts):
+        return False, None
+    if any(_IGNORE_PROVER_BUDGET_RE.search(t) for t in texts):
+        return False, None
+    if any(_NON_WP_HEAVY_TOOL_RE.search(t) for t in texts):
+        return False, None
+    budget_path = _locate_prover_budget_path(cmd, run_dir=run_dir)
+    if budget_path is None:
+        return False, None
+    budget_data = _load_json(budget_path)
+    if not isinstance(budget_data, dict):
+        return False, None
+
+    def _safe_int(val: Any) -> int:
+        if isinstance(val, bool) or val is None:
+            return 0
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 0
+
+    invocations = _safe_int(budget_data.get("wp_invocations"))
+    max_inv = _safe_int(budget_data.get("max_wp_invocations"))
+    max_wall_s = _safe_int(budget_data.get("max_wall_clock_s"))
+    if max_inv > 0 and invocations + 1 > max_inv:
+        return True, f"wp_invocations={invocations}/{max_inv}"
+
+    first_wp_at = budget_data.get("first_wp_at")
+    if (
+        invocations >= 1
+        and max_wall_s > 0
+        and isinstance(first_wp_at, (int, float))
+        and not isinstance(first_wp_at, bool)
+        and math.isfinite(first_wp_at)
+        and first_wp_at > 0
+    ):
+        stored_wait = budget_data.get("lease_wait_s")
+        wait_s = (
+            float(stored_wait)
+            if isinstance(stored_wait, (int, float))
+            and not isinstance(stored_wait, bool)
+            and math.isfinite(stored_wait)
+            and stored_wait > 0
+            else 0.0
+        )
+        now_ts = time.time() if now is None else float(now)
+        since_first_s = max(0.0, now_ts - float(first_wp_at))
+        queued_s = min(wait_s, since_first_s)
+        elapsed_s = max(0.0, since_first_s - queued_s)
+        if elapsed_s > max_wall_s:
+            return True, f"elapsed={int(elapsed_s)}s/{max_wall_s}s, excluding {int(queued_s)}s queued"
+    return False, None
+
+
 def cmd_run(argv: list[str], root: Path | str = "/") -> int:
     """`run --class C [--key K] [--output P] -- cmd...`: run cmd under a CPU+memory sub-lease of this container."""
     opts, cmd = _split_dashdash(argv)
@@ -3095,6 +3373,14 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
         _say(problem)
         return 2
     run_dir = history_run_dir()
+    if cls_name == "wp":
+        exhausted, reason = _prover_budget_already_exhausted(cmd, run_dir)
+        if exhausted:
+            _say(
+                f"prover budget already exhausted ({reason}); downgrading wp to light "
+                "to report exhaustion without queueing for a wp lease"
+            )
+            cls_name = "light"
     floor: int | None = None
     attempt = 0
 
@@ -3102,12 +3388,12 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
         if attempt > 1:
             return None  # the retry's floor already holds what the first attempt measured
         hist = history_estimate(run_dir, c, k)
-        if c == "build":
+        if c in ("build", "guardrail"):
             # The Phase 0 estimate stays a floor: a build that aborted in seconds (run-3's missing
             # objs/ngx_modules.c) records a tiny peak, which must not shrink the next whole-program build.
             phase0 = first_build_estimate(run_dir, cmd)
             if phase0 is not None and phase0[0] > (hist or 0):
-                _say(f"build of {k or 'this module'}: {phase0[0]} MiB from Phase 0's parse ({phase0[1]})")
+                _say(f"{c} of {k or 'this module'}: {phase0[0]} MiB from Phase 0's parse ({phase0[1]})")
                 return phase0[0]
         return hist
 
@@ -3132,6 +3418,8 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
         before = cgroup_stats(root_p)
         start = time.monotonic()
         try:
+            if lease.wait_s > 0 and (lease.waited or lease.wait_s >= 0.05):
+                _credit_prover_budget_lease_wait(cmd, run_dir, lease.id, lease.wait_s)
             rc, maxrss = _run_child(cmd, env)
         finally:
             single = broker.release(lease)
@@ -3686,6 +3974,15 @@ def cmd_exec(argv: list[str]) -> int:
             parser.error(f"unknown class {cls_name!r} (one of: {', '.join(CLASSES)})")
         cls = CLASSES[cls_name]
         runs_target_code = cls.runs_target_code
+    if cls_name == "wp" and command:
+        exhausted, reason = _prover_budget_already_exhausted(command, args.run_dir)
+        if exhausted:
+            _say(
+                f"prover budget already exhausted ({reason}); downgrading wp to light "
+                "to report exhaustion without queueing for a wp lease"
+            )
+            cls_name = "light"
+            cls = CLASSES["light"]
     fixed_cpus = None
     if args.cpus:
         try:
@@ -3742,10 +4039,21 @@ def cmd_exec(argv: list[str]) -> int:
     placer = _cpuset_placer(pool) if plan.exclusive and pool.topology and cls.gated else None
     lease_id = new_lease_id()
     name = f"framac-{lease_id}"
+
+    def _exec_estimate(c: str, k: str | None) -> int | None:
+        hist = history_estimate(run_dir, c, k, cache_dir=cache_host)
+        if c in ("build", "guardrail") and command:
+            src_argv = _command_sources_argv(command, base_dir=run_dir)
+            phase0 = first_build_estimate(run_dir, src_argv, cache_dir=cache_host) if src_argv else None
+            if phase0 is not None and phase0[0] > (hist or 0):
+                _say(f"{c} of {k or 'this module'}: {phase0[0]} MiB from Phase 0's parse ({phase0[1]})")
+                return phase0[0]
+        return hist
+
     broker = Broker(
         broker_dir,
         pool_fn,
-        history_fn=lambda c, k: history_estimate(run_dir, c, k, cache_dir=cache_host),
+        history_fn=_exec_estimate,
         placer=placer,
         container_alive=lambda e: container_running(str(e.get("engine") or engine_bin), e["id"]),
         container_kill=_orphan_killer(engine_bin),
@@ -3778,6 +4086,8 @@ def cmd_exec(argv: list[str]) -> int:
         },
     )
     try:
+        if not args.dry_run and command and lease.wait_s > 0 and (lease.waited or lease.wait_s >= 0.05):
+            _credit_prover_budget_lease_wait(command, run_dir, lease.id, lease.wait_s)
         for warning in plan.warnings:
             _say(warning)
         full = build_engine_argv(

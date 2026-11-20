@@ -435,3 +435,89 @@ def test_scaffold_needs_validation_for_unlinked_candidate_is_ingestible(run_dir,
     L.cmd_ingest_verifier(_write_result(run_dir, res))
     assert load(run_dir / "findings.json")[0]["verdict"] == "needs_validation"
     assert validate_run_dir(run_dir) == []
+
+
+def test_clear_memory_refused_evidence_prunes_only_insufficient_memory_wp_errors(run_dir, capsys):
+    mem_rep = "agents/prove-a/scratch/parent_wp/a.json"
+    to_rep = "agents/prove-a/scratch/parent_wp/a_timeout.json"
+    ok_rep = "agents/prove-b/scratch/parent_wp/b.json"
+    eva_rep = "workspace/reports/eva/m.json"
+    for rel in (mem_rep, to_rep, ok_rep, eva_rep):
+        write_json(run_dir / rel, {"status": "ok"})
+
+    mem_ev = {
+        "phase": "wp",
+        "producer": "run_wp_function.py",
+        "result": "wp_analysis_error",
+        "discharging": False,
+        "tool_output": mem_rep,
+        "summary": "WP did not complete (insufficient_memory); no goal was credited.",
+        "details": {"reason": "insufficient_memory"},
+    }
+    timeout_ev = {
+        "phase": "wp",
+        "producer": "run_wp_function.py",
+        "result": "wp_analysis_error",
+        "discharging": False,
+        "tool_output": to_rep,
+        "summary": "WP did not complete (timeout); no goal was credited.",
+        "details": {"reason": "timeout"},
+    }
+    eva_ev = {
+        "phase": "eva",
+        "producer": "run_eva.py",
+        "result": "eva_unknown",
+        "discharging": False,
+        "tool_output": eva_rep,
+        "summary": "Eva left alarms.",
+    }
+    proved_ev = {
+        "phase": "wp",
+        "producer": "run_wp_function.py",
+        "result": "wp_proved",
+        "discharging": True,
+        "tool_output": ok_rep,
+        "summary": "All WP goals proved.",
+        "details": {"limits": {"vacuity": {"status": "consistent", "doomed": [], "dead_goals": 0}}},
+    }
+
+    u_in_prog = unit(
+        "src/m/a.c", "a", "rte", status="in_progress", agent_id="prove-a", evidence=[eva_ev, mem_ev, timeout_ev]
+    )
+    u_covered = unit("src/m/b.c", "b", "rte", status="covered", evidence=[proved_ev, mem_ev])
+    u_blocked_sole = unit(
+        "src/m/c.c", "c", "rte", status="blocked", unresolved=["blocked on memory"], evidence=[mem_ev]
+    )
+    u_other = unit("src/m/d.c", "d", "rte", status="in_progress", agent_id="prove-d", evidence=[mem_ev])
+    _verifier_run(run_dir, [u_in_prog, u_covered, u_blocked_sole, u_other], [])
+
+    out = L.clear_memory_refused_evidence(
+        [u_in_prog["coverage_id"], u_covered["coverage_id"], u_blocked_sole["coverage_id"]]
+    )
+    assert out["ok"] is True
+    assert out["removed"] == 2
+    assert out["units"] == [u_in_prog["coverage_id"], u_covered["coverage_id"]]
+    assert out["skipped_sole_evidence"] == [u_blocked_sole["coverage_id"]]
+
+    by_id = units_by_id(run_dir)
+    # In-progress unit loses only insufficient_memory; keeps eva_unknown and real timeout wp_analysis_error.
+    assert [e["result"] for e in by_id[u_in_prog["coverage_id"]]["evidence"]] == ["eva_unknown", "wp_analysis_error"]
+    assert by_id[u_in_prog["coverage_id"]]["evidence"][1]["details"]["reason"] == "timeout"
+    # Covered unit loses insufficient_memory and keeps its discharging WP verdict.
+    assert [e["result"] for e in by_id[u_covered["coverage_id"]]["evidence"]] == ["wp_proved"]
+    # Blocked unit whose sole evidence was insufficient_memory is preserved so ledger stays valid.
+    assert len(by_id[u_blocked_sole["coverage_id"]]["evidence"]) == 1
+    # Unlisted unit is untouched.
+    assert len(by_id[u_other["coverage_id"]]["evidence"]) == 1
+    assert validate_run_dir(run_dir) == []
+
+    # Idempotent on second call.
+    again = L.clear_memory_refused_evidence([u_in_prog["coverage_id"], u_covered["coverage_id"]])
+    assert again["removed"] == 0 and again["units"] == []
+
+    # CLI cleans the remaining listed unit cleanly.
+    assert L.main(["clear-memory-refused-evidence", "--id", u_other["coverage_id"]]) == 0
+    cli_out = json.loads(capsys.readouterr().out)
+    assert cli_out["removed"] == 1 and cli_out["units"] == [u_other["coverage_id"]]
+    assert units_by_id(run_dir)[u_other["coverage_id"]]["evidence"] == []
+    assert validate_run_dir(run_dir) == []

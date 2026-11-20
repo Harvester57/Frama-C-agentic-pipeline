@@ -892,20 +892,335 @@ def _linkage_block_braces(tokens: list[Token], delims: _ConditionalDelims | None
     return frozenset(skip)
 
 
-def locate_function_span(
-    source: str, function_name: str, is_header: bool = False, path: str = "<input>"
-) -> Span | None:
+_PTR_QUAL_TOKENS = frozenset({"*", "const", "volatile", "restrict", "__restrict", "__restrict__", "_Atomic"})
+_NOT_FUNC_NAMES = frozenset(
+    {
+        "typedef",
+        "extern",
+        "static",
+        "inline",
+        "struct",
+        "enum",
+        "union",
+        "__attribute__",
+        "__attribute",
+        "__asm__",
+        "__asm",
+        "asm",
+        "sizeof",
+        "typeof",
+        "__typeof__",
+        "_Alignas",
+        "_Static_assert",
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "switch",
+        "do",
+    }
+)
+_KR_FORBIDDEN_DECL_TOKENS = frozenset(
+    {
+        "typedef",
+        "extern",
+        "static",
+        "inline",
+        "return",
+        "if",
+        "while",
+        "for",
+        "switch",
+        "do",
+        "case",
+        "default",
+        "goto",
+        "break",
+        "continue",
+    }
+)
+
+
+def _has_top_level_token(
+    tokens: list[Token], start: int, end: int, wanted: frozenset[str], ignored: frozenset[int]
+) -> bool:
+    """Whether any c_token at paren/brace depth 0 in `tokens[start:end]` has text in `wanted`."""
+    p_depth = 0
+    b_depth = 0
+    for k in range(max(0, start), end):
+        if k in ignored:
+            continue
+        t = tokens[k]
+        if t.kind != "c_token":
+            continue
+        if t.text == "(":
+            p_depth += 1
+        elif t.text == ")":
+            p_depth = max(0, p_depth - 1)
+        elif t.text == "{":
+            b_depth += 1
+        elif t.text == "}":
+            b_depth = max(0, b_depth - 1)
+        elif p_depth == 0 and b_depth == 0 and t.text in wanted:
+            return True
+    return False
+
+
+def _is_nested_decl_prefix(
+    tokens: list[Token],
+    last_top_boundary_idx: int,
+    open_parens: list[int],
+    fn_idx: int,
+    delims: _ConditionalDelims,
+) -> bool:
     """
-    Locate the byte and line span of `function_name` (including any immediately preceding
-    ACSL contract block) in a C source file (`is_header=False`) or header file (`is_header=True`).
+    Whether `open_parens` wraps a nested C function declarator for `tokens[fn_idx]` (such as
+    `int (*f(int x))(int)` or `int (*(*f(int x))(int y))(int z)`), rather than another function's
+    parameter list or a parenthesised expression.
     """
+    outer = open_parens[0]
+    has_return_spec = any(
+        k not in delims.ignored and tokens[k].kind == "c_token" for k in range(max(0, last_top_boundary_idx + 1), outer)
+    )
+    if not has_return_spec:
+        return False
+    if _has_top_level_token(tokens, last_top_boundary_idx + 1, outer, frozenset({"="}), delims.ignored):
+        return False
+    boundaries = [*open_parens, fn_idx]
+    for p_idx, next_idx in zip(boundaries, boundaries[1:], strict=False):
+        saw_star = False
+        k = p_idx + 1
+        while k < next_idx:
+            if k in delims.ignored:
+                k += 1
+                continue
+            t = tokens[k]
+            if t.kind in ("whitespace", "c_comment", "acsl_block", "acsl_line", "pp_directive"):
+                k += 1
+                continue
+            if t.kind == "c_token" and t.text in _DECL_SUFFIX_KWS:
+                paren = _next_meaningful(tokens, k + 1)
+                if paren < next_idx and tokens[paren].kind == "c_token" and tokens[paren].text == "(":
+                    k = _skip_paren_group(tokens, paren)
+                    continue
+            if t.kind != "c_token" or t.text not in _PTR_QUAL_TOKENS:
+                return False
+            if t.text == "*":
+                saw_star = True
+            k += 1
+        if not saw_star:
+            return False
+    return True
+
+
+def _unwind_nested_declarator(tokens: list[Token], pos: int, depth: int, delims: _ConditionalDelims) -> int:
+    """
+    Close `depth` enclosing declarator `)` levels starting at `pos`, each followed by at least one
+    `(...)` or `[...]` declarator suffix (the return type's parameters or array dimensions).
+    Returns the token index after the outermost suffix, or -1 if the shape does not match.
+    """
+    n = len(tokens)
+    for _ in range(depth):
+        pos = _next_after_params(tokens, pos)
+        if pos >= n or tokens[pos].kind != "c_token" or tokens[pos].text != ")":
+            return -1
+        pos = _next_after_params(tokens, pos + 1)
+        saw_suffix = False
+        while pos < n and tokens[pos].kind == "c_token" and tokens[pos].text in ("(", "["):
+            open_ch = tokens[pos].text
+            close_ch = ")" if open_ch == "(" else "]"
+            close_idx = _find_matching_delim(tokens, pos, open_ch, close_ch, delims)
+            if close_idx == -1:
+                return -1
+            saw_suffix = True
+            pos = _next_after_params(tokens, close_idx + 1)
+        if not saw_suffix:
+            return -1
+    return pos
+
+
+def _kr_param_identifiers(
+    tokens: list[Token], open_paren_idx: int, close_paren_idx: int, delims: _ConditionalDelims
+) -> set[str] | None:
+    """
+    If `tokens[open_paren_idx + 1 : close_paren_idx]` is a non-empty K&R identifier list (`a, b`),
+    return the parameter names; otherwise None.
+    """
+    inner = [
+        tokens[k].text
+        for k in range(open_paren_idx + 1, close_paren_idx)
+        if k not in delims.ignored and tokens[k].kind == "c_token"
+    ]
+    if not inner or len(inner) % 2 == 0:
+        return None
+    idents: set[str] = set()
+    for i, text in enumerate(inner):
+        if i % 2 == 1:
+            if text != ",":
+                return None
+        else:
+            if not _IDENT_RE.fullmatch(text) or text in _C_PARAM_KEYWORDS:
+                return None
+            idents.add(text)
+    return idents
+
+
+def _kr_body_brace_idx(tokens: list[Token], start_idx: int, kr_idents: set[str], delims: _ConditionalDelims) -> int:
+    """
+    Scan K&R parameter declarations (`int a; char *b;`) starting at `start_idx` and return the token
+    index of the function body's opening `{`, or -1 if `start_idx` is not a K&R declaration list.
+    """
+    n = len(tokens)
+    cur = start_idx
+    decl_count = 0
+    while cur < n:
+        cur = _next_after_params(tokens, cur)
+        if cur >= n:
+            return -1
+        if tokens[cur].kind == "c_token" and tokens[cur].text == "{":
+            return cur if decl_count >= 1 else -1
+        # Scan a single `;`-terminated K&R parameter declaration.
+        p_depth = 0
+        tag_state = 0  # 1 right after struct/union/enum, 2 right after tag name
+        decl_idents: set[str] = set()
+        found_semi = False
+        while cur < n:
+            if cur in delims.ignored:
+                cur += 1
+                continue
+            t = tokens[cur]
+            if t.kind in ("whitespace", "c_comment", "acsl_block", "acsl_line", "pp_directive"):
+                cur += 1
+                continue
+            if t.kind != "c_token":
+                tag_state = 0
+                cur += 1
+                continue
+            text = t.text
+            if text == "(":
+                p_depth += 1
+                tag_state = 0
+            elif text == ")":
+                if p_depth == 0:
+                    return -1
+                p_depth -= 1
+                tag_state = 0
+            elif text == "{" and p_depth == 0:
+                if tag_state not in (1, 2):
+                    return -1
+                close_b = _find_matching_delim(tokens, cur, "{", "}", delims)
+                if close_b == -1:
+                    return -1
+                cur = close_b + 1
+                tag_state = 0
+                continue
+            elif text == "}" and p_depth == 0:
+                return -1
+            elif text == ";" and p_depth == 0:
+                if not (decl_idents & kr_idents):
+                    return -1
+                decl_count += 1
+                cur += 1
+                found_semi = True
+                break
+            elif p_depth == 0 and (text == "=" or text in _KR_FORBIDDEN_DECL_TOKENS):
+                return -1
+            else:
+                if p_depth == 0 and text in ("struct", "union", "enum"):
+                    tag_state = 1
+                elif p_depth == 0 and tag_state == 1 and _IDENT_RE.fullmatch(text):
+                    tag_state = 2
+                else:
+                    tag_state = 0
+                if _IDENT_RE.fullmatch(text):
+                    decl_idents.add(text)
+            cur += 1
+        if not found_semi:
+            return -1
+    return -1
+
+
+def _match_declaration_at(
+    tokens: list[Token],
+    idx: int,
+    last_top_boundary_idx: int,
+    open_parens: list[int],
+    delims: _ConditionalDelims,
+) -> tuple[str, int, int] | None:
+    """
+    If `tokens[idx]` names a top-level function declaration (ordinary, nested declarator such as
+    `int (*f(int x))(int)`, or K&R definition `int f(a, b) int a; char *b; { ... }`), return
+    `(kind, start_idx, end_idx)` where `kind` is `"prototype"` or `"definition"`; else None.
+    """
+    n = len(tokens)
+    if open_parens:
+        if not _is_nested_decl_prefix(tokens, last_top_boundary_idx, open_parens, idx, delims):
+            return None
+        decl_anchor_idx = open_parens[0]
+    else:
+        if _has_top_level_token(tokens, last_top_boundary_idx + 1, idx, frozenset({"="}), delims.ignored):
+            return None
+        decl_anchor_idx = idx
+
+    open_paren_idx = _next_meaningful(tokens, idx + 1)
+    if open_paren_idx >= n or tokens[open_paren_idx].kind != "c_token" or tokens[open_paren_idx].text != "(":
+        return None
+    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
+    if close_paren_idx == -1:
+        return None
+
+    pos = close_paren_idx + 1
+    if open_parens:
+        pos = _unwind_nested_declarator(tokens, pos, len(open_parens), delims)
+        if pos == -1:
+            return None
+
+    after_idx = _next_after_params(tokens, pos)
+    if after_idx >= n or tokens[after_idx].kind != "c_token":
+        return None
+
+    next_text = tokens[after_idx].text
+    if next_text == "{":
+        end_idx = _find_matching_delim(tokens, after_idx, "{", "}", delims)
+        if end_idx != -1:
+            return ("definition", _compute_span_start(tokens, last_top_boundary_idx, decl_anchor_idx), end_idx)
+        return None
+    if next_text == ";":
+        if _has_top_level_token(
+            tokens, last_top_boundary_idx + 1, decl_anchor_idx, frozenset({"typedef"}), delims.ignored
+        ):
+            return None
+        return ("prototype", _compute_span_start(tokens, last_top_boundary_idx, decl_anchor_idx), after_idx)
+
+    # K&R function definition: identifier list in `(...)`, parameter declarations ending in `;`, then `{ ... }`.
+    kr_idents = _kr_param_identifiers(tokens, open_paren_idx, close_paren_idx, delims)
+    if kr_idents:
+        body_brace_idx = _kr_body_brace_idx(tokens, after_idx, kr_idents, delims)
+        if body_brace_idx != -1:
+            end_idx = _find_matching_delim(tokens, body_brace_idx, "{", "}", delims)
+            if end_idx != -1:
+                return ("definition", _compute_span_start(tokens, last_top_boundary_idx, decl_anchor_idx), end_idx)
+    return None
+
+
+def _iter_declaration_spans(
+    source: str,
+    path: str = "<input>",
+    *,
+    target_name: str | None = None,
+    allow_prototype: bool = True,
+    allow_definition: bool = True,
+) -> Iterator[DeclSpan]:
+    """Yield top-level function declarations in `source` in source order."""
     tokens = tokenize_c_acsl(source, path=path)
     delims = _conditional_delims(tokens)
     linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     brace_depth = 0
     paren_depth = 0
-    last_top_boundary_idx = -1  # index of last top-level ';', '}', or 'pp_directive'
-
+    bracket_depth = 0
+    open_parens: list[int] = []
+    last_top_boundary_idx = -1
     idx = 0
     n = len(tokens)
     while idx < n:
@@ -913,76 +1228,77 @@ def locate_function_span(
         if idx in linkage:
             idx += 1
             continue
-        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
+        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
             last_top_boundary_idx = idx
-            idx += 1
-            continue
-
-        if tok.kind == "c_token":
+        elif tok.kind == "c_token":
             if tok.text == "{":
                 brace_depth += 1
-                idx += 1
-                continue
-            if tok.text == "}":
+            elif tok.text == "}":
                 brace_depth = max(0, brace_depth - 1)
-                if brace_depth == 0 and paren_depth == 0:
+                if brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
                     last_top_boundary_idx = idx
-                idx += 1
-                continue
-            if tok.text == "(":
+            elif tok.text == "(":
                 paren_depth += 1
-                idx += 1
-                continue
-            if tok.text == ")":
+                if brace_depth == 0 and bracket_depth == 0:
+                    open_parens.append(idx)
+            elif tok.text == ")":
                 paren_depth = max(0, paren_depth - 1)
-                idx += 1
-                continue
-            if tok.text == ";" and brace_depth == 0 and paren_depth == 0:
+                if brace_depth == 0 and bracket_depth == 0 and open_parens:
+                    open_parens.pop()
+            elif tok.text == "[":
+                bracket_depth += 1
+            elif tok.text == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif tok.text == ";" and brace_depth == 0 and paren_depth == 0 and bracket_depth == 0:
                 last_top_boundary_idx = idx
-                idx += 1
-                continue
-
-            # Candidate function name at top level
-            if brace_depth == 0 and paren_depth == 0 and tok.text == function_name:
-                open_paren_idx = _next_meaningful(tokens, idx + 1)
-                if (
-                    open_paren_idx < n
-                    and tokens[open_paren_idx].kind == "c_token"
-                    and tokens[open_paren_idx].text == "("
-                ):
-                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
-                    if close_paren_idx != -1:
-                        after_paren_idx = _next_after_params(tokens, close_paren_idx + 1)
-                        if after_paren_idx < n and tokens[after_paren_idx].kind == "c_token":
-                            next_tok = tokens[after_paren_idx]
-                            if not is_header and next_tok.text == "{":
-                                close_brace_idx = _find_matching_delim(tokens, after_paren_idx, "{", "}", delims)
-                                if close_brace_idx != -1:
-                                    start_idx = _compute_span_start(tokens, last_top_boundary_idx, idx)
-                                    start_tok = tokens[start_idx]
-                                    end_tok = tokens[close_brace_idx]
-                                    return Span(
-                                        function=function_name,
-                                        start_byte=start_tok.start,
-                                        end_byte=end_tok.end,
-                                        start_line=start_tok.line,
-                                        end_line=end_tok.line,
-                                        text=source[start_tok.start : end_tok.end],
-                                    )
-                            elif is_header and next_tok.text == ";":
-                                start_idx = _compute_span_start(tokens, last_top_boundary_idx, idx)
-                                start_tok = tokens[start_idx]
-                                end_tok = tokens[after_paren_idx]
-                                return Span(
-                                    function=function_name,
-                                    start_byte=start_tok.start,
-                                    end_byte=end_tok.end,
-                                    start_line=start_tok.line,
-                                    end_line=end_tok.line,
-                                    text=source[start_tok.start : end_tok.end],
-                                )
+            elif (
+                brace_depth == 0
+                and bracket_depth == 0
+                and _IDENT_RE.fullmatch(tok.text)
+                and tok.text not in _NOT_FUNC_NAMES
+            ):
+                matched = _match_declaration_at(tokens, idx, last_top_boundary_idx, open_parens, delims)
+                if matched is not None:
+                    kind, start_idx, end_idx = matched
+                    if (target_name is None or tok.text == target_name) and (
+                        (kind == "prototype" and allow_prototype) or (kind == "definition" and allow_definition)
+                    ):
+                        start_tok = tokens[start_idx]
+                        end_tok = tokens[end_idx]
+                        yield DeclSpan(
+                            kind=kind,
+                            span=Span(
+                                function=tok.text,
+                                start_byte=start_tok.start,
+                                end_byte=end_tok.end,
+                                start_line=start_tok.line,
+                                end_line=end_tok.line,
+                                text=source[start_tok.start : end_tok.end],
+                            ),
+                        )
+                    last_top_boundary_idx = end_idx
+                    paren_depth = 0
+                    open_parens.clear()
+                    idx = end_idx + 1
+                    continue
         idx += 1
 
+
+def locate_function_span(
+    source: str, function_name: str, is_header: bool = False, path: str = "<input>"
+) -> Span | None:
+    """
+    Locate the byte and line span of `function_name` (including any immediately preceding
+    ACSL contract block) in a C source file (`is_header=False`) or header file (`is_header=True`).
+    """
+    for decl in _iter_declaration_spans(
+        source,
+        path=path,
+        target_name=function_name,
+        allow_prototype=is_header,
+        allow_definition=not is_header,
+    ):
+        return decl.span
     return None
 
 
@@ -1001,66 +1317,7 @@ def function_declaration_spans(source: str, function_name: str, path: str = "<in
     a `static inline` function twice (QCBOR's `UsefulBuf.h`), and ACSL accepts a contract on either
     declaration (Frama-C merges them), so every reader of a header function's contract uses this.
     """
-    tokens = tokenize_c_acsl(source, path=path)
-    delims = _conditional_delims(tokens)
-    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
-    out: list[DeclSpan] = []
-    brace_depth = 0
-    paren_depth = 0
-    last_top_boundary_idx = -1
-    idx = 0
-    n = len(tokens)
-    while idx < n:
-        tok = tokens[idx]
-        if idx in linkage:
-            idx += 1
-            continue
-        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
-            last_top_boundary_idx = idx
-        elif tok.kind == "c_token":
-            if tok.text == "{":
-                brace_depth += 1
-            elif tok.text == "}":
-                brace_depth = max(0, brace_depth - 1)
-                if brace_depth == 0 and paren_depth == 0:
-                    last_top_boundary_idx = idx
-            elif tok.text == "(":
-                paren_depth += 1
-            elif tok.text == ")":
-                paren_depth = max(0, paren_depth - 1)
-            elif tok.text == ";" and brace_depth == 0 and paren_depth == 0:
-                last_top_boundary_idx = idx
-            elif brace_depth == 0 and paren_depth == 0 and tok.text == function_name:
-                open_paren_idx = _next_meaningful(tokens, idx + 1)
-                if open_paren_idx < n and tokens[open_paren_idx].kind == "c_token" and tokens[open_paren_idx].text == "(":
-                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
-                    after_idx = _next_after_params(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
-                    end_idx = -1
-                    kind = ""
-                    if after_idx < n and tokens[after_idx].kind == "c_token":
-                        if tokens[after_idx].text == "{":
-                            end_idx = _find_matching_delim(tokens, after_idx, "{", "}", delims)
-                            kind = "definition"
-                        elif tokens[after_idx].text == ";":
-                            end_idx = after_idx
-                            kind = "prototype"
-                    if end_idx != -1:
-                        start_tok = tokens[_compute_span_start(tokens, last_top_boundary_idx, idx)]
-                        end_tok = tokens[end_idx]
-                        span = Span(
-                            function=function_name,
-                            start_byte=start_tok.start,
-                            end_byte=end_tok.end,
-                            start_line=start_tok.line,
-                            end_line=end_tok.line,
-                            text=source[start_tok.start : end_tok.end],
-                        )
-                        out.append(DeclSpan(kind=kind, span=span))
-                        last_top_boundary_idx = end_idx
-                        idx = end_idx + 1
-                        continue
-        idx += 1
-    return out
+    return list(_iter_declaration_spans(source, path=path, target_name=function_name))
 
 
 def contract_declaration_spans(
@@ -1127,161 +1384,14 @@ def _compute_span_start(tokens: list[Token], last_top_boundary_idx: int, fn_name
 
 def locate_all_prototype_spans(source: str, path: str = "<input>") -> list[Span]:
     """Locate all function prototype spans in a header source file in source order."""
-    tokens = tokenize_c_acsl(source, path=path)
-    delims = _conditional_delims(tokens)
-    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
-    brace_depth = 0
-    paren_depth = 0
-    last_top_boundary_idx = -1
-    spans: list[Span] = []
-
-    idx = 0
-    n = len(tokens)
-    while idx < n:
-        tok = tokens[idx]
-        if idx in linkage:
-            idx += 1
-            continue
-        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
-            last_top_boundary_idx = idx
-            idx += 1
-            continue
-
-        if tok.kind == "c_token":
-            if tok.text == "{":
-                brace_depth += 1
-                idx += 1
-                continue
-            if tok.text == "}":
-                brace_depth = max(0, brace_depth - 1)
-                if brace_depth == 0 and paren_depth == 0:
-                    last_top_boundary_idx = idx
-                idx += 1
-                continue
-            if tok.text == "(":
-                paren_depth += 1
-                idx += 1
-                continue
-            if tok.text == ")":
-                paren_depth = max(0, paren_depth - 1)
-                idx += 1
-                continue
-            if tok.text == ";" and brace_depth == 0 and paren_depth == 0:
-                last_top_boundary_idx = idx
-                idx += 1
-                continue
-
-            # Candidate function name at top level
-            if brace_depth == 0 and paren_depth == 0 and _IDENT_RE.match(tok.text):
-                if tok.text not in (
-                    "typedef",
-                    "extern",
-                    "static",
-                    "inline",
-                    "struct",
-                    "enum",
-                    "union",
-                    "__attribute__",
-                ):
-                    open_paren_idx = _next_meaningful(tokens, idx + 1)
-                    if (
-                        open_paren_idx < n
-                        and tokens[open_paren_idx].kind == "c_token"
-                        and tokens[open_paren_idx].text == "("
-                    ):
-                        close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
-                        if close_paren_idx != -1:
-                            after_paren_idx = _next_after_params(tokens, close_paren_idx + 1)
-                            if (
-                                after_paren_idx < n
-                                and tokens[after_paren_idx].kind == "c_token"
-                                and tokens[after_paren_idx].text == ";"
-                            ):
-                                has_typedef = any(
-                                    tokens[k].kind == "c_token" and tokens[k].text == "typedef"
-                                    for k in range(max(0, last_top_boundary_idx + 1), idx)
-                                )
-                                if not has_typedef:
-                                    start_idx = _compute_span_start(tokens, last_top_boundary_idx, idx)
-                                    start_tok = tokens[start_idx]
-                                    end_tok = tokens[after_paren_idx]
-                                    spans.append(
-                                        Span(
-                                            function=tok.text,
-                                            start_byte=start_tok.start,
-                                            end_byte=end_tok.end,
-                                            start_line=start_tok.line,
-                                            end_line=end_tok.line,
-                                            text=source[start_tok.start : end_tok.end],
-                                        )
-                                    )
-                                    last_top_boundary_idx = after_paren_idx
-                                    idx = after_paren_idx + 1
-                                    continue
-        idx += 1
-    return spans
+    return [d.span for d in _iter_declaration_spans(source, path=path, allow_prototype=True, allow_definition=False)]
 
 
 def locate_all_definition_spans(source: str, path: str = "<input>") -> dict[str, Span]:
     """Spans of every function definition in `source`, in one pass; the first one when a name repeats."""
-    tokens = tokenize_c_acsl(source, path=path)
-    delims = _conditional_delims(tokens)
-    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
     spans: dict[str, Span] = {}
-    brace_depth = 0
-    paren_depth = 0
-    last_top_boundary_idx = -1
-    idx = 0
-    n = len(tokens)
-    while idx < n:
-        tok = tokens[idx]
-        if idx in linkage:
-            idx += 1
-            continue
-        if tok.kind == "pp_directive" and brace_depth == 0 and paren_depth == 0:
-            last_top_boundary_idx = idx
-        elif tok.kind == "c_token":
-            if tok.text == "{":
-                brace_depth += 1
-            elif tok.text == "}":
-                brace_depth = max(0, brace_depth - 1)
-                if brace_depth == 0 and paren_depth == 0:
-                    last_top_boundary_idx = idx
-            elif tok.text == "(":
-                paren_depth += 1
-            elif tok.text == ")":
-                paren_depth = max(0, paren_depth - 1)
-            elif tok.text == ";" and brace_depth == 0 and paren_depth == 0:
-                last_top_boundary_idx = idx
-            elif brace_depth == 0 and paren_depth == 0 and _IDENT_RE.fullmatch(tok.text):
-                open_paren_idx = _next_meaningful(tokens, idx + 1)
-                if (
-                    open_paren_idx < n
-                    and tokens[open_paren_idx].kind == "c_token"
-                    and tokens[open_paren_idx].text == "("
-                ):
-                    close_paren_idx = _find_matching_delim(tokens, open_paren_idx, "(", ")", delims)
-                    after_paren_idx = _next_after_params(tokens, close_paren_idx + 1) if close_paren_idx != -1 else n
-                    if after_paren_idx < n and tokens[after_paren_idx].text == "{":
-                        close_brace_idx = _find_matching_delim(tokens, after_paren_idx, "{", "}", delims)
-                        if close_brace_idx != -1:
-                            start_tok = tokens[_compute_span_start(tokens, last_top_boundary_idx, idx)]
-                            end_tok = tokens[close_brace_idx]
-                            spans.setdefault(
-                                tok.text,
-                                Span(
-                                    function=tok.text,
-                                    start_byte=start_tok.start,
-                                    end_byte=end_tok.end,
-                                    start_line=start_tok.line,
-                                    end_line=end_tok.line,
-                                    text=source[start_tok.start : end_tok.end],
-                                ),
-                            )
-                            last_top_boundary_idx = close_brace_idx
-                            idx = close_brace_idx + 1
-                            continue
-        idx += 1
+    for decl in _iter_declaration_spans(source, path=path, allow_prototype=False, allow_definition=True):
+        spans.setdefault(decl.span.function, decl.span)
     return spans
 
 
@@ -1290,15 +1400,21 @@ def _find_body_brace_offset(span_text: str, path: str = "<input>") -> int | None
     tokens = tokenize_c_acsl(span_text, path=path)
     ignored = _conditional_delims(tokens).ignored
     paren_depth = 0
+    brace_depth = 0
+    last_top_brace: int | None = None
     for idx, tok in enumerate(tokens):
         if tok.kind == "c_token" and idx not in ignored:
             if tok.text == "(":
                 paren_depth += 1
             elif tok.text == ")":
                 paren_depth = max(0, paren_depth - 1)
-            elif tok.text == "{" and paren_depth == 0:
-                return tok.start
-    return None
+            elif tok.text == "{":
+                if paren_depth == 0 and brace_depth == 0:
+                    last_top_brace = tok.start
+                brace_depth += 1
+            elif tok.text == "}":
+                brace_depth = max(0, brace_depth - 1)
+    return last_top_brace
 
 
 def has_function_contract(
@@ -2971,8 +3087,9 @@ def declaration_param_names(decl: DeclSpan, path: str = "<input>") -> list[str]:
         if tok.text != function or k + 1 >= len(toks) or toks[k + 1].text != "(":
             continue
         depth = 0
+        close_idx = len(toks)
         params: list[list[str]] = [[]]
-        for t in toks[k + 1 :]:
+        for offset, t in enumerate(toks[k + 1 :], start=k + 1):
             if t.text in "([":
                 depth += 1
                 if depth == 1 and t.text == "(":
@@ -2980,14 +3097,22 @@ def declaration_param_names(decl: DeclSpan, path: str = "<input>") -> list[str]:
             elif t.text in ")]":
                 depth -= 1
                 if depth == 0:
+                    close_idx = offset
                     break
             if depth == 1 and t.text == ",":
                 params.append([])
                 continue
             params[-1].append(t.text)
+        # In a K&R definition (`int f(a, b) int a; char *b; { ... }`), parameter type declarations
+        # ending with `;` follow the parameter list before `{`, so single-identifier items in `(...)`
+        # are parameter names rather than unnamed type names.
+        is_kr = decl.kind == "definition" and any(t.text == ";" for t in toks[close_idx + 1 :])
         names: list[str] = []
         for p in params:
             if not p or p in (["void"], ["..."]):
+                continue
+            if is_kr and len(p) == 1 and _IDENT_RE.fullmatch(p[0]) and p[0] not in _C_PARAM_KEYWORDS:
+                names.append(p[0])
                 continue
             ptr = [i for i in range(len(p) - 2) if p[i] == "(" and p[i + 1] == "*" and _IDENT_RE.fullmatch(p[i + 2])]
             if ptr:
@@ -3486,3 +3611,51 @@ def compare_function_contracts(baseline: Mapping[str, str], candidate: Mapping[s
         result["available"] = True
         return result
     return {**_empty_contract_comparison(function), "reason": reason}
+
+
+_COMPLETE_BEHAVIORS_RE = re.compile(r"^complete\s+behaviors(?:\s+(.*))?$")
+
+
+def contract_has_whole_frame(comparison: Mapping[str, object], side: str) -> bool:
+    """
+    Whether `side` (`"baseline"` or `"candidate"`) of a `compare_function_contracts` result frames
+    the whole function: either the default behavior (`DEFAULT_BEHAVIOR`) has an `assigns` clause,
+    or a `complete behaviors` clause covers a non-empty set of named behaviors (all named behaviors
+    when no explicit list is given) and every behavior in that set has an `assigns` clause.
+    """
+    if not comparison.get("available"):
+        return False
+    raw_behaviors = comparison.get("behaviors")
+    if not isinstance(raw_behaviors, Mapping):
+        return False
+    default = raw_behaviors.get(DEFAULT_BEHAVIOR)
+    if isinstance(default, Mapping):
+        default_assigns = default.get("assigns")
+        if isinstance(default_assigns, Mapping) and default_assigns.get(side):
+            return True
+    in_side_key = f"in_{side}"
+    named: list[str] = []
+    assigns_in: set[str] = set()
+    for name, entry in raw_behaviors.items():
+        if name == DEFAULT_BEHAVIOR or not isinstance(entry, Mapping):
+            continue
+        if entry.get(in_side_key):
+            named.append(str(name))
+        assigns = entry.get("assigns")
+        if isinstance(assigns, Mapping) and assigns.get(side):
+            assigns_in.add(str(name))
+    raw_comp = comparison.get("completeness")
+    clauses = raw_comp.get(side) if isinstance(raw_comp, Mapping) else None
+    if not isinstance(clauses, list):
+        return False
+    for clause in clauses:
+        if not isinstance(clause, str):
+            continue
+        m = _COMPLETE_BEHAVIORS_RE.match(" ".join(clause.split()))
+        if m is None:
+            continue
+        rest = (m.group(1) or "").strip()
+        bset = [part.strip() for part in rest.split(",") if part.strip()] if rest else named
+        if bset and all(name in assigns_in for name in bset):
+            return True
+    return False

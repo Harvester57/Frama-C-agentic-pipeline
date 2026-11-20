@@ -285,6 +285,112 @@ def test_an_equivalence_without_operand_is_left_for_the_kernel():
 
 
 # ---------------------------------------------------------------------------------------------------
+# ACSL annotations (and `-dD` macro bodies): `__alignof__` / `__alignof` -> `_Alignof`
+# ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_alignof_rewrites_annotations_and_define_bodies_but_leaves_c_code_strings_and_comments_alone():
+    text = _pp(
+        "#define MPACK_ALIGNOF(T) __alignof__(T)\n"
+        "#define MPACK_ALIGNOF_ALIAS __alignof__\n"
+        "#define MSVC_ALIGNOF(T) __alignof (T)\n"
+        '#define MSG "__alignof__(int)"\n'
+        "#define CMT 1 /* __alignof__(int) */\n"
+        "#define PASTE(a) a ## __alignof__\n"
+        "/*@ requires n > 0;\n"
+        "    @ // __alignof__(my_t) inside a comment\n"
+        "    @ ensures \\result % __alignof__(my_t) == 0;\n"
+        "    @ ensures \\result % __alignof\n"
+        "    @   (my_t) == 0;\n"
+        '    @ ensures s != "__alignof__(my_t)"; */\n'
+        "//@ ensures \\result >= __alignof(int);\n"
+        "/* __alignof__(my_t) in a plain comment */\n"
+        "// __alignof__(my_t) in a line comment\n"
+        'const char *s = "/*@ ensures __alignof__(my_t); */";\n'
+        "size_t f(size_t n) { return n + __alignof__(my_t); }\n"
+        "long long __max_align_ll __attribute__((__aligned__(__alignof__(long long))));\n",
+        file="src/mpack-writer.c",
+        line=10,
+    )
+    new, notes = W.rewrite_alignof_text(text)
+    assert new.count("\n") == text.count("\n")
+    # Rewritten in `#define` replacement bodies and ACSL annotations.
+    assert "#define MPACK_ALIGNOF(T) _Alignof(T)\n" in new
+    assert "#define MPACK_ALIGNOF_ALIAS _Alignof\n" in new
+    assert "#define MSVC_ALIGNOF(T) _Alignof (T)\n" in new
+    assert "ensures \\result % _Alignof(my_t) == 0;" in new
+    assert "ensures \\result % _Alignof\n    @   (my_t) == 0;" in new
+    assert "//@ ensures \\result >= _Alignof(int);\n" in new
+    # Untouched: strings, comments, `##`, and C code (including glibc's max_align_t).
+    assert '#define MSG "__alignof__(int)"\n' in new
+    assert "#define CMT 1 /* __alignof__(int) */\n" in new
+    assert "#define PASTE(a) a ## __alignof__\n" in new
+    assert "// __alignof__(my_t) inside a comment" in new
+    assert 'ensures s != "__alignof__(my_t)";' in new
+    assert "/* __alignof__(my_t) in a plain comment */" in new
+    assert "// __alignof__(my_t) in a line comment" in new
+    assert 'const char *s = "/*@ ensures __alignof__(my_t); */";' in new
+    assert "size_t f(size_t n) { return n + __alignof__(my_t); }" in new
+    assert "__attribute__((__aligned__(__alignof__(long long))))" in new
+    assert [(n["file"], n["line"]) for n in notes] == [
+        ("src/mpack-writer.c", 10),
+        ("src/mpack-writer.c", 11),
+        ("src/mpack-writer.c", 12),
+        ("src/mpack-writer.c", 16),
+        ("src/mpack-writer.c", 22),
+    ]
+
+
+@pytest.mark.unit
+def test_alignof_without_open_paren_in_annotation_or_part_of_identifier_is_untouched():
+    text = _pp(
+        "/*@ predicate p(int x) = __alignof__ == 0 && my__alignof__(x) == 0 && __alignof__x(x) == 0; */\n"
+        "#define __alignof__(T) _Alignof(T)\n"
+        "#define KEEP_IDENT(T) my__alignof__(T) + __alignof__x(T)\n",
+        file="src/t.c",
+        line=1,
+    )
+    assert W.rewrite_alignof_text(text) == (text, [])
+
+
+@pytest.mark.unit
+def test_alignof_rewrite_runs_for_both_wp_and_eacsl_wrappers_and_respects_disable_env(tmp_path, monkeypatch, capsys):
+    text = _pp(
+        "#define ALIGN(T) __alignof__(T)\n/*@ ensures \\result == __alignof__(int); */\nint f(void) { return __alignof__(int); }\n",
+        file="src/a.c",
+        line=5,
+    )
+    out = tmp_path / "a.i"
+    cmd = [CC1, "-E", "src/a.c", "-o", str(out)]
+
+    # WP / Eva wrapper (`fc_cpp_wrapper.run`).
+    call, _ = _fake_cc1(text)
+    assert W.run(cmd, call=call) == 0
+    rewritten = out.read_text(encoding="utf-8")
+    assert "#define ALIGN(T) _Alignof(T)\n" in rewritten
+    assert "ensures \\result == _Alignof(int);" in rewritten
+    assert "return __alignof__(int);" in rewritten
+    err = capsys.readouterr().err
+    assert "[fc-cpp] src/a.c:5: 1 `__alignof__` in a `#define` (ACSL: `_Alignof`) rewritten" in err
+    assert "[fc-cpp] src/a.c:6: 1 `__alignof__` in an annotation (ACSL: `_Alignof`) rewritten" in err
+
+    # E-ACSL wrapper (`fc_cpp_wrapper_eacsl.run_eacsl`).
+    import fc_cpp_wrapper_eacsl
+
+    call, _ = _fake_cc1(text)
+    assert fc_cpp_wrapper_eacsl.run_eacsl(cmd, call=call) == 0
+    assert "ensures \\result == _Alignof(int);" in out.read_text(encoding="utf-8")
+    capsys.readouterr()
+
+    # Disabled by FRAMAC_CPP_REWRITE=off.
+    monkeypatch.setenv(W.DISABLE_ENV, "off")
+    call, _ = _fake_cc1(text)
+    assert W.run(cmd, call=call) == 0
+    assert out.read_text(encoding="utf-8") == text
+
+
+# ---------------------------------------------------------------------------------------------------
 # The wrapper around gcc's subcommands
 # ---------------------------------------------------------------------------------------------------
 
@@ -568,3 +674,134 @@ def test_eacsl_builds_and_checks_equivalences_over_labelled_terms(tmp_path):
     assert "viol_rc=0" not in log and "Postcondition" in violation and "wrong" in violation, log
     if "off_rc=0" not in log:  # Frama-C 35: the original text fails as diagnosed; 34 builds both
         assert "labels pre-analysis was not performed" in (tmp_path / "off.log").read_text(encoding="utf-8"), log
+
+
+# mpack run-4 (`mpack-platform.h:1409-1429` / `MPACK_BUILD_ALIGNMENT`): selects `_Alignof` under C11+
+# and `__alignof__` under `-std=c99`. Both function-like and alias macro forms are exercised.
+MPACK_ALIGN_LIKE = r"""#include <stddef.h>
+#include <stdint.h>
+
+typedef struct {
+    int count;
+    double payload;
+} my_build_t;
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define MY_ALIGNOF(T) _Alignof(T)
+#define MY_ALIGNOF_KW _Alignof
+#else
+#define MY_ALIGNOF(T) __alignof__(T)
+#define MY_ALIGNOF_KW __alignof__
+#endif
+
+#define MY_BUILD_ALIGNMENT MY_ALIGNOF(my_build_t)
+#define MY_BUILD_ALIGNMENT_ALIAS MY_ALIGNOF_KW(my_build_t)
+
+/*@ requires n <= 1024;
+    assigns \nothing;
+    ensures \result >= n;
+    ensures \result < n + MY_BUILD_ALIGNMENT;
+    ensures \result % MY_BUILD_ALIGNMENT == 0;
+    ensures \result % MY_BUILD_ALIGNMENT_ALIAS == 0;
+*/
+size_t align_build(size_t n) {
+    size_t a = MY_BUILD_ALIGNMENT;
+    size_t rem = n % a;
+    return rem == 0 ? n : n + (a - rem);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    (void)data;
+    size_t n = size <= 1024 ? size : 1024;
+    return align_build(n) >= n ? 0 : 1;
+}
+"""
+
+DIRECT_ALIGNOF_LIKE = r"""#include <stddef.h>
+typedef struct { int a; double b; } my_t;
+/*@ assigns \nothing;
+    ensures \result == __alignof__(my_t); */
+size_t get_align(void) { return __alignof__(my_t); }
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_wp_and_eacsl_guardrail_agree_on_alignof_macros_under_default_and_c99(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "mpack_align.c").write_text(MPACK_ALIGN_LIKE, encoding="utf-8", newline="\n")
+    (tmp_path / "direct_align.c").write_text(DIRECT_ALIGNOF_LIKE, encoding="utf-8", newline="\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "seed1").write_bytes(b"abc")
+    (corpus / "seed2").write_bytes(b"12345678")
+
+    probe = (
+        'trap \'for f in /w/*.err /w/*.stdout; do [ -s "$f" ] && echo "=== $f ===" && tail -n 40 "$f"; done\' EXIT; '
+        "set -e; cd /w; "
+        "export PYTHONPATH=/opt/framac-pipeline/scripts; "
+        # (a) Default (no -std=): both WP and E-ACSL guardrail use C11+/gnu17, so MY_BUILD_ALIGNMENT
+        # expands to _Alignof(my_build_t) directly with no __alignof__ rewrite needed.
+        "python3 /opt/framac-pipeline/scripts/run_wp_function.py "
+        "--file mpack_align.c --function align_build --cppflags '-I.' "
+        "--out-dir /w/wp_default --out-json /w/wp_default.json > /w/wp_default.stdout 2> /w/wp_default.err; "
+        "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail "
+        "--sources mpack_align.c --cppflags '-I.' --out-bin /w/guard_default "
+        "--corpus-dir /w/corpus --functions align_build --extra-runs 0 --no-cache "
+        "--out-json /w/guard_default.json > /w/guard_default.stdout 2> /w/guard_default.err; "
+        # (b) Explicit -std=c99: both WP and E-ACSL guardrail hit the __alignof__ branch; the
+        # wrapper rewrites `#define` bodies to `_Alignof`, so both prove and pass cleanly.
+        "python3 /opt/framac-pipeline/scripts/run_wp_function.py "
+        "--file mpack_align.c --function align_build --cppflags '-I. -std=c99' "
+        "--out-dir /w/wp_c99 --out-json /w/wp_c99.json > /w/wp_c99.stdout 2> /w/wp_c99.err; "
+        "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail "
+        "--sources mpack_align.c --cppflags '-I. -std=c99' --out-bin /w/guard_c99 "
+        "--corpus-dir /w/corpus --functions align_build --extra-runs 0 --no-cache "
+        "--out-json /w/guard_c99.json > /w/guard_c99.stdout 2> /w/guard_c99.err; "
+        # Direct `__alignof__(my_t)` written inside an ACSL annotation also proves under -std=c99.
+        "python3 /opt/framac-pipeline/scripts/run_wp_function.py "
+        "--file direct_align.c --function get_align --cppflags '-I. -std=c99' "
+        "--out-dir /w/wp_direct --out-json /w/wp_direct.json > /w/wp_direct.stdout 2> /w/wp_direct.err; "
+        # Negative control: with FRAMAC_CPP_REWRITE=off under -std=c99, Frama-C rejects __alignof__(.
+        "FRAMAC_CPP_REWRITE=off python3 /opt/framac-pipeline/scripts/run_wp_function.py "
+        "--file mpack_align.c --function align_build --cppflags '-I. -std=c99' "
+        "--out-dir /w/wp_c99_off --out-json /w/wp_c99_off.json > /w/wp_c99_off.stdout 2> /w/wp_c99_off.err || true; "
+        "echo PROBE_DONE"
+    )
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", f"{tmp_path}:/w",
+            "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+            "-v", f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
+            "--entrypoint", "bash", ANALYSIS_IMAGE, "-c", probe,
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False,
+    )  # fmt: skip
+    log = proc.stdout + proc.stderr
+    assert proc.returncode == 0 and "PROBE_DONE" in log, log
+
+    import json
+
+    wp_default = json.loads((tmp_path / "wp_default.json").read_text(encoding="utf-8"))
+    guard_default = json.loads((tmp_path / "guard_default.json").read_text(encoding="utf-8"))
+    guard_default_log = (tmp_path / "guard_default.compile.log").read_text(encoding="utf-8", errors="replace")
+    assert wp_default["status"] == "all_proven", wp_default
+    assert guard_default["status"] == "passed_dynamic_oracle", guard_default
+    assert "-std=gnu17" in guard_default_log, guard_default_log
+    assert "`__alignof__`" not in guard_default_log, guard_default_log
+
+    wp_c99 = json.loads((tmp_path / "wp_c99.json").read_text(encoding="utf-8"))
+    guard_c99 = json.loads((tmp_path / "guard_c99.json").read_text(encoding="utf-8"))
+    guard_c99_log = (tmp_path / "guard_c99.compile.log").read_text(encoding="utf-8", errors="replace")
+    assert wp_c99["status"] == "all_proven", wp_c99
+    assert guard_c99["status"] == "passed_dynamic_oracle", guard_c99
+    assert "[fc-cpp]" in guard_c99_log and "`__alignof__`" in guard_c99_log, guard_c99_log
+
+    wp_direct = json.loads((tmp_path / "wp_direct.json").read_text(encoding="utf-8"))
+    assert wp_direct["status"] == "all_proven", wp_direct
+
+    wp_c99_off = json.loads((tmp_path / "wp_c99_off.json").read_text(encoding="utf-8"))
+    assert wp_c99_off["status"] != "all_proven", wp_c99_off
+    off_text = json.dumps(wp_c99_off) + (tmp_path / "wp_c99_off.err").read_text(encoding="utf-8", errors="replace")
+    assert "unexpected token ')'" in off_text, off_text

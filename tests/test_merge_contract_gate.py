@@ -368,3 +368,193 @@ def test_the_batch_merge_records_contract_changes_and_the_frame_state(tmp_path: 
         "assigns_vcs_proven": True,
         "baseline_had_assigns": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Complete-behaviors whole-function frame transitions (Task 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("complete_clause", ["complete behaviors;", "complete behaviors null, live;"])
+def test_default_assigns_replaced_by_complete_behaviors_with_assigns_merges(
+    tmp_path: Path, complete_clause: str
+) -> None:
+    agent_h = _with_register_contract(*BEHAVIORS, complete_clause)
+    run_dir, overlay = _run(tmp_path, agent_h=agent_h)
+    res = _merge(run_dir, overlay)
+    assert res["ok"] is True
+    changes = res["contract_changes"]
+    assert changes["baseline_has_whole_frame"] is True
+    assert changes["candidate_has_whole_frame"] is True
+
+
+@pytest.mark.parametrize(
+    "clauses",
+    [
+        # Complete behaviors, but one behavior has no `assigns` clause.
+        (BEHAVIORS[0], "behavior live: assumes ctx != \\null; ensures \\result >= -1;", "complete behaviors;"),
+        # Both behaviors have `assigns`, but there is no `complete behaviors;` clause.
+        (*BEHAVIORS, "disjoint behaviors;"),
+    ],
+)
+def test_default_assigns_replaced_by_incomplete_behavior_frame_is_still_refused(
+    tmp_path: Path, clauses: tuple[str, ...]
+) -> None:
+    agent_h = _with_register_contract(*clauses)
+    run_dir, overlay = _run(tmp_path, agent_h=agent_h)
+    with pytest.raises(AcslError, match=workspace_overlay.FRAME_REFUSAL):
+        _merge(run_dir, overlay)
+    assert (overlay / "work" / H_REL).read_text(encoding="utf-8") == ARCHITECT_H
+
+
+def test_removing_complete_behaviors_coverage_of_a_whole_frame_is_refused(tmp_path: Path) -> None:
+    tree_h = _with_register_contract(*BEHAVIORS, "complete behaviors;")
+    agent_h = _with_register_contract(*BEHAVIORS)
+    run_dir, overlay = _run(tmp_path, tree_h=tree_h, agent_h=agent_h)
+    with pytest.raises(AcslError, match="complete behaviors"):
+        _merge(run_dir, overlay)
+    assert (overlay / "work" / H_REL).read_text(encoding="utf-8") == tree_h
+
+
+def test_named_behavior_only_baseline_does_not_trigger_no_frame_refusal(tmp_path: Path, monkeypatch) -> None:
+    tree_h = _with_register_contract("behavior live: assumes ctx != \\null; assigns *ctx;")
+    agent_h = _with_register_contract("behavior live: assumes ctx != \\null; assigns *ctx; ensures \\result >= -1;")
+    run_dir, overlay = _run(tmp_path, tree_h=tree_h, agent_h=agent_h)
+    _parent_wp_answers(monkeypatch, _wp_report(tmp_path, monkeypatch, "guarded_some"))
+    res = _merge(run_dir, overlay, skip_reverify=False)
+    assert res["ok"] is True
+    assert res["frame_state"] == {
+        "assigns_clause": "behaviors_only",
+        "assigns_vcs_proven": False,
+        "baseline_had_assigns": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Architect merges: cannot silently delete an existing `assigns` clause (Task 1)
+# ---------------------------------------------------------------------------
+
+ARCH_AGENT = "arch-libmodbus"
+
+
+def _arch_run(tmp_path: Path, tree_h: str = ARCHITECT_H, agent_h: str = PROVER_H) -> tuple[Path, Path]:
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    (target / C_REL).write_text(SOURCE_C, encoding="utf-8")
+    (target / H_REL).write_text(TARGET_H, encoding="utf-8")
+    run_dir = (tmp_path / "run").resolve()
+    overlay = run_dir / "workspace"
+    workspace_overlay.init_overlay(target, overlay)
+    (overlay / "work" / H_REL).write_text(tree_h, encoding="utf-8")
+    workspace_overlay.init_agent_overlay(run_dir, ARCH_AGENT, overlay)
+    (run_dir / "agents" / ARCH_AGENT / "scratch" / "work" / H_REL).write_text(agent_h, encoding="utf-8")
+    return run_dir, overlay
+
+
+def test_architect_deleting_existing_assigns_is_refused(tmp_path: Path) -> None:
+    run_dir, overlay = _arch_run(tmp_path, tree_h=ARCHITECT_H, agent_h=PROVER_H)
+    with pytest.raises(AcslError) as exc:
+        workspace_overlay.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id=ARCH_AGENT,
+            role="architect",
+            overlay_dir=overlay,
+            header_file=H_REL,
+            skip_reverify=True,
+        )
+    message = str(exc.value)
+    assert workspace_overlay.FRAME_REFUSAL in message
+    assert FN in message and "`assigns *ctx \\from reg_addr, value`" in message
+    assert (overlay / "work" / H_REL).read_text(encoding="utf-8") == ARCHITECT_H
+
+
+def test_architect_deleting_existing_assigns_is_refused_in_batch_and_dry_run(tmp_path: Path) -> None:
+    run_dir, overlay = _arch_run(tmp_path, tree_h=ARCHITECT_H, agent_h=PROVER_H)
+    dry = workspace_overlay.merged_frame_refusal(
+        run_dir, None, None, H_REL, None, "-I.", {H_REL: PROVER_H}, role="architect"
+    )
+    assert dry is not None and workspace_overlay.FRAME_REFUSAL in dry and FN in dry
+    res = workspace_overlay.merge_agent_batch(
+        run_dir,
+        [{"agent_id": ARCH_AGENT, "role": "architect", "header": H_REL}],
+        overlay_dir=overlay,
+        skip_reverify=True,
+    )
+    assert res["merged"] == []
+    (failed,) = res["failed"]
+    assert workspace_overlay.FRAME_REFUSAL in failed["reason"] and FN in failed["reason"]
+    assert (overlay / "work" / H_REL).read_text(encoding="utf-8") == ARCHITECT_H
+
+
+def test_architect_adding_or_tightening_header_contracts_merges_cleanly(tmp_path: Path) -> None:
+    tightened_h = _with_register_contract(*KEPT, "assigns ctx->debug \\from value;", "ensures status: \\result >= -1;")
+    run_dir, overlay = _arch_run(tmp_path, tree_h=ARCHITECT_H, agent_h=tightened_h)
+    res = workspace_overlay.merge_agent_overlay(
+        run_dir=run_dir,
+        agent_id=ARCH_AGENT,
+        role="architect",
+        overlay_dir=overlay,
+        header_file=H_REL,
+        skip_reverify=True,
+    )
+    assert res["ok"] is True
+    assert res["contract_changes"]["available"] is True
+    assert res["contract_changes"]["assigns_removed"] == []
+    assert res["contract_changes"]["ensures_removed"] == []
+    assert FN in res["contract_changes"]["functions"]
+    assert (overlay / "work" / H_REL).read_text(encoding="utf-8") == tightened_h
+
+    # Adding a brand-new contract to an unannotated header also merges cleanly.
+    run_dir2, overlay2 = _arch_run(tmp_path / "fresh", tree_h=TARGET_H, agent_h=ARCHITECT_H)
+    res2 = workspace_overlay.merge_agent_overlay(
+        run_dir=run_dir2,
+        agent_id=ARCH_AGENT,
+        role="architect",
+        overlay_dir=overlay2,
+        header_file=H_REL,
+        skip_reverify=True,
+    )
+    assert res2["ok"] is True and res2["contract_changes"]["assigns_removed"] == []
+
+
+def test_architect_removing_ensures_while_keeping_assigns_merges_and_records_change(tmp_path: Path) -> None:
+    agent_h = _with_register_contract(*KEPT, REMOVED_ASSIGNS, "ensures null_status: ctx == \\null ==> \\result == -1;")
+    run_dir, overlay = _arch_run(tmp_path, tree_h=ARCHITECT_H, agent_h=agent_h)
+    res = workspace_overlay.merge_agent_overlay(
+        run_dir=run_dir,
+        agent_id=ARCH_AGENT,
+        role="architect",
+        overlay_dir=overlay,
+        header_file=H_REL,
+        skip_reverify=True,
+    )
+    assert res["ok"] is True
+    assert res["contract_changes"]["assigns_removed"] == []
+    assert res["contract_changes"]["ensures_removed"] == [
+        {"behavior": "default!", "clauses": ["\\result >= -1"], "function": FN}
+    ]
+
+
+def test_architect_deleting_assigns_on_static_inline_header_definition_is_refused(tmp_path: Path) -> None:
+    base_h = "static inline int bump(int *p) { *p = 1; return 0; }\n"
+    framed_h = "/*@ requires \\valid(p);\n    assigns *p;\n*/\n" + base_h
+    stripped_h = "/*@ requires \\valid(p);\n    ensures \\result == 0;\n*/\n" + base_h
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "inline.h").write_text(base_h, encoding="utf-8")
+    run_dir = (tmp_path / "run").resolve()
+    overlay = run_dir / "workspace"
+    workspace_overlay.init_overlay(target, overlay)
+    (overlay / "work" / "inline.h").write_text(framed_h, encoding="utf-8")
+    workspace_overlay.init_agent_overlay(run_dir, ARCH_AGENT, overlay)
+    (run_dir / "agents" / ARCH_AGENT / "scratch" / "work" / "inline.h").write_text(stripped_h, encoding="utf-8")
+    with pytest.raises(AcslError, match=r"bump.*assigns \*p"):
+        workspace_overlay.merge_agent_overlay(
+            run_dir=run_dir,
+            agent_id=ARCH_AGENT,
+            role="architect",
+            overlay_dir=overlay,
+            header_file="inline.h",
+            skip_reverify=True,
+        )
+    assert (overlay / "work" / "inline.h").read_text(encoding="utf-8") == framed_h

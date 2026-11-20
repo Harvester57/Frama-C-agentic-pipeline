@@ -27,6 +27,7 @@ from promote_artifact import (
     MAX_SEED_BYTES,
     MAX_SEEDS_PER_AGENT,
     PromotionError,
+    _discover_fuzz_binary,
     promote_file,
     promote_seeds,
 )
@@ -111,6 +112,110 @@ class TestPromoteArtifact:
             too_many.append(f"agents/breaker-1/scratch/seeds/extra_{idx}.bin")
         with pytest.raises(PromotionError, match="too many seeds"):
             promote_seeds(run_dir, "breaker-1", "snmp", too_many)
+
+    def test_discover_fuzz_binary_precedence_and_missing(self, run_dir: Path) -> None:
+        """Auto-discovery prefers explicit > fuzz report > fuzz_<mod>.e-acsl > fuzz_<mod>, and returns None when absent."""
+        assert _discover_fuzz_binary(run_dir, "snmp") is None
+        assert _discover_fuzz_binary(run_dir, "../escape") is None
+
+        # 1. Fallback to workspace/harnesses/fuzz_<mod>
+        plain = run_dir / "workspace" / "harnesses" / "fuzz_snmp"
+        plain.parent.mkdir(parents=True, exist_ok=True)
+        plain.write_bytes(b"plain")
+        assert _discover_fuzz_binary(run_dir, "snmp") == plain
+
+        # 2. Prefer .e-acsl over plain binary
+        eacsl = run_dir / "workspace" / "harnesses" / "fuzz_snmp.e-acsl"
+        eacsl.write_bytes(b"eacsl")
+        assert _discover_fuzz_binary(run_dir, "snmp") == eacsl
+
+        # 3. Prefer binary named in workspace/reports/fuzz/<mod>.json (including /framac-run/ prefix)
+        custom_from_report = run_dir / "workspace" / "harnesses" / "custom_snmp.e-acsl"
+        custom_from_report.write_bytes(b"from-report")
+        write_json(
+            run_dir / "workspace" / "reports" / "fuzz" / "snmp.json",
+            {"compile": {"binary": "/framac-run/workspace/harnesses/custom_snmp.e-acsl"}},
+        )
+        assert _discover_fuzz_binary(run_dir, "snmp") == custom_from_report
+
+        # 4. Explicit binary takes precedence over everything; missing explicit binary returns None
+        explicit = run_dir / "explicit.e-acsl"
+        explicit.write_bytes(b"explicit")
+        assert _discover_fuzz_binary(run_dir, "snmp", explicit) == explicit
+        assert _discover_fuzz_binary(run_dir, "snmp", run_dir / "does_not_exist") is None
+
+    def test_promote_seeds_screens_and_deduplicates_hanging_seeds(
+        self, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pre-promotion screening refuses hanging seeds without timeout- artifacts, deduplicates by sha256, and skips timeout-* filenames."""
+        import promote_artifact as pa_mod
+
+        seeds_dir = run_dir / "agents" / "breaker-1" / "scratch" / "seeds"
+        seeds_dir.mkdir(parents=True)
+        (seeds_dir / "h1.bin").write_bytes(b"HANG")
+        (seeds_dir / "h2_dup.bin").write_bytes(b"HANG")
+        (seeds_dir / "ok.bin").write_bytes(b"OK")
+        (seeds_dir / "timeout-manual").write_bytes(b"MANUAL")
+
+        fuzz_bin = run_dir / "workspace" / "harnesses" / "fuzz_snmp.e-acsl"
+        fuzz_bin.parent.mkdir(parents=True, exist_ok=True)
+        fuzz_bin.write_bytes(b"bin")
+        write_json(
+            run_dir / "workspace" / "reports" / "fuzz" / "snmp.json",
+            {"compile": {"binary": "workspace/harnesses/fuzz_snmp.e-acsl"}},
+        )
+
+        calls: list[bytes] = []
+
+        def fake_screen(binary: Path, seed_path: Path, timeout_s: float) -> str | None:
+            data = seed_path.read_bytes()
+            calls.append(data)
+            return f"seed hung during pre-promotion screen (>{timeout_s:g}s)" if data == b"HANG" else None
+
+        monkeypatch.setattr(pa_mod, "_check_seed_hangs", fake_screen)
+        res = promote_seeds(
+            run_dir,
+            "breaker-1",
+            "snmp",
+            [
+                "agents/breaker-1/scratch/seeds/h1.bin",
+                "agents/breaker-1/scratch/seeds/h2_dup.bin",
+                "agents/breaker-1/scratch/seeds/ok.bin",
+                "agents/breaker-1/scratch/seeds/timeout-manual",
+            ],
+        )
+        assert [p["src"] for p in res["promoted"]] == ["agents/breaker-1/scratch/seeds/ok.bin"]
+        assert len(res["refused_hanging"]) == 3
+        # h1.bin and h2_dup.bin share identical bytes -> screened once; timeout-manual refused by filename without replay.
+        assert calls == [b"HANG", b"OK"]
+        assert res["refused_hanging"][0]["reason"] == "seed hung during pre-promotion screen (>5s)"
+        assert res["refused_hanging"][1]["reason"] == "seed hung during pre-promotion screen (>5s)"
+        assert res["refused_hanging"][2] == {
+            "src": "agents/breaker-1/scratch/seeds/timeout-manual",
+            "artifact": "agents/breaker-1/scratch/seeds/timeout-manual",
+        }
+
+    def test_promote_seeds_rejects_negative_replay_timeout_and_validates_before_screening(
+        self, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Negative replay_timeout raises PromotionError; unsafe/oversized seeds fail before replay screening."""
+        import promote_artifact as pa_mod
+
+        seeds_dir = run_dir / "agents" / "breaker-1" / "scratch" / "seeds"
+        seeds_dir.mkdir(parents=True)
+        (seeds_dir / "ok.bin").write_bytes(b"ok")
+        (seeds_dir / "huge.bin").write_bytes(b"X" * (MAX_SEED_BYTES + 1))
+
+        fuzz_bin = run_dir / "workspace" / "harnesses" / "fuzz_snmp.e-acsl"
+        fuzz_bin.parent.mkdir(parents=True, exist_ok=True)
+        fuzz_bin.write_bytes(b"bin")
+
+        with pytest.raises(PromotionError, match="replay_timeout"):
+            promote_seeds(run_dir, "breaker-1", "snmp", ["agents/breaker-1/scratch/seeds/ok.bin"], replay_timeout=-1.0)
+
+        monkeypatch.setattr(pa_mod, "_check_seed_hangs", lambda *a, **k: pytest.fail("must validate before screening"))
+        with pytest.raises(PromotionError, match="exceeds limit"):
+            promote_seeds(run_dir, "breaker-1", "snmp", ["agents/breaker-1/scratch/seeds/huge.bin"])
 
 
 class TestVerifierIngestionAndHypotheses:

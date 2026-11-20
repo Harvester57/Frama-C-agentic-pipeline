@@ -59,7 +59,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from acsl_ast import AcslError, has_function_contract, locate_all_definition_spans  # noqa: E402
+from acsl_ast import (  # noqa: E402
+    AcslError,
+    has_function_contract,
+    iter_clauses,
+    locate_all_definition_spans,
+    tokenize_c_acsl,
+)
 from c_definitions import return_type_tokens, returns_void  # noqa: E402
 from framac_common import STUB_OVERLAY_REL, STUB_REPORT_REL, atomic_write_json, load_json_optional, utc_now  # noqa: E402
 from kernel_ast import parse_location  # noqa: E402
@@ -314,8 +320,14 @@ def split_blocks(text: str) -> dict[str, str]:
 def block_state(block: str) -> str:
     if re.search(rf"^\s*#\s*if(?:def)?\s+{DRAFT_GUARD}\b", block, re.MULTILINE):
         return "draft"
-    contracts = re.findall(r"/\*@.*?\*/", block, re.DOTALL)
-    if TODO_MARK in block or not any(_ASSIGNS_RE.search(c) for c in contracts):
+    if TODO_MARK in block:
+        return "incomplete"
+    try:
+        tokens = tokenize_c_acsl(block)
+    except AcslError:
+        return "incomplete"
+    acsl = "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
+    if not any(kind == "assigns" and pred for kind, _label, pred, _span in iter_clauses(acsl)):
         return "incomplete"
     return "filled"
 

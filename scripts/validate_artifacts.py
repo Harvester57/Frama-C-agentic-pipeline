@@ -8,7 +8,7 @@ Subcommands:
   ledger        <coverage-ledger.json> [--run-dir DIR]
   metadata      <run-metadata.json>
   snapshot      <snapshot-manifest.json> [--run-dir DIR]
-  agent-result  <result.json>          [--run-dir DIR]  (default: the run dir of an agents/<id>/scratch/ result)
+  agent-result  <result.json>          [--run-dir DIR] [--expected-* ...]  (default: agents/<id>/scratch/ run dir & id)
   dag | sidecar | build-check | reach-dynamic | seed-harvest | build-capture | phase0-model
   | security-props | variadic-calls  <artifact.json>    (Phase 0 artifacts, remediation R5)
   traces        <traces.jsonl>
@@ -391,6 +391,30 @@ def _verifier_files(errors: Errors, data: dict, run_dir: Path) -> None:
             check(f"{where}.remediation.fix_patch", (rec.get("remediation") or {}).get("fix_patch"), "artifact")
 
 
+_SCHEDULE_RESULT_ROLE: dict[str, str] = {
+    "verify": "crash_verifier",
+    "arch": "architect",
+    "prove": "prover",
+    "breaker": "breaker",
+    "negotiate": "prover",
+}
+_SCRATCH_PREFIX_RE = re.compile(r"^(?:.*/)?agents/[A-Za-z0-9_-]+/scratch/(?:work|base)/")
+_WORK_PREFIX_RE = re.compile(r"^(?:.*/)?workspace/(?:work|baseline)/")
+
+
+def _norm_source_path(value: str | None) -> str:
+    """Repository-relative, forward-slash form of a source path (matches wp_scheduler.norm_path)."""
+    text = (value or "").replace("\\", "/").strip()
+    text = _SCRATCH_PREFIX_RE.sub("", text)
+    text = _WORK_PREFIX_RE.sub("", text)
+    for prefix in ("/framac-run/", "/target/"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+    while text.startswith("./"):
+        text = text[2:]
+    return re.sub(r"/+", "/", text).strip("/")
+
+
 def run_dir_of_result(path: Path) -> Path | None:
     """The run dir of a result written where briefs say: <run>/agents/<agent-id>/scratch/<file>."""
     p = path.resolve()
@@ -399,8 +423,104 @@ def run_dir_of_result(path: Path) -> Path | None:
     return None
 
 
-def validate_agent_result(data, run_dir: Path | None = None) -> Errors:
-    """With `run_dir`, also the cited files a crash verifier's ingest promotes or requires (_verifier_files)."""
+def agent_id_of_result(path: Path) -> str | None:
+    """The agent id of a result written where briefs say: <run>/agents/<agent-id>/scratch/<file>."""
+    p = path.resolve()
+    if p.parent.name == "scratch" and p.parent.parent.parent.name == "agents":
+        return p.parent.parent.name
+    return None
+
+
+def _scheduled_task(run_dir: Path, agent_id: str) -> dict | None:
+    """The scheduled task for `agent_id` in `<run_dir>/state/wp_schedule.json`, if present and readable."""
+    sched_path = run_dir / "state" / "wp_schedule.json"
+    if not sched_path.is_file():
+        return None
+    try:
+        state = load_json_strict(sched_path)
+    except ArtifactError:
+        return None
+    if not isinstance(state, dict):
+        return None
+    agents = state.get("agents")
+    tasks = state.get("tasks")
+    if not isinstance(agents, dict) or not isinstance(tasks, dict):
+        return None
+    tid = agents.get(agent_id)
+    if not isinstance(tid, str):
+        return None
+    task = tasks.get(tid)
+    return task if isinstance(task, dict) else None
+
+
+def _check_task_identity(
+    errors: Errors,
+    data: dict,
+    run_dir: Path | None,
+    *,
+    expected_agent_id: str | None = None,
+    expected_role: str | None = None,
+    expected_function: str | None = None,
+    expected_file: str | None = None,
+    expected_fingerprint: str | None = None,
+) -> None:
+    """
+    Check the scheduler's own task-identity invariants (`wp_scheduler._load_result`):
+    `agent_id`, `role`, `function` + normalized `file` (for prove/negotiate/breaker), and
+    `candidate_fingerprint` (for verify). Values come from explicit `expected_*` arguments and,
+    where omitted, from `<run_dir>/state/wp_schedule.json` if present and matching the agent id.
+    """
+    aid = data["agent_id"]
+    role = data["role"]
+    task = _scheduled_task(run_dir, expected_agent_id or aid) if run_dir is not None else None
+    if task is not None:
+        kind = str(task.get("kind") or "")
+        if expected_role is None and kind in _SCHEDULE_RESULT_ROLE:
+            expected_role = _SCHEDULE_RESULT_ROLE[kind]
+        if kind in ("prove", "negotiate", "breaker"):
+            if expected_function is None and isinstance(task.get("function"), str) and task["function"]:
+                expected_function = task["function"]
+            if expected_file is None and isinstance(task.get("file"), str) and task["file"]:
+                expected_file = task["file"]
+        if kind == "verify":
+            if expected_fingerprint is None and isinstance(task.get("fingerprint"), str) and task["fingerprint"]:
+                expected_fingerprint = task["fingerprint"]
+
+    if expected_agent_id is not None and aid != expected_agent_id:
+        errors.add(f"$.agent_id: is {aid!r}, expected {expected_agent_id!r}")
+    if expected_role is not None and role != expected_role:
+        errors.add(f"$.role: is {role!r}, expected {expected_role!r}")
+    if expected_function is not None and data.get("function") != expected_function:
+        errors.add(f"$.function: is {data.get('function')!r}, expected {expected_function!r}")
+    if expected_file is not None:
+        raw_file = data.get("file")
+        got_file = _norm_source_path(raw_file) if isinstance(raw_file, str) else ""
+        want_file = _norm_source_path(expected_file)
+        if got_file != want_file:
+            norm_note = f" (normalized {got_file!r})" if isinstance(raw_file, str) and raw_file != got_file else ""
+            errors.add(f"$.file: is {raw_file!r}{norm_note}, expected {want_file!r}")
+    if expected_fingerprint is not None and data.get("candidate_fingerprint") != expected_fingerprint:
+        errors.add(
+            f"$.candidate_fingerprint: is {data.get('candidate_fingerprint')!r}, expected {expected_fingerprint!r}"
+        )
+
+
+def validate_agent_result(
+    data,
+    run_dir: Path | None = None,
+    *,
+    expected_agent_id: str | None = None,
+    expected_role: str | None = None,
+    expected_function: str | None = None,
+    expected_file: str | None = None,
+    expected_fingerprint: str | None = None,
+) -> Errors:
+    """
+    Validate an agent result against its schema and semantic rules. With `run_dir`, also checks the
+    cited files a crash verifier's ingest promotes or requires (`_verifier_files`) and, when
+    `state/wp_schedule.json` or explicit `expected_*` arguments are given, the scheduler's task
+    identity invariants (`agent_id`, `role`, `function`, `file`, `candidate_fingerprint`).
+    """
     errors = Errors()
     for e in Validator(get_schema("agent-result")).errors(data):
         errors.add(e)
@@ -474,6 +594,16 @@ def validate_agent_result(data, run_dir: Path | None = None) -> Errors:
     elif role == "critic":
         if data["stop"] and (data["missing_units"] or data["reassign_ids"]):
             errors.add("$.stop: may only be true when no missing_units and no reassign_ids are proposed")
+    _check_task_identity(
+        errors,
+        data,
+        run_dir,
+        expected_agent_id=expected_agent_id,
+        expected_role=expected_role,
+        expected_function=expected_function,
+        expected_file=expected_file,
+        expected_fingerprint=expected_fingerprint,
+    )
     return errors
 
 
@@ -996,7 +1126,16 @@ def main(argv=None) -> int:
         "--run-dir",
         type=Path,
         default=None,
-        help="Check cited files as the ingest does (default: the run dir of an agents/<id>/scratch/ result)",
+        help="Check cited files and scheduled task identity (default: the run dir of an agents/<id>/scratch/ result)",
+    )
+    p.add_argument("--expected-agent-id", default=None, help="Require $.agent_id to match this agent id")
+    p.add_argument("--expected-role", default=None, help="Require $.role to match this role")
+    p.add_argument("--expected-function", default=None, help="Require $.function to match this function")
+    p.add_argument("--expected-file", default=None, help="Require $.file (normalized) to match this file")
+    p.add_argument(
+        "--expected-fingerprint",
+        default=None,
+        help="Require $.candidate_fingerprint to match this fingerprint (crash_verifier)",
     )
     for name in (*PHASE0_COMMANDS, "traces"):
         p = sub.add_parser(name)
@@ -1023,7 +1162,19 @@ def main(argv=None) -> int:
             return _emit(PHASE0_COMMANDS[args.cmd](data))
         if args.cmd == "agent-result":
             data = load_agent_result_json(args.path)
-            return _emit(validate_agent_result(data, args.run_dir or run_dir_of_result(args.path)))
+            effective_run_dir = args.run_dir or run_dir_of_result(args.path)
+            effective_agent_id = args.expected_agent_id or agent_id_of_result(args.path)
+            return _emit(
+                validate_agent_result(
+                    data,
+                    effective_run_dir,
+                    expected_agent_id=effective_agent_id,
+                    expected_role=args.expected_role,
+                    expected_function=args.expected_function,
+                    expected_file=args.expected_file,
+                    expected_fingerprint=args.expected_fingerprint,
+                )
+            )
         data = load_json_strict(args.path)
         if args.cmd == "findings":
             return _emit(validate_findings(data, args.run_dir))

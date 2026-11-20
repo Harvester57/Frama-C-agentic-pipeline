@@ -43,10 +43,13 @@ import os
 import posixpath
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +87,7 @@ from framac_common import (  # noqa: E402
     read_report_csv,
     scan_undeclared_functions,
     stub_repair_action,
+    utc_now,
     wp_model_problem,
 )
 from resources import CLASSES, FRAMAC_KERNEL_RESERVE_MB, WP_MEMLIMIT_MB, enforced_memory_mb, wp_parallelism  # noqa: E402
@@ -142,6 +146,7 @@ _MISSING_SPEC_RE = re.compile(r"Neither code nor specification for function ([A-
 # correct defensive code (`if (p == NULL)` under `requires \valid(p)`), so they are only counted.
 _DOOMED_REQUIRES_RE = re.compile(r"\(Doomed\)\s+[A-Za-z0-9_]*?_wp_smoke_([A-Za-z0-9_]+)_requires\b")
 _DOOMED_DEAD_RE = re.compile(r"\(Doomed\)\s+([A-Za-z0-9_]*?_wp_smoke_dead_[a-z_]+_[A-Za-z0-9_]+)")
+_ANY_DOOMED_RE = re.compile(r"\(Doomed\)\s+([A-Za-z_]\w*)")
 _SMOKE_COUNT_RE = re.compile(r"Smoke Tests\s*:\s*(\d+)\s*/\s*(\d+)")
 VACUITY_GOAL_TIMEOUT_S = 1
 VACUITY_SMOKE_TIMEOUT_S = 5
@@ -193,14 +198,17 @@ def parse_failed_wp_goals(log: str) -> set[str]:
 
 # Per-goal solver cost (Tier 1 of docs/plans/proof-papers-generalization-plan.md). Source: WP's own JSON
 # report (`-wp-report-json`, Frama-C 34), which names each goal, its property, its verdict, a `cached`
-# count and the prover entries with their time in seconds. Measured in framac-analysis:latest
-# (2026-11-16): a proved goal carries the time of the prover that proved it; an unproved goal carries ONE
-# merged prover entry whose time is a 0 placeholder (Why3 measured 0.01 s or 4.00 s for it), and WP ranks
-# a Timeout above an Unknown when it merges provers (z3 Timeout + cvc5 Unknown reads `[Timeout] (Alt-Ergo)`).
-# So an unproved goal's `time_ms` is null unless a positive time is reported, and "every prover timed out"
-# is only known when a single prover was configured. The log tags are the fallback when the JSON is missing:
-# they carry no solver time at all (the `Qed 2ms` tag is the simplifier's), and `(Cached)` also appears on
-# a first run under `-wp-cache update`, so a log-sourced entry never has a time either.
+# count and the prover entries with their time in seconds, paired with `-wp-status` for per-prover
+# verdicts on multi-prover runs. Measured in framac-analysis:latest (2026-11-16..20): a proved goal
+# carries the time of the prover that proved it; an unproved goal in `-wp-report-json` carries ONE
+# merged prover entry whose time is a 0 placeholder, and WP ranks a Timeout above an Unknown when it
+# merges provers (z3 Timeout + cvc5 Unknown reads `[Timeout] (Alt-Ergo)`). `-wp-status` prints every
+# pending goal in Wpo.iter order with one `Prover <name> <ver> returns <verdict> ...` line per prover,
+# giving exact `per_prover_verdicts` on multi-prover runs. Without `-wp-status` (legacy reports),
+# "every prover timed out" falls back to single-prover runs only. The log tags are the fallback when
+# the JSON is missing: they carry no solver time at all (the `Qed 2ms` tag is the simplifier's), and
+# `(Cached)` also appears on a first run under `-wp-cache update`, so a log-sourced entry never has a
+# time either.
 GOAL_COSTS_ENV = "FRAMAC_WP_GOAL_COSTS"
 _VERDICT_KINDS = {"timeout": "timeout", "stepout": "stepout", "unknown": "unknown", "failed": "failed"}
 SLOWEST_PROVED_MAX = 5
@@ -210,6 +218,327 @@ TIMEOUT_REACHED_FRACTION = 0.9
 _COST_LINE_RE = re.compile(r"^\[wp\] \[(Timeout|Stepout|Unknown|Failed)\] ([A-Za-z_]\w*)(.*)$", re.MULTILINE)
 _COST_TAGS_RE = re.compile(r"(?:[ \t]+\([^()\n]*\))*[ \t]*")
 _PROVER_TAG_RE = re.compile(r"^(?:Alt-Ergo|Z3|CVC4|CVC5|Colibri2?|Vampire|Eprover|Coq|Rocq|Script)$", re.IGNORECASE)
+_WP_STATUS_SEP_RE = re.compile(r"^-{20,}\s*$")
+_WP_STATUS_FN_RE = re.compile(r"^\s+Function\s+([A-Za-z_]\w*)\s*$")
+_WP_STATUS_SECTION_RE = re.compile(r"^\s+(?:Global|Axiomatic\b|Lemma\b)")
+_WP_STATUS_PROVER_RE = re.compile(
+    r"^Prover\s+(?P<prover>.+?)\s+returns\s+"
+    r"(?P<verdict>Step\s+limit|Timeout|Unknown|Failed|Valid|Invalid|Stepout|NoResult)\b(?P<tail>.*)$"
+)
+_WP_STATUS_VERDICT_MAP = {
+    "timeout": "timeout",
+    "step limit": "stepout",
+    "stepout": "stepout",
+    "unknown": "unknown",
+    "failed": "failed",
+    "valid": "valid",
+    "invalid": "invalid",
+}
+_WP_STATUS_TIME_TAG_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s)\s*$")
+_WP_STATUS_PART_RE = re.compile(r"\((\d+)/(\d+)\)\s*$")
+_WP_STATUS_LINE_RE = re.compile(r",\s*line\s+(\d+)\)")
+_WP_STATUS_HEADER_FN_RE = re.compile(r"\bin\s+'([A-Za-z_]\w*)'")
+
+
+def _wp_status_prover_name(raw: str) -> str | None:
+    """`Alt-Ergo 2.4.3` -> `Alt-Ergo`, `Z3 4.13.3 (counterexample)` -> `Z3`, `Qed` -> `Qed`."""
+    cleaned = re.sub(r"\s+\([^)]*\)\s*$", "", raw.strip()).strip()
+    cleaned = re.sub(r"\s+\d+(?:\.\d+)*(?:[A-Za-z0-9._+-]*)?$", "", cleaned).strip()
+    return cleaned or None
+
+
+def _parse_wp_status_tail(tail: str) -> tuple[int | None, bool]:
+    """(prover time in ms or None, cached) from parenthesised tags on a `Prover ... returns ...` line."""
+    time_ms: int | None = None
+    cached = False
+    for raw_tag in _PAREN_TAG_RE.findall(tail or ""):
+        tag = raw_tag.strip()
+        low = tag.lower()
+        if low == "cached":
+            cached = True
+            continue
+        if low.startswith("qed:") or low == "qed" or low == "model":
+            continue
+        m_time = _WP_STATUS_TIME_TAG_RE.match(tag)
+        if m_time:
+            val = float(m_time.group(1))
+            unit = m_time.group(2)
+            ms = round(val if unit == "ms" else val * 1000.0)
+            if ms > 0:
+                time_ms = ms
+    return time_ms, cached
+
+
+def _parse_wp_status_blocks(log_text: str) -> list[dict[str, Any]]:
+    """
+    Extract pending goal blocks from Frama-C WP `-wp-status` (or `-wp-print`) output.
+    Each block holds `function`, `header`, and `per_prover` ({prover: {verdict, time_ms, cached}})
+    for non-Qed provers. Blocks proved Valid are skipped (only unproved goals matter for residual costs).
+    """
+    lines = (log_text or "").splitlines()
+    n = len(lines)
+    i = 0
+    current_fn: str | None = None
+    blocks: list[dict[str, Any]] = []
+
+    while i < n:
+        line = lines[i]
+        if line.startswith("[report] ") or line.startswith("--- Properties of Function "):
+            break
+        if _WP_STATUS_SEP_RE.match(line) and i + 2 < n and _WP_STATUS_SEP_RE.match(lines[i + 2]):
+            m_fn = _WP_STATUS_FN_RE.match(lines[i + 1])
+            if m_fn:
+                current_fn = m_fn.group(1)
+                i += 3
+                continue
+            if _WP_STATUS_SECTION_RE.match(lines[i + 1]):
+                current_fn = None
+                i += 3
+                continue
+        if line.startswith("Goal "):
+            header_parts = [line[len("Goal ") :].strip()]
+            j = i + 1
+            while j < n and not header_parts[-1].endswith(":"):
+                nxt = lines[j].strip()
+                if (
+                    not nxt
+                    or _WP_STATUS_SEP_RE.match(lines[j])
+                    or nxt.startswith(("Assume", "Let ", "Tags:", "Prove:", "Prover ", "Goal "))
+                ):
+                    break
+                header_parts.append(nxt)
+                j += 1
+            header = " ".join(header_parts).rstrip(":").strip()
+            per_prover: dict[str, dict[str, Any]] = {}
+            has_valid = False
+            while j < n:
+                cur = lines[j]
+                if (
+                    _WP_STATUS_SEP_RE.match(cur)
+                    or cur.startswith("Goal ")
+                    or cur.startswith("[report] ")
+                    or cur.startswith("--- Properties of Function ")
+                ):
+                    break
+                m_p = _WP_STATUS_PROVER_RE.match(cur)
+                if m_p:
+                    pname = _wp_status_prover_name(m_p.group("prover"))
+                    raw_v = " ".join(m_p.group("verdict").lower().split())
+                    verdict = _WP_STATUS_VERDICT_MAP.get(raw_v)
+                    if verdict == "valid":
+                        has_valid = True
+                    elif pname and pname.lower() != "qed" and verdict in _VERDICT_KINDS:
+                        t_ms, is_cached = _parse_wp_status_tail(m_p.group("tail"))
+                        per_prover[pname] = {"verdict": verdict, "time_ms": t_ms, "cached": is_cached}
+                j += 1
+            block_fn = current_fn
+            if block_fn is None:
+                fn_matches = _WP_STATUS_HEADER_FN_RE.findall(header)
+                if fn_matches:
+                    block_fn = fn_matches[-1]
+            if per_prover and not has_valid:
+                blocks.append({"function": block_fn, "header": header, "per_prover": per_prover})
+            i = j
+            continue
+        i += 1
+    return blocks
+
+
+def _sanitize_label(raw: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", raw).strip("_")
+
+
+def _status_header_matches_goal(header: str, goal: str, fn_name: str | None, cost_line: int | None) -> bool:
+    """Whether a `-wp-status` `Goal <header>:` description is structurally compatible with `goal`."""
+    rest = goal
+    if fn_name:
+        marker = f"_{fn_name}_"
+        idx = goal.find(marker)
+        if idx >= 0:
+            rest = goal[idx + len(marker) :]
+
+    # Split part suffix `(k/m)` <-> `_part<k>`
+    m_part = _WP_STATUS_PART_RE.search(header)
+    if m_part:
+        if not rest.endswith(f"_part{m_part.group(1)}"):
+            return False
+
+    # Single source line `("file", line N)` (not `lines N-M`): last occurrence matches JSON line
+    if cost_line is not None:
+        line_hits = _WP_STATUS_LINE_RE.findall(header)
+        if line_hits and int(line_hits[-1]) != cost_line:
+            return False
+
+    # Kind + optional label compatibility against the goal name suffix
+    m_post = re.match(r"^Post-condition(?:\s+'([^']+)')?", header)
+    if m_post:
+        if "ensures" not in rest:
+            return False
+        lbl = _sanitize_label(m_post.group(1) or "")
+        return not lbl or lbl in rest
+
+    m_assert = re.match(r"^Assertion(?:\s+'([^']+)')?", header)
+    if m_assert:
+        if "assert" not in rest:
+            return False
+        lbl = _sanitize_label(m_assert.group(1) or "")
+        if lbl:
+            return f"assert_{lbl}" in rest or lbl in rest
+        return "assert_rte_" not in rest
+
+    m_check = re.match(r"^Check(?:\s+'([^']+)')?", header)
+    if m_check:
+        if "check" not in rest:
+            return False
+        lbl = _sanitize_label(m_check.group(1) or "")
+        return not lbl or lbl in rest
+
+    m_inv_est = re.match(r"^Establishment of Invariant(?:\s+'([^']+)')?", header)
+    if m_inv_est:
+        if "loop_invariant" not in rest or "established" not in rest:
+            return False
+        lbl = _sanitize_label(m_inv_est.group(1) or "")
+        return not lbl or lbl in rest
+
+    m_inv_pre = re.match(r"^Preservation of Invariant(?:\s+'([^']+)')?", header)
+    if m_inv_pre:
+        if "loop_invariant" not in rest or "preserved" not in rest:
+            return False
+        lbl = _sanitize_label(m_inv_pre.group(1) or "")
+        return not lbl or lbl in rest
+
+    if header.startswith("Positivity of Loop variant"):
+        return "loop_variant" in rest and "positive" in rest
+    if header.startswith("Decreasing of Loop variant"):
+        return "loop_variant" in rest and "decrease" in rest
+    if header.startswith(("Positivity of Variant", "Decreasing of Variant", "Recursion variant")):
+        return "variant" in rest or "decreases" in rest
+    if header.startswith("Termination-condition"):
+        return "terminates" in rest
+    if header.startswith("Exit-condition"):
+        return "exits" in rest
+    if header.startswith("Loop assigns"):
+        return "loop_assigns" in rest
+    if header.startswith("Assigns"):
+        return "assigns" in rest
+    if header.startswith("Instance of 'Pre-condition"):
+        m_callee = re.search(r"in\s+'([A-Za-z_]\w*)'", header)
+        if m_callee and f"call_{m_callee.group(1)}" in rest:
+            return True
+        return "requires" in rest
+    m_cp = re.match(r"^Call point\s+([A-Za-z_]\w*)\b", header)
+    if m_cp:
+        return f"call_point_{m_cp.group(1)}" in rest
+    if header.startswith("Complete behaviors"):
+        return "complete" in rest
+    if header.startswith("Disjoint behaviors"):
+        return "disjoint" in rest
+    return True
+
+
+def _status_block_matches_cost(block: dict[str, Any], cost: dict[str, Any], fn_name: str | None) -> bool:
+    """Whether a `-wp-status` block is compatible with an unproven goal cost record."""
+    goal = str(cost.get("goal") or "")
+    if not goal:
+        return False
+    bfn = block.get("function")
+    effective_fn = fn_name or bfn
+    if fn_name and bfn and bfn != fn_name:
+        return False
+    if bfn and f"_{bfn}_" not in goal:
+        return False
+    per_prover: dict[str, dict[str, Any]] = block.get("per_prover") or {}
+    if not per_prover:
+        return False
+    verdict_kind = cost.get("verdict_kind")
+    if isinstance(verdict_kind, str) and verdict_kind:
+        by_prover_lower = {p.lower(): str(info.get("verdict") or "") for p, info in per_prover.items()}
+        if verdict_kind not in by_prover_lower.values():
+            return False
+        for cp in cost.get("provers") or []:
+            if isinstance(cp, str) and cp.lower() in by_prover_lower:
+                if by_prover_lower[cp.lower()] != verdict_kind:
+                    return False
+    raw_line = cost.get("line")
+    cost_line = raw_line if isinstance(raw_line, int) and not isinstance(raw_line, bool) and raw_line > 0 else None
+    return _status_header_matches_goal(str(block.get("header") or ""), goal, effective_fn, cost_line)
+
+
+def parse_wp_status_per_prover(
+    log_text: str,
+    goals: list[dict[str, Any]] | None = None,
+    fn_name: str | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """
+    Parse Frama-C 34 `-wp-status` output into `{goal_name: {prover_name: {"verdict", "time_ms", "cached"}}}`.
+
+    `-wp-status` iterates pending goals in deterministic `Wpo.iter` order (matching `-wp-report-json`),
+    printing every prover's `Prover <Name> <Version> returns <Verdict> ...` line under each goal.
+    When `goals` (from `-wp-report-json` or `goal_costs_from_log`) aligns 1-to-1 in order and every
+    pair passes structural + verdict consistency checks, all goals bind directly (including multiple
+    identical same-line RTE headers). Otherwise falls back to iterative unique-match peeling and fails
+    closed on ambiguity.
+    """
+    blocks = _parse_wp_status_blocks(log_text)
+    if fn_name:
+        blocks = [b for b in blocks if not b.get("function") or b["function"] == fn_name]
+    if not blocks:
+        return {}
+
+    targets: list[dict[str, Any]]
+    if goals is not None:
+        targets = [g for g in goals if isinstance(g, dict) and isinstance(g.get("goal"), str)]
+    else:
+        targets = goal_costs_from_log(log_text)
+        if fn_name:
+            targets = [t for t in targets if f"_{fn_name}_" in str(t.get("goal") or "")]
+    if not targets:
+        return {}
+
+    # Pass 1: exact Wpo.iter 1-to-1 order match verified per pair.
+    if len(blocks) == len(targets) and all(
+        _status_block_matches_cost(b, t, fn_name) for b, t in zip(blocks, targets, strict=True)
+    ):
+        return {str(t["goal"]): dict(b["per_prover"]) for b, t in zip(blocks, targets, strict=True)}
+
+    # Pass 2: iterative unique-match peeling (handles out-of-order console lines under -wp-par).
+    rem_b = set(range(len(blocks)))
+    rem_t = set(range(len(targets)))
+    compat: dict[int, set[int]] = {
+        bi: {ti for ti in rem_t if _status_block_matches_cost(blocks[bi], targets[ti], fn_name)} for bi in rem_b
+    }
+    matched: dict[str, dict[str, dict[str, Any]]] = {}
+    changed = True
+    while changed and rem_b and rem_t:
+        changed = False
+        for bi in list(rem_b):
+            cands = compat[bi] & rem_t
+            if len(cands) == 1:
+                ti = next(iter(cands))
+                matched[str(targets[ti]["goal"])] = dict(blocks[bi]["per_prover"])
+                rem_b.remove(bi)
+                rem_t.remove(ti)
+                changed = True
+        for ti in list(rem_t):
+            cands_b = [bi for bi in rem_b if ti in compat[bi]]
+            if len(cands_b) == 1:
+                bi = cands_b[0]
+                matched[str(targets[ti]["goal"])] = dict(blocks[bi]["per_prover"])
+                rem_b.remove(bi)
+                rem_t.remove(ti)
+                changed = True
+
+    # Remaining ambiguous targets: bind only when every candidate block agrees on the exact verdict map.
+    for ti in list(rem_t):
+        cands_b = [bi for bi in rem_b if ti in compat[bi]]
+        if not cands_b:
+            continue
+        verdict_maps = [
+            tuple(sorted((p, str(info["verdict"])) for p, info in blocks[bi]["per_prover"].items())) for bi in cands_b
+        ]
+        if len(set(verdict_maps)) == 1:
+            matched[str(targets[ti]["goal"])] = dict(blocks[cands_b[0]]["per_prover"])
+    return matched
 
 
 def goal_costs_enabled() -> bool:
@@ -341,6 +670,32 @@ def goal_costs_from_log(log: str) -> list[dict]:
     return costs
 
 
+def _merge_wp_status_per_prover(unproven: list[dict], log: str, fn_name: str) -> None:
+    """Attach `per_prover_verdicts` (and non-cached `per_prover_time_ms`) from `-wp-status` onto `unproven`."""
+    if not unproven or not log:
+        return
+    per_goal = parse_wp_status_per_prover(log, goals=unproven, fn_name=fn_name)
+    if not per_goal:
+        return
+    for cost in unproven:
+        goal = cost.get("goal")
+        if not isinstance(goal, str) or goal not in per_goal:
+            continue
+        details = per_goal[goal]
+        verdicts = {p: str(info["verdict"]) for p, info in details.items() if info.get("verdict")}
+        if verdicts:
+            cost["per_prover_verdicts"] = verdicts
+        times = {
+            p: info["time_ms"]
+            for p, info in details.items()
+            if isinstance(info.get("time_ms"), int)
+            and not isinstance(info.get("time_ms"), bool)
+            and not info.get("cached")
+        }
+        if times:
+            cost["per_prover_time_ms"] = times
+
+
 def collect_goal_costs(json_path: Path, log: str, fn_name: str) -> tuple[list[dict], list[dict], str | None]:
     """(unproven_goal_costs, slowest_proved_goals, source): the JSON report first, else the log tags."""
     entries: list[dict] | None = None
@@ -348,8 +703,10 @@ def collect_goal_costs(json_path: Path, log: str, fn_name: str) -> tuple[list[di
         entries = parse_wp_report_json(json_path.read_text(encoding="utf-8", errors="replace"))
     if entries is not None:
         unproven, slowest = goal_costs_from_report(entries, fn_name)
+        _merge_wp_status_per_prover(unproven, log, fn_name)
         return unproven, slowest, "report_json"
     unproven = goal_costs_from_log(log)
+    _merge_wp_status_per_prover(unproven, log, fn_name)
     return unproven, [], ("log" if unproven else None)
 
 
@@ -358,12 +715,29 @@ def _goal_list(names: list[str]) -> str:
     return shown + (f" and {len(names) - 5} more" if len(names) > 5 else "")
 
 
+def _normalized_per_prover_verdicts(cost: dict) -> dict[str, str]:
+    """Lowercased `{prover: verdict}` from `cost['per_prover_verdicts']`, skipping Qed and invalid entries."""
+    raw = cost.get("per_prover_verdicts")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        pname, verdict = k.strip().lower(), v.strip().lower()
+        if pname and pname != "qed" and verdict:
+            out[pname] = verdict
+    return out
+
+
 def goal_cost_hints(res: dict) -> list[str]:
     """
     The two verdict-kind hints. Each needs every unproven goal (the Degenerated function-pointer goals the
     result assumes are left out) to agree, and the run's -wp-timeout; a cached time is never used, and an
     Unknown/Timeout with a measured time on the wrong side of the threshold blocks the hint. Not on a
     counter-example run, whose merged verdicts differ (an Unknown with a Model beats a Timeout there).
+    With `per_prover_verdicts` (from `-wp-status`), multi-prover runs also detect when every configured
+    prover timed out or stepped out versus when a fast Unknown was masked by another prover's Timeout.
     """
     costs = res.get("unproven_goal_costs")
     timeout_s = res.get("wp_timeout_s")
@@ -376,20 +750,65 @@ def goal_cost_hints(res: dict) -> list[str]:
     if not goals:
         return []
     timeout_ms = timeout_s * 1000
+    provers = [p for p in (res.get("wp_provers") or []) if isinstance(p, str) and p]
+    configured_lower = {p.lower() for p in provers}
 
     def measured(c: dict) -> int | None:
         t = c.get("time_ms")
         return t if isinstance(t, int) and not isinstance(t, bool) and not c.get("cached") else None
 
+    def prover_times_lower(c: dict) -> dict[str, int]:
+        if c.get("cached"):
+            return {}
+        raw = c.get("per_prover_time_ms")
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            k.strip().lower(): v
+            for k, v in raw.items()
+            if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v > 0
+        }
+
     def gave_up_early(c: dict) -> bool:
+        ppv = _normalized_per_prover_verdicts(c)
+        if ppv and any(v != "unknown" for v in ppv.values()):
+            return False
         t = measured(c)
         return c.get("verdict_kind") == "unknown" and (t is None or t <= UNKNOWN_FAST_FRACTION * timeout_ms)
 
     def ran_out(c: dict) -> bool:
         t = measured(c)
-        if c.get("verdict_kind") == "stepout":
+        ppv = _normalized_per_prover_verdicts(c)
+        if len(provers) > 1:
+            if not ppv or not (configured_lower <= set(ppv)):
+                return False
+            if any(v not in ("timeout", "stepout") for v in ppv.values()):
+                return False
+            if t is not None and c.get("verdict_kind") == "timeout" and t < TIMEOUT_REACHED_FRACTION * timeout_ms:
+                return False
+            ptimes = prover_times_lower(c)
+            for pname, verdict in ppv.items():
+                if verdict == "timeout":
+                    pt = ptimes.get(pname)
+                    if pt is not None and pt < TIMEOUT_REACHED_FRACTION * timeout_ms:
+                        return False
             return True
-        return c.get("verdict_kind") == "timeout" and (t is None or t >= TIMEOUT_REACHED_FRACTION * timeout_ms)
+        if len(provers) == 1:
+            if ppv:
+                if provers[0].lower() not in ppv or any(v not in ("timeout", "stepout") for v in ppv.values()):
+                    return False
+                ptimes = prover_times_lower(c)
+                pt = ptimes.get(provers[0].lower())
+                if (
+                    ppv[provers[0].lower()] == "timeout"
+                    and pt is not None
+                    and pt < TIMEOUT_REACHED_FRACTION * timeout_ms
+                ):
+                    return False
+            if c.get("verdict_kind") == "stepout":
+                return True
+            return c.get("verdict_kind") == "timeout" and (t is None or t >= TIMEOUT_REACHED_FRACTION * timeout_ms)
+        return False
 
     names = [str(c.get("goal")) for c in goals]
     hints: list[str] = []
@@ -400,14 +819,22 @@ def goal_cost_hints(res: dict) -> list[str]:
             "probably false or missing a fact: read its sequent with `--prop <clause> --dump-goal` and check the "
             "claim with the E-ACSL guardrail before strengthening anything."
         )
-    provers = [p for p in (res.get("wp_provers") or []) if isinstance(p, str) and p]
-    if len(provers) == 1 and all(ran_out(c) for c in goals):
-        hints.append(
-            f"Every unproven goal ({_goal_list(names)}) ran out of time or steps with the only configured prover "
-            f"({provers[0]}, {timeout_s}s limit): the goal may be true and too large. Isolate it (`--prop <clause>`) "
-            "and reduce what it depends on (split the clause, add an intermediate `assert`, drop facts it does not "
-            "need) before weakening it."
-        )
+    if provers and all(ran_out(c) for c in goals):
+        if len(provers) == 1:
+            hints.append(
+                f"Every unproven goal ({_goal_list(names)}) ran out of time or steps with the only configured prover "
+                f"({provers[0]}, {timeout_s}s limit): the goal may be true and too large. Isolate it (`--prop <clause>`) "
+                "and reduce what it depends on (split the clause, add an intermediate `assert`, drop facts it does not "
+                "need) before weakening it."
+            )
+        else:
+            prover_list = ", ".join(provers)
+            hints.append(
+                f"Every unproven goal ({_goal_list(names)}) ran out of time or steps on all configured provers "
+                f"({prover_list}, {timeout_s}s limit): the goal may be true and too large. Isolate it (`--prop <clause>`) "
+                "and reduce what it depends on (split the clause, add an intermediate `assert`, drop facts it does not "
+                "need) before weakening it."
+            )
     return hints
 
 
@@ -429,6 +856,15 @@ def goal_obligation_class(item: dict) -> str:
     ledger unit has a class of its own for it (the pre-I9 classes l4_auth, l5_output, l6_secret are
     gone), so it falls through.
 
+    `l2_termination` matches the report kind (`loop variant`, `loop_variant`, `variant`, `decreases`,
+    `decreases clause`), never a substring inside a precondition/postcondition label such as
+    `ensures decreases_len: ...` (libmodbus run-1: 133 postcondition rows with a `decreases` label).
+    For unlabeled items (`kind` empty or `assertion`, as `ledger.py` builds for a prover's
+    `proof_gap`/`fault_hypothesis`), only an annotation starting with `loop variant` or `decreases`
+    followed by whitespace or end-of-string (not `:` or `_`) maps to `l2_termination`.
+    `termination clause` (`terminates \\true;`) stays `rte`: the kernel emits it on loop-free
+    functions too.
+
     A `\\separated` in the predicate of a precondition or a postcondition (the report kinds
     `precondition`, `precondition of <callee>`, `postcondition`) is not a frame goal: it says nothing
     about what the function writes. libmodbus run-1: the one "proven l3_frame goal" of
@@ -439,12 +875,13 @@ def goal_obligation_class(item: dict) -> str:
     meta = _META_NAME_RE.search(text)
     if meta:
         return _META_CLASS[next(g for g in meta.groups() if g)]
-    low = text.lower()
-    if re.search(r"(?<!in)variant", low) or "decreases" in low:
+    kind = str(item.get("kind") or "").strip().lower()
+    ann = str(item.get("annotation") or "").strip().lower()
+    if _TERMINATION_KIND_RE.match(kind) or (kind in ("", "assertion") and _TERMINATION_CLAUSE_RE.match(ann)):
         return "l2_termination"
+    low = text.lower()
     if "assigns" in low or "frees" in low or "allocates" in low:
         return "l3_frame"
-    kind = str(item.get("kind") or "").strip().lower()
     if "\\separated" in low and not kind.startswith(_PREDICATE_CLAUSE_KINDS):
         return "l3_frame"
     return "rte"
@@ -452,6 +889,13 @@ def goal_obligation_class(item: dict) -> str:
 
 # The report kinds of a contract's predicates: `precondition`, `precondition of <callee>`, `postcondition`.
 _PREDICATE_CLAUSE_KINDS = ("precondition", "postcondition")
+# Whole-word termination kinds at the start of the report `kind` (`loop variant`, `loop_variant`,
+# `variant`, `decreases`, `decreases clause`); never matches `loop invariant` or `termination clause`.
+_TERMINATION_KIND_RE = re.compile(r"^(?:(?:loop[\s_]+)?variant|decreases)\b")
+# For unlabeled / synthetic `assertion` items (e.g. ledger proof_gap/fault_hypothesis predicates):
+# requires whitespace or end-of-string after the keyword so clause labels (`decreases:` / `decreases_len:`)
+# are not misclassified.
+_TERMINATION_CLAUSE_RE = re.compile(r"^(?:loop[\s_]+variant|decreases)(?:\s|$)")
 
 
 _BITWISE_GOAL_RE = re.compile(
@@ -466,11 +910,82 @@ _WP_ALLOC_UNSUPPORTED_RE = re.compile(
     r"\\(?:freeable|fresh|allocable|allocation)\b|\b(?:freeable|allocates|frees)\b",
     re.IGNORECASE,
 )
+_WP_WARN_FN_RE = re.compile(
+    r"\b(?:(?:for|in|of)\s+function|specification\s+for)\s+'?(?P<fn>[A-Za-z_]\w*)'?(?=[\s.,;:)]|$)"
+)
+_LIBC_ALLOC_FNS = frozenset({"malloc", "calloc", "realloc", "free", "aligned_alloc", "valloc", "pvalloc"})
+_PROJECT_HEADER_SUFFIXES = (".h", ".hh", ".hpp", ".hxx", ".h++", ".inc")
 
 
 def _is_alloc_limitation_goal(item: dict) -> bool:
     text = f"{item.get('kind') or ''} {item.get('annotation') or ''}"
     return bool(_WP_ALLOC_UNSUPPORTED_RE.search(text))
+
+
+def _is_libc_header(path: str) -> bool:
+    norm = posixpath.normpath(path.replace("\\", "/")).lower()
+    return (
+        posixpath.basename(norm) == "stdlib.h"
+        or "/libc/" in norm
+        or norm.startswith("framac_share/libc/")
+        or norm.startswith("/usr/include/")
+    )
+
+
+def _warn_file_matches_target(msg_file: str, target_file: str) -> bool:
+    if not msg_file or not target_file:
+        return True
+    m_norm = posixpath.normpath(msg_file.replace("\\", "/"))
+    t_norm = posixpath.normpath(target_file.replace("\\", "/"))
+    if m_norm == t_norm or t_norm.endswith("/" + m_norm) or m_norm.endswith("/" + t_norm):
+        return True
+    if posixpath.basename(m_norm) == posixpath.basename(t_norm):
+        return True
+    # A function's contract may live in a project header rather than its .c file.
+    return posixpath.splitext(m_norm)[1].lower() in _PROJECT_HEADER_SUFFIXES
+
+
+def _is_alloc_warning_for_function(msg_plugin: str, msg_file: str, folded: str, res: dict) -> bool:
+    """True when a WP skipped/ignored allocation warning is tied to the function under proof."""
+    if msg_plugin not in ("wp", "") or not _WP_ALLOC_UNSUPPORTED_RE.search(folded):
+        return False
+    fn = str(res.get("function") or "").strip()
+    fn_m = _WP_WARN_FN_RE.search(folded)
+    if fn_m:
+        named_fn = fn_m.group("fn")
+        return named_fn == fn if fn else named_fn not in _LIBC_ALLOC_FNS
+    if msg_file and _is_libc_header(msg_file):
+        return False
+    return _warn_file_matches_target(msg_file, str(res.get("file") or "").strip())
+
+
+def _classify_skipped_spec_messages(res: dict, log_text: str) -> tuple[list[str], list[str]]:
+    """
+    Partition skipped/ignored specification warnings in `soundness.tier_b_unsound` and the WP log
+    into `(alloc_skipped_for_fn, other_skipped)`.
+
+    - `alloc_skipped_for_fn`: WP `not yet supported (skipped)` / `Ignoring` warnings about dynamic
+      allocation clauses tied to the function under proof (not unrelated `stdlib.h` / libc mentions).
+    - `other_skipped`: non-allocation `not yet supported (skipped)` / `Ignoring` warnings.
+    """
+    soundness = res.get("soundness") or {}
+    raw_chunks = [*(soundness.get("tier_b_unsound") or []), log_text or "", res.get("wp_log_tail") or ""]
+    alloc_skipped: list[str] = []
+    other_skipped: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw_chunks:
+        for m in fold_messages(str(chunk or "")):
+            if m.folded in seen:
+                continue
+            seen.add(m.folded)
+            if "not yet supported (skipped)" not in m.folded and "Ignoring " not in m.folded:
+                continue
+            if m.plugin in ("wp", "") and _WP_ALLOC_UNSUPPORTED_RE.search(m.folded):
+                if _is_alloc_warning_for_function(m.plugin, m.file, m.folded, res):
+                    alloc_skipped.append(m.folded)
+            else:
+                other_skipped.append(m.folded)
+    return alloc_skipped, other_skipped
 
 
 _POINTER_CAST_RE = re.compile(
@@ -863,6 +1378,147 @@ ASSIGNS_ABSENT = "absent"
 ASSIGNS_UNKNOWN = "unknown"
 _WP_PROVED_GOALS_RE = re.compile(r"^\s*(?:\[wp\]\s*)?Proved goals:\s*(\d+)\s*/\s*(\d+)", re.MULTILINE)
 _WP_TIMEOUT_COUNT_RE = re.compile(r"^(?:\[wp\])?\s*Timeout:\s*(\d+)", re.MULTILINE)
+_WP_GOALS_SCHEDULED_RE = re.compile(r"^\[wp\]\s+(\d+)\s+goals?\s+scheduled\b", re.MULTILINE)
+_PARTIAL_WP_GOAL_COLON_RE = re.compile(
+    r"^\[wp\]\s+\[[^\]\n]+\]\s+Goal\s+([A-Za-z_]\w*)\s*:\s*"
+    r"(Valid|Proved|Timeout|Stepout|Step\s+limit|Unknown|Failed|Invalid|Unsuccess|Incorrect)\b(.*)$"
+)
+_PARTIAL_WP_BRACKET_RE = re.compile(
+    r"^\[wp\]\s+\[(Valid|Proved|Timeout|Stepout|Step\s+limit|Unknown|Failed|Invalid|Unsuccess|Incorrect)\]\s+"
+    r"([A-Za-z_]\w*)(.*)$"
+)
+_PARTIAL_VERDICT_CATEGORY: dict[str, str] = {
+    "valid": "proved",
+    "proved": "proved",
+    "timeout": "timed_out",
+    "stepout": "timed_out",
+    "step limit": "timed_out",
+    "unknown": "unknown",
+    "failed": "failed",
+    "invalid": "failed",
+    "unsuccess": "failed",
+    "incorrect": "failed",
+}
+_PARTIAL_VERDICT_PRIORITY: dict[str, int] = {
+    "unknown": 1,
+    "timed_out": 2,
+    "failed": 3,
+    "proved": 4,
+}
+_PARTIAL_VERDICTS_MAX_GOALS = 25
+
+
+def parse_partial_wp_log_verdicts(log_text: str) -> dict[str, Any] | None:
+    """
+    Salvage incremental VC verdicts logged by Frama-C WP before the process was killed (e.g. timeout
+    or OOM) and never wrote `-report-csv`.
+
+    Returns None when neither `[wp] N goals scheduled` nor any per-VC verdict line appears in `log_text`.
+    All counts reflect VCs (not CSV properties) and carry `incomplete: True` so downstream ledger
+    ingestion never mistakes them for a verified proof report.
+    """
+    if not log_text:
+        return None
+
+    scheduled_vcs: int | None = None
+    for m in _WP_GOALS_SCHEDULED_RE.finditer(log_text):
+        scheduled_vcs = int(m.group(1))
+
+    verdicts_by_goal: dict[str, tuple[str, bool]] = {}
+    for line in log_text.splitlines():
+        if not line.startswith("[wp]"):
+            continue
+        goal: str | None = None
+        raw_verdict: str | None = None
+        tail = ""
+        m_colon = _PARTIAL_WP_GOAL_COLON_RE.match(line)
+        if m_colon:
+            goal = m_colon.group(1)
+            raw_verdict = m_colon.group(2)
+            tail = m_colon.group(3)
+        else:
+            m_bracket = _PARTIAL_WP_BRACKET_RE.match(line)
+            if m_bracket:
+                raw_verdict = m_bracket.group(1)
+                goal = m_bracket.group(2)
+                tail = m_bracket.group(3)
+        if not goal or not raw_verdict:
+            continue
+        norm_verdict = re.sub(r"\s+", " ", raw_verdict.strip().lower())
+        category = _PARTIAL_VERDICT_CATEGORY.get(norm_verdict)
+        if category is None:
+            continue
+        tags = [t.strip() for t in _PAREN_TAG_RE.findall(tail)]
+        cached = "Cached" in tags
+        prev = verdicts_by_goal.get(goal)
+        if prev is None:
+            verdicts_by_goal[goal] = (category, cached)
+        else:
+            prev_cat, prev_cached = prev
+            if _PARTIAL_VERDICT_PRIORITY[category] > _PARTIAL_VERDICT_PRIORITY[prev_cat]:
+                verdicts_by_goal[goal] = (category, cached)
+            elif category == prev_cat:
+                verdicts_by_goal[goal] = (prev_cat, prev_cached or cached)
+
+    proved_vcs = 0
+    timed_out_vcs = 0
+    unknown_vcs = 0
+    failed_vcs = 0
+    cached_vcs = 0
+    cached_timed_out_vcs = 0
+    timed_out_goals: list[str] = []
+    unknown_goals: list[str] = []
+    failed_goals: list[str] = []
+
+    for goal, (category, cached) in verdicts_by_goal.items():
+        if cached:
+            cached_vcs += 1
+        if category == "proved":
+            proved_vcs += 1
+        elif category == "timed_out":
+            timed_out_vcs += 1
+            if cached:
+                cached_timed_out_vcs += 1
+            if len(timed_out_goals) < _PARTIAL_VERDICTS_MAX_GOALS:
+                timed_out_goals.append(goal)
+        elif category == "unknown":
+            unknown_vcs += 1
+            if len(unknown_goals) < _PARTIAL_VERDICTS_MAX_GOALS:
+                unknown_goals.append(goal)
+        elif category == "failed":
+            failed_vcs += 1
+            if len(failed_goals) < _PARTIAL_VERDICTS_MAX_GOALS:
+                failed_goals.append(goal)
+
+    # If WP finished proving and printed its summary right before being killed during `-report-csv`,
+    # recover the proved count (Frama-C 34 does not print individual `[Valid]` lines in batch mode).
+    proved_m = _WP_PROVED_GOALS_RE.search(log_text)
+    if proved_m:
+        summary_proved = int(proved_m.group(1))
+        summary_total = int(proved_m.group(2))
+        if summary_proved > proved_vcs:
+            proved_vcs = summary_proved
+        if scheduled_vcs is None or summary_total > scheduled_vcs:
+            scheduled_vcs = summary_total
+
+    completed_vcs = proved_vcs + timed_out_vcs + unknown_vcs + failed_vcs
+    if scheduled_vcs is None and completed_vcs == 0:
+        return None
+
+    return {
+        "incomplete": True,
+        "scheduled_vcs": scheduled_vcs,
+        "completed_vcs": completed_vcs,
+        "proved_vcs": proved_vcs,
+        "timed_out_vcs": timed_out_vcs,
+        "unknown_vcs": unknown_vcs,
+        "failed_vcs": failed_vcs,
+        "cached_vcs": cached_vcs,
+        "cached_timed_out_vcs": cached_timed_out_vcs,
+        "timed_out_goals": timed_out_goals,
+        "unknown_goals": unknown_goals,
+        "failed_goals": failed_goals,
+    }
 
 
 def frame_clause_state(log_text: str, fn_name: str) -> dict:
@@ -985,7 +1641,7 @@ def _goal_failure_strategy(goal: dict) -> tuple[str, str]:
         return "weaken", "fails establishment"
     if "preserved" in ann:
         return "adjust", "fails preservation"
-    if "loop_variant" in ann or "decreases" in ann:
+    if "loop_variant" in ann or "loop variant" in ann or "decreases" in ann:
         return "progress", "termination"
     if "loop_invariant" in ann:
         return "strengthen", "provability"
@@ -1004,7 +1660,7 @@ def _loop_goal_strategies(unproven_goals: list[dict]) -> str | None:
         kind = str(g.get("kind") or "")
         ann = str(g.get("annotation") or "")
         text = f"{kind} {ann}".lower()
-        if "loop_variant" in text or "decreases" in text:
+        if "loop_variant" in text or "loop variant" in text or "decreases" in text:
             variant_goals.append(ann or kind)
             continue
         if "loop_invariant" not in text:
@@ -1032,7 +1688,10 @@ def _loop_goal_strategies(unproven_goals: list[dict]) -> str | None:
             parts.append(f"strengthen `{base}` (holds but too weak to imply the postcondition at loop exit)")
     for v in sorted(set(variant_goals)):
         parts.append(
-            f"fix progress for `{v}` (variant/measure does not strictly decrease — check the measure or add a progress guard, e.g. 'if (consumed == 0) return -1;')"
+            f"fix progress for `{v}` (variant/measure does not strictly decrease — fix the measure, add the "
+            "missing progress fact via a 'loop invariant' or 'requires' (e.g. from a callee's 'ensures' "
+            "guaranteeing positive progress), or stop and report a 'proof_gap' / termination finding if the "
+            "loop can legitimately fail to progress)"
         )
     return "Failure-kind repair strategy: " + "; ".join(parts) + "."
 
@@ -1177,7 +1836,7 @@ def derive_wp_diagnostic_hints(
         if _BOOL_PRED_ERR_RE.search(err_blob):
             _add(
                 "ACSL separates terms (values) from predicates (formulas): write 'x == 0' instead of '!x' on C "
-                "integers, and use '==>' or '<==>' instead of '? :' when combining predicates."
+                "integers, and use '==>' or '(p1 ==> p2) && (p2 ==> p1)' instead of '? :' when combining predicates."
             )
         if not hints:
             _add(
@@ -1215,12 +1874,80 @@ def derive_wp_diagnostic_hints(
         )
         return hints
 
+    if status == "analysis_error" and res.get("reason") == OUT_DIR_LOCKED_REASON:
+        _add(
+            "Another Frama-C WP run is already writing to this --out-dir (exclusive lock held). "
+            "Wait for the active run to finish or invoke run_wp_function.py with a separate --out-dir; "
+            "do not run concurrent WP invocations against the same directory."
+        )
+        return hints
+
     if status == "analysis_error":
         reason = res.get("reason") or "unknown"
-        _add(
-            f"Frama-C WP terminated before producing a report (reason: {reason}). Re-run once; if it repeats, "
-            "report status 'blocked' with this reason rather than weakening contracts."
-        )
+        partial = res.get("partial_verdicts")
+        if isinstance(partial, dict) and (
+            partial.get("scheduled_vcs") is not None or int(partial.get("completed_vcs") or 0) > 0
+        ):
+            scheduled = partial.get("scheduled_vcs")
+            completed = int(partial.get("completed_vcs") or 0)
+            proved = int(partial.get("proved_vcs") or 0)
+            timed_out = int(partial.get("timed_out_vcs") or 0)
+            unknown = int(partial.get("unknown_vcs") or 0)
+            failed = int(partial.get("failed_vcs") or 0)
+            cached_to = int(partial.get("cached_timed_out_vcs") or 0)
+            breakdown: list[str] = []
+            if proved > 0:
+                breakdown.append(f"{proved} proved")
+            if timed_out > 0:
+                to_text = f"{timed_out} timed out"
+                if cached_to > 0:
+                    to_text += f" ({cached_to} cached)"
+                breakdown.append(to_text)
+            if unknown > 0:
+                breakdown.append(f"{unknown} unknown")
+            if failed > 0:
+                breakdown.append(f"{failed} failed")
+
+            if completed > 0:
+                if proved > 0:
+                    progress = (
+                        f"after deciding {completed}/{scheduled} VCs"
+                        if scheduled is not None
+                        else f"after deciding {completed} {'VC' if completed == 1 else 'VCs'}"
+                    )
+                else:
+                    unproved_unit = "VC" if completed == 1 else "VCs"
+                    progress = (
+                        f"with {scheduled} {'VC' if scheduled == 1 else 'VCs'} scheduled and {completed} unproved {unproved_unit} logged"
+                        if scheduled is not None
+                        else f"after logging {completed} unproved {unproved_unit}"
+                    )
+                summary_part = f"WP stopped before writing its report ({reason}) {progress}"
+                if breakdown:
+                    summary_part += f": {', '.join(breakdown)}"
+            else:
+                summary_part = (
+                    f"WP stopped before writing its report ({reason}) after scheduling "
+                    f"{scheduled} {'VC' if scheduled == 1 else 'VCs'} (no per-VC verdicts logged yet)"
+                )
+
+            remedies: list[str] = []
+            if cached_to > 0:
+                remedies.append(
+                    "raise --timeout (e.g. --timeout 10 or --timeout 15) to bypass cached Timeout verdicts "
+                    "instead of replaying them at the same timeout"
+                )
+            remedies.append("give the WP call dedicated wall time without running the guardrail concurrently")
+            remedies.append("or narrow with --prop <clause> / simplify heavy invariants before re-running")
+            _add(
+                f"{summary_part}; {'; '.join(remedies)}. "
+                "If it repeats, report status 'blocked' with this reason rather than weakening contracts."
+            )
+        else:
+            _add(
+                f"Frama-C WP terminated before producing a report (reason: {reason}). Re-run once; if it repeats, "
+                "report status 'blocked' with this reason rather than weakening contracts."
+            )
         unframed_var = res.get("unframed_variadic_callees") or []
         if (
             unframed_var
@@ -1240,6 +1967,13 @@ def derive_wp_diagnostic_hints(
         + list(soundness.get("tier_b_unsound") or [])
         + [log_text or "", res.get("wp_log_tail") or ""]
     )
+    alloc_skipped, other_skipped = _classify_skipped_spec_messages(res, log_text)
+    mm_sep_hint = (
+        "WP emitted Typed memory-model separation hypotheses: add explicit "
+        "'requires \\separated(p1 + (0 .. n1 - 1), p2 + (0 .. n2 - 1));' preconditions for distinct "
+        "pointer parameters."
+    )
+    has_mm_hyp = bool("Memory model hypotheses" in aborts_and_unsound or soundness.get("checked_memory_model_functions"))
     if not soundness.get("ok", True) or status in ("wp_aborted", "unsound_proof"):
         if "Missing assigns clause" in aborts_and_unsound or "using unguarded behavior assigns" in aborts_and_unsound:
             _add(
@@ -1247,25 +1981,35 @@ def derive_wp_diagnostic_hints(
                 "must have an explicit 'loop assigns ...;' / 'assigns ...;' clause (use 'assigns \\nothing;' for "
                 "pure functions)."
             )
-        if "Memory model hypotheses" in aborts_and_unsound or soundness.get("checked_memory_model_functions"):
-            _add(
-                "WP emitted Typed memory-model separation hypotheses: add explicit "
-                "'requires \\separated(p1 + (0 .. n1 - 1), p2 + (0 .. n2 - 1));' preconditions for distinct "
-                "pointer parameters."
-            )
+        if has_mm_hyp:
+            _add(mm_sep_hint)
+        indirect_call_text = "\n".join(
+            [aborts_and_unsound, *(str(s) for s in (soundness.get("skipped_rte_guards") or []))]
+        )
         if (
-            soundness.get("skipped_rte_guards")
-            or "Missing 'calls'" in aborts_and_unsound
-            or "Through function pointer" in aborts_and_unsound
+            _INDIRECT_CALL_UNSOUND_RE.search(indirect_call_text)
+            or "Through function pointer" in indirect_call_text
+            or "No 'calls' specification" in indirect_call_text
+            or "indirect call present without '//@ calls'" in indirect_call_text
         ):
             _add(
                 "Indirect call through a function pointer without a 'calls' annotation: place "
                 "'//@ calls f1, f2;' immediately above the indirect call statement."
             )
         if "unproven lemma" in aborts_and_unsound.lower():
+            lemma_names = [
+                str(g.get("annotation") or "").split(":", 1)[0].strip()
+                for g in (res.get("unproven_goals") or [])
+                if "lemma" in str(g.get("kind") or "").lower()
+            ]
+            lemma_names = [n for n in dict.fromkeys(lemma_names) if n]
+            named = f" ({', '.join(lemma_names[:5])})" if lemma_names else ""
             _add(
-                "Unproven global ACSL lemma in scope: replace global 'lemma' declarations with a recursive "
-                "'/*@ ghost ... */' C function with 'decreases n; assigns \\nothing;' so WP proves induction."
+                f"Unproven global ACSL lemma in scope{named}: WP assumes an unproven lemma without proof for "
+                "sibling goals, making the proof unsound. Remove the unproven 'lemma' and do NOT work around "
+                "it with a file-scope ghost function (forbidden by the brief and refused at merge); if the "
+                "goal requires induction WP cannot prove inline, stop with status 'stalled_after_k_retries' "
+                "and proof_gap (reason: 'inductive lemma required: ...')."
             )
         if _SMOKE_FAIL_RE.search(aborts_and_unsound):
             _add(
@@ -1291,20 +2035,19 @@ def derive_wp_diagnostic_hints(
                 + "; ".join(stub_repair_action(fn) for fn in missing_spec)
                 + "."
             )
-        if "Ignoring " in aborts_and_unsound or "not yet supported (skipped)" in aborts_and_unsound:
-            if _WP_ALLOC_UNSUPPORTED_RE.search(aborts_and_unsound):
-                _add(
-                    "Frama-C WP does not support dynamic allocation clauses ('\\freeable', '\\fresh', "
-                    "'\\allocable', 'allocates', 'frees') from <stdlib.h> ('not yet supported (skipped)'). "
-                    "Do NOT write synthetic probe_*.c programs to investigate this limitation; once all "
-                    "non-allocation goals are proven and the E-ACSL guardrail passes, stop and write "
-                    "result.json with status 'stalled_after_k_retries'."
-                )
-            else:
-                _add(
-                    "Frama-C ignored part of a specification (see 'soundness.tier_b_unsound'): rewrite the unsupported "
-                    "or misplaced clause so WP checks it."
-                )
+        if alloc_skipped:
+            _add(
+                "Frama-C WP does not support dynamic allocation clauses ('\\freeable', '\\fresh', "
+                "'\\allocable', 'allocates', 'frees') from <stdlib.h> ('not yet supported (skipped)'). "
+                "Do NOT write synthetic probe_*.c programs to investigate this limitation; once all "
+                "non-allocation goals are proven and the E-ACSL guardrail passes, stop and write "
+                "result.json with status 'stalled_after_k_retries'."
+            )
+        if other_skipped:
+            _add(
+                "Frama-C ignored part of a specification (see 'soundness.tier_b_unsound'): rewrite the unsupported "
+                "or misplaced clause so WP checks it."
+            )
 
     if res.get("budget_exhausted"):
         _add(
@@ -1336,8 +2079,10 @@ def derive_wp_diagnostic_hints(
         buckets = res.get("unproven_by_bucket") or {}
         unproven_goals = res.get("unproven_goals") or []
         full_log = (log_text or "") + "\n" + (res.get("wp_log_tail") or "")
+        if has_mm_hyp:
+            _add(mm_sep_hint)
         alloc_goals = [g for g in unproven_goals if _is_alloc_limitation_goal(g)]
-        if alloc_goals or _WP_ALLOC_UNSUPPORTED_RE.search(full_log):
+        if alloc_goals or alloc_skipped:
             _add(
                 "Frama-C WP does not support dynamic allocation predicates ('\\freeable', '\\fresh', "
                 "'\\allocable', 'allocates', 'frees') on malloc/calloc/realloc/free in <stdlib.h>. "
@@ -1449,6 +2194,7 @@ def _analysis_error_result(
     soundness: dict,
     combined_log: str,
     metacsl_failure: dict | None = None,
+    partial_verdicts: dict[str, Any] | None = None,
 ) -> dict:
     res: dict[str, Any] = {
         "status": "analysis_error",
@@ -1474,6 +2220,8 @@ def _analysis_error_result(
     }
     if metacsl_failure is not None:
         res["metacsl_failure"] = metacsl_failure
+    if partial_verdicts is not None:
+        res["partial_verdicts"] = partial_verdicts
     res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
     return res
 
@@ -1661,6 +2409,441 @@ def collect_counter_example_models(res: dict, call_args: dict[str, Any]) -> dict
     return res
 
 
+OUT_DIR_LOCK_NAME = ".wp_out_dir.lock"
+OUT_DIR_LOCK_STALE_ENV = "FRAMAC_WP_OUT_DIR_LOCK_STALE"
+OUT_DIR_LOCK_STALE_DEFAULT_S = 180.0
+OUT_DIR_LOCKED_REASON = "out_dir_locked"
+
+# Resolved out_dir -> (owner_thread_id, reentrancy_depth) for same-thread nested WP retries/checks.
+_HELD_OUT_DIR_LOCKS: dict[str, tuple[int, int]] = {}
+_HELD_OUT_DIR_GUARD = threading.Lock()
+
+
+class OutDirLockedError(RuntimeError):
+    """Another active WP run already holds the exclusive lock on `out_dir`."""
+
+    def __init__(self, out_dir: Path, owner: dict[str, Any]) -> None:
+        self.out_dir = out_dir
+        self.owner = owner
+        parts: list[str] = []
+        if owner.get("pid") is not None:
+            parts.append(f"pid={owner['pid']}")
+        if owner.get("host"):
+            parts.append(f"host={owner['host']}")
+        if owner.get("function"):
+            parts.append(f"function={owner['function']}")
+        if owner.get("started_at"):
+            parts.append(f"started_at={owner['started_at']}")
+        holder = ", ".join(parts) if parts else "unknown holder"
+        super().__init__(
+            f"WP output directory '{out_dir}' is already locked by another active run ({holder}); "
+            "wait for it to finish or pass a separate --out-dir."
+        )
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if process `pid` currently exists on this host."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is None:
+            return True
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        process_query_limited_info = 0x1000
+        still_active = 259
+        handle = kernel32.OpenProcess(process_query_limited_info, False, pid)
+        if not handle:
+            # ERROR_ACCESS_DENIED (5): process exists, caller lacks permission to query it.
+            return int(ctypes.get_last_error()) == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return int(exit_code.value) == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _out_dir_lock_stale_seconds(stale_after: float | None) -> float:
+    if stale_after is not None:
+        return max(0.0, float(stale_after))
+    raw = (os.environ.get(OUT_DIR_LOCK_STALE_ENV) or "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if math.isfinite(val) and val > 0:
+                return val
+        except ValueError:
+            pass
+    return OUT_DIR_LOCK_STALE_DEFAULT_S
+
+
+def _read_lock_owner(lock_dir: Path, wait_s: float = 0.25) -> dict[str, Any]:
+    """Read `lock_dir/owner.json`, waiting briefly if the creator is mid-write."""
+    owner_file = lock_dir / "owner.json"
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            data = json.loads(owner_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+            return {}
+        except (OSError, ValueError):
+            if not lock_dir.exists() or time.monotonic() >= deadline:
+                return {}
+            time.sleep(0.02)
+
+
+def _out_dir_lock_age(lock_dir: Path) -> float | None:
+    for probe in (lock_dir / "owner.json", lock_dir):
+        try:
+            return time.time() - probe.stat().st_mtime
+        except OSError:
+            continue
+    return None
+
+
+def _is_out_dir_lock_stale(lock_dir: Path, owner: dict[str, Any], stale_s: float) -> bool:
+    pid = owner.get("pid")
+    host = owner.get("host")
+    if host and host == socket.gethostname() and isinstance(pid, int) and not isinstance(pid, bool):
+        if not _pid_is_alive(pid):
+            return True
+    age = _out_dir_lock_age(lock_dir)
+    return age is not None and age > stale_s
+
+
+def _break_stale_out_dir_lock(lock_dir: Path) -> None:
+    tomb = lock_dir.with_name(f"{lock_dir.name}.stale-{os.getpid()}-{time.time_ns()}")
+    try:
+        os.replace(lock_dir, tomb)
+    except OSError:
+        return
+    shutil.rmtree(tomb, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _out_dir_lock(out_dir: Path, fn_name: str, stale_after: float | None = None) -> Iterator[Path]:
+    """Non-blocking exclusive cross-process lock on `out_dir`, re-entrant on the holding thread."""
+    out_path = Path(out_dir)
+    key = str(out_path.resolve())
+    tid = threading.get_ident()
+    with _HELD_OUT_DIR_GUARD:
+        held = _HELD_OUT_DIR_LOCKS.get(key)
+        if held is not None:
+            owner_tid, depth = held
+            if owner_tid == tid:
+                _HELD_OUT_DIR_LOCKS[key] = (owner_tid, depth + 1)
+            else:
+                lock_dir = out_path / OUT_DIR_LOCK_NAME
+                owner = (
+                    _read_lock_owner(lock_dir, wait_s=0.05)
+                    if lock_dir.exists()
+                    else {"pid": os.getpid(), "host": socket.gethostname()}
+                )
+                raise OutDirLockedError(out_path, owner)
+    if held is not None:
+        try:
+            yield out_path / OUT_DIR_LOCK_NAME
+        finally:
+            with _HELD_OUT_DIR_GUARD:
+                cur = _HELD_OUT_DIR_LOCKS.get(key)
+                if cur is not None:
+                    if cur[1] > 1:
+                        _HELD_OUT_DIR_LOCKS[key] = (cur[0], cur[1] - 1)
+                    else:
+                        _HELD_OUT_DIR_LOCKS.pop(key, None)
+        return
+
+    stale_s = _out_dir_lock_stale_seconds(stale_after)
+    out_path.mkdir(parents=True, exist_ok=True)
+    lock_dir = out_path / OUT_DIR_LOCK_NAME
+    stale_breaks = 0
+    transient_deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            break
+        except FileNotFoundError:
+            out_path.mkdir(parents=True, exist_ok=True)
+            continue
+        except PermissionError:
+            # Windows: lock_dir may be pending delete while a releasing holder removes it.
+            if time.monotonic() >= transient_deadline:
+                raise
+            time.sleep(0.02)
+            continue
+        except FileExistsError:
+            owner = _read_lock_owner(lock_dir)
+            if not lock_dir.exists():
+                continue
+            if stale_breaks < 3 and _is_out_dir_lock_stale(lock_dir, owner, stale_s):
+                _break_stale_out_dir_lock(lock_dir)
+                stale_breaks += 1
+                continue
+            raise OutDirLockedError(out_path, owner) from None
+
+    owner_file = lock_dir / "owner.json"
+    try:
+        payload = (
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "started_at": utc_now(),
+                    "function": fn_name,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        tmp_owner = lock_dir / f"owner.json.tmp.{os.getpid()}.{tid}"
+        tmp_owner.write_text(payload, encoding="utf-8")
+        os.replace(tmp_owner, owner_file)
+    except Exception:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        raise
+
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        interval = max(1.0, min(15.0, stale_s / 4)) if stale_s > 0 else 15.0
+        while not stop.wait(interval):
+            try:
+                os.utime(owner_file)
+            except OSError:
+                return
+
+    beat = threading.Thread(target=_heartbeat, name=f"wp-out-lock-{fn_name}", daemon=True)
+    beat.start()
+    with _HELD_OUT_DIR_GUARD:
+        _HELD_OUT_DIR_LOCKS[key] = (tid, 1)
+    try:
+        yield lock_dir
+    finally:
+        with _HELD_OUT_DIR_GUARD:
+            _HELD_OUT_DIR_LOCKS.pop(key, None)
+        stop.set()
+        beat.join(timeout=5)
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
+_VERDICT_STATUS_ORDER = {"timeout": 3, "stepout": 2, "failed": 1, "unknown": 0}
+_VERDICT_STATUS_LABEL = {"timeout": "Timeout", "stepout": "Stepout", "failed": "Failed", "unknown": "Unknown"}
+
+
+def _variant_goal_info(goal: str, prop: str | None, fn_name: str) -> tuple[str, str] | None:
+    """
+    If `goal`/`prop` is a WP loop-variant or recursion-decreases VC for `fn_name`, return
+    `(kind, group_key)` with `kind` in `{"loop variant", "decreases"}`; else None.
+
+    Frama-C 34 `-report-csv` omits `loop variant` and recursion `decreases` (`Recursion variant`)
+    rows completely, leaving only a `Partially proven` `termination clause` row even when the
+    variant timed out (`[wp] [Timeout] typed_<fn>_loop_variant_positive`).
+    """
+    fn_esc = re.escape(fn_name)
+    if prop:
+        m_prop = re.fullmatch(rf"{fn_esc}_(loop_variant|variant|decreases)(?:_(\d+))?", prop)
+        if m_prop:
+            kind = "loop variant" if m_prop.group(1) == "loop_variant" else "decreases"
+            return kind, prop
+    m_goal = re.search(
+        rf"_{fn_esc}_(loop_variant|variant|decreases)(?:_(\d+))?(?:_(?:positive|decrease))?(?:_part\d+)?$",
+        goal,
+    )
+    if m_goal:
+        raw_kind, idx = m_goal.group(1), m_goal.group(2)
+        kind = "loop variant" if raw_kind == "loop_variant" else "decreases"
+        base = f"{fn_name}_{raw_kind}" + (f"_{idx}" if idx else "")
+        return kind, base
+    return None
+
+
+def _infer_kind_from_wp_goal(goal: str, fn_name: str) -> str:
+    """Best-effort property kind from a WP goal name when `-report-csv` omitted the property."""
+    fn_esc = re.escape(fn_name)
+    m = re.search(rf"_{fn_esc}_(.+)$", goal)
+    suffix = (m.group(1) if m else goal).lower()
+    if re.match(r"^loop_variant\b", suffix):
+        return "loop variant"
+    if re.match(r"^(?:variant|decreases)\b", suffix):
+        return "decreases"
+    if "loop_assigns" in suffix or re.match(r"^assigns\b", suffix) or "_assigns" in suffix:
+        return "assigns clause"
+    if "loop_invariant" in suffix:
+        return "loop invariant"
+    m_rte = re.search(r"assert_rte_([a-z_]+?)(?:_\d+)?(?:_part\d+)?$", suffix)
+    if m_rte:
+        return f"rte: {m_rte.group(1)}"
+    if "_requires" in suffix or suffix.startswith("requires"):
+        return "precondition"
+    if "terminates" in suffix:
+        return "termination clause"
+    if "ensures" in suffix or "exits" in suffix:
+        return "postcondition"
+    return "wp_goal"
+
+
+def _reconcile_unreported_wp_goals(
+    *,
+    fn_name: str,
+    c_file: Path,
+    goal_costs: list[dict],
+    combined_log: str,
+    assumed_fpv: set[str],
+    all_vcs_cleanly_proved: bool,
+    has_vc_deficit: bool,
+    unproven_goals: list[dict],
+    buckets: dict[str, list[dict]],
+    by_class: dict[str, dict[str, int]],
+) -> None:
+    """
+    Surface failed/timed-out WP VCs that Frama-C `-report-csv` omitted from the CSV:
+    1. Loop-variant and recursion-variant (`decreases`) goals are omitted from `-report-csv`
+       in Frama-C 34 (leaving only `termination clause | Partially proven`), so any unproved
+       variant VC in `goal_costs` (or the WP log) is grouped per property and added unless
+       `unproven_goals` already has an `l2_termination` row for that line.
+    2. If `unproven_goals` is still empty despite `vc_timeouts > 0` or `vc_proved < vc_total`,
+       any remaining non-assumed failed VCs are synthesized so counts, buckets, obligation
+       classes, and diagnostic hints never contradict `status == 'unproven_goals_remain'`.
+
+    Never modifies clean `all_proven` runs (`all_vcs_cleanly_proved` True).
+    """
+    if all_vcs_cleanly_proved:
+        return
+
+    def _active_cost(c: dict) -> bool:
+        goal = str(c.get("goal") or "")
+        return bool(goal) and goal not in assumed_fpv and "_wp_smoke_" not in goal
+
+    def _add_synthesized(
+        kind: str,
+        file_name: str,
+        line: int,
+        verdicts: list[str],
+        goal_names: list[str],
+    ) -> None:
+        best_v = max(verdicts, key=lambda v: _VERDICT_STATUS_ORDER.get(v, -1), default="unknown")
+        item: dict[str, Any] = {
+            "file": file_name,
+            "function": fn_name,
+            "line": line,
+            "kind": kind,
+            "status": _VERDICT_STATUS_LABEL.get(best_v, "Unknown"),
+            "annotation": ", ".join(goal_names),
+            "wp_goals": goal_names,
+        }
+        cls = goal_obligation_class(item)
+        item["obligation_class"] = cls
+        bkey = classify_unproven_goal(item)
+        item["diagnostic_bucket"] = bkey
+        unproven_goals.append(item)
+        buckets[bkey].append(item)
+        counts = by_class.setdefault(cls, {"proven": 0, "proven_under_hyp": 0, "unproven": 0})
+        counts["unproven"] += 1
+
+    # 1. Reconcile omitted variant / decreases goals (even when other CSV goals also failed).
+    existing_term_lines = {
+        int(g.get("line") or 0) for g in unproven_goals if g.get("obligation_class") == "l2_termination"
+    }
+    has_existing_term = bool(existing_term_lines)
+    variant_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    matched_goals: set[str] = set()
+    for c in goal_costs:
+        if not _active_cost(c):
+            continue
+        goal = str(c["goal"])
+        info = _variant_goal_info(goal, c.get("property"), fn_name)
+        if info is None:
+            continue
+        matched_goals.add(goal)
+        kind, group_key = info
+        line = int(c["line"]) if isinstance(c.get("line"), int) and not isinstance(c.get("line"), bool) else 0
+        raw_file = c.get("file")
+        file_name = Path(str(raw_file)).name if isinstance(raw_file, str) and raw_file else c_file.name
+        grp = variant_groups.setdefault(
+            (kind, group_key),
+            {"file": file_name, "line": line, "verdicts": [], "goals": []},
+        )
+        if grp["line"] == 0 and line > 0:
+            grp["line"] = line
+        grp["verdicts"].append(str(c.get("verdict_kind") or "unknown"))
+        if goal not in grp["goals"]:
+            grp["goals"].append(goal)
+
+    for (kind, _group_key), grp in variant_groups.items():
+        line = int(grp["line"])
+        if (line > 0 and line in existing_term_lines) or (line == 0 and has_existing_term):
+            continue
+        _add_synthesized(kind, str(grp["file"]), line, list(grp["verdicts"]), list(grp["goals"]))
+
+    # 2. General fallback when CSV + variant reconciliation still left `unproven_goals` empty
+    #    despite WP reporting unproved or timed-out VCs.
+    if unproven_goals or not has_vc_deficit:
+        return
+
+    other_groups: dict[str, dict[str, Any]] = {}
+    for c in goal_costs:
+        if not _active_cost(c):
+            continue
+        goal = str(c["goal"])
+        if goal in matched_goals:
+            continue
+        group_key = str(c.get("property") or goal)
+        line = int(c["line"]) if isinstance(c.get("line"), int) and not isinstance(c.get("line"), bool) else 0
+        raw_file = c.get("file")
+        file_name = Path(str(raw_file)).name if isinstance(raw_file, str) and raw_file else c_file.name
+        grp = other_groups.setdefault(
+            group_key,
+            {
+                "kind": _infer_kind_from_wp_goal(goal, fn_name),
+                "file": file_name,
+                "line": line,
+                "verdicts": [],
+                "goals": [],
+            },
+        )
+        if grp["line"] == 0 and line > 0:
+            grp["line"] = line
+        grp["verdicts"].append(str(c.get("verdict_kind") or "unknown"))
+        if goal not in grp["goals"]:
+            grp["goals"].append(goal)
+
+    if not other_groups:
+        # Handle log-only `[Unsuccess]` / `[Incorrect]` / `[Invalid]` goals outside `goal_costs`.
+        for goal in sorted(parse_failed_wp_goals(combined_log)):
+            if goal in assumed_fpv or goal in matched_goals or "_wp_smoke_" in goal:
+                continue
+            other_groups[goal] = {
+                "kind": _infer_kind_from_wp_goal(goal, fn_name),
+                "file": c_file.name,
+                "line": 0,
+                "verdicts": ["unknown"],
+                "goals": [goal],
+            }
+
+    for grp in other_groups.values():
+        _add_synthesized(
+            str(grp["kind"]),
+            str(grp["file"]),
+            int(grp["line"]),
+            list(grp["verdicts"]),
+            list(grp["goals"]),
+        )
+
+
 def run_wp_on_function(
     c_file: Path,
     fn_name: str,
@@ -1697,6 +2880,63 @@ def run_wp_on_function(
     warn_signed_downcast: bool = True,
 ) -> dict:
     call_args: dict[str, Any] = dict(locals())  # first statement: exactly this call's arguments
+    try:
+        with _out_dir_lock(out_dir, fn_name):
+            return _run_wp_on_function_locked(call_args)
+    except OutDirLockedError as exc:
+        err_res = _analysis_error_result(
+            fn_name,
+            c_file,
+            OUT_DIR_LOCKED_REASON,
+            None,
+            scan_wp_log_soundness(""),
+            str(exc),
+        )
+        err_res["error_summary"] = [str(exc)]
+        err_res["lock_owner"] = exc.owner
+        err_res["sizing"] = {
+            "wp_par": resolve_wp_par(wp_par),
+            "wp_memlimit_mb": WP_MEMLIMIT_MB,
+            "wall_timeout_s": wall_timeout,
+            "wp_cache_dir": None,
+        }
+        return err_res
+
+
+def _run_wp_on_function_locked(call_args: dict[str, Any]) -> dict:
+    c_file: Path = call_args["c_file"]
+    fn_name: str = call_args["fn_name"]
+    out_dir: Path = call_args["out_dir"]
+    machdep: str = call_args["machdep"]
+    cppflags: str = call_args["cppflags"]
+    provers: str = call_args["provers"]
+    wp_par: int | str = call_args["wp_par"]
+    timeout: int = call_args["timeout"]
+    wp_steps: int = call_args["wp_steps"]
+    wp_model: str = call_args["wp_model"]
+    check_memory_model: bool = call_args["check_memory_model"]
+    warn_invalid_pointer: bool = call_args["warn_invalid_pointer"]
+    unsigned_reduced: bool = call_args["unsigned_reduced"]
+    warn_unsigned_downcast: bool = call_args["warn_unsigned_downcast"]
+    retry_bitwise: bool = call_args["retry_bitwise"]
+    retry_tail: bool = call_args["retry_tail"]
+    smoke_tests: bool = call_args["smoke_tests"]
+    counter_examples: bool = call_args["counter_examples"]
+    prop: str | None = call_args["prop"]
+    dump_goal: bool = call_args["dump_goal"]
+    session_dir: Path | None = call_args["session_dir"]
+    extra_sources: list[str] | None = call_args["extra_sources"]
+    wall_timeout: int | None = call_args["wall_timeout"]
+    artifact_suffix: str = call_args["artifact_suffix"]
+    cache_dir: str | Path | None = call_args["cache_dir"]
+    sarif: bool = call_args["sarif"]
+    keep_goals: bool = call_args["keep_goals"]
+    wp_blockers: list[str] | None = call_args["wp_blockers"]
+    ignore_prover_budget: bool = call_args["ignore_prover_budget"]
+    retry_cast_probe: bool = call_args["retry_cast_probe"]
+    security_meta: dict | None = call_args["security_meta"]
+    retry_bytes: bool = call_args["retry_bytes"]
+    warn_signed_downcast: bool = call_args["warn_signed_downcast"]
     if counter_examples and not artifact_suffix.endswith(_MODEL_PASS_SUFFIX):
         return _prove_then_collect_models(call_args)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2023,6 +3263,12 @@ def run_wp_on_function(
         cmd.append(f"-wp-prop={WP_PROP_EXCLUDE}")
     if dump_goal:
         cmd.extend(["-wp-print", "-wp-no-qed"])
+    else:
+        # Per-prover verdicts for every pending goal (`Prover <Name> <Ver> returns <Verdict>`):
+        # WP's `-wp-report-json` keeps only one merged prover per unproved goal. Omitted with
+        # `--dump-goal` because `-wp-status` hides Valid goals under `-wp-print`, and `-wp-print`
+        # already emits the same per-prover lines.
+        cmd.append("-wp-status")
 
     cmd.extend(["-then-last" if meta_stage else "-then", "-report", "-report-csv", str(csv_path)])
     if sarif:
@@ -2136,8 +3382,9 @@ def run_wp_on_function(
             soundness["macro_loop_warnings"] = macro_loop_warns
             soundness["ok"] = len(soundness["tier_a_aborts"]) == 0 and len(soundness["tier_b_unsound"]) == 0
     if not csv_path.exists() and not soundness["tier_a_aborts"]:
-        # Killed (OOM, wall-clock limit) or crashed before the report step: nothing was decided,
-        # which must never read as "unproven goals remain" with nothing left to synthesize.
+        # Killed (OOM, wall-clock limit) or crashed before the report step: nothing was decided
+        # into a verified CSV report, which must never read as "unproven goals remain" or "all_proven",
+        # while any incremental VC verdicts already logged are preserved under `partial_verdicts`.
         error_res = _analysis_error_result(
             fn_name,
             c_file,
@@ -2145,6 +3392,7 @@ def run_wp_on_function(
             returncode,
             soundness,
             combined_log,
+            partial_verdicts=parse_partial_wp_log_verdicts(combined_log),
         )
         if unframed_var_callees:
             error_res["unframed_variadic_callees"] = unframed_var_callees
@@ -2273,6 +3521,27 @@ def run_wp_on_function(
         )
         soundness["ok"] = False
 
+    proved_m = _WP_PROVED_GOALS_RE.search(combined_log)
+    timeout_m = _WP_TIMEOUT_COUNT_RE.search(combined_log)
+    vc_proved = int(proved_m.group(1)) if proved_m else 0
+    vc_total = int(proved_m.group(2)) if proved_m else 0
+    vc_timeouts = int(timeout_m.group(1)) if timeout_m else 0
+    goal_costs, slowest_proved, goal_costs_source = collect_goal_costs(goals_json_path, combined_log, fn_name)
+    all_vcs_cleanly_proved = proved_m is not None and vc_total > 0 and vc_proved == vc_total and vc_timeouts == 0
+    has_vc_deficit = vc_timeouts > 0 or (vc_total > 0 and vc_proved < vc_total)
+    _reconcile_unreported_wp_goals(
+        fn_name=fn_name,
+        c_file=c_file,
+        goal_costs=goal_costs,
+        combined_log=combined_log,
+        assumed_fpv=set(soundness["assumed_function_pointer_goals"]),
+        all_vcs_cleanly_proved=all_vcs_cleanly_proved,
+        has_vc_deficit=has_vc_deficit,
+        unproven_goals=unproven_goals,
+        buckets=buckets,
+        by_class=by_class,
+    )
+
     # Workstream 3: Automatic bitwise/shift solver retry with Typed+ref+int and extended timeout
     model_parts = {m.strip().lower() for m in re.split(r"[+,]", wp_model) if m.strip()}
     model_problem = wp_model_problem(wp_model)
@@ -2338,12 +3607,6 @@ def run_wp_on_function(
                 return retry_res
         except Exception:
             pass
-
-    proved_m = _WP_PROVED_GOALS_RE.search(combined_log)
-    timeout_m = _WP_TIMEOUT_COUNT_RE.search(combined_log)
-    vc_proved = int(proved_m.group(1)) if proved_m else 0
-    vc_total = int(proved_m.group(2)) if proved_m else 0
-    vc_timeouts = int(timeout_m.group(1)) if timeout_m else 0
 
     # Automatic focused tail retry when >=90% of VCs are proven (or >=5 proven properties and <=6
     # unproven properties with >=3:1 ratio) and 1..30 VCs timed out on SMT solvers.
@@ -2485,7 +3748,6 @@ def run_wp_on_function(
         next_focus = "complete"
 
     model_goals = parse_model_goals(combined_log) if counter_examples else []
-    goal_costs, slowest_proved, goal_costs_source = collect_goal_costs(goals_json_path, combined_log, fn_name)
 
     res = {
         "status": status,
@@ -2754,7 +4016,8 @@ def run_vacuity_check(
 
 def classify_vacuity_log(log_text: str, returncode: int | None = 0) -> dict:
     doomed = sorted(set(_DOOMED_REQUIRES_RE.findall(log_text)))
-    dead = sorted(set(_DOOMED_DEAD_RE.findall(log_text)))
+    dead_matches = _DOOMED_DEAD_RE.findall(log_text)
+    dead = sorted(set(dead_matches))
     if doomed:
         return {"status": "contradictory", "doomed": doomed, "dead_goals": len(dead)}
     if returncode != 0 or "Smoke Tests" not in log_text:
@@ -2780,8 +4043,14 @@ def classify_vacuity_log(log_text: str, returncode: int | None = 0) -> dict:
             "doomed": [],
             "dead_goals": len(dead),
         }
-    unexplained_fails = (n - k) - len(dead)
-    if (k < n and not dead) or (unexplained_fails > 0):
+    dead_set = set(dead)
+    unknown_doomed = [g for g in _ANY_DOOMED_RE.findall(log_text) if g not in dead_set]
+    # Frama-C 34 WP with P configured provers prints `[Failed] (Doomed) <goal>` once per prover
+    # and counts each report in the `Smoke Tests: k / n` denominator (e.g. 1 dead_code goal under
+    # alt-ergo,z3,cvc5 prints 3 lines and `Smoke Tests: 2 / 5`), so match `n - k` against the raw
+    # recognised dead-goal occurrences while keeping `dead_goals` as the unique goal count.
+    unexplained_fails = (n - k) - len(dead_matches)
+    if unknown_doomed or (k < n and not dead) or (unexplained_fails > 0):
         return {
             "status": "inconclusive",
             "reason": f"smoke test failure ({k}/{n}) without recognised doomed goals",
@@ -3515,109 +4784,139 @@ def main(argv: list[str] | None = None) -> int:
 
     # --prop and --dump-goal are partial runs: they say nothing about the candidate as a whole.
     whole_run = not (args.prop or args.dump_goal)
-    digest_before = prover_candidates.digest_before_run(args.out_json) if whole_run else None
-    security_meta = resolve_security_meta(args.security_props, args.file, args.function, args.out_dir)
-    wp_kwargs: dict[str, Any] = {
-        "c_file": args.file,
-        "fn_name": args.function,
-        "out_dir": args.out_dir,
-        "machdep": args.machdep,
-        "cppflags": args.cppflags,
-        "provers": args.provers,
-        "wp_par": args.wp_par,
-        "timeout": args.timeout,
-        "wp_steps": args.wp_steps,
-        "wp_model": args.wp_model or "Typed",
-        # Only when the caller left the model to us: a chosen model (a parent re-check replaying the
-        # prover's) is the configuration under test.
-        "retry_bytes": args.wp_model is None and not args.no_retry_bytes,
-        "check_memory_model": not args.no_check_memory_model,
-        "warn_invalid_pointer": not args.no_warn_invalid_pointer,
-        "unsigned_reduced": args.no_warn_unsigned,
-        "warn_unsigned_downcast": not args.no_warn_unsigned_downcast,
-        "warn_signed_downcast": not args.waive_signed_downcast,
-        "retry_bitwise": not args.no_retry_bitwise,
-        "retry_tail": not args.no_retry_tail,
-        "smoke_tests": args.smoke_tests,
-        "prop": args.prop,
-        "dump_goal": args.dump_goal,
-        "session_dir": args.session_dir,
-        "extra_sources": args.extra_sources,
-        "wall_timeout": default_wall_timeout(args.wall_timeout),
-        "cache_dir": args.cache_dir,
-        "sarif": args.sarif,
-        "keep_goals": args.keep_goals,
-        "wp_blockers": args.wp_blockers,
-        "ignore_prover_budget": args.ignore_prover_budget,
-        "security_meta": security_meta,
-    }
-    # --counter-examples: the verdict pass first; its report is written before the model pass starts
-    # (below), so a kill during that second full WP run never loses the verdict.
-    res = run_wp_on_function(**wp_kwargs, counter_examples=False)
-    if args.no_warn_unsigned and whole_run:
-        res = check_declared_wraps(
-            res,
-            args.file,
-            args.function,
-            args.out_dir,
-            wrap_lines=args.wrap_lines,
-            wrap_code_lines=args.wrap_code_lines,
-            waive_signed_downcast=args.waive_signed_downcast,
-            machdep=args.machdep,
-            cppflags=args.cppflags,
-            provers=args.provers,
-            wp_par=args.wp_par,
-            timeout=args.timeout,
-            wp_steps=args.wp_steps,
-            wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
-            check_memory_model=not args.no_check_memory_model,
-            warn_invalid_pointer=not args.no_warn_invalid_pointer,
-            session_dir=args.session_dir,
-            extra_sources=args.extra_sources,
-            wall_timeout=default_wall_timeout(args.wall_timeout),
-            cache_dir=args.cache_dir,
-        )
-    vacuity = None
-    # A filtered or goal-dump run is not a whole proof: nothing is credited from it.
-    if res.get("status") == "all_proven" and not args.prop and not args.dump_goal:
-        vacuity = run_vacuity_check(
-            args.file,
-            args.function,
-            args.out_dir,
-            machdep=args.machdep,
-            cppflags=args.cppflags,
-            provers=args.provers,
-            wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
-            wp_par=args.wp_par,
-            extra_sources=args.extra_sources,
-        )
-    apply_verdict_limits(res, args.file, vacuity, cppflags=args.cppflags, machdep=args.machdep)
-    args.out_json.parent.mkdir(parents=True, exist_ok=True)
-    if args.counter_examples:
-        res["counter_examples"] = True
-        res["counter_example_goals"] = []
-        if needs_model_pass(res) and not res.get("budget_exhausted"):
-            res["counter_example_pass"] = {"status": "pending"}
+    try:
+        with _out_dir_lock(args.out_dir, args.function):
+            digest_before = prover_candidates.digest_before_run(args.out_json) if whole_run else None
+            security_meta = resolve_security_meta(args.security_props, args.file, args.function, args.out_dir)
+            wp_kwargs: dict[str, Any] = {
+                "c_file": args.file,
+                "fn_name": args.function,
+                "out_dir": args.out_dir,
+                "machdep": args.machdep,
+                "cppflags": args.cppflags,
+                "provers": args.provers,
+                "wp_par": args.wp_par,
+                "timeout": args.timeout,
+                "wp_steps": args.wp_steps,
+                "wp_model": args.wp_model or "Typed",
+                # Only when the caller left the model to us: a chosen model (a parent re-check replaying the
+                # prover's) is the configuration under test.
+                "retry_bytes": args.wp_model is None and not args.no_retry_bytes,
+                "check_memory_model": not args.no_check_memory_model,
+                "warn_invalid_pointer": not args.no_warn_invalid_pointer,
+                "unsigned_reduced": args.no_warn_unsigned,
+                "warn_unsigned_downcast": not args.no_warn_unsigned_downcast,
+                "warn_signed_downcast": not args.waive_signed_downcast,
+                "retry_bitwise": not args.no_retry_bitwise,
+                "retry_tail": not args.no_retry_tail,
+                "smoke_tests": args.smoke_tests,
+                "prop": args.prop,
+                "dump_goal": args.dump_goal,
+                "session_dir": args.session_dir,
+                "extra_sources": args.extra_sources,
+                "wall_timeout": default_wall_timeout(args.wall_timeout),
+                "cache_dir": args.cache_dir,
+                "sarif": args.sarif,
+                "keep_goals": args.keep_goals,
+                "wp_blockers": args.wp_blockers,
+                "ignore_prover_budget": args.ignore_prover_budget,
+                "security_meta": security_meta,
+            }
+            # --counter-examples: the verdict pass first; its report is written before the model pass starts
+            # (below), so a kill during that second full WP run never loses the verdict.
+            res = run_wp_on_function(**wp_kwargs, counter_examples=False)
+            if args.no_warn_unsigned and whole_run:
+                res = check_declared_wraps(
+                    res,
+                    args.file,
+                    args.function,
+                    args.out_dir,
+                    wrap_lines=args.wrap_lines,
+                    wrap_code_lines=args.wrap_code_lines,
+                    waive_signed_downcast=args.waive_signed_downcast,
+                    machdep=args.machdep,
+                    cppflags=args.cppflags,
+                    provers=args.provers,
+                    wp_par=args.wp_par,
+                    timeout=args.timeout,
+                    wp_steps=args.wp_steps,
+                    wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
+                    check_memory_model=not args.no_check_memory_model,
+                    warn_invalid_pointer=not args.no_warn_invalid_pointer,
+                    session_dir=args.session_dir,
+                    extra_sources=args.extra_sources,
+                    wall_timeout=default_wall_timeout(args.wall_timeout),
+                    cache_dir=args.cache_dir,
+                )
+            vacuity = None
+            # A filtered or goal-dump run is not a whole proof: nothing is credited from it.
+            if res.get("status") == "all_proven" and not args.prop and not args.dump_goal:
+                vacuity = run_vacuity_check(
+                    args.file,
+                    args.function,
+                    args.out_dir,
+                    machdep=args.machdep,
+                    cppflags=args.cppflags,
+                    provers=args.provers,
+                    wp_model=res.get("wp_model") or wp_kwargs["wp_model"],
+                    wp_par=args.wp_par,
+                    extra_sources=args.extra_sources,
+                )
+            apply_verdict_limits(res, args.file, vacuity, cppflags=args.cppflags, machdep=args.machdep)
+            args.out_json.parent.mkdir(parents=True, exist_ok=True)
+            if args.counter_examples:
+                res["counter_examples"] = True
+                res["counter_example_goals"] = []
+                if needs_model_pass(res) and not res.get("budget_exhausted"):
+                    res["counter_example_pass"] = {"status": "pending"}
+                    args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+                res = collect_counter_example_models(res, wp_kwargs)
             args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
-        res = collect_counter_example_models(res, wp_kwargs)
-    args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
-    summary = {
-        "status": res["status"],
-        "function": res["function"],
-        "proven_count": res.get("proven_count", 0),
-        "proven_under_hyp_count": res.get("proven_under_hyp_count", 0),
-        "unproven_count": res.get("unproven_count", 0),
-        "soundness_ok": res.get("soundness", {}).get("ok", False),
-        "next_synthesis_focus": res.get("next_synthesis_focus", "syntax_error"),
-    }
-    if res.get("diagnostic_hints"):
-        summary["diagnostic_hints"] = res["diagnostic_hints"]
-    if res.get("unsigned_wraps"):
-        summary["unsigned_wraps"] = res["unsigned_wraps"]
-    if whole_run and not res.get("budget_exhausted"):
-        prover_candidates.add_candidate_block(summary, args.out_json, "wp", res, digest_before)
-    print(json.dumps(summary, indent=2))
-    return 0
+            summary = {
+                "status": res["status"],
+                "function": res["function"],
+                "proven_count": res.get("proven_count", 0),
+                "proven_under_hyp_count": res.get("proven_under_hyp_count", 0),
+                "unproven_count": res.get("unproven_count", 0),
+                "soundness_ok": res.get("soundness", {}).get("ok", False),
+                "next_synthesis_focus": res.get("next_synthesis_focus", "syntax_error"),
+            }
+            if res.get("diagnostic_hints"):
+                summary["diagnostic_hints"] = res["diagnostic_hints"]
+            if res.get("partial_verdicts"):
+                summary["partial_verdicts"] = res["partial_verdicts"]
+            if res.get("unsigned_wraps"):
+                summary["unsigned_wraps"] = res["unsigned_wraps"]
+            if whole_run and not res.get("budget_exhausted"):
+                prover_candidates.add_candidate_block(summary, args.out_json, "wp", res, digest_before)
+            print(json.dumps(summary, indent=2))
+            return 0
+    except OutDirLockedError as exc:
+        err_res = _analysis_error_result(
+            args.function,
+            args.file,
+            OUT_DIR_LOCKED_REASON,
+            None,
+            scan_wp_log_soundness(""),
+            str(exc),
+        )
+        summary = {
+            "status": err_res["status"],
+            "reason": OUT_DIR_LOCKED_REASON,
+            "function": args.function,
+            "out_dir": str(args.out_dir),
+            "error": str(exc),
+            "lock_owner": exc.owner,
+            "proven_count": 0,
+            "proven_under_hyp_count": 0,
+            "unproven_count": 0,
+            "soundness_ok": False,
+            "next_synthesis_focus": err_res["next_synthesis_focus"],
+            "diagnostic_hints": err_res["diagnostic_hints"],
+        }
+        print(json.dumps(summary, indent=2))
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

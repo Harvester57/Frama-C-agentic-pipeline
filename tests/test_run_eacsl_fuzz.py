@@ -205,3 +205,59 @@ def test_a_harness_that_is_not_a_dispatch_harness_runs_in_fork_mode(tmp_path: Pa
 
     res = R.run_campaign_rounds(Path("bin"), 60, campaign=campaign, rebuild=None, n_cases=0)
     assert res["keep_going"] == {"mode": "fork"} and calls == [True]
+
+
+def test_derive_eacsl_diagnostic_hints_for_stage_killed_and_with_preprocessing():
+    # Stage-1 kill emits a memory/OOM hint and suppresses false unsupported-construct / syntax guesses.
+    killed_suspected = {
+        "status": "compile_error",
+        "reason": "eacsl_stage_killed",
+        "compile": {
+            "returncode": 1,
+            "reason": "eacsl_stage_killed",
+            "killed_suspected": True,
+            "stdout": "[kernel] Parsing adig.c (with preprocessing)\n[e-acsl] beginning translation.\n",
+            "stderr": "++ frama-c -kernel-warn-key annot-error=abort\ne-acsl-gcc: fatal error: aborted by Frama-C\n",
+        },
+    }
+    hints = R.derive_eacsl_diagnostic_hints(killed_suspected)
+    assert any("container memory limit" in h and "docker events" in h and "`oom`" in h for h in hints), hints
+    assert not any("unsupported ACSL construct" in h for h in hints), hints
+    assert not any("ACSL syntax/typing error" in h for h in hints), hints
+
+    # Explicit SIGKILL produces the SIGKILL memory hint.
+    sigkill = {
+        "status": "compile_error",
+        "reason": "eacsl_stage_killed",
+        "compile": {"returncode": 137, "reason": "eacsl_stage_killed", "killed": True, "stdout": "", "stderr": ""},
+    }
+    sig_hints = R.derive_eacsl_diagnostic_hints(sigkill)
+    assert any("SIGKILL" in h and "docker events" in h for h in sig_hints), sig_hints
+    assert not any("unsupported ACSL construct" in h for h in sig_hints), sig_hints
+
+    # Normal Frama-C error mentioning `(with preprocessing)` must NOT falsely guess unsupported ACSL constructs.
+    normal_err = {
+        "status": "compile_error",
+        "reason": "eacsl_instrumentation_failed",
+        "compile": {
+            "returncode": 1,
+            "reason": "eacsl_instrumentation_failed",
+            "stdout": "[kernel] Parsing foo.c (with preprocessing)\n[kernel] User Error: syntax error\n",
+            "stderr": "e-acsl-gcc: fatal error: aborted by Frama-C\n",
+        },
+    }
+    normal_hints = R.derive_eacsl_diagnostic_hints(normal_err)
+    assert any("ACSL syntax/typing error" in h for h in normal_hints), normal_hints
+    assert not any("unsupported ACSL construct" in h for h in normal_hints), normal_hints
+
+    # An actual ACSL functional update `\with` error still triggers the unsupported-construct hint.
+    with_update = {
+        "status": "compile_error",
+        "reason": "eacsl_instrumentation_failed",
+        "compile": {
+            "returncode": 1,
+            "stdout": "[e-acsl] Failure: { s \\with .x = 1 }\n",
+            "stderr": "",
+        },
+    }
+    assert any("unsupported ACSL construct" in h for h in R.derive_eacsl_diagnostic_hints(with_update))

@@ -18,6 +18,7 @@ import fuzz_build
 import run_eacsl_fuzz as R
 import run_eva_slice
 import sandbox_exec
+from test_acsl_ast_conditionals import AFTER, ARMS
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 EACSL_MARKER_BYTES = b"\x7fELF...__e_acsl_assert...eacsl_store_block"
@@ -755,6 +756,60 @@ def test_normalized_source_digest_handles_trailing_attribute_macros(tmp_path):
     d_ret_acsl = cache.normalized_source_digest(hdr, target_functions=["target_fn"])
     assert d_ret_base != d_ret_acsl
     assert cache.normalized_source_digest(hdr, target_functions=["other_fn"]) == d_ret_base
+
+
+@pytest.mark.parametrize("name", sorted(ARMS))
+def test_normalized_source_digest_handles_split_conditional_arms(tmp_path, name):
+    src = tmp_path / f"{name}.c"
+    first_fn = ARMS[name][: ARMS[name].index("(")].split()[-1]
+    base = ARMS[name] + AFTER
+    src.write_text(base, encoding="utf-8")
+    d_last_base = cache.normalized_source_digest(src, target_functions=["last"])
+    d_first_base = cache.normalized_source_digest(src, target_functions=[first_fn])
+
+    # Editing ACSL on `after` (which sits after the split conditional) or on the first function
+    # must not change the L2 digest for `last`, whereas editing ACSL on `last` must change it.
+    unrelated_edit = (
+        "/*@ requires \\true; */\n"
+        + ARMS[name]
+        + AFTER.replace("/*@ assigns \\nothing; */", "/*@ requires \\valid_read(ctx); assigns \\nothing; */").replace(
+            "return ctx->s;", "//@ assert ctx != \\null;\n    return ctx->s;"
+        )
+    )
+    src.write_text(unrelated_edit, encoding="utf-8")
+    assert cache.normalized_source_digest(src, target_functions=["last"]) == d_last_base
+    assert cache.normalized_source_digest(src, target_functions=[first_fn]) != d_first_base
+
+    target_edit = base.replace("int last(void)", "/*@ ensures \\result == 2; */\nint last(void)")
+    src.write_text(target_edit, encoding="utf-8")
+    assert cache.normalized_source_digest(src, target_functions=["last"]) != d_last_base
+    assert cache.normalized_source_digest(src, target_functions=[first_fn]) == d_first_base
+
+
+def test_normalized_source_digest_handles_split_parameters_and_balanced_conditionals(tmp_path):
+    src = tmp_path / "split_params.c"
+    split = "int f(int a,\n#ifdef A\n      int b)\n#else\n      long b)\n#endif\n{\n    return a;\n}\n" + AFTER
+    src.write_text(split, encoding="utf-8")
+    d_f_base = cache.normalized_source_digest(src, target_functions=["f"])
+    d_last_base = cache.normalized_source_digest(src, target_functions=["last"])
+
+    src.write_text("/*@ requires a >= 0; */\n" + split, encoding="utf-8")
+    assert cache.normalized_source_digest(src, target_functions=["f"]) != d_f_base
+    assert cache.normalized_source_digest(src, target_functions=["last"]) == d_last_base
+
+    balanced = "#ifdef A\nint win(void) { return 1; }\n#else\nint posix(void) { return 2; }\n#endif\n" + AFTER
+    src.write_text(balanced, encoding="utf-8")
+    d_posix_base = cache.normalized_source_digest(src, target_functions=["posix"])
+    src.write_text(
+        balanced.replace("int win(void)", "/*@ ensures \\result == 1; */\nint win(void)"),
+        encoding="utf-8",
+    )
+    assert cache.normalized_source_digest(src, target_functions=["posix"]) == d_posix_base
+    src.write_text(
+        balanced.replace("int posix(void)", "/*@ ensures \\result == 2; */\nint posix(void)"),
+        encoding="utf-8",
+    )
+    assert cache.normalized_source_digest(src, target_functions=["posix"]) != d_posix_base
 
 
 def test_guardrail_verdict_cache_hits_and_invalidates_on_corpus_change(run, monkeypatch):

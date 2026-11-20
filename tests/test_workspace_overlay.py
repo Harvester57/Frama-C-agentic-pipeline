@@ -39,7 +39,7 @@ def test_parent_reverify_scoped_by_function_and_unique_binary(tmp_path, monkeypa
 
     captured_cmds: list[list[str]] = []
 
-    def fake_subprocess_run(cmd, cwd=None, capture_output=None, text=None, encoding=None, errors=None):
+    def fake_subprocess_run(cmd, cwd=None, capture_output=None, text=None, encoding=None, errors=None, timeout=None):
         captured_cmds.append(list(cmd))
         out_json_idx = cmd.index("--out-json") + 1
         json_path = Path(cmd[out_json_idx])
@@ -182,7 +182,7 @@ def test_parent_reverify_allow_partial_wp(tmp_path, monkeypatch):
         "unproven_by_bucket": {"step_a_assigns": [], "step_b_loop_invariant": [{"line": 5}]},
     }
 
-    def fake_run(cmd, cwd=None, capture_output=None, text=None, encoding=None, errors=None):
+    def fake_run(cmd, cwd=None, capture_output=None, text=None, encoding=None, errors=None, timeout=None):
         json_path = Path(cmd[cmd.index("--out-json") + 1])
         json_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.write_text(json.dumps(partial_report), encoding="utf-8")
@@ -538,13 +538,18 @@ def test_parent_reverify_uses_only_the_answerable_harness_sources(tmp_path, monk
         encoding="utf-8",
     )
     (overlay / "reports" / "callgraph_dag.json").write_text(
-        json.dumps({"modules": {"libp_a": {"functions": ["parse"]}}, "functions": {"parse": {"name": "parse", "file": "p.c", "module": "libp_a"}}}),
+        json.dumps(
+            {
+                "modules": {"libp_a": {"functions": ["parse"]}},
+                "functions": {"parse": {"name": "parse", "file": "p.c", "module": "libp_a"}},
+            }
+        ),
         encoding="utf-8",
     )
 
     seen: list[list[str]] = []
 
-    def fake_run(cmd, cwd=None, capture_output=None, text=None, encoding=None, errors=None):
+    def fake_run(cmd, cwd=None, capture_output=None, text=None, encoding=None, errors=None, timeout=None):
         seen.append(list(cmd))
         out = Path(cmd[cmd.index("--out-json") + 1])
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1215,3 +1220,480 @@ def test_prepare_agent_cli_reads_the_evidence_files(tmp_path, capsys):
     assert "line 88, precondition" in brief and "Agent `a-3` ran 4 iterations" in brief
     # A history file that is not an object is refused.
     assert WO.main([*base, "--callee-history-json", str(ev)]) != 0
+
+
+def test_prepare_agent_renders_budget_section_for_core_provable_and_blockers(tmp_path):
+    target = tmp_path / "target"
+    src = target / "src"
+    src.mkdir(parents=True)
+    (src / "m.c").write_text("int core_fn(int x) { return x; }\nint shell_fn(int x) { return x; }\n", encoding="utf-8")
+    (src / "m.h").write_text("int core_fn(int x);\nint shell_fn(int x);\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    WO.init_overlay(target, run_dir / "workspace")
+    (run_dir / "run-metadata.json").write_text(json.dumps({"profile": "standard"}), encoding="utf-8")
+    reports = run_dir / "workspace" / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / "callgraph_dag.json").write_text(
+        json.dumps(
+            {
+                "functions": {
+                    "src/m.c#core_fn": {
+                        "name": "core_fn",
+                        "file": "src/m.c",
+                        "module": "m",
+                        "verifiability": "core_provable",
+                        "wp_blockers": [],
+                        "wp_notes": [],
+                    },
+                    "src/m.c#shell_fn": {
+                        "name": "shell_fn",
+                        "file": "src/m.c",
+                        "module": "m",
+                        "verifiability": "shell_unverifiable_wp",
+                        "wp_blockers": ["dynamic_allocation"],
+                        "wp_notes": ["uses malloc"],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    core_prep = WO.prepare_agent(
+        run_dir=run_dir, agent_id="prove-core_fn", role="prover", c_file="src/m.c", function="core_fn"
+    )
+    core_brief = (run_dir / core_prep["brief_file"]).read_text(encoding="utf-8")
+    assert "## WP Verifiability & Iteration Budget" in core_brief
+    assert "- **Static WP Verifiability Classification:** `core_provable`" in core_brief
+    assert "Detected WP Blockers" not in core_brief
+    assert "Detected WP Notes" not in core_brief
+    assert "Fast-Fail Rule" not in core_brief
+    assert "at most `6` `run_wp_function.py` invocations and `900s` wall-clock" in core_brief
+    assert "queued for a WP lease in the host resource broker does not count." in core_brief
+
+    shell_prep = WO.prepare_agent(
+        run_dir=run_dir, agent_id="prove-shell_fn", role="prover", c_file="src/m.c", function="shell_fn"
+    )
+    shell_brief = (run_dir / shell_prep["brief_file"]).read_text(encoding="utf-8")
+    assert "## WP Verifiability & Iteration Budget" in shell_brief
+    assert "- **Static WP Verifiability Classification:** `shell_unverifiable_wp`" in shell_brief
+    assert '- **Detected WP Blockers:** `["dynamic_allocation"]`' in shell_brief
+    assert '- **Detected WP Notes:** `["uses malloc"]`' in shell_brief
+    assert "at most `4` `run_wp_function.py` invocations and `300s` wall-clock" in shell_brief
+    assert "Fast-Fail Rule for `shell_fn`" in shell_brief
+
+    for other in (
+        WO.prepare_agent(run_dir=run_dir, agent_id="arch-m", role="architect", module="m", header_file="src/m.h"),
+        WO.prepare_agent(
+            run_dir=run_dir, agent_id="breaker-core_fn", role="breaker", c_file="src/m.c", function="core_fn"
+        ),
+    ):
+        assert "## WP Verifiability & Iteration Budget" not in (run_dir / other["brief_file"]).read_text(
+            encoding="utf-8"
+        )
+
+
+def test_prepare_agent_cli_rejected_result_preserves_section_and_validates_input(tmp_path, capsys):
+    run_dir = _negotiate_run(tmp_path)
+    rejected = {
+        "agent_id": "prove-parse_hdr",
+        "errors": ["$.strengthening_requests[0].caller_function: unexpected property"],
+    }
+    rej_file = tmp_path / "rejected.json"
+    rej_file.write_text(json.dumps(rejected), encoding="utf-8")
+    base = [
+        "prepare-agent",
+        "--run-dir",
+        str(run_dir),
+        "--agent-id",
+        "prove-parse_hdr-2",
+        "--role",
+        "prover",
+        "--function",
+        "parse_hdr",
+        "--file",
+        "src/hdr.c",
+    ]
+
+    # File path, @file, --rejected-result-json alias, and inline JSON object all render identically.
+    rendered_briefs: list[str] = []
+    for extra in (
+        ["--rejected-result", str(rej_file)],
+        ["--rejected-result", f"@{rej_file}"],
+        ["--rejected-result-json", str(rej_file)],
+        ["--rejected-result", json.dumps(rejected)],
+    ):
+        assert WO.main([*base, *extra]) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is True
+        brief = (run_dir / out["brief_file"]).read_text(encoding="utf-8")
+        assert "## Previous Attempt: Result Rejected" in brief
+        assert "Agent `prove-parse_hdr`" in brief
+        assert "$.strengthening_requests[0].caller_function: unexpected property" in brief
+        assert "agents/prove-parse_hdr-2/" in brief
+        rendered_briefs.append(brief)
+    assert len(set(rendered_briefs)) == 1
+
+    # Invalid inputs fail cleanly with ok=False and a clear error message.
+    list_file = tmp_path / "list.json"
+    list_file.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+    bad_json_file = tmp_path / "bad.json"
+    bad_json_file.write_text("{not valid", encoding="utf-8")
+    bad_cases = [
+        ("[1, 2]", "expected a JSON object"),
+        ("123", "expected a JSON object"),
+        ("null", "expected a JSON object"),
+        ("{broken", "invalid JSON"),
+        ("", "empty value"),
+        ("@", "missing file path"),
+        (str(list_file), "expected a JSON object"),
+        (str(bad_json_file), "malformed JSON"),
+        (str(tmp_path / "does_not_exist.json"), "missing artifact"),
+        (f"@{tmp_path / 'does_not_exist.json'}", "missing artifact"),
+        (json.dumps({"agent_id": "prove-parse_hdr", "errors": "not-a-list"}), "'errors' must be a JSON list"),
+    ]
+    for raw, needle in bad_cases:
+        assert WO.main([*base, "--rejected-result", raw]) == 1, raw
+        out = json.loads(capsys.readouterr().out)
+        assert out["ok"] is False and needle in out["error"], (raw, out)
+
+
+# ---------------------------------------------------------------------------
+# Parent WP re-check wall timeout and TimeoutExpired handling (Task 4)
+# ---------------------------------------------------------------------------
+
+
+def test_parent_wp_wall_timeout_env_parsing(monkeypatch):
+    monkeypatch.delenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, raising=False)
+    assert WO.parent_wp_wall_timeout() == WO.DEFAULT_PARENT_WP_WALL_TIMEOUT_S
+    assert WO.parent_wp_wall_timeout(120) == 120
+    assert WO.parent_wp_wall_timeout(0) is None
+
+    monkeypatch.setenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, "240")
+    assert WO.parent_wp_wall_timeout() == 240
+    for disabled in ("0", "off", "OFF", "false", "none", "disabled", "-5"):
+        monkeypatch.setenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, disabled)
+        assert WO.parent_wp_wall_timeout() is None, disabled
+    monkeypatch.setenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, "not-a-number")
+    assert WO.parent_wp_wall_timeout() == WO.DEFAULT_PARENT_WP_WALL_TIMEOUT_S
+
+
+def test_parent_reverify_passes_wall_timeout_and_subprocess_backstop(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    overlay_dir = tmp_path / "overlay"
+    work_dir = overlay_dir / "work"
+    work_dir.mkdir(parents=True)
+    (work_dir / "parser.c").write_text("int helper(int x) { return x; }\n", encoding="utf-8")
+
+    seen: list[tuple[list[str], int | None]] = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append((list(cmd), kwargs.get("timeout")))
+        json_path = Path(cmd[cmd.index("--out-json") + 1])
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps({"status": "all_proven"}), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(WO.subprocess, "run", fake_run)
+
+    # Default 600s wall timeout + 60s subprocess grace backstop
+    monkeypatch.delenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, raising=False)
+    ok, _ = WO._run_parent_reverify(
+        run_dir, "prove-helper", "prover", overlay_dir, "parser.c", "helper", None, None, "-I."
+    )
+    assert ok is True
+    cmd, timeout = seen[-1]
+    assert cmd[cmd.index("--wall-timeout") + 1] == str(WO.DEFAULT_PARENT_WP_WALL_TIMEOUT_S)
+    assert timeout == WO.DEFAULT_PARENT_WP_WALL_TIMEOUT_S + WO.PARENT_WP_SUBPROCESS_GRACE_S
+
+    # Custom env value
+    monkeypatch.setenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, "180")
+    ok, _ = WO._run_parent_reverify(
+        run_dir, "prove-helper", "prover", overlay_dir, "parser.c", "helper", None, None, "-I."
+    )
+    assert ok is True
+    cmd, timeout = seen[-1]
+    assert cmd[cmd.index("--wall-timeout") + 1] == "180"
+    assert timeout == 180 + WO.PARENT_WP_SUBPROCESS_GRACE_S
+
+    # Disabled via FRAMAC_PARENT_WP_WALL_TIMEOUT=off
+    monkeypatch.setenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, "off")
+    ok, _ = WO._run_parent_reverify(
+        run_dir, "prove-helper", "prover", overlay_dir, "parser.c", "helper", None, None, "-I."
+    )
+    assert ok is True
+    cmd, timeout = seen[-1]
+    assert cmd[cmd.index("--wall-timeout") + 1] == "0"
+    assert timeout is None
+
+
+def test_parent_reverify_handles_wp_timeout_expired_cleanly(tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    target.mkdir()
+    base_c = "int helper(int x) { return x; }\n"
+    (target / "parser.c").write_text(base_c, encoding="utf-8")
+    run_dir = (tmp_path / "run").resolve()
+    overlay = run_dir / "workspace"
+    WO.init_overlay(target, overlay)
+    WO.init_agent_overlay(run_dir, "prove-helper", overlay)
+    agent_c = "/*@ assigns \\nothing; ensures \\result == x; */\n" + base_c
+    (run_dir / "agents" / "prove-helper" / "scratch" / "work" / "parser.c").write_text(agent_c, encoding="utf-8")
+
+    monkeypatch.setenv(WO.PARENT_WP_WALL_TIMEOUT_ENV, "45")
+
+    def fake_timeout(cmd, **kwargs):
+        # Simulate a partial report written before a later pass (e.g., CEX) hung past the backstop.
+        out = Path(cmd[cmd.index("--out-json") + 1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"status": "all_proven"}), encoding="utf-8")
+        raise subprocess.TimeoutExpired(cmd, float(kwargs.get("timeout") or 0))
+
+    monkeypatch.setattr(WO.subprocess, "run", fake_timeout)
+
+    res = WO.merge_agent_overlay(
+        run_dir=run_dir,
+        agent_id="prove-helper",
+        role="prover",
+        overlay_dir=overlay,
+        c_file="parser.c",
+        function="helper",
+        cppflags="-I.",
+        allow_partial_wp=True,
+    )
+    assert res["ok"] is False and res["rolled_back"] is True
+    assert "parent WP re-check timed out after 105s" in res["reason"]
+    assert "wall limit 45s" in res["reason"]
+    # Shared work tree is rolled back and partial WP report was cleaned up.
+    assert (overlay / "work" / "parser.c").read_text(encoding="utf-8") == base_c
+    assert not (run_dir / "agents" / "prove-helper" / "scratch" / "parent_wp" / "helper.json").exists()
+
+
+@pytest.mark.unit
+def test_scale_prover_wall_budget_s_thresholds_scaling_and_caps() -> None:
+    # Small and threshold-boundary functions stay unchanged across all profiles.
+    assert WO.scale_prover_wall_budget_s(900, profile="standard") == (900, None)
+    assert WO.scale_prover_wall_budget_s(
+        900, profile="standard", total_goals=40, vc_total=80, eva_unknowns=25, loop_count=2, loc=150
+    ) == (900, None)
+    assert WO.scale_prover_wall_budget_s(600, profile="quick", total_goals=20, vc_total=40) == (600, None)
+    assert WO.scale_prover_wall_budget_s(1800, profile="deep", total_goals=20, vc_total=40) == (1800, None)
+
+    # Large WP goal/VC function (_modbus_receive_msg shape: 116 goals, 316 VCs -> 900 + 1180 = 2080s).
+    scaled, reason = WO.scale_prover_wall_budget_s(900, profile="standard", total_goals=116, vc_total=316)
+    assert scaled == 2080
+    assert reason is not None and "900s" in reason and "116 WP goals" in reason and "316 VCs" in reason
+
+    # Profile caps: standard 2400s, deep 3600s, quick 600s (never below base_s).
+    std_cap, std_reason = WO.scale_prover_wall_budget_s(900, profile="standard", total_goals=300, vc_total=700)
+    assert std_cap == 2400 and std_reason is not None and "2400s cap" in std_reason
+
+    deep_cap, deep_reason = WO.scale_prover_wall_budget_s(1800, profile="deep", total_goals=400, vc_total=900)
+    assert deep_cap == 3600 and deep_reason is not None and "3600s cap" in deep_reason
+
+    assert WO.scale_prover_wall_budget_s(600, profile="quick", total_goals=200, vc_total=500) == (600, None)
+    q_scaled, q_reason = WO.scale_prover_wall_budget_s(300, profile="quick", total_goals=100)
+    assert q_scaled == 600 and q_reason is not None
+    assert WO.scale_prover_wall_budget_s(4000, profile="standard", total_goals=300) == (4000, None)
+
+    # Fallback signal when no WP report exists yet (Eva unknowns, LOC, loop count).
+    fb_scaled, fb_reason = WO.scale_prover_wall_budget_s(
+        900, profile="standard", eva_unknowns=45, loop_count=3, loc=200
+    )
+    assert fb_scaled == 900 + (45 - 25) * 15 + (200 - 150) * 3 + (3 - 2) * 120
+    assert (
+        fb_reason is not None and "45 Eva unknowns" in fb_reason and "200 LOC" in fb_reason and "3 loops" in fb_reason
+    )
+
+    # When WP report counts are present and small, they take precedence over coarse LOC/loop fallbacks.
+    assert WO.scale_prover_wall_budget_s(
+        900, profile="standard", total_goals=12, vc_total=20, eva_unknowns=60, loop_count=5, loc=400
+    ) == (900, None)
+
+
+@pytest.mark.unit
+def test_prepare_agent_scales_prover_budget_from_wp_eva_facts_and_respects_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    src = target / "src"
+    src.mkdir(parents=True)
+    (src / "m.c").write_text(
+        "int big_fn(int x) { return x; }\nint shell_big(int x) { return x; }\nint fallback_fn(int x) { return x; }\n",
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    overlay = run_dir / "workspace"
+    WO.init_overlay(target, overlay)
+    (run_dir / "run-metadata.json").write_text(json.dumps({"profile": "standard"}), encoding="utf-8")
+    reports = overlay / "reports"
+    (reports / "wp").mkdir(parents=True, exist_ok=True)
+    (reports / "facts").mkdir(parents=True, exist_ok=True)
+    (reports / "callgraph_dag.json").write_text(
+        json.dumps(
+            {
+                "functions": {
+                    "src/m.c#big_fn": {
+                        "name": "big_fn",
+                        "file": "src/m.c",
+                        "module": "m",
+                        "verifiability": "core_provable",
+                    },
+                    "src/m.c#shell_big": {
+                        "name": "shell_big",
+                        "file": "src/m.c",
+                        "module": "m",
+                        "verifiability": "shell_unverifiable_wp",
+                        "wp_blockers": ["dynamic_allocation"],
+                        "loc": 500,
+                        "loop_count": 6,
+                    },
+                    "src/m.c#fallback_fn": {
+                        "name": "fallback_fn",
+                        "file": "src/m.c",
+                        "module": "m",
+                        "verifiability": "core_provable",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (reports / "wp" / "big_fn.json").write_text(
+        json.dumps(
+            {
+                "function": "big_fn",
+                "file": "workspace/work/src/m.c",
+                "status": "unproven_goals_remain",
+                "total_goals": 116,
+                "wp_vc_stats": {"proved": 190, "total": 316, "timeouts": 126},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (reports / "facts" / "m.json").write_text(
+        json.dumps(
+            {
+                "schema": 4,
+                "module": "m",
+                "functions": {
+                    "src/m.c#fallback_fn": {
+                        "name": "fallback_fn",
+                        "file": "src/m.c",
+                        "code_lines": list(range(1, 221)),
+                        "loops": [
+                            {"index": 0, "line": 10},
+                            {"index": 1, "line": 20},
+                            {"index": 2, "line": 30},
+                        ],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("FRAMAC_PROVER_WALL_BUDGET_S", raising=False)
+
+    # 1. Large WP report scales budget and renders Budget Scaling in brief.
+    big_prep = WO.prepare_agent(
+        run_dir=run_dir, agent_id="prove-big_fn", role="prover", module="m", c_file="src/m.c", function="big_fn"
+    )
+    big_budget = json.loads(
+        (run_dir / "agents" / "prove-big_fn" / "scratch" / ".prover_budget.json").read_text(encoding="utf-8")
+    )
+    assert big_budget["budget_base_s"] == 900
+    assert big_budget["max_wall_clock_s"] == 2080
+    assert "116 WP goals" in big_budget["budget_scaling_reason"]
+    big_brief = (run_dir / big_prep["brief_file"]).read_text(encoding="utf-8")
+    assert "`2080s` wall-clock" in big_brief
+    assert "- **Budget Scaling:** scaled from 900s for large function (116 WP goals, 316 VCs)." in big_brief
+
+    # 2. Explicit FRAMAC_PROVER_WALL_BUDGET_S override is never overridden or scaled.
+    monkeypatch.setenv("FRAMAC_PROVER_WALL_BUDGET_S", "750")
+    WO.prepare_agent(
+        run_dir=run_dir, agent_id="prove-big_fn-env", role="prover", module="m", c_file="src/m.c", function="big_fn"
+    )
+    env_budget = json.loads(
+        (run_dir / "agents" / "prove-big_fn-env" / "scratch" / ".prover_budget.json").read_text(encoding="utf-8")
+    )
+    assert env_budget["max_wall_clock_s"] == 750
+    assert env_budget["budget_base_s"] == 750
+    assert "budget_scaling_reason" not in env_budget
+    monkeypatch.delenv("FRAMAC_PROVER_WALL_BUDGET_S", raising=False)
+
+    # 3. shell_unverifiable_wp stays at 300s even with high LOC/loop counts or WP report.
+    (reports / "wp" / "shell_big.json").write_text(
+        json.dumps(
+            {
+                "function": "shell_big",
+                "file": "workspace/work/src/m.c",
+                "total_goals": 200,
+                "wp_vc_stats": {"proved": 0, "total": 500, "timeouts": 500},
+            }
+        ),
+        encoding="utf-8",
+    )
+    WO.prepare_agent(
+        run_dir=run_dir, agent_id="prove-shell_big", role="prover", module="m", c_file="src/m.c", function="shell_big"
+    )
+    shell_budget = json.loads(
+        (run_dir / "agents" / "prove-shell_big" / "scratch" / ".prover_budget.json").read_text(encoding="utf-8")
+    )
+    assert shell_budget["max_wall_clock_s"] == 300
+    assert shell_budget["budget_base_s"] == 300
+    assert "budget_scaling_reason" not in shell_budget
+
+    # 4. Fallback uses passed eva_unknown_obligations + function_facts without WP report.
+    eva_unknowns = [{"function": "fallback_fn", "line": i} for i in range(40)]
+    fb_prep = WO.prepare_agent(
+        run_dir=run_dir,
+        agent_id="prove-fallback_fn",
+        role="prover",
+        module="m",
+        c_file="src/m.c",
+        function="fallback_fn",
+        eva_unknown_obligations=eva_unknowns,
+    )
+    fb_budget = json.loads(
+        (run_dir / "agents" / "prove-fallback_fn" / "scratch" / ".prover_budget.json").read_text(encoding="utf-8")
+    )
+    # 900 + (40-25)*15 + (220-150)*3 + (3-2)*120 = 900 + 225 + 210 + 120 = 1455
+    assert fb_budget["max_wall_clock_s"] == 1455
+    assert fb_budget["budget_base_s"] == 900
+    assert "40 Eva unknowns" in fb_budget["budget_scaling_reason"]
+    assert "220 LOC" in fb_budget["budget_scaling_reason"]
+    assert "3 loops" in fb_budget["budget_scaling_reason"]
+    fb_brief = (run_dir / fb_prep["brief_file"]).read_text(encoding="utf-8")
+    assert "`1455s` wall-clock" in fb_brief
+    assert "- **Budget Scaling:**" in fb_brief
+
+    # 5. Earlier killed agent's WP report with partial_verdicts.scheduled_vcs scales a redispatched prover.
+    prev_scratch = run_dir / "agents" / "prove-fallback_fn" / "scratch"
+    (prev_scratch / "wp_fallback_fn.json").write_text(
+        json.dumps(
+            {
+                "status": "analysis_error",
+                "reason": "timeout",
+                "function": "fallback_fn",
+                "file": "agents/prove-fallback_fn/scratch/work/src/m.c",
+                "total_goals": 0,
+                "partial_verdicts": {"incomplete": True, "scheduled_vcs": 316, "completed_vcs": 120},
+            }
+        ),
+        encoding="utf-8",
+    )
+    WO.prepare_agent(
+        run_dir=run_dir,
+        agent_id="prove-fallback_fn-2",
+        role="prover",
+        module="m",
+        c_file="src/m.c",
+        function="fallback_fn",
+        eva_unknown_obligations=[],
+    )
+    redispatch_budget = json.loads(
+        (run_dir / "agents" / "prove-fallback_fn-2" / "scratch" / ".prover_budget.json").read_text(encoding="utf-8")
+    )
+    assert redispatch_budget["max_wall_clock_s"] == 2080
+    assert "316 VCs" in redispatch_budget["budget_scaling_reason"]

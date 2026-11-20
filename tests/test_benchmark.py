@@ -519,6 +519,149 @@ class TestPhase3:
         assert block["tokens"] == {"input": 10, "output": 5, "source": "host"}
         assert block["iterations_host_reported"] == 3
 
+    def test_goals_discover_same_named_static_functions_under_work(self, tmp_path):
+        import workspace_overlay as wo
+
+        run = self.setup_run(tmp_path, {})
+        rep_a = run / "workspace" / wo.baseline_wp_report_rel("src/a/x.c", "helper")
+        rep_b = run / "workspace" / wo.baseline_wp_report_rel("src/b/y.c", "helper")
+        rep_a.parent.mkdir(parents=True, exist_ok=True)
+        rep_a.write_text(
+            json.dumps(
+                {
+                    "status": "all_proven",
+                    "function": "helper",
+                    "file": "workspace/work/src/a/x.c",
+                    "total_goals": 4,
+                    "proven_count": 4,
+                    "proven_under_hyp_count": 0,
+                    "unproven_count": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        rep_b.write_text(
+            json.dumps(
+                {
+                    "status": "analysis_error",
+                    "function": "helper",
+                    "file": "/framac-run/workspace/work/src/b/y.c",
+                    "total_goals": 3,
+                    "proven_count": 1,
+                    "proven_under_hyp_count": 1,
+                    "unproven_count": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        goals = summarize_phase3(run)["goals"]
+        assert goals == {
+            "analysis_errors": 1,
+            "proven_count": 5,
+            "proven_under_hyp_count": 1,
+            "reports": 2,
+            "total_goals": 7,
+            "unproven_count": 1,
+        }
+
+    def test_goals_deduplicate_canonical_over_work_baseline(self, tmp_path):
+        import workspace_overlay as wo
+
+        run = self.setup_run(tmp_path, {})
+        canonical = run / "workspace" / "reports" / "wp" / "foo.json"
+        work_rep = run / "workspace" / wo.baseline_wp_report_rel("src/m/foo.c", "foo")
+        work_rep.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(
+            json.dumps(
+                {
+                    "status": "all_proven",
+                    "function": "foo",
+                    "file": "src/m/foo.c",
+                    "total_goals": 6,
+                    "proven_count": 6,
+                    "proven_under_hyp_count": 0,
+                    "unproven_count": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        work_rep.write_text(
+            json.dumps(
+                {
+                    "status": "analysis_error",
+                    "function": "foo",
+                    "file": "/framac-run/workspace/work/src/m/foo.c",
+                    "total_goals": 6,
+                    "proven_count": 2,
+                    "proven_under_hyp_count": 0,
+                    "unproven_count": 4,
+                }
+            ),
+            encoding="utf-8",
+        )
+        goals = summarize_phase3(run)["goals"]
+        assert goals == {
+            "proven_count": 6,
+            "proven_under_hyp_count": 0,
+            "reports": 1,
+            "total_goals": 6,
+            "unproven_count": 0,
+        }
+
+    def test_goals_ignore_non_report_artifacts_under_work(self, tmp_path):
+        import workspace_overlay as wo
+
+        run = self.setup_run(tmp_path, {})
+        wp_dir = run / "workspace" / "reports" / "wp"
+        wp_work = wp_dir / "work"
+        wp_work.mkdir(parents=True, exist_ok=True)
+        valid = run / "workspace" / wo.baseline_wp_report_rel("src/a/x.c", "helper")
+        valid.write_text(
+            json.dumps(
+                {
+                    "status": "all_proven",
+                    "function": "helper",
+                    "file": "src/a/x.c",
+                    "total_goals": 2,
+                    "proven_count": 2,
+                    "proven_under_hyp_count": 0,
+                    "unproven_count": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (wp_dir / "empty.json").write_text("{}", encoding="utf-8")
+        (wp_work / "src_a_x_c_helper.wp-report-json").write_text(
+            json.dumps({"goals": [{"status": "Valid"}], "total_goals": 99}),
+            encoding="utf-8",
+        )
+        (wp_work / "summary.json").write_text(json.dumps({"total_goals": 50}), encoding="utf-8")
+        (wp_work / "no_file.json").write_text(
+            json.dumps({"status": "all_proven", "function": "other", "total_goals": 10}),
+            encoding="utf-8",
+        )
+        (wp_work / "guardrail.json").write_text(
+            json.dumps(
+                {"mode": "guardrail", "status": "passed_dynamic_oracle", "function": "helper", "file": "src/a/x.c"}
+            ),
+            encoding="utf-8",
+        )
+        (wp_work / "corrupt.json").write_text("{not json", encoding="utf-8")
+        nested = wp_work / "src_a_x_c_helper"
+        nested.mkdir()
+        (nested / "wp_helper.json").write_text(
+            json.dumps({"status": "all_proven", "function": "nested", "file": "src/a/x.c", "total_goals": 20}),
+            encoding="utf-8",
+        )
+        goals = summarize_phase3(run)["goals"]
+        assert goals == {
+            "proven_count": 2,
+            "proven_under_hyp_count": 0,
+            "reports": 1,
+            "total_goals": 2,
+            "unproven_count": 0,
+        }
+
 
 @pytest.mark.unit
 class TestManifest:

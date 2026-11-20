@@ -324,7 +324,12 @@ class Sim:
             if aid in self.merge_fail:
                 failed.append({"ok": False, "rolled_back": True, "agent_id": aid, "reason": self.merge_fail[aid]})
             else:
-                item = {"ok": True, "agent_id": aid, "modified_files": self.modified.get(aid, []), "parent_wp_report": rel}
+                item = {
+                    "ok": True,
+                    "agent_id": aid,
+                    "modified_files": self.modified.get(aid, []),
+                    "parent_wp_report": rel,
+                }
                 if aid in self.refinement:
                     item["contract_refinement"] = self.refinement[aid]
                 merged.append(item)
@@ -2898,7 +2903,10 @@ def splice_scratch(run_dir, current):
     base = SPLICE_BASE + SPLICE_TARGET
     write_text(run_dir / "agents/prove-f/scratch/result.json", json.dumps({"status": "all_proven"}))
     write_text(run_dir / "agents/prove-f/scratch/base/src/m/f.c", base)
-    write_text(run_dir / "agents/prove-f/scratch/work/src/m/f.c", base.replace("int f(void)", "/*@ assigns \\nothing; */\nint f(void)"))
+    write_text(
+        run_dir / "agents/prove-f/scratch/work/src/m/f.c",
+        base.replace("int f(void)", "/*@ assigns \\nothing; */\nint f(void)"),
+    )
     write_text(run_dir / "workspace/work/src/m/f.c", current)
     return {"id": "prove:src/m/f.c#f", "function": "f", "file": "src/m/f.c"}
 
@@ -3104,3 +3112,598 @@ def test_requeue_memory_refused_gives_back_a_retry_a_queued_merge_lost_to_a_refu
     out = S.cmd_requeue_memory_refused()
     assert out["retries_reset"] == ["prove:src/m/a.c#a"]
     assert tasks()["prove:src/m/a.c#a"]["merge"]["analysis_retries"] == 0
+
+
+def test_status_does_not_mutate_ledger_for_quick_off_chain_units(sim):
+    sim.build(
+        {
+            "entry": ("src/m/entry.c", "m", []),
+            "off": ("src/m/off.c", "m", []),
+        },
+        modules={"m": {"candidate_entry_points": ["entry"]}},
+    )
+    S.cmd_init()
+    # Switch profile to quick after init so an off-chain planned unit sits in coverage-ledger.json.
+    write_json(sim.run_dir / "run-metadata.json", {"profile": "quick"})
+    ledger_path = sim.run_dir / "coverage-ledger.json"
+    sched_path = sim.run_dir / "state/wp_schedule.json"
+    ledger_before = ledger_path.read_bytes()
+    sched_before = sched_path.read_bytes()
+
+    st = S.cmd_status()
+
+    assert ledger_path.read_bytes() == ledger_before
+    assert sched_path.read_bytes() == sched_before
+    assert units()["src/m/off.c#off::rte"]["status"] == "planned"
+    assert "prove:src/m/entry.c#entry" in [r["task"] for r in st["ready"]]
+
+
+def test_status_does_not_mutate_ledger_for_shell_unverifiable_wp_units(sim):
+    sim.build({"a_shell": ("src/m/a.c", "m", []), "b": ("src/m/b.c", "m", [])})
+    S.cmd_init()
+    # Mark a_shell as shell_unverifiable_wp in the DAG after init so cmd_status sees a pending task to skip.
+    dag_path = sim.run_dir / "workspace/reports/callgraph_dag.json"
+    dag = load(dag_path)
+    dag["functions"]["a_shell"]["verifiability"] = "shell_unverifiable_wp"
+    dag["functions"]["a_shell"]["wp_blockers"] = ["variadic_function"]
+    write_json(dag_path, dag)
+
+    ledger_path = sim.run_dir / "coverage-ledger.json"
+    ledger_before = ledger_path.read_bytes()
+
+    st = S.cmd_status()
+
+    assert ledger_path.read_bytes() == ledger_before
+    assert units()["src/m/a.c#a_shell::rte"]["status"] == "planned"
+    assert "prove:src/m/a.c#a_shell" not in [r["task"] for r in st["ready"]]
+    assert "prove:src/m/b.c#b" in [r["task"] for r in st["ready"]]
+
+
+def test_status_does_not_mutate_request_store_for_skippable_negotiate_task(sim):
+    sim.build({"f": ("src/m/f.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)
+    sim.prover("prove-f", "f", "src/m/f.c", status="stalled_after_k_retries", requests=[request("g", 1)])
+    S.cmd_complete("prove-f")
+    assert tasks()["negotiate:src/m/g.c#g"]["state"] == "pending"
+
+    # Now g gets an Eva candidate so the pending negotiate task will be skipped on sync.
+    sim.eva_candidate("m", "src/m/g.c", "g")
+    req_path = sim.run_dir / "workspace/reports/strengthen_requests.json"
+    ledger_path = sim.run_dir / "coverage-ledger.json"
+    req_before = req_path.read_bytes()
+    ledger_before = ledger_path.read_bytes()
+
+    st = S.cmd_status()
+
+    assert req_path.read_bytes() == req_before
+    assert ledger_path.read_bytes() == ledger_before
+    assert request_store()[0]["status"] == "pending"
+    assert "negotiate:src/m/g.c#g" not in [r["task"] for r in st["ready"]]
+
+    # A persisting next DOES skip the task and resolve the request on disk.
+    S.cmd_next("auto", prepare=False)
+    assert tasks()["negotiate:src/m/g.c#g"]["state"] == "skipped"
+    assert request_store()[0]["status"] == "rejected_by_callee"
+
+
+def test_status_and_requeue_protect_running_task_with_valid_result_waiting(sim, capsys):
+    sim.build({"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])}, sidecars={"m": {}})
+    fp = sim.eva_candidate("m", "src/m/f.c", "f")
+    S.cmd_init()
+    ver = S.cmd_next("auto", prepare=True)["tasks"][0]
+    aid = ver["agent_id"]
+    res_path = sim.run_dir / f"agents/{aid}/scratch/result.json"
+    L.cmd_scaffold_verifier(fp, "needs_validation", aid, out_path=res_path)
+    raw_before = res_path.read_bytes()
+
+    # status surfaces the waiting valid result without modifying disk.
+    st = S.cmd_status()
+    assert res_path.read_bytes() == raw_before
+    assert st["result_waiting"] == [
+        {
+            "task": f"verify:{fp}",
+            "kind": "verify",
+            "agent_id": aid,
+            "result_file": f"agents/{aid}/scratch/result.json",
+            "action": f"wp_scheduler.py step --complete {aid}",
+        }
+    ]
+
+    # requeue --agent-id and --stale-minutes 0 both refuse to discard the waiting result unless --force is passed.
+    rq_id = S.cmd_requeue(agent_id=aid)
+    assert rq_id["requeued"] == []
+    assert [w["agent_id"] for w in rq_id["result_waiting"]] == [aid]
+    assert tasks()[f"verify:{fp}"]["state"] == "running"
+
+    rq_stale = S.cmd_requeue(stale_minutes=0)
+    assert rq_stale["requeued"] == []
+    assert [w["agent_id"] for w in rq_stale["result_waiting"]] == [aid]
+    assert tasks()[f"verify:{fp}"]["state"] == "running"
+
+    # --force overrides the guard and requeues it.
+    assert S.main(["requeue", "--agent-id", aid, "--force"]) == 0
+    forced = json.loads(capsys.readouterr().out)
+    assert [r["agent_id"] for r in forced["requeued"]] == [aid]
+    assert forced["result_waiting"] == []
+    assert tasks()[f"verify:{fp}"]["state"] == "pending"
+
+    # A malformed or schema-invalid result.json does NOT trigger result_waiting (requeue still proceeds).
+    ver2 = S.cmd_next("auto", prepare=True)["tasks"][0]
+    aid2 = ver2["agent_id"]
+    bad_path = sim.run_dir / f"agents/{aid2}/scratch/result.json"
+    bad_path.write_text("{not valid json", encoding="utf-8")
+    assert S.cmd_status()["result_waiting"] == []
+    rq_bad = S.cmd_requeue(agent_id=aid2)
+    assert [r["agent_id"] for r in rq_bad["requeued"]] == [aid2]
+    assert rq_bad["result_waiting"] == []
+
+
+def test_requeue_stale_minutes_protects_live_agents_younger_than_wall_budget_unless_forced(sim, capsys):
+    sim.build({"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("1", prepare=True)  # prove-f (prepared)
+    sim.clock += 1000  # past default wall_budget_s (900)
+    S.cmd_next("1", prepare=True)  # prove-g (prepared, fresh: age 0 < 900)
+
+    rq = S.cmd_requeue(stale_minutes=0)
+    assert [r["task"] for r in rq["requeued"]] == ["prove:src/m/f.c#f"]
+    assert [s["task"] for s in rq["skipped_active"]] == ["prove:src/m/g.c#g"]
+    assert rq["skipped_active"][0]["agent_id"] == "prove-g"
+    assert rq["skipped_active"][0]["wall_budget_s"] == 900
+    assert "--force" in rq["skipped_active"][0]["reason"]
+    assert tasks()["prove:src/m/g.c#g"]["state"] == "running"
+    assert units()["src/m/g.c#g::rte"]["status"] == "in_progress"
+
+    # --force overrides the live-agent wall_budget_s guard via CLI too.
+    assert S.main(["requeue", "--stale-minutes", "0", "--force"]) == 0
+    forced = json.loads(capsys.readouterr().out)
+    assert [r["task"] for r in forced["requeued"]] == ["prove:src/m/g.c#g"]
+    assert forced["skipped_active"] == []
+    assert tasks()["prove:src/m/g.c#g"]["state"] == "pending"
+    assert units()["src/m/g.c#g::rte"]["status"] == "planned"
+
+
+def test_over_budget_and_status_distinguish_never_prepared_tasks_without_brief(sim):
+    sim.build({"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("1", prepare=True)  # prove-f: agents/prove-f/brief.md exists
+    # Mark prove-f as an active agent (ran WP at least once) so it is not flagged dispatch_lost.
+    write_json(
+        sim.run_dir / "agents/prove-f/scratch/.prover_budget.json",
+        {"wp_invocations": 1, "first_wp_at": "2026-11-20T00:00:00Z", "max_wall_clock_s": 900},
+    )
+    S.cmd_next("1", prepare=False)  # prove-g: no agents/prove-g/brief.md
+    assert (sim.run_dir / "agents/prove-f/brief.md").is_file()
+    assert not (sim.run_dir / "agents/prove-g/brief.md").exists()
+
+    # Even before crossing wall_budget_s, cmd_status surfaces never_prepared cleanly.
+    st_fresh = S.cmd_status()
+    assert st_fresh["never_prepared"] == [
+        {
+            "task": "prove:src/m/g.c#g",
+            "kind": "prove",
+            "agent_id": "prove-g",
+            "age_s": 0.0,
+            "reason": "never prepared (missing brief.md)",
+            "action": "wp_scheduler.py requeue --agent-id prove-g",
+        }
+    ]
+    running_by_id = {r["task"]: r for r in st_fresh["running"]}
+    assert running_by_id["prove:src/m/g.c#g"].get("never_prepared") is True
+    assert "never_prepared" not in running_by_id["prove:src/m/f.c#f"]
+
+    # Once over budget, over_budget_tasks offers ONLY requeue for prove-g (never FINALIZE NOW)
+    # and keeps FINALIZE NOW for the active prepared prove-f.
+    sim.clock += 1000
+    for source in (S.cmd_status(), S.cmd_next("0")):
+        over_by_id = {e["task"]: e for e in source["over_budget_tasks"]}
+        unprep = over_by_id["prove:src/m/g.c#g"]
+        assert unprep["never_prepared"] is True
+        assert unprep["reason"] == "never prepared (missing brief.md)"
+        assert unprep["action"] == "wp_scheduler.py requeue --agent-id prove-g"
+        assert "FINALIZE NOW" not in unprep["action"]
+
+        prep = over_by_id["prove:src/m/f.c#f"]
+        assert "never_prepared" not in prep
+        assert "dispatch_lost" not in prep
+        assert "FINALIZE NOW" in prep["action"]
+
+    # If the prepared over-budget agent writes a valid result.json, over_budget_tasks points to step --complete.
+    sim.prover("prove-f", "f", "src/m/f.c")
+    over_after = {e["task"]: e for e in S.cmd_status()["over_budget_tasks"]}
+    assert over_after["prove:src/m/f.c#f"].get("result_waiting") is True
+    assert over_after["prove:src/m/f.c#f"]["action"] == "wp_scheduler.py step --complete prove-f"
+    assert "FINALIZE NOW" not in over_after["prove:src/m/f.c#f"]["action"]
+
+
+# ---------------------------------------------------------------------------
+# Item 3: requeue --memory-refused partial-merge retry & evidence cleanup
+# ---------------------------------------------------------------------------
+
+
+def _stalled_prover_with_refused_partial_merge(sim, *, modified=None):
+    """Set up a stalled prover whose sound partial contract merge failed with insufficient_memory inside complete."""
+    sim.build({"caller": ("src/m/p.c", "m", ["callee"]), "callee": ("src/m/p.c", "m", [])})
+    S.cmd_init()
+    nxt = S.cmd_next("auto", prepare=True)
+    aid = [t for t in nxt["tasks"] if t["task"] == "prove:src/m/p.c#callee"][0]["agent_id"]
+
+    scratch_c = sim.run_dir / f"agents/{aid}/scratch/work/src/m/p.c"
+    scratch_c.parent.mkdir(parents=True, exist_ok=True)
+    scratch_c.write_text(
+        "/*@ requires x >= 0;\n  @ assigns \\nothing;\n  @ ensures \\result == x;\n  @*/\n"
+        "static int callee(int x) { return x; }\n"
+        "int caller(int x) { return callee(x); }\n",
+        encoding="utf-8",
+    )
+    write_json(sim.run_dir / f"agents/{aid}/scratch/guard_callee.json", {"status": "passed_dynamic_oracle"})
+    report_rel = f"agents/{aid}/scratch/wp_callee.json"
+    write_json(
+        sim.run_dir / report_rel,
+        {
+            "status": "unproven_goals_remain",
+            "function": "callee",
+            "file": f"agents/{aid}/scratch/work/src/m/p.c",
+            "soundness": {"ok": True},
+            "by_obligation_class": {"rte": {"proven": 4, "proven_under_hyp": 0, "unproven": 1}},
+            "unproven_by_bucket": {
+                "step_a_assigns": [],
+                "step_b_loop_invariant": [{"line": 3, "annotation": "p != 0"}],
+                "step_c_rte_obligation": [],
+                "step_c_caller_precondition": [],
+                "step_c_contract_postcondition": [],
+            },
+            "unproven_goals": [{"obligation_class": "rte", "kind": "assert", "line": 3, "annotation": "p != 0"}],
+        },
+    )
+    write_json(
+        sim.run_dir / f"agents/{aid}/scratch/result.json",
+        {
+            "role": "prover",
+            "agent_id": aid,
+            "file": "src/m/p.c",
+            "function": "callee",
+            "status": "stalled_after_k_retries",
+            "patch": None,
+            "evidence": [{"tool_output": report_rel, "result": "unproven_goals_remain"}],
+            "unproven_goals": [{"line": 3, "annotation": "p != 0"}],
+            "strengthening_requests": [],
+            "boundary_assumptions": [],
+            "fault_hypothesis": None,
+        },
+    )
+    sim.merge_fail[aid] = MEMORY_REFUSAL_FAILURE
+    out = S.cmd_complete(aid)
+    assert out["action"] == "blocked"
+    assert out["partial_merge"]["ok"] is False
+    write_json(
+        sim.run_dir / f"agents/{aid}/scratch/parent_wp/callee.json",
+        wp_report("callee", "workspace/work/src/m/p.c", "analysis_error", "insufficient_memory"),
+    )
+    sim.merge_fail.pop(aid, None)
+    if modified is not None:
+        sim.modified[aid] = list(modified)
+    return aid
+
+
+def test_requeue_memory_refused_cleans_memory_refused_wp_evidence_and_preserves_other_evidence(sim):
+    sim.build({"a": ("src/m/a.c", "m", []), "b": ("src/m/b.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    for n in "ab":
+        sim.prover(f"prove-{n}", n, f"src/m/{n}.c")
+        S.cmd_complete(f"prove-{n}")
+    # Also attach a real timeout wp_analysis_error to a's unit BEFORE the memory refusal.
+    to_rel = "agents/prove-a/scratch/parent_wp/a_timeout.json"
+    write_json(sim.run_dir / to_rel, wp_report("a", "workspace/work/src/m/a.c", "analysis_error", "timeout"))
+    S.DEPS.ingest_wp([Path(to_rel)])
+    damage_as_before_the_fix(sim, "prove:src/m/a.c#a")
+    # b suffers a real timeout refusal (must not be touched by requeue --memory-refused).
+    b_rel = "agents/prove-b/scratch/parent_wp/b.json"
+    write_json(sim.run_dir / b_rel, wp_report("b", "workspace/work/src/m/b.c", "analysis_error", "timeout"))
+    S.DEPS.ingest_wp([Path(b_rel)])
+    state = S.load_schedule()
+    S._park_units(state["tasks"]["prove:src/m/b.c#b"], "prove-b", "analysis_error: timeout")
+    S._finish(state, state["tasks"]["prove:src/m/b.c#b"], "blocked", "analysis_error", reason="timeout")
+    S.save_schedule(state)
+
+    a_ev_before = units()["src/m/a.c#a::rte"]["evidence"]
+    assert sorted(e["details"]["reason"] for e in a_ev_before) == ["insufficient_memory", "timeout"]
+
+    out = S.cmd_requeue_memory_refused()
+    assert out["ok"] is True
+    assert out["evidence_cleaned"] == 1
+    a_ev_after = units()["src/m/a.c#a::rte"]["evidence"]
+    assert [e["details"]["reason"] for e in a_ev_after] == ["timeout"]
+    b_ev_after = units()["src/m/b.c#b::rte"]["evidence"]
+    assert [e["details"]["reason"] for e in b_ev_after] == ["timeout"]
+
+    # Second run is idempotent and cleans nothing more.
+    again = S.cmd_requeue_memory_refused()
+    assert again["evidence_cleaned"] == 0 and again["restored"] == []
+
+
+def test_requeue_memory_refused_retries_eligible_partial_merge_and_is_idempotent(sim, monkeypatch):
+    aid = _stalled_prover_with_refused_partial_merge(sim, modified=["src/m/p.c"])
+    sim.arch_merges.clear()
+
+    # In an undersized container, partial merge retry is deferred (not attempted).
+    monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: 1024)
+    deferred = S.cmd_requeue_memory_refused()
+    assert deferred["ok"] is False
+    assert deferred["merge_deferred"]["tasks"] == ["prove:src/m/p.c#callee"]
+    assert deferred["partial_merges_retried"] == []
+    assert deferred["partial_merges_refused"] == ["prove:src/m/p.c#callee"]
+    assert sim.arch_merges == []
+
+    # In a properly sized container, the partial merge is retried and succeeds cleanly.
+    monkeypatch.setattr(S.DEPS, "enforced_memory_mb", lambda: None)
+    retried = S.cmd_requeue_memory_refused()
+    assert retried["ok"] is True
+    assert retried["partial_merges_refused"] == []
+    assert len(retried["partial_merges_retried"]) == 1
+    assert retried["partial_merges_retried"][0]["task"] == "prove:src/m/p.c#callee"
+    assert retried["partial_merges_retried"][0]["agent_id"] == aid
+    assert len(sim.arch_merges) == 1 and sim.arch_merges[0][2].get("allow_partial_wp") is True
+    assert tasks()["prove:src/m/p.c#callee"].get("partial_contract_merged") is True
+
+    # Idempotent: a second call does not re-run the partial merge.
+    sim.arch_merges.clear()
+    again = S.cmd_requeue_memory_refused()
+    assert again["ok"] is True
+    assert again["partial_merges_retried"] == []
+    assert again["partial_merges_refused"] == []
+    assert sim.arch_merges == []
+
+
+def test_requeue_memory_refused_skips_partial_merge_superseded_by_applied_negotiation(sim):
+    _stalled_prover_with_refused_partial_merge(sim, modified=["src/m/p.c"])
+    sim.arch_merges.clear()
+    state = S.load_schedule()
+    callee_task = state["tasks"]["prove:src/m/p.c#callee"]
+    state["tasks"]["negotiate:src/m/p.c#callee"] = {
+        **callee_task,
+        "id": "negotiate:src/m/p.c#callee",
+        "kind": "negotiate",
+        "state": "done",
+        "outcome": "applied",
+        "last_reason": None,
+    }
+    S.save_schedule(state)
+
+    out = S.cmd_requeue_memory_refused()
+    assert out["ok"] is True
+    assert out["partial_merges_retried"] == []
+    assert out["partial_merges_refused"] == []
+    assert [e["task"] for e in out["left"]] == ["prove:src/m/p.c#callee"]
+    assert "negotiate:src/m/p.c#callee" in out["left"][0]["reason"]
+    assert sim.arch_merges == []
+
+
+# ---------------------------------------------------------------------------
+# Item 6: briefs_file, dispatch_lost detection, retroactive self-healing
+# ---------------------------------------------------------------------------
+
+
+def test_next_and_step_prepare_write_last_prepared_briefs_file(sim):
+    sim.build({"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+
+    nxt = S.cmd_next("1", prepare=True)
+    assert nxt["briefs_file"] == "state/last_prepared_briefs.json"
+    briefs_doc = load(sim.run_dir / "state/last_prepared_briefs.json")
+    assert briefs_doc["count"] == 1
+    assert isinstance(briefs_doc["timestamp"], str) and briefs_doc["timestamp"]
+    assert briefs_doc["tasks"] == [
+        {
+            "task": "prove:src/m/f.c#f",
+            "kind": "prove",
+            "agent_id": "prove-f",
+            "brief_file": "agents/prove-f/brief.md",
+        }
+    ]
+
+    step_out = S.cmd_step(slots="auto", prepare=True)
+    assert step_out["briefs_file"] == "state/last_prepared_briefs.json"
+    assert step_out["next"]["briefs_file"] == "state/last_prepared_briefs.json"
+    briefs_doc2 = load(sim.run_dir / "state/last_prepared_briefs.json")
+    assert briefs_doc2["count"] == 1
+    assert [t["agent_id"] for t in briefs_doc2["tasks"]] == ["prove-g"]
+
+    # When a subsequent step --prepare prepares 0 briefs, last_prepared_briefs.json resets to 0 (no stale briefs).
+    step_empty = S.cmd_step(slots="auto", prepare=True)
+    assert step_empty["briefs_file"] == "state/last_prepared_briefs.json"
+    briefs_doc3 = load(sim.run_dir / "state/last_prepared_briefs.json")
+    assert briefs_doc3["count"] == 0 and briefs_doc3["tasks"] == []
+
+
+def test_dispatch_lost_detection_ignores_prepare_files_and_refunds_dispatch_on_requeue(sim):
+    sim.build({"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("2", prepare=True)
+
+    # Populate ONLY the files prepare_agent itself creates inside scratch/ (base, work, context, budget with 0 calls).
+    for aid, fn in (("prove-f", "f"), ("prove-g", "g")):
+        scratch = sim.run_dir / f"agents/{aid}/scratch"
+        for sub in ("base/src/m", "work/src/m", "context"):
+            (scratch / sub).mkdir(parents=True, exist_ok=True)
+        (scratch / f"base/src/m/{fn}.c").write_text(f"int {fn}(void) {{ return 0; }}\n", encoding="utf-8")
+        (scratch / f"work/src/m/{fn}.c").write_text(f"int {fn}(void) {{ return 0; }}\n", encoding="utf-8")
+        (scratch / "context/slice.c").write_text("// slice\n", encoding="utf-8")
+        (sim.run_dir / f"agents/{aid}/artifacts").mkdir(parents=True, exist_ok=True)
+        write_json(
+            scratch / ".prover_budget.json",
+            {"wp_invocations": 0, "first_wp_at": None, "max_wall_clock_s": 900},
+        )
+
+    # Give prove-g real agent activity (1 WP invocation); prove-f stays idle.
+    write_json(
+        sim.run_dir / "agents/prove-g/scratch/.prover_budget.json",
+        {"wp_invocations": 1, "first_wp_at": "2026-11-20T00:00:00Z", "max_wall_clock_s": 900},
+    )
+
+    # Below grace period (599s < 600s): neither task is dispatch_lost.
+    sim.clock += S.DISPATCH_LOST_GRACE_S - 1
+    st_before = S.cmd_status()
+    assert st_before["dispatch_lost"] == []
+    assert st_before["over_budget_tasks"] == []
+
+    # Past grace period (601s >= 600s, still < wall_budget_s=900s): prove-f is dispatch_lost; active prove-g is not.
+    sim.clock += 2
+    st = S.cmd_status()
+    assert [d["task"] for d in st["dispatch_lost"]] == ["prove:src/m/f.c#f"]
+    assert st["dispatch_lost"][0]["brief_file"] == "agents/prove-f/brief.md"
+    assert "requeue --agent-id prove-f" in st["dispatch_lost"][0]["action"]
+    running_by_id = {r["task"]: r for r in st["running"]}
+    assert running_by_id["prove:src/m/f.c#f"].get("dispatch_lost") is True
+    assert "dispatch_lost" not in running_by_id["prove:src/m/g.c#g"]
+
+    over_by_id = {e["task"]: e for e in st["over_budget_tasks"]}
+    assert set(over_by_id) == {"prove:src/m/f.c#f"}
+    assert over_by_id["prove:src/m/f.c#f"]["dispatch_lost"] is True
+    assert "FINALIZE NOW" not in over_by_id["prove:src/m/f.c#f"]["action"]
+
+    # Editing scratch/work/<file> relative to scratch/base/<file> counts as agent activity and clears dispatch_lost.
+    (sim.run_dir / "agents/prove-f/scratch/work/src/m/f.c").write_text(
+        "/*@ assigns \\nothing; */\nint f(void) { return 0; }\n", encoding="utf-8"
+    )
+    assert S.cmd_status()["dispatch_lost"] == []
+    # Revert work file so prove-f is idle again and test requeue --stale-minutes (below wall_budget_s=900s!).
+    (sim.run_dir / "agents/prove-f/scratch/work/src/m/f.c").write_text("int f(void) { return 0; }\n", encoding="utf-8")
+
+    rq_stale = S.cmd_requeue(stale_minutes=10)
+    # dispatch_lost prove-f is requeued and refunded; active prove-g (< 900s) is protected in skipped_active.
+    assert [r["task"] for r in rq_stale["requeued"]] == ["prove:src/m/f.c#f"]
+    assert rq_stale["requeued"][0]["dispatch_lost"] is True
+    assert rq_stale["requeued"][0]["dispatch_refunded"] is True
+    assert [s["task"] for s in rq_stale["skipped_active"]] == ["prove:src/m/g.c#g"]
+    assert tasks()["prove:src/m/f.c#f"]["dispatches"] == 0
+    assert units()["src/m/f.c#f::rte"]["status"] == "planned"
+
+    # Requeuing active prove-g explicitly does NOT refund its dispatch.
+    rq_active = S.cmd_requeue(agent_id="prove-g")
+    assert [r["task"] for r in rq_active["requeued"]] == ["prove:src/m/g.c#g"]
+    assert "dispatch_lost" not in rq_active["requeued"][0]
+    assert tasks()["prove:src/m/g.c#g"]["dispatches"] == 1
+
+
+def test_next_and_step_prepare_retroactively_heal_unprepared_running_tasks(sim, monkeypatch):
+    sim.build({"f": ("src/m/f.c", "m", []), "g": ("src/m/g.c", "m", [])})
+    monkeypatch.setattr(S.DEPS, "recommend", lambda max_agents=None: {"max_agents": 2})
+    S.cmd_init()
+
+    # Step without --prepare strands both slots as running without brief.md (available becomes 0).
+    no_prep = S.cmd_next("auto", prepare=False)
+    assert sorted(t["agent_id"] for t in no_prep["tasks"]) == ["prove-f", "prove-g"]
+    assert not (sim.run_dir / "agents/prove-f/brief.md").exists()
+    assert not (sim.run_dir / "agents/prove-g/brief.md").exists()
+    assert units()["src/m/f.c#f::rte"]["status"] == "planned"
+    assert len(S.cmd_status()["never_prepared"]) == 2
+
+    # Advance clock past dispatch_lost grace, then run step --prepare: both tasks self-heal even with available=0!
+    sim.clock += 700
+    healed = S.cmd_step(slots="auto", prepare=True)
+    assert healed["ok"] is True
+    assert healed["next"]["slots"]["available"] == 0
+    assert sorted(t["agent_id"] for t in healed["next"]["tasks"]) == ["prove-f", "prove-g"]
+    assert all(t.get("retroactively_prepared") is True for t in healed["next"]["tasks"])
+    assert sorted(healed["next"]["briefs"]) == ["agents/prove-f/brief.md", "agents/prove-g/brief.md"]
+    assert (sim.run_dir / "agents/prove-f/brief.md").is_file()
+    assert (sim.run_dir / "agents/prove-g/brief.md").is_file()
+    assert units()["src/m/f.c#f::rte"]["status"] == "in_progress"
+    assert units()["src/m/g.c#g::rte"]["status"] == "in_progress"
+
+    briefs_doc = load(sim.run_dir / "state/last_prepared_briefs.json")
+    assert briefs_doc["count"] == 2
+    assert sorted(t["agent_id"] for t in briefs_doc["tasks"]) == ["prove-f", "prove-g"]
+
+    # After healing, status shows neither never_prepared nor immediate dispatch_lost (assigned_ts was refreshed).
+    st = S.cmd_status()
+    assert st["never_prepared"] == []
+    assert st["dispatch_lost"] == []
+    assert "over_budget_tasks" not in healed["next"]
+
+
+# ---------------------------------------------------------------------------
+# Item 7: No-op negotiation needed_clause verification
+# ---------------------------------------------------------------------------
+
+
+def _write_work_file(run_dir: Path, rel: str, text: str) -> None:
+    p = run_dir / "workspace" / "work" / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8", newline="\n")
+
+
+def test_missing_needed_clause_matching_semantics():
+    contract = (
+        "/*@ requires \\valid(p) && \\separated(rsp + (0 .. 15), sft);\n"
+        "  @ assigns *p, ctx->x \\from \\nothing;\n"
+        "  @ ensures bound_ok: \\result >= 0 && \\result <= 10;\n"
+        "  @*/"
+    )
+    # Matching clauses (ignoring label, whitespace, outer parens, conjunction split, INCOMPLETE suffix, \separated roots)
+    assert S._missing_needed_clause("ensures R1: (\\result >= 0);", contract) is None
+    assert S._missing_needed_clause("ensures \\result>=0 && \\result<=10", contract) is None
+    assert S._missing_needed_clause("requires \\separated(rsp + (0 .. 7), sft);", contract) is None
+    assert (
+        S._missing_needed_clause(
+            "assigns *p \\from \\nothing; [INCOMPLETE: the function also writes `ctx->y`, ...]", contract
+        )
+        is None
+    )
+    assert S._missing_needed_clause(S.DEFAULT_CONTRACT_CLAUSE, contract) is None
+    assert S._missing_needed_clause("needs tighter return value bound", contract) is None
+    assert S._missing_needed_clause("", contract) is None
+
+    # Clearly missing clauses are flagged
+    assert S._missing_needed_clause("ensures \\result == 42;", contract) is not None
+    assert S._missing_needed_clause("assigns \\nothing;", contract) is not None
+    assert S._missing_needed_clause("assigns *q \\from \\nothing;", contract) is not None
+    assert S._missing_needed_clause("requires \\separated(other, sft);", contract) is not None
+    # Empty contract fails even DEFAULT_CONTRACT_CLAUSE and prose requests
+    assert S._missing_needed_clause(S.DEFAULT_CONTRACT_CLAUSE, "") is not None
+    assert S._missing_needed_clause("needs tighter return value bound", "") is not None
+
+
+def test_noop_negotiation_mixed_requests_applies_present_and_rejects_missing(sim):
+    sim.build({"c1": ("src/m/c1.c", "m", ["g"]), "c2": ("src/m/c2.c", "m", ["g"]), "g": ("src/m/g.c", "m", [])})
+    S.cmd_init()
+    S.cmd_next("auto", prepare=True)
+    sim.finish("prove-g", "g", "src/m/g.c")
+    S.cmd_next("auto", prepare=True)  # prove-c1, prove-c2
+
+    # c1 asks for `ensures R1: n >= 1;` (present in workspace/work/src/m/g.c);
+    # c2 asks for `ensures R2: n >= 2;` (ABSENT from workspace/work/src/m/g.c).
+    sim.prover("prove-c1", "c1", "src/m/c1.c", status="stalled_after_k_retries", requests=[request("g", 1)])
+    S.cmd_complete("prove-c1")
+    sim.prover("prove-c2", "c2", "src/m/c2.c", status="stalled_after_k_retries", requests=[request("g", 2)])
+    S.cmd_complete("prove-c2")
+    neg = [x for x in S.cmd_next("auto", prepare=True)["tasks"] if x["kind"] == "negotiate"][0]
+    assert neg["agent_id"] == "negotiate-g"
+
+    _write_work_file(
+        sim.run_dir,
+        "src/m/g.c",
+        "/*@ assigns \\nothing;\n  @ ensures existing_label: n >= 1;\n  @*/\nint g(int n) { return n; }\n",
+    )
+    sim.prover("negotiate-g", "g", "src/m/g.c")
+    S.cmd_complete("negotiate-g")
+    # Empty modified_files => no-op merge.
+    out = S.cmd_merge_pending(force=True)
+    assert out["merged"][0]["agent_id"] == "negotiate-g"
+
+    reqs = {r["caller_function"]: r for r in request_store()}
+    assert reqs["c1"]["status"] == "verified_and_applied"
+    assert reqs["c2"]["status"] == "rejected_by_callee"
+    assert "no-op merge" in reqs["c2"]["resolution_note"]
+    assert "n >= 2" in reqs["c2"]["resolution_note"]
+
+    # c1 is requeued because its clause IS in the contract; c2 stays blocked because its clause is missing.
+    assert tasks()["prove:src/m/c1.c#c1"]["state"] == "pending"
+    assert tasks()["prove:src/m/c2.c#c2"]["state"] == "blocked"
+    missing_notes = (tasks()["negotiate:src/m/g.c#g"].get("merge_notes") or {}).get("noop_missing_clauses") or []
+    assert [m["request"] for m in missing_notes] == [reqs["c2"]["id"]]

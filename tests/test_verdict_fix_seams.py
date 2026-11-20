@@ -583,23 +583,22 @@ SEAM_WAS_SAME_FRAME = "the same assigns clauses"
 #   merged            the merge stands and the ledger credits the frame
 #   merged_no_frame   the merge stands, the ledger does not credit the frame: both record why
 #   refused_contract  the contract comparison refuses it (an `assigns` clause is gone)
-#   refused_frame     the parent WP report shows no frame and the replaced contract had `assigns`
+#   refused_frame     the parent WP report shows no frame and the replaced contract had a whole-function frame
 #   refused_status    WP did not prove every goal
 #
-# Three of these refusals are of a result that weakened no frame. They are what the gate does today, written
-# down so that a change shows here, not what it should do (open; none occurred in libmodbus run-1):
+# All three non-weakening behavior-frame shapes are accepted:
 #   - guarded_all over a default `assigns`: the result frames every case (complete behaviors, each with a
-#     clause; WP says `present`, the ledger would credit it), the contract comparison still reads the default
-#     behavior's clause as deleted;
+#     clause; WP says `present`, the ledger credits it);
 #   - guarded_some and guarded_gap over the same clauses: the replaced contract had `assigns` in a named
-#     behavior only, so it had no frame either, and the refusal asks to "put back" a clause that never was.
+#     behavior only, so it never framed the whole function either; the merge stands as `merged_no_frame`
+#     with `baseline_had_assigns=False`, and the ledger withholds `l3_frame` credit.
 SEAM_MERGE_CASES = {
     ("pure_ok", SEAM_WAS_NONE): "merged",
     ("pure_ok", SEAM_WAS_DEFAULT): "merged",
     ("on_header", SEAM_WAS_NONE): "merged",
     ("on_header", SEAM_WAS_DEFAULT): "merged",
     ("guarded_all", SEAM_WAS_NONE): "merged",
-    ("guarded_all", SEAM_WAS_DEFAULT): "refused_contract",
+    ("guarded_all", SEAM_WAS_DEFAULT): "merged",
     ("guarded_all", SEAM_WAS_SAME_FRAME): "merged",
     ("post_only", SEAM_WAS_NONE): "merged_no_frame",
     ("post_only", SEAM_WAS_DEFAULT): "refused_contract",
@@ -607,10 +606,10 @@ SEAM_MERGE_CASES = {
     ("on_header_post_only", SEAM_WAS_DEFAULT): "refused_contract",
     ("guarded_some", SEAM_WAS_NONE): "merged_no_frame",
     ("guarded_some", SEAM_WAS_DEFAULT): "refused_contract",
-    ("guarded_some", SEAM_WAS_SAME_FRAME): "refused_frame",
+    ("guarded_some", SEAM_WAS_SAME_FRAME): "merged_no_frame",
     ("guarded_gap", SEAM_WAS_NONE): "merged_no_frame",
     ("guarded_gap", SEAM_WAS_DEFAULT): "refused_contract",
-    ("guarded_gap", SEAM_WAS_SAME_FRAME): "refused_frame",
+    ("guarded_gap", SEAM_WAS_SAME_FRAME): "merged_no_frame",
     ("pure_broken", SEAM_WAS_NONE): "refused_status",
     ("calls_post_only", SEAM_WAS_NONE): "refused_status",
 }
@@ -704,9 +703,19 @@ def test_a_recheck_refuses_nothing_and_the_ledger_still_withholds_the_frame(run_
     assert frame_unit["status"] == "planned" and frame_unit["evidence"][-1]["result"] == "wp_no_frame_clause"
 
 
-def _refused_twice(run_dir: Path, monkeypatch, fn: str, baseline: str, why: str) -> tuple[dict, list[dict]]:
+def _refused_twice(
+    run_dir: Path,
+    monkeypatch,
+    fn: str,
+    baseline: str,
+    why: str,
+    candidate_contract: str | None = None,
+) -> tuple[dict, list[dict]]:
     """Two scheduler rounds whose merge of `fn` is refused for `why`: (the shared tree's texts, the WP reports)."""
     shared, result = _frame_texts(fn, baseline)
+    if candidate_contract is not None:
+        holder = SEAM_HDR_FRAME if fn in SEAM_IN_HEADER else SEAM_SRC_FRAME
+        result = {holder: _contract_swapped(result[holder], fn, candidate_contract)}
     target = run_dir.parent / "target"
     for rel_path, text in shared.items():
         (target / rel_path).parent.mkdir(parents=True, exist_ok=True)
@@ -740,9 +749,14 @@ def test_a_merge_refused_for_its_frame_credits_nothing(run_dir, monkeypatch) -> 
     """
     The refused merge leaves a parent WP report that says `all_proven`, of a contract that was rolled back.
     When the scheduler gives the task up (second refusal), no unit may be covered from that report.
+    Baseline had a whole-function default frame (`SEAM_WAS_DEFAULT`); the candidate passes the syntactic
+    gate with `complete behaviors pos;` while WP's recorded report for `guarded_some` reports `behaviors_only`.
     """
     fn = "guarded_some"
-    shared, reports = _refused_twice(run_dir, monkeypatch, fn, SEAM_WAS_SAME_FRAME, "frame_summary.assigns_clause")
+    candidate = "/*@ behavior pos:\n      assumes x > 0;\n      assigns g;\n      ensures g == x;\n    complete behaviors pos;\n*/"
+    shared, reports = _refused_twice(
+        run_dir, monkeypatch, fn, SEAM_WAS_DEFAULT, "frame_summary.assigns_clause", candidate_contract=candidate
+    )
     assert [r["status"] for r in reports] == ["all_proven", "all_proven"]  # the refusal is the merge's, not WP's
     assert (run_dir / "workspace" / "work" / SEAM_SRC_FRAME).read_text(encoding="utf-8") == shared[SEAM_SRC_FRAME]
     for cls in ("rte", "l3_frame"):

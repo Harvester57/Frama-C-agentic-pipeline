@@ -19,6 +19,7 @@ import checkpoint
 import run_metadata
 from conftest import ANALYSIS_IMAGE, BUILD_IMAGE, PHASE0_FIXTURES, ROOT, require_docker_images
 from framac_common import ArtifactError
+from test_acsl_ast_conditionals import AFTER, ARMS
 from test_sandbox_and_overlay import _engine_run_args, _fake_engine
 
 FIXTURES = ROOT / "tests" / "fixtures" / "build_capture"
@@ -381,6 +382,35 @@ class TestSymbolsAndHeaders:
             "rec_get_version",
             "helper",
         }
+
+    @pytest.mark.parametrize("name", sorted(ARMS))
+    def test_declared_names_finds_functions_after_split_conditional_arms(self, name):
+        source = ARMS[name] + AFTER + "int proto(int a);\n"
+        first_fn = source[: source.index("(")].split()[-1]
+        names = {first_fn, "after", "last", "proto", "select", "call", "other", "connect", "close"}
+        assert bc.declared_names(source, names) == {first_fn, "after", "last", "proto"}
+
+    def test_declared_names_handles_split_params_cplusplus_linkage_and_balanced_conditionals(self):
+        split_params = "int f(int a,\n#ifdef A\n      int b)\n#else\n      long b)\n#endif\n{\n    return inner(a);\n}\nint after(void);\n"
+        assert bc.declared_names(split_params, {"f", "inner", "after"}) == {"f", "after"}
+
+        linkage = (
+            "#ifdef __cplusplus\n"
+            'extern "C" {\n'
+            "#endif\n"
+            "int api(int a);\n"
+            "static inline int wrap(int x) { return helper_call(x); }\n"
+            "#ifdef __cplusplus\n"
+            "}\n"
+            "#endif\n"
+            "int more(void);\n"
+        )
+        assert bc.declared_names(linkage, {"api", "wrap", "helper_call", "more"}) == {"api", "wrap", "more"}
+
+        balanced = (
+            "#ifdef A\nint win(void) { return 1; }\n#else\nint posix(void) { return 2; }\n#endif\nint tail(void);\n"
+        )
+        assert bc.declared_names(balanced, {"win", "posix", "tail"}) == {"win", "posix", "tail"}
 
     def test_headers_outside_source_dirs(self):
         headers = ["include/a.h", "src/internal/b.h", "config.h", "vendor/include/c.h", "src/d.h"]

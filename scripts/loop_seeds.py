@@ -58,7 +58,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import function_facts  # noqa: E402
-from acsl_ast import AcslSyntaxError, locate_function_span, tokenize_c_acsl  # noqa: E402
+from acsl_ast import AcslSyntaxError, iter_clauses, locate_function_span, tokenize_c_acsl  # noqa: E402
 from framac_common import (  # noqa: E402
     STATUS_VALID,
     STATUS_VALID_UNDER_HYP,
@@ -98,8 +98,6 @@ _UNSIGNED_TYPE_RE = re.compile(r"\bunsigned\b|\bsize_t\b|\buint\w*_t\b|\buintptr
 _C_INT_TOKEN_RE = re.compile(r"^(0[xX][0-9a-fA-F]+|\d+)[uUlL]*$")
 _SEED_NAME_RE = re.compile(rf"\b{SEED_PREFIX}(\d+)\b")
 _SEED_CLAUSE_RE = re.compile(rf"loop\s+invariant\s+({SEED_PREFIX}\d+)\s*:")
-_INVARIANT_RE = re.compile(rf"loop\s+invariant\s+(?:{_IDENT}\s*:\s*)*([^;]+);")
-_LOOP_CLAUSE_RE = re.compile(r"\bloop\s+(?:invariant|assigns|variant|allocates|frees)\b")
 _WP_FAIL_RE = re.compile(
     rf"^\[wp\]\s*\[(?:Timeout|Unknown|Failed|Stepout|NoResult)\][^\n]*loop_invariant_({SEED_PREFIX}\d+)_"
     r"(established|preserved)",
@@ -308,7 +306,16 @@ def source_literals(span_text: str, path: str = "<input>") -> set[int]:
 
 
 def _existing_invariants(span_text: str) -> set[str]:
-    return {re.sub(r"\s+", "", m.group(1)) for m in _INVARIANT_RE.finditer(span_text)}
+    try:
+        tokens = tokenize_c_acsl(span_text)
+    except AcslSyntaxError:
+        return set()
+    acsl = "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
+    return {
+        re.sub(r"\s+", "", pred)
+        for kind, _label, pred, _span in iter_clauses(acsl)
+        if kind == "loop invariant" and pred
+    }
 
 
 def _next_seed_number(span_text: str) -> int:
@@ -511,11 +518,17 @@ def insert_seeds(
             prev -= 1
         clauses = "".join(f"loop invariant {seed.name}: {seed.predicate};\n" for seed in group)
         before = tokens[prev] if prev >= 0 else None
-        if before is not None and before.kind == "acsl_line":
+        is_doxygen = before is not None and before.kind in ("acsl_block", "acsl_line") and before.text[3:4] in "{*}"
+        if before is not None and not is_doxygen and before.kind == "acsl_line":
             skipped[line] = "a `//@` annotation precedes the loop"
-        elif before is not None and before.kind == "acsl_block" and _LOOP_CLAUSE_RE.search(before.text):
+        elif (
+            before is not None
+            and not is_doxygen
+            and before.kind == "acsl_block"
+            and any(kind.startswith("loop ") for kind, _label, _pred, _span in iter_clauses(before.text))
+        ):
             edits.append((before.start + len("/*@"), "\n" + clauses))
-        elif before is not None and before.kind == "acsl_block":
+        elif before is not None and not is_doxygen and before.kind == "acsl_block":
             skipped[line] = "an annotation that is not a loop annotation precedes the loop"
         else:
             edits.append((tokens[idx].start, "/*@\n" + clauses + "*/\n"))

@@ -46,6 +46,7 @@ _BRIEF_KEYS = (
     "references_dir",
 )
 _PROVER_BRIEF = ROOT / "skills" / "framac-wp" / "prover_brief.md"
+_ARCHITECT_BRIEF = ROOT / "skills" / "framac-wp" / "header_architect_brief.md"
 _RUN_COMMANDS = ROOT / "skills" / "framac-wp" / "run_commands.md"
 
 
@@ -167,3 +168,68 @@ def test_prover_brief_void_pointer_row_follows_pointer_params(pointer_params):
     assert "<!-- if:" not in rendered and "<!-- endif -->" not in rendered
     row = "\\block_length((char *)p)"
     assert (row in rendered) is pointer_params
+
+
+@pytest.mark.unit
+def test_prover_brief_variant_repair_strategy_never_suggests_editing_c_code():
+    text = _PROVER_BRIEF.read_text(encoding="utf-8")
+    assert "if (consumed == 0)" not in text
+    line = next(ln for ln in text.splitlines() if "**Failure-kind repair strategy:**" in ln)
+    tail = line.split("`loop_variant` / `decreases` goals fail =>", 1)[1]
+    for expected in ("`loop invariant`", "`requires`", "`proof_gap`", "never edit C code"):
+        assert expected in tail, expected
+
+
+@pytest.mark.unit
+def test_prover_brief_rule5_matches_check_memory_model_default():
+    text = _PROVER_BRIEF.read_text(encoding="utf-8")
+    rule5 = next(ln for ln in text.splitlines() if ln.startswith("5. **No Silent Unsoundness"))
+    assert "-wp-check-memory-model" in rule5
+    assert "Memory model hypotheses for function" in rule5
+    assert "--no-check-memory-model" in rule5
+    # The message must not sit in the unconditional failure list before the default-check explanation.
+    unconditional = rule5.split("By default", 1)[0]
+    assert "Memory model hypotheses" not in unconditional
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("strings", [True, False])
+def test_prover_brief_documents_strlen_plus_zero_variant_workaround(strings):
+    text = _PROVER_BRIEF.read_text(encoding="utf-8")
+    rendered = function_facts.render_conditionals(text, {"strings": strings})
+    assert "<!-- if:" not in rendered and "<!-- endif -->" not in rendered
+    assert ("loop variant strlen(s) + 0;" in rendered) is strings
+    assert ("typing was not performed on construct strlen(s)" in rendered) is strings
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pointer_params", [True, False])
+def test_briefs_document_guarding_dereferences_inside_old_terms(pointer_params):
+    prover_text = _PROVER_BRIEF.read_text(encoding="utf-8")
+    rendered = function_facts.render_conditionals(
+        prover_text, {"pointer_params": pointer_params, "division": False, "structs": pointer_params}
+    )
+    assert "<!-- if:" not in rendered and "<!-- endif -->" not in rendered
+    guarded = r"\old(p == \null ? 0 : p->f)"
+    assert (guarded in rendered) is pointer_params
+    assert (r"(T *)\null" in rendered) is pointer_params
+    if pointer_params:
+        assert r"\old(q) == \null || q->len == \old(q == \null ? 0 : q->len)" in rendered
+        assert "behavior `assumes`" in rendered
+
+    architect_text = _ARCHITECT_BRIEF.read_text(encoding="utf-8")
+    assert guarded in architect_text
+    assert r"(T *)\null" in architect_text
+    assert "behavior `assumes`" in architect_text
+
+
+@pytest.mark.unit
+def test_prover_brief_worked_patterns_never_recommends_axiomatic():
+    text = _PROVER_BRIEF.read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if "**Worked contract patterns:**" in ln)
+    assert "axiomatic `gcd`" not in line
+    assert "(axiomatic" not in line
+    assert "never copy" in line.lower() and "axiomatic" in line.lower()
+    assert "top-level declaration" in line.lower()
+    for expected in ("`bsearch.c`", "`find.i`", "`euclid.c`", r"loop variant \abs(b)"):
+        assert expected in line, expected

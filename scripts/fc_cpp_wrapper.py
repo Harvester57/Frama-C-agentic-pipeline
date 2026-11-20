@@ -46,6 +46,13 @@ preprocessed text declares the target `__fc_syscall_<name>`, which templates/fc_
 in its `__fc_libc` branch (Eva, WP, the model), never for E-ACSL, which links the real `syscall`; and only
 when the call has that syscall's number of arguments. Other numbers keep `syscall`'s own contract.
 
+Fourth, `__alignof__` and `__alignof` become `_Alignof` inside ACSL annotations (when followed by `(`) and
+inside `#define` replacement bodies emitted by `-dD` (which Frama-C reads solely for its `-pp-annot` logic
+preprocessor; C code in the preprocessed file is already expanded and stays untouched). Frama-C's C parser
+accepts `__alignof__` under `-machdep gcc_x86_64`, but its ACSL parser rejects `__alignof__(` with
+`unexpected token ')'` when a target compiles explicitly with `-std=c99` and a macro expands to
+`__alignof__(T)` (mpack run-4).
+
 For the E-ACSL frontend only, fc_cpp_wrapper_eacsl.py runs this script with `iff=True`, which also writes
 every `<==>` in an ACSL annotation as two implications (E-ACSL 35 aborts on `<==>` over a labelled term;
 see `rewrite_iff_text`). Eva and WP read the annotations as written.
@@ -635,6 +642,138 @@ def rewrite_iff_text(text: str) -> tuple[str, list[dict]]:
     return "".join(out), notes
 
 
+# ---------------------------------------------------------------------------------------------------
+# ACSL annotations (and `-dD` macro bodies): `__alignof__` / `__alignof` -> `_Alignof`
+# ---------------------------------------------------------------------------------------------------
+#
+# Frama-C's C parser accepts GCC's `__alignof__(T)` under `-machdep gcc_x86_64`, but its ACSL parser
+# rejects `__alignof__(` and `__alignof(` with `unexpected token ')'` (mpack run-4: `MPACK_BUILD_ALIGNMENT`
+# selects `_Alignof` under C11+ and `__alignof__` under `-std=c99`). On LP64 x86_64, `_Alignof(T)` and
+# `__alignof__(T)` evaluate to the same alignment.
+#
+# Two places in `cc1 -E -C -dD` output feed Frama-C's ACSL parser:
+# 1. ACSL annotations (`/*@ ... */` and `//@ ...`) where `__alignof__(` or `__alignof(` was written
+#    directly; only occurrences immediately followed by `(` are rewritten.
+# 2. `#define` replacement bodies emitted by `-dD`: C code in the `.i` file is already macro-expanded,
+#    so Frama-C uses `#define` lines in `.i` solely for its `-pp-annot` logic preprocessor (`ppannot`).
+#    Rewriting `__alignof__` / `__alignof` in `#define` replacement bodies handles both function-like
+#    macros (`#define ALIGN(T) __alignof__(T)`) and alias macros (`#define ALIGNOF __alignof__`)
+#    without touching C code, strings, char literals, comments, or token-pasting (`##`).
+
+_ALIGNOF_SCAN_RE = re.compile(
+    r"/\*@(?P<block>.*?)\*/"
+    r"|//@(?P<line>[^\n]*)"
+    r"|//[^\n]*"
+    r"|/\*.*?\*/"
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|'(?:\\.|[^'\\\n])*'"
+    r"|(?P<define>^[ \t]*#[ \t]*define[ \t]+[A-Za-z_]\w*(?:\([^)\n]*\))?)(?P<defbody>(?:\\\r?\n|[^\n\\]|\\.)*)"
+    r"|^[ \t]*#(?:\\\r?\n|[^\n\\]|\\.)*",
+    re.DOTALL | re.MULTILINE,
+)
+_ALIGNOF_ANNOT_TOKEN_RE = re.compile(
+    r"//[^\n]*"
+    r"|/\*.*?\*/"
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|'(?:\\.|[^'\\\n])*'"
+    r"|(?<![\\A-Za-z0-9_])(__alignof(?:__)?)(?=(?:[\s@]|//[^\n]*\n|/\*.*?\*/)*\()",
+    re.DOTALL,
+)
+_ALIGNOF_DEFINE_TOKEN_RE = re.compile(
+    r"//[^\n]*"
+    r"|/\*.*?\*/"
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|'(?:\\.|[^'\\\n])*'"
+    r"|##\s*\w+"
+    r"|(?<![#\\A-Za-z0-9_])(__alignof(?:__)?)(?![A-Za-z0-9_])(?!\s*##)",
+    re.DOTALL,
+)
+
+
+def rewrite_alignof_body(body: str) -> tuple[str, int]:
+    """An ACSL annotation body with every `__alignof__(` / `__alignof(` rewritten to `_Alignof(`, and the count."""
+    if "__alignof" not in body:
+        return body, 0
+    count = 0
+
+    def _sub(m: re.Match[str]) -> str:
+        nonlocal count
+        if m.group(1) is None:
+            return m.group(0)
+        count += 1
+        return "_Alignof"
+
+    return _ALIGNOF_ANNOT_TOKEN_RE.sub(_sub, body), count
+
+
+def rewrite_alignof_define_body(body: str) -> tuple[str, int]:
+    """A `#define` replacement body with every `__alignof__` / `__alignof` rewritten to `_Alignof`, and the count."""
+    if "__alignof" not in body:
+        return body, 0
+    count = 0
+
+    def _sub(m: re.Match[str]) -> str:
+        nonlocal count
+        if m.group(1) is None:
+            return m.group(0)
+        count += 1
+        return "_Alignof"
+
+    return _ALIGNOF_DEFINE_TOKEN_RE.sub(_sub, body), count
+
+
+def rewrite_alignof_text(text: str) -> tuple[str, list[dict]]:
+    """
+    The preprocessed text with `__alignof__` / `__alignof` rewritten to `_Alignof` inside ACSL
+    annotations (when followed by `(`) and `#define` replacement bodies (used by Frama-C `-pp-annot`),
+    leaving C code, strings, char literals and comments untouched, and one note per rewritten span.
+    """
+    if "__alignof" not in text:
+        return text, []
+    out: list[str] = []
+    notes: list[dict] = []
+    last = 0
+    where: Callable[[int], tuple[str, int]] | None = None
+    for m in _ALIGNOF_SCAN_RE.finditer(text):
+        if m.group("block") is not None:
+            group = "block"
+            body = m.group(group)
+            new_body, n = rewrite_alignof_body(body)
+            place = "an annotation"
+        elif m.group("line") is not None:
+            group = "line"
+            body = m.group(group)
+            new_body, n = rewrite_alignof_body(body)
+            place = "an annotation"
+        elif m.group("defbody") is not None:
+            group = "defbody"
+            body = m.group(group)
+            new_body, n = rewrite_alignof_define_body(body)
+            place = "a `#define`"
+        else:
+            continue
+        if not n:
+            continue
+        out += [text[last : m.start(group)], new_body]
+        last = m.end(group)
+        where = where or _locator(text)
+        file, line = where(m.start())
+        prefix = (m.group("define") or "") if group == "defbody" else ""
+        notes.append(
+            {
+                "file": file,
+                "line": line,
+                "kind": f"{n} `__alignof__` in {place} (ACSL: `_Alignof`)",
+                "original": " ".join((prefix + body).split())[:240],
+                "rewritten": " ".join((prefix + new_body).split())[:480],
+            }
+        )
+    if not notes:
+        return text, []
+    out.append(text[last:])
+    return "".join(out), notes
+
+
 def rewrite_file(path: str, iff: bool = False) -> list[dict]:
     """Rewrite one preprocessed file in place; fail open (the file stays as the preprocessor wrote it)."""
     try:
@@ -643,6 +782,8 @@ def rewrite_file(path: str, iff: bool = False) -> list[dict]:
         new, notes = rewrite_text(text)
         new, syscall_notes = rewrite_syscall_text(new)
         notes += syscall_notes
+        new, alignof_notes = rewrite_alignof_text(new)
+        notes += alignof_notes
         if iff:
             new, iff_notes = rewrite_iff_text(new)
             notes += iff_notes

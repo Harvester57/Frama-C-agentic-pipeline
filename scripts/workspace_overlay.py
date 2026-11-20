@@ -33,7 +33,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,7 @@ from acsl_ast import (  # noqa: E402
     check_frame_preserved,
     compare_function_contracts,
     contract_declaration_spans,
+    contract_has_whole_frame,
     declaration_contract_text,
     declaration_param_names,
     dedup_acsl_declarations,
@@ -229,6 +230,147 @@ def load_function_wp_report(overlay: Path, c_file: str | None, function: str) ->
         if data and wp_report_is_for(data, c_file, function):
             return data
     return {}
+
+
+PROVER_WALL_BUDGET_CEILING_S: dict[str, int] = {
+    "quick": 600,
+    "standard": 2400,
+    "deep": 3600,
+}
+_BUDGET_SCALE_GOAL_THRESHOLD = 40
+_BUDGET_SCALE_VC_THRESHOLD = 80
+_BUDGET_SCALE_EVA_THRESHOLD = 25
+_BUDGET_SCALE_LOC_THRESHOLD = 150
+_BUDGET_SCALE_LOOP_THRESHOLD = 3
+
+
+def _safe_nonneg_int(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wp_report_size_signals(report: dict) -> tuple[int, int]:
+    """Return `(total_goals, vc_total)` from a WP report, including partial_verdicts of a killed run."""
+    if not isinstance(report, dict) or not report:
+        return 0, 0
+    total_goals = _safe_nonneg_int(report.get("total_goals"))
+    vc_stats = report.get("wp_vc_stats")
+    vc_total = _safe_nonneg_int(vc_stats.get("total")) if isinstance(vc_stats, dict) else 0
+    partial = report.get("partial_verdicts")
+    if isinstance(partial, dict):
+        vc_total = max(vc_total, _safe_nonneg_int(partial.get("scheduled_vcs")))
+        vc_total = max(vc_total, _safe_nonneg_int(partial.get("completed_vcs")))
+    return total_goals, vc_total
+
+
+def _latest_earlier_agent_wp_report(run_dir: Path, agent_id: str, function: str, c_file: str | None) -> dict:
+    """
+    Most recent earlier agent's WP report for `(function, c_file)` that carries goal or VC counts
+    (including `partial_verdicts` from a killed WP call). Used only for budget sizing when no
+    canonical/baseline report exists yet.
+    """
+    agents = run_dir / "agents"
+    if not function or not agents.is_dir():
+        return {}
+    best: tuple[float, str, dict] | None = None
+    for agent in sorted(agents.iterdir()):
+        if agent.name == agent_id or not agent.is_dir():
+            continue
+        scratch = agent / "scratch"
+        budget = load_json_optional(scratch / prover_candidates.BUDGET_FILE, None)
+        if not isinstance(budget, dict) or budget.get("function") != function:
+            continue
+        if c_file and _normalize_work_relpath(str(budget.get("file") or "")) != c_file:
+            continue
+        for candidate in (scratch / f"wp_{function}.json", scratch / "wp" / f"wp_{function}.json"):
+            if not candidate.is_file():
+                continue
+            data = load_json_optional(candidate, {})
+            if not isinstance(data, dict) or not data or not wp_report_is_for(data, c_file, function):
+                continue
+            goals, vcs = _wp_report_size_signals(data)
+            if goals == 0 and vcs == 0:
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            key = (mtime, agent.name)
+            if best is None or key > (best[0], best[1]):
+                best = (mtime, agent.name, data)
+    return best[2] if best is not None else {}
+
+
+def scale_prover_wall_budget_s(
+    base_s: int,
+    *,
+    profile: str,
+    total_goals: int = 0,
+    vc_total: int = 0,
+    eva_unknowns: int = 0,
+    loop_count: int = 0,
+    loc: int = 0,
+) -> tuple[int, str | None]:
+    """
+    Scale a prover's wall-clock budget for large functions using already-computed size signals.
+
+    Small and medium functions keep `base_s` unchanged and return `(base_s, None)`.
+    When WP counts are present (`total_goals > 0` or `vc_total > 0`), scale from goal and VC counts;
+    otherwise fall back to Eva unknown obligations, function LOC, and loop count. Always bounded
+    between `base_s` and the profile ceiling (`quick: 600`, `standard: 2400`, `deep: 3600`).
+    """
+    base = max(1, int(base_s))
+    norm_profile = str(profile or "standard").strip().lower()
+    ceiling = max(base, PROVER_WALL_BUDGET_CEILING_S.get(norm_profile, PROVER_WALL_BUDGET_CEILING_S["standard"]))
+
+    goals = _safe_nonneg_int(total_goals)
+    vcs = _safe_nonneg_int(vc_total)
+    unknowns = _safe_nonneg_int(eva_unknowns)
+    loops = _safe_nonneg_int(loop_count)
+    lines = _safe_nonneg_int(loc)
+
+    has_wp = goals > 0 or vcs > 0
+    bump = 0
+    parts: list[str] = []
+
+    if has_wp:
+        if goals > _BUDGET_SCALE_GOAL_THRESHOLD or vcs > _BUDGET_SCALE_VC_THRESHOLD:
+            goal_bump = max(0, goals - _BUDGET_SCALE_GOAL_THRESHOLD) * 10
+            vc_bump = max(0, vcs - _BUDGET_SCALE_VC_THRESHOLD) * 5
+            bump = max(goal_bump, vc_bump)
+            if goals > 0:
+                parts.append(f"{goals} WP goals")
+            if vcs > 0:
+                parts.append(f"{vcs} VCs")
+    else:
+        eva_bump = max(0, unknowns - _BUDGET_SCALE_EVA_THRESHOLD) * 15
+        loc_bump = max(0, lines - _BUDGET_SCALE_LOC_THRESHOLD) * 3
+        loop_bump = max(0, loops - (_BUDGET_SCALE_LOOP_THRESHOLD - 1)) * 120
+        bump = eva_bump + loc_bump + loop_bump
+        if eva_bump > 0:
+            parts.append(f"{unknowns} Eva unknowns")
+        if loc_bump > 0:
+            parts.append(f"{lines} LOC")
+        if loop_bump > 0:
+            parts.append(f"{loops} loops")
+
+    if bump <= 0:
+        return base, None
+
+    scaled = min(ceiling, base + bump)
+    if scaled <= base:
+        return base, None
+
+    detail = ", ".join(parts)
+    if base + bump > ceiling:
+        reason = f"scaled from {base}s to {scaled}s cap for large function ({detail})"
+    else:
+        reason = f"scaled from {base}s for large function ({detail})"
+    return scaled, reason
 
 
 class OverlayMergeError(RuntimeError):
@@ -1292,13 +1434,40 @@ def _wp_report_detail(wp_report: dict) -> str:
         soundness.get("tier_a_aborts") if isinstance(soundness, dict) else None,
         soundness.get("tier_b_unsound") if isinstance(soundness, dict) else None,
     ):
-        first = next((e for e in errors if isinstance(e, str) and e.strip()), None) if isinstance(errors, list) else None
+        first = (
+            next((e for e in errors if isinstance(e, str) and e.strip()), None) if isinstance(errors, list) else None
+        )
         if first is not None:
             line = first.strip().splitlines()[0][:300]
             if not any(line in p for p in parts):
                 parts.append(line)
             break
     return (": " + "; ".join(parts)) if parts else ""
+
+
+PARENT_WP_WALL_TIMEOUT_ENV = "FRAMAC_PARENT_WP_WALL_TIMEOUT"
+DEFAULT_PARENT_WP_WALL_TIMEOUT_S = 600
+PARENT_WP_SUBPROCESS_GRACE_S = 60
+
+
+def parent_wp_wall_timeout(explicit: int | None = None) -> int | None:
+    """
+    Wall-clock limit (seconds) for the parent WP re-check inside `_run_parent_reverify`.
+    Reads `explicit` if given, else `FRAMAC_PARENT_WP_WALL_TIMEOUT`, else `DEFAULT_PARENT_WP_WALL_TIMEOUT_S` (600 s).
+    `0` or `off` (also `none`/`false`/`no`/`disabled`) disables the limit and returns None.
+    """
+    if explicit is not None:
+        return explicit if explicit > 0 else None
+    raw = (os.environ.get(PARENT_WP_WALL_TIMEOUT_ENV) or "").strip().lower()
+    if raw:
+        if raw in ("0", "off", "none", "false", "no", "disabled"):
+            return None
+        try:
+            val = int(float(raw))
+        except ValueError:
+            return DEFAULT_PARENT_WP_WALL_TIMEOUT_S
+        return val if val > 0 else None
+    return DEFAULT_PARENT_WP_WALL_TIMEOUT_S
 
 
 def _run_parent_reverify(
@@ -1318,6 +1487,7 @@ def _run_parent_reverify(
     reach_functions: list[str] | None = None,
     baseline_had_assigns: bool | None = None,
     guardrail_note: dict | None = None,
+    wp_wall_timeout: int | None = None,
 ) -> tuple[bool, str]:
     """
     Run dynamic guardrail (and WP for provers) on the merged workspace/work/ tree. `wp_par`
@@ -1347,7 +1517,11 @@ def _run_parent_reverify(
         # A proof under a memory model that is not evidence is never replayed, so the parent check
         # would re-prove under another model than the prover's: refuse it outright.
         model_problem = prover_wp_model_problem(
-            run_dir, overlay_dir=overlay_dir, agent_id=agent_id, c_file=_normalize_work_relpath(c_file), function=function
+            run_dir,
+            overlay_dir=overlay_dir,
+            agent_id=agent_id,
+            c_file=_normalize_work_relpath(c_file),
+            function=function,
         )
         if model_problem:
             return False, f"prover's WP report used a memory model that is not accepted: {model_problem}"
@@ -1452,6 +1626,7 @@ def _run_parent_reverify(
             c_file=norm_c,
             function=function,
         )
+        wall_timeout = parent_wp_wall_timeout(wp_wall_timeout)
         cmd = [
             sys.executable,
             str(scripts_dir / "run_wp_function.py"),
@@ -1464,6 +1639,8 @@ def _run_parent_reverify(
             f"--cppflags={cppflags}",
             "--wp-par",
             str(wp_par) if wp_par else "auto",
+            "--wall-timeout",
+            str(wall_timeout if wall_timeout is not None else 0),
             *wp_extra_flags,
             # Witness models for failed goals, so crash verifiers get a concrete counter-example
             # for any Invalid the merged candidate still carries (report: counter_example_goals).
@@ -1475,7 +1652,24 @@ def _run_parent_reverify(
         ]
         if wp_extra_sources:
             cmd.extend(["--extra-sources", *wp_extra_sources])
-        proc = subprocess.run(cmd, cwd=str(run_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
+        proc_timeout = wall_timeout + PARENT_WP_SUBPROCESS_GRACE_S if wall_timeout is not None else None
+        run_kwargs: dict[str, Any] = {
+            "cwd": str(run_dir),
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if proc_timeout is not None and _supports_kwarg(subprocess.run, "timeout"):
+            run_kwargs["timeout"] = proc_timeout
+        try:
+            proc = subprocess.run(cmd, **run_kwargs)
+        except subprocess.TimeoutExpired:
+            wp_json.unlink(missing_ok=True)
+            return (
+                False,
+                f"parent WP re-check timed out after {proc_timeout}s (wall limit {wall_timeout}s) for {function}",
+            )
         if proc.returncode != 0 or not wp_json.is_file():
             return False, f"parent WP check failed (rc={proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
         wp_report = json.loads(wp_json.read_text(encoding="utf-8"))
@@ -1921,16 +2115,29 @@ def _had_contract(texts: dict[str, str], function: str) -> bool | None:
         return None
 
 
+def _has_whole_frame(change: Mapping[str, Any], side: str) -> bool:
+    """
+    Whether `side` (`"baseline"` or `"candidate"`) of a `contract_change` dict frames the whole function:
+    explicit `*_has_whole_frame` when present, else whether `DEFAULT_BEHAVIOR` has an `assigns` clause.
+    """
+    key = f"{side}_has_whole_frame"
+    if key in change:
+        return bool(change[key])
+    return DEFAULT_BEHAVIOR in (change.get(f"{side}_assigns_in") or ())
+
+
 def contract_change(shared_work: Path, rels: list[str], new_contents: dict[str, str], function: str) -> dict:
     """
-    What a prover merge changes in the contract of `function` (the merge result's `contract_changes`): the
-    contract in `rels` on the shared tree against the one the merge leaves there (`new_contents` for the files
+    What a prover or architect merge changes in the contract of `function` (the merge result's `contract_changes`):
+    the contract in `rels` on the shared tree against the one the merge leaves there (`new_contents` for the files
     it changes), compared clause by clause (acsl_ast.compare_function_contracts).
 
     - `available`, `reason`: whether the two could be compared, and why not;
     - `had_contract`: the shared tree had a contract for the function (None: its text cannot be read);
     - `baseline_assigns_in`, `candidate_assigns_in`: the behaviors with an `assigns` clause before and after
       (`default!` is the contract outside every named behavior);
+    - `baseline_has_whole_frame`, `candidate_has_whole_frame`: whether the baseline / candidate frames the
+      whole function (a default `assigns` clause, or a `complete behaviors` set whose behaviors all have one);
     - `assigns_removed`, `ensures_removed`: `{behavior, clauses}` per behavior that lost its `assigns` clause
       altogether, or some `ensures` clause; `behaviors_removed`, `completeness_removed`: the named behaviors
       and the `complete` / `disjoint` clauses that are gone.
@@ -1958,6 +2165,8 @@ def contract_change(shared_work: Path, rels: list[str], new_contents: dict[str, 
         "had_contract": bool(cmp["had_contract"]) if cmp["available"] else _had_contract(before, function),
         "baseline_assigns_in": [n for n, e in behaviors.items() if e["assigns"]["baseline"]],
         "candidate_assigns_in": [n for n, e in behaviors.items() if e["assigns"]["candidate"]],
+        "baseline_has_whole_frame": contract_has_whole_frame(cmp, "baseline"),
+        "candidate_has_whole_frame": contract_has_whole_frame(cmp, "candidate"),
         "assigns_removed": [
             {"behavior": n, "clauses": [c["text"] for c in behaviors[n]["assigns"]["baseline"]]}
             for n in cmp["summary"]["assigns_removed_in"]
@@ -1976,9 +2185,12 @@ def contract_change_errors(change: dict) -> list[str]:
     Why the merge refuses the contract change `change` (contract_change), or []. Refused:
 
     - an `assigns` clause the contract had, in the default behavior or in a named one, with none left in that
-      behavior. A tightened or rewritten clause is not a removal. A named behavior removed as a whole takes
-      its clause with it only when the default behavior of the result has an `assigns` clause, which then
-      frames every case;
+      behavior. A tightened or rewritten clause is not a removal. Replacing a default `assigns` with a
+      `complete behaviors` set whose behaviors each have an `assigns` clause is not a removal either (the whole
+      function remains framed). A named behavior removed as a whole takes its clause with it only when the result
+      still frames the whole function (default `assigns`, or a `complete behaviors` set where every behavior has
+      one);
+    - removing `complete behaviors` coverage that was the baseline's only whole-function frame;
     - a comparison that cannot be made, unless the function is known to have had no contract.
 
     A removed `ensures` or behavior is not refused: `change` records it for the ledger and the report.
@@ -1994,10 +2206,10 @@ def contract_change_errors(change: dict) -> list[str]:
             f"of {fn} and its C text as they are, change ACSL annotations only, and return the result again."
         ]
     errors: list[str] = []
-    default_framed = DEFAULT_BEHAVIOR in change["candidate_assigns_in"]
+    candidate_framed = _has_whole_frame(change, "candidate")
     for item in change["assigns_removed"]:
         name = item["behavior"]
-        if name in change["behaviors_removed"] and default_framed:
+        if (name == DEFAULT_BEHAVIOR or name in change["behaviors_removed"]) and candidate_framed:
             continue
         where = "its contract" if name == DEFAULT_BEHAVIOR else f"behavior '{name}' of its contract"
         clauses = ", ".join(f"`assigns {c}`" for c in item["clauses"])
@@ -2007,12 +2219,58 @@ def contract_change_errors(change: dict) -> list[str]:
             "rewritten, never deleted. When a callee without a usable contract makes it unprovable, keep the "
             "clause, return the function as not proven and file a strengthening request for that callee."
         )
+    if not errors and _has_whole_frame(change, "baseline") and not candidate_framed:
+        errors.append(
+            f"{fn}: the result removes `complete behaviors` coverage of its `assigns` clauses and leaves no "
+            f"whole-function `assigns` clause, so nothing would be proved about what {fn} writes. Keep a "
+            "default `assigns` clause or a `complete behaviors` set whose behaviors each have an `assigns` clause."
+        )
     return errors
 
 
 def _contract_refusal(change: dict) -> str | None:
     errors = contract_change_errors(change)
     return f"{FRAME_REFUSAL}:\n  " + "\n  ".join(errors) if errors else None
+
+
+def _architect_contract_changes(
+    shared_work: Path, rels: list[str], new_contents: dict[str, str]
+) -> tuple[dict | None, list[str]]:
+    """
+    Check every function declared in modified header files `rels` against the shared tree so an architect
+    merge cannot silently delete an existing `assigns` clause. Returns `(aggregated_changes, refusal_errors)`.
+    """
+    hdr_rels = [rel for rel in rels if rel.endswith(".h") and rel in new_contents]
+    if not hdr_rels:
+        return None, []
+    per_fn: dict[str, dict] = {}
+    errors: list[str] = []
+    for rel in hdr_rels:
+        before_text = (shared_work / rel).read_text(encoding="utf-8")
+        after_text = new_contents[rel]
+        fns = sorted(set(header_function_names(before_text, rel)) | set(header_function_names(after_text, rel)))
+        for fn in fns:
+            change = contract_change(shared_work, [rel], new_contents, fn)
+            errors.extend(contract_change_errors(change))
+            per_fn[fn] = change
+    if errors:
+        return None, errors
+    if not per_fn:
+        return None, []
+    reasons = [c["reason"] for c in per_fn.values() if not c["available"] and c.get("reason")]
+    return (
+        {
+            "files": hdr_rels,
+            "available": all(c["available"] for c in per_fn.values()),
+            "reason": "; ".join(reasons),
+            "functions": per_fn,
+            "assigns_removed": [{**item, "function": fn} for fn, c in per_fn.items() for item in c["assigns_removed"]],
+            "ensures_removed": [{**item, "function": fn} for fn, c in per_fn.items() for item in c["ensures_removed"]],
+            "behaviors_removed": [f"{fn}:{b}" for fn, c in per_fn.items() for b in c["behaviors_removed"]],
+            "completeness_removed": [f"{fn}: {cl}" for fn, c in per_fn.items() for cl in c["completeness_removed"]],
+        },
+        [],
+    )
 
 
 def _changed_prover_header(
@@ -2038,29 +2296,35 @@ def _changed_prover_header(
 
 def merged_frame_refusal(
     run_dir: Path,
-    c_file: str,
-    function: str,
+    c_file: str | None,
+    function: str | None,
     header_file: str | None,
     module: str | None,
     cppflags: str,
     new_contents: dict[str, str],
+    *,
+    role: str = "prover",
 ) -> str | None:
-    """The merge's own frame check, run dry on a prover result spliced into `new_contents` (work-relative paths)."""
+    """The merge's own frame check, run dry on a prover or architect result spliced into `new_contents`."""
     run_dir = Path(run_dir).resolve()
     overlay = run_dir / "workspace"
-    c_rel = _normalize_work_relpath(c_file)
-    skeleton = _function_frame_skeleton(overlay, module, c_rel, function)
+    if role == "architect" or (not c_file and not function):
+        _changes, arch_errors = _architect_contract_changes(overlay / "work", [*new_contents], new_contents)
+        return f"{FRAME_REFUSAL}:\n  " + "\n  ".join(arch_errors) if arch_errors else None
+    c_rel = _normalize_work_relpath(c_file or "")
+    fn = function or ""
+    skeleton = _function_frame_skeleton(overlay, module, c_rel, fn)
     flags = _module_header_flags(overlay, module, cppflags)
     header = (
-        _prover_header(run_dir, overlay / "work", c_rel, function, _normalize_work_relpath(header_file), flags)
+        _prover_header(run_dir, overlay / "work", c_rel, fn, _normalize_work_relpath(header_file), flags)
         if header_file
-        else _changed_prover_header(run_dir, overlay, c_rel, function, module, flags, [*new_contents])
+        else _changed_prover_header(run_dir, overlay, c_rel, fn, module, flags, [*new_contents])
     )
-    rels = _frame_contract_files(run_dir, overlay, c_rel, function, header, module, flags, [*new_contents])
-    refusal = _contract_refusal(contract_change(overlay / "work", rels, new_contents, function))
+    rels = _frame_contract_files(run_dir, overlay, c_rel, fn, header, module, flags, [*new_contents])
+    refusal = _contract_refusal(contract_change(overlay / "work", rels, new_contents, fn))
     if refusal or skeleton is None:
         return refusal
-    return _frame_refusal(skeleton, run_dir, overlay, c_rel, function, header, module, flags, new_contents)
+    return _frame_refusal(skeleton, run_dir, overlay, c_rel, fn, header, module, flags, new_contents)
 
 
 TRUST_BOUNDARY_REASON = "trust-boundary check failed"
@@ -2336,7 +2600,14 @@ def _merge_agent_overlay_locked(
         contract_refusal = _contract_refusal(contract_changes)
         if contract_refusal:
             raise AcslError(contract_refusal)
-    baseline_had_assigns = bool(contract_changes["baseline_assigns_in"]) if contract_changes is not None else None
+    elif role == "architect" and new_contents:
+        # Check every function declared in the modified header so an architect cannot delete an existing `assigns`.
+        contract_changes, arch_errors = _architect_contract_changes(shared_work, [*new_contents], new_contents)
+        if arch_errors:
+            raise AcslError(f"{FRAME_REFUSAL}:\n  " + "\n  ".join(arch_errors))
+    baseline_had_assigns = (
+        _has_whole_frame(contract_changes, "baseline") if role == "prover" and contract_changes is not None else None
+    )
 
     if frame_skel is not None:
         frame_refusal = _frame_refusal(
@@ -2535,16 +2806,17 @@ def _note_frame_state(run_dir: Path, result: dict) -> None:
     """
     Add `frame_state` to a prover's merge result: what its parent WP report says about the function's frame
     (`assigns_clause`: present | behaviors_only | absent | unknown, and `assigns_vcs_proven`) and whether the
-    contract it replaced had an `assigns` clause. A function merged without a frame is visible here.
+    contract it replaced had a whole-function `assigns` frame. A function merged without a frame is visible here.
     """
     report = load_json_optional(run_dir / str(result.get("parent_wp_report") or ""), {})
     frame = report.get("frame_summary") if isinstance(report, dict) else None
     if not isinstance(frame, dict) or "assigns_clause" not in frame:
         return
+    changes = result.get("contract_changes")
     result["frame_state"] = {
         "assigns_clause": frame.get("assigns_clause"),
         "assigns_vcs_proven": frame.get("assigns_vcs_proven"),
-        "baseline_had_assigns": bool((result.get("contract_changes") or {}).get("baseline_assigns_in")),
+        "baseline_had_assigns": _has_whole_frame(changes, "baseline") if isinstance(changes, dict) else False,
     }
 
 
@@ -2768,9 +3040,13 @@ def _splice_batch(run_dir: Path, overlay: Path, items: list[dict]) -> tuple[list
                 journal=False,
                 wp_extra_sources=item.get("wp_extra_sources"),
             )
-            # For the parent WP check of this item: whether the contract it replaces had an `assigns` clause.
+            # For the parent WP check of this item: whether the contract it replaces had a whole-function frame.
             changes = res.get("contract_changes")
-            item["baseline_had_assigns"] = bool(changes["baseline_assigns_in"]) if isinstance(changes, dict) else None
+            item["baseline_had_assigns"] = (
+                _has_whole_frame(changes, "baseline")
+                if item.get("role") == "prover" and isinstance(changes, dict)
+                else None
+            )
             spliced.append((item, res))
         except (OverlayMergeError, AcslError, ScopeViolationError, ArtifactError, UnicodeDecodeError, OSError) as exc:
             failures.append(
@@ -3164,6 +3440,9 @@ def _resolve_brief_template(role: str) -> str:
     raise ArtifactError(f"brief template {fname} not found in skills/framac-wp")
 
 
+_FACTS_UNSET = object()
+
+
 def _prover_context(
     run_dir: Path,
     overlay: Path,
@@ -3175,6 +3454,8 @@ def _prover_context(
     header: str | None,
     cppflags: str,
     dag_functions: dict,
+    *,
+    facts_record: Any = _FACTS_UNSET,
 ) -> tuple[str, dict[str, bool] | None, dict]:
     """
     A prover's deterministic context: (brief section, features selecting the brief's conditional
@@ -3188,7 +3469,11 @@ def _prover_context(
         return "", None, {"enabled": True, "facts": False, "slice": "no_target"}
     work_dir = agent_root / "scratch" / "work"
     context_dir = agent_root / "scratch" / "context"
-    record = _load_function_facts(overlay, module, c_file, function)
+    record = (
+        _load_function_facts(overlay, module, c_file, function)
+        if facts_record is _FACTS_UNSET
+        else (facts_record if isinstance(facts_record, dict) else None)
+    )
     slice_result = function_slice.build_slice(
         run_dir,
         work_dir,
@@ -3787,22 +4072,44 @@ def prepare_agent(
     profile = str(run_meta.get("profile") or "standard").strip().lower()
 
     effective_max_retries = max_retries
-    max_wall_clock_s = 900
+    base_wall_s = PROVER_WALL_BUDGET_S.get(profile, PROVER_WALL_BUDGET_S["standard"])
+    max_wall_clock_s = base_wall_s
+    scaling_reason: str | None = None
     max_wp_invocations = effective_max_retries + 2
+    facts_record: dict | None = None
     if role == "prover":
         if max_retries == 4 and (profile == "quick" or verifiability == "shell_unverifiable_wp"):
             effective_max_retries = 2
         elif max_retries == 4 and profile == "deep":
             effective_max_retries = 6
+        facts_record = _load_function_facts(overlay, module, norm_c_file, function)
         env_wall = (os.environ.get("FRAMAC_PROVER_WALL_BUDGET_S") or "").strip()
         if env_wall.isdigit() and int(env_wall) > 0:
-            max_wall_clock_s = int(env_wall)
+            base_wall_s = int(env_wall)
+            max_wall_clock_s = base_wall_s
         elif verifiability == "shell_unverifiable_wp":
+            base_wall_s = 300
             max_wall_clock_s = 300
         else:
-            max_wall_clock_s = PROVER_WALL_BUDGET_S.get(profile, PROVER_WALL_BUDGET_S["standard"])
+            wp_goals, wp_vcs = _wp_report_size_signals(wp_data)
+            if wp_goals == 0 and wp_vcs == 0 and function:
+                earlier_wp = _latest_earlier_agent_wp_report(run_dir, agent_id, function, norm_c_file)
+                wp_goals, wp_vcs = _wp_report_size_signals(earlier_wp)
+            facts_loc = len(facts_record.get("code_lines") or []) if isinstance(facts_record, dict) else 0
+            facts_loops = len(facts_record.get("loops") or []) if isinstance(facts_record, dict) else 0
+            dag_loc = _safe_nonneg_int(fn_meta.get("loc")) if isinstance(fn_meta, dict) else 0
+            dag_loops = _safe_nonneg_int(fn_meta.get("loop_count")) if isinstance(fn_meta, dict) else 0
+            max_wall_clock_s, scaling_reason = scale_prover_wall_budget_s(
+                base_wall_s,
+                profile=profile,
+                total_goals=wp_goals,
+                vc_total=wp_vcs,
+                eva_unknowns=len(unknown_obligations),
+                loop_count=max(facts_loops, dag_loops),
+                loc=max(facts_loc, dag_loc),
+            )
         max_wp_invocations = effective_max_retries + 2
-        budget_payload = {
+        budget_payload: dict[str, Any] = {
             "agent_id": agent_id,
             "function": function or "",
             "file": norm_c_file or "",
@@ -3813,9 +4120,12 @@ def prepare_agent(
             "max_retries": effective_max_retries,
             "max_wp_invocations": max_wp_invocations,
             "max_wall_clock_s": max_wall_clock_s,
+            "budget_base_s": base_wall_s,
             "wp_invocations": 0,
             "first_wp_at": None,
         }
+        if scaling_reason is not None:
+            budget_payload["budget_scaling_reason"] = scaling_reason
         atomic_write_json(agent_root / "scratch" / ".prover_budget.json", budget_payload)
 
     cand_short = "candidate"
@@ -3829,12 +4139,21 @@ def prepare_agent(
     prover_context: dict = {}
     if role == "prover":
         context_section, features, prover_context = _prover_context(
-            run_dir, overlay, agent_root, agent_id, module, function, norm_c_file, norm_header, eff_cppflags, dag_fns
+            run_dir,
+            overlay,
+            agent_root,
+            agent_id,
+            module,
+            function,
+            norm_c_file,
+            norm_header,
+            eff_cppflags,
+            dag_fns,
+            facts_record=facts_record,
         )
         tpl = function_facts.render_conditionals(tpl, features)
         if spec_kb.enabled():
-            record = _load_function_facts(overlay, module, norm_c_file, function)
-            kb_section = spec_kb.kb_section_for(overlay, record)
+            kb_section = spec_kb.kb_section_for(overlay, facts_record)
     if role in ("prover", "breaker") and spec_kb.enabled():
         # Dead ends: clauses refuted on this function (earlier dispatches included) and rejected callee requests.
         kb_section += spec_kb.obstructions_section_for(
@@ -3899,18 +4218,24 @@ def prepare_agent(
     # After substitution, like what is appended below: source text and reports are data, never placeholders.
     rendered = rendered.replace(function_facts.CONTEXT_SENTINEL + "\n\n", context_section and context_section + "\n")
     rendered = rendered.replace(spec_kb.KB_SENTINEL + "\n\n", kb_section and kb_section + "\n")
-    if role == "prover" and (verifiability != "core_provable" or wp_blockers or wp_notes or profile == "quick"):
+    if role == "prover":
         fn_label = function or "this function"
         rendered += (
             "\n## WP Verifiability & Iteration Budget\n\n"
             f"- **Static WP Verifiability Classification:** `{verifiability}`\n"
-            f"- **Detected WP Blockers:** `{json.dumps(wp_blockers)}`\n"
-            f"- **Detected WP Notes:** `{json.dumps(wp_notes)}`\n"
+        )
+        if wp_blockers:
+            rendered += f"- **Detected WP Blockers:** `{json.dumps(wp_blockers)}`\n"
+        if wp_notes:
+            rendered += f"- **Detected WP Notes:** `{json.dumps(wp_notes)}`\n"
+        rendered += (
             f"- **Enforced Budget (`agents/{agent_id}/scratch/.prover_budget.json`):** "
             f"at most `{max_wp_invocations}` `run_wp_function.py` invocations and `{max_wall_clock_s}s` wall-clock, "
             "counted from your first `run_wp_function.py` call; time your later calls spend queued for a WP "
             "lease in the host resource broker does not count.\n"
         )
+        if scaling_reason:
+            rendered += f"- **Budget Scaling:** {scaling_reason}.\n"
         if verifiability == "shell_unverifiable_wp" or "dynamic_allocation" in wp_blockers:
             rendered += (
                 f"- **Fast-Fail Rule for `{fn_label}`:** This function is classified as `shell_unverifiable_wp` "
@@ -4122,6 +4447,37 @@ def apply_in_place(overlay_dir: Path, target_dir: Path) -> dict:
     return out
 
 
+def _load_rejected_result_arg(raw: str) -> dict:
+    """Load `--rejected-result` from an inline JSON object string, a JSON file path, or `@<path>`."""
+    stripped = raw.strip()
+    if not stripped:
+        raise ArtifactError("--rejected-result: empty value; expected a JSON object or JSON file path")
+    if stripped.startswith("@"):
+        source = stripped[1:]
+        if not source:
+            raise ArtifactError("--rejected-result: missing file path after '@'")
+        data = load_json_strict(Path(source))
+        label = source
+    elif (
+        stripped[0] in '{["'
+        or stripped in ("null", "true", "false")
+        or re.fullmatch(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", stripped)
+    ):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ArtifactError(f"--rejected-result: invalid JSON: {exc}") from exc
+        label = "--rejected-result"
+    else:
+        data = load_json_strict(Path(raw))
+        label = raw
+    if not isinstance(data, dict):
+        raise ArtifactError(f"{label}: expected a JSON object")
+    if "errors" in data and data["errors"] is not None and not isinstance(data["errors"], list):
+        raise ArtifactError(f"{label}: 'errors' must be a JSON list")
+    return data
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage the run's workspace/ shadow overlay and agent overlays.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -4176,6 +4532,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="JSON object summarizing the callee's previous prover run, rendered under the requests",
     )
+    p_prep.add_argument(
+        "--rejected-result",
+        "--rejected-result-json",
+        dest="rejected_result",
+        default=None,
+        help=(
+            "JSON object (inline, file path, or @path) describing a rejected previous result "
+            '({"agent_id": "...", "errors": [...]}), rendered under Previous Attempt: Result Rejected'
+        ),
+    )
 
     p_check = sub.add_parser("check-acsl-only")
     p_check.add_argument("--overlay", type=Path, default=Path("workspace"))
@@ -4193,7 +4559,9 @@ def main(argv: list[str] | None = None) -> int:
     p_merge.add_argument("--module", default=None)
     p_merge.add_argument("--sources", nargs="*", default=None, help="Default: the --module's harness sources")
     p_merge.add_argument("--cppflags", default=None, help="Default: the --module's cppflags, else -I.")
-    p_merge.add_argument("--ldflags", default=None, help="Extra linker flags for parent guardrail (default: the --module's)")
+    p_merge.add_argument(
+        "--ldflags", default=None, help="Extra linker flags for parent guardrail (default: the --module's)"
+    )
     p_merge.add_argument("--skip-reverify", action="store_true")
     p_merge.add_argument(
         "--allow-partial-wp",
@@ -4255,6 +4623,9 @@ def main(argv: list[str] | None = None) -> int:
             callee_history = load_json_strict(args.callee_history_json) if args.callee_history_json else None
             if callee_history is not None and not isinstance(callee_history, dict):
                 raise ArtifactError(f"{args.callee_history_json}: expected a JSON object")
+            rejected_result = (
+                _load_rejected_result_arg(args.rejected_result) if args.rejected_result is not None else None
+            )
             res = prepare_agent(
                 run_dir=args.run_dir,
                 agent_id=args.agent_id,
@@ -4272,6 +4643,7 @@ def main(argv: list[str] | None = None) -> int:
                 requests=requests,
                 caller_evidence=caller_evidence,
                 callee_history=callee_history,
+                rejected_result=rejected_result,
             )
         elif args.cmd == "check-acsl-only":
             res = check_acsl_only(args.overlay, args.work_dir, args.file or None)

@@ -16,6 +16,7 @@ Subcommands (run with the run directory as working directory; each prints one JS
   merge-pending  [--module M] [--force]         merge finished provers in micro-batches, run re-checks
   refresh        [--module M]                   re-sync after a harness repair or a module re-run
   requeue        --agent-id ID | --stale-minutes N | --memory-refused | --locate-failed | --frame-refused
+                 [--force]
   requeue        --guardrail-hung               recover the tasks a hanging corpus input left without a dynamic verdict
   status
 
@@ -74,6 +75,7 @@ from framac_common import (  # noqa: E402
     load_agent_result_json,
     load_json_optional,
     load_json_strict,
+    repair_acsl_json_text,
     run_lock,
     utc_now,
 )
@@ -82,6 +84,7 @@ from promote_artifact import promote_file  # noqa: E402
 from validate_artifacts import validate_agent_result  # noqa: E402
 
 SCHEDULE = Path("state/wp_schedule.json")
+LAST_PREPARED_BRIEFS = Path("state/last_prepared_briefs.json")
 WP_QUEUE = Path("workspace/reports/wp_queue.json")
 WP_BASELINE = Path("workspace/reports/wp_baseline.json")
 DAG_PATH = Path("workspace/reports/callgraph_dag.json")
@@ -153,6 +156,15 @@ MERGE_MAX_WAIT_S = 300.0  # the oldest queued result never waits longer than thi
 HISTORY_LIMIT = 400
 REOPENABLE_SKIPS = frozenset({"candidate", "no_open_units"})
 DEFAULT_WALL_BUDGET_S = PROVER_WALL_BUDGET_S
+DISPATCH_LOST_GRACE_S = 600  # 10 min with brief.md present and zero post-prepare agent activity
+# Entries created inside agents/<id>/scratch/ by prepare_agent itself (not post-prepare agent activity).
+_PREPARE_SCRATCH_ENTRIES = frozenset({"base", "work", "context", ".prover_budget.json"})
+_INCOMPLETE_SUFFIX_RE = re.compile(r"\s*\[INCOMPLETE:.*\]\s*$", re.DOTALL)
+_STARTS_WITH_ACSL_CLAUSE_RE = re.compile(
+    r"^(?:/\*@|//@)?\s*(?:behavior\s+\w+\s*:\s*)?"
+    r"(?:loop\s+(?:invariant|assigns|variant|allocates|frees)|"
+    r"requires|ensures|assumes|assigns|allocates|frees|terminates|exits|breaks|continues|returns|decreases|invariant|variant)\b"
+)
 
 
 def _agent_wall_budget_s() -> int:
@@ -164,6 +176,135 @@ def _agent_wall_budget_s() -> int:
     return DEFAULT_WALL_BUDGET_S.get(profile, 900)
 
 
+def _task_wall_budget_s(task: dict) -> int:
+    raw = task.get("wall_budget_s")
+    if isinstance(raw, (int, float)) and raw > 0:
+        return int(raw)
+    aid = task.get("agent_id")
+    if aid and is_safe_agent_id(str(aid)):
+        budget_data = load_json_optional(Path("agents") / str(aid) / "scratch" / ".prover_budget.json", None)
+        if isinstance(budget_data, dict):
+            val = budget_data.get("max_wall_clock_s")
+            if isinstance(val, (int, float)) and val > 0:
+                return int(val)
+    return _agent_wall_budget_s()
+
+
+def _agent_has_brief(agent_id: str | None) -> bool:
+    return bool(
+        agent_id and is_safe_agent_id(str(agent_id)) and (Path("agents") / str(agent_id) / "brief.md").is_file()
+    )
+
+
+def _agent_has_activity(agent_id: str | None, task: dict | None = None) -> bool:
+    """
+    True when an agent directory shows any post-prepare activity: files in `artifacts/`,
+    entries in `scratch/` beyond what `prepare_agent` creates (`base`, `work`, `context`,
+    `.prover_budget.json`), `.prover_budget.json` recording any WP invocation, or edits to
+    the task's target source/header in `scratch/work/` relative to `scratch/base/`.
+    """
+    if not agent_id or not is_safe_agent_id(str(agent_id)):
+        return False
+    agent_root = Path("agents") / str(agent_id)
+    artifacts_dir = agent_root / "artifacts"
+    try:
+        if artifacts_dir.is_dir() and any(artifacts_dir.iterdir()):
+            return True
+    except OSError:
+        pass
+    scratch = agent_root / "scratch"
+    if not scratch.is_dir():
+        return False
+    try:
+        for child in scratch.iterdir():
+            if child.name not in _PREPARE_SCRATCH_ENTRIES:
+                return True
+    except OSError:
+        pass
+    budget_path = scratch / ".prover_budget.json"
+    if budget_path.is_file() and not budget_path.is_symlink():
+        budget_data = load_json_optional(budget_path, None)
+        if isinstance(budget_data, dict) and (
+            int(budget_data.get("wp_invocations") or 0) > 0 or budget_data.get("first_wp_at") is not None
+        ):
+            return True
+    if isinstance(task, dict):
+        for raw_rel in (task.get("file"), task.get("header")):
+            rel = norm_path(str(raw_rel or ""))
+            if not rel:
+                continue
+            work_file = scratch / "work" / rel
+            base_file = scratch / "base" / rel
+            try:
+                if work_file.is_file() and base_file.is_file() and work_file.read_bytes() != base_file.read_bytes():
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _is_dispatch_lost(task: dict, now: float | None = None) -> bool:
+    """
+    True for a `running` agent task whose `agents/<id>/brief.md` exists, whose elapsed time
+    since assignment (or `brief.md` mtime) is at least `DISPATCH_LOST_GRACE_S`, and whose
+    scratch/artifacts show zero post-prepare agent activity.
+    """
+    if task.get("state") != "running" or task.get("kind") not in AGENT_KINDS:
+        return False
+    aid = task.get("agent_id")
+    if not _agent_has_brief(aid):
+        return False
+    now_ts = DEPS.now() if now is None else now
+    assigned = task.get("assigned_ts")
+    if isinstance(assigned, (int, float)):
+        since = float(assigned)
+    else:
+        try:
+            since = (Path("agents") / str(aid) / "brief.md").stat().st_mtime
+        except OSError:
+            return False
+    if (now_ts - since) < DISPATCH_LOST_GRACE_S:
+        return False
+    return not _agent_has_activity(aid, task)
+
+
+def _waiting_result_entry(task: dict) -> dict | None:
+    """If a running agent task already has a valid `agents/<id>/scratch/result.json` on disk, describe it (read-only)."""
+    if task.get("state") != "running" or task.get("kind") not in AGENT_KINDS:
+        return None
+    aid = task.get("agent_id")
+    if not aid or not is_safe_agent_id(str(aid)):
+        return None
+    aid_str = str(aid)
+    result_path = Path("agents") / aid_str / "scratch" / "result.json"
+    try:
+        if result_path.is_symlink() or not result_path.is_file() or result_path.stat().st_size > 64 * 1024 * 1024:
+            return None
+        raw = result_path.read_text(encoding="utf-8")
+        repaired, _ = repair_acsl_json_text(raw)
+        res = json.loads(repaired)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if _validate_result_for_task(res, task, aid_str):
+        return None
+    return {
+        "task": task["id"],
+        "kind": task["kind"],
+        "agent_id": aid_str,
+        "result_file": result_path.as_posix(),
+        "action": f"wp_scheduler.py step --complete {aid_str}",
+    }
+
+
+def _result_waiting_tasks(state: dict) -> list[dict]:
+    waiting: list[dict] = []
+    for _, t in sorted(state["tasks"].items()):
+        entry = _waiting_result_entry(t)
+        if entry is not None:
+            waiting.append(entry)
+    return waiting
+
+
 def _over_budget_tasks(state: dict, now: float | None = None) -> list[dict]:
     now_ts = DEPS.now() if now is None else now
     over: list[dict] = []
@@ -171,20 +312,43 @@ def _over_budget_tasks(state: dict, now: float | None = None) -> list[dict]:
         if t["state"] != "running" or t["kind"] not in AGENT_KINDS:
             continue
         assigned = float(t.get("assigned_ts") or now_ts)
-        budget_s = int(t.get("wall_budget_s") or _agent_wall_budget_s())
+        budget_s = _task_wall_budget_s(t)
         age_s = round(now_ts - assigned, 1)
-        if age_s >= budget_s:
-            over.append(
-                {
-                    "task": t["id"],
-                    "kind": t["kind"],
-                    "agent_id": t.get("agent_id"),
-                    "age_s": age_s,
-                    "wall_budget_s": budget_s,
-                    "action": "FINALIZE NOW: inject 'FINALIZE NOW — write agents/<agent-id>/scratch/result.json immediately' or run wp_scheduler.py requeue --agent-id "
-                    + str(t.get("agent_id") or ""),
-                }
-            )
+        waiting = _waiting_result_entry(t)
+        lost = waiting is None and _is_dispatch_lost(t, now_ts)
+        if age_s >= budget_s or lost:
+            aid = t.get("agent_id")
+            aid_str = str(aid or "")
+            entry: dict[str, Any] = {
+                "task": t["id"],
+                "kind": t["kind"],
+                "agent_id": aid,
+                "age_s": age_s,
+                "wall_budget_s": budget_s,
+            }
+            if waiting is not None:
+                entry["result_waiting"] = True
+                entry["reason"] = "valid result.json already waiting on disk"
+                entry["action"] = waiting["action"]
+            elif not _agent_has_brief(aid):
+                entry["never_prepared"] = True
+                entry["reason"] = "never prepared (missing brief.md)"
+                entry["action"] = f"wp_scheduler.py requeue --agent-id {aid_str}"
+            elif lost:
+                brief_rel = t.get("brief_file") or f"agents/{aid_str}/brief.md"
+                entry["dispatch_lost"] = True
+                entry["brief_file"] = brief_rel
+                entry["reason"] = (
+                    f"no agent activity after {age_s}s (grace {DISPATCH_LOST_GRACE_S}s; "
+                    "brief prepared but never spawned?)"
+                )
+                entry["action"] = f"spawn {brief_rel} or run wp_scheduler.py requeue --agent-id {aid_str}"
+            else:
+                entry["action"] = (
+                    "FINALIZE NOW: inject 'FINALIZE NOW — write agents/<agent-id>/scratch/result.json immediately' "
+                    "or run wp_scheduler.py requeue --agent-id " + aid_str
+                )
+            over.append(entry)
     return over
 
 
@@ -317,6 +481,9 @@ class Deps:
         self.enforced_memory_mb: Callable[[], int | None] = resources.enforced_memory_mb
         self.transition: Callable[..., dict] = ledger.cmd_transition
         self.transition_many: Callable[[list[dict]], list[dict]] = ledger.cmd_transition_many
+        self.clear_memory_refused_evidence: Callable[[Iterable[str] | None], dict] = (
+            ledger.clear_memory_refused_evidence
+        )
         self.ingest_wp: Callable[..., dict] = ledger.cmd_ingest_wp
         self.audit_hypotheses: Callable[..., dict] = ledger.cmd_audit_hypotheses
         self.ingest_agent_hypothesis: Callable[..., dict] = ledger.cmd_ingest_agent_hypothesis
@@ -585,6 +752,7 @@ def _assign_agent(state: dict, task: dict) -> str:
         wall_budget_s=_agent_wall_budget_s(),
     )
     task.pop("requeued_from", None)
+    task.pop("dispatch_refunded", None)
     task.setdefault("agents", []).append(aid)
     if task["kind"] == "negotiate":
         # The agents each request was handed to: a request closed later is no longer "not dispatched".
@@ -1099,7 +1267,7 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
     unverified candidate, a prove task per function with planned units, an architect per module
     with prove work and a header; then recompute dependencies, gates, recursion groups, waves and
     priorities, and handle callees without a contract (`_contract_less_callees`). `persist=False`
-    is for a sync whose state is not saved: it files no contract request.
+    is for a sync whose state is not saved: it writes nothing to the ledger or request store.
     """
     tasks = state["tasks"]
     changes: dict[str, list[str]] = {"created": [], "reopened": [], "skipped": [], "closed": []}
@@ -1142,7 +1310,8 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
     planned = sorted({(norm_path(u["file"]), u["function"]) for u in ctx.units.values() if u["status"] == "planned"})
     if ctx.profile == "quick":
         allowed_quick = ctx.quick_entry_chain(planned)
-        _park_quick_off_chain(ctx, [pair for pair in planned if pair not in allowed_quick], changes)
+        if persist:
+            _park_quick_off_chain(ctx, [pair for pair in planned if pair not in allowed_quick], changes)
         planned = [pair for pair in planned if pair in allowed_quick]
     for file, fn in planned:
         tid = f"prove:{file}#{fn}"
@@ -1203,7 +1372,8 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
             verdict = _skip_verdict(task, fn_units, open_verify, verifiability)
             if verdict:
                 if verdict == "shell_unverifiable_wp":
-                    _park_shell_unverifiable_units(task, fn_units, wp_blockers, [])
+                    if persist:
+                        _park_shell_unverifiable_units(task, fn_units, wp_blockers, [])
                     blocker_str = ", ".join(wp_blockers) if wp_blockers else "unsupported C construct"
                     _finish(
                         state,
@@ -1229,7 +1399,15 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
             verifiability = ctx.verifiability(task["file"], task["function"])
             neg_verdict = _negotiate_skip_verdict(fn_units, open_verify, verifiability)
             if neg_verdict:
-                _close_negotiation_unrun(state, task, "skipped", neg_verdict, f"callee unit is {neg_verdict}", [])
+                _close_negotiation_unrun(
+                    state,
+                    task,
+                    "skipped",
+                    neg_verdict,
+                    f"callee unit is {neg_verdict}",
+                    [],
+                    persist=persist,
+                )
                 changes["skipped"].append(tid)
 
     prove_modules = sorted({t["module"] for t in tasks.values() if t["kind"] == "prove" and t["state"] != "skipped"})
@@ -1398,12 +1576,20 @@ def _contract_less_callees(state: dict, ctx: Ctx, changes: dict, persist: bool =
                 waits.add(neg_id)  # class B
             else:
                 untagged.append(key)  # class C
-        if filed or task.get("extra_deps"):
-            # Open deps stay (a prover's own request still being negotiated); a negotiation filed here counts only
-            # while this caller is among its callers.
+        held = {d for d in task.get("held_negotiations") or [] if d in tasks and tasks[d]["state"] not in TERMINAL}
+        if sorted(held) != sorted(task.get("held_negotiations") or []):
+            if held:
+                task["held_negotiations"] = sorted(held)
+            else:
+                task.pop("held_negotiations", None)
+            changed = True
+        if filed or task.get("extra_deps") or held:
+            # Open deps stay (a prover's own request still being negotiated, or a restored negotiation held by
+            # `_hold_callers` until it reaches TERMINAL); a negotiation filed here counts only while this caller
+            # is waiting on it.
             extra = {d for d in task.get("extra_deps") or [] if d in tasks and tasks[d]["state"] not in TERMINAL}
-            extra = {d for d in extra if d in waits or d.removeprefix("negotiate:") not in filed}
-            extra |= waits
+            extra = {d for d in extra if d in waits or d in held or d.removeprefix("negotiate:") not in filed}
+            extra |= waits | held
             if sorted(extra) != sorted(task.get("extra_deps") or []):
                 task["extra_deps"] = sorted(extra)
                 changed = True
@@ -2791,12 +2977,45 @@ def _is_done(state: dict, ctx: Ctx | None = None) -> bool:
     return not any(u.get("status") in ("planned", "in_progress") for u in units)
 
 
+def _already_claimed_by_agent(task: dict, fn_units: list[dict]) -> list[str]:
+    """Units already in `in_progress` owned by this task's current agent (for retroactive prepare)."""
+    aid = task.get("agent_id")
+    if not aid or any(u["status"] == "candidate" for u in fn_units):
+        return []
+    return [u["coverage_id"] for u in fn_units if u["status"] == "in_progress" and u.get("agent_id") == aid]
+
+
+def _write_last_prepared_briefs(tasks_desc: list[dict]) -> str:
+    """Atomically write the full prepared brief list to `state/last_prepared_briefs.json`."""
+    brief_entries = [
+        {
+            "task": t["task"],
+            "kind": t["kind"],
+            "agent_id": t["agent_id"],
+            "brief_file": t["brief_file"],
+        }
+        for t in tasks_desc
+        if t.get("brief_file")
+    ]
+    atomic_write_json(
+        LAST_PREPARED_BRIEFS,
+        {
+            "timestamp": utc_now(),
+            "count": len(brief_entries),
+            "tasks": brief_entries,
+        },
+    )
+    return LAST_PREPARED_BRIEFS.as_posix()
+
+
 def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None = None) -> dict:
     """
     Hand out the highest-priority ready tasks. `auto` slots = recommend().max_agents minus the agent
     tasks already running; a number hands out at most that many. Repair tasks go to the parent and
-    take no slot. With --prepare, every agent gets its scratch overlay and brief, and a prover's units
-    move to in_progress with a compare-and-set.
+    take no slot. With --prepare, every agent gets its scratch overlay and brief (including any
+    existing running tasks left without brief.md by an earlier call without --prepare), a prover's
+    units move to in_progress with a compare-and-set, and the full brief list is written to
+    `state/last_prepared_briefs.json`.
     """
     mode = scheduler_mode()
     out: dict[str, Any] = {
@@ -2820,6 +3039,21 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
         else:
             budget = max(0, int(slots))
             out["slots"] = {"mode": "fixed", "running": running, "available": budget}
+        retro_ids: list[str] = []
+        if prepare:
+            # Self-heal running agent tasks left without `brief.md` (e.g., an earlier `step`/`next` without --prepare).
+            now_iso = utc_now()
+            now_ts = DEPS.now()
+            for tid, task in sorted(state["tasks"].items()):
+                if (
+                    task["state"] == "running"
+                    and task["kind"] in AGENT_KINDS
+                    and task.get("agent_id")
+                    and not _agent_has_brief(task.get("agent_id"))
+                ):
+                    task["assigned_at"] = now_iso
+                    task["assigned_ts"] = now_ts
+                    retro_ids.append(tid)
         picked: list[str] = []
         ready = _ready(state, mode, ctx=ctx)
         # A breaker has no waiter, so its height is 0 and every taller prover outranks it: without reserved
@@ -2870,7 +3104,9 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
         if over_budget:
             out["over_budget_tasks"] = over_budget
         save_schedule(state)
-        snapshot = {tid: json.loads(json.dumps(state["tasks"][tid])) for tid in picked}
+        to_prepare = [*retro_ids, *picked]
+        retro_set = set(retro_ids)
+        snapshot = {tid: json.loads(json.dumps(state["tasks"][tid])) for tid in to_prepare}
         if not prepare:
             out["tasks"] = [_describe(snapshot[tid], ctx, state) for tid in picked]
             out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
@@ -2882,14 +3118,14 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                 snapshot[tid].get("file"),
                 snapshot[tid].get("function"),
             )
-            for tid in picked
+            for tid in to_prepare
         }
 
     # Scratch overlays are snapshotted under the `merge` lock: never while holding the ledger lock.
     prepared: dict[str, dict] = {}
     failures: dict[str, str] = {}
-    if picked:
-        worker_cap = min(len(picked), os.cpu_count() or 4, 16)
+    if to_prepare:
+        worker_cap = min(len(to_prepare), os.cpu_count() or 4, 16)
         sched = state  # the schedule the snapshot was taken from: negotiate evidence reads callers and agents
         try:
             _prepare_params = inspect.signature(DEPS.prepare_agent).parameters
@@ -2914,7 +3150,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
 
         with run_lock("merge"):
             with concurrent.futures.ThreadPoolExecutor(max_workers=worker_cap) as executor:
-                for tid, res, err in executor.map(_do_prepare, picked):
+                for tid, res, err in executor.map(_do_prepare, to_prepare):
                     if err is not None:
                         failures[tid] = err
                     elif res is not None:
@@ -2924,7 +3160,7 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
         state = load_schedule()
         ready_tids: list[str] = []
         prove_tasks: list[dict] = []
-        for tid in picked:
+        for tid in to_prepare:
             task = state["tasks"].get(tid)
             aid = snapshot[tid]["agent_id"]
             if task is None or task["state"] != "running" or task.get("agent_id") != aid:
@@ -2945,13 +3181,18 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             task_open_cids: dict[str, list[str]] = {}
             for task in prove_tasks:
                 fn_units = [units[cid] for cid in _unit_ids(task, units) if units[cid]["status"] not in NO_TOUCH]
+                already_owned = _already_claimed_by_agent(task, fn_units) if task["id"] in retro_set else []
                 refusal = _prove_dispatch_check(task, fn_units)
+                if refusal == "no_open_units" and already_owned:
+                    task["units"] = already_owned
+                    prove_refusals[task["id"]] = None
+                    continue
                 if refusal:
                     _finish(state, task, "skipped", refusal, reason=f"claim refused at dispatch ({refusal})")
                     prove_refusals[task["id"]] = refusal
                     continue
                 open_list = _open_units(task, fn_units)
-                task_open_cids[task["id"]] = [u["coverage_id"] for u in open_list]
+                task_open_cids[task["id"]] = sorted(set(already_owned) | {u["coverage_id"] for u in open_list})
                 for u in open_list:
                     batch_items.append(
                         {
@@ -2977,7 +3218,20 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
             task = state["tasks"][tid]
             aid = snapshot[tid]["agent_id"]
             if task["kind"] == "prove":
-                refusal = prove_refusals[tid] if tid in prove_refusals else _claim_units(state, task)
+                if tid in prove_refusals:
+                    refusal = prove_refusals[tid]
+                else:
+                    if tid in retro_set:
+                        u_now, _ = ledger.load_state()
+                        fn_u = [u_now[cid] for cid in _unit_ids(task, u_now) if u_now[cid]["status"] not in NO_TOUCH]
+                        already_owned = _already_claimed_by_agent(task, fn_u)
+                        if already_owned and _prove_dispatch_check(task, fn_u) == "no_open_units":
+                            task["units"] = already_owned
+                            refusal = None
+                        else:
+                            refusal = _claim_units(state, task)
+                    else:
+                        refusal = _claim_units(state, task)
                 if refusal:
                     out["skipped"].append({"task": tid, "agent_id": aid, "reason": refusal})
                     continue
@@ -2991,16 +3245,31 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                 ]
                 neg_refusal = _negotiate_skip_verdict(neg_units, set(), task.get("verifiability"))
                 if neg_refusal:
-                    note = f"claim refused at dispatch: callee unit is {neg_refusal}"
-                    for rid in task.get("requests") or []:
-                        _resolve_request(out["errors"], str(rid), "rejected_by_callee", note)
-                    _finish(state, task, "skipped", neg_refusal, reason=note)
+                    task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+                    _forget_request_agent(task, aid)
+                    _close_negotiation_unrun(
+                        state,
+                        task,
+                        "skipped",
+                        neg_refusal,
+                        f"claim refused at dispatch: callee unit is {neg_refusal}",
+                        out["errors"],
+                    )
                     out["skipped"].append({"task": tid, "agent_id": aid, "reason": neg_refusal})
                     continue
             task["brief_file"] = prepared[tid].get("brief_file")
-            out["tasks"].append(_describe(task, ctx, state))
+            desc = _describe(task, ctx, state)
+            if tid in retro_set:
+                desc["retroactively_prepared"] = True
+            out["tasks"].append(desc)
             if task["brief_file"]:
                 out["briefs"].append(task["brief_file"])
+        over_budget = _over_budget_tasks(state)
+        if over_budget:
+            out["over_budget_tasks"] = over_budget
+        else:
+            out.pop("over_budget_tasks", None)
+        out["briefs_file"] = _write_last_prepared_briefs(out["tasks"])
         out["pending"] = sum(1 for t in state["tasks"].values() if t["state"] == "pending")
         out["done"] = _is_done(state, ctx)
         save_schedule(state)
@@ -3012,16 +3281,12 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
 # ---------------------------------------------------------------------------
 
 
-def _load_result(path: Path, task: dict, agent_id: str) -> tuple[dict | None, list[str]]:
-    try:
-        res = load_agent_result_json(path)
-    except ArtifactError as exc:
-        return None, [str(exc)]
+def _validate_result_for_task(res: Any, task: dict, agent_id: str) -> list[str]:
     if not isinstance(res, dict):
-        return None, ["the result is not a JSON object"]
+        return ["the result is not a JSON object"]
     errors = list(validate_agent_result(res))[:10]
     if errors:
-        return res, errors
+        return errors
     if res.get("agent_id") != agent_id:
         errors.append(f"agent_id is {res.get('agent_id')!r}, expected {agent_id!r}")
     if res.get("role") != RESULT_ROLE[task["kind"]]:
@@ -3033,6 +3298,17 @@ def _load_result(path: Path, task: dict, agent_id: str) -> tuple[dict | None, li
         errors.append(
             f"candidate_fingerprint is {res.get('candidate_fingerprint')!r}, expected {task['fingerprint']!r}"
         )
+    return errors
+
+
+def _load_result(path: Path, task: dict, agent_id: str) -> tuple[dict | None, list[str]]:
+    try:
+        res = load_agent_result_json(path)
+    except ArtifactError as exc:
+        return None, [str(exc)]
+    errors = _validate_result_for_task(res, task, agent_id)
+    if not isinstance(res, dict):
+        return None, errors
     return res, errors
 
 
@@ -3263,12 +3539,39 @@ def _negotiation_request_note(task: dict, rid: str, reason: str) -> str:
     return f"{NOT_DISPATCHED} {reason}"
 
 
-def _close_negotiation_unrun(state: dict, task: dict, new_state: str, outcome: str, reason: str, errors: list) -> None:
+def _close_negotiation_unrun(
+    state: dict,
+    task: dict,
+    new_state: str,
+    outcome: str,
+    reason: str,
+    errors: list,
+    *,
+    persist: bool = True,
+) -> None:
     """Close a negotiate task that will not run (again): its requests are rejected, each with its own note."""
-    for rid in task.get("requests") or []:
-        _resolve_request(errors, str(rid), "rejected_by_callee", _negotiation_request_note(task, str(rid), reason))
+    if persist:
+        for rid in task.get("requests") or []:
+            _resolve_request(errors, str(rid), "rejected_by_callee", _negotiation_request_note(task, str(rid), reason))
     prefix = NOT_DISPATCHED if not int(task.get("dispatches") or 0) else "not dispatched again:"
     _finish(state, task, new_state, outcome, reason=f"{prefix} {reason}")
+
+
+def _open_followup_negotiation(state: dict, task: dict, out: dict) -> None:
+    """Promote queued follow-up strengthening requests to the next round, unless the callee hit its round cap."""
+    followups = list(dict.fromkeys(task.get("followup_requests") or []))
+    if not followups:
+        return
+    followup_callers = list(dict.fromkeys(task.get("followup_callers") or []))
+    task["followup_requests"], task["followup_callers"] = [], []
+    if _negotiation_capped(task):
+        reason = _negotiation_cap_reason(task)
+        for rid in followups:
+            _resolve_request(out["errors"], rid, "rejected_by_callee", _negotiation_request_note(task, rid, reason))
+            out.setdefault("negotiations_capped", []).append({"request": rid, "callee": _key(task)})
+        return
+    task["requests"], task["callers"] = followups, followup_callers
+    _reopen(state, task, "follow-up strengthening requests")
 
 
 def _resolve_negotiation(state: dict, task: dict, applied: bool, note: str, out: dict) -> None:
@@ -3286,19 +3589,270 @@ def _resolve_negotiation(state: dict, task: dict, applied: bool, note: str, out:
     _finish(state, task, "done", "applied" if applied else "rejected", reason=note)
     requeued = [c for c in (task.get("callers") or []) if applied and _requeue_caller(state, c)]
     out.setdefault("negotiation", []).append({"task": task["id"], "status": status, "requeued_callers": requeued})
-    followups = list(dict.fromkeys(task.get("followup_requests") or []))
-    if not followups:
+    _open_followup_negotiation(state, task, out)
+
+
+_IDENT_LEAD_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _merged_contract_text_for_task(task: dict, requests: list[dict]) -> tuple[str | None, list[str]]:
+    """
+    Read the function's current merged contract across its source and header files in `workspace/work/`.
+    Returns `(None, [])` when none of those files exist on disk (e.g., synthetic tests with no work tree),
+    or `(contract_text, checked_files)` when at least one file exists.
+    """
+    fn = str(task.get("function") or "")
+    if not fn:
+        return None, []
+    work_dir = Path("workspace/work")
+    candidates: list[str] = []
+    for raw in (
+        task.get("file"),
+        task.get("header"),
+        *(r.get("header_file") for r in requests if isinstance(r, dict)),
+        *(r.get("callee_file") for r in requests if isinstance(r, dict)),
+    ):
+        rel = norm_path(str(raw or ""))
+        if rel and rel not in candidates:
+            candidates.append(rel)
+    existing = [rel for rel in candidates if (work_dir / rel).is_file()]
+    if not existing:
+        return None, []
+    parts: list[str] = []
+    for rel in existing:
+        try:
+            text = (work_dir / rel).read_text(encoding="utf-8", errors="replace")
+            is_h = rel.endswith(".h")
+            decls = acsl_ast.contract_declaration_spans(text, fn, is_header=is_h, path=rel)
+            if decls:
+                for decl in decls:
+                    piece = acsl_ast.declaration_contract_text(decl, rel)
+                    if piece and piece not in parts:
+                        parts.append(piece)
+            else:
+                piece = acsl_ast.function_contract_text(text, fn, is_header=is_h, path=rel)
+                if piece and piece not in parts:
+                    parts.append(piece)
+        except (acsl_ast.AcslError, OSError, ValueError):
+            continue
+    return "\n".join(parts), existing
+
+
+def _parse_needed_clauses(needed_clause: str) -> list[tuple[str, str, str]]:
+    """
+    Parse ACSL `(kind, label, predicate)` tuples from a request's `needed_clause` after stripping
+    any scheduler `[INCOMPLETE: ...]` suffix. Returns `[]` for empty or unparseable prose text.
+    """
+    cleaned = _INCOMPLETE_SUFFIX_RE.sub("", needed_clause or "").strip()
+    if not cleaned or cleaned == DEFAULT_CONTRACT_CLAUSE:
+        return []
+    if not _STARTS_WITH_ACSL_CLAUSE_RE.match(cleaned) and "/*@" not in cleaned and "//@" not in cleaned:
+        return []
+    parsed = [(k, lab, pred) for k, lab, pred, _span in acsl_ast.iter_clauses(cleaned) if pred]
+    if not parsed and not cleaned.endswith(";") and "*/" not in cleaned:
+        parsed = [(k, lab, pred) for k, lab, pred, _span in acsl_ast.iter_clauses(cleaned + ";") if pred]
+    return parsed
+
+
+def _norm_acsl_pred(text: str) -> str:
+    return acsl_ast._norm_clause(acsl_ast._strip_outer_parens((text or "").strip()))
+
+
+def _pred_atoms(pred: str) -> list[str]:
+    stripped = acsl_ast._strip_outer_parens((pred or "").strip())
+    parts = acsl_ast._split_top_level(stripped, "&&")
+    return [_norm_acsl_pred(p) for p in parts if p.strip()]
+
+
+def _separated_covered(req_atom: str, merged_sep: list[list[str]]) -> bool:
+    if not req_atom.startswith("\\separated(") or not req_atom.endswith(")"):
+        return False
+    inner = req_atom[len("\\separated(") : -1]
+    want_roots = set()
+    for arg in acsl_ast._split_top_level(inner, ","):
+        m = _IDENT_LEAD_RE.match(arg.strip())
+        if m:
+            want_roots.add(m.group(0))
+    if not want_roots:
+        return False
+    for args in merged_sep:
+        have_roots = set()
+        for arg in args:
+            m = _IDENT_LEAD_RE.match(arg.strip())
+            if m:
+                have_roots.add(m.group(0))
+        if want_roots <= have_roots:
+            return True
+    return False
+
+
+def _clause_in_contract(
+    req_kind: str,
+    req_pred: str,
+    merged_clauses: list[tuple[str, str, str]],
+    merged_sep: list[list[str]],
+) -> bool:
+    """Whether one parsed `(kind, pred)` from `needed_clause` is present/satisfied in `merged_clauses`."""
+    if req_kind == "assigns":
+        req_a = acsl_ast._split_assigns(req_pred)
+        req_locs = {acsl_ast._norm_clause(loc) for loc in req_a["locs"] if loc.strip()}
+        if not req_locs:
+            return True
+        have_assigns = [acsl_ast._split_assigns(p) for k, _lab, p in merged_clauses if k == "assigns"]
+        if not have_assigns:
+            return False
+        have_locs = {acsl_ast._norm_clause(loc) for cl in have_assigns for loc in cl["locs"] if loc.strip()}
+        return all(loc in have_locs for loc in req_locs)
+
+    same_kind = [p for k, _lab, p in merged_clauses if k == req_kind]
+    if not same_kind:
+        return False
+    req_norm = _norm_acsl_pred(req_pred)
+    have_full = {_norm_acsl_pred(p) for p in same_kind}
+    if req_norm in have_full:
+        return True
+    have_atoms = {atom for p in same_kind for atom in _pred_atoms(p)}
+    req_atoms = _pred_atoms(req_pred)
+    if not req_atoms:
+        return False
+    for atom in req_atoms:
+        if atom in have_atoms:
+            continue
+        if req_kind == "requires" and _separated_covered(atom, merged_sep):
+            continue
+        return False
+    return True
+
+
+def _missing_needed_clause(needed_clause: str, merged_contract: str) -> str | None:
+    """
+    Compare a request's `needed_clause` against `merged_contract` on disk.
+    Returns `None` when satisfied (or when `needed_clause` is empty/prose on a non-empty contract),
+    otherwise a concise description of the missing requested clause(s).
+    """
+    cleaned = _INCOMPLETE_SUFFIX_RE.sub("", needed_clause or "").strip()
+    if not cleaned:
+        return None
+    merged_clauses = [(k, lab, p) for k, lab, p, _span in acsl_ast.iter_clauses(merged_contract) if p]
+    if cleaned == DEFAULT_CONTRACT_CLAUSE:
+        return None if merged_clauses else DEFAULT_CONTRACT_CLAUSE
+    requested = _parse_needed_clauses(cleaned)
+    if not requested:
+        # Unparseable prose: fail-open if the function has a contract at all; reject if it has none.
+        return None if merged_clauses else cleaned[:160]
+    merged_sep = acsl_ast.extract_frame_clauses(merged_contract).get("separated") or []
+    missing: list[str] = []
+    for kind, label, pred in requested:
+        if not _clause_in_contract(kind, pred, merged_clauses, merged_sep):
+            prefix = f"{kind} {label}: " if label else f"{kind} "
+            missing.append(f"{prefix}{' '.join(pred.split())}"[:160])
+    return "; ".join(missing) if missing else None
+
+
+def _resolve_noop_negotiation(state: dict, task: dict, aid: str, entry: dict, out: dict) -> None:
+    """
+    Resolve a negotiation whose merge changed no files (`modified_files == []`).
+    Checks each open request's `needed_clause` against the function's current merged contract in
+    `workspace/work/`. Satisfied requests are marked `verified_and_applied`; any request whose
+    clause is absent from the merged contract is marked `rejected_by_callee` with a clear note
+    and recorded in `task["merge_notes"]`.
+    """
+    req_ids = [str(rid) for rid in (task.get("requests") or [])]
+    store = {str(r.get("id")): r for r in _requests()}
+    reqs = [store[rid] for rid in req_ids if rid in store]
+    merged_contract, checked_files = _merged_contract_text_for_task(task, reqs)
+    if merged_contract is None:
+        _resolve_negotiation(state, task, True, f"applied by {aid}; the parent WP re-check passed", out)
         return
-    followup_callers = list(dict.fromkeys(task.get("followup_callers") or []))
-    task["followup_requests"], task["followup_callers"] = [], []
-    if _negotiation_capped(task):
-        reason = _negotiation_cap_reason(task)
-        for rid in followups:
-            _resolve_request(out["errors"], rid, "rejected_by_callee", _negotiation_request_note(task, rid, reason))
-            out.setdefault("negotiations_capped", []).append({"request": rid, "callee": _key(task)})
+
+    applied_rids: list[str] = []
+    missing_items: list[dict[str, Any]] = []
+    for rid in req_ids:
+        req = store.get(rid)
+        if req is None:
+            applied_rids.append(rid)
+            continue
+        needed = str(req.get("needed_clause") or "")
+        missing = _missing_needed_clause(needed, merged_contract)
+        if missing is None:
+            applied_rids.append(rid)
+        else:
+            missing_items.append(
+                {
+                    "id": rid,
+                    "caller_function": str(req.get("caller_function") or ""),
+                    "needed_clause": needed,
+                    "missing": missing,
+                }
+            )
+
+    if not missing_items:
+        _resolve_negotiation(state, task, True, f"applied by {aid}; the parent WP re-check passed", out)
         return
-    task["requests"], task["callers"] = followups, followup_callers
-    _reopen(state, task, "follow-up strengthening requests")
+
+    noop_note = [
+        {
+            "request": item["id"],
+            "needed_clause": item["needed_clause"],
+            "missing": item["missing"],
+            "checked_files": checked_files,
+        }
+        for item in missing_items
+    ]
+    notes = dict(task.get("merge_notes") or {})
+    notes["noop_missing_clauses"] = noop_note
+    task["merge_notes"] = notes
+    entry["merge_notes"] = notes
+
+    for rid in applied_rids:
+        _resolve_request(
+            out["errors"],
+            rid,
+            "verified_and_applied",
+            f"applied by {aid}; already present in merged contract and parent WP re-check passed",
+        )
+    for item in missing_items:
+        note = f"no-op merge ({aid}): merged contract does not contain requested clause ({item['missing']})"
+        _resolve_request(out["errors"], item["id"], "rejected_by_callee", note)
+
+    missing_summary = "; ".join(f"{item['id']}: {item['missing']}" for item in missing_items)[:360]
+    if applied_rids:
+        applied_callers = {str((store.get(rid) or {}).get("caller_function") or "") for rid in applied_rids}
+        missing_callers = {item["caller_function"] for item in missing_items}
+        requeued = [
+            c
+            for c in (task.get("callers") or [])
+            if (state["tasks"].get(c) or {}).get("function") in applied_callers
+            and (state["tasks"].get(c) or {}).get("function") not in missing_callers
+            and _requeue_caller(state, c)
+        ]
+        reason = (
+            f"no-op merge ({aid}): applied {len(applied_rids)} request(s); "
+            f"merged contract does not contain requested clause(s): {missing_summary}"
+        )
+        _finish(state, task, "done", "applied", reason=reason)
+        out.setdefault("negotiation", []).append(
+            {
+                "task": task["id"],
+                "status": "partially_applied",
+                "applied_requests": applied_rids,
+                "rejected_requests": [item["id"] for item in missing_items],
+                "requeued_callers": requeued,
+                "missing_clauses": noop_note,
+            }
+        )
+    else:
+        reason = f"no-op merge ({aid}): merged contract does not contain requested clause(s): {missing_summary}"
+        _finish(state, task, "done", "rejected", reason=reason)
+        out.setdefault("negotiation", []).append(
+            {
+                "task": task["id"],
+                "status": "rejected_by_callee",
+                "requeued_callers": [],
+                "missing_clauses": noop_note,
+            }
+        )
+    _open_followup_negotiation(state, task, out)
 
 
 def _ensure_breaker(state: dict, prove_task: dict, agent_id: str, wp_report: str | None, out: dict) -> None:
@@ -3910,6 +4464,13 @@ def _complete_agent(agent_id: str) -> dict:
             # Requeued as stale but not re-dispatched yet: the late result is still welcome.
             task.update(state="running", agent_id=agent_id)
             task.pop("requeued_from", None)
+            if task.pop("dispatch_refunded", None):
+                task["dispatches"] = int(task.get("dispatches") or 0) + 1
+                if task["kind"] == "negotiate":
+                    handed = task.setdefault("request_agents", {})
+                    for rid in task.get("requests") or []:
+                        if agent_id not in handed.setdefault(str(rid), []):
+                            handed[str(rid)].append(agent_id)
             out["late_result"] = True
         elif task.get("agent_id") != agent_id:
             out.update(action="stale_agent", current_agent=task.get("agent_id"))
@@ -4168,7 +4729,10 @@ def _on_merged(state: dict, task: dict, aid: str, merged: dict, out: dict) -> No
     task["merged_at"] = utc_now()
     task["parent_wp_report"] = entry.get("parent_wp_report")
     if task["kind"] == "negotiate":
-        _resolve_negotiation(state, task, True, f"applied by {aid}; the parent WP re-check passed", out)
+        if not merged.get("modified_files"):
+            _resolve_noop_negotiation(state, task, aid, entry, out)
+        else:
+            _resolve_negotiation(state, task, True, f"applied by {aid}; the parent WP re-check passed", out)
     else:
         _finish(state, task, "done", "merged")
     refinement = merged.get("contract_refinement")
@@ -4488,6 +5052,8 @@ def cmd_step(
         "next": next_out,
         "errors": errors,
     }
+    if next_out.get("briefs_file"):
+        out["briefs_file"] = next_out["briefs_file"]
     deferred = [d for d in [merge_out, *completed] if d.get("merge_deferred")]
     if deferred:
         out.update(ok=False, merge_deferred=deferred[0]["merge_deferred"])
@@ -4604,13 +5170,29 @@ def cmd_refresh(module: str | None = None) -> dict:
     return out
 
 
-def cmd_requeue(agent_id: str | None = None, stale_minutes: float | None = None) -> dict:
-    """Tasks whose agents never returned go back to ready; their units return to planned (CAS)."""
+def cmd_requeue(
+    agent_id: str | None = None,
+    stale_minutes: float | None = None,
+    force: bool = False,
+) -> dict:
+    """
+    Tasks whose agents never returned go back to ready; their units return to planned (CAS).
+
+    Unless `force=True`, a running agent whose `agents/<id>/scratch/result.json` already validates is left alone and
+    reported in `result_waiting` (so finished work is completed instead of discarded), and a stale-minutes requeue
+    leaves prepared running agents younger than their `wall_budget_s` alone under `skipped_active`.
+    """
     with run_lock("ledger"):
         state = load_schedule()
         tasks = state["tasks"]
         now = DEPS.now()
-        out: dict[str, Any] = {"ok": True, "requeued": [], "merges_requeued": []}
+        out: dict[str, Any] = {
+            "ok": True,
+            "requeued": [],
+            "merges_requeued": [],
+            "result_waiting": [],
+            "skipped_active": [],
+        }
         if agent_id is not None:
             task = tasks.get(state["agents"].get(agent_id, ""))
             if task is None:
@@ -4634,21 +5216,55 @@ def cmd_requeue(agent_id: str | None = None, stale_minutes: float | None = None)
                     {"task": task["id"], "agent_id": (task.get("merge") or {}).get("agent_id")}
                 )
                 continue
-            released = _release_units(task)
+            waiting = _waiting_result_entry(task)
+            if waiting is not None and not force:
+                out["result_waiting"].append(waiting)
+                continue
             previous = task.get("agent_id")
-            had_brief = bool(previous and (Path("agents") / str(previous) / "brief.md").is_file())
-            if had_brief:
-                _reopen(state, task, f"requeued: agent {previous} never returned")
-                task["requeued_from"] = previous  # its result, should it still arrive, is accepted
-            else:
+            had_brief = _agent_has_brief(previous)
+            dispatch_lost = had_brief and _is_dispatch_lost(task, now)
+            if agent_id is None and not force and had_brief and not dispatch_lost:
+                age_s = round(now - float(task.get("assigned_ts") or now), 1)
+                budget_s = _task_wall_budget_s(task)
+                if age_s < budget_s:
+                    out["skipped_active"].append(
+                        {
+                            "task": task["id"],
+                            "kind": task["kind"],
+                            "agent_id": previous,
+                            "age_s": age_s,
+                            "wall_budget_s": budget_s,
+                            "reason": (
+                                f"running agent is younger than its wall_budget_s ({age_s}s < {budget_s}s); "
+                                "pass --force to requeue anyway"
+                            ),
+                        }
+                    )
+                    continue
+            released = _release_units(task)
+            if not had_brief:
                 # `step --prepare` / `next --prepare` died after saving `running` before writing brief.md:
                 # no agent ever ran for `previous`, so do not burn the task's dispatch budget.
                 _reopen(state, task, f"requeued: agent {previous} was never prepared (missing brief.md)")
                 task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
                 _forget_request_agent(task, previous)
+            elif dispatch_lost:
+                # Brief existed but no post-prepare agent activity occurred past grace period:
+                # refund the dispatch while still accepting a late result before re-dispatch.
+                _reopen(state, task, f"requeued: agent {previous} had no activity past grace period (dispatch_lost)")
+                task["dispatches"] = max(0, int(task.get("dispatches") or 0) - 1)
+                _forget_request_agent(task, previous)
+                task["requeued_from"] = previous
+                task["dispatch_refunded"] = True
+            else:
+                _reopen(state, task, f"requeued: agent {previous} never returned")
+                task["requeued_from"] = previous  # its result, should it still arrive, is accepted
             entry_info: dict[str, Any] = {"task": task["id"], "agent_id": previous, "units_released": released}
             if not had_brief:
                 entry_info["unprepared"] = True
+            elif dispatch_lost:
+                entry_info["dispatch_lost"] = True
+                entry_info["dispatch_refunded"] = True
             out["requeued"].append(entry_info)
         limit = float(stale_minutes or 0) * 60.0
         rechecks_requeued = []
@@ -4658,7 +5274,8 @@ def cmd_requeue(agent_id: str | None = None, stale_minutes: float | None = None)
                 rechecks_requeued.append(rid)
         if rechecks_requeued:
             out["rechecks_requeued"] = rechecks_requeued
-        save_schedule(state)
+        if out["requeued"] or out["merges_requeued"] or rechecks_requeued:
+            save_schedule(state)
     return out
 
 
@@ -4722,14 +5339,48 @@ def _hold_callers(state: dict, task: dict) -> dict[str, str]:
         seen[cid] = caller["state"]
         if caller["kind"] == "prove" and caller["state"] == "pending":
             caller["extra_deps"] = sorted({*(caller.get("extra_deps") or []), task["id"]})
+            caller["held_negotiations"] = sorted({*(caller.get("held_negotiations") or []), task["id"]})
     return seen
+
+
+def _partial_merge_job_for_refused(task: dict, aid: str, ctx: Ctx) -> dict | None:
+    """
+    Build a partial-merge job for a stalled prover whose partial contract merge was refused for
+    memory inside `complete`, or `None` when `scratch/result.json`, the agent's sound assigns-verified
+    WP report, or its contracted scratch file is no longer available.
+    """
+    result_path = Path("agents") / aid / "scratch" / "result.json"
+    if not result_path.is_file():
+        return None
+    fn = str(task.get("function") or "")
+    if not fn:
+        return None
+    report: dict | None = None
+    promoted = Path("agents") / aid / "artifacts" / f"wp_{fn}.json"
+    if promoted.is_file() and not promoted.is_symlink():
+        report = _load_report(promoted)
+    if report is None:
+        res, _errors = _load_result(result_path, task, aid)
+        if isinstance(res, dict):
+            src = _find_agent_wp_report(aid, res, fn)
+            if src is not None:
+                report = _load_report(src)
+    if not isinstance(report, dict):
+        return None
+    # Mirror `_complete_prover`: a restored best candidate's WP report may say `all_proven` while the
+    # stalled prover's final result was `stalled_after_k_retries`.
+    if report.get("status") == "all_proven":
+        report = {**report, "status": "unproven_goals_remain"}
+    return _partial_contract_merge_job(task, aid, report, ctx)
 
 
 def cmd_requeue_memory_refused() -> dict:
     """
     Repair what a parent WP re-check refused for memory did before such refusals were deferred: merges blocked or
-    rejected without WP having run go back to the merge queue, their units to the agent, their strengthening requests
-    to pending. Idempotent. Tasks blocked for any other reason are not touched; what cannot be restored is listed.
+    rejected without WP having run go back to the merge queue, their units to the agent (with stale
+    `insufficient_memory` `wp_analysis_error` evidence pruned), their strengthening requests to pending, and
+    eligible stalled-prover partial contract merges are retried. Idempotent. Tasks blocked for any other reason
+    are not touched; what cannot be restored is listed.
     """
     out: dict[str, Any] = {
         "ok": True,
@@ -4738,17 +5389,22 @@ def cmd_requeue_memory_refused() -> dict:
         "negotiations_rerun": [],
         "requests_restored": [],
         "retries_reset": [],
+        "partial_merges_retried": [],
+        "partial_merges_refused": [],
+        "evidence_cleaned": 0,
         "left": [],
         "requests_left": [],
         "blocked_callers_to_review": [],
         "errors": [],
     }
+    partial_jobs: list[tuple[str, dict]] = []
     with run_lock("ledger"):
         state = load_schedule()
         tasks = state["tasks"]
         ctx = Ctx()
         store = {str(r.get("id")): r for r in _requests()}
         refused = [t for _, t in sorted(tasks.items()) if MEMORY_REFUSAL in str(t.get("last_reason") or "")]
+        cleaned_tasks: list[dict] = []
 
         for task in refused:
             if task["kind"] != "prove" or (task["state"], task.get("outcome")) != ("blocked", "analysis_error"):
@@ -4763,6 +5419,7 @@ def cmd_requeue_memory_refused() -> dict:
                 continue
             reclaimed = _reclaim_parked_units(task, aid, out["errors"])
             _requeue_refused_merge(state, task, aid)
+            cleaned_tasks.append(task)
             out["restored"].append({"task": task["id"], "agent_id": aid, "units": reclaimed})
 
         def callee_merges_first(task: dict) -> bool:
@@ -4792,6 +5449,7 @@ def cmd_requeue_memory_refused() -> dict:
             else:
                 _requeue_refused_merge(state, task, aid)
                 out["negotiations_restored"].append(entry)
+            cleaned_tasks.append(task)
             entry["callers"] = _hold_callers(state, task)
 
         # Still queued, but a refusal already spent the retry a real analysis error is entitled to.
@@ -4804,9 +5462,17 @@ def cmd_requeue_memory_refused() -> dict:
                 continue
             merge["analysis_retries"] = 0
             out["retries_reset"].append(tid)
+            cleaned_tasks.append(task)
             if task["kind"] == "negotiate" and callee_merges_first(task):
                 _rerun_negotiation(state, ctx, task)
                 out["negotiations_rerun"].append({"task": tid, "agent_id": merge.get("agent_id"), "requests": []})
+
+        if cleaned_tasks:
+            units_now, _ = ledger.load_state()
+            cids = sorted({cid for t in cleaned_tasks for cid in _unit_ids(t, units_now)})
+            if cids:
+                cleaned = _try(out["errors"], "clear memory-refused evidence", DEPS.clear_memory_refused_evidence, cids)
+                out["evidence_cleaned"] += int((cleaned or {}).get("removed") or 0)
 
         for rid, req in sorted(store.items()):
             if (
@@ -4828,24 +5494,89 @@ def cmd_requeue_memory_refused() -> dict:
             and tid not in held
             and restored_keys & set(t.get("callees") or [])
         ]
-        # A stalled prover's partial contract was refused inside `complete`: only a new run of the prover merges one.
-        out["partial_merges_refused"] = [
-            tid
-            for tid, t in sorted(tasks.items())
-            if t["kind"] == "prove"
-            and t.get("outcome") == "stalled_after_k_retries"
-            and not t.get("partial_contract_merged")
-            and (
-                _load_report(Path(f"agents/{t.get('agent_id')}/scratch/parent_wp/{t.get('function')}.json")) or {}
-            ).get("reason")
-            == MEMORY_REFUSAL
-        ]
+        # Stalled provers whose partial contract merge was refused for memory inside `complete`:
+        # retry when the agent's result/contract is still intact and not superseded; otherwise list in `partial_merges_refused`.
+        for tid, t in sorted(tasks.items()):
+            if (
+                t["kind"] != "prove"
+                or t["state"] != "blocked"
+                or t.get("outcome") != "stalled_after_k_retries"
+                or t.get("partial_contract_merged")
+            ):
+                continue
+            aid = str(t.get("agent_id") or "")
+            if not aid:
+                continue
+            p_report = _load_report(Path(f"agents/{aid}/scratch/parent_wp/{t.get('function')}.json")) or {}
+            if p_report.get("reason") != MEMORY_REFUSAL:
+                continue
+            negotiation = tasks.get(f"negotiate:{_key(t)}") or {}
+            if negotiation.get("outcome") == "applied":
+                out["left"].append(
+                    {
+                        "task": tid,
+                        "reason": f"{negotiation['id']} has merged a proved contract for this function since",
+                    }
+                )
+                continue
+            job = _partial_merge_job_for_refused(t, aid, ctx)
+            if job is None:
+                out["partial_merges_refused"].append(tid)
+            else:
+                partial_jobs.append((tid, job))
         out["sync"] = _sync(state, Ctx())
         save_schedule(state)
+
+    if partial_jobs:
+        if _memory_too_small():
+            for tid, _job in partial_jobs:
+                out["partial_merges_refused"].append(tid)
+                _note_refused_check(out, tid)
+        else:
+            for tid, job in partial_jobs:
+                pmerged = _merge_partial_prover(job)
+                if pmerged.get("ok"):
+                    with run_lock("ledger"):
+                        state = load_schedule()
+                        ptask = state["tasks"].get(tid)
+                        if ptask is not None and not ptask.get("partial_contract_merged"):
+                            ptask["partial_contract_merged"] = True
+                            ptask["partial_merged_at"] = utc_now()
+                            pentry: dict[str, Any] = {"task": tid, "agent_id": job["agent_id"]}
+                            _keep_merge_notes(ptask, pmerged, pentry)
+                            if pmerged.get("modified_files"):
+                                pentry["modified_files"] = list(pmerged["modified_files"])
+                                reason = _contract_change_reason(
+                                    ptask, job["agent_id"], pmerged.get("contract_refinement")
+                                )
+                                pentry["rechecks_queued"] = _queue_rechecks_for(state, ptask, "partial " + reason)
+                            if isinstance(pmerged.get("contract_refinement"), dict):
+                                pentry["contract_refinement"] = pmerged["contract_refinement"]
+                            _event(state, "partial_merge_retried", tid, agent_id=job["agent_id"])
+                            units_now, _ = ledger.load_state()
+                            cids = _unit_ids(ptask, units_now)
+                            if cids:
+                                cleaned = _try(
+                                    out["errors"],
+                                    f"clear memory-refused evidence {tid}",
+                                    DEPS.clear_memory_refused_evidence,
+                                    cids,
+                                )
+                                out["evidence_cleaned"] += int((cleaned or {}).get("removed") or 0)
+                            out["sync"] = _sync(state, Ctx())
+                            save_schedule(state)
+                            out["partial_merges_retried"].append(pentry)
+                else:
+                    reason = str(pmerged.get("reason") or "partial merge failed")
+                    if MEMORY_REFUSAL in reason:
+                        _note_refused_check(out, tid)
+                    out["partial_merges_refused"].append(tid)
+                    out["left"].append({"task": tid, "reason": f"partial merge retry failed: {reason}"})
+
     out["obstructions_forgotten"] = (
         _try(out["errors"], "forget refused obstructions", spec_kb.forget_memory_refusals, Path.cwd()) or 0
     )
-    out["ok"] = not out["errors"]
+    out["ok"] = not out["errors"] and not out.get("merge_deferred")
     return out
 
 
@@ -4901,7 +5632,10 @@ def _frame_refused_verdict(tasks: dict, task: dict, store: dict) -> tuple[str | 
         return aid, why
     negotiation = tasks.get(f"negotiate:{_key(task)}") or {}
     if task["kind"] == "prove" and (negotiation.get("outcome") == "applied" or negotiation.get("state") in LIVE):
-        return aid, f"{negotiation['id']} ({negotiation['state']}, {negotiation.get('outcome')}) answers for this function"
+        return (
+            aid,
+            f"{negotiation['id']} ({negotiation['state']}, {negotiation.get('outcome')}) answers for this function",
+        )
     return aid, None
 
 
@@ -5279,17 +6013,52 @@ def cmd_status() -> dict:
     now = DEPS.now()
     ready = _ready(state, mode, ctx=ctx)
     view = _View(state, ctx=ctx)
-    running = [
-        {
+    running: list[dict[str, Any]] = []
+    never_prepared: list[dict[str, Any]] = []
+    dispatch_lost: list[dict[str, Any]] = []
+    for _, t in sorted(tasks.items()):
+        if t["state"] != "running":
+            continue
+        aid = t.get("agent_id")
+        entry: dict[str, Any] = {
             "task": t["id"],
             "kind": t["kind"],
-            "agent_id": t.get("agent_id"),
+            "agent_id": aid,
             "age_s": round(now - float(t.get("assigned_ts") or now), 1),
-            "wall_budget_s": int(t.get("wall_budget_s") or _agent_wall_budget_s()),
+            "wall_budget_s": _task_wall_budget_s(t),
         }
-        for _, t in sorted(tasks.items())
-        if t["state"] == "running"
-    ]
+        if t["kind"] in AGENT_KINDS and not _agent_has_brief(aid):
+            entry["never_prepared"] = True
+            never_prepared.append(
+                {
+                    "task": t["id"],
+                    "kind": t["kind"],
+                    "agent_id": aid,
+                    "age_s": entry["age_s"],
+                    "reason": "never prepared (missing brief.md)",
+                    "action": f"wp_scheduler.py requeue --agent-id {aid or ''}",
+                }
+            )
+        elif t["kind"] in AGENT_KINDS and _is_dispatch_lost(t, now):
+            aid_str = str(aid or "")
+            brief_rel = t.get("brief_file") or f"agents/{aid_str}/brief.md"
+            entry["dispatch_lost"] = True
+            dispatch_lost.append(
+                {
+                    "task": t["id"],
+                    "kind": t["kind"],
+                    "agent_id": aid,
+                    "age_s": entry["age_s"],
+                    "brief_file": brief_rel,
+                    "reason": (
+                        f"no agent activity after {entry['age_s']}s (grace {DISPATCH_LOST_GRACE_S}s; "
+                        "brief prepared but never spawned?)"
+                    ),
+                    "action": f"spawn {brief_rel} or run wp_scheduler.py requeue --agent-id {aid_str}",
+                }
+            )
+        running.append(entry)
+    result_waiting = _result_waiting_tasks(state)
     over_budget = _over_budget_tasks(state, now)
     merge_queue = [
         {
@@ -5327,6 +6096,9 @@ def cmd_status() -> dict:
             for t in ready
         ],
         "running": running,
+        "result_waiting": result_waiting,
+        "never_prepared": never_prepared,
+        "dispatch_lost": dispatch_lost,
         "over_budget_tasks": over_budget,
         "merge_queue": merge_queue,
         "rechecks": sorted(state.get("rechecks") or {}),
@@ -5741,6 +6513,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Restore merges the frame-preservation check refused, when the result passes that check on the tree now",
     )
+    p_req.add_argument(
+        "--force",
+        action="store_true",
+        help="Requeue even when a valid result.json is waiting on disk or a running agent is younger than its wall_budget_s",
+    )
     sub.add_parser("status", help="Counts, ready/running tasks, gates and the remaining critical path")
     args = parser.parse_args(argv)
 
@@ -5791,7 +6568,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.memory_refused:
                 out = cmd_requeue_memory_refused()
             else:
-                out = cmd_requeue(args.agent_id, args.stale_minutes)
+                out = cmd_requeue(args.agent_id, args.stale_minutes, force=args.force)
         else:
             out = cmd_status()
     except (SchedulerError, ledger.LedgerError, ArtifactError, RunLockTimeout) as exc:

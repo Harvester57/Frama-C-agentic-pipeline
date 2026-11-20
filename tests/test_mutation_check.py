@@ -15,7 +15,12 @@ import pytest  # noqa: E402
 
 import generate_report as gr  # noqa: E402
 import mutation_check as mc  # noqa: E402
-from acsl_ast import _find_body_brace_offset  # noqa: E402
+from acsl_ast import (  # noqa: E402
+    Span,
+    _find_body_brace_offset,
+    function_declaration_spans,
+    locate_function_span,
+)
 
 SRC = """\
 /*@
@@ -302,7 +307,10 @@ def test_default_runner_requests_no_counter_examples(monkeypatch: pytest.MonkeyP
             ["--no-warn-unsigned", "--wrap-code-lines=1,4", "--wp-model", "Bytes"],
             {"unsigned_reduced": True, "wp_model": "Bytes"},
         ),
-        (["--no-warn-invalid-pointer", "--wp-model=Typed+ref+int"], {"warn_invalid_pointer": False, "wp_model": "Typed+ref+int"}),
+        (
+            ["--no-warn-invalid-pointer", "--wp-model=Typed+ref+int"],
+            {"warn_invalid_pointer": False, "wp_model": "Typed+ref+int"},
+        ),
         (["--no-warn-unsigned", "--waive-signed-downcast"], {"unsigned_reduced": True, "warn_signed_downcast": False}),
     ],
 )
@@ -341,7 +349,9 @@ def test_mutants_replay_the_model_and_checks_the_proof_used(monkeypatch: pytest.
     assert f["wp_flags"] == ["--no-warn-unsigned", "--wrap-code-lines=2", "--wp-model", "Bytes"]
 
 
-def test_mutants_of_a_default_proof_keep_the_parent_check_flags(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_mutants_of_a_default_proof_keep_the_parent_check_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     seen: list[dict] = []
 
     def fake(c_file, fn_name, out_dir, **kwargs):
@@ -581,3 +591,342 @@ def test_report_lists_functions_whose_mutants_failed_to_preprocess(tmp_path: Pat
     section = "\n".join(gr.spec_quality_section({"run_dir": run_dir, "ledger": [], "mutation": doc}))
     assert "failed to preprocess (setup, not the contract)" in section
     assert "not checked: `sum`" in section
+
+
+BODY_ANNOTS_SRC = """\
+/*@
+  requires n >= 0;
+  ensures \\result >= 0;
+*/
+int count_up(int n) {
+  int i = 0;
+  /*@ loop invariant 0 <= i <= n;
+      loop assigns i;
+  */
+  for (; i < n; i++) {}
+  /*@ requires i == n;
+      ensures i >= 0;
+  */
+  { i = n; }
+  //@ assert i == n;
+  return i;
+}
+"""
+
+BODY_ONLY_ANNOTS_SRC = """\
+int clamp_body_only(int x) {
+  /*@ requires x < 0 || x >= 0;
+      ensures x >= 0;
+  */
+  if (x < 0) x = 0;
+  //@ assert x >= 0;
+  return x;
+}
+"""
+
+
+def test_acsl_text_of_span_ignores_body_annotations() -> None:
+    span = locate_function_span(BODY_ANNOTS_SRC, "count_up", is_header=False, path="c.c")
+    assert span is not None
+    contract = mc._acsl_text_of_span(span)
+    assert contract == "/*@\n  requires n >= 0;\n  ensures \\result >= 0;\n*/"
+    assert "loop invariant" not in contract
+    assert "ensures i >= 0;" not in contract
+    assert "assert" not in contract
+
+    mutants = dict(mc.spec_mutants(contract, 6))
+    assert list(mutants) == ["drop-ensures-0", "weaken-ensures-0", "ensures-true"]
+    assert "ensures \\result > 0;" in mutants["weaken-ensures-0"]
+
+    body_only_span = locate_function_span(BODY_ONLY_ANNOTS_SRC, "clamp_body_only", is_header=False, path="c.c")
+    assert body_only_span is not None
+    assert mc._acsl_text_of_span(body_only_span) == ""
+    assert mc.spec_mutants(mc._acsl_text_of_span(body_only_span), 6) == []
+
+
+def test_check_function_keeps_body_annotations_intact_across_spec_mutants(tmp_path: Path) -> None:
+    c_file = _write(tmp_path, "count.c", BODY_ANNOTS_SRC)
+    orig_body = BODY_ANNOTS_SRC[BODY_ANNOTS_SRC.index("{") :]
+    spec_texts: dict[str, str] = {}
+
+    def runner(mut_file, fn, out_dir, cppflags="-I."):
+        name = Path(out_dir).name
+        if name.startswith("wp-spec-"):
+            spec_texts[name] = Path(mut_file).read_text(encoding="utf-8")
+        return {"status": "all_proven"}
+
+    res = mc.check_function(c_file, "count_up", "-I.", tmp_path / "out", wp_runner=runner)
+    assert res["spec_mutants"] == 3
+    assert sorted(spec_texts) == ["wp-spec-drop-ensures-0", "wp-spec-ensures-true", "wp-spec-weaken-ensures-0"]
+    for name, text in spec_texts.items():
+        brace = text.index("{")
+        header, body = text[:brace], text[brace:]
+        assert body == orig_body, f"{name} altered body annotations"
+        assert "loop invariant" not in header and "ensures i >= 0;" not in header and "assert" not in header
+        assert "requires n >= 0;" in header
+    assert "ensures \\result >= 0;" not in spec_texts["wp-spec-drop-ensures-0"]
+    assert "ensures \\result > 0;" in spec_texts["wp-spec-weaken-ensures-0"]
+    assert "ensures \\true;" in spec_texts["wp-spec-ensures-true"]
+
+    body_only_file = _write(tmp_path, "body_only.c", BODY_ONLY_ANNOTS_SRC)
+    body_only_res = mc.check_function(
+        body_only_file,
+        "clamp_body_only",
+        "-I.",
+        tmp_path / "out2",
+        wp_runner=lambda *a, **k: {"status": "all_proven"},
+    )
+    assert body_only_res["spec_mutants"] == 0
+    assert body_only_res["completeness"] is None
+
+
+def test_check_function_multi_block_indented_contract_keeps_body_annotations(tmp_path: Path) -> None:
+    src = (
+        "  //@ requires n >= 0;\n"
+        "  //@ ensures \\result >= 0;\n"
+        "  //@ ensures \\result <= n;\n"
+        "  int f(int n) {\n"
+        "    int i = 0;\n"
+        "    /*@ loop invariant 0 <= i <= n; */\n"
+        "    for (; i < n; i++) {}\n"
+        "    /*@ ensures i >= 0; */\n"
+        "    { i = n; }\n"
+        "    //@ assert i == n;\n"
+        "    return i;\n"
+        "  }\n"
+    )
+    c_file = _write(tmp_path, "multi.c", src)
+    orig_body = src[src.index("{") :]
+    spec_texts: dict[str, str] = {}
+
+    def runner(mut_file, fn, out_dir, cppflags="-I."):
+        name = Path(out_dir).name
+        if name.startswith("wp-spec-"):
+            spec_texts[name] = Path(mut_file).read_text(encoding="utf-8")
+        return {"status": "all_proven"}
+
+    res = mc.check_function(c_file, "f", "-I.", tmp_path / "out", wp_runner=runner)
+    # 2 ensures clauses -> 2 drops + 2 weakens + 1 ensures-true = 5 spec mutants (none from body's ensures i >= 0).
+    assert res["spec_mutants"] == 5
+    for name, text in spec_texts.items():
+        brace = text.index("{")
+        header, body = text[:brace], text[brace:]
+        assert body == orig_body, f"{name} dropped or altered body annotations"
+        assert "requires n >= 0;" in header
+        assert "loop invariant" not in header and "ensures i >= 0;" not in header
+    assert "ensures \\result > 0;" in spec_texts["wp-spec-weaken-ensures-0"]
+    assert "ensures \\result < n;" in spec_texts["wp-spec-weaken-ensures-1"]
+
+
+def test_acsl_text_of_span_contract_shapes() -> None:
+    # 1. Single-block contract
+    single = "/*@ requires x >= 0; ensures \\result >= x; */\nint id(int x) { return x; }\n"
+    single_span = locate_function_span(single, "id", is_header=False, path="s.c")
+    assert single_span is not None
+    assert mc._acsl_text_of_span(single_span) == "/*@ requires x >= 0; ensures \\result >= x; */"
+
+    # 2. Multi-block contract (two /*@ ... */ blocks) with a body statement contract
+    multi = (
+        "/*@ requires x >= 0; */\n\n"
+        "/*@ ensures \\result >= x; */\n"
+        "int id2(int x) {\n"
+        "  /*@ ensures x >= 0; */\n"
+        "  return x;\n"
+        "}\n"
+    )
+    multi_span = locate_function_span(multi, "id2", is_header=False, path="m.c")
+    assert multi_span is not None
+    assert mc._acsl_text_of_span(multi_span) == "/*@ requires x >= 0; */\n/*@ ensures \\result >= x; */"
+
+    # 3. Prototype + static inline definition in a header (both Span and DeclSpan)
+    hdr = (
+        "/*@ requires x >= 0; ensures \\result >= 0; */\n"
+        "static inline int inc(int x);\n\n"
+        "/*@ ensures \\result == x + 1; */\n"
+        "static inline int inc(int x) {\n"
+        "  /*@ ensures x >= 0; */\n"
+        "  return x + 1;\n"
+        "}\n"
+    )
+    proto_span = locate_function_span(hdr, "inc", is_header=True, path="h.h")
+    def_span = locate_function_span(hdr, "inc", is_header=False, path="h.h")
+    assert proto_span is not None and def_span is not None
+    assert mc._acsl_text_of_span(proto_span) == "/*@ requires x >= 0; ensures \\result >= 0; */"
+    assert mc._acsl_text_of_span(def_span) == "/*@ ensures \\result == x + 1; */"
+    decls = function_declaration_spans(hdr, "inc", path="h.h")
+    assert [d.kind for d in decls] == ["prototype", "definition"]
+    assert mc._acsl_text_of_span(decls[0]) == "/*@ requires x >= 0; ensures \\result >= 0; */"
+    assert mc._acsl_text_of_span(decls[1]) == "/*@ ensures \\result == x + 1; */"
+
+    # 4. Continuation `@` markers, `//` comment, and string literal inside the contract + body statement contract
+    cont = (
+        "/*@\n"
+        "  @ // ensures \\result == 999;\n"
+        '  @ requires p != "ensures x <= 0;";\n'
+        "  @ requires x >= 0;\n"
+        "  @ ensures \\result >= x;\n"
+        "  @*/\n"
+        "int cont_fn(const char *p, int x) {\n"
+        "  /*@ ensures x >= 0; */\n"
+        "  return x;\n"
+        "}\n"
+    )
+    cont_span = locate_function_span(cont, "cont_fn", is_header=False, path="c.c")
+    assert cont_span is not None
+    cont_contract = mc._acsl_text_of_span(cont_span)
+    assert "ensures \\result >= x;" in cont_contract
+    assert "ensures x >= 0;" not in cont_contract
+    cont_muts = dict(mc.spec_mutants(cont_contract, 6))
+    assert list(cont_muts) == ["drop-ensures-0", "weaken-ensures-0", "ensures-true"]
+    assert "// ensures \\result == 999;" in cont_muts["weaken-ensures-0"]
+    assert '"ensures x <= 0;"' in cont_muts["weaken-ensures-0"]
+    assert "ensures \\result > x;" in cont_muts["weaken-ensures-0"]
+    spliced = mc._replace_contract_in_span(cont_span.text, cont_contract, cont_muts["weaken-ensures-0"])
+    assert "ensures \\result > x;" in spliced and "/*@ ensures x >= 0; */" in spliced
+
+    # 5. Malformed span (unclosed ACSL comment) returns empty string cleanly
+    bad = Span(function="bad", start_byte=0, end_byte=10, start_line=1, end_line=1, text="/*@ unclosed")
+    assert mc._acsl_text_of_span(bad) == ""
+
+
+STATIC_A_SRC = """\
+/*@
+  ensures \\result == x;
+*/
+static int helper(int x) {
+  return x;
+}
+"""
+
+STATIC_B_SRC = """\
+/*@
+  requires \\valid(p);
+  assigns *p;
+*/
+static void helper(int *p) {
+  if (*p < 0) *p = 0;
+}
+"""
+
+
+def test_run_mutation_check_discovers_same_named_static_functions_under_work(tmp_path: Path) -> None:
+    import workspace_overlay as wo
+
+    run_dir = tmp_path / "run"
+    work = run_dir / "workspace" / "work"
+    (work / "src" / "a").mkdir(parents=True)
+    (work / "src" / "b").mkdir(parents=True)
+    (work / "src" / "a" / "x.c").write_text(STATIC_A_SRC, encoding="utf-8")
+    (work / "src" / "b" / "y.c").write_text(STATIC_B_SRC, encoding="utf-8")
+
+    rep_a = run_dir / "workspace" / wo.baseline_wp_report_rel("src/a/x.c", "helper")
+    rep_b = run_dir / "workspace" / wo.baseline_wp_report_rel("src/b/y.c", "helper")
+    rep_a.parent.mkdir(parents=True, exist_ok=True)
+    rep_a.write_text(
+        json.dumps({"status": "all_proven", "function": "helper", "file": "workspace/work/src/a/x.c"}),
+        encoding="utf-8",
+    )
+    rep_b.write_text(
+        json.dumps({"status": "all_proven", "function": "helper", "file": "/framac-run/workspace/work/src/b/y.c"}),
+        encoding="utf-8",
+    )
+    assert not (run_dir / "workspace" / "reports" / "wp" / "helper.json").exists()
+
+    seen_files: set[str] = set()
+
+    def runner(c_file, fn, out_dir, cppflags="-I."):
+        text = Path(c_file).read_text(encoding="utf-8")
+        seen_files.add(Path(c_file).name)
+        if "{ return 0; }" in text:
+            return _unproven(("ensures", "Unknown"))
+        return {"status": "all_proven"}
+
+    doc = mc.run_mutation_check(run_dir, wp_runner=runner)
+    assert sorted(doc["functions"]) == ["src/a/x.c#helper", "src/b/y.c#helper"]
+    assert doc["totals"]["functions"] == 2
+    assert seen_files == {"x.c", "y.c"}
+    assert doc["functions"]["src/a/x.c#helper"]["function"] == "helper"
+    assert doc["functions"]["src/b/y.c#helper"]["function"] == "helper"
+    assert doc["functions"]["src/a/x.c#helper"]["trivial_body_rejected"] is True
+    assert doc["functions"]["src/b/y.c#helper"]["trivial_body_rejected"] is False
+    assert doc["totals"]["trivial_body_accepted_functions"] == ["src/b/y.c#helper"]
+
+
+def test_run_mutation_check_deduplicates_canonical_over_work_baseline(tmp_path: Path) -> None:
+    import workspace_overlay as wo
+
+    run_dir = _fake_run(tmp_path)
+    # Write the canonical report first and the older baseline report afterwards to verify
+    # precedence relies on canonical location rather than filesystem mtime order.
+    canonical = run_dir / "workspace" / "reports" / "wp" / "sum.json"
+    work_rep = run_dir / "workspace" / wo.baseline_wp_report_rel("m.c", "sum")
+    work_rep.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text(
+        json.dumps({"status": "all_proven", "function": "sum", "file": "m.c"}),
+        encoding="utf-8",
+    )
+    work_rep.write_text(
+        json.dumps({"status": "unproven_goals_remain", "function": "sum", "file": "/framac-run/workspace/work/m.c"}),
+        encoding="utf-8",
+    )
+
+    checked_calls = 0
+
+    def runner(c_file, fn, out_dir, cppflags="-I."):
+        nonlocal checked_calls
+        checked_calls += 1
+        return {"status": "all_proven"}
+
+    doc = mc.run_mutation_check(run_dir, wp_runner=runner)
+    assert list(doc["functions"]) == ["sum"]
+    assert doc["totals"]["functions"] == 1
+    assert checked_calls == doc["functions"]["sum"]["spec_mutants"] + doc["functions"]["sum"]["impl_mutants"]
+
+    # Conversely, if the canonical top-level report is no longer all_proven, the older
+    # all_proven baseline under work/ must not cause the function to be checked.
+    canonical.write_text(
+        json.dumps({"status": "unproven_goals_remain", "function": "sum", "file": "m.c"}),
+        encoding="utf-8",
+    )
+    work_rep.write_text(
+        json.dumps({"status": "all_proven", "function": "sum", "file": "m.c"}),
+        encoding="utf-8",
+    )
+    doc2 = mc.run_mutation_check(run_dir, wp_runner=runner)
+    assert doc2["totals"]["functions"] == 0
+
+
+def test_run_mutation_check_ignores_non_report_artifacts_under_work(tmp_path: Path) -> None:
+    import workspace_overlay as wo
+
+    run_dir = tmp_path / "run"
+    (run_dir / "workspace" / "work").mkdir(parents=True)
+    (run_dir / "workspace" / "work" / "m.c").write_text(SRC, encoding="utf-8")
+    wp_work = run_dir / "workspace" / "reports" / "wp" / "work"
+    wp_work.mkdir(parents=True)
+
+    valid = run_dir / "workspace" / wo.baseline_wp_report_rel("m.c", "sum")
+    valid.write_text(json.dumps({"status": "all_proven", "function": "sum", "file": "m.c"}), encoding="utf-8")
+
+    # Non-report artifacts that must be ignored cleanly.
+    (wp_work / "m_c_sum.wp-report-json").write_text(
+        json.dumps({"status": "all_proven", "function": "bogus", "file": "m.c"}),
+        encoding="utf-8",
+    )
+    (wp_work / "summary.json").write_text(json.dumps({"results": [{"status": "all_proven"}]}), encoding="utf-8")
+    (wp_work / "no_file.json").write_text(json.dumps({"status": "all_proven", "function": "other"}), encoding="utf-8")
+    (wp_work / "guardrail.json").write_text(
+        json.dumps({"mode": "guardrail", "status": "all_proven", "function": "other", "file": "m.c"}),
+        encoding="utf-8",
+    )
+    (wp_work / "corrupt.json").write_text("{not json", encoding="utf-8")
+    nested = wp_work / "m_c_sum"
+    nested.mkdir()
+    (nested / "wp_sum.json").write_text(
+        json.dumps({"status": "all_proven", "function": "nested", "file": "m.c"}),
+        encoding="utf-8",
+    )
+
+    doc = mc.run_mutation_check(run_dir, wp_runner=lambda *a, **k: {"status": "all_proven"})
+    assert list(doc["functions"]) == ["sum"]
+    assert doc["totals"]["functions"] == 1

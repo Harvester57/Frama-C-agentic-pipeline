@@ -32,8 +32,9 @@ reports it as analysis_error with a `preprocessing_failed` reason, older reports
 acsl_syntax_error), else the WP status. A function whose every
 mutant failed to preprocess gets an `error` instead of a score.
 
-Runs only on functions whose parent WP report (workspace/reports/wp/<fn>.json)
-is all_proven, judges every mutant under the WP model and checks that proof used
+Runs only on functions whose WP report (workspace/reports/wp/<fn>.json or
+workspace/reports/wp/work/<slug>_<fn>.json) is all_proven, judges every mutant
+under the WP model and checks that proof used
 (workspace_overlay.infer_prover_wp_flags, recorded per function as `wp_flags` /
 `wp_options`), writes workspace/reports/mutation.json, and generate_report.py
 renders it as a "Specification quality" section. Purely evaluative: it never
@@ -50,14 +51,32 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import run_wp_function  # noqa: E402
-from acsl_ast import _find_body_brace_offset, iter_clauses, locate_function_span, tokenize_c_acsl  # noqa: E402
-from framac_common import _CPP_ERROR_RE, atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from acsl_ast import (  # noqa: E402
+    AcslError,
+    DeclSpan,
+    Span,
+    _find_body_brace_offset,
+    declaration_contract_text,
+    iter_clauses,
+    locate_function_span,
+    tokenize_c_acsl,
+)
+from fingerprint import normalize_file  # noqa: E402
+from framac_common import (  # noqa: E402
+    _CPP_ERROR_RE,
+    ArtifactError,
+    atomic_write_json,
+    load_json_optional,
+    utc_now,
+)
 
 MUTATION_SCHEMA = 1
 DEFAULT_MAX_FUNCTIONS = 20
@@ -95,12 +114,17 @@ def stub_enabled() -> bool:
     return os.environ.get("FRAMAC_MUTATION_STUB", "on").strip().lower() != "off"
 
 
-def _acsl_text_of_span(span) -> str:
+def _acsl_text_of_span(span: Span | DeclSpan) -> str:
+    """The ACSL contract in front of a function declaration span, without body annotations."""
+    if isinstance(span, DeclSpan):
+        decl = span
+    else:
+        kind = "prototype" if span.text.rstrip().endswith(";") else "definition"
+        decl = DeclSpan(kind=kind, span=span)
     try:
-        tokens = tokenize_c_acsl(span.text, path=span.function)
-    except Exception:
+        return declaration_contract_text(decl, path=decl.span.function)
+    except AcslError:
         return ""
-    return "\n".join(t.text for t in tokens if t.kind in ("acsl_block", "acsl_line"))
 
 
 def spec_mutants(contract_acsl: str, max_mutants: int) -> list[tuple[str, str]]:
@@ -119,7 +143,9 @@ def spec_mutants(contract_acsl: str, max_mutants: int) -> list[tuple[str, str]]:
             out.append((f"weaken-ensures-{i}", contract_acsl[: span[0]] + flipped + contract_acsl[span[1] :]))
     if ensures and len(out) < max_mutants:
         first_span, _ = ensures[0]
-        out.append(("ensures-true", contract_acsl[: first_span[0]] + r"ensures \true;" + contract_acsl[first_span[1] :]))
+        out.append(
+            ("ensures-true", contract_acsl[: first_span[0]] + r"ensures \true;" + contract_acsl[first_span[1] :])
+        )
     return out[:max_mutants]
 
 
@@ -501,11 +527,13 @@ def check_function(
 
 
 def _replace_contract_in_span(span_text: str, old_contract: str, new_contract: str) -> str:
-    """Swap the ACSL contract text inside the span, leaving C tokens untouched."""
-    if old_contract and old_contract in span_text:
-        return span_text.replace(old_contract, new_contract, 1)
-    # Fallback: replace the leading ACSL block(s) before the first C token of the body.
-    tokens = tokenize_c_acsl(span_text, path="<span>")
+    """Swap the ACSL contract text in front of the declaration, leaving C code and body annotations untouched."""
+    brace = _find_body_brace_offset(span_text, path="<span>")
+    header, body = (span_text[:brace], span_text[brace:]) if brace is not None else (span_text, "")
+    if old_contract and old_contract in header:
+        return header.replace(old_contract, new_contract, 1) + body
+    # Fallback: replace the contract ACSL block(s)/line(s) before the body `{`.
+    tokens = tokenize_c_acsl(header, path="<span>")
     out = []
     replaced = False
     for t in tokens:
@@ -516,7 +544,7 @@ def _replace_contract_in_span(span_text: str, old_contract: str, new_contract: s
             continue
         else:
             out.append(t.text)
-    return "".join(out) if replaced else span_text
+    return "".join(out) + body if replaced else span_text
 
 
 def classify_open_unit(wp_report: dict | None) -> str:
@@ -541,6 +569,175 @@ def classify_open_unit(wp_report: dict | None) -> str:
     return "spec_limited"
 
 
+_DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:/")
+
+
+def _is_absolute_raw_path(raw: Any) -> bool:
+    text = str(raw or "").replace("\\", "/").strip()
+    return text.startswith("/") or bool(_DRIVE_ABS_RE.match(text))
+
+
+def _normalize_wp_file(raw_file: str | None, run_dir: Path | None = None) -> str:
+    """Repository-relative posix path of a WP report's `file`, or '' when absent."""
+    raw = str(raw_file or "").strip()
+    if not raw:
+        return ""
+    if run_dir is not None:
+        raw_path = Path(raw)
+        if raw_path.is_absolute():
+            for base in (run_dir / "workspace" / "work", run_dir / "workspace" / "baseline", run_dir):
+                try:
+                    return normalize_file(raw_path.resolve().relative_to(base.resolve()).as_posix())
+                except (OSError, ValueError):
+                    continue
+    norm = normalize_file(raw)
+    return "" if norm == "unknown" and raw.lower() != "unknown" else norm
+
+
+def _load_json_safe(path: Path) -> Any:
+    try:
+        return load_json_optional(path, None)
+    except (ArtifactError, OSError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class DiscoveredWpReport:
+    """One deduplicated per-function WP verdict report under `workspace/reports/wp/`."""
+
+    file: str
+    function: str
+    path: Path
+    report: dict[str, Any]
+    canonical: bool
+
+
+def _wp_report_rank(path: Path, canonical: bool, norm_file: str, fn: str) -> tuple[int, int, int, str]:
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    if canonical:
+        exact_name = int(path.name == f"{fn}.json")
+    else:
+        exact_name = 0
+        if norm_file:
+            import workspace_overlay
+
+            exact_name = int(path.name == f"{workspace_overlay.wp_work_slug(norm_file)}_{fn}.json")
+    return (int(canonical), exact_name, mtime_ns, path.as_posix())
+
+
+def discover_wp_reports(run_dir: Path) -> list[DiscoveredWpReport]:
+    """
+    Discover valid per-function WP verdict reports in both `workspace/reports/wp/*.json`
+    (canonical top-level reports) and `workspace/reports/wp/work/*.json` (per-file baseline
+    reports, including same-named static functions that have no name-only canonical copy).
+
+    Deduplicates by `(normalized_file, function)`, preferring the canonical top-level
+    `reports/wp/<fn>.json` over an older `reports/wp/work/<slug>_<fn>.json` for the same
+    `(file, function)`. Ignores non-report artifacts (`*.wp-report-json`, guardrail reports,
+    subdirectories under `work/`, corrupt JSON, and objects missing `status`/`function`).
+    """
+    run_dir = Path(run_dir)
+    wp_dir = run_dir / "workspace" / "reports" / "wp"
+    if not wp_dir.is_dir():
+        return []
+    sources: list[tuple[Path, bool]] = [(wp_dir, True)]
+    work_wp_dir = wp_dir / "work"
+    if work_wp_dir.is_dir():
+        sources.append((work_wp_dir, False))
+    best: dict[tuple[str, str], tuple[tuple[int, int, int, str], DiscoveredWpReport]] = {}
+    for directory, canonical in sources:
+        for path in sorted(directory.glob("*.json")):
+            if not path.is_file():
+                continue
+            raw = _load_json_safe(path)
+            if not isinstance(raw, dict) or raw.get("mode") == "guardrail":
+                continue
+            status = raw.get("status")
+            fn = raw.get("function")
+            if not isinstance(status, str) or not status.strip() or not isinstance(fn, str) or not fn.strip():
+                continue
+            raw_file = raw.get("file")
+            if raw_file is not None and not isinstance(raw_file, str):
+                continue
+            norm_file = _normalize_wp_file(raw_file, run_dir)
+            if not canonical and not norm_file:
+                continue
+            key = (norm_file, fn.strip())
+            rank = _wp_report_rank(path, canonical, norm_file, key[1])
+            existing = best.get(key)
+            if existing is None or rank > existing[0]:
+                best[key] = (
+                    rank,
+                    DiscoveredWpReport(
+                        file=norm_file,
+                        function=key[1],
+                        path=path,
+                        report=raw,
+                        canonical=canonical,
+                    ),
+                )
+    return sorted((item for _, item in best.values()), key=lambda r: (r.file, r.function))
+
+
+class WpReportIndex:
+    """Lookup over deduplicated WP reports by `(normalized_file, function)`."""
+
+    def __init__(self, reports: Sequence[DiscoveredWpReport], run_dir: Path | None = None) -> None:
+        self.reports = list(reports)
+        self._run_dir = run_dir
+        self._by_key: dict[tuple[str, str], DiscoveredWpReport] = {(r.file, r.function): r for r in self.reports}
+        self._by_fn: dict[str, list[DiscoveredWpReport]] = {}
+        for r in self.reports:
+            self._by_fn.setdefault(r.function, []).append(r)
+
+    def get(self, c_file: str | None, function: str) -> dict[str, Any] | None:
+        if not function:
+            return None
+        want_file = _normalize_wp_file(c_file, self._run_dir)
+        if want_file:
+            exact = self._by_key.get((want_file, function))
+            if exact is not None:
+                return exact.report
+            suffix_hits = [
+                r
+                for r in self._by_fn.get(function, ())
+                if r.file and _is_absolute_raw_path(r.report.get("file")) and r.file.endswith("/" + want_file)
+            ]
+            if len(suffix_hits) == 1:
+                return suffix_hits[0].report
+        legacy = self._by_key.get(("", function))
+        if legacy is not None:
+            return legacy.report
+        if not want_file:
+            matches = self._by_fn.get(function, ())
+            if len(matches) == 1:
+                return matches[0].report
+        return None
+
+
+def _resolve_work_c_file(work: Path, norm_file: str, raw_file: str) -> Path | None:
+    if norm_file:
+        cand = work / norm_file
+        if cand.is_file():
+            return cand
+    if raw_file:
+        raw_path = Path(raw_file)
+        if raw_path.is_file():
+            return raw_path
+        if not raw_path.is_absolute():
+            cand = work / raw_path
+            if cand.is_file():
+                return cand
+        # The report's file path may be agent-scratch relative; try workspace/work by name.
+        cand = work / raw_path.name
+        if cand.is_file():
+            return cand
+    return None
+
+
 def _module_cppflags_resolver(run_dir: Path):
     """
     (work-relative file, function) -> (cppflags, source) with the module's WP cppflags, as wp-sweep proves with.
@@ -560,7 +757,8 @@ def _module_cppflags_resolver(run_dir: Path):
         by_fn: dict[str, set[str]] = {}
         for unit in ledger if isinstance(ledger, list) else []:
             if isinstance(unit, dict) and unit.get("module") and unit.get("function"):
-                modules[(str(unit.get("file")), str(unit["function"]))] = str(unit["module"])
+                unit_file = _normalize_wp_file(str(unit.get("file") or ""), run_dir)
+                modules[(unit_file, str(unit["function"]))] = str(unit["module"])
                 by_fn.setdefault(str(unit["function"]), set()).add(str(unit["module"]))
         plan = pipeline_make.build_plan(run_dir) if modules else None
     except Exception as exc:  # no build plan: keep the old default, but say so
@@ -592,52 +790,55 @@ def run_mutation_check(
 ) -> dict:
     """Run the mutation check over all all_proven functions of a run directory."""
     run_dir = Path(run_dir)
-    wp_dir = run_dir / "workspace" / "reports" / "wp"
     work = run_dir / "workspace" / "work"
     out_path = out_path or run_dir / "workspace" / "reports" / "mutation.json"
     doc: dict[str, Any] = {"schema": MUTATION_SCHEMA, "generated_at": utc_now(), "functions": {}}
     skipped: list[dict] = []
     flags_for = _module_cppflags_resolver(run_dir)
-    if wp_dir.is_dir():
-        reports = sorted(wp_dir.glob("*.json"))
-        for rep_path in reports[:max_functions]:
-            rep = load_json_optional(rep_path, {})
-            if rep.get("status") != "all_proven":
-                continue
-            fn = str(rep.get("function") or rep_path.stem)
-            c_file = Path(str(rep.get("file") or ""))
-            if not c_file.is_absolute():
-                c_file = work / c_file
-            if not c_file.is_file():
-                # The report's file path may be agent-scratch relative; try workspace/work by name.
-                cand = work / c_file.name
-                c_file = cand if cand.is_file() else c_file
-            if not c_file.is_file():
-                continue
-            try:
-                rel = c_file.resolve().relative_to(work.resolve()).as_posix()
-            except ValueError:
-                rel = c_file.name
-            cppflags, source = flags_for(rel, fn)
-            if cppflags is None:
-                skipped.append({"function": fn, "file": rel, "reason": source})
-                continue
-            # The mutants are judged under the model and checks the original contract was proved with (a
-            # proof under Bytes or with the unsigned checks off does not hold under the defaults).
-            wp_flags = _proof_wp_flags(run_dir, rel, fn)
-            wp_options, _ = wp_options_from_flags(wp_flags)
-            result = check_function(
-                c_file,
-                fn,
-                cppflags,
-                run_dir / "workspace" / "reports" / "mutation-wp",
-                wp_runner=wp_runner or _default_runner(wp_options),
-                max_mutants=max_mutants,
-            )
-            result["cppflags_source"] = source
-            result["wp_flags"] = wp_flags
-            result["wp_options"] = wp_options
-            doc["functions"][fn] = result
+    discovered = discover_wp_reports(run_dir)
+    files_by_fn: dict[str, set[str]] = {}
+    for item in discovered:
+        if item.file:
+            files_by_fn.setdefault(item.function, set()).add(item.file)
+    ledger_data = _load_json_safe(run_dir / "coverage-ledger.json")
+    if isinstance(ledger_data, list):
+        for unit in ledger_data:
+            if isinstance(unit, dict) and unit.get("function") and unit.get("file"):
+                norm_u = _normalize_wp_file(str(unit["file"]), run_dir)
+                if norm_u:
+                    files_by_fn.setdefault(str(unit["function"]), set()).add(norm_u)
+    shared_names = {fn for fn, files in files_by_fn.items() if len(files) > 1}
+    proven = [item for item in discovered if item.report.get("status") == "all_proven"]
+    for item in proven[:max_functions]:
+        fn = item.function
+        c_file = _resolve_work_c_file(work, item.file, str(item.report.get("file") or ""))
+        if c_file is None:
+            continue
+        try:
+            rel = c_file.resolve().relative_to(work.resolve()).as_posix()
+        except ValueError:
+            rel = item.file or c_file.name
+        cppflags, source = flags_for(rel, fn)
+        if cppflags is None:
+            skipped.append({"function": fn, "file": rel, "reason": source})
+            continue
+        # The mutants are judged under the model and checks the original contract was proved with (a
+        # proof under Bytes or with the unsigned checks off does not hold under the defaults).
+        wp_flags = _proof_wp_flags(run_dir, rel, fn)
+        wp_options, _ = wp_options_from_flags(wp_flags)
+        result = check_function(
+            c_file,
+            fn,
+            cppflags,
+            run_dir / "workspace" / "reports" / "mutation-wp",
+            wp_runner=wp_runner or _default_runner(wp_options),
+            max_mutants=max_mutants,
+        )
+        result["cppflags_source"] = source
+        result["wp_flags"] = wp_flags
+        result["wp_options"] = wp_options
+        entry_key = f"{rel}#{fn}" if fn in shared_names or fn in doc["functions"] else fn
+        doc["functions"][entry_key] = result
     if skipped:
         doc["skipped"] = skipped
     totals: dict[str, Any] = {

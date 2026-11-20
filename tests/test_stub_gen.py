@@ -291,6 +291,44 @@ def test_missing_model_fails(run_dir):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "block",
+    [
+        "/* fc-stub: f */\n/*@\n  requires \\valid(p);\n  // assigns *p \\from p;\n*/\nextern void f(int *p);\n",
+        "/* fc-stub: f */\n/*@\n  requires \\valid(p);\n  //@ assigns *p \\from p;\n*/\nextern void f(int *p);\n",
+        "/* fc-stub: f */\n/*@* assigns \\nothing; */\nextern void f(int *p);\n",
+        "/* fc-stub: f */\n/*@{ assigns \\nothing; */\nextern void f(int *p);\n",
+        "/* fc-stub: f */\n//@* assigns \\nothing;\nextern void f(int *p);\n",
+        "/* fc-stub: f */\n//@ requires \\valid(p); //@ assigns *p \\from p;\nextern void f(int *p);\n",
+        '/* fc-stub: f */\n/*@ requires s != "assigns \\nothing;"; */\nextern void f(const char *s);\n',
+        "/* fc-stub: f */\n/* assigns \\nothing; */\nextern int f(int assigns);\n",
+    ],
+)
+def test_block_state_ignores_commented_nested_and_doxygen_assigns(block):
+    assert stub_gen.block_state(block) == "incomplete"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "block",
+    [
+        "/* fc-stub: f */\n/*@ assigns @ \\result \\from x; */\nextern int f(int x);\n",
+        (
+            "/* fc-stub: f */\n"
+            "/*@ // frame\n"
+            "  @ assigns // comment\n"
+            "  @   *p \\from p; // note\n"
+            "  @*/\n"
+            "extern void f(int *p);\n"
+        ),
+        "/* fc-stub: f */\n//@ assigns \\nothing;\nextern void f(void);\n",
+    ],
+)
+def test_block_state_accepts_real_assigns_with_comments_and_at_signs(block):
+    assert stub_gen.block_state(block) == "filled"
+
+
+@pytest.mark.unit
 def test_brief_names_the_header_and_its_open_functions(stub_run, run_dir, capsys):
     stub_run()
     capsys.readouterr()

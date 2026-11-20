@@ -92,6 +92,12 @@ def _prototype_name(stmt: list[Token]) -> str | None:
     return None
 
 
+# Standalone semicolon-less Frama-C / glibc header guard macros that expand to `_Pragma(...)` or
+# `extern "C" {` / `}`. They never begin a function declaration and must not swallow a following
+# prototype's `/*@ ... */` contract.
+_NO_SEMI_GUARD_MACROS = frozenset({"__PUSH_FC_STDLIB", "__POP_FC_STDLIB", "__BEGIN_DECLS", "__END_DECLS"})
+
+
 def parse_prototypes(source: str, path: str = "<input>") -> list[Prototype]:
     """List the top-level function prototypes in a header, each with its immediately preceding ACSL block.
 
@@ -125,6 +131,9 @@ def parse_prototypes(source: str, path: str = "<input>") -> list[Prototype]:
         if tok.kind in ("pp_directive", "acsl_line"):
             if not stmt:
                 pending_contract = None
+            continue
+        if not stmt and tok.kind == "c_token" and tok.text in _NO_SEMI_GUARD_MACROS:
+            pending_contract = None
             continue
         if tok.kind == "c_token" and tok.text == "{":
             if len(stmt) == 2 and stmt[0].text == "extern" and stmt[1].kind == "string":

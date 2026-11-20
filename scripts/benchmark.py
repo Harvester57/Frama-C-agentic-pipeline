@@ -43,7 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from benchmark_compare import SCHEMA_VERSION, Tolerances, compare_runs, load_run, rate_block, render_text  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file  # noqa: E402
 from minischema import Validator, load_schema  # noqa: E402
-from mutation_check import summarize_mutation  # noqa: E402
+from mutation_check import discover_wp_reports, summarize_mutation  # noqa: E402
 from patterns import KERNEL_RENAME_RE  # noqa: E402
 from resources import FUZZ_RSS_LIMIT_MB, WP_MEMLIMIT_MB  # noqa: E402
 
@@ -826,8 +826,8 @@ def summarize_phase3(run_dir: Path, usage: dict | None = None) -> dict:
         total[bucket] += 1
         per_wave.setdefault(str(task.get("wave")), Counter())[bucket] += 1
     goals: Counter = Counter()
-    for path in (run_dir / "workspace" / "reports" / "wp").glob("*.json"):
-        report = read_json(path, {}) or {}
+    for item in discover_wp_reports(run_dir):
+        report = item.report
         for key in ("total_goals", "proven_count", "proven_under_hyp_count", "unproven_count"):
             goals[key] += int(report.get(key) or 0)
         goals["reports"] += 1

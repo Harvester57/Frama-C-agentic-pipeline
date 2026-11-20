@@ -78,7 +78,30 @@ def test_flag_sets_never_compile_instrumented_code_before_c99(tmp_path, std):
     flags = T.build_eacsl_flag_sets(f"-Isrc {std} -fcommon", fuzzer=True, fc_stubs=stubs)
     front, back = flags["frontend"].split(), flags["backend"].split()
     assert std not in front and std not in back
+    assert T.EACSL_DEFAULT_STD in front and T.EACSL_DEFAULT_STD in back
     assert "-Isrc" in front and "-fcommon" in back
+
+
+def test_flag_sets_default_to_gnu17_when_no_std_is_specified(tmp_path):
+    # mpack run-4: e-acsl-gcc hardcodes -std=c99 in both stages, causing __STDC_VERSION__-gated
+    # macros (_Alignof vs __alignof__) to disagree with WP/Eva unless overridden with gnu17.
+    stubs = tmp_path / "fc_stubs"
+    stubs.mkdir()
+    flags = T.build_eacsl_flag_sets("-Isrc -DFOO=1", fuzzer=False, fc_stubs=stubs)
+    front, back = flags["frontend"].split(), flags["backend"].split()
+    assert T.EACSL_DEFAULT_STD == "-std=gnu17"
+    assert front[-1] == T.EACSL_DEFAULT_STD
+    assert T.EACSL_DEFAULT_STD in back
+
+
+@pytest.mark.parametrize("std", ["-std=c99", "-std=gnu99", "-std=c11", "-std=gnu11", "-std=c17"])
+def test_flag_sets_preserve_explicit_c99_plus_std_without_appending_default(tmp_path, std):
+    stubs = tmp_path / "fc_stubs"
+    stubs.mkdir()
+    flags = T.build_eacsl_flag_sets(f"-Isrc {std}", fuzzer=True, fc_stubs=stubs)
+    front, back = flags["frontend"].split(), flags["backend"].split()
+    assert [t for t in front if t.startswith("-std=")] == [std]
+    assert [t for t in back if t.startswith("-std=")] == [std]
 
 
 def test_flag_sets_route_glibc_fp_classification_away_from_gcc_builtins(tmp_path):
@@ -2417,3 +2440,244 @@ def test_rewrite_sync_builtins_restores_polymorphic_names_and_skips_comments_and
     assert "int __sync_bool_compare_and_swap_uint64_t(unsigned long volatile *" in out
     assert '"__sync_fetch_and_add_int32_t(p, 1)"' in out
     assert T.rewrite_sync_builtins("int plain(void) { return 0; }\n") == ("int plain(void) { return 0; }\n", 0)
+
+
+def test_errno_shim_discovers_and_wraps_close_dup2_and_fclose(tmp_path, modern_cli):
+    instrumented = (
+        "int __fc_eacsl_errno;\n"
+        "extern int close(int __fd);\n"
+        "extern int dup2(int __fd, int __fd2);\n"
+        "extern int dup(int __fd);\n"
+        "extern int fclose(void *__stream);\n"
+        "int f(int fd, void *fp)\n"
+        "{\n"
+        "  int a = dup2(fd, 2);\n"
+        "  int b = fclose(fp);\n"
+        "  int c = close(fd);\n"
+        "  return a + b + c;\n"
+        "}\n"
+    )
+    assert T.find_errno_shim_calls(instrumented) == ["close", "dup2", "fclose"]
+    fake = FakeEacslGcc(instrumented_text=instrumented)
+    out_bin = tmp_path / "fuzz_stdio"
+    res = R.compile_eacsl_binary([str(_src(tmp_path))], out_bin, runner=fake, use_cache=False)
+    assert res["returncode"] == 0, res
+    assert res["errno_shim"]["wrapped"] == ["close", "dup2", "fclose"]
+    link = fake.calls[-1][fake.calls[-1].index("-l") + 1].split()
+    assert "-Wl,--wrap=close,--wrap=dup2,--wrap=fclose" in link
+    shim_src = (tmp_path / "fuzz_stdio_errno_shim" / "eacsl_errno_shim.c").read_text(encoding="utf-8")
+    assert "if (a0 >= 0 && a0 <= 2) return 0;" in shim_src
+    assert "if ((a1 == 1 || a1 == 2) && a0 != a1)" in shim_src
+    assert "if (a0 == stdin || a0 == stdout || a0 == stderr)" in shim_src
+
+
+STDIO_GUARD_FUZZ_C = r"""#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    int p[2];
+    (void)data;
+    (void)size;
+    if (pipe(p) != 0)
+        return 0;
+
+    /* 1. close(2) must pretend success without closing stderr. */
+    errno = 0;
+    int r_close2 = close(2);
+
+    /* 2. dup2(fd, 2) and dup2(fd, 1) must fail with EBADF without redirecting stderr/stdout. */
+    errno = 0;
+    int r_dup2_err = dup2(p[1], 2);
+    int e_dup2_err = errno;
+    errno = 0;
+    int r_dup2_out = dup2(p[1], 1);
+    int e_dup2_out = errno;
+
+    /* 3. dup2(2, 2) stays a POSIX no-op. */
+    int r_dup2_self = dup2(2, 2);
+
+    /* 4. Normal dup2 onto a non-stdio descriptor (>= 3) works and transfers data. */
+    int spare = dup(p[1]);
+    int r_dup2_norm = -1;
+    int norm_ok = 0;
+    if (spare >= 3) {
+        r_dup2_norm = dup2(p[1], spare);
+        if (r_dup2_norm == spare && write(spare, "OK", 2) == 2) {
+            char buf[2] = {0, 0};
+            if (read(p[0], buf, 2) == 2 && buf[0] == 'O' && buf[1] == 'K')
+                norm_ok = 1;
+        }
+        close(spare);
+    }
+
+    /* 5. dup2(p[0], 0) keeps working for stdin harnesses (STDIN_FEED_PRELUDE). */
+    int saved_stdin = dup(0);
+    int r_dup2_in = dup2(p[0], 0);
+    if (saved_stdin >= 3) {
+        (void)dup2(saved_stdin, 0);
+        close(saved_stdin);
+    }
+    close(p[0]);
+    close(p[1]);
+
+    /* 6. fclose(stderr/stdout/stdin) returns 0 without closing them or clobbering errno. */
+    errno = EINVAL;
+    int r_fc_err = fclose(stderr);
+    int e_fc_err = errno;
+    int r_fc_out = fclose(stdout);
+    int r_fc_in = fclose(stdin);
+
+    /* 7. Normal fopen/fclose on a regular file works normally. */
+    int file_ok = 0;
+    FILE *fp = fopen("/tmp/stdio_guard_probe.txt", "w");
+    if (fp != NULL) {
+        if (fputs("ok\n", fp) >= 0 && fclose(fp) == 0)
+            file_ok = 1;
+    }
+
+    int w2 = (int)write(2, "STDERR_FD_OPEN\n", 15);
+    fprintf(stderr, "STDIO_CHECK close2=%d dup2_err=%d/%d dup2_out=%d/%d self=%d dup2_in=%d norm=%d fc=%d/%d/%d/%d file=%d w2=%d ebadf=%d einval=%d\n",
+            r_close2, r_dup2_err, e_dup2_err, r_dup2_out, e_dup2_out, r_dup2_self, r_dup2_in,
+            norm_ok, r_fc_err, e_fc_err, r_fc_out, r_fc_in, file_ok, w2, EBADF, EINVAL);
+    return 0;
+}
+"""
+
+STDIO_GUARD_BUILD_SCRIPT = r"""set -e
+cp -r /fixture /tmp/w && cd /tmp/w
+python3 - <<'EOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/opt/framac-pipeline/scripts")
+import run_eacsl_fuzz as R
+res = R.compile_eacsl_binary(["mod.c"], Path("out/fuzz_stdio"), cppflags="-I.", use_cache=False)
+print("RESULT " + json.dumps({k: res.get(k) for k in ("returncode", "reason", "binary", "errno_shim")}))
+EOF
+./out/fuzz_stdio.e-acsl -runs=2 > run.out 2> run.err && echo RUN_OK
+grep "^STDIO_CHECK " run.err | head -4
+grep -c "^STDERR_FD_OPEN$" run.err | sed 's/^/STDERR_WRITES=/'
+grep -c "Done 2 runs" run.err | sed 's/^/LIBFUZZER_DONE=/'
+"""
+
+
+@pytest.mark.integration
+def test_stdio_guards_keep_stderr_open_after_close_dup2_and_fclose_in_the_analysis_image(tmp_path):
+    """close(2), dup2(fd, 1|2) and fclose(stderr) keep stdio open while normal dup2/fclose and dup2(fd, 0) work."""
+    from conftest import ANALYSIS_IMAGE, require_docker_images
+
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "mod.c").write_text(STDIO_GUARD_FUZZ_C, encoding="utf-8")
+    argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro"]
+    argv += ["-v", f"{REPO / 'scripts'}:/opt/framac-pipeline/scripts:ro"]
+    argv += ["-v", f"{REPO / 'templates'}:/opt/framac-pipeline/templates:ro", ANALYSIS_IMAGE, STDIO_GUARD_BUILD_SCRIPT]
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+    out = proc.stdout + proc.stderr
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    assert line, out[-4000:]
+    res = json.loads(line[len("RESULT ") :])
+    assert res["returncode"] == 0, out[-4000:]
+    assert res["errno_shim"]["status"] == "built"
+    assert {"close", "dup2", "fclose"} <= set(res["errno_shim"]["wrapped"])
+    assert "RUN_OK" in proc.stdout, out[-4000:]
+    expected = (
+        "STDIO_CHECK close2=0 dup2_err=-1/9 dup2_out=-1/9 self=2 dup2_in=0 "
+        "norm=1 fc=0/22/0/0 file=1 w2=15 ebadf=9 einval=22"
+    )
+    assert proc.stdout.count(expected) >= 2, out[-4000:]
+    assert "STDERR_WRITES=2" in proc.stdout or "STDERR_WRITES=3" in proc.stdout, out[-4000:]
+    assert "LIBFUZZER_DONE=1" in proc.stdout, out[-4000:]
+
+
+PROMOTE_SCREEN_FUZZ_C = r"""#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <sys/select.h>
+#include <unistd.h>
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    if (size < 1)
+        return 0;
+    if (data[0] == 'H') {
+        /* Blocking select() without EINTR retry: matches libmodbus _modbus_tcp_select hang. */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        struct timeval tv = {30, 0};
+        select(0, &rfds, NULL, NULL, &tv);
+    } else if (data[0] == 'L') {
+        volatile int x = 0;
+        while (1)
+            x++;
+    } else if (data[0] == 'C') {
+        abort();
+    }
+    return 0;
+}
+"""
+
+PROMOTE_SCREEN_SCRIPT = r"""set -e
+cp -r /fixture /tmp/w && cd /tmp/w
+mkdir -p workspace/harnesses agents/breaker-1/scratch/seeds
+clang -O1 -fsanitize=fuzzer mod.c -o workspace/harnesses/fuzz_demo.e-acsl
+printf 'OK' > agents/breaker-1/scratch/seeds/clean.bin
+printf 'HANG_SELECT' > agents/breaker-1/scratch/seeds/hang_select.bin
+printf 'LOOP_SPIN' > agents/breaker-1/scratch/seeds/hang_spin.bin
+printf 'CRASH' > agents/breaker-1/scratch/seeds/crash.bin
+python3 - <<'EOF'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "/opt/framac-pipeline/scripts")
+import promote_artifact as P
+out = P.promote_seeds(
+    Path("/tmp/w"),
+    "breaker-1",
+    "demo",
+    [
+        "agents/breaker-1/scratch/seeds/clean.bin",
+        "agents/breaker-1/scratch/seeds/hang_select.bin",
+        "agents/breaker-1/scratch/seeds/hang_spin.bin",
+        "agents/breaker-1/scratch/seeds/crash.bin",
+    ],
+    replay_timeout=2.0,
+)
+print("PROMOTE " + json.dumps(out))
+EOF
+"""
+
+
+@pytest.mark.integration
+def test_promote_seeds_pre_promotion_screen_refuses_hanging_seed_in_the_analysis_image(tmp_path):
+    """End-to-end in the analysis image: select() and spin hangs without timeout- artifacts are refused; clean and crashing seeds promote."""
+    from conftest import ANALYSIS_IMAGE, require_docker_images
+
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "mod.c").write_text(PROMOTE_SCREEN_FUZZ_C, encoding="utf-8")
+    argv = ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/fixture:ro"]
+    argv += ["-v", f"{REPO / 'scripts'}:/opt/framac-pipeline/scripts:ro"]
+    argv += ["-v", f"{REPO / 'templates'}:/opt/framac-pipeline/templates:ro", ANALYSIS_IMAGE, PROMOTE_SCREEN_SCRIPT]
+    proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    out = proc.stdout + proc.stderr
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("PROMOTE ")), None)
+    assert line, out[-4000:]
+    res = json.loads(line[len("PROMOTE ") :])
+    assert [p["src"] for p in res["promoted"]] == [
+        "agents/breaker-1/scratch/seeds/clean.bin",
+        "agents/breaker-1/scratch/seeds/crash.bin",
+    ], res
+    assert res["refused_hanging"] == [
+        {
+            "src": "agents/breaker-1/scratch/seeds/hang_select.bin",
+            "reason": "seed hung during pre-promotion screen (>2s)",
+            "binary": "workspace/harnesses/fuzz_demo.e-acsl",
+        },
+        {
+            "src": "agents/breaker-1/scratch/seeds/hang_spin.bin",
+            "reason": "seed hung during pre-promotion screen (>2s)",
+            "binary": "workspace/harnesses/fuzz_demo.e-acsl",
+        },
+    ], res

@@ -195,3 +195,52 @@ def test_closing_an_assigned_round_by_hand_never_writes_the_structural_prefix(si
     [req] = _requests()
     assert "WP Typed pointer-cast limit" in req["resolution_note"]
     _check_assigned_notes(sim)
+
+
+def test_negotiate_claim_refused_after_prepare_refunds_dispatch_and_marks_not_dispatched(sim, monkeypatch):
+    """Callee gets a skip verdict between assignment and preparation: refund dispatch and prefix `not dispatched:`."""
+    agents = _callers(sim, 1)
+    _stall_with_request(sim, agents, "c1", 1)
+
+    def become_candidate(agent_id, role, kw):
+        if agent_id.startswith("negotiate-"):
+            sim.eva_candidate("m", "src/m/g.c", "g")
+
+    monkeypatch.setattr(sim, "on_prepare", become_candidate)
+    nxt = S.cmd_next("16", prepare=True)
+
+    assert [t for t in nxt["tasks"] if t["kind"] == "negotiate"] == []
+    assert any(s["task"] == NEG and s["reason"] == "candidate" for s in nxt["skipped"])
+    neg = tasks()[NEG]
+    assert neg["state"] == "skipped" and neg["outcome"] == "candidate"
+    assert neg["dispatches"] == 0
+    assert not neg.get("request_agents")
+    [req] = _requests()
+    assert req["status"] == "rejected_by_callee"
+    assert req["resolution_note"].startswith(spec_kb.STRUCTURAL_REJECTION_PREFIX), req
+    assert "candidate" in req["resolution_note"]
+    assert spec_kb._request_obstruction(req) is None
+
+
+def test_requeued_negotiate_claim_refused_after_prepare_keeps_prior_agent_attribution(sim, monkeypatch):
+    """If an earlier round DID run for the request, refunding a later refused prepare still blames the earlier agent."""
+    agents = _callers(sim, 1)
+    _stall_with_request(sim, agents, "c1", 1)
+    aid1 = _dispatch_negotiation()
+    assert aid1 == "negotiate-g"
+    assert S.cmd_requeue(aid1)["requeued"]
+
+    def become_candidate(agent_id, role, kw):
+        if agent_id.startswith("negotiate-"):
+            sim.eva_candidate("m", "src/m/g.c", "g")
+
+    monkeypatch.setattr(sim, "on_prepare", become_candidate)
+    nxt = S.cmd_next("16", prepare=True)
+
+    assert nxt["tasks"] == []
+    neg = tasks()[NEG]
+    assert neg["state"] == "skipped" and neg["dispatches"] == 1
+    [req] = _requests()
+    assert req["status"] == "rejected_by_callee"
+    assert req["resolution_note"].startswith(f"{S.NEGOTIATION_CLOSED_AFTER_DISPATCH} to {aid1}:"), req
+    assert spec_kb._request_obstruction(req) is not None

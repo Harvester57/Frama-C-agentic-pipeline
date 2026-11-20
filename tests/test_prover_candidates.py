@@ -1570,6 +1570,67 @@ def test_trivial_added_clauses_fails_open_on_an_untokenizable_file(prover, monke
     assert PC.trivial_added_clauses(prover.scratch, {}, {C_REL: with_trivial("a", 2).encode()}) == []
 
 
+def test_trivial_added_clauses_ignores_comments_nested_annotations_and_doxygen(prover):
+    base = "int f(int x, const char *s) {\n  return x;\n}\n"
+    work = (
+        "/*@ ensures x >= 0; // ensures \\true;\n"
+        "  @ //@ ensures 1 == 1;\n"
+        '  @ ensures s != "a // \\true" && x >= 0;\n'
+        "  @*/\n"
+        "/*@* ensures \\true; */\n"
+        "/*@{ ensures \\true; */\n"
+        "//@* assert \\true;\n"
+        "int f(int x, const char *s) {\n"
+        "  /*@ assert x >= 0; // assert \\true;\n"
+        "    @ //@ check 2 == 2;\n"
+        "    @*/\n"
+        "  return x;\n"
+        "}\n"
+    )
+    (prover.scratch / "base" / C_REL).write_text(base, encoding="utf-8")
+    budget = {"file": C_REL, "function": FN}
+    assert PC.trivial_added_clauses(prover.scratch, budget, {C_REL: work.encode()}) == []
+
+
+def test_trivial_added_clauses_sees_trivial_clauses_past_comments_and_at_signs(prover):
+    base = "int f(int x) {\n  int i = 0;\n  while (i < x) i++;\n  return x;\n}\n"
+    work = (
+        "/*@ // comment before clause\n"
+        "  @ ensures \\true // == x\n"
+        "  @ ;\n"
+        "  @ ensures // fake_lbl:\n"
+        "  @   real_lbl: @ x == x //@ && x > 0\n"
+        "  @   ;\n"
+        "  @*/\n"
+        "int f(int x) {\n"
+        "  int i = 0;\n"
+        "  /*@ loop @ invariant @ 1 <= 2;\n"
+        "    @ loop assigns i;\n"
+        "    @*/\n"
+        "  while (i < x) i++;\n"
+        "  /*@ assert \\true; // trailing note\n"
+        "    @*/\n"
+        "  //@ check \\true; // trailing note\n"
+        "  /*@ ghost int y = x;\n"
+        "    @ // assert 3 == 3;\n"
+        "    @ //@ assert \\true;\n"
+        "    @*/\n"
+        "  return x;\n"
+        "}\n"
+    )
+    (prover.scratch / "base" / C_REL).write_text(base, encoding="utf-8")
+    budget = {"file": C_REL, "function": FN}
+    found = PC.trivial_added_clauses(prover.scratch, budget, {C_REL: work.encode()})
+    assert [(c["kind"], c["predicate"], c["line"]) for c in found] == [
+        ("ensures", "\\true", 2),
+        ("ensures", "x == x", 4),
+        ("loop invariant", "1 <= 2", 10),
+        ("assert", "\\true", 14),
+        ("check", "\\true", 16),
+        ("assert", "\\true", 19),
+    ]
+
+
 def test_the_wp_oracle_records_trivial_clauses_in_the_candidate_and_history(prover):
     block = iterate_source(prover, with_trivial("a", 2), failed=1, proved=7)
     assert block["trivial_added"] == 2

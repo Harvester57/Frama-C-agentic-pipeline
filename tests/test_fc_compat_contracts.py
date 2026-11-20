@@ -6,6 +6,7 @@ contracts (M6), the string vocabulary (S8).
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -221,7 +222,8 @@ STRINGS = ("valid_read_string", "valid_string", "valid_read_nstring", "valid_str
 
 def _eacsl_string_block() -> str:
     text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
-    start = text.index("logic integer strlen(char *s)")
+    marker = text.index("The string vocabulary")
+    start = text.index("/*@", marker)
     return text[start : text.index("*/", start)]
 
 
@@ -232,6 +234,13 @@ def test_eacsl_builds_define_libc_s_string_names_and_nothing_else():
     # Plus the private helpers that keep one predicate call after each quantifier guard
     # (E-ACSL 35 drops the first conjunct of `\exists i; guard && P && Q`).
     assert defined - {"__fc_eacsl_read_nul_at", "__fc_eacsl_nul_at"} == set(STRINGS)
+    logic_fns = set(re.findall(r"logic\s+[\w\s]+?\s+(\w+)\(", block))
+    assert logic_fns - {"__fc_eacsl_strlen_inc"} == {"strlen"}
+    # C integer return type avoids GMP in E-ACSL loop variants; the non-recursive helper avoids
+    # E-ACSL duplicating the recursive call 3x inside an explicit cast's overflow RTE check.
+    assert "logic unsigned int strlen(char *s)" in block
+    assert "logic integer strlen(" not in block
+    assert "__fc_eacsl_strlen_inc(strlen(s + 1))" in block
     assert "valid_nstring" not in (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
     # libc semantics: n readable initialized bytes, or a shorter string.
     nstring = block.split("predicate valid_read_nstring", 1)[1].split("predicate", 1)[0]
@@ -311,6 +320,139 @@ def test_the_string_vocabulary_runs_under_eacsl_and_proves_under_wp(tmp_path):
     assert proved == total, log.split("==wp==", 1)[1]
     eva = log.split("==eva==", 1)[1]
     assert eva.count("Invalid") + eva.count("invalid") >= 1, eva
+
+
+STRLEN_VARIANT_C = r"""#include <stdio.h>
+#include <string.h>
+
+/*@ requires valid_read_string(s);
+  @ terminates \true;
+  @ exits \false;
+  @ assigns \nothing;
+  @ ensures \result >= 0; */
+int walk_ptr(const char *s) {
+  int acc = 0;
+  /*@ loop invariant valid_read_string(s);
+    @ loop invariant acc >= 0;
+    @ loop assigns s, acc;
+    @ loop variant strlen(s) + 0; */
+  while (*s != '\0') {
+    acc ^= (unsigned char)*s;
+    s++;
+  }
+  return acc;
+}
+
+/*@ requires valid_read_string(s);
+  @ requires strlen(s) <= 1024;
+  @ terminates \true;
+  @ exits \false;
+  @ assigns \nothing;
+  @ ensures \result == strlen(s); */
+size_t walk_plus1(const char *s) {
+  size_t n = 0;
+  /*@ loop invariant valid_read_string(s);
+    @ loop invariant n + strlen(s) == \at(strlen(s), Pre);
+    @ loop assigns s, n;
+    @ loop variant strlen(s) + 1; */
+  while (*s != '\0') {
+    n++;
+    s++;
+  }
+  return n;
+}
+
+/*@ requires valid_read_string(s);
+  @ requires strlen(s) <= 1024;
+  @ terminates \true;
+  @ exits \false;
+  @ assigns \nothing;
+  @ ensures \result == strlen(s); */
+int walk_idx(const char *s) {
+  int i = 0;
+  /*@ loop invariant 0 <= i <= strlen(s);
+    @ loop assigns i;
+    @ loop variant strlen(s) - i; */
+  while (s[i] != '\0') {
+    i++;
+  }
+  return i;
+}
+
+/*@ requires valid_read_string(s);
+  @ assigns \nothing; */
+int walk_bad(const char *s) {
+  int step = 0;
+  /*@ loop invariant valid_read_string(s);
+    @ loop assigns s, step;
+    @ loop variant strlen(s) + 0; */
+  while (*s != '\0') {
+    if (step == 0) {
+      step = 1;
+    } else {
+      s++;
+    }
+  }
+  return step;
+}
+
+int main(int argc, char **argv) {
+  char empty[] = "";
+  char buf[65];
+  memset(buf, 'a', 64);
+  buf[64] = '\0';
+  printf("ok %d %zu %d\n", walk_ptr(empty), walk_plus1(buf), walk_idx(buf));
+  fflush(stdout);
+  if (argc > 1 && argv[1][0] == 'b') return walk_bad(buf);
+  return 0;
+}
+"""
+
+
+@image
+@slow
+def test_strlen_loop_variant_proves_under_wp_and_is_checked_at_runtime_under_eacsl(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    eacsl_flags = (
+        f"F=$(python3 -c '{PY}import eacsl_toolchain as T; "
+        'print(T.build_eacsl_flag_sets("-I.", fuzzer=False, full_mtracking=True)["frontend"])\'); '
+        f"B=$(python3 -c '{PY}import eacsl_toolchain as T; "
+        'print(T.build_eacsl_flag_sets("-I.", fuzzer=False, full_mtracking=True)["backend"])\'); '
+    )
+    checks = "--libc-replacements --validate-format-strings"
+    script = (
+        FRAMAC_FLAGS + eacsl_flags + 'echo "==eacsl=="; '
+        f"e-acsl-gcc -n --no-constfold {checks} -G clang "
+        f'-F "-rte -machdep gcc_x86_64 -e-acsl-full-mtracking -rte-initialized @all -warn-unsigned-downcast" '
+        '-E "$F" -o v.inst.c v.c > s1.log 2>&1; echo "stage1=$?"; '
+        f'e-acsl-gcc -C {checks} -G clang -e "$B" -O vbin v.inst.c > s2.log 2>&1; echo "stage2=$?"; '
+        'timeout 10 ./vbin.e-acsl 2>&1; echo "run_ok=$?"; '
+        'timeout 10 ./vbin.e-acsl b 2>&1; echo "run_bad=$?"; '
+        'echo "==wp=="; frama-c -no-unicode -machdep gcc_x86_64 v.c -cpp-extra-args="$A" '
+        "-wp -wp-model Typed -wp-check-memory-model -wp-rte -wp-fct walk_ptr,walk_plus1,walk_idx "
+        '-wp-timeout 20 -wp-cache none 2>&1; echo "==end=="'
+    )
+    log = _run_in_image(tmp_path, {"v.c": STRLEN_VARIANT_C}, script, timeout=600)
+    s1_log = (tmp_path / "s1.log").read_text(encoding="utf-8", errors="replace")
+    s2_log = (tmp_path / "s2.log").read_text(encoding="utf-8", errors="replace")
+    eacsl = log.split("==eacsl==", 1)[1].split("==wp==", 1)[0]
+    assert "stage1=0" in eacsl, s1_log
+    assert "stage2=0" in eacsl, s2_log
+    assert "loop variant using GMP" not in s1_log, s1_log
+    inst = (tmp_path / "v.inst.c").read_text(encoding="utf-8", errors="replace")
+    assert inst.count('kind = "Variant"') == 8, inst
+    for sig, expected_rec in (
+        ("unsigned int __gen_e_acsl___fc_eacsl_strlen_inc(unsigned int n)\n{", 0),
+        ("unsigned int __gen_e_acsl_strlen_here(char *s)\n{", 1),
+    ):
+        idx = inst.index(sig)
+        body = inst[idx : inst.index("\n}\n", idx) + 3]
+        assert "__gmpz_" not in body, body
+        assert body.count("__gen_e_acsl_strlen_here(") == expected_rec + (1 if expected_rec else 0), body
+    assert "ok 0 64 64" in eacsl and "run_ok=0" in eacsl, eacsl
+    assert "run_bad=0" not in eacsl and "Variant failed" in eacsl, eacsl
+    proved, total = _proved(log, "wp")
+    assert proved == total, log.split("==wp==", 1)[1]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -691,7 +833,9 @@ def test_eacsl_host_headers_define_the_libc_model_objects_weakly():
     assert "struct __fc_sockfds_type {\n  int x;\n};" in block
     # E-ACSL only: __fc_libc declares them itself for Eva and WP.
     text = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
-    assert text.count("__attribute__((weak));") == len(LIBC_MODEL_OBJECTS)
+    assert block.count("__attribute__((weak));") == text.count("__attribute__((weak));")
+    # The five __fc_libc model objects plus __fc_eacsl_errno (shared-header `assigns errno;` shim).
+    assert text.count("__attribute__((weak));") == len(LIBC_MODEL_OBJECTS) + 1
     assert text.count("struct __fc_sockfds_type {") == 1
 
 
@@ -763,3 +907,250 @@ def test_contracts_naming_libc_model_objects_prove_under_wp_and_build_under_eacs
     for tag in ("wp", "bytes"):
         proved, total = _proved(log, tag)
         assert proved == total, log.split(f"=={tag}==", 1)[1]
+
+
+# ---------------------------------------------------------------------------------------------------
+# Shared-header `assigns errno;` shim (libmodbus run-1, 2026-11-18): a contract in a shared header
+# naming `errno` aborted with `Failure: unbound logic variable errno` in translation units that did
+# not `#include <errno.h>` before the header (for example helpers and harnesses).
+# ---------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_fc_compat_types_and_errno_stub_map_errno_without_including_errno_h():
+    compat = (ROOT / "templates" / "fc_stubs" / "fc_compat_types.h").read_text(encoding="utf-8")
+    errno_h = (ROOT / "templates" / "fc_stubs" / "errno.h").read_text(encoding="utf-8")
+
+    # Never `#include <errno.h>` inside the force-included compat header: that would pull glibc
+    # `<features.h>` / `<errno.h>` and 130+ `E*` macros ahead of line 1 of target sources.
+    assert re.search(r"^\s*#\s*include\b.*errno\.h", compat, re.MULTILINE) is None
+
+    eacsl = _eacsl_host_block()
+    assert "#ifndef __FC_EACSL_ERRNO_DEFINED\n#define __FC_EACSL_ERRNO_DEFINED 1" in eacsl
+    assert "\nint __fc_eacsl_errno __attribute__((weak));\n" in eacsl
+    assert "#ifndef errno\n#define errno __fc_eacsl_errno\n#endif" in eacsl
+
+    fc_libc = compat.split("#else /* Frama-C __fc_libc */", 1)[1].split("#endif /* __FRAMAC_EACSL__ */", 1)[0]
+    assert '__PRAGMA_PUSH("errno.h")' in fc_libc
+    assert "__FC_EXTERN_FOR_MACRO(errno) _Thread_local int __fc_errno;" in fc_libc
+    assert "#define errno __fc_errno" in fc_libc
+    assert "__POP_FC_STDLIB" in fc_libc
+
+    # templates/fc_stubs/errno.h must `#undef errno` before `#include_next <errno.h>` so glibc's
+    # `<errno.h>` does not emit a macro-redefined warning, guard `__fc_eacsl_errno` with
+    # `__FC_EACSL_ERRNO_DEFINED`, and re-map `errno` afterwards.
+    inc_next = errno_h.index("#include_next <errno.h>")
+    assert errno_h.index("#undef errno") < inc_next
+    after = errno_h[inc_next:]
+    assert "#ifndef __FC_EACSL_ERRNO_DEFINED\n#define __FC_EACSL_ERRNO_DEFINED 1" in after
+    assert "int __fc_eacsl_errno __attribute__((weak));" in after
+    assert "#undef errno\n#define errno __fc_eacsl_errno" in after
+
+
+SHARED_ERRNO_API_H = r"""#ifndef API_H
+#define API_H
+#include <stddef.h>
+
+/*@ requires valid_out: \valid(out);
+  @ terminates \true;
+  @ exits \false;
+  @ assigns *out, errno;
+  @ ensures neg_err: x < 0 ==> \result == -1;
+  @ ensures nonneg_ok: x >= 0 ==> \result == 0 && *out == x;
+  @*/
+int set_value(int x, int *out);
+
+/*@ requires valid_s: s != \null && valid_read_string(s);
+  @ assigns errno;
+  @*/
+int parse_overflow_errno(const char *s);
+
+/*@ assigns errno; */
+int close_bad_fd(void);
+
+/*@ requires valid_hay: hlen > 0 && \valid_read(hay + (0 .. hlen - 1));
+  @ requires valid_ndl: nlen > 0 && \valid_read(ndl + (0 .. nlen - 1));
+  @ assigns \nothing;
+  @*/
+int has_subslice(const char *hay, size_t hlen, const char *ndl, size_t nlen);
+#endif
+"""
+
+SHARED_ERRNO_A_C = r"""#include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include "api.h"
+
+int set_value(int x, int *out) {
+  if (x < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  *out = x;
+  return 0;
+}
+
+int parse_overflow_errno(const char *s) {
+  char *end = NULL;
+  errno = 0;
+  (void)strtol(s, &end, 10);
+  return errno;
+}
+
+int close_bad_fd(void) {
+  errno = 0;
+  if (close(1000) == -1) {
+    return errno;
+  }
+  return 0;
+}
+"""
+
+SHARED_ERRNO_B_C = r"""#define _GNU_SOURCE
+#include <string.h>
+#include "api.h"
+
+#if defined(__FRAMAC_EACSL__) && (defined(_ERRNO_H) || defined(EINVAL))
+#error "fc_compat_types.h must not include <errno.h> under E-ACSL"
+#endif
+#if defined(FC_STUBS_KEEP_LIBC_GETSOCKOPT) && defined(FC_STUBS_NO_SCHED_AFFINITY_DECLS) && defined(EINVAL)
+#error "fc_compat_types.h must not include <errno.h> under __fc_libc"
+#endif
+
+int has_subslice(const char *hay, size_t hlen, const char *ndl, size_t nlen) {
+  const void *p = memmem(hay, hlen, ndl, nlen);
+#if !defined(__FRAMAC__)
+  /* Under clang without __FRAMAC__, #define _GNU_SOURCE on line 1 must still expose __USE_GNU APIs. */
+  const void *r = memrchr(hay, (int)(unsigned char)ndl[0], hlen);
+  return (p != NULL && r != NULL) ? 1 : 0;
+#else
+  return p != NULL ? 1 : 0;
+#endif
+}
+"""
+
+SHARED_ERRNO_HARNESS_C = r"""#define _GNU_SOURCE
+#include <stdint.h>
+#include <stdlib.h>
+#include "api.h"
+
+#if defined(__FRAMAC_EACSL__) && (defined(_ERRNO_H) || defined(EINVAL))
+#error "fc_compat_types.h must not include <errno.h> into harness"
+#endif
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  (void)data;
+  (void)size;
+  int out = 0;
+  if (set_value(-1, &out) != -1 || errno != 22) abort();
+  if (set_value(42, &out) != 0 || out != 42) abort();
+  if (parse_overflow_errno("99999999999999999999999999") != 34) abort();
+  if (close_bad_fd() != 9) abort();
+  char hay[4] = {'a', 'b', 'c', 'd'};
+  char ndl[2] = {'b', 'c'};
+  if (has_subslice(hay, 4, ndl, 2) != 1) abort();
+  return 0;
+}
+"""
+
+SHARED_ERRNO_EVA_MAIN_C = r"""#include "api.h"
+
+int eva_main(void) {
+  int out = 0;
+  int r1 = set_value(-1, &out);
+  int r2 = set_value(7, &out);
+  char hay[4] = {'a', 'b', 'c', 'd'};
+  char ndl[2] = {'b', 'c'};
+  int r3 = has_subslice(hay, 4, ndl, 2);
+  return r1 + r2 + r3 + out;
+}
+"""
+
+
+@image
+@slow
+def test_shared_header_assigns_errno_works_in_wp_eva_eacsl_guardrail_and_preserves_gnu_source(tmp_path):
+    """
+    A shared header declaring `assigns *out, errno;` and `assigns errno;` must parse, prove, analyze,
+    and run across TUs where only `a.c` includes `<errno.h>` while `b.c`, `harness.c`, and `eva_main.c`
+    do not: WP (`run_wp_function.py`), Eva (`frama-c -eva`, both default and with every opt-out flag),
+    E-ACSL guardrail (`run_eacsl_fuzz.py guardrail`, multi-TU + `errno_shim`), `-fno-common` linking,
+    and native clang (`#define _GNU_SOURCE` on line 1 exposing GNU declarations).
+    """
+    require_docker_images(ANALYSIS_IMAGE)
+    optouts = (
+        "-DFC_STUBS_KEEP_LIBC_GETSOCKOPT -DFC_STUBS_KEEP_LIBC_GETOPT -DFC_STUBS_KEEP_LIBC_STRLCPY "
+        "-DFC_STUBS_NO_PIPE2_DECL -DFC_STUBS_NO_NETDB_DECLS -DFC_STUBS_NO_SCHED_AFFINITY_DECLS "
+        "-DFC_STUBS_NO_NETINET_LINUX_DECLS"
+    )
+    script = (
+        FRAMAC_FLAGS + EACSL_FLAGS + "set -e; "
+        "mkdir -p corpus; printf 'x' > corpus/seed1; "
+        'echo "==wp=="; '
+        "FRAMAC_CACHE=off python3 /opt/framac-pipeline/scripts/run_wp_function.py "
+        '--file a.c --extra-sources b.c --function set_value --cppflags "-I." '
+        "--out-dir wp_out --out-json wp.json > wp_cli.log 2>&1; "
+        'echo "==eva=="; '
+        "frama-c -no-unicode -machdep gcc_x86_64 -kernel-warn-key annot-error=abort -warn-left-shift-negative "
+        '-cpp-extra-args="$A" a.c b.c eva_main.c -main eva_main -eva 2>&1; '
+        'echo "==eva_optouts=="; '
+        "frama-c -no-unicode -machdep gcc_x86_64 -kernel-warn-key annot-error=abort -warn-left-shift-negative "
+        f'-cpp-extra-args="$A {optouts}" a.c b.c eva_main.c -main eva_main -eva 2>&1; '
+        'echo "==cpp_warn=="; '
+        "gcc -E -Wall -Wextra -D__FRAMAC__ $F a.c > /dev/null 2> cpp.err; cat cpp.err; "
+        'echo "==guardrail=="; '
+        "FRAMAC_CACHE=off python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail "
+        "--sources a.c b.c harness.c --out-bin out/guard_mod --corpus-dir corpus --extra-runs 20 "
+        '--module errno_mod --cppflags "-I." '
+        "--functions set_value parse_overflow_errno close_bad_fd has_subslice "
+        "--no-cache --no-verdict-cache --out-json guard.json > guard_cli.log 2>&1; "
+        'echo "==fno_common=="; '
+        "e-acsl-gcc -C --libc-replacements --validate-format-strings -G clang "
+        '-e "-fno-common -O1 -Wno-implicit-function-declaration -fsanitize=fuzzer" '
+        '-l "out/guard_mod_errno_shim/eacsl_errno_shim.o -Wl,--wrap=strtol,--wrap=close" '
+        "-O out/guard_nocommon out/guard_mod.instrumented.c "
+        "/opt/framac-pipeline/templates/eacsl_runtime/fuzz_init.c > nocommon.log 2>&1; "
+        "./out/guard_nocommon.e-acsl -runs=1 corpus/seed1 > nocommon_run.log 2>&1; "
+        'echo "==clang=="; '
+        "clang -std=c11 -Wall -Werror=implicit-function-declaration "
+        "-I/opt/framac-pipeline/templates/fc_stubs "
+        "-include /opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h -c a.c -o a.o 2>&1; "
+        "clang -std=c11 -Wall -Werror=implicit-function-declaration "
+        "-I/opt/framac-pipeline/templates/fc_stubs "
+        "-include /opt/framac-pipeline/templates/fc_stubs/fc_compat_types.h -c b.c -o b.o 2>&1; "
+        'echo "==end=="'
+    )
+    files = {
+        "api.h": SHARED_ERRNO_API_H,
+        "a.c": SHARED_ERRNO_A_C,
+        "b.c": SHARED_ERRNO_B_C,
+        "harness.c": SHARED_ERRNO_HARNESS_C,
+        "eva_main.c": SHARED_ERRNO_EVA_MAIN_C,
+    }
+    log = _run_in_image(tmp_path, files, script, timeout=900)
+
+    wp = json.loads((tmp_path / "wp.json").read_text(encoding="utf-8"))
+    assert wp["status"] == "all_proven", wp
+    assert wp["assigns_vcs_proven"] is True, wp
+
+    for tag, next_tag in (("eva", "eva_optouts"), ("eva_optouts", "cpp_warn")):
+        section = log.split(f"=={tag}==", 1)[1].split(f"=={next_tag}==", 1)[0]
+        assert "No errors or warnings raised during the analysis." in section, section
+        assert "0 alarms generated by the analysis." in section, section
+        assert "unbound logic variable" not in section, section
+
+    cpp_err = (tmp_path / "cpp.err").read_text(encoding="utf-8", errors="replace")
+    assert '"errno" redefined' not in cpp_err, cpp_err
+
+    guard = json.loads((tmp_path / "guard.json").read_text(encoding="utf-8"))
+    assert guard["status"] == "passed_dynamic_oracle", guard
+    assert guard["compile"]["returncode"] == 0, guard
+    shim = guard["compile"]["errno_shim"]
+    assert shim is not None and shim["status"] == "built", shim
+    assert {"strtol", "close"} <= set(shim["wrapped"]), shim
+    reach = guard["reach"]
+    assert reach["unreached"] == [], reach
+    for fn in ("set_value", "parse_overflow_errno", "close_bad_fd", "has_subslice"):
+        assert (reach["functions"].get(fn) or 0) > 0, (fn, reach)
+    inst = (tmp_path / "out" / "guard_mod.instrumented.c").read_text(encoding="utf-8", errors="replace")
+    assert "int __fc_eacsl_errno __attribute__((__weak__));" in inst

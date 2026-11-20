@@ -44,10 +44,10 @@ from ledger import (  # noqa: E402
     relocated_properties,
     unchecked_clause_text,
 )
-from mutation_check import classify_open_unit  # noqa: E402
+from mutation_check import WpReportIndex, classify_open_unit, discover_wp_reports  # noqa: E402
 from phase0_gates import dynamic_gaps  # noqa: E402
 from validate_artifacts import validate_run_dir  # noqa: E402
-from workspace_overlay import load_function_wp_report, map_work_to_baseline_line  # noqa: E402
+from workspace_overlay import map_work_to_baseline_line  # noqa: E402
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 CLASSES = [
@@ -1240,19 +1240,20 @@ def ledger_bar_lines(ledger: list[dict]) -> list[str]:
 
 def load_wp_meta_runs(run_dir: Path, ledger: list[dict]) -> list[dict]:
     """
-    The latest WP report of each function with a MetAcsl unit (workspace_overlay.load_function_wp_report:
-    the canonical report, else the baseline's report of its file) when MetAcsl stopped the run on a
+    The latest WP report of each function with a MetAcsl unit (`workspace/reports/wp/<fn>.json`,
+    else `workspace/reports/wp/work/<slug>_<fn>.json` for its file) when MetAcsl stopped the run on a
     set-valued `assigns` or in-code check rows stayed unnamed: {function, file, stopped, callees, unnamed}.
     """
     functions = {
         (str(u.get("file")), str(u.get("function"))) for u in ledger if u.get("obligation_class") in METACSL_CLASSES
     }
+    if not functions:
+        return []
+    rdir = Path(run_dir)
+    wp_index = WpReportIndex(discover_wp_reports(rdir), run_dir=rdir)
     rows: list[dict] = []
     for file, function in sorted(functions):
-        try:
-            report = load_function_wp_report(Path(run_dir) / "workspace", file, function)
-        except (ArtifactError, OSError, ValueError):
-            continue
+        report = wp_index.get(file, function) or {}
         failure = report.get("metacsl_failure")
         section = report.get("security_props")
         unnamed = section.get("code_checks_unnamed") if isinstance(section, dict) else None
@@ -1519,11 +1520,17 @@ def spec_quality_section(data: dict) -> list[str]:
     open_units = [u for u in ledger if u.get("status") not in ("covered", "excluded", "candidate")]
     counts: Counter = Counter()
     if run_dir is not None and open_units:
-        wp_dir = Path(run_dir) / "workspace" / "reports" / "wp"
+        rdir = Path(run_dir)
+        wp_index = WpReportIndex(discover_wp_reports(rdir), run_dir=rdir)
         for u in open_units:
             fn = str(u.get("function") or "")
-            rep = load_json_optional(wp_dir / f"{fn}.json", None) if fn else None
-            counts[classify_open_unit(rep if isinstance(rep, dict) else None)] += 1
+            u_file = str(u.get("file") or "")
+            if not u_file:
+                cid = str(u.get("coverage_id") or "")
+                if "#" in cid:
+                    u_file = cid.split("#", 1)[0]
+            rep = wp_index.get(u_file, fn) if fn else None
+            counts[classify_open_unit(rep)] += 1
     # Proofs a prover gave up on because they need an inductive lemma it may not write (prover brief, Step B: Inductive Lemmas).
     lemma_gap_fns = sorted(
         {

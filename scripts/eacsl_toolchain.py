@@ -60,6 +60,12 @@ EACSL_STUBS_SUBDIR = "eacsl"
 # gcc `-wrapper` of the E-ACSL frontend: fc_cpp_wrapper.py plus the `<==>` rewrite.
 EACSL_CPP_WRAPPER = Path(__file__).resolve().parent / "fc_cpp_wrapper_eacsl.py"
 EACSL_CODEGEN_FLAGS = ("-gline-tables-only", "-O1", "-fcommon", "-Wno-implicit-function-declaration")
+# e-acsl-gcc hardcodes -std=c99 in both stage-1 FRAMAC_CPP_EXTRA and stage-2 CFLAGS, while Frama-C
+# WP/Eva default to C11+ (and gcc/clang in framac-analysis default to gnu17). Passing -std=gnu17
+# when no C99+ -std= is given overrides e-acsl-gcc's -std=c99 in both stages so __STDC_VERSION__-gated
+# macros (such as _Alignof vs __alignof__) expand identically across WP/Eva and E-ACSL, matching the
+# shim compiles in this module without defining __STRICT_ANSI__.
+EACSL_DEFAULT_STD = "-std=gnu17"
 # Fuzz harnesses have no main(), so E-ACSL's memory analysis cannot see the entry point and
 # leaves stack blocks untracked (valid accesses through a callee then fail `\valid`). Full
 # tracking fixes that; it needs the runtime initialized by templates/eacsl_runtime/fuzz_init.c.
@@ -409,6 +415,7 @@ def build_eacsl_flag_sets(
     # A build's pre-C99 -std (an old sidecar; generate_harness.py drops it now): Frama-C prints C99
     # (`restrict` in glibc prototypes) and e-acsl-gcc compiles its own C99 runtime with the `-e` flags.
     other = [t for t in other if not is_pre_c99_std(t)]
+    std_flags = [t for t in other if t.startswith("-std=")]
     joined_user = " ".join(pre + forced)
     front: list[str] = list(EACSL_DEFINES)
     if full_mtracking:
@@ -434,7 +441,9 @@ def build_eacsl_flag_sets(
         front.extend(["-wrapper", wrapper])
     front.extend(pre)
     front.extend(forced)
-    front.extend(t for t in other if t.startswith("-std="))
+    # Override e-acsl-gcc's hardcoded -std=c99 with the build's own C99+ -std=, or EACSL_DEFAULT_STD
+    # when none was specified (so stage-1 preprocessing matches WP/Eva's C11+/gnu17 default).
+    front.extend(std_flags if std_flags else [EACSL_DEFAULT_STD])
     # Codegen flags and warning suppression (-Wno-*) stay isolated on the backend compile
     backend: list[str] = (["-fsanitize=fuzzer"] if fuzzer else []) + list(EACSL_CODEGEN_FLAGS)
     if concurrency and "-DE_ACSL_CONCURRENCY_PTHREAD" not in backend:
@@ -442,6 +451,8 @@ def build_eacsl_flag_sets(
     for tok in other:
         if tok not in backend:
             backend.append(tok)
+    if not std_flags and EACSL_DEFAULT_STD not in backend:
+        backend.append(EACSL_DEFAULT_STD)
     return {
         "frontend": normalize_passthrough(shlex.join(front)),
         "backend": normalize_passthrough(shlex.join(backend)),
@@ -1996,6 +2007,9 @@ ERRNO_SHIM_FUNCTIONS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     ("int", "clock_gettime", ("clockid_t", "struct timespec *"), "time.h"),
 )
 _ERRNO_SHIM_NAMES = frozenset(f[1] for f in ERRNO_SHIM_FUNCTIONS)
+# Wrapped libc functions whose generated wrappers protect the process's stdio streams/fds so target
+# teardown cannot close or redirect libFuzzer's and E-ACSL's output descriptors.
+STDIO_GUARD_FUNCTIONS: tuple[str, ...] = ("close", "dup2", "fclose")
 # A call in CIL output is a statement or the right-hand side of an assignment (CIL hoists calls
 # out of expressions); a prototype has its return type before the name, so it never matches.
 _CALL_SITE_RE = re.compile(
@@ -2329,6 +2343,32 @@ def generate_errno_shim_source(names: Sequence[str], effects: Sequence[str] = ()
             # The process's stdio belongs to libFuzzer and the E-ACSL runtime. A target handed descriptor 2 as its
             # socket closes it on teardown: every later report is lost and the next failure is a silent exit 77.
             lines.append("if (a0 >= 0 && a0 <= 2) return 0;")
+        elif name == "dup2":
+            # Refuse redirecting stdout (1) or stderr (2) so libFuzzer and E-ACSL reports are never lost.
+            # Keep dup2(fd, 0) working because stdin harnesses (generate_harness.STDIN_FEED_PRELUDE)
+            # intentionally replace fd 0 with the input pipe, and dup2(n, n) is a POSIX no-op.
+            if sync:
+                lines.append(
+                    "if ((a1 == 1 || a1 == 2) && a0 != a1) "
+                    f"{{ errno = EBADF; {ERRNO_SHIM_GLOBAL} = EBADF; return -1; }}"
+                )
+            else:
+                lines.append("if ((a1 == 1 || a1 == 2) && a0 != a1) { errno = EBADF; return -1; }")
+        elif name == "fclose":
+            # Keep stdin/stdout/stderr open so target teardown cannot close libFuzzer's streams or
+            # free the global FILE objects; flush output streams while preserving errno.
+            # Pointer identity (never dereferencing a0) leaves NULL and invalid/freed FILE* bugs intact.
+            if sync:
+                lines.append(
+                    "if (a0 == stdin || a0 == stdout || a0 == stderr) "
+                    f"{{ if (a0 != stdin) {{ int fc_e = errno; int fc_g = {ERRNO_SHIM_GLOBAL}; "
+                    f"(void)fflush(a0); errno = fc_e; {ERRNO_SHIM_GLOBAL} = fc_g; }} return 0; }}"
+                )
+            else:
+                lines.append(
+                    "if (a0 == stdin || a0 == stdout || a0 == stderr) "
+                    "{ if (a0 != stdin) { int fc_e = errno; (void)fflush(a0); errno = fc_e; } return 0; }"
+                )
         if sync:
             lines.append(f"errno = {ERRNO_SHIM_GLOBAL};")
         lines.append(f"{ret} r = __real_{name}({args});")
@@ -2355,7 +2395,11 @@ def generate_errno_shim_source(names: Sequence[str], effects: Sequence[str] = ()
         "/* Generated by run_eacsl_fuzz.py: link-only libc shim for E-ACSL builds.\n"
         f" * templates/fc_stubs/errno.h maps the target's errno to {ERRNO_SHIM_GLOBAL}; each errno wrapper hands\n"
         " * that value to libc and copies libc's errno back, so the target sees what the call set. The\n"
-        " * E-ACSL effects tell the runtime what the call wrote (eacsl_toolchain.EACSL_LIBC_EFFECTS). */\n"
+        " * E-ACSL effects tell the runtime what the call wrote (eacsl_toolchain.EACSL_LIBC_EFFECTS).\n"
+        " * Stdio protection (close, dup2, fclose): close(0..2) and fclose(stdin|stdout|stderr) return 0\n"
+        " * without closing the process's stdio (output streams are flushed with errno preserved); dup2\n"
+        " * refuses redirecting stdout (1) or stderr (2) with EBADF (keeping dup2(fd, 0) for stdin\n"
+        " * harnesses and dup2(n, n) no-ops intact). */\n"
         "#define _GNU_SOURCE 1\n"
         + "".join(f"#include <{h}>\n" for h in headers)
         + f"\nextern int {ERRNO_SHIM_GLOBAL};\n"

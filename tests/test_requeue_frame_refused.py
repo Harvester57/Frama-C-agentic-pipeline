@@ -18,7 +18,8 @@ pytestmark = pytest.mark.unit
 NEGOTIATION = "negotiate:src/m/g.c#g"
 PROVER = "prove:src/m/a.c#a"
 CODE = "(int *p)\n{\n    *p = 0;\n    return 0;\n}\n"
-STRONG = "/*@ requires \\valid(p);\n    assigns *p \\from \\nothing;\n*/\n"
+STRONG_NO_ENSURES = "/*@ requires \\valid(p);\n    assigns *p \\from \\nothing;\n*/\n"
+STRONG = "/*@ requires \\valid(p);\n    assigns *p \\from \\nothing;\n    ensures R1: n >= 1;\n*/\n"
 WEAK = "/*@ requires \\valid(p);\n    assigns \\nothing;\n*/\n"
 REFUSAL = (
     "frame-preservation check failed:\n  src/m/g.c: projected frame clause missing or weakened: "
@@ -128,6 +129,39 @@ def test_a_pending_caller_waits_for_the_restored_negotiation(sim):
     assert NEGOTIATION in tasks()["prove:src/m/f.c#f"]["extra_deps"]
 
 
+def test_sync_and_next_preserve_hold_callers_extra_deps_when_callee_is_merged_and_filed(sim):
+    """`_sync` must not drop `_hold_callers`'s hold even when the callee proof is already done and in `contract_requests`."""
+    rid = rejected_negotiation(sim)
+    state = S.load_schedule()
+    assert state["tasks"]["prove:src/m/g.c#g"]["state"] == "done"
+    state["tasks"]["prove:src/m/f.c#f"].update(
+        state="pending",
+        outcome=None,
+        contract_requests={"src/m/g.c#g": rid},
+    )
+    S.save_schedule(state)
+
+    out = S.cmd_requeue_frame_refused()
+
+    assert out["merge_restored"][0]["callers"] == {"prove:src/m/f.c#f": "pending"}
+    assert NEGOTIATION in tasks()["prove:src/m/f.c#f"]["extra_deps"]
+    assert NEGOTIATION in tasks()["prove:src/m/f.c#f"]["held_negotiations"]
+
+    # Subsequent read-only status and persisting next keep the hold and do NOT dispatch f before the merge finishes.
+    assert "prove:src/m/f.c#f" not in [r["task"] for r in S.cmd_status()["ready"]]
+    nxt = S.cmd_next("auto", prepare=True)
+    assert nxt["tasks"] == []
+    assert NEGOTIATION in tasks()["prove:src/m/f.c#f"]["extra_deps"]
+
+    # Once the restored negotiation merges (reaches TERMINAL), the hold clears and f is dispatched.
+    assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "negotiate-g"
+    assert tasks()[NEGOTIATION]["state"] == "done"
+    nxt_after = S.cmd_next("auto", prepare=True)
+    assert [t["task"] for t in nxt_after["tasks"]] == ["prove:src/m/f.c#f"]
+    assert NEGOTIATION not in tasks()["prove:src/m/f.c#f"]["extra_deps"]
+    assert "held_negotiations" not in tasks()["prove:src/m/f.c#f"]
+
+
 def test_a_result_that_really_weakens_a_clause_stays_rejected(sim):
     rid = rejected_negotiation(sim, work=WEAK)
     before = tasks()[NEGOTIATION]
@@ -184,7 +218,10 @@ def test_a_blocked_prover_that_passes_now_gets_its_units_back(sim):
     assert out["merge_restored"] == [{"task": PROVER, "agent_id": "prove-a", "units": ["src/m/a.c#a::rte"]}]
     task = tasks()[PROVER]
     assert (task["state"], task["outcome"], task["merge_attempts"], task["dispatches"]) == ("merge_queued", None, 0, 1)
-    assert (units()["src/m/a.c#a::rte"]["status"], units()["src/m/a.c#a::rte"]["agent_id"]) == ("in_progress", "prove-a")
+    assert (units()["src/m/a.c#a::rte"]["status"], units()["src/m/a.c#a::rte"]["agent_id"]) == (
+        "in_progress",
+        "prove-a",
+    )
     assert S.cmd_merge_pending(force=True)["merged"][0]["agent_id"] == "prove-a"
 
 
@@ -249,3 +286,29 @@ def test_a_negotiation_is_left_while_the_callees_own_proof_is_merging(sim):
 
     assert out["merge_restored"] == [] and "merges first" in out["left"][0]["reason"]
     assert status_of(rid) == "rejected_by_callee"
+
+
+def test_noop_negotiation_lacking_needed_clause_marks_request_rejected_with_merge_note(sim):
+    """A no-op merge whose merged contract satisfies the frame but lacks `needed_clause` must not mark the request applied."""
+    rid = rejected_negotiation(sim, tree=STRONG_NO_ENSURES, base=STRONG_NO_ENSURES, work=STRONG_NO_ENSURES)
+
+    rq = S.cmd_requeue_frame_refused()
+    assert [(e["task"], e["agent_id"]) for e in rq["merge_restored"]] == [(NEGOTIATION, "negotiate-g")]
+
+    merged = S.cmd_merge_pending(force=True)
+    assert merged["merged"][0]["agent_id"] == "negotiate-g"
+    task = tasks()[NEGOTIATION]
+    assert task["outcome"] == "rejected"
+    assert "no-op merge" in str(task.get("last_reason") or "")
+    missing_notes = (task.get("merge_notes") or {}).get("noop_missing_clauses") or []
+    assert len(missing_notes) == 1
+    assert missing_notes[0]["request"] == rid
+    assert "n >= 1" in missing_notes[0]["missing"]
+    assert merged["merged"][0]["merge_notes"]["noop_missing_clauses"] == missing_notes
+
+    req = next(r for r in request_store() if r["id"] == rid)
+    assert req["status"] == "rejected_by_callee"
+    assert "no-op merge" in req["resolution_note"]
+    assert "n >= 1" in req["resolution_note"]
+    # Caller stays blocked because its requested clause was never added.
+    assert tasks()["prove:src/m/f.c#f"]["state"] == "blocked"

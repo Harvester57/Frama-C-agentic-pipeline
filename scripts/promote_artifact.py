@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import stat
 import sys
@@ -26,12 +27,19 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import sandbox_exec  # noqa: E402
 from framac_common import ArtifactError, is_safe_agent_id, is_safe_relative_path  # noqa: E402
+from fuzz_common import SANITIZER_RUNTIME_ENV  # noqa: E402
+from resources import FUZZ_RSS_LIMIT_MB  # noqa: E402
 
 MAX_SEED_BYTES = 64 * 1024
 MAX_SEEDS_PER_AGENT = 32
 MAX_ARTIFACT_BYTES = 1024 * 1024
 MAX_AGENT_TOTAL_BYTES = 4 * 1024 * 1024
+DEFAULT_SEED_REPLAY_TIMEOUT_S = 5.0
+_LIBFUZZER_TIMEOUT_EXITCODE = 70
+_LIBFUZZER_ALARM_MARKER = "ALARM: working on the last Unit"
+_LIBFUZZER_TIMEOUT_ERROR_MARKER = "ERROR: libFuzzer: timeout"
 
 
 class PromotionError(ArtifactError):
@@ -125,6 +133,24 @@ def check_promotable(
     return st_pre
 
 
+def _read_validated_bytes(run_dir: Path, norm_rel: str, st_pre: os.stat_result) -> bytes:
+    """Open `run_dir / norm_rel` with O_NOFOLLOW, verify fstat matches `st_pre`, and return its bytes."""
+    src_abs = run_dir / norm_rel
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(src_abs, flags)
+    try:
+        st_post = os.fstat(fd)
+        if st_post.st_dev != st_pre.st_dev or st_post.st_ino != st_pre.st_ino or st_post.st_size != st_pre.st_size:
+            raise PromotionError(f"{norm_rel}: file changed during promotion (TOCTOU detected)")
+        blob = os.read(fd, st_pre.st_size + 1)
+    finally:
+        os.close(fd)
+
+    if len(blob) != st_pre.st_size:
+        raise PromotionError(f"{norm_rel}: short or long read ({len(blob)} != {st_pre.st_size})")
+    return blob
+
+
 def promote_file(
     run_dir: Path,
     agent_id: str,
@@ -144,20 +170,7 @@ def promote_file(
     st_pre = check_promotable(run_dir, agent_id, src_rel, kind)
     norm_rel = src_rel.replace("\\", "/")
     run_dir = run_dir.resolve()
-
-    src_abs = run_dir / norm_rel
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(src_abs, flags)
-    try:
-        st_post = os.fstat(fd)
-        if st_post.st_dev != st_pre.st_dev or st_post.st_ino != st_pre.st_ino or st_post.st_size != st_pre.st_size:
-            raise PromotionError(f"{norm_rel}: file changed during promotion (TOCTOU detected)")
-        blob = os.read(fd, st_pre.st_size + 1)
-    finally:
-        os.close(fd)
-
-    if len(blob) != st_pre.st_size:
-        raise PromotionError(f"{norm_rel}: short or long read ({len(blob)} != {st_pre.st_size})")
+    blob = _read_validated_bytes(run_dir, norm_rel, st_pre)
 
     sha256 = hashlib.sha256(blob).hexdigest()
     if kind == "seed":
@@ -193,11 +206,129 @@ def _timeout_artifacts(run_dir: Path, agent_id: str) -> dict[str, str]:
 
 def _hang_artifact_of(run_dir: Path, agent_id: str, seed_rel: str, artifacts: dict[str, str]) -> str | None:
     """The agent's own timeout artifact for this seed, when it saw the seed hang."""
+    norm_rel = seed_rel.replace("\\", "/")
+    if Path(norm_rel).name.startswith("timeout-"):
+        check_promotable(run_dir, agent_id, norm_rel, "seed")
+        return norm_rel
     if not artifacts:
         return None
-    check_promotable(run_dir, agent_id, seed_rel, "seed")
-    blob = (Path(run_dir).resolve() / seed_rel.replace("\\", "/")).read_bytes()
+    st_pre = check_promotable(run_dir, agent_id, norm_rel, "seed")
+    blob = _read_validated_bytes(Path(run_dir).resolve(), norm_rel, st_pre)
     return artifacts.get(hashlib.sha1(blob, usedforsecurity=False).hexdigest())
+
+
+def _format_timeout(timeout_s: float) -> str:
+    return f"{timeout_s:g}"
+
+
+def _discover_fuzz_binary(
+    run_dir: Path,
+    module: str,
+    explicit_binary: Path | str | None = None,
+) -> Path | None:
+    """
+    Locate an existing fuzz binary for `module` to screen seeds before promotion, or None.
+
+    Checks `explicit_binary` first (when supplied), then `workspace/reports/fuzz/<module>.json`
+    (`compile.binary` / `binary`), then `workspace/harnesses/fuzz_<module>.e-acsl` and
+    `workspace/harnesses/fuzz_<module>`. Never fails when no binary exists on disk.
+    """
+    root = Path(run_dir).resolve()
+    if explicit_binary is not None:
+        raw = Path(explicit_binary)
+        cand = raw if raw.is_absolute() else (root / raw)
+        return cand if cand.is_file() else None
+
+    if not module or "/" in module or "\\" in module or module in (".", "..") or ".." in module:
+        return None
+
+    candidates: list[Path] = []
+    report_path = root / "workspace" / "reports" / "fuzz" / f"{module}.json"
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            report = None
+        if isinstance(report, dict):
+            compile_info = report.get("compile")
+            raw_paths = [
+                compile_info.get("binary") if isinstance(compile_info, dict) else None,
+                report.get("binary"),
+            ]
+            for raw_bin in raw_paths:
+                if not isinstance(raw_bin, str) or not raw_bin.strip():
+                    continue
+                p = Path(raw_bin)
+                candidates.append(p if p.is_absolute() else (root / p))
+                if raw_bin.startswith("/framac-run/"):
+                    candidates.append(root / raw_bin[len("/framac-run/") :])
+
+    candidates.append(root / "workspace" / "harnesses" / f"fuzz_{module}.e-acsl")
+    candidates.append(root / "workspace" / "harnesses" / f"fuzz_{module}")
+
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _check_seed_hangs(binary: Path, seed_path: Path, timeout_s: float) -> str | None:
+    """
+    Replay a single seed input through `binary` under `sandbox_exec` with a bounded timeout.
+
+    LibFuzzer is invoked with `-timeout=0` so its periodic SIGALRM timer (`UnitTimeoutSec / 2 + 1`)
+    cannot interrupt a blocking `select()`/`poll()`/`sleep()` call with EINTR and make a hanging
+    seed exit 0 early; instead `sandbox_exec.run_sandboxed` enforces the wall-clock bound and
+    SIGKILLs the process group on timeout. Returns a refusal reason string when the input hangs
+    (sandbox wall-timeout, libFuzzer exit code 70, `ALARM: working on the last Unit` /
+    `ERROR: libFuzzer: timeout`, or a `timeout-*` artifact). Clean exits (rc 0), normal crashes
+    (nonzero rc != 70 without timeout markers), and non-POSIX / non-executable environments return
+    None so promotion is never falsely blocked.
+    """
+    if timeout_s <= 0:
+        return None
+    wall_timeout = max(1, math.ceil(timeout_s))
+    reason = f"seed hung during pre-promotion screen (>{_format_timeout(timeout_s)}s)"
+    try:
+        seed_bytes = Path(seed_path).read_bytes()
+    except OSError:
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="framac-seed-screen-") as tmp_str:
+        tmp_dir = Path(tmp_str)
+        input_copy = tmp_dir / "seed"
+        input_copy.write_bytes(seed_bytes)
+        cmd = [
+            str(Path(binary).resolve()),
+            "-runs=1",
+            "-timeout=0",
+            f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+            f"-artifact_prefix={tmp_dir.as_posix()}/",
+            str(input_copy),
+        ]
+        try:
+            res = sandbox_exec.run_sandboxed(
+                cmd,
+                writable=[tmp_dir],
+                timeout_s=wall_timeout,
+                cwd=tmp_dir,
+                limits=sandbox_exec.Limits(cpu_seconds=max(2, wall_timeout * 2)),
+                extra_env=SANITIZER_RUNTIME_ENV,
+            )
+        except (sandbox_exec.SandboxUnavailable, OSError):
+            return None
+
+        combined = f"{res.stdout}\n{res.stderr}"
+        wrote_timeout = any(p.name.startswith("timeout-") for p in tmp_dir.iterdir() if p.is_file())
+        if (
+            res.timed_out
+            or res.returncode == _LIBFUZZER_TIMEOUT_EXITCODE
+            or _LIBFUZZER_ALARM_MARKER in combined
+            or _LIBFUZZER_TIMEOUT_ERROR_MARKER in combined
+            or wrote_timeout
+        ):
+            return reason
+    return None
 
 
 def promote_seeds(
@@ -205,25 +336,54 @@ def promote_seeds(
     agent_id: str,
     module: str,
     seed_rels: list[str],
+    *,
+    binary: Path | str | None = None,
+    replay_timeout: float = DEFAULT_SEED_REPLAY_TIMEOUT_S,
 ) -> dict[str, Any]:
     """
     Promote up to MAX_SEEDS_PER_AGENT breaker seeds into workspace/corpus/<module>/.
 
-    A seed the agent itself saw hang (its libFuzzer run left a `timeout-<sha1>` artifact of these bytes) is refused
-    and listed in `refused_hanging`: every later guardrail replays every promoted seed, so it would pay for the hang.
-    Only the agent's own evidence is read: a seed that hangs without having left an artifact still gets through.
+    Refuses a seed and records it in `refused_hanging` if:
+    1. Its filename starts with `timeout-` or its bytes match a `timeout-<sha1>` artifact left in
+       the agent's scratch directory; or
+    2. `replay_timeout > 0`, a fuzz binary for `module` is available (supplied via `binary` or
+       auto-discovered from `workspace/reports/fuzz/<module>.json` or `workspace/harnesses/`), and
+       the bounded single-input replay hangs/times out.
     """
     if len(seed_rels) > MAX_SEEDS_PER_AGENT:
         raise PromotionError(f"too many seeds ({len(seed_rels)}) from {agent_id}; limit is {MAX_SEEDS_PER_AGENT}")
-    artifacts = _timeout_artifacts(run_dir, agent_id)
+    if replay_timeout < 0:
+        raise PromotionError(f"replay_timeout must be >= 0, got {replay_timeout}")
+    root = Path(run_dir).resolve()
+    artifacts = _timeout_artifacts(root, agent_id)
+    fuzz_binary = _discover_fuzz_binary(root, module, binary) if replay_timeout > 0 else None
+    bin_label = ""
+    if fuzz_binary is not None:
+        try:
+            bin_label = fuzz_binary.resolve().relative_to(root).as_posix()
+        except ValueError:
+            bin_label = fuzz_binary.as_posix()
+
     promoted: list[dict[str, Any]] = []
     refused: list[dict[str, str]] = []
+    screened_by_sha256: dict[str, str | None] = {}
     for seed in seed_rels:
-        artifact = _hang_artifact_of(run_dir, agent_id, seed, artifacts)
+        norm_rel = seed.replace("\\", "/")
+        st_pre = check_promotable(root, agent_id, norm_rel, "seed")
+        artifact = _hang_artifact_of(root, agent_id, norm_rel, artifacts)
         if artifact is not None:
-            refused.append({"src": seed.replace("\\", "/"), "artifact": artifact})
+            refused.append({"src": norm_rel, "artifact": artifact})
             continue
-        promoted.append(promote_file(run_dir, agent_id, seed, kind="seed", module=module))
+        if fuzz_binary is not None:
+            blob = _read_validated_bytes(root, norm_rel, st_pre)
+            seed_sha = hashlib.sha256(blob).hexdigest()
+            if seed_sha not in screened_by_sha256:
+                screened_by_sha256[seed_sha] = _check_seed_hangs(fuzz_binary, root / norm_rel, replay_timeout)
+            hang_reason = screened_by_sha256[seed_sha]
+            if hang_reason is not None:
+                refused.append({"src": norm_rel, "reason": hang_reason, "binary": bin_label})
+                continue
+        promoted.append(promote_file(root, agent_id, norm_rel, kind="seed", module=module))
     return {"agent_id": agent_id, "module": module, "promoted": promoted, "refused_hanging": refused}
 
 
@@ -240,6 +400,18 @@ def main(argv: list[str] | None = None) -> int:
     p_seeds = sub.add_parser("promote-seeds")
     p_seeds.add_argument("--agent-id", required=True)
     p_seeds.add_argument("--module", required=True)
+    p_seeds.add_argument(
+        "--binary",
+        type=Path,
+        default=None,
+        help="Optional fuzz binary to screen seeds for hangs before promotion (auto-discovered if omitted)",
+    )
+    p_seeds.add_argument(
+        "--replay-timeout",
+        type=float,
+        default=DEFAULT_SEED_REPLAY_TIMEOUT_S,
+        help="Per-seed replay timeout in seconds to screen hanging seeds (0 disables)",
+    )
     p_seeds.add_argument("seeds", nargs="+")
 
     p_crash = sub.add_parser("promote-crash")
@@ -252,7 +424,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "promote-artifact":
             out = promote_file(args.run_dir, args.agent_id, args.src, kind="artifact", dest_name=args.dest_name)
         elif args.cmd == "promote-seeds":
-            out = promote_seeds(args.run_dir, args.agent_id, args.module, args.seeds)
+            out = promote_seeds(
+                args.run_dir,
+                args.agent_id,
+                args.module,
+                args.seeds,
+                binary=args.binary,
+                replay_timeout=args.replay_timeout,
+            )
         else:
             out = promote_file(args.run_dir, args.agent_id, args.src, kind="crash", module=args.module)
     except PromotionError as exc:

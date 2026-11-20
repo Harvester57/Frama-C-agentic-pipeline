@@ -1099,6 +1099,38 @@ def parse_nm(text: str) -> dict[str, tuple[str, str | None]]:
 FUNCTION_TYPES = {"T", "W", "i"}
 
 
+def _linkage_brace_indices(tokens: list[Any], ignored: frozenset[int], close_alias: Any) -> set[int]:
+    """Token indices of the `{` and `}` of every `extern "C" { ... }` / `extern "C++" { ... }` block."""
+    skip: set[int] = set()
+    for i, tok in enumerate(tokens):
+        if tok.kind != "c_token" or tok.text != "{" or i in ignored:
+            continue
+        j = i - 1
+        while j >= 0 and tokens[j].kind in ("whitespace", "c_comment"):
+            j -= 1
+        if j < 0 or tokens[j].kind != "string" or tokens[j].text not in ('"C"', '"C++"'):
+            continue
+        j -= 1
+        while j >= 0 and tokens[j].kind in ("whitespace", "c_comment"):
+            j -= 1
+        if j < 0 or tokens[j].kind != "c_token" or tokens[j].text != "extern":
+            continue
+        skip.add(i)
+        depth = 0
+        for k in range(i, len(tokens)):
+            t = tokens[k]
+            if t.kind == "c_token" and (k == i or k not in ignored):
+                if t.text == "{":
+                    depth += 1
+                elif t.text == "}":
+                    depth -= 1
+                    if depth == 0:
+                        skip.add(k)
+                        skip.add(close_alias.get(k, k))
+                        break
+    return skip
+
+
 def declared_names(text: str, names: set[str]) -> set[str]:
     """Return function names declared in text, ignoring comments, strings, and call expressions."""
     if not names:
@@ -1108,22 +1140,22 @@ def declared_names(text: str, names: set[str]) -> set[str]:
         return set()
 
     try:
-        from acsl_ast import tokenize_c_acsl
+        from acsl_ast import _conditional_delims, tokenize_c_acsl
 
         tokens = tokenize_c_acsl(text)
     except Exception:
-        return {
-            n
-            for n in candidates
-            if re.search(rf"(?m)^\s*(?:[A-Za-z0-9_*]+\s+)+[*]*\b{re.escape(n)}\b\s*\(", text)
-        }
+        return {n for n in candidates if re.search(rf"(?m)^\s*(?:[A-Za-z0-9_*]+\s+)+[*]*\b{re.escape(n)}\b\s*\(", text)}
 
-    c_tokens = [t for t in tokens if t.kind in ("c_token", "char")]
+    delims = _conditional_delims(tokens)
+    skip_delims = set(delims.ignored) | _linkage_brace_indices(tokens, delims.ignored, delims.close_alias)
+    indexed = [(raw_idx, tok) for raw_idx, tok in enumerate(tokens) if tok.kind in ("c_token", "char")]
     found: set[str] = set()
-    n = len(c_tokens)
+    n = len(indexed)
     paren_depth = 0
     brace_depth = 0
-    for i, tok in enumerate(c_tokens):
+    for i, (raw_idx, tok) in enumerate(indexed):
+        if raw_idx in skip_delims:
+            continue
         if tok.text == "(":
             paren_depth += 1
         elif tok.text == ")":
@@ -1133,7 +1165,7 @@ def declared_names(text: str, names: set[str]) -> set[str]:
         elif tok.text == "}":
             brace_depth = max(0, brace_depth - 1)
         elif brace_depth == 0 and paren_depth == 0 and tok.text in candidates:
-            if i + 1 < n and c_tokens[i + 1].text == "(":
+            if i + 1 < n and indexed[i + 1][1].text == "(":
                 found.add(tok.text)
     return found
 

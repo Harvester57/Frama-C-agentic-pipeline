@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
+from acsl_ast import AcslSyntaxError, Token, _conditional_delims, tokenize_c_acsl  # noqa: E402
 
 C_KEYWORDS = {
     "if",
@@ -105,22 +106,41 @@ def _is_ident(text: str) -> bool:
     return bool(_IDENT_RE.match(text)) and text not in C_KEYWORDS
 
 
-def _find_matching_forward(tokens: list[Token], open_idx: int, open_tok: str, close_tok: str) -> int:
+def _find_matching_forward(
+    tokens: list[Token],
+    open_idx: int,
+    open_tok: str,
+    close_tok: str,
+    ignored: frozenset[int] = frozenset(),
+    close_alias: Mapping[int, int] | None = None,
+) -> int:
     depth = 0
     for idx in range(open_idx, len(tokens)):
+        if idx != open_idx and idx in ignored:
+            continue
         t = tokens[idx].text
         if t == open_tok:
             depth += 1
         elif t == close_tok:
             depth -= 1
             if depth == 0:
-                return idx
+                return close_alias.get(idx, idx) if close_alias else idx
     return -1
 
 
-def _find_matching_backward(tokens: list[Token], close_idx: int, open_tok: str, close_tok: str) -> int:
+def _find_matching_backward(
+    tokens: list[Token],
+    close_idx: int,
+    open_tok: str,
+    close_tok: str,
+    ignored: frozenset[int] = frozenset(),
+    reverse_alias: Mapping[int, int] | None = None,
+) -> int:
+    start = reverse_alias.get(close_idx, close_idx) if reverse_alias else close_idx
     depth = 0
-    for idx in range(close_idx, -1, -1):
+    for idx in range(start, -1, -1):
+        if idx != start and idx in ignored:
+            continue
         t = tokens[idx].text
         if t == close_tok:
             depth += 1
@@ -131,7 +151,13 @@ def _find_matching_backward(tokens: list[Token], close_idx: int, open_tok: str, 
     return -1
 
 
-def _strip_trailing_attributes(c_tokens: list[Token], end_idx: int, min_idx: int) -> int:
+def _strip_trailing_attributes(
+    c_tokens: list[Token],
+    end_idx: int,
+    min_idx: int,
+    ignored: frozenset[int] = frozenset(),
+    reverse_alias: Mapping[int, int] | None = None,
+) -> int:
     """
     Walk backward from end_idx (exclusive) skipping trailing `__attribute__((...))`,
     `__declspec(...)`, or `asm(...)` qualifiers between `)` and `{`.
@@ -140,7 +166,7 @@ def _strip_trailing_attributes(c_tokens: list[Token], end_idx: int, min_idx: int
     cursor = end_idx - 1
     while cursor > min_idx:
         if c_tokens[cursor].text == ")":
-            open_p = _find_matching_backward(c_tokens, cursor, "(", ")")
+            open_p = _find_matching_backward(c_tokens, cursor, "(", ")", ignored, reverse_alias)
             if open_p > min_idx and c_tokens[open_p - 1].text in {
                 "__attribute__",
                 "__attribute",
@@ -328,8 +354,20 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
     comment closed lines later, it deleted the code in between and shifted every line after it.
     """
     all_tokens = tokenize_c_acsl(raw_code, path=path)
+    delims = _conditional_delims(all_tokens)
 
-    c_tokens = [t for t in all_tokens if t.kind in ("c_token", "string")]
+    c_tokens: list[Token] = []
+    raw_to_c: dict[int, int] = {}
+    for raw_idx, tok in enumerate(all_tokens):
+        if tok.kind in ("c_token", "string"):
+            raw_to_c[raw_idx] = len(c_tokens)
+            c_tokens.append(tok)
+
+    ignored: frozenset[int] = frozenset(raw_to_c[i] for i in delims.ignored if i in raw_to_c)
+    close_alias: dict[int, int] = {
+        raw_to_c[k]: raw_to_c[v] for k, v in delims.close_alias.items() if k in raw_to_c and v in raw_to_c
+    }
+    reverse_alias: dict[int, int] = {v: k for k, v in close_alias.items()}
     results: list[dict] = []
 
     n = len(c_tokens)
@@ -340,6 +378,21 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
     while idx < n:
         tok = c_tokens[idx]
         text = tok.text
+
+        if text == "{" and paren_depth == 0:
+            header_slice = c_tokens[last_top_boundary + 1 : idx]
+            if (
+                len(header_slice) >= 2
+                and header_slice[-2].text == "extern"
+                and header_slice[-1].text in ('"C"', '"C++"')
+            ) or (len(header_slice) == 1 and header_slice[-1].text == "extern"):
+                last_top_boundary = idx
+                idx += 1
+                continue
+
+        if idx in ignored:
+            idx += 1
+            continue
 
         if text == "(":
             paren_depth += 1
@@ -362,23 +415,17 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
             # A brace inside parentheses, as in `MACRO(x, ({ ... }))`, is not a top-level body.
             if paren_depth == 0:
                 header_slice = c_tokens[last_top_boundary + 1 : idx]
-                if (
-                    len(header_slice) >= 2
-                    and header_slice[-2].text == "extern"
-                    and header_slice[-1].text in ('"C"', '"C++"')
-                ) or (len(header_slice) == 1 and header_slice[-1].text == "extern"):
-                    last_top_boundary = idx
-                    idx += 1
-                    continue
-
-                close_brace = _find_matching_forward(c_tokens, idx, "{", "}")
+                close_brace = _find_matching_forward(c_tokens, idx, "{", "}", ignored, close_alias)
                 if close_brace == -1:
                     break
 
                 # Check if tokens between last_top_boundary and idx form a function header
                 has_top_equals = False
                 p_depth = 0
-                for ht in header_slice:
+                for ht_idx in range(last_top_boundary + 1, idx):
+                    if ht_idx in ignored:
+                        continue
+                    ht = c_tokens[ht_idx]
                     if ht.text == "(":
                         p_depth += 1
                     elif ht.text == ")":
@@ -388,12 +435,18 @@ def extract_functions_from_code(raw_code: str, path: str = "<input>") -> list[di
                         break
 
                 if not has_top_equals and header_slice:
-                    before_brace = _strip_trailing_attributes(c_tokens, idx, last_top_boundary)
+                    before_brace = _strip_trailing_attributes(c_tokens, idx, last_top_boundary, ignored, reverse_alias)
                     if before_brace > last_top_boundary and c_tokens[before_brace].text == ")":
-                        open_params = _find_matching_backward(c_tokens, before_brace, "(", ")")
+                        open_params = _find_matching_backward(c_tokens, before_brace, "(", ")", ignored, reverse_alias)
                         if open_params > last_top_boundary:
                             fn_name, param_tokens, decl_prefix = _resolve_declarator(
-                                c_tokens, last_top_boundary, open_params, before_brace
+                                c_tokens,
+                                last_top_boundary,
+                                open_params,
+                                before_brace,
+                                ignored,
+                                close_alias,
+                                reverse_alias,
                             )
                             if fn_name and _is_ident(fn_name):
                                 body_tokens = c_tokens[idx + 1 : close_brace]
@@ -429,6 +482,9 @@ def _resolve_declarator(
     last_top_boundary: int,
     open_params: int,
     close_params: int,
+    ignored: frozenset[int] = frozenset(),
+    close_alias: Mapping[int, int] | None = None,
+    reverse_alias: Mapping[int, int] | None = None,
 ) -> tuple[str | None, list[Token], list[Token]]:
     """
     Resolve function name and parameter tokens from a top-level declarator.
@@ -457,13 +513,13 @@ def _resolve_declarator(
         if candidate.text == ")":
             # Parenthesized declarator before the params: `ret (*fn)(params)` or
             # `ret (*fn(params))(fp_params)`.
-            inner_open = _find_matching_backward(c_tokens, j, "(", ")")
+            inner_open = _find_matching_backward(c_tokens, j, "(", ")", ignored, reverse_alias)
             if inner_open > last_top_boundary:
                 orig_inner_open = inner_open
                 while (
                     inner_open < j - 1
                     and c_tokens[inner_open + 1].text == "("
-                    and _find_matching_forward(c_tokens, inner_open + 1, "(", ")") == j - 1
+                    and _find_matching_forward(c_tokens, inner_open + 1, "(", ")", ignored, close_alias) == j - 1
                 ):
                     inner_open += 1
                     j -= 1
@@ -473,6 +529,8 @@ def _resolve_declarator(
                 last_inner_open = -1
                 depth = 0
                 for k in range(inner_open + 1, j):
+                    if k in ignored:
+                        continue
                     if c_tokens[k].text == "(":
                         if depth == 0:
                             last_inner_open = k
@@ -490,8 +548,10 @@ def _resolve_declarator(
                     else False
                 )
                 if last_inner_open != -1 and depth == 0 and has_name_before:
-                    inner_close = _find_matching_forward(c_tokens, last_inner_open, "(", ")")
-                    return _resolve_declarator(c_tokens, inner_open, last_inner_open, inner_close)
+                    inner_close = _find_matching_forward(c_tokens, last_inner_open, "(", ")", ignored, close_alias)
+                    return _resolve_declarator(
+                        c_tokens, inner_open, last_inner_open, inner_close, ignored, close_alias, reverse_alias
+                    )
                 # `(*fn)(params)`: the name is the last identifier inside the parens.
                 for k in range(j - 1, inner_open, -1):
                     if _is_ident(c_tokens[k].text) and c_tokens[k].text not in TYPE_MODIFIERS_AND_PRIMITIVES:
@@ -508,6 +568,8 @@ def _resolve_declarator(
             last_inner_open = -1
             depth = 0
             for k in range(open_params + 1, close_params):
+                if k in ignored:
+                    continue
                 if c_tokens[k].text == "(":
                     if depth == 0:
                         last_inner_open = k
@@ -515,6 +577,8 @@ def _resolve_declarator(
                 elif c_tokens[k].text == ")":
                     depth -= 1
             if last_inner_open != -1 and depth == 0:
-                inner_close = _find_matching_forward(c_tokens, last_inner_open, "(", ")")
-                return _resolve_declarator(c_tokens, open_params, last_inner_open, inner_close)
+                inner_close = _find_matching_forward(c_tokens, last_inner_open, "(", ")", ignored, close_alias)
+                return _resolve_declarator(
+                    c_tokens, open_params, last_inner_open, inner_close, ignored, close_alias, reverse_alias
+                )
     return None, [], []

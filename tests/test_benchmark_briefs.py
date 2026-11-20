@@ -76,6 +76,10 @@ class TestSampling:
         assert not is_candidate("void f(){ while(1){} }\n")
         assert not is_candidate("// assert in a plain comment\nvoid f(){ while(1){} }\n")
         assert not is_candidate("/*@ assert \\true; */ void f(){ /* while */ }\n")
+        assert not is_candidate("/*@ // assert 1 == 1;\n */ void f(){ while(1){} }\n")
+        assert not is_candidate("/*@ requires 1 == 1;\n //@ assert 1 == 1;\n */ void f(){ while(1){} }\n")
+        assert not is_candidate("/*@* assert \\true; */ void f(){ while(1){} }\n")
+        assert is_candidate("/*@ assert @ 1 == 1; */ void f(){ while(1){} }\n")
 
     def test_selection_is_independent_of_file_names_and_location(self, tmp_path):
         from benchmark_briefs import scan_dataset
@@ -156,6 +160,30 @@ class TestStaticOracle:
     def test_whitespace_changes_do_not_count_as_removal(self):
         assert missing_annotations(PROGRAM, ANSWER.replace("assert(y == n)", "assert( y==n )")) == []
 
+    @pytest.mark.parametrize(
+        "spoof",
+        [
+            "/*@ // ; assert(y == n);\n    assigns \\nothing;\n*/",
+            "/*@ assigns \\nothing;\n    //@ assert(y == n);\n*/",
+            "/*@{ ; assert(y == n); */",
+            "/*@* assert(y == n); */",
+            '/*@ assert s != ";assert(y==n);"; */',
+        ],
+    )
+    def test_comment_or_doxygen_cannot_forge_removed_annotation(self, spoof):
+        changed = ANSWER.replace("//@ assert(y == n);", spoof)
+        assert "assert(y==n)" in missing_annotations(PROGRAM, changed)
+
+    def test_comments_and_at_signs_beside_real_clauses_do_not_count_as_removal(self):
+        annotated = ANSWER.replace(
+            "requires n >= 0;",
+            "// entry guard\n  @ requires @ n >= 0; // non-negative",
+        ).replace(
+            "//@ assert(y == n);",
+            "/*@ // final check\n  @ assert @ (y == n); // done\n  @*/",
+        )
+        assert missing_annotations(PROGRAM, annotated) == []
+
 
 @pytest.mark.unit
 class TestEntryPreconditions:
@@ -191,6 +219,33 @@ class TestEntryPreconditions:
 
     def test_defined_functions_lists_only_definitions(self):
         assert defined_functions("int a(void);\nint b(void) { return 0; }\n") == ["b"]
+
+    @pytest.mark.parametrize(
+        "added",
+        [
+            "requires n == 5 // \\valid(p)\n;",
+            "requires // \\valid(p)\n  n == 5;",
+            "requires @ n == 5;",
+        ],
+    )
+    def test_comment_or_at_sign_cannot_hide_added_entry_precondition(self, added):
+        answer = ANSWER.replace("requires n >= 0;", f"requires n >= 0;\n{added}")
+        assert added_entry_preconditions(PROGRAM, answer) == ["foo: n==5"]
+
+    @pytest.mark.parametrize(
+        "commented",
+        [
+            "requires n >= 0; // requires n == 5;",
+            "requires n >= 0;\n  //@ requires n == 5;",
+        ],
+    )
+    def test_commented_out_requires_is_not_flagged_as_entry_precondition(self, commented):
+        answer = ANSWER.replace("requires n >= 0;", commented)
+        assert added_entry_preconditions(PROGRAM, answer) == []
+
+    def test_doxygen_requires_is_not_flagged_as_entry_precondition(self):
+        answer = "/*@* requires n == 5; */\n" + ANSWER
+        assert added_entry_preconditions(PROGRAM, answer) == []
 
 
 def wp(status="all_proven", total=3, proven=3, unproven=0, log="") -> dict:

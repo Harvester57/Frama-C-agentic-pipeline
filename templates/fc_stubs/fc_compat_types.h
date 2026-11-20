@@ -243,6 +243,22 @@ struct __fc_sockfds_type __fc_sockfds[__FC_MAX_OPEN_SOCKETS] __attribute__((weak
 int __fc_socket_counter __attribute__((weak));
 volatile int __fc_fds_state __attribute__((weak));
 
+/* Shared-header `assigns errno;` shim (libmodbus run-1, 2026-11-18): a contract in a shared header
+ * naming `errno` is parsed in every translation unit that includes that header, even units (such as
+ * harnesses or helpers) that never `#include <errno.h>`. Map `errno` to the tracked E-ACSL global
+ * here without including `<errno.h>` (which would pull glibc `<errno.h>` and its `E*` macros into
+ * every unit). Weak definition so multi-TU links under `-fno-common` merge cleanly and
+ * `eacsl_errno_shim.o`'s `extern int __fc_eacsl_errno;` resolves; `templates/fc_stubs/errno.h`
+ * `#undef`s `errno` before `#include_next <errno.h>`, re-maps it afterwards, and skips redefining
+ * `__fc_eacsl_errno` when `__FC_EACSL_ERRNO_DEFINED` is set. */
+#ifndef __FC_EACSL_ERRNO_DEFINED
+#define __FC_EACSL_ERRNO_DEFINED 1
+int __fc_eacsl_errno __attribute__((weak));
+#endif
+#ifndef errno
+#define errno __fc_eacsl_errno
+#endif
+
 #else /* Frama-C __fc_libc */
 
 #include <stdint.h>
@@ -1168,6 +1184,28 @@ struct tcp_info {
 #endif
 #endif /* FC_STUBS_NO_NETINET_LINUX_DECLS */
 
+/* Shared-header `assigns errno;` shim for __fc_libc (Eva, WP, Phase 0): declare `__fc_errno` and
+ * `#define errno __fc_errno` without `#include <errno.h>` (so `E*` macros and `program_invocation_*`
+ * stay out of units that did not include `<errno.h>`). Placed after the libc includes above and
+ * guarded by `#ifndef errno`, so when one of them already pulled in `<errno.h>` this is a no-op;
+ * when all of them are opted out (`FC_STUBS_KEEP_LIBC_*` / `FC_STUBS_NO_*`), `assigns errno;` still
+ * resolves with the same `fc_stdlib("errno.h")` attributes and storage class as
+ * `FRAMAC_SHARE/libc/errno.h`, and a later `#include <errno.h>` redeclares both identically. */
+#ifndef errno
+#ifdef __PRAGMA_PUSH
+__PRAGMA_PUSH("errno.h")
+#endif
+#ifdef __FC_EXTERN_FOR_MACRO
+__FC_EXTERN_FOR_MACRO(errno) _Thread_local int __fc_errno;
+#else
+extern _Thread_local int __fc_errno;
+#endif
+#define errno __fc_errno
+#ifdef __POP_FC_STDLIB
+__POP_FC_STDLIB
+#endif
+#endif
+
 #endif /* __FRAMAC_EACSL__ */
 
 /*
@@ -1186,7 +1224,14 @@ struct tcp_info {
  *   - on a buffer that is not a string they abort with an E-ACSL RTE inside the predicate
  *     (`\valid_read(s + i)`, E-ACSL checks the read before the validity guard next to it) rather than
  *     with the precondition: still a failure, reported at the predicate's line;
- *   - strlen is recursive: on a buffer that is not a string it aborts the same way.
+ *   - strlen is recursive and typed `unsigned int` (up to UINT_MAX, far above valid_read_string's
+ *     65536 bound): returning a C integer type instead of `integer` avoids GMP in E-ACSL so loop
+ *     variants such as `strlen(s) + 0`, `strlen(s) + 1`, and `strlen(s) - i` (with `int i`) are
+ *     checked at run time rather than ignored (`loop variant using GMP`). The `+ 1` cast lives in
+ *     the non-recursive helper `__fc_eacsl_strlen_inc` because E-ACSL re-evaluates the argument of
+ *     an explicit cast three times inside its overflow RTE check, which would turn
+ *     `(unsigned int)(1 + strlen(s + 1))` into O(3^n) recursion. On a buffer that is not a string
+ *     strlen aborts at the out-of-bounds read the same way as the predicates.
  * These definitions must NOT reach the Eva/WP (__fc_libc) parse: a second definition of a libc
  * predicate aborts the kernel under annot-error=abort.
  */
@@ -1194,7 +1239,11 @@ struct tcp_info {
 #if defined(__FRAMAC_EACSL__)
 
 /*@
-  @ logic integer strlen(char *s) = s[0] == '\0' ? 0 : 1 + strlen(s + 1);
+  @ logic unsigned int __fc_eacsl_strlen_inc(unsigned int n) =
+  @   n < 4294967295 ? (unsigned int)(n + 1) : (unsigned int)4294967295;
+  @
+  @ logic unsigned int strlen(char *s) =
+  @   s[0] == '\0' ? (unsigned int)0 : __fc_eacsl_strlen_inc(strlen(s + 1));
   @
   @ predicate __fc_eacsl_read_nul_at(char *s, integer i) = \valid_read(s + (0 .. i)) && s[i] == '\0';
   @

@@ -838,3 +838,115 @@ def test_guardrail_never_blames_the_contract_for_an_input_it_cannot_drop(tmp_pat
     outside = verdict["outside_checked_functions"]
     assert outside["failure"]["label"] == "rte/signed_overflow" and outside["fingerprint"]
     assert len(verdict["diagnostic_hints"]) == 1 and "NOT a code_fault" in verdict["diagnostic_hints"][0]
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 Frama-C OOM / kill classification (`eacsl_stage_killed`, c-ares run-1)
+# ---------------------------------------------------------------------------
+
+
+def test_guardrail_classifies_silent_aborted_by_frama_c_as_eacsl_stage_killed(tmp_path, monkeypatch):
+    """
+    c-ares run-1 (`adig`, 98 TUs): stage-1 Frama-C was OOM-killed under 2048 MiB. `e-acsl-gcc`
+    exited 1 with `aborted by Frama-C` and no Frama-C diagnostic message, and the report previously
+    labeled it `eacsl_instrumentation_failed` with a false struct-comparison hint (triggered by
+    `with` inside `(with preprocessing)`).
+    """
+    import subprocess
+
+    src = tmp_path / "adig.c"
+    src.write_text("int config_defaults(int x) { return x; }\n", encoding="utf-8")
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(R.prover_candidates, "add_candidate_block", lambda *a, **k: None)
+
+    stage1_stdout = (
+        "[kernel] Parsing adig.c (with preprocessing)\n"
+        "[kernel] Parsing src/error.c (with preprocessing)\n"
+        "[e-acsl] beginning translation.\n"
+    )
+    stage1_stderr = (
+        "++ /home/opam/.opam/5.5/bin/frama-c -no-frama-c-stdlib -kernel-warn-key annot-error=abort adig.c\n"
+        "e-acsl-gcc: fatal error: aborted by Frama-C\n"
+    )
+
+    def fake_run_tool(cmd, runner=subprocess.run, timeout=None):
+        return 1, stage1_stdout, stage1_stderr
+
+    monkeypatch.setattr(fuzz_build, "_run_tool", fake_run_tool)
+
+    out_json = tmp_path / "guard_config_defaults.json"
+    rc = R.main(
+        [
+            "guardrail",
+            "--sources",
+            str(src),
+            "--functions",
+            "config_defaults",
+            "--out-bin",
+            str(tmp_path / "guard_config_defaults"),
+            "--corpus-dir",
+            str(tmp_path / "corpus"),
+            "--no-cache",
+            "--out-json",
+            str(out_json),
+        ]
+    )
+    assert rc == 0
+    rep = json.loads(out_json.read_text(encoding="utf-8"))
+    assert rep["status"] == "compile_error"
+    assert rep["reason"] == "eacsl_stage_killed"
+    assert rep["compile"]["reason"] == "eacsl_stage_killed"
+    assert rep["compile"].get("killed_suspected") is True
+    hints = rep["diagnostic_hints"]
+    assert any("memory" in h.lower() and "oom" in h.lower() and "docker events" in h for h in hints), hints
+    assert not any("unsupported ACSL construct" in h for h in hints), hints
+    assert not any("ACSL syntax/typing error" in h for h in hints), hints
+
+
+@pytest.mark.parametrize(
+    ("rc", "stdout", "stderr", "expected_reason", "expected_flag"),
+    [
+        (137, "[kernel] Parsing a.c (with preprocessing)\n", "", "eacsl_stage_killed", "killed"),
+        (-9, "", "", "eacsl_stage_killed", "killed"),
+        (
+            1,
+            "[kernel] Parsing a.c (with preprocessing)\n",
+            "bash: line 1: 42 Killed frama-c\ne-acsl-gcc: fatal error: aborted by Frama-C\n",
+            "eacsl_stage_killed",
+            "killed",
+        ),
+        (
+            1,
+            "[kernel] Parsing a.c (with preprocessing)\n[kernel] User Error: bad token\n",
+            "e-acsl-gcc: fatal error: aborted by Frama-C\n",
+            "eacsl_instrumentation_failed",
+            None,
+        ),
+        (
+            1,
+            "[e-acsl] Failure: unbound logic variable foo\n",
+            "e-acsl-gcc: fatal error: aborted by Frama-C\n",
+            "eacsl_instrumentation_failed",
+            None,
+        ),
+    ],
+)
+def test_compile_eacsl_binary_distinguishes_stage_kill_from_frama_c_error(
+    tmp_path, monkeypatch, rc, stdout, stderr, expected_reason, expected_flag
+):
+    import subprocess
+
+    src = tmp_path / "m.c"
+    src.write_text("int f(int x) { return x; }\n", encoding="utf-8")
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+
+    def fake_runner(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr=stderr)
+
+    res = fuzz_build.compile_eacsl_binary([str(src)], tmp_path / "guard_m", runner=fake_runner, use_cache=False)
+    assert res["returncode"] == rc
+    assert res["reason"] == expected_reason
+    if expected_flag:
+        assert res.get(expected_flag) is True
+    else:
+        assert not res.get("killed") and not res.get("killed_suspected")

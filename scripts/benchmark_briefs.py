@@ -39,7 +39,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from acsl_ast import AcslSyntaxError, tokenize_c_acsl, verify_acsl_only  # noqa: E402
+from acsl_ast import (  # noqa: E402
+    AcslSyntaxError,
+    _kernel_views,
+    iter_clauses,
+    locate_function_span,
+    mask_comments_and_literals,
+    tokenize_c_acsl,
+    verify_acsl_only,
+)
 from benchmark_compare import rate_block  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -52,9 +60,8 @@ CONTAINER_SCRIPTS = "/opt/framac-pipeline/scripts"
 WP_GOAL_TIMEOUT_S = 15  # run_wp_function's default, fixed so results do not depend on the machine
 
 _LOOP_RE = re.compile(r"\b(?:while|for|do)\b")
-_ACSL_ASSERT_RE = re.compile(r"(?:/\*@|//@)[^\n]*\bassert\b")
-_CLAUSE_SPLIT_RE = re.compile(r";")
-_REQUIRES_RE = re.compile(r"\brequires\s+(?:[A-Za-z_]\w*\s*:\s*)?([^;]+);")
+_ASSERT_WORD_RE = re.compile(r"(?<![\\\w])assert\b")
+_BINDER_RE = re.compile(r"\\(?:forall|exists|let)\b")
 _MEMORY_SHAPE_RE = re.compile(
     r"\\(?:valid|valid_read|separated|initialized|valid_string|valid_read_string)\b|\bvalid_read_n?string\b"
 )
@@ -102,18 +109,26 @@ def sha256_text(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _has_acsl_assert(text: str) -> bool:
+    try:
+        tokens = tokenize_c_acsl(text)
+    except AcslSyntaxError:
+        return False
+    for tok in tokens:
+        if tok.kind in ("acsl_block", "acsl_line"):
+            masked, _ = _kernel_views(tok.text)
+            if _ASSERT_WORD_RE.search(masked):
+                return True
+    return False
+
+
 def is_candidate(text: str) -> bool:
     """A program the briefs can differ on: small, with an ACSL assert and a loop to invariant over."""
-    return (
-        text.count("\n") + 1 <= MAX_LINES
-        and bool(_ACSL_ASSERT_RE.search(text))
-        and bool(_LOOP_RE.search(strip_comments(text)))
-    )
+    return text.count("\n") + 1 <= MAX_LINES and _has_acsl_assert(text) and bool(_LOOP_RE.search(strip_comments(text)))
 
 
 def strip_comments(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
-    return re.sub(r"//[^\n]*", " ", text)
+    return mask_comments_and_literals(text, acsl="blank", literals=True, on_error="mask")
 
 
 def scan_dataset(dataset: Path) -> dict[str, dict]:
@@ -180,10 +195,41 @@ def _acsl_tokens(text: str) -> list[str]:
 
 
 def _clauses(acsl_text: str) -> set[str]:
-    """Clauses of one ACSL annotation with comment markers and all whitespace removed."""
-    body = re.sub(r"^\s*/\*@|\*/\s*$|^\s*//@", "", acsl_text)
-    body = re.sub(r"(?m)^\s*@", "", body)
-    return {re.sub(r"\s+", "", part) for part in _CLAUSE_SPLIT_RE.split(body) if part.strip()}
+    """Clauses of one ACSL annotation as the Frama-C kernel reads it, with all whitespace removed."""
+    masked, visible = _kernel_views(acsl_text)
+    if acsl_text.startswith("/*@"):
+        end = -2 if acsl_text.endswith("*/") else len(acsl_text)
+        m_body, v_body = masked[3:end], visible[3:end]
+    elif acsl_text.startswith("//@"):
+        m_body, v_body = masked[3:], visible[3:]
+    else:
+        m_body, v_body = masked, visible
+    if not m_body.strip():
+        return set()
+    depth = 0
+    top: list[bool] = []
+    for ch in m_body:
+        if ch in ")]}":
+            depth = max(0, depth - 1)
+        top.append(depth == 0)
+        if ch in "([{":
+            depth += 1
+    binders = {m.start() for m in _BINDER_RE.finditer(m_body) if top[m.start()]}
+    pending = 0
+    parts: list[str] = []
+    start = 0
+    for i, ch in enumerate(m_body):
+        if i in binders:
+            pending += 1
+        elif top[i] and ch == ";":
+            if pending:
+                pending -= 1
+            else:
+                parts.append(v_body[start:i])
+                start = i + 1
+    if start < len(v_body):
+        parts.append(v_body[start:])
+    return {re.sub(r"\s+", "", part) for part in parts if part.strip()}
 
 
 def missing_annotations(original: str, answer: str) -> list[str]:
@@ -211,8 +257,6 @@ def _called_names(text: str, defined: list[str]) -> set[str]:
 
 
 def _contract_requires(text: str, function: str) -> list[str]:
-    from acsl_ast import locate_function_span
-
     span = locate_function_span(text, function)
     if span is None:
         return []
@@ -221,7 +265,9 @@ def _contract_requires(text: str, function: str) -> list[str]:
         if token.kind == "c_token" and token.text == "{":
             break  # the body; a brace inside an annotation, as in `x \in {1, 2}`, is part of its token
         if token.kind in ("acsl_block", "acsl_line"):
-            clauses.extend(re.sub(r"\s+", "", m.group(1)) for m in _REQUIRES_RE.finditer(token.text))
+            for kind, _label, pred, _span in iter_clauses(token.text):
+                if kind == "requires" and pred:
+                    clauses.append(re.sub(r"\s+", "", pred))
     return clauses
 
 

@@ -1930,6 +1930,7 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, u
         mod_info = _dag_module_info(dag, module_name, unit)
         if not isinstance(mod_info, dict):
             continue
+        caller_has_std = any(t.startswith("-std=") and not is_pre_c99_std(t) for t in _split_cppflags(cppflags))
         for raw_flag in mod_info.get("cppflags") or []:
             if not isinstance(raw_flag, str) or not raw_flag.strip():
                 continue
@@ -1937,12 +1938,14 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, u
             if not norm_flag.startswith(("-I", "-D", "-U", "-std=")):
                 continue
             # Not carried into the harness: a macro value with quotes or spaces (later stages split
-            # and re-join flag strings, and `-DLOG="log.txt"` reaches the compiler as `log.txt`), and,
-            # with link units, the build's `-std=` (the harness code is ours, and needs C99 or later
-            # where a build may say -std=c89). The harness spec supplies such flags itself.
+            # and re-join flag strings, and `-DLOG="log.txt"` reaches the compiler as `log.txt`), and
+            # pre-C99 `-std=` flags (the harness code is ours, and needs C99 or later where a build
+            # may say -std=c89). C99+ `-std=` flags (e.g. `-std=c11`, `-std=gnu11`, `-std=c17`) are
+            # preserved on link units so WP, Eva and E-ACSL see the build's language standard unless
+            # the caller already supplied a C99+ `-std=`.
             if norm_flag.startswith("-D") and any(c in norm_flag for c in "\"' \\"):
                 continue
-            if norm_flag.startswith("-std=") and dag.get("module_kind") == "link_unit":
+            if norm_flag.startswith("-std=") and (is_pre_c99_std(norm_flag) or caller_has_std):
                 continue
             cppflags = _append_cppflag(cppflags, norm_flag)
         # The unit's force-included files (`-include config.h` in the build): without them the
@@ -1963,7 +1966,7 @@ def _drop_pre_c99_std(module_name: str, cppflags: str) -> str:
     `cppflags` without a language standard older than C99 (`-std=gnu90`, `-ansi`), said on stderr. It
     comes from `--cppflags` (the unit's build flags, as for a target fuzzer) or a non-link-unit DAG
     module. The harness code is ours and C99, and Frama-C prints C99 (`restrict` in glibc prototypes),
-    which E-ACSL then compiles with these flags: dropped, as the DAG path drops a link unit's `-std=`.
+    which E-ACSL then compiles with these flags: dropped, as the DAG path drops pre-C99 `-std=`.
     """
     tokens = _split_cppflags(cppflags)
     dropped = [t for t in tokens if is_pre_c99_std(t)]

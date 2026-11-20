@@ -1,6 +1,9 @@
 import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
+import validate_artifacts
 from conftest import (
     FP_EVA,
     FP_PARSE,
@@ -431,3 +434,294 @@ def test_validate_agent_result_proof_gap():
     # Invalid proof_gap (missing reason) fails schema validation
     bad_gap = dict(prover_base, proof_gap={"predicate": "\\valid(p)"})
     assert any("proof_gap" in e for e in validate_agent_result(bad_gap))
+
+
+def _run_agent_result_cli(capsys, argv: list[str]) -> tuple[int, dict[str, Any]]:
+    rc = validate_artifacts.main(["agent-result", *argv])
+    out = json.loads(capsys.readouterr().out)
+    assert (rc == 0) == out["ok"]
+    return rc, out
+
+
+def _schedule_fixture(run_dir: Path) -> None:
+    write_json(
+        run_dir / "state" / "wp_schedule.json",
+        {
+            "agents": {
+                "prove-f": "prove:src/a.c#f",
+                "negotiate-g": "negotiate:src/a.c#g",
+                "breaker-f": "breaker:src/a.c#f",
+                "arch-m": "arch:m",
+                "verify-1": "verify:rej",
+            },
+            "tasks": {
+                "prove:src/a.c#f": {"id": "prove:src/a.c#f", "kind": "prove", "file": "src/a.c", "function": "f"},
+                "negotiate:src/a.c#g": {
+                    "id": "negotiate:src/a.c#g",
+                    "kind": "negotiate",
+                    "file": "src/a.c",
+                    "function": "g",
+                },
+                "breaker:src/a.c#f": {
+                    "id": "breaker:src/a.c#f",
+                    "kind": "breaker",
+                    "file": "src/a.c",
+                    "function": "f",
+                },
+                "arch:m": {"id": "arch:m", "kind": "arch", "module": "m"},
+                "verify:rej": {"id": "verify:rej", "kind": "verify", "fingerprint": FP_REJ},
+            },
+        },
+    )
+
+
+def test_agent_result_task_identity_from_schedule_and_agent_dir(tmp_path: Path, capsys) -> None:
+    run = tmp_path / "run"
+    _schedule_fixture(run)
+
+    # Matching prover result (including normalized scratch/work/dot-slash paths matching wp_scheduler.norm_path).
+    for file_val in ("src/a.c", "./src/a.c", "workspace/work/src/a.c", "agents/prove-f/scratch/work/src/a.c"):
+        p_path = run / "agents" / "prove-f" / "scratch" / "result.json"
+        write_json(
+            p_path,
+            prover_result(
+                agent_id="prove-f",
+                file=file_val,
+                function="f",
+                patch="agents/prove-f/artifacts/f.patch",
+                evidence=[{"tool_output": "agents/prove-f/scratch/wp_f.json", "result": "all_proven"}],
+            ),
+        )
+        rc, out = _run_agent_result_cli(capsys, [str(p_path)])
+        assert rc == 0, out
+
+    # Matching negotiate (role prover), breaker, architect, and crash_verifier results pass.
+    neg_path = run / "agents" / "negotiate-g" / "scratch" / "result.json"
+    write_json(
+        neg_path,
+        prover_result(
+            agent_id="negotiate-g",
+            file="src/a.c",
+            function="g",
+            patch="agents/negotiate-g/artifacts/g.patch",
+            evidence=[{"tool_output": "agents/negotiate-g/scratch/wp_g.json", "result": "all_proven"}],
+        ),
+    )
+    assert _run_agent_result_cli(capsys, [str(neg_path)])[0] == 0
+
+    brk_path = run / "agents" / "breaker-f" / "scratch" / "result.json"
+    write_json(
+        brk_path,
+        {
+            "role": "breaker",
+            "agent_id": "breaker-f",
+            "file": "src/a.c",
+            "function": "f",
+            "status": "clean",
+            "seeds": [],
+            "crash_artifact": None,
+            "failing_predicate": None,
+            "analysis": "No crash found.",
+            "fault_hypothesis": None,
+        },
+    )
+    assert _run_agent_result_cli(capsys, [str(brk_path)])[0] == 0
+
+    arch_path = run / "agents" / "arch-m" / "scratch" / "result.json"
+    write_json(
+        arch_path,
+        {
+            "role": "architect",
+            "agent_id": "arch-m",
+            "header": "src/m.h",
+            "status": "passed",
+            "patch": "agents/arch-m/artifacts/m.patch",
+            "evidence": [{"tool_output": "agents/arch-m/scratch/guard.json", "result": "passed_dynamic_oracle"}],
+            "boundary_assumptions": [],
+            "notes": "ok",
+        },
+    )
+    assert _run_agent_result_cli(capsys, [str(arch_path)])[0] == 0
+
+    ev_rel = "agents/verify-1/scratch/replay.log"
+    (run / ev_rel).parent.mkdir(parents=True, exist_ok=True)
+    (run / ev_rel).write_text("ok\n", encoding="utf-8")
+    rec = rejected_record()
+    rec["evidence"] = [{"phase": "verifier", "tool_output": ev_rel, "description": "replay"}]
+    rec["verifier"]["agent_id"] = "verify-1"
+    ver_path = run / "agents" / "verify-1" / "scratch" / "result.json"
+    ver_res = {
+        "role": "crash_verifier",
+        "agent_id": "verify-1",
+        "candidate_fingerprint": FP_REJ,
+        "decision": "rejected",
+        "refingerprint_reason": None,
+        "record": rec,
+    }
+    write_json(ver_path, ver_res)
+    assert _run_agent_result_cli(capsys, [str(ver_path)])[0] == 0
+
+    # Mismatched agent_id (e.g. copied from another attempt) catches both agent_id and task mismatches.
+    p_path = run / "agents" / "prove-f" / "scratch" / "result.json"
+    write_json(
+        p_path,
+        prover_result(
+            agent_id="prove-other",
+            file="src/other.c",
+            function="other_fn",
+            patch="agents/prove-other/artifacts/other_fn.patch",
+            evidence=[{"tool_output": "agents/prove-other/scratch/wp.json", "result": "all_proven"}],
+        ),
+    )
+    rc, out = _run_agent_result_cli(capsys, [str(p_path)])
+    assert rc == 1
+    assert any("$.agent_id" in e and "prove-other" in e and "prove-f" in e for e in out["errors"])
+    assert any("$.function" in e and "other_fn" in e and "'f'" in e for e in out["errors"])
+    assert any("$.file" in e and "src/other.c" in e and "src/a.c" in e for e in out["errors"])
+
+    # Mismatched role (breaker result written for a prove task).
+    write_json(
+        p_path,
+        {
+            "role": "breaker",
+            "agent_id": "prove-f",
+            "file": "src/a.c",
+            "function": "f",
+            "status": "clean",
+            "seeds": [],
+            "crash_artifact": None,
+            "failing_predicate": None,
+            "analysis": "No crash found.",
+            "fault_hypothesis": None,
+        },
+    )
+    rc, out = _run_agent_result_cli(capsys, [str(p_path)])
+    assert rc == 1
+    assert any("$.role" in e and "breaker" in e and "prover" in e for e in out["errors"])
+
+    # Mismatched function alone.
+    write_json(
+        p_path,
+        prover_result(
+            agent_id="prove-f",
+            file="src/a.c",
+            function="wrong_fn",
+            patch="agents/prove-f/artifacts/f.patch",
+            evidence=[{"tool_output": "agents/prove-f/scratch/wp_f.json", "result": "all_proven"}],
+        ),
+    )
+    rc, out = _run_agent_result_cli(capsys, [str(p_path)])
+    assert rc == 1
+    assert any("$.function" in e and "wrong_fn" in e and "'f'" in e for e in out["errors"])
+
+    # Mismatched file alone.
+    write_json(
+        p_path,
+        prover_result(
+            agent_id="prove-f",
+            file="src/wrong.c",
+            function="f",
+            patch="agents/prove-f/artifacts/f.patch",
+            evidence=[{"tool_output": "agents/prove-f/scratch/wp_f.json", "result": "all_proven"}],
+        ),
+    )
+    rc, out = _run_agent_result_cli(capsys, [str(p_path)])
+    assert rc == 1
+    assert any("$.file" in e and "src/wrong.c" in e and "src/a.c" in e for e in out["errors"])
+
+    # Mismatched candidate_fingerprint on a verify task.
+    write_json(
+        ver_path,
+        {**ver_res, "candidate_fingerprint": FP_PARSE, "refingerprint_reason": "re-fingerprinted"},
+    )
+    rc, out = _run_agent_result_cli(capsys, [str(ver_path)])
+    assert rc == 1
+    assert any("$.candidate_fingerprint" in e and FP_PARSE in e and FP_REJ in e for e in out["errors"])
+
+
+def test_agent_result_standalone_and_explicit_expected_flags(tmp_path: Path, capsys) -> None:
+    # Standalone result.json without agents/<id>/scratch/ or state/wp_schedule.json still passes.
+    standalone = tmp_path / "result.json"
+    write_json(standalone, prover_result())
+    rc, out = _run_agent_result_cli(capsys, [str(standalone)])
+    assert rc == 0, out
+
+    # Matching explicit --expected-* flags pass (including unnormalized file path).
+    rc, out = _run_agent_result_cli(
+        capsys,
+        [
+            str(standalone),
+            "--expected-agent-id",
+            "prover-1",
+            "--expected-role",
+            "prover",
+            "--expected-function",
+            "f",
+            "--expected-file",
+            "./src/a.c",
+        ],
+    )
+    assert rc == 0, out
+
+    # Mismatched explicit --expected-* flags report every mismatch.
+    rc, out = _run_agent_result_cli(
+        capsys,
+        [
+            str(standalone),
+            "--expected-agent-id",
+            "prover-2",
+            "--expected-role",
+            "breaker",
+            "--expected-function",
+            "g",
+            "--expected-file",
+            "src/b.c",
+        ],
+    )
+    assert rc == 1
+    assert any("$.agent_id" in e and "prover-2" in e for e in out["errors"])
+    assert any("$.role" in e and "breaker" in e for e in out["errors"])
+    assert any("$.function" in e and "'g'" in e for e in out["errors"])
+    assert any("$.file" in e and "src/b.c" in e for e in out["errors"])
+
+    # Python API kwargs behave identically.
+    assert (
+        list(
+            validate_agent_result(
+                prover_result(),
+                expected_agent_id="prover-1",
+                expected_role="prover",
+                expected_function="f",
+                expected_file="src/a.c",
+            )
+        )
+        == []
+    )
+    errs = list(validate_agent_result(prover_result(), expected_function="other", expected_file="src/b.c"))
+    assert any("$.function" in e for e in errs) and any("$.file" in e for e in errs)
+
+
+def test_agent_result_in_agent_dir_without_schedule_checks_directory_agent_id(tmp_path: Path, capsys) -> None:
+    run = tmp_path / "run-no-sched"
+    p_path = run / "agents" / "prover-1" / "scratch" / "result.json"
+    write_json(p_path, prover_result(agent_id="prover-1"))
+    assert _run_agent_result_cli(capsys, [str(p_path)])[0] == 0
+
+    # Copied result with a different agent_id is caught even when state/wp_schedule.json does not exist.
+    write_json(
+        p_path,
+        prover_result(
+            agent_id="prover-old",
+            patch="agents/prover-old/artifacts/f.patch",
+            evidence=[{"tool_output": "agents/prover-old/scratch/wp_f.json", "result": "all_proven"}],
+        ),
+    )
+    rc, out = _run_agent_result_cli(capsys, [str(p_path)])
+    assert rc == 1
+    assert any("$.agent_id" in e and "prover-old" in e and "prover-1" in e for e in out["errors"])
+
+    # A malformed or unrelated wp_schedule.json does not break standalone/unscheduled agent validation.
+    (run / "state").mkdir(parents=True, exist_ok=True)
+    (run / "state" / "wp_schedule.json").write_text("{corrupt", encoding="utf-8")
+    write_json(p_path, prover_result(agent_id="prover-1"))
+    assert _run_agent_result_cli(capsys, [str(p_path)])[0] == 0

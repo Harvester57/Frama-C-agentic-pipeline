@@ -439,3 +439,110 @@ def test_report_counts_functions_carried_forward_and_reproven(tmp_path):
     generate(tmp_path, tmp_path)
     report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
     assert "- Carried forward from earlier runs and re-proven: 1 function(s)" in report.split("## 3.")[0]
+
+
+def test_spec_quality_classifies_same_named_static_open_units_from_work(tmp_path):
+    from workspace_overlay import baseline_wp_report_rel
+
+    write_json(
+        tmp_path / "workspace" / baseline_wp_report_rel("src/a/x.c", "helper"),
+        {"status": "analysis_error", "reason": "timeout", "function": "helper", "file": "workspace/work/src/a/x.c"},
+    )
+    write_json(
+        tmp_path / "workspace" / baseline_wp_report_rel("src/b/y.c", "helper"),
+        {
+            "status": "unproven_goals_remain",
+            "function": "helper",
+            "file": "/framac-run/workspace/work/src/b/y.c",
+            "unproven_goals": [{"kind": "ensures", "status": "Unknown"}],
+        },
+    )
+    data = {
+        "run_dir": tmp_path,
+        "ledger": [
+            unit("src/a/x.c", "helper", "rte", "planned"),
+            unit("src/b/y.c", "helper", "rte", "blocked"),
+        ],
+        "mutation": None,
+    }
+    text = "\n".join(spec_quality_section(data))
+    assert "- **prover_limited**: 1" in text
+    assert "- **spec_limited**: 1" in text
+    assert "**unknown**" not in text
+
+    # A legacy name-only report belonging to src/b/y.c must not be applied to an open unit of src/a/x.c.
+    (tmp_path / "workspace" / baseline_wp_report_rel("src/a/x.c", "helper")).unlink()
+    write_json(
+        tmp_path / "workspace/reports/wp/helper.json",
+        {
+            "status": "unproven_goals_remain",
+            "function": "helper",
+            "file": "src/b/y.c",
+            "unproven_goals": [{"kind": "ensures", "status": "Unknown"}],
+        },
+    )
+    text_legacy = "\n".join(spec_quality_section(data))
+    assert "- **spec_limited**: 1" in text_legacy
+    assert "- **unknown**: 1" in text_legacy
+    assert "**prover_limited**" not in text_legacy
+
+
+def test_spec_quality_prefers_canonical_report_over_work_baseline(tmp_path):
+    from workspace_overlay import baseline_wp_report_rel
+
+    write_json(
+        tmp_path / "workspace/reports/wp/foo.json",
+        {
+            "status": "unproven_goals_remain",
+            "function": "foo",
+            "file": "src/m/foo.c",
+            "unproven_goals": [{"kind": "ensures", "status": "Timeout"}],
+        },
+    )
+    write_json(
+        tmp_path / "workspace" / baseline_wp_report_rel("src/m/foo.c", "foo"),
+        {
+            "status": "unproven_goals_remain",
+            "function": "foo",
+            "file": "/framac-run/workspace/work/src/m/foo.c",
+            "frame_summary": {"missing_assigns_warning": True},
+        },
+    )
+    data = {
+        "run_dir": tmp_path,
+        "ledger": [unit("src/m/foo.c", "foo", "rte", "blocked")],
+        "mutation": None,
+    }
+    text = "\n".join(spec_quality_section(data))
+    assert "- **prover_limited**: 1" in text
+    assert "**spec_limited**" not in text
+    assert "**unknown**" not in text
+
+
+def test_spec_quality_ignores_non_report_artifacts_under_work(tmp_path):
+    wp_work = tmp_path / "workspace/reports/wp/work"
+    wp_work.mkdir(parents=True)
+    (wp_work / "src_a_x_c_helper.wp-report-json").write_text(
+        json.dumps({"status": "analysis_error", "function": "helper", "file": "src/a/x.c"}),
+        encoding="utf-8",
+    )
+    write_json(wp_work / "summary.json", {"results": [{"status": "analysis_error"}]})
+    write_json(wp_work / "no_file.json", {"status": "analysis_error", "function": "helper"})
+    write_json(
+        wp_work / "guardrail.json",
+        {"mode": "guardrail", "status": "analysis_error", "function": "helper", "file": "src/a/x.c"},
+    )
+    (wp_work / "corrupt.json").write_text("{not json", encoding="utf-8")
+    write_json(
+        wp_work / "src_a_x_c_helper/wp_helper.json",
+        {"status": "analysis_error", "function": "helper", "file": "src/a/x.c"},
+    )
+    data = {
+        "run_dir": tmp_path,
+        "ledger": [unit("src/a/x.c", "helper", "rte", "planned")],
+        "mutation": None,
+    }
+    text = "\n".join(spec_quality_section(data))
+    assert "- **unknown**: 1" in text
+    assert "**prover_limited**" not in text
+    assert "**spec_limited**" not in text

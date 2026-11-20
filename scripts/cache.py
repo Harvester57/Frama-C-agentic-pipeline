@@ -48,13 +48,13 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from acsl_ast import AcslSyntaxError, Token, tokenize_c_acsl  # noqa: E402
+from acsl_ast import AcslSyntaxError, Token, _conditional_delims, tokenize_c_acsl  # noqa: E402
 from c_definitions import C_KEYWORDS  # noqa: E402
 from framac_common import RunLockTimeout, run_lock, stub_overlay_dir, utc_now  # noqa: E402
 from patterns import parse_make_deps  # noqa: E402
@@ -715,9 +715,18 @@ def file_digest(path: str | Path) -> str | None:
     return value
 
 
-def _find_matching_delim(tokens: list[Token], open_idx: int, open_ch: str, close_ch: str) -> int:
+def _find_matching_delim(
+    tokens: list[Token],
+    open_idx: int,
+    open_ch: str,
+    close_ch: str,
+    ignored: frozenset[int] = frozenset(),
+    close_alias: Mapping[int, int] | None = None,
+) -> int:
     depth = 0
     for idx in range(open_idx, len(tokens)):
+        if idx != open_idx and idx in ignored:
+            continue
         tok = tokens[idx]
         if tok.kind == "c_token":
             if tok.text == open_ch:
@@ -725,13 +734,23 @@ def _find_matching_delim(tokens: list[Token], open_idx: int, open_ch: str, close
             elif tok.text == close_ch:
                 depth -= 1
                 if depth == 0:
-                    return idx
+                    return close_alias.get(idx, idx) if close_alias else idx
     return -1
 
 
-def _find_matching_backward(tokens: list[Token], close_idx: int, open_ch: str, close_ch: str) -> int:
+def _find_matching_backward(
+    tokens: list[Token],
+    close_idx: int,
+    open_ch: str,
+    close_ch: str,
+    ignored: frozenset[int] = frozenset(),
+    reverse_alias: Mapping[int, int] | None = None,
+) -> int:
+    start = reverse_alias.get(close_idx, close_idx) if reverse_alias else close_idx
     depth = 0
-    for idx in range(close_idx, -1, -1):
+    for idx in range(start, -1, -1):
+        if idx != start and idx in ignored:
+            continue
         tok = tokens[idx]
         if tok.kind == "c_token":
             if tok.text == close_ch:
@@ -745,18 +764,30 @@ def _find_matching_backward(tokens: list[Token], close_idx: int, open_ch: str, c
 
 def _prev_meaningful(tokens: list[Token], idx: int, min_idx: int = -1) -> int:
     cursor = idx
-    while cursor > min_idx and tokens[cursor].kind in ("whitespace", "c_comment", "acsl_block", "acsl_line"):
+    while cursor > min_idx and tokens[cursor].kind in (
+        "whitespace",
+        "c_comment",
+        "acsl_block",
+        "acsl_line",
+        "pp_directive",
+    ):
         cursor -= 1
     return cursor
 
 
-def _has_preceding_fn_sig(tokens: list[Token], idx: int, min_idx: int) -> bool:
+def _has_preceding_fn_sig(
+    tokens: list[Token],
+    idx: int,
+    min_idx: int,
+    ignored: frozenset[int] = frozenset(),
+    reverse_alias: Mapping[int, int] | None = None,
+) -> bool:
     """True when `idx` is preceded by `...(params)` with a function name and return type before `(`."""
     before = _prev_meaningful(tokens, idx, min_idx)
     while before > min_idx:
         tok = tokens[before]
         if tok.kind == "c_token" and tok.text == ")":
-            open_p = _find_matching_backward(tokens, before, "(", ")")
+            open_p = _find_matching_backward(tokens, before, "(", ")", ignored, reverse_alias)
             if open_p <= min_idx:
                 return False
             prev_fn = _prev_meaningful(tokens, open_p - 1, min_idx)
@@ -776,15 +807,21 @@ def _has_preceding_fn_sig(tokens: list[Token], idx: int, min_idx: int) -> bool:
     return False
 
 
-def _strip_trailing_attrs_backward(tokens: list[Token], end_idx: int, min_idx: int) -> int:
+def _strip_trailing_attrs_backward(
+    tokens: list[Token],
+    end_idx: int,
+    min_idx: int,
+    ignored: frozenset[int] = frozenset(),
+    reverse_alias: Mapping[int, int] | None = None,
+) -> int:
     cursor = end_idx - 1
     while cursor > min_idx:
         tok = tokens[cursor]
-        if tok.kind in ("whitespace", "c_comment", "acsl_block", "acsl_line"):
+        if tok.kind in ("whitespace", "c_comment", "acsl_block", "acsl_line", "pp_directive"):
             cursor -= 1
             continue
         if tok.kind == "c_token" and tok.text == ")":
-            open_p = _find_matching_backward(tokens, cursor, "(", ")")
+            open_p = _find_matching_backward(tokens, cursor, "(", ")", ignored, reverse_alias)
             if open_p > min_idx:
                 p_c = _prev_meaningful(tokens, open_p - 1, min_idx)
                 if p_c > min_idx:
@@ -802,7 +839,7 @@ def _strip_trailing_attrs_backward(tokens: list[Token], end_idx: int, min_idx: i
                         tokens[p_c].kind == "c_token"
                         and _IDENT_RE.fullmatch(tokens[p_c].text)
                         and tokens[p_c].text not in C_KEYWORDS
-                        and _has_preceding_fn_sig(tokens, p_c - 1, min_idx)
+                        and _has_preceding_fn_sig(tokens, p_c - 1, min_idx, ignored, reverse_alias)
                     ):
                         cursor = p_c - 1
                         continue
@@ -813,7 +850,7 @@ def _strip_trailing_attrs_backward(tokens: list[Token], end_idx: int, min_idx: i
             if (
                 _IDENT_RE.fullmatch(tok.text)
                 and tok.text not in C_KEYWORDS
-                and _has_preceding_fn_sig(tokens, cursor - 1, min_idx)
+                and _has_preceding_fn_sig(tokens, cursor - 1, min_idx, ignored, reverse_alias)
             ):
                 cursor -= 1
                 continue
@@ -821,7 +858,13 @@ def _strip_trailing_attrs_backward(tokens: list[Token], end_idx: int, min_idx: i
     return cursor
 
 
-def _resolve_fn_name(tokens: list[Token], min_idx: int, open_params_idx: int) -> str | None:
+def _resolve_fn_name(
+    tokens: list[Token],
+    min_idx: int,
+    open_params_idx: int,
+    ignored: frozenset[int] = frozenset(),
+    reverse_alias: Mapping[int, int] | None = None,
+) -> str | None:
     prev_idx = _prev_meaningful(tokens, open_params_idx - 1, min_idx)
     if prev_idx <= min_idx:
         return None
@@ -830,25 +873,25 @@ def _resolve_fn_name(tokens: list[Token], min_idx: int, open_params_idx: int) ->
         return prev.text
     # Function-pointer returning declarator: `ret (*fn(params))(fp_params)`
     if prev.kind == "c_token" and prev.text == ")":
-        inner_open = _find_matching_backward(tokens, prev_idx, "(", ")")
+        inner_open = _find_matching_backward(tokens, prev_idx, "(", ")", ignored, reverse_alias)
         if inner_open > min_idx:
-            inner_close_p = _strip_trailing_attrs_backward(tokens, prev_idx, inner_open)
+            inner_close_p = _strip_trailing_attrs_backward(tokens, prev_idx, inner_open, ignored, reverse_alias)
             if inner_close_p > inner_open and tokens[inner_close_p].text == ")":
-                inner_open_p = _find_matching_backward(tokens, inner_close_p, "(", ")")
+                inner_open_p = _find_matching_backward(tokens, inner_close_p, "(", ")", ignored, reverse_alias)
                 if inner_open_p > inner_open:
                     cand_idx = _prev_meaningful(tokens, inner_open_p - 1, inner_open)
                     if cand_idx > inner_open:
                         cand = tokens[cand_idx]
-                        if (
-                            cand.kind == "c_token"
-                            and cand.text not in C_KEYWORDS
-                            and _IDENT_RE.fullmatch(cand.text)
-                        ):
+                        if cand.kind == "c_token" and cand.text not in C_KEYWORDS and _IDENT_RE.fullmatch(cand.text):
                             return cand.text
     return None
 
 
 def _identify_unrelated_acsl_tokens(tokens: list[Token], target_functions: set[str]) -> set[int]:
+    delims = _conditional_delims(tokens)
+    ignored = delims.ignored
+    close_alias = delims.close_alias
+    reverse_alias = {v: k for k, v in close_alias.items()}
     unrelated_indices: set[int] = set()
     n = len(tokens)
     idx = 0
@@ -858,6 +901,25 @@ def _identify_unrelated_acsl_tokens(tokens: list[Token], target_functions: set[s
 
     while idx < n:
         tok = tokens[idx]
+        if tok.kind == "c_token" and tok.text == "{" and brace_depth == 0 and paren_depth == 0:
+            header_tokens = [
+                t
+                for t in tokens[last_top_boundary + 1 : idx]
+                if t.kind not in ("whitespace", "c_comment", "acsl_block", "acsl_line", "pp_directive")
+            ]
+            if (
+                len(header_tokens) >= 2
+                and header_tokens[-2].text == "extern"
+                and header_tokens[-1].text in ('"C"', '"C++"')
+            ) or (len(header_tokens) == 1 and header_tokens[-1].text == "extern"):
+                last_top_boundary = idx
+                idx += 1
+                continue
+
+        if idx in ignored:
+            idx += 1
+            continue
+
         if tok.kind == "c_token":
             if tok.text == "(":
                 paren_depth += 1
@@ -869,11 +931,11 @@ def _identify_unrelated_acsl_tokens(tokens: list[Token], target_functions: set[s
                 continue
             if tok.text == ";" and brace_depth == 0 and paren_depth == 0:
                 # Top-level prototype / declaration
-                before_semi = _strip_trailing_attrs_backward(tokens, idx, last_top_boundary)
+                before_semi = _strip_trailing_attrs_backward(tokens, idx, last_top_boundary, ignored, reverse_alias)
                 if before_semi > last_top_boundary and tokens[before_semi].text == ")":
-                    open_p = _find_matching_backward(tokens, before_semi, "(", ")")
+                    open_p = _find_matching_backward(tokens, before_semi, "(", ")", ignored, reverse_alias)
                     if open_p > last_top_boundary:
-                        fn_name = _resolve_fn_name(tokens, last_top_boundary, open_p)
+                        fn_name = _resolve_fn_name(tokens, last_top_boundary, open_p, ignored, reverse_alias)
                         if fn_name:
                             for c_idx in range(last_top_boundary + 1, open_p):
                                 t = tokens[c_idx]
@@ -891,31 +953,16 @@ def _identify_unrelated_acsl_tokens(tokens: list[Token], target_functions: set[s
                 idx += 1
                 continue
             if tok.text == "{" and brace_depth == 0 and paren_depth == 0:
-                # Check if extern "C" linkage block
-                header_tokens = [
-                    t
-                    for t in tokens[last_top_boundary + 1 : idx]
-                    if t.kind not in ("whitespace", "c_comment", "acsl_block", "acsl_line")
-                ]
-                if (
-                    len(header_tokens) >= 2
-                    and header_tokens[-2].text == "extern"
-                    and header_tokens[-1].text in ('"C"', '"C++"')
-                ) or (len(header_tokens) == 1 and header_tokens[-1].text == "extern"):
-                    last_top_boundary = idx
-                    idx += 1
-                    continue
-
-                close_brace = _find_matching_delim(tokens, idx, "{", "}")
+                close_brace = _find_matching_delim(tokens, idx, "{", "}", ignored, close_alias)
                 if close_brace == -1:
                     break
 
                 # Function definition header
-                before_brace = _strip_trailing_attrs_backward(tokens, idx, last_top_boundary)
+                before_brace = _strip_trailing_attrs_backward(tokens, idx, last_top_boundary, ignored, reverse_alias)
                 if before_brace > last_top_boundary and tokens[before_brace].text == ")":
-                    open_p = _find_matching_backward(tokens, before_brace, "(", ")")
+                    open_p = _find_matching_backward(tokens, before_brace, "(", ")", ignored, reverse_alias)
                     if open_p > last_top_boundary:
-                        fn_name = _resolve_fn_name(tokens, last_top_boundary, open_p)
+                        fn_name = _resolve_fn_name(tokens, last_top_boundary, open_p, ignored, reverse_alias)
                         if fn_name:
                             # Preceding contract tokens
                             for c_idx in range(last_top_boundary + 1, open_p):

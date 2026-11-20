@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -1797,9 +1798,83 @@ def test_infer_class_run_eacsl_fuzz_subcommand_precedes_build_module_name():
 
 
 def test_infer_class_scheduler_commands_that_merge_run_in_the_verify_class():
-    for sub in ("step --complete prove-a --slots auto --prepare", "complete --agent-id prove-a", "merge-pending"):
+    for sub in (
+        "step --complete prove-a --slots auto --prepare",
+        "complete --agent-id prove-a",
+        "merge-pending",
+        "next --slots auto --prepare",
+        "next --prepare --slots 4",
+        "next --prepare",
+        "next --slots 4 --max-agents 8 --prepare",
+    ):
         assert R.infer_class(f"python3 $S/wp_scheduler.py {sub}") == "verify", sub
-    assert R.infer_class("python3 $S/wp_scheduler.py status") == "light"
+    for light_sub in (
+        "status",
+        "next --slots 4",
+        "next --slots auto",
+        "next --slots 4 && echo --prepare",
+        "next --prepare-only",
+    ):
+        assert R.infer_class(f"python3 $S/wp_scheduler.py {light_sub}") == "light", light_sub
+
+
+def test_guardrail_memory_floor_is_4096_mib_and_scales_from_phase0_parse(tmp_path, fake_engine, monkeypatch, capsys):
+    """
+    c-ares run-1 regression: stage-1 Frama-C E-ACSL over 98 TUs (adig) OOM-killed at the old 2048 MiB
+    guardrail cap and compiled cleanly at 4096 MiB. The guardrail class now has a 4096 MiB floor and
+    also scales above 4096 MiB from Phase 0's measured parse peak (including scratch/work paths).
+    """
+    assert R.CLASSES["guardrail"].mem_base_mb == 4096
+    assert R.CLASSES["guardrail"].mem_per_cpu_mb == 0
+    assert R.nominal_grant(R.CLASSES["guardrail"], R.Budget(12, 32_000, "t")) == {"cpus": 2, "mem_mb": 4096}
+
+    # On a pool smaller than 4096 MiB, the broker clamps cleanly to the pool with a warning.
+    broker = R.Broker(tmp_path / "small_broker", lambda: R.Budget(4, 2048, "t"))
+    lease = broker.acquire("guardrail", "adig")
+    try:
+        assert lease.mem_mb == 2048
+        assert any("clamped to the pool" in w for w in lease.warnings), lease.warnings
+    finally:
+        broker.release(lease)
+
+    # Host broker `exec` gives a guardrail 4096 MiB by default and scales up when Phase 0 measured more.
+    fake_engine(DOCKER_DESKTOP)
+    monkeypatch.setenv("FRAMAC_POOL_CPUS", "12")
+    monkeypatch.setenv("FRAMAC_POOL_MEMORY", "16g")
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir()
+    (run_dir / "run-metadata.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(
+        "FRAMAC_CONTAINER_CMD",
+        "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail --sources agents/p/scratch/work/src/a.c --out-bin g",
+    )
+    assert R.main(["exec", "--run-dir", str(run_dir), "--dry-run", "--", "docker", "run", "img"]) == 0
+    out_base = json.loads(capsys.readouterr().out)
+    assert out_base["class"] == "guardrail" and out_base["mem_mb"] == 4096
+
+    # With a Phase 0 parse peak of 8000 MiB over 4 files, a guardrail compiling all 4 scratch/work files gets 10000 MiB.
+    unit_files = [f"src/u{i}.c" for i in range(4)]
+    (run_dir / "workspace" / "reports").mkdir(parents=True)
+    (run_dir / "workspace" / "reports" / "phase0_model.json").write_text(
+        json.dumps(
+            {
+                "parse_jobs": [{"key": "job1", "units": ["big"], "sources": unit_files, "status": "ok", "seconds": 10}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    R.write_history(run_dir, {"class": "parse", "key": "p0-job1", "peak_mb": 8000, "oom_killed": False})
+    scratch_srcs = " ".join(f"agents/prove-f/scratch/work/{s}" for s in unit_files)
+    script_file = run_dir / "agents" / "prove-f" / "scratch" / "run_guard.sh"
+    script_file.parent.mkdir(parents=True)
+    script_file.write_text(
+        f"#!/bin/bash\npython3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail \\\n  --sources {scratch_srcs} --out-bin g\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", "bash agents/prove-f/scratch/run_guard.sh")
+    assert R.main(["exec", "--run-dir", str(run_dir), "--dry-run", "--", "docker", "run", "img"]) == 0
+    out_scaled = json.loads(capsys.readouterr().out)
+    assert out_scaled["class"] == "guardrail" and out_scaled["mem_mb"] == 10000
 
 
 def test_infer_class_sizes_build_check_like_run_build():
@@ -2018,3 +2093,179 @@ def test_gc_kills_the_container_of_a_dead_exec_client_and_then_drops_its_lease(t
     wait_for(lambda: not (tmp_path / "bin" / "running").read_text().split())
     assert R.main(["gc", *host]) == 0
     assert not (broker / "leases" / f"{lid}.json").exists()
+
+
+def test_exec_downgrades_exhausted_prover_wp_to_light_without_waiting(tmp_path, fake_engine, monkeypatch, capsys):
+    """
+    When a prover's .prover_budget.json is already exhausted, `resources.py exec` downgrades the `wp`
+    command to ungated `light` so it skips the host broker's wp queue (even while the pool is 100%
+    held) and lets `run_wp_function.py` write its normal `budget_exhausted: True` report immediately.
+    """
+    fake_engine(DOCKER_DESKTOP)
+    run_dir = tmp_path / "run-1"
+    scratch = run_dir / "agents" / "prove-f" / "scratch"
+    (scratch / "work").mkdir(parents=True)
+    (scratch / "work" / "f.c").write_text("int f(int x) { return x; }\n", encoding="utf-8")
+    budget_path = scratch / ".prover_budget.json"
+    budget_path.write_text(
+        json.dumps(
+            {
+                "max_wp_invocations": 6,
+                "max_wall_clock_s": 900,
+                "wp_invocations": 6,
+                "first_wp_at": time.time() - 120.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    wp_cmd = (
+        "python3 /opt/framac-pipeline/scripts/run_wp_function.py "
+        "--file agents/prove-f/scratch/work/f.c --function f "
+        "--out-dir agents/prove-f/scratch/wp --out-json agents/prove-f/scratch/wp_f.json"
+    )
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", wp_cmd)
+
+    # Occupy the entire 2-CPU / 4096-MiB pool with a live gated lease so any gated `wp` request would block.
+    broker = R.Broker(tmp_path / "broker", lambda: R.Budget(2, 4096, "test"))
+    blocker = broker.acquire("build", fixed_cpus=2, fixed_mem_mb=4096)
+    try:
+        rc = R.main(["exec", "--run-dir", str(run_dir), "--dry-run", "--", "docker", "run", "img"])
+    finally:
+        broker.release(blocker)
+    assert rc == 0
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["class"] == "light" and out["cpus"] == 1.0 and out["mem_mb"] == 1024
+    assert ("-e", "FRAMAC_JOB_CLASS=light") in _pairs(out["argv"])
+    assert "downgrading wp to light" in captured.err
+
+    # With --ignore-prover-budget or a non-exhausted budget, `wp` stays `wp`.
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", f"{wp_cmd} --ignore-prover-budget")
+    assert R.main(["exec", "--run-dir", str(run_dir), "--dry-run", "--", "docker", "run", "img"]) == 0
+    assert json.loads(capsys.readouterr().out)["class"] == "wp"
+
+    budget_path.write_text(
+        json.dumps(
+            {
+                "max_wp_invocations": 6,
+                "max_wall_clock_s": 900,
+                "wp_invocations": 2,
+                "first_wp_at": time.time() - 120.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", wp_cmd)
+    assert R.main(["exec", "--run-dir", str(run_dir), "--dry-run", "--", "docker", "run", "img"]) == 0
+    assert json.loads(capsys.readouterr().out)["class"] == "wp"
+
+
+def test_exec_credits_guardrail_lease_wait_into_prover_budget(tmp_path, fake_engine, monkeypatch):
+    """
+    A prover's queued `guardrail` lease wait in `resources.py exec` is credited into its
+    `.prover_budget.json` (and never mutated on `--dry-run`).
+    """
+    fake_engine(DOCKER_DESKTOP)
+    monkeypatch.setenv("FRAMAC_POOL_CPUS", "4")
+    monkeypatch.setenv("FRAMAC_POOL_MEMORY", "8g")
+    run_dir = tmp_path / "run-1"
+    scratch = run_dir / "agents" / "prove-f" / "scratch"
+    (scratch / "work").mkdir(parents=True)
+    (scratch / "work" / "f.c").write_text("int f(int x) { return x; }\n", encoding="utf-8")
+    budget_path = scratch / ".prover_budget.json"
+    budget_path.write_text(
+        json.dumps(
+            {
+                "max_wp_invocations": 6,
+                "max_wall_clock_s": 900,
+                "wp_invocations": 1,
+                "first_wp_at": time.time() - 500.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    guard_cmd = (
+        "python3 /opt/framac-pipeline/scripts/run_eacsl_fuzz.py guardrail "
+        "--sources agents/prove-f/scratch/work/f.c --out-bin agents/prove-f/scratch/g"
+    )
+    monkeypatch.setenv("FRAMAC_CONTAINER_CMD", guard_cmd)
+
+    # Dry-run must not mutate .prover_budget.json even if a wait occurred.
+    broker = R.Broker(tmp_path / "broker", lambda: R.Budget(4, 8192, "test"), poll=0.02, max_poll=0.05)
+    blocker1 = broker.acquire("build", fixed_cpus=4, fixed_mem_mb=8192)
+    t1 = threading.Timer(0.4, broker.release, [blocker1])
+    t1.start()
+    try:
+        assert R.main(["exec", "--run-dir", str(run_dir), "--dry-run", "--", "docker", "run", "img"]) == 0
+    finally:
+        t1.join()
+    assert "lease_wait_s" not in json.loads(budget_path.read_text(encoding="utf-8"))
+
+    # Real exec credits the guardrail queue wait into .prover_budget.json.
+    blocker2 = broker.acquire("build", fixed_cpus=4, fixed_mem_mb=8192)
+    t2 = threading.Timer(0.4, broker.release, [blocker2])
+    t2.start()
+    try:
+        assert R.main(["exec", "--run-dir", str(run_dir), "--", "docker", "run", "img"]) == 0
+    finally:
+        t2.join()
+    updated = json.loads(budget_path.read_text(encoding="utf-8"))
+    assert len(updated.get("lease_wait_credited") or []) == 1
+    assert float(updated.get("lease_wait_s") or 0) >= 0.3
+
+
+def test_cmd_run_downgrades_exhausted_wp_sublease_to_light(tmp_path, monkeypatch):
+    """In-container `resources.py run` also downgrades an already-exhausted `wp` sub-lease to `light`."""
+    run_dir = tmp_path / "run"
+    scratch = run_dir / "agents" / "prove-f" / "scratch"
+    (scratch / "work").mkdir(parents=True)
+    c_file = scratch / "work" / "f.c"
+    c_file.write_text("int f(int x) { return x; }\n", encoding="utf-8")
+    (run_dir / "run-metadata.json").write_text("{}", encoding="utf-8")
+    (scratch / ".prover_budget.json").write_text(
+        json.dumps(
+            {
+                "max_wp_invocations": 6,
+                "max_wall_clock_s": 900,
+                "wp_invocations": 6,
+                "first_wp_at": time.time() - 60.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    broker_dir = tmp_path / "container-broker"
+    monkeypatch.setenv("FRAMAC_BROKER_DIR", str(broker_dir))
+    monkeypatch.delenv("FRAMAC_SUBLEASE_ID", raising=False)
+    monkeypatch.chdir(run_dir)
+    monkeypatch.setattr(R, "job_budget", lambda *_a, **_kw: R.Budget(2, 4096, "test"))
+    monkeypatch.setattr(R, "cgroup_stats", lambda *_a, **_kw: {})
+    seen_env: dict[str, str] = {}
+
+    def fake_run_child(cmd: list[str], env: dict[str, str]) -> tuple[int, int | None]:
+        seen_env.update(env)
+        return 0, None
+
+    monkeypatch.setattr(R, "_run_child", fake_run_child)
+    broker = R.Broker(broker_dir, lambda: R.Budget(2, 4096, "test"))
+    blocker = broker.acquire("build", fixed_cpus=2, fixed_mem_mb=4096)
+    try:
+        rc = R.cmd_run(
+            [
+                "--",
+                "python3",
+                "/opt/framac-pipeline/scripts/run_wp_function.py",
+                "--file",
+                "agents/prove-f/scratch/work/f.c",
+                "--function",
+                "f",
+                "--out-dir",
+                "agents/prove-f/scratch/wp",
+                "--out-json",
+                "agents/prove-f/scratch/wp_f.json",
+            ]
+        )
+    finally:
+        broker.release(blocker)
+    assert rc == 0
+    assert seen_env.get("FRAMAC_JOB_CLASS") == "light"
+    assert seen_env.get("FRAMAC_JOB_MEM_MB") == "1024"

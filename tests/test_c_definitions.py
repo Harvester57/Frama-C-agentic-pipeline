@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from c_definitions import extract_functions_from_code, extract_macro_definitions
+from test_acsl_ast_conditionals import AFTER, ARMS, LIBMODBUS_CONNECT
 
 
 class TestTokenFunctionExtraction:
@@ -117,3 +120,72 @@ class TestParenthesizedDeclarators:
         names = [f["name"] for f in extract_functions_from_code(src, path="<t>")]
         assert names == ["ssh2_default_alloc"]
         assert "void" not in names
+
+
+class TestPreprocessorConditionals:
+    """Preprocessor conditionals with unbalanced arms must not hide subsequent function definitions."""
+
+    @pytest.mark.parametrize("name", sorted(ARMS))
+    def test_extracts_functions_after_preprocessor_conditional_arms(self, name: str) -> None:
+        source = ARMS[name] + AFTER
+        first_fn = source[: source.index("(")].split()[-1]
+        fns = extract_functions_from_code(source, path="<t>")
+        by_name = {f["name"]: f for f in fns}
+        assert [f["name"] for f in fns] == [first_fn, "after", "last"]
+        assert by_name[first_fn]["line"] == 1
+        assert by_name[first_fn]["end_line"] == ARMS[name].rstrip("\n").count("\n") + 1
+        after_start = source[: source.index("int after(")].count("\n") + 1
+        assert by_name["after"]["line"] == after_start
+        assert by_name["last"]["line"] == source[: source.index("int last(")].count("\n") + 1
+
+    def test_extracts_split_params_duplicated_header_and_else_only_functions(self) -> None:
+        split_params = (
+            "int f(int a,\n#ifdef A\n      int b)\n#else\n      long b)\n#endif\n{\n    return a;\n}\n" + AFTER
+        )
+        assert [f["name"] for f in extract_functions_from_code(split_params)] == ["f", "after", "last"]
+
+        dup_header = "#ifdef A\nint f(int a) {\n#else\nint f(long a) {\n#endif\n    return 0;\n}\n" + AFTER
+        assert [f["name"] for f in extract_functions_from_code(dup_header)] == ["f", "after", "last"]
+
+        else_only = "#ifdef A\nint win(void) { return 1; }\n#else\nint posix(void) { return 2; }\n#endif\n" + AFTER
+        assert [f["name"] for f in extract_functions_from_code(else_only)] == ["win", "posix", "after", "last"]
+
+        # `#ifndef __cplusplus` before `#ifdef __cplusplus extern "C" {` must not leak `extern "C"` into `inner`.
+        linkage = (
+            "#ifndef __cplusplus\n"
+            "typedef int flag_t;\n"
+            "#endif\n"
+            "#ifdef __cplusplus\n"
+            'extern "C" {\n'
+            "#endif\n"
+            "int inner(void) { return 0; }\n"
+            "#ifdef __cplusplus\n"
+            "}\n"
+            "#endif\n" + LIBMODBUS_CONNECT + AFTER
+        )
+        fns = extract_functions_from_code(linkage)
+        assert [f["name"] for f in fns] == ["inner", "_connect", "after", "last"]
+        assert [t.text for t in fns[0]["decl_tokens"]] == ["int"]
+        assert fns[0]["line"] == 7
+
+    def test_balanced_conditional_preserves_exact_line_ranges(self) -> None:
+        src = (
+            "int first(int a)\n"
+            "{\n"
+            "#ifdef A\n"
+            "    if (a) { a = 1; }\n"
+            "#else\n"
+            "    if (a) { a = 2; }\n"
+            "#endif\n"
+            "    return a;\n"
+            "}\n"
+            "int second(void)\n"
+            "{\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        fns = extract_functions_from_code(src)
+        assert [(f["name"], f["line"], f["end_line"], f["loc"]) for f in fns] == [
+            ("first", 1, 9, 9),
+            ("second", 10, 13, 4),
+        ]

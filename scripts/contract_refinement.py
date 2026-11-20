@@ -25,7 +25,7 @@ Verdicts: `refines`, `weaker` (with the clauses left unproved: file, line, kind,
 clause counts as not implied only when WP reports a counter-example model for its goal
 (`-wp-counter-examples`); a goal left unproved without a model (a timeout on a hard but true implication
 looks the same as one on a false one) is undecided. `undecided` is also the verdict when the probe cannot
-be built (variadic prototype, unnamed formal, K&R or nested declarator, A without `assigns`, whose frame the
+be built (variadic prototype, unnamed formal, empty or malformed parameter list, A without `assigns`, whose frame the
 kernel would generate), when Frama-C does not parse it, when the run times out, when an unproved goal is
 not one of the probe's clauses, or when no goal at all is proved. `undecided` is never read as `refines`
 or `weaker`. A model is the solver's candidate counter-example, which WP does not check: a `weaker` verdict
@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from acsl_ast import (  # noqa: E402
     AcslError,
     DeclSpan,
+    Token,
     contract_declaration_spans,
     declaration_param_names,
     iter_clauses,
@@ -86,8 +87,66 @@ PROBE_FILE = "contract_probe.c"
 
 _INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*["<]([^">\n]+)[">]', re.MULTILINE)
 _INCLUDE_DIR_RE = re.compile(r"(?:^|\s)-I\s*(\S+)")
-_STORAGE_RE = re.compile(r"(?<![A-Za-z0-9_])(?:static|inline|__inline|__inline__|extern|_Noreturn)(?![A-Za-z0-9_])")
-_ATTRIBUTE_RE = re.compile(r"__attribute__\s*\(\(")
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_STORAGE_CLASS_TOKENS = frozenset({"static", "inline", "__inline", "__inline__", "extern", "_Noreturn"})
+_DECL_SUFFIX_KWS = frozenset({"__attribute__", "__attribute", "__asm__", "__asm", "asm"})
+_PTR_QUAL_TOKENS = frozenset({"*", "const", "volatile", "restrict", "__restrict", "__restrict__", "_Atomic"})
+_TYPE_QUAL_TOKENS = frozenset({"const", "volatile", "restrict", "__restrict", "__restrict__", "__extension__"})
+_BUILTIN_TYPE_TOKENS = frozenset(
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "_Bool",
+        "bool",
+        "_Complex",
+        "_Imaginary",
+        "__int128",
+        "__int128_t",
+        "__uint128_t",
+    }
+)
+_TAG_KEYWORDS = frozenset({"struct", "union", "enum"})
+_TYPEOF_KEYWORDS = frozenset({"typeof", "__typeof__", "__typeof"})
+_KR_FORBIDDEN_DECL_TOKENS = frozenset(
+    {
+        "typedef",
+        "extern",
+        "static",
+        "inline",
+        "__inline",
+        "__inline__",
+        "auto",
+        "_Noreturn",
+        "return",
+        "if",
+        "else",
+        "while",
+        "for",
+        "switch",
+        "do",
+        "case",
+        "default",
+        "goto",
+        "break",
+        "continue",
+    }
+)
+_C_NON_PARAM_KEYWORDS = (
+    _STORAGE_CLASS_TOKENS
+    | _TYPE_QUAL_TOKENS
+    | _BUILTIN_TYPE_TOKENS
+    | _TAG_KEYWORDS
+    | _TYPEOF_KEYWORDS
+    | _KR_FORBIDDEN_DECL_TOKENS
+    | frozenset({"register", "_Atomic", "sizeof"})
+)
 _BEHAVIOR_HEAD_RE = re.compile(r"(?<![\\\w])behavior\s+[A-Za-z_][A-Za-z0-9_]*\s*:")
 _SECTION_END_RE = re.compile(r"(?<![\\\w])(?:behavior\s+[A-Za-z_]\w*\s*:|complete\s+behaviors|disjoint\s+behaviors)")
 _LABEL_RE = re.compile(rf"(?:^|_){LABEL_PREFIX}(\d+)(?:_|$)")
@@ -192,87 +251,296 @@ def contract_sources(c_file: Path, source: str, cppflags: str = "") -> list[Path
     return out
 
 
-def _decl_head(decl: DeclSpan, path: str) -> str:
-    """The C head of a declaration: no ACSL, no comments, no body, no trailing `;`."""
-    text = decl.span.text
-    masked = mask_comments_and_literals(text, acsl="blank", literals=False, on_error="mask", path=path)
-    if decl.kind == "definition":
-        brace = masked.find("{")
-        masked = masked[:brace] if brace >= 0 else masked
-    return " ".join(masked.split()).rstrip(";").strip()
+def _tokenize_code(text: str, path: str = "<input>") -> list[Token]:
+    """Non-trivia tokens of C text (comments, whitespace, and preprocessor directives omitted)."""
+    return [
+        t
+        for t in tokenize_c_acsl(text, path=path)
+        if t.kind not in ("whitespace", "c_comment", "acsl_block", "acsl_line", "pp_directive")
+    ]
 
 
-def _param_list(head: str, function: str) -> tuple[str, str] | None:
-    """(the text between the parentheses of `function`'s parameter list, the text after them)."""
-    m = re.search(rf"(?<![A-Za-z0-9_]){re.escape(function)}\s*\(", head)
-    if m is None:
-        return None
+def _matching_token(toks: list[Token], open_idx: int, open_ch: str, close_ch: str) -> int:
+    """Index in `toks` of the closing delimiter matching `toks[open_idx]`, or -1 if unclosed."""
     depth = 0
-    for i in range(m.end() - 1, len(head)):
-        if head[i] == "(":
+    for idx in range(open_idx, len(toks)):
+        tok = toks[idx]
+        if tok.kind != "c_token":
+            continue
+        if tok.text == open_ch:
             depth += 1
-        elif head[i] == ")":
+        elif tok.text == close_ch:
             depth -= 1
             if depth == 0:
-                return head[m.end() : i], head[i + 1 :]
+                return idx
+    return -1
+
+
+def _skip_decl_suffixes(toks: list[Token], idx: int) -> int:
+    """Advance past consecutive GCC attribute / asm suffixes starting at `idx`, or -1 if malformed."""
+    n = len(toks)
+    while idx < n and toks[idx].kind == "c_token" and toks[idx].text in _DECL_SUFFIX_KWS:
+        if idx + 1 >= n or toks[idx + 1].kind != "c_token" or toks[idx + 1].text != "(":
+            return -1
+        close_idx = _matching_token(toks, idx + 1, "(", ")")
+        if close_idx == -1:
+            return -1
+        idx = close_idx + 1
+    return idx
+
+
+def _is_nested_decl_prefix(toks: list[Token], open_parens: list[int], fn_idx: int) -> bool:
+    """Whether `open_parens` wraps a nested pointer declarator around `toks[fn_idx]` (e.g. `int (*f(int))(int)`)."""
+    if not any(toks[k].kind == "c_token" for k in range(open_parens[0])):
+        return False
+    boundaries = [*open_parens, fn_idx]
+    for p_idx, next_idx in zip(boundaries, boundaries[1:], strict=False):
+        saw_star = False
+        k = p_idx + 1
+        while k < next_idx:
+            if toks[k].kind == "c_token" and toks[k].text in _DECL_SUFFIX_KWS:
+                nxt = _skip_decl_suffixes(toks, k)
+                if nxt < 0 or nxt > next_idx:
+                    return False
+                k = nxt
+                continue
+            if toks[k].kind != "c_token" or toks[k].text not in _PTR_QUAL_TOKENS:
+                return False
+            if toks[k].text == "*":
+                saw_star = True
+            k += 1
+        if not saw_star:
+            return False
+    return True
+
+
+def _find_function_declarator(toks: list[Token], function: str) -> tuple[int, int, int, list[int]] | None:
+    """
+    Locate `(fn_idx, open_paren_idx, close_paren_idx, open_parens)` for `function`'s declarator in `toks`.
+    `open_parens` holds the enclosing `(` indices of a nested return declarator (`int (*f(int))(int)`).
+    """
+    n = len(toks)
+    brace_depth = 0
+    bracket_depth = 0
+    open_parens: list[int] = []
+    i = 0
+    while i < n:
+        tok = toks[i]
+        if tok.kind != "c_token":
+            i += 1
+            continue
+        text = tok.text
+        if brace_depth == 0 and bracket_depth == 0:
+            if (
+                (text in _DECL_SUFFIX_KWS or text in _TYPEOF_KEYWORDS or text == "_Atomic")
+                and i + 1 < n
+                and toks[i + 1].kind == "c_token"
+                and toks[i + 1].text == "("
+            ):
+                close_idx = _matching_token(toks, i + 1, "(", ")")
+                if close_idx == -1:
+                    return None
+                i = close_idx + 1
+                continue
+            if (
+                text == function
+                and i + 1 < n
+                and toks[i + 1].kind == "c_token"
+                and toks[i + 1].text == "("
+                and (not open_parens or _is_nested_decl_prefix(toks, open_parens, i))
+            ):
+                close_idx = _matching_token(toks, i + 1, "(", ")")
+                if close_idx == -1:
+                    return None
+                return i, i + 1, close_idx, list(open_parens)
+            if text == "(":
+                open_parens.append(i)
+            elif text == ")" and open_parens:
+                open_parens.pop()
+        if text == "{":
+            brace_depth += 1
+        elif text == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif text == "[":
+            bracket_depth += 1
+        elif text == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        i += 1
     return None
 
 
-def _split_params(inner: str) -> list[str]:
-    parts: list[str] = []
-    depth = 0
-    cur: list[str] = []
-    for ch in inner:
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        if ch == "," and depth == 0:
-            parts.append("".join(cur).strip())
-            cur = []
+def _unwind_nested_declarator(toks: list[Token], pos: int, depth: int) -> int:
+    """Close `depth` nested declarator `)` levels, each followed by `(...)` or `[...]` return suffixes, or -1."""
+    n = len(toks)
+    for _ in range(depth):
+        pos = _skip_decl_suffixes(toks, pos)
+        if pos < 0 or pos >= n or toks[pos].kind != "c_token" or toks[pos].text != ")":
+            return -1
+        pos = _skip_decl_suffixes(toks, pos + 1)
+        if pos < 0:
+            return -1
+        saw_suffix = False
+        while pos < n and toks[pos].kind == "c_token" and toks[pos].text in ("(", "["):
+            open_ch = toks[pos].text
+            close_ch = ")" if open_ch == "(" else "]"
+            close_idx = _matching_token(toks, pos, open_ch, close_ch)
+            if close_idx == -1:
+                return -1
+            saw_suffix = True
+            pos = _skip_decl_suffixes(toks, close_idx + 1)
+            if pos < 0:
+                return -1
+        if not saw_suffix:
+            return -1
+    return pos
+
+
+def _split_token_list(toks: list[Token], sep: str) -> list[list[Token]] | None:
+    """Split `toks` at top-level `sep` tokens (preserving empty slices), or None on unbalanced delimiters."""
+    parts: list[list[Token]] = [[]]
+    p_depth = 0
+    b_depth = 0
+    c_depth = 0
+    for tok in toks:
+        if tok.kind == "c_token":
+            t = tok.text
+            if t == "(":
+                p_depth += 1
+            elif t == ")":
+                p_depth -= 1
+            elif t == "[":
+                b_depth += 1
+            elif t == "]":
+                b_depth -= 1
+            elif t == "{":
+                c_depth += 1
+            elif t == "}":
+                c_depth -= 1
+            elif t == sep and p_depth == 0 and b_depth == 0 and c_depth == 0:
+                parts.append([])
+                continue
+            if p_depth < 0 or b_depth < 0 or c_depth < 0:
+                return None
+        parts[-1].append(tok)
+    if p_depth != 0 or b_depth != 0 or c_depth != 0:
+        return None
+    return parts
+
+
+def _body_brace_offset(text: str, function: str, path: str = "<input>") -> int | None:
+    """Byte offset of the function body's opening `{` in `text`, skipping `struct/union/enum { ... }` in the head."""
+    toks = _tokenize_code(text, path=path)
+    found = _find_function_declarator(toks, function)
+    if found is not None:
+        _fn_idx, _open_p, close_p, open_parens = found
+        pos = _unwind_nested_declarator(toks, close_p + 1, len(open_parens))
+        if pos >= 0:
+            p_depth = 0
+            tag_state = 0  # 1 right after struct/union/enum, 2 right after tag identifier
+            n = len(toks)
+            while pos < n:
+                tok = toks[pos]
+                if tok.kind != "c_token":
+                    tag_state = 0
+                    pos += 1
+                    continue
+                t = tok.text
+                if p_depth == 0 and t in _DECL_SUFFIX_KWS:
+                    nxt = _skip_decl_suffixes(toks, pos)
+                    if nxt >= 0:
+                        pos = nxt
+                        continue
+                if t == "(":
+                    p_depth += 1
+                    tag_state = 0
+                elif t == ")":
+                    p_depth = max(0, p_depth - 1)
+                    tag_state = 0
+                elif t == "{" and p_depth == 0:
+                    if tag_state in (1, 2):
+                        close_b = _matching_token(toks, pos, "{", "}")
+                        if close_b == -1:
+                            break
+                        pos = close_b + 1
+                        tag_state = 0
+                        continue
+                    return tok.start
+                elif p_depth == 0:
+                    if t in _TAG_KEYWORDS:
+                        tag_state = 1
+                    elif tag_state == 1 and _IDENT_RE.fullmatch(t):
+                        tag_state = 2
+                    else:
+                        tag_state = 0
+                pos += 1
+    p_depth = 0
+    b_depth = 0
+    last_top_brace: int | None = None
+    for tok in toks:
+        if tok.kind != "c_token":
             continue
-        cur.append(ch)
-    parts.append("".join(cur).strip())
-    return [p for p in parts if p]
+        if tok.text == "(":
+            p_depth += 1
+        elif tok.text == ")":
+            p_depth = max(0, p_depth - 1)
+        elif tok.text == "{":
+            if p_depth == 0 and b_depth == 0:
+                last_top_brace = tok.start
+            b_depth += 1
+        elif tok.text == "}":
+            b_depth = max(0, b_depth - 1)
+    return last_top_brace
 
 
-def _strip_attributes(text: str) -> str:
-    """`text` without its `__attribute__((...))` groups."""
-    out = text
-    while (m := _ATTRIBUTE_RE.search(out)) is not None:
-        depth = 0
-        end = len(out)
-        for i in range(m.end() - 2, len(out)):
-            if out[i] == "(":
-                depth += 1
-            elif out[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        out = out[: m.start()] + " " + out[end:]
-    return out
+def _decl_head(decl: DeclSpan, path: str) -> str:
+    """The C head of a declaration: no ACSL, no comments, no body, no trailing `;` on prototypes."""
+    text = decl.span.text
+    if decl.kind == "definition":
+        brace = _body_brace_offset(text, decl.span.function, path=path)
+        text = text[:brace] if brace is not None else text
+    masked = mask_comments_and_literals(text, acsl="blank", literals=False, on_error="mask", path=path)
+    head = " ".join(masked.split()).strip()
+    if decl.kind != "definition":
+        head = head.rstrip(";").strip()
+    return head
 
 
 def _piece(decl: DeclSpan, function: str, path: str, file_label: str) -> Piece:
     part = decl.span.text
     if decl.kind == "definition":
-        masked = mask_comments_and_literals(part, acsl="keep", literals=False, on_error="mask", path=path)
-        part = part[: masked.find("{")] if "{" in masked else part
+        brace = _body_brace_offset(part, function, path=path)
+        part = part[:brace] if brace is not None else part
     tokens = [t for t in tokenize_c_acsl(part, path=path) if t.kind in ("acsl_block", "acsl_line")]
     acsl = "\n".join(t.text for t in tokens)
     line = decl.span.start_line + (tokens[0].line - 1 if tokens else 0)
     head = _decl_head(decl, path)
-    params_info = _param_list(head, function)
+    head_toks = _tokenize_code(head, path=path)
+    found = _find_function_declarator(head_toks, function)
     names = declaration_param_names(decl, path=path)
     params: list[str] | None = names
     variadic = False
-    if params_info is not None:
-        raw = _split_params(params_info[0])
-        variadic = any(p == "..." for p in raw)
-        declared = [p for p in raw if p not in ("void", "...")]
-        if len(declared) != len(names):
+    if found is None:
+        params = None
+    else:
+        _fn_idx, open_p, close_p, _open_parens = found
+        param_toks = head_toks[open_p + 1 : close_p]
+        if not param_toks:
             params = None
+        else:
+            param_parts = _split_token_list(param_toks, ",")
+            if param_parts is None or any(not p for p in param_parts):
+                params = None
+            else:
+                variadic = any(len(p) == 3 and [t.text for t in p] == [".", ".", "."] for p in param_parts)
+                has_bad_void = any(len(p) == 1 and p[0].text == "void" for p in param_parts) and len(param_parts) > 1
+                declared = [
+                    p
+                    for p in param_parts
+                    if not (len(p) == 1 and p[0].text == "void")
+                    and not (len(p) == 3 and [t.text for t in p] == [".", ".", "."])
+                ]
+                if has_bad_void or len(declared) != len(names):
+                    params = None
     return Piece(file=file_label, line=line, acsl=acsl, declarator=head, params=params, variadic=variadic)
 
 
@@ -400,23 +668,326 @@ def _labelled(body: str, piece: Piece, role: str, unit: ProbeUnit, next_label: l
     return out
 
 
-def _check_piece(piece: Piece, function: str, what: str) -> str:
-    """The piece's declarator renamed for the probe; ProbeError when the probe cannot carry it."""
+@dataclass(frozen=True)
+class _ParsedDecl:
+    """Validated declarator normalized to ANSI form, split around the function identifier for renaming."""
+
+    before_name: str
+    after_name: str
+
+    def render(self, name: str) -> str:
+        return f"{self.before_name}{name}{self.after_name}"
+
+
+def _valid_decl_suffixes(toks: list[Token], start: int) -> bool:
+    """Whether `toks[start:]` consists solely of valid declarator suffixes (`[...]`, `(...)`, attributes)."""
+    idx = start
+    n = len(toks)
+    while idx < n:
+        idx = _skip_decl_suffixes(toks, idx)
+        if idx < 0:
+            return False
+        if idx >= n:
+            return True
+        tok = toks[idx]
+        if tok.kind == "c_token" and tok.text in ("(", "["):
+            close_ch = ")" if tok.text == "(" else "]"
+            close_idx = _matching_token(toks, idx, tok.text, close_ch)
+            if close_idx == -1:
+                return False
+            idx = close_idx + 1
+            continue
+        return False
+    return True
+
+
+def _declarator_name(toks: list[Token]) -> str | None:
+    """Extract the declared identifier from a C declarator token sequence, or None if unnamed/malformed."""
+    idx = 0
+    n = len(toks)
+    while idx < n:
+        idx = _skip_decl_suffixes(toks, idx)
+        if idx < 0 or idx >= n:
+            return None
+        tok = toks[idx]
+        if tok.kind == "c_token" and tok.text in _PTR_QUAL_TOKENS:
+            idx += 1
+            continue
+        break
+    if idx >= n:
+        return None
+    tok = toks[idx]
+    if tok.kind == "c_token" and tok.text == "(":
+        close_idx = _matching_token(toks, idx, "(", ")")
+        if close_idx == -1 or not _valid_decl_suffixes(toks, close_idx + 1):
+            return None
+        return _declarator_name(toks[idx + 1 : close_idx])
+    if tok.kind == "c_token" and _IDENT_RE.fullmatch(tok.text) and tok.text not in _C_NON_PARAM_KEYWORDS:
+        if not _valid_decl_suffixes(toks, idx + 1):
+            return None
+        return tok.text
+    return None
+
+
+def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    """`text` with the given `(start, end)` spans removed."""
+    out = text
+    for start, end in sorted(spans, reverse=True):
+        out = out[:start] + out[end:]
+    return out
+
+
+def _has_forbidden_top_level_kr_token(toks: list[Token]) -> bool:
+    """Whether `toks` contains `=` or a storage-class/control-flow keyword forbidden in K&R parameter declarations."""
+    p_depth = 0
+    b_depth = 0
+    c_depth = 0
+    for tok in toks:
+        if tok.kind != "c_token":
+            continue
+        t = tok.text
+        if t == "(":
+            p_depth += 1
+        elif t == ")":
+            p_depth -= 1
+        elif t == "[":
+            b_depth += 1
+        elif t == "]":
+            b_depth -= 1
+        elif t == "{":
+            c_depth += 1
+        elif t == "}":
+            c_depth -= 1
+        elif p_depth == 0 and b_depth == 0 and c_depth == 0 and (t == "=" or t in _KR_FORBIDDEN_DECL_TOKENS):
+            return True
+    return False
+
+
+def _split_kr_spec_and_decl(head: str, part_toks: list[Token], param_set: set[str]) -> tuple[str, list[Token]] | None:
+    """
+    Split the first comma-element of a K&R parameter declaration into `(specifiers_text, declarator_tokens)`.
+    Strips `register` and inserts default `int` when only `register`/qualifiers are present. Returns None if malformed.
+    """
+    has_type_spec = False
+    i = 0
+    n = len(part_toks)
+    while i < n:
+        tok = part_toks[i]
+        if tok.kind != "c_token":
+            break
+        t = tok.text
+        if t == "register" or t in _TYPE_QUAL_TOKENS:
+            i += 1
+            continue
+        if t == "_Atomic":
+            if i + 1 < n and part_toks[i + 1].kind == "c_token" and part_toks[i + 1].text == "(":
+                close_p = _matching_token(part_toks, i + 1, "(", ")")
+                if close_p == -1:
+                    return None
+                i = close_p + 1
+                has_type_spec = True
+            else:
+                i += 1
+            continue
+        if t in _BUILTIN_TYPE_TOKENS:
+            has_type_spec = True
+            i += 1
+            continue
+        if t in _TAG_KEYWORDS:
+            i += 1
+            i = _skip_decl_suffixes(part_toks, i)
+            if i < 0:
+                return None
+            saw_tag_or_body = False
+            if (
+                i < n
+                and part_toks[i].kind == "c_token"
+                and _IDENT_RE.fullmatch(part_toks[i].text)
+                and part_toks[i].text not in _C_NON_PARAM_KEYWORDS
+            ):
+                saw_tag_or_body = True
+                i += 1
+                i = _skip_decl_suffixes(part_toks, i)
+                if i < 0:
+                    return None
+            if i < n and part_toks[i].kind == "c_token" and part_toks[i].text == "{":
+                close_b = _matching_token(part_toks, i, "{", "}")
+                if close_b == -1:
+                    return None
+                saw_tag_or_body = True
+                i = close_b + 1
+            if not saw_tag_or_body:
+                return None
+            has_type_spec = True
+            continue
+        if t in _TYPEOF_KEYWORDS:
+            if i + 1 < n and part_toks[i + 1].kind == "c_token" and part_toks[i + 1].text == "(":
+                close_p = _matching_token(part_toks, i + 1, "(", ")")
+                if close_p == -1:
+                    return None
+                i = close_p + 1
+                has_type_spec = True
+                continue
+            break
+        if t in ("__attribute__", "__attribute"):
+            if i + 1 < n and part_toks[i + 1].kind == "c_token" and part_toks[i + 1].text == "(":
+                close_p = _matching_token(part_toks, i + 1, "(", ")")
+                if close_p == -1:
+                    return None
+                i = close_p + 1
+                continue
+            break
+        if not has_type_spec and _IDENT_RE.fullmatch(t) and t not in _C_NON_PARAM_KEYWORDS:
+            # Distinguish a typedef-name (`size_t a`, `my_t (*cb)(int)`) from a parameter declarator with
+            # implicit `int` (`register a;`, `register a[4];`, `const a;`).
+            if i + 1 == n:
+                break
+            is_ptr_paren = (
+                i + 2 < n
+                and part_toks[i + 1].kind == "c_token"
+                and part_toks[i + 1].text == "("
+                and part_toks[i + 2].kind == "c_token"
+                and part_toks[i + 2].text == "*"
+            )
+            if i > 0 and t in param_set and not is_ptr_paren and _declarator_name(part_toks[i:]) == t:
+                break
+            has_type_spec = True
+            i += 1
+            continue
+        break
+    if i == 0 or i >= n:
+        return None
+    spec_toks = part_toks[:i]
+    base = spec_toks[0].start
+    spec_slice = head[base : spec_toks[-1].end]
+    reg_spans = [(t.start - base, t.end - base) for t in spec_toks if t.kind == "c_token" and t.text == "register"]
+    spec_text = " ".join(_remove_spans(spec_slice, reg_spans).split())
+    if not has_type_spec:
+        spec_text = f"{spec_text} int".strip()
+    return spec_text, part_toks[i:]
+
+
+def _parse_kr_declarations(
+    head: str, tail_toks: list[Token], param_order: list[str], what: str, function: str
+) -> list[str]:
+    """
+    Parse K&R parameter declarations (`int a; char *b;`, including `register`, multi-declarator items,
+    structs/function-pointers, and default-`int` for omitted parameters) into ordered ANSI parameters.
+    """
+    decls = _split_token_list(tail_toks, ";")
+    if decls is None:
+        raise ProbeError(f"{what} of {function}: unbalanced K&R parameter declarations in `{head}`")
+    if decls and not decls[-1]:
+        decls = decls[:-1]
+    if not decls or any(not d for d in decls):
+        raise ProbeError(f"{what} of {function}: malformed K&R parameter declarations in `{head}`")
+    param_set = set(param_order)
+    declared: dict[str, str] = {}
+    for decl_toks in decls:
+        if _has_forbidden_top_level_kr_token(decl_toks):
+            raise ProbeError(f"{what} of {function}: invalid K&R parameter declaration in `{head}`")
+        items = _split_token_list(decl_toks, ",")
+        if items is None or any(not item for item in items):
+            raise ProbeError(f"{what} of {function}: malformed K&R parameter declaration in `{head}`")
+        split = _split_kr_spec_and_decl(head, items[0], param_set)
+        if split is None:
+            raise ProbeError(f"{what} of {function}: unrecognized K&R parameter declaration in `{head}`")
+        spec_text, first_decl = split
+        for decl_item in (first_decl, *items[1:]):
+            name = _declarator_name(decl_item)
+            if name is None or name not in param_set:
+                raise ProbeError(
+                    f"{what} of {function}: K&R parameter declaration does not match parameter list in `{head}`"
+                )
+            if name in declared:
+                raise ProbeError(f"{what} of {function}: duplicate K&R declaration for parameter `{name}` in `{head}`")
+            decl_text = " ".join(head[decl_item[0].start : decl_item[-1].end].split())
+            declared[name] = f"{spec_text} {decl_text}"
+    return [declared.get(name, f"int {name}") for name in param_order]
+
+
+def _top_level_storage_spans(toks: list[Token], limit: int) -> list[tuple[int, int]]:
+    """Byte spans of top-level storage-class specifiers in `toks[:limit]`."""
+    spans: list[tuple[int, int]] = []
+    p_depth = 0
+    b_depth = 0
+    c_depth = 0
+    for tok in toks[:limit]:
+        if tok.kind != "c_token":
+            continue
+        t = tok.text
+        if t == "(":
+            p_depth += 1
+        elif t == ")":
+            p_depth = max(0, p_depth - 1)
+        elif t == "[":
+            b_depth += 1
+        elif t == "]":
+            b_depth = max(0, b_depth - 1)
+        elif t == "{":
+            c_depth += 1
+        elif t == "}":
+            c_depth = max(0, c_depth - 1)
+        elif p_depth == 0 and b_depth == 0 and c_depth == 0 and t in _STORAGE_CLASS_TOKENS:
+            spans.append((tok.start, tok.end))
+    return spans
+
+
+def _check_piece(piece: Piece, function: str, what: str) -> _ParsedDecl:
+    """Validate and normalize a piece's declarator (ANSI, K&R, or nested); ProbeError if the probe cannot carry it."""
     if piece.variadic:
         raise ProbeError(f"{what} of {function} is variadic: the probe cannot forward its arguments")
-    split = _param_list(piece.declarator, function)
-    if split is None:
-        raise ProbeError(f"{what} of {function}: parameter list not found in `{piece.declarator}`")
-    if _strip_attributes(split[1]).strip():
-        raise ProbeError(
-            f"{what} of {function}: text after the parameter list (K&R definition or nested declarator) in "
-            f"`{piece.declarator}`"
-        )
-    return _STORAGE_RE.sub(" ", piece.declarator).strip()
+    head = piece.declarator
+    toks = _tokenize_code(head)
+    found = _find_function_declarator(toks, function)
+    if found is None:
+        raise ProbeError(f"{what} of {function}: parameter list not found in `{head}`")
+    fn_idx, open_p, close_p, open_parens = found
+    decl_end = _unwind_nested_declarator(toks, close_p + 1, len(open_parens))
+    if decl_end == -1:
+        raise ProbeError(f"{what} of {function}: malformed nested declarator in `{head}`")
+    tail_pos = _skip_decl_suffixes(toks, decl_end)
+    if tail_pos == -1:
+        raise ProbeError(f"{what} of {function}: malformed attribute after parameter list in `{head}`")
+    param_toks = toks[open_p + 1 : close_p]
+    if not param_toks:
+        raise ProbeError(f"{what} of {function}: empty parameter list in `{head}`")
+    param_parts = _split_token_list(param_toks, ",")
+    if param_parts is None or any(not p for p in param_parts):
+        raise ProbeError(f"{what} of {function}: malformed parameter list in `{head}`")
+    if any(len(p) == 3 and [t.text for t in p] == [".", ".", "."] for p in param_parts):
+        raise ProbeError(f"{what} of {function} is variadic: the probe cannot forward its arguments")
+    if any(len(p) == 1 and p[0].text == "void" for p in param_parts) and len(param_parts) > 1:
+        raise ProbeError(f"{what} of {function}: malformed parameter list in `{head}`")
 
+    decl_anchor = open_parens[0] if open_parens else fn_idx
+    storage_spans = _top_level_storage_spans(toks, decl_anchor)
+    prefix_before_anchor = re.sub(r"\s+", " ", _remove_spans(head[: toks[decl_anchor].start], storage_spans)).lstrip()
+    if not prefix_before_anchor.strip():
+        prefix_before_anchor = "int "
+    before_name = prefix_before_anchor + head[toks[decl_anchor].start : toks[fn_idx].start]
 
-def _rename(declarator: str, function: str, new_name: str) -> str:
-    return re.sub(rf"(?<![A-Za-z0-9_]){re.escape(function)}(?=\s*\()", new_name, declarator, count=1)
+    if tail_pos == len(toks):
+        after_name = head[toks[fn_idx].end :].rstrip()
+        return _ParsedDecl(before_name=before_name, after_name=after_name)
+
+    # Non-empty tail after the declarator (and its attributes): must be a K&R parameter declaration list.
+    param_order: list[str] = []
+    for p in param_parts:
+        if (
+            len(p) != 1
+            or p[0].kind != "c_token"
+            or not _IDENT_RE.fullmatch(p[0].text)
+            or p[0].text in _C_NON_PARAM_KEYWORDS
+        ):
+            raise ProbeError(f"{what} of {function}: unexpected text after the parameter list in `{head}`")
+        param_order.append(p[0].text)
+    if len(set(param_order)) != len(param_order):
+        raise ProbeError(f"{what} of {function}: duplicate parameter name in K&R parameter list in `{head}`")
+    ansi_params = _parse_kr_declarations(head, toks[tail_pos:], param_order, what, function)
+    outer_suffix = head[toks[close_p].end : toks[tail_pos - 1].end] if tail_pos > close_p + 1 else ""
+    after_name = f"({', '.join(ansi_params)}){outer_suffix}"
+    return _ParsedDecl(before_name=before_name, after_name=after_name)
 
 
 def _annotated(body: str) -> list[str]:
@@ -447,35 +1018,35 @@ def build_probe(
     """
     if not given or not probe:
         raise ProbeError(f"{function}: nothing to compare (a contract is empty)")
+    def_decl = _check_piece(definition, function, "the definition")
     if definition.params is None:
         raise ProbeError(f"{function}: a formal parameter of the definition is unnamed")
-    def_head = _check_piece(definition, function, "the definition")
     unit = ProbeUnit(text="", function=function)
     label = [1]
     lines = [f'#include "{include.as_posix()}"', ""]
     given_text: list[str] = []
     for p in given:
-        head = _check_piece(p, function, f"the declaration at {p.file}:{p.line}")
+        decl = _check_piece(p, function, f"the declaration at {p.file}:{p.line}")
         body = acsl_body(p.acsl)
         if strip_given_ensures:
             body = strip_ensures(body)
         given_text.append(body)
         lines += _annotated(_labelled(body, p, "given", unit, label))
-        lines += [_rename(head, function, function + GIVEN_SUFFIX) + ";", ""]
+        lines += [decl.render(function + GIVEN_SUFFIX) + ";", ""]
     if not any(kind == "assigns" for body in given_text for kind, *_ in iter_clauses(body)):
         raise ProbeError(
             f"{function}: the contract compared against has no `assigns` clause, so the kernel would "
             "generate the frame the probe relies on"
         )
     for p in probe:
-        head = _check_piece(p, function, f"the declaration at {p.file}:{p.line}")
+        decl = _check_piece(p, function, f"the declaration at {p.file}:{p.line}")
         body = _labelled(acsl_body(p.acsl), p, "probe", unit, label)
         lines += _annotated(body)
-        lines += [_rename(head, function, function + PROBE_SUFFIX) + ";", ""]
+        lines += [decl.render(function + PROBE_SUFFIX) + ";", ""]
     args = ", ".join(definition.params)
     call = f"{function}{GIVEN_SUFFIX}({args});"
     lines += [
-        _rename(def_head, function, function + PROBE_SUFFIX),
+        def_decl.render(function + PROBE_SUFFIX),
         "{",
         f"  {call}" if returns_void else f"  return {call}",
         "}",

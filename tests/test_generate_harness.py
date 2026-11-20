@@ -301,3 +301,106 @@ def test_record_repair_combined_with_api_regeneration_and_dispatch_case(
     assert meta["repair_history"][0]["reason"] == "append custom case for skipped API function"
     assert meta["dispatch_case_count"] == 2
     assert list(va.validate_sidecar(meta, "libqcbor_a")) == []
+
+
+@pytest.mark.parametrize("std", ["-std=c99", "-std=gnu99", "-std=c11", "-std=gnu11", "-std=c17", "-std=gnu17"])
+def test_merge_dag_module_cppflags_preserves_c99_plus_std_on_link_units(tmp_path: Path, std: str) -> None:
+    harnesses = tmp_path / "workspace" / "harnesses"
+    harnesses.mkdir(parents=True)
+    _write_json(
+        tmp_path / "workspace" / "reports" / "callgraph_dag.json",
+        {
+            "module_kind": "link_unit",
+            "modules": {
+                "libmpack_a": {
+                    "cppflags": ["-Iworkspace/work/src", std, "-DMPACK_STDIO=1"],
+                }
+            },
+        },
+    )
+    merged = gh._merge_dag_module_cppflags("libmpack_a", harnesses, "-I.")
+    tokens = gh._split_cppflags(merged)
+    assert std in tokens
+    assert "-Iworkspace/work/src" in tokens and "-DMPACK_STDIO=1" in tokens
+
+
+@pytest.mark.parametrize(
+    "std", ["-std=c89", "-std=c90", "-std=gnu89", "-std=gnu90", "-std=iso9899:1990", "-std=iso9899:199409"]
+)
+def test_merge_dag_module_cppflags_drops_pre_c99_std_on_link_units(tmp_path: Path, std: str) -> None:
+    harnesses = tmp_path / "workspace" / "harnesses"
+    harnesses.mkdir(parents=True)
+    _write_json(
+        tmp_path / "workspace" / "reports" / "callgraph_dag.json",
+        {
+            "module_kind": "link_unit",
+            "modules": {
+                "libold_a": {
+                    "cppflags": ["-Iworkspace/work/src", std, "-DKEEP=1"],
+                }
+            },
+        },
+    )
+    merged = gh._merge_dag_module_cppflags("libold_a", harnesses, "-I.")
+    tokens = gh._split_cppflags(merged)
+    assert std not in tokens
+    assert "-Iworkspace/work/src" in tokens and "-DKEEP=1" in tokens
+
+
+def test_merge_dag_module_cppflags_keeps_explicit_caller_std_over_link_unit_std(tmp_path: Path) -> None:
+    harnesses = tmp_path / "workspace" / "harnesses"
+    harnesses.mkdir(parents=True)
+    _write_json(
+        tmp_path / "workspace" / "reports" / "callgraph_dag.json",
+        {
+            "module_kind": "link_unit",
+            "modules": {
+                "libmpack_a": {
+                    "cppflags": ["-Iworkspace/work/src", "-std=c99"],
+                }
+            },
+        },
+    )
+    merged = gh._merge_dag_module_cppflags("libmpack_a", harnesses, "-I. -std=c11")
+    tokens = gh._split_cppflags(merged)
+    assert "-std=c11" in tokens and "-std=c99" not in tokens
+
+
+def test_generate_harness_cli_preserves_link_unit_c11_std_in_sidecar(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "workspace" / "work" / "src" / "mod.c"
+    src.parent.mkdir(parents=True)
+    src.write_text("int parse_buf(const unsigned char *p, unsigned long n) { return (int)n; }\n", encoding="utf-8")
+    out_dir = tmp_path / "workspace" / "harnesses"
+    _write_json(
+        tmp_path / "workspace" / "reports" / "callgraph_dag.json",
+        {
+            "module_kind": "link_unit",
+            "modules": {
+                "libmod_a": {
+                    "cppflags": ["-Iworkspace/work/src", "-std=c11", "-std=gnu90"],
+                }
+            },
+        },
+    )
+    rc = gh.main(
+        [
+            "--module",
+            "libmod_a",
+            "--sources",
+            str(src),
+            "--header",
+            "none",
+            "--entry-fn",
+            "parse_buf",
+            "--out-dir",
+            str(out_dir),
+            "--no-auto-prelude",
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+    meta = json.loads((out_dir / "harness_libmod_a.json").read_text(encoding="utf-8"))
+    flags = gh._split_cppflags(meta["cppflags"])
+    assert "-std=c11" in flags and "-std=gnu90" not in flags

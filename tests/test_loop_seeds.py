@@ -243,6 +243,42 @@ def test_candidates_skip_macro_loops_existing_invariants_and_used_seed_names() -
 
 
 @pytest.mark.unit
+def test_existing_invariants_ignores_comments_nested_annotations_and_doxygen() -> None:
+    # Commented-out, nested //@, doxygen, and plain C comments must not suppress candidate generation.
+    commented = SUM_INT.replace(
+        "    for (i = 0",
+        (
+            "    // loop invariant 0 <= i;\n"
+            "    /*@* loop invariant i <= len; */\n"
+            "    /*@ // loop invariant 0 <= i;\n"
+            "      @ //@ loop invariant i <= len;\n"
+            "      @ loop assigns i;\n"
+            "      @*/\n"
+            "    for (i = 0"
+        ),
+    )
+    record = _sum_int_record()
+    record["loops"][0]["line"] = 13
+    preds = [c.predicate for c in ls.generate_candidates(record, commented)]
+    assert "0 <= i" in preds and "i <= len" in preds
+
+    # Real invariants with inline // comments or @ whitespace ARE recognized as already present.
+    real = SUM_INT.replace(
+        "    for (i = 0",
+        (
+            "    /*@ loop invariant 0 <= i // non-negative\n"
+            "      @ ;\n"
+            "      @ loop @ invariant @ i <= len;\n"
+            "      @*/\n"
+            "    for (i = 0"
+        ),
+    )
+    record2 = _sum_int_record()
+    record2["loops"][0]["line"] = 11
+    assert [c.predicate for c in ls.generate_candidates(record2, real)] == ["0 <= len ==> i <= len"]
+
+
+@pytest.mark.unit
 def test_candidates_are_capped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ls, "MAX_CANDIDATES_PER_LOOP", 2)
     assert len(ls.generate_candidates(_sum_int_record(), SUM_INT)) == 2
@@ -293,6 +329,35 @@ def test_insert_skips_loops_it_cannot_annotate() -> None:
     assert seeded == text and lines == {}
     assert set(skipped) == {3, 5, 7, 99}
     assert "not the first token" in skipped[3] and "//@" in skipped[5] and "not a loop annotation" in skipped[7]
+
+
+@pytest.mark.unit
+def test_insert_seeds_ignores_commented_loop_clauses_and_handles_at_and_doxygen() -> None:
+    # A // comment or nested //@ mentioning `loop invariant` inside an assert block must not trick insert_seeds
+    # into splicing loop invariants into that non-loop annotation block.
+    fake_loop = (
+        "void f(int n) {\n"
+        "  int i = 0;\n"
+        "  /*@ assert n >= 0; // loop invariant i >= 0;\n"
+        "    @ //@ loop assigns i;\n"
+        "    @*/\n"
+        "  while (i < n) i++;\n"
+        "}\n"
+    )
+    seeded, lines, skipped = ls.insert_seeds(fake_loop, _seeds(("seed_1", 6, "i <= n")))
+    assert seeded == fake_loop and lines == {} and "not a loop annotation" in skipped[6]
+
+    # A real loop annotation with `@` or a `//` comment between `loop` and `assigns` IS joined cleanly.
+    at_loop = "void f(int n) {\n  int i = 0;\n  /*@ loop // note\n    @ @ assigns i; */\n  while (i < n) i++;\n}\n"
+    seeded2, lines2, skipped2 = ls.insert_seeds(at_loop, _seeds(("seed_1", 5, "i <= n")))
+    assert skipped2 == {} and "seed_1" in lines2 and seeded2.count("/*@") == 1
+    assert "/*@\nloop invariant seed_1: i <= n;\n loop // note" in seeded2
+
+    # A doxygen comment before a loop is a plain comment to Frama-C, so seeds get a fresh block after it.
+    doxy = "void f(int n) {\n  int i = 0;\n  /*@* loop assigns i; */\n  while (i < n) i++;\n}\n"
+    seeded3, lines3, skipped3 = ls.insert_seeds(doxy, _seeds(("seed_1", 4, "i <= n")))
+    assert skipped3 == {} and "seed_1" in lines3
+    assert "/*@* loop assigns i; */\n  /*@\nloop invariant seed_1: i <= n;\n*/\nwhile (i < n) i++;" in seeded3
 
 
 # ---------------------------------------------------------------------------

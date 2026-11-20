@@ -21,7 +21,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from acsl_ast import DEFAULT_BEHAVIOR, compare_function_contracts  # noqa: E402
+from acsl_ast import DEFAULT_BEHAVIOR, compare_function_contracts, contract_has_whole_frame  # noqa: E402
 
 RUN1_CONTRACTS = ROOT / "tests" / "fixtures" / "libmodbus_run1_contracts"
 EMPTY_DELTA: dict[str, list[str]] = {"baseline": [], "candidate": [], "removed": [], "added": []}
@@ -373,3 +373,85 @@ def test_text_that_cannot_be_tokenized_never_raises() -> None:
         for right in garbage:
             result = compare_function_contracts({"f.h": left}, {"f.h": right}, "parse")
             assert isinstance(result["available"], bool) and isinstance(result["reason"], str)
+
+
+# ---------------------------------------------------------------------------
+# Whole-function frame detection and K&R / nested-declarator comparisons
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("clauses", "expected"),
+    [
+        (("assigns *out;",), True),
+        (
+            (
+                "behavior ok: assumes len >= 0; assigns *out;",
+                "behavior bad: assumes len < 0; assigns \\nothing;",
+                "complete behaviors;",
+            ),
+            True,
+        ),
+        (
+            (
+                "behavior ok: assumes len >= 0; assigns *out;",
+                "behavior bad: assumes len < 0; assigns \\nothing;",
+                "complete behaviors ok, bad;",
+            ),
+            True,
+        ),
+        (
+            (
+                "behavior ok: assumes len >= 0; assigns *out;",
+                "behavior bad: assumes len < 0; assigns \\nothing;",
+                "behavior extra: assumes len == 0; ensures \\result == 0;",
+                "complete behaviors ok, bad;",
+            ),
+            True,
+        ),
+        (
+            (
+                "behavior ok: assumes len >= 0; assigns *out;",
+                "behavior bad: assumes len < 0; ensures \\result == -1;",
+                "complete behaviors;",
+            ),
+            False,
+        ),
+        (
+            (
+                "behavior ok: assumes len >= 0; assigns *out;",
+                "behavior bad: assumes len < 0; assigns \\nothing;",
+                "disjoint behaviors;",
+            ),
+            False,
+        ),
+        (("behavior ok: assumes len >= 0; assigns *out;",), False),
+        (("complete behaviors;",), False),
+        (("behavior ok: assumes len >= 0; assigns *out;", "complete behaviors ok, missing;"), False),
+        (("ensures \\result == 0;",), False),
+    ],
+)
+def test_contract_has_whole_frame_distinguishes_full_and_partial_frames(
+    clauses: tuple[str, ...], expected: bool
+) -> None:
+    text = _with_contract(HEADER, *clauses)
+    cmp = compare_function_contracts({"parse.h": HEADER}, {"parse.h": text}, "parse")
+    assert contract_has_whole_frame(cmp, "baseline") is False
+    assert contract_has_whole_frame(cmp, "candidate") is expected
+    assert contract_has_whole_frame({"available": False}, "candidate") is False
+
+
+def test_compare_function_contracts_supports_kr_and_nested_declarators() -> None:
+    kr_def = "int parse(a, b, c)\nconst unsigned char *a;\nint b;\nint *c;\n{\n    *c = b;\n    return 0;\n}\n"
+    base_kr = {"parse.h": _with_contract(HEADER, "assigns *out \\from len;"), "parse.c": kr_def}
+    cand_kr = {"parse.h": HEADER, "parse.c": _with_contract(kr_def, "assigns *c \\from b;")}
+    res_kr = compare_function_contracts(base_kr, cand_kr, "parse")
+    assert res_kr["available"] is True and res_kr["formals_unified"] is True
+    assert res_kr["behaviors"][DEFAULT_BEHAVIOR]["assigns"]["status"] == "same"
+
+    nested_proto = "int (*getcb(int k))(int);\n"
+    base_n = {"cb.h": _with_contract(nested_proto, "assigns \\nothing;", "ensures \\result != \\null;")}
+    cand_n = {"cb.h": _with_contract(nested_proto, "ensures \\result != \\null;")}
+    res_n = compare_function_contracts(base_n, cand_n, "getcb")
+    assert res_n["available"] is True
+    assert res_n["summary"]["assigns_removed_in"] == [DEFAULT_BEHAVIOR]

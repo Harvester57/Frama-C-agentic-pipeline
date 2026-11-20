@@ -318,10 +318,14 @@ def test_a_cached_pass_keeps_the_count_of_inputs_it_replayed(run, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _wrapper_body(name: str, *, effects: list[str] | tuple[str, ...] = ()) -> str:
+    src = eacsl_toolchain.generate_errno_shim_source([name], effects)
+    start = src.index(f" __wrap_{name}(")
+    return src[start : src.index("\n}\n", start)]
+
+
 def _close_wrapper() -> str:
-    src = eacsl_toolchain.generate_errno_shim_source(["close"])
-    body = src[src.index("int __wrap_close(") :]
-    return body[: body.index("}")]
+    return _wrapper_body("close")
 
 
 def test_the_close_shim_keeps_the_process_stdio_open():
@@ -329,8 +333,39 @@ def test_the_close_shim_keeps_the_process_stdio_open():
     assert body.index("if (a0 >= 0 && a0 <= 2) return 0;") < body.index("__real_close(a0)")
 
 
-def test_only_close_gets_the_stdio_guard():
-    assert "a0 <= 2" not in eacsl_toolchain.generate_errno_shim_source(["read", "dup"])
+def test_the_dup2_shim_refuses_redirecting_stdout_and_stderr_but_keeps_stdin_and_self():
+    body = _wrapper_body("dup2")
+    guard = "if ((a1 == 1 || a1 == 2) && a0 != a1) { errno = EBADF; __fc_eacsl_errno = EBADF; return -1; }"
+    assert body.index(guard) < body.index("__real_dup2(a0, a1)")
+    # stdin (fd 0) is intentionally allowed so stdin harnesses (STDIN_FEED_PRELUDE) can dup2(fds[0], 0).
+    assert "a1 <= 2" not in body and "a1 >= 0" not in body
+
+
+def test_the_fclose_shim_keeps_stdio_streams_open():
+    src = eacsl_toolchain.generate_errno_shim_source(["fclose"])
+    assert "#include <stdio.h>" in src
+    body = _wrapper_body("fclose")
+    guard = (
+        "if (a0 == stdin || a0 == stdout || a0 == stderr) "
+        "{ if (a0 != stdin) { int fc_e = errno; int fc_g = __fc_eacsl_errno; "
+        "(void)fflush(a0); errno = fc_e; __fc_eacsl_errno = fc_g; } return 0; }"
+    )
+    assert body.index(guard) < body.index("__real_fclose(a0)")
+    # NULL is not intercepted: passing NULL to fclose stays a real target defect.
+    assert "a0 == NULL" not in body and "!a0" not in body
+
+
+def test_only_close_dup2_and_fclose_get_the_stdio_guard():
+    assert eacsl_toolchain.STDIO_GUARD_FUNCTIONS == ("close", "dup2", "fclose")
+    all_errno = [f[1] for f in eacsl_toolchain.ERRNO_SHIM_FUNCTIONS]
+    all_effects = list(eacsl_toolchain.EACSL_LIBC_EFFECTS)
+    src = eacsl_toolchain.generate_errno_shim_source(all_errno, all_effects)
+    seen = list(dict.fromkeys([*all_errno, *all_effects]))
+    for name in seen:
+        start = src.index(f" __wrap_{name}(")
+        body = src[start : src.index("\n}\n", start)]
+        has_guard = any(tok in body for tok in ("a0 <= 2", "a1 == 1 || a1 == 2", "stdin", "stdout", "stderr"))
+        assert has_guard is (name in eacsl_toolchain.STDIO_GUARD_FUNCTIONS), (name, body)
 
 
 def test_a_changed_shim_does_not_restore_a_cached_binary(tmp_path, monkeypatch):
@@ -343,7 +378,16 @@ def test_a_changed_shim_does_not_restore_a_cached_binary(tmp_path, monkeypatch):
         assert found is not None
         return found
 
+    seen_names: list[list[str]] = []
+    real_gen = eacsl_toolchain.generate_errno_shim_source
+
+    def spy_gen(names):
+        seen_names.append(list(names))
+        return real_gen(names)
+
+    monkeypatch.setattr(fuzz_build, "generate_errno_shim_source", spy_gen)
     before = material()["libc_shim"]
+    assert {"close", "dup2", "fclose"} <= set(seen_names[-1])
     monkeypatch.setattr(fuzz_build, "generate_errno_shim_source", lambda names: "another shim")
     assert material()["libc_shim"] != before
 
@@ -387,3 +431,117 @@ def test_the_cli_reports_a_refused_seed(breaker, capsys):
     (breaker / "agents/breaker-1/scratch/crashes" / f"timeout-{sha1}").write_bytes(HANG_A)
     assert P.main(["--run-dir", str(breaker), "promote-seeds", "--agent-id", "breaker-1", "--module", "m", *SEEDS]) == 0
     assert len(json.loads(capsys.readouterr().out)["refused_hanging"]) == 1
+
+
+def test_hanging_seed_without_timeout_artifact_is_refused_by_replay_screen(breaker, monkeypatch):
+    fuzz_bin = breaker / "workspace" / "harnesses" / "fuzz_m.e-acsl"
+    fuzz_bin.parent.mkdir(parents=True)
+    fuzz_bin.write_bytes(b"fake-bin")
+
+    seen: list[tuple[Path, bytes, float]] = []
+
+    def fake_screen(binary: Path, seed_path: Path, timeout_s: float) -> str | None:
+        data = seed_path.read_bytes()
+        seen.append((binary, data, timeout_s))
+        if data == HANG_A:
+            return f"seed hung during pre-promotion screen (>{timeout_s:g}s)"
+        return None
+
+    monkeypatch.setattr(P, "_check_seed_hangs", fake_screen)
+    out = P.promote_seeds(breaker, "breaker-1", "m", SEEDS)
+    assert [p["src"] for p in out["promoted"]] == [SEEDS[1]]
+    assert out["refused_hanging"] == [
+        {
+            "src": SEEDS[0],
+            "reason": "seed hung during pre-promotion screen (>5s)",
+            "binary": "workspace/harnesses/fuzz_m.e-acsl",
+        }
+    ]
+    names = [p.name for p in (breaker / "workspace/corpus/m").iterdir()]
+    assert names == [f"seed-{hashlib.sha256(b'fine').hexdigest()[:16]}"]
+    assert len(seen) == 2 and all(b == fuzz_bin.resolve() and t == 5.0 for b, _d, t in seen)
+
+
+def test_replay_screen_refuses_timeout_exits_and_allows_clean_or_crashing_seeds(tmp_path, monkeypatch):
+    binary = tmp_path / "fuzz_m.e-acsl"
+    binary.write_bytes(b"bin")
+    seed = tmp_path / "seed.bin"
+    seed.write_bytes(b"payload")
+
+    commands: list[list[str]] = []
+
+    def run_with(result: SandboxResult | Exception):
+        def _fake(cmd, **kw):
+            commands.append(list(cmd))
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        monkeypatch.setattr(sandbox_exec, "run_sandboxed", _fake)
+        return P._check_seed_hangs(binary, seed, 5.0)
+
+    # 1. Wall-clock timeout in sandbox -> refused.
+    assert run_with(SandboxResult(-9, "", "", True, "rlimits", [])) == "seed hung during pre-promotion screen (>5s)"
+    assert "-runs=1" in commands[-1] and "-timeout=0" in commands[-1]
+    assert any(a.startswith("-artifact_prefix=") for a in commands[-1])
+
+    # 2. LibFuzzer timeout exit code (70) -> refused.
+    assert run_with(SandboxResult(70, "", "", False, "rlimits", [])) == "seed hung during pre-promotion screen (>5s)"
+
+    # 3. LibFuzzer ALARM marker in stderr -> refused.
+    alarm = "ALARM: working on the last Unit for 6 seconds\n"
+    assert run_with(SandboxResult(1, "", alarm, False, "rlimits", [])) == "seed hung during pre-promotion screen (>5s)"
+
+    # 4. Normal crash (deadly signal / E-ACSL violation, rc != 70 without ALARM) -> allowed.
+    assert run_with(SandboxResult(77, "", "==1== ERROR: libFuzzer: deadly signal\n", False, "rlimits", [])) is None
+    assert run_with(SandboxResult(1, "", "Error: E-ACSL RTE failed\n", False, "rlimits", [])) is None
+
+    # 5. Clean exit -> allowed.
+    assert run_with(SandboxResult(0, "", "", False, "rlimits", [])) is None
+
+    # 6. Non-POSIX host / unavailable sandbox -> gracefully skipped (not refused).
+    assert run_with(sandbox_exec.SandboxUnavailable("win32")) is None
+
+
+def test_replay_screen_disabled_when_timeout_is_zero(breaker, monkeypatch):
+    fuzz_bin = breaker / "workspace" / "harnesses" / "fuzz_m.e-acsl"
+    fuzz_bin.parent.mkdir(parents=True)
+    fuzz_bin.write_bytes(b"fake-bin")
+    monkeypatch.setattr(P, "_check_seed_hangs", lambda *a, **k: pytest.fail("should not screen when timeout is 0"))
+    out = P.promote_seeds(breaker, "breaker-1", "m", SEEDS, replay_timeout=0)
+    assert len(out["promoted"]) == 2 and out["refused_hanging"] == []
+
+
+def test_promote_seeds_cli_threads_binary_and_replay_timeout(breaker, monkeypatch, capsys):
+    explicit = breaker / "custom.e-acsl"
+    explicit.write_bytes(b"bin")
+    captured: list[tuple[Path, float]] = []
+
+    def fake_screen(binary: Path, seed_path: Path, timeout_s: float) -> str | None:
+        captured.append((binary, timeout_s))
+        return f"seed hung during pre-promotion screen (>{timeout_s:g}s)" if seed_path.read_bytes() == HANG_A else None
+
+    monkeypatch.setattr(P, "_check_seed_hangs", fake_screen)
+    rc = P.main(
+        [
+            "--run-dir",
+            str(breaker),
+            "promote-seeds",
+            "--agent-id",
+            "breaker-1",
+            "--module",
+            "m",
+            "--binary",
+            str(explicit),
+            "--replay-timeout",
+            "2.5",
+            *SEEDS,
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [p["src"] for p in payload["promoted"]] == [SEEDS[1]]
+    assert payload["refused_hanging"] == [
+        {"src": SEEDS[0], "reason": "seed hung during pre-promotion screen (>2.5s)", "binary": "custom.e-acsl"}
+    ]
+    assert captured == [(explicit.resolve(), 2.5), (explicit.resolve(), 2.5)]

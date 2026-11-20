@@ -3,7 +3,8 @@ A passing verdict must state what it covered: the should-pass and should-fail ca
 limits recorded by run_wp_function.py and run_eacsl_fuzz.py and enforced by ledger.py and
 validate_artifacts.py.
 
-The `needs_framac` cases run the real tools (skipped without Frama-C, e.g. outside the image).
+The real-tool cases run natively when `frama-c` is on PATH, or inside `framac-analysis:latest`
+when `FRAMAC_DOCKER_TESTS=1` is set on the host; otherwise they are skipped.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,13 +23,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import run_eacsl_fuzz as R
 import run_wp_function as W
 from acsl_ast import find_named_clause, is_trivial_predicate
-from conftest import evidence, unit
+from conftest import ANALYSIS_IMAGE, ROOT, evidence, require_docker_images, unit
 from framac_common import wp_limits_problem
 from generate_report import verdict_limits_section
 from run_eacsl_fuzz import derive_eacsl_diagnostic_hints, parse_guardrail_reach
 from validate_artifacts import validate_ledger
 
-needs_framac = pytest.mark.skipif(shutil.which("frama-c") is None, reason="Frama-C not available")
+
+def _use_native_framac() -> bool:
+    """True to invoke native `frama-c` in-process; False to run inside `ANALYSIS_IMAGE` (or skip)."""
+    if shutil.which("frama-c") is not None:
+        return True
+    require_docker_images(ANALYSIS_IMAGE)
+    return False
 
 
 @pytest.mark.parametrize(
@@ -99,9 +107,41 @@ def test_doomed_requires_is_contradictory():
     assert W.classify_vacuity_log(DOOMED_BEHAVIOR)["doomed"] == ["b"]
 
 
+# Real Frama-C 34 output for `defensive_branch` with 3 provers (alt-ergo,z3,cvc5): WP reports the
+# same doomed dead-code goal once per configured prover and counts each report in `Smoke Tests: 2 / 5`.
+DOOMED_DEFENSIVE_MULTIPROVER = (
+    "[wp] 6 goals scheduled\n"
+    "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s3 (Qed)\n"
+    "[wp] defensive_branch.c:2: Warning: Failed smoke-test\n"
+    "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s3 (Qed)\n"
+    "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s3 (Qed)\n"
+    "[wp] Proved goals:    7 / 8\n"
+    "  Failed:          1\n"
+    "  Smoke Tests:     2 / 5\n"
+)
+
+
 def test_dead_defensive_code_is_counted_but_not_contradictory():
     res = W.classify_vacuity_log(DOOMED_DEFENSIVE)
     assert res["status"] == "consistent" and res["dead_goals"] == 2
+
+
+def test_dead_defensive_code_repeated_per_prover_is_consistent():
+    res = W.classify_vacuity_log(DOOMED_DEFENSIVE_MULTIPROVER)
+    assert res["status"] == "consistent"
+    assert res["dead_goals"] == 1
+    assert res["doomed"] == []
+
+
+def test_unrecognised_doomed_smoke_goal_fails_closed():
+    log = (
+        "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s3 (Qed)\n"
+        "[wp] [Failed] (Doomed) typed_f_wp_smoke_unknown_kind (Qed)\n"
+        "  Smoke Tests:     2 / 4\n"
+    )
+    res = W.classify_vacuity_log(log)
+    assert res["status"] == "inconclusive"
+    assert res["dead_goals"] == 1
 
 
 def test_smoke_pass_without_a_result_is_inconclusive():
@@ -411,32 +451,73 @@ CASES = {
 
 
 def _run(tmp_path: Path, name: str, fn: str, source: str) -> dict:
-    os.chdir(tmp_path)  # Frama-C and Why3 write next to the working directory
     c = tmp_path / f"{name}.c"
-    c.write_text(source, encoding="utf-8")
+    c.write_text(source, encoding="utf-8", newline="\n")
     out = tmp_path / f"{name}.json"
-    assert (
-        W.main(
+    if _use_native_framac():
+        os.chdir(tmp_path)  # Frama-C and Why3 write next to the working directory
+        assert (
+            W.main(
+                [
+                    "--file",
+                    str(c),
+                    "--function",
+                    fn,
+                    "--out-dir",
+                    str(tmp_path / name),
+                    "--out-json",
+                    str(out),
+                    "--ignore-prover-budget",
+                    "--cache-dir",
+                    "off",
+                ]
+            )
+            == 0
+        )
+    else:
+        proc = subprocess.run(
             [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                f"{tmp_path.resolve()}:/w",
+                "-v",
+                f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+                "-v",
+                f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
+                "-w",
+                "/w",
+                "--entrypoint",
+                "python3",
+                ANALYSIS_IMAGE,
+                "/opt/framac-pipeline/scripts/run_wp_function.py",
                 "--file",
-                str(c),
+                f"/w/{name}.c",
                 "--function",
                 fn,
                 "--out-dir",
-                str(tmp_path / name),
+                f"/w/{name}",
                 "--out-json",
-                str(out),
+                f"/w/{name}.json",
                 "--ignore-prover-budget",
                 "--cache-dir",
                 "off",
-            ]
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+            check=False,
         )
-        == 0
-    )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
     return json.loads(out.read_text(encoding="utf-8"))
 
 
-@needs_framac
+@pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_real_wp_verdicts(tmp_path, name):
     fn, source, status, vacuity = CASES[name]
@@ -445,7 +526,7 @@ def test_real_wp_verdicts(tmp_path, name):
     assert res["limits"]["vacuity"]["status"] == vacuity
 
 
-@needs_framac
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "fn,call,status,hits",
     [
@@ -455,7 +536,6 @@ def test_real_wp_verdicts(tmp_path, name):
     ],
 )
 def test_real_guardrail_reports_reach(tmp_path, fn, call, status, hits):
-    os.chdir(tmp_path)
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     (corpus / "a").write_bytes(b"AAAA")
@@ -470,11 +550,57 @@ def test_real_guardrail_reports_reach(tmp_path, fn, call, status, hits):
         "  if (size > 0) memcpy(copy, data, size);\n"
         f"  {call}\n  free(copy);\n  return 0;\n}}\n",
         encoding="utf-8",
+        newline="\n",
     )
     out = tmp_path / "guard.json"
-    argv = ["guardrail", "--sources", str(c), "--functions", fn, "--out-bin", str(tmp_path / "bin")]
-    argv += ["--corpus-dir", str(corpus), "--extra-runs", "0", "--no-cache", "--out-json", str(out)]
-    assert R.main(argv) == 0
+    if _use_native_framac():
+        os.chdir(tmp_path)
+        argv = ["guardrail", "--sources", str(c), "--functions", fn, "--out-bin", str(tmp_path / "bin")]
+        argv += ["--corpus-dir", str(corpus), "--extra-runs", "0", "--no-cache", "--out-json", str(out)]
+        assert R.main(argv) == 0
+    else:
+        proc = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                f"{tmp_path.resolve()}:/w",
+                "-v",
+                f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+                "-v",
+                f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
+                "-w",
+                "/w",
+                "--entrypoint",
+                "python3",
+                ANALYSIS_IMAGE,
+                "/opt/framac-pipeline/scripts/run_eacsl_fuzz.py",
+                "guardrail",
+                "--sources",
+                "/w/g.c",
+                "--functions",
+                fn,
+                "--out-bin",
+                "/w/bin",
+                "--corpus-dir",
+                "/w/corpus",
+                "--extra-runs",
+                "0",
+                "--no-cache",
+                "--out-json",
+                "/w/guard.json",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
     res = json.loads(out.read_text(encoding="utf-8"))
     assert res["status"] == status
     if hits is not None:
@@ -482,7 +608,7 @@ def test_real_guardrail_reports_reach(tmp_path, fn, call, status, hits):
         assert res["reach"]["unreached"] == ([fn] if hits == 0 else [])
 
 
-@needs_framac
+@pytest.mark.integration
 def test_real_trivial_layer_clause_is_flagged(tmp_path):
     res = _run(
         tmp_path,
@@ -494,7 +620,7 @@ def test_real_trivial_layer_clause_is_flagged(tmp_path):
     assert res["limits"]["classes_without_real_clause"] == []
 
 
-@needs_framac
+@pytest.mark.integration
 def test_real_layer_clause_is_credited(tmp_path):
     res = _run(
         tmp_path,

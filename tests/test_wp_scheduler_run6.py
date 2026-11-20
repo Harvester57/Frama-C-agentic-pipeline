@@ -365,9 +365,7 @@ def test_replay_no_prover_is_dispatched_blind_on_a_contract_less_callee(sim):
     }
     sim.build(
         fns,
-        units=[
-            base.unit(file, n, "rte", module="m", tier=base.TIER1) for n, (file, _m, _c) in fns.items() if n != "c3"
-        ]
+        units=[base.unit(file, n, "rte", module="m", tier=base.TIER1) for n, (file, _m, _c) in fns.items() if n != "c3"]
         + [covered],
         sidecars={"m": {}},
     )
@@ -383,9 +381,7 @@ def test_replay_no_prover_is_dispatched_blind_on_a_contract_less_callee(sim):
         for job in nxt["tasks"]:
             aid, kind, fn = job["agent_id"], job["kind"], job.get("function")
             if kind == "verify":
-                L.cmd_scaffold_verifier(
-                    fp, "needs_validation", aid, out_path=Path(f"agents/{aid}/scratch/result.json")
-                )
+                L.cmd_scaffold_verifier(fp, "needs_validation", aid, out_path=Path(f"agents/{aid}/scratch/result.json"))
                 S.cmd_complete(aid)
             elif kind == "breaker":
                 sim.breaker(aid, fn, job["file"])

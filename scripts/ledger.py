@@ -62,7 +62,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -5599,6 +5599,64 @@ def cmd_transition_many(items: list[dict]) -> list[dict]:
     return updated
 
 
+MEMORY_REFUSAL_REASON = "insufficient_memory"
+
+
+def _is_memory_refused_evidence(ev: object) -> bool:
+    """Whether `ev` is a non-discharging `wp_analysis_error` evidence entry caused by `insufficient_memory`."""
+    if not isinstance(ev, dict):
+        return False
+    if ev.get("phase") != "wp" or ev.get("result") != "wp_analysis_error":
+        return False
+    if ev.get("discharging"):
+        return False
+    details = ev.get("details")
+    reason = str(details.get("reason") or "") if isinstance(details, dict) else ""
+    summary = str(ev.get("summary") or "")
+    return MEMORY_REFUSAL_REASON in reason or MEMORY_REFUSAL_REASON in summary
+
+
+@ledger_locked
+def clear_memory_refused_evidence(coverage_ids: Iterable[str] | None = None) -> dict:
+    """
+    Prune non-discharging `wp_analysis_error` evidence entries caused by `insufficient_memory`
+    from the named units (or all units when `coverage_ids` is None). Never removes discharging
+    verdicts, non-memory `wp_analysis_error` entries, or the sole evidence of a `blocked` or
+    `candidate` unit (preserving coverage-ledger invariants). Idempotent.
+    """
+    units, candidates = load_state()
+    if coverage_ids is None:
+        target_ids = sorted(units)
+    else:
+        target_ids = list(dict.fromkeys(str(cid) for cid in coverage_ids if str(cid) in units))
+    removed_total = 0
+    cleaned_units: list[str] = []
+    skipped_sole: list[str] = []
+    changed = False
+    for cid in target_ids:
+        u = units[cid]
+        ev_list = u.get("evidence") or []
+        kept = [e for e in ev_list if not _is_memory_refused_evidence(e)]
+        removed = len(ev_list) - len(kept)
+        if removed <= 0:
+            continue
+        if u.get("status") in ("blocked", "candidate") and not kept:
+            skipped_sole.append(cid)
+            continue
+        u["evidence"] = kept
+        removed_total += removed
+        cleaned_units.append(cid)
+        changed = True
+    if changed:
+        commit(units, candidates)
+    return {
+        "ok": True,
+        "removed": removed_total,
+        "units": cleaned_units,
+        **({"skipped_sole_evidence": skipped_sole} if skipped_sole else {}),
+    }
+
+
 @ledger_locked
 def cmd_close_remaining(reason: str) -> dict:
     """
@@ -6209,6 +6267,17 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="JSON list (or path to JSON file) of {id, status, agent_id?, reason?, expected?} transitions",
     )
+    p_cmr = sub.add_parser(
+        "clear-memory-refused-evidence",
+        help="Prune non-discharging wp_analysis_error (insufficient_memory) evidence entries from units",
+    )
+    p_cmr.add_argument(
+        "--id",
+        dest="ids",
+        action="append",
+        default=[],
+        help="Coverage ID to clean (repeatable; default: all units)",
+    )
     sub.add_parser(
         "gate-reach",
         help="Hold the planned units of dynamically gated modules out of WP, release the rest (D2, D18)",
@@ -6272,6 +6341,8 @@ def main(argv: list[str] | None = None) -> int:
             out = cmd_transition(args.id, args.status, args.agent_id, args.reason, args.expect or None)
         elif args.cmd == "transition-many":
             out = cmd_transition_many(_parse_transitions_spec(args.spec_json))
+        elif args.cmd == "clear-memory-refused-evidence":
+            out = clear_memory_refused_evidence(args.ids or None)
         elif args.cmd == "close-remaining":
             out = cmd_close_remaining(args.reason)
         elif args.cmd == "gate-reach":

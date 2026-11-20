@@ -123,6 +123,27 @@ _ASAN_OP_RE = re.compile(
     re.MULTILINE,
 )
 
+# UBSan standalone deadly-signal header (printed when ASan is absent, e.g. E-ACSL builds):
+#   UndefinedBehaviorSanitizer:DEADLYSIGNAL
+#   ==7==ERROR: UndefinedBehaviorSanitizer: SEGV on unknown address 0x... (pc 0x... T7)
+#   ==7==The signal is caused by a READ memory access.
+_UBSAN_ERR_RE = re.compile(
+    r"ERROR:\s*UndefinedBehaviorSanitizer:\s*(?P<kind>[A-Za-z0-9_-]+)(?P<rest>[^\n]*)",
+    re.IGNORECASE,
+)
+
+_SIGNAL_OP_RE = re.compile(
+    r"The signal is caused by a (?P<op>READ|WRITE) memory access\.",
+    re.IGNORECASE,
+)
+
+_UBSAN_SUMMARY_RE = re.compile(
+    r"^SUMMARY:\s*UndefinedBehaviorSanitizer:\s*(?P<kind>(?!undefined-behavior\b)[A-Za-z0-9_-]+)"
+    r"(?:\s+(?P<file>(?:[A-Za-z]:)?[^\s():]+):(?P<line>\d+)(?::\d+)?)?"
+    r"(?:\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*))?",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 # Sanitizer stack frame:
 #   #0 0x555555 in UpdateSyncMem /path/to/SyncMem.c:827:5
@@ -894,7 +915,15 @@ def parse_sanitizer_failure(text: str) -> dict | None:
         for m in frames
         if (not m.group("file") or not Path(m.group("file")).name.startswith("harness_"))
         and not m.group("function").startswith(
-            ("__interceptor_", "__asan_", "LLVMFuzzerTestOneInput", TARGET_EMBEDDED_PREFIX)
+            (
+                "__interceptor_",
+                "__asan_",
+                "__ubsan_",
+                "__sanitizer_",
+                "fuzzer::",
+                "LLVMFuzzerTestOneInput",
+                TARGET_EMBEDDED_PREFIX,
+            )
         )
     ]
     candidates = non_harness_frames or frames
@@ -932,8 +961,8 @@ def parse_sanitizer_failure(text: str) -> dict | None:
     asan = _ASAN_ERR_RE.search(text)
     if asan:
         asan_kind = asan.group("kind").strip()
-        op_m = _ASAN_OP_RE.search(text, asan.end())
-        op_txt = f" ({op_m.group('op')})" if op_m else ""
+        op_m = _ASAN_OP_RE.search(text, asan.end()) or _SIGNAL_OP_RE.search(text, asan.end())
+        op_txt = f" ({op_m.group('op').upper()})" if op_m else ""
         alarm = _map_sanitizer_alarm_kind(asan_kind)
         # The site is on the stack of the failure itself: the `freed by` and `allocated by` stacks that
         # follow it name other statements. Without a target frame there, the first usable frame stays.
@@ -976,6 +1005,83 @@ def parse_sanitizer_failure(text: str) -> dict | None:
             "alarm_kind": alarm,
             "is_rte": True,
             "predicate": f"rte: {alarm}: {pred}",
+        }
+
+    ub_err = _UBSAN_ERR_RE.search(text)
+    ub_sum = _UBSAN_SUMMARY_RE.search(text, ub_err.end() if ub_err else 0)
+    if ub_err or ub_sum:
+        if ub_err:
+            ub_kind = ub_err.group("kind").strip()
+            rest = ub_err.group("rest").strip()
+            message = f"UndefinedBehaviorSanitizer: {ub_kind}" + (f" {rest}" if rest else "")
+            search_from = ub_err.end()
+            op_m = _SIGNAL_OP_RE.search(text, search_from)
+        else:
+            assert ub_sum is not None
+            ub_kind = ub_sum.group("kind").strip()
+            message = f"UndefinedBehaviorSanitizer: {ub_kind}"
+            search_from = 0
+            op_m = _SIGNAL_OP_RE.search(text)
+        op_txt = f" ({op_m.group('op').upper()})" if op_m else ""
+        alarm = _map_sanitizer_alarm_kind(ub_kind)
+        stack = _first_stack(frames, search_from)
+        site = next((i for i, m in enumerate(stack) if _is_target_frame(m)), None)
+        if site is not None:
+            frame = stack[site]
+        else:
+            stack_non_rt = [
+                m
+                for m in stack
+                if not is_runtime_function(m.group("function"), m.group("file"))
+                and not (m.group("file") and Path(m.group("file")).name.startswith("harness_"))
+                and not is_harness_fuzz_function(m.group("function"))
+            ]
+            frame = stack_non_rt[0] if stack_non_rt else (stack[0] if stack else best_frame)
+        file_ = (frame.group("file") if frame and frame.group("file") else "") or "unknown"
+        line_ = int(frame.group("line")) if frame and frame.group("line") else 0
+        fn = frame.group("function") if frame else "unknown_function"
+        if frame is None and ub_sum is not None:
+            sum_file = ub_sum.group("file") or ""
+            sum_line = int(ub_sum.group("line")) if ub_sum.group("line") else 0
+            sum_fn = ub_sum.group("function") or ""
+            if (
+                sum_fn
+                and not is_runtime_function(sum_fn, sum_file)
+                and not is_harness_fuzz_function(sum_fn)
+                and not (sum_file and Path(sum_file).name.startswith("harness_"))
+            ):
+                file_ = sum_file or "unknown"
+                line_ = sum_line
+                fn = sum_fn
+        if fn == "unknown_function" and file_ != "unknown" and line_ > 0:
+            fn = _resolve_function_at_line(file_, line_)
+        pred = f"UndefinedBehaviorSanitizer: {ub_kind}{op_txt}"
+        called = None
+        if site is not None:
+            called = next(
+                (
+                    m
+                    for m in reversed(stack[:site])
+                    if not m.group("file") or is_runtime_function(m.group("function"), m.group("file"))
+                ),
+                None,
+            )
+        if called is not None:
+            called_name = re.sub(r"^_+(?:interceptor|asan|ubsan)_", "", called.group("function"))
+            pred += f" in {called_name} from {fn}"
+        line_hash = line_text_hash(file_, line_)
+        if line_hash is not None:
+            pred += f" [line {line_hash}]"
+        kind_slug = re.sub(r"[^a-z0-9_]+", "_", ub_kind.lower()).strip("_")
+        return {
+            "file": file_,
+            "line": line_,
+            "function": fn,
+            "kind": "ubsan_" + kind_slug,
+            "alarm_kind": alarm,
+            "is_rte": True,
+            "predicate": f"rte: {alarm}: {pred}",
+            "message": message,
         }
 
     return _parse_leak_failure(text)
@@ -1142,10 +1248,12 @@ def needs_attribution(failure: dict | None) -> bool:
     if failure.get("meta_property"):
         return False
     fn = failure.get("function") or ""
+    file_ = str(failure.get("file") or "")
     return (
         int(failure.get("line") or 0) <= 0
         or fn in ("", "unknown_function")
-        or is_runtime_function(fn, failure.get("file"))
+        or is_runtime_function(fn, file_)
+        or file_.endswith(".instrumented.c")
     )
 
 

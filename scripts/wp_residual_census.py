@@ -28,8 +28,10 @@ clause in a behavior) follow WP's naming scheme unchecked, and a mismatch there 
 
 A verdict kind is WP's merged verdict over the provers of the run: with several provers a timeout
 can hide another prover's unknown, so `would_be_all_proven_if_timeouts_closed` is an upper bound.
-For the same reason `unproved_by_prover` (timed out, gave up, failed, per prover) counts only the
-goals of reports whose run had exactly one prover; `unproved_without_prover_data` counts the rest.
+`unproved_by_prover` (timed out, gave up, failed, per prover) reads `per_prover_verdicts` recorded
+from WP's `-wp-status` output on multi-prover runs, and falls back to the merged verdict when a
+report's run had exactly one prover (`wp_provers`); `unproved_without_prover_data` counts legacy
+multi-prover goals lacking `per_prover_verdicts` and reports without `unproven_goal_costs`.
 It changes no prover and no timeout: it is there to decide later whether a prover costs time for nothing.
 
 Fail closed: a report that cannot be read or has the wrong shape is counted and named under
@@ -195,34 +197,70 @@ def join_by_line(goals: list[dict], costs: list[dict], function: str) -> tuple[l
     return kinds, len(costs) - len(paired)
 
 
+def _verdict_bucket(kind: str) -> str | None:
+    low = kind.strip().lower()
+    if low in TIMEOUT_KINDS:
+        return "timeout"
+    if low == "unknown":
+        return "gave_up"
+    if low == "failed":
+        return "failed"
+    return None
+
+
 def prover_verdicts(report: dict) -> tuple[dict[str, dict[str, int]], int]:
     """
     ({prover: {timeout, gave_up, failed}}, goals without per-prover data) for the unproved WP goals of a
-    report. WP merges the verdicts of several provers into one entry per goal (a Timeout outranks an
-    Unknown), so a goal is attributed to a prover only when the run had exactly one (`wp_provers`);
-    every other unproved goal, and every row of a report without `unproven_goal_costs`, has no
-    per-prover data. `timeout` counts timeout and stepout, `gave_up` unknown, `failed` a prover error.
+    report. When an entry in `unproven_goal_costs` carries `per_prover_verdicts` (parsed from WP's
+    `-wp-status` output), each prover's own verdict is attributed directly even on multi-prover runs.
+    Otherwise, because WP's merged verdict ranks a Timeout over an Unknown, a goal is attributed to a
+    prover only when the run had exactly one (`wp_provers`); legacy multi-prover goals without
+    `per_prover_verdicts`, and every row of a report without `unproven_goal_costs`, count in
+    `without_prover_data`. `timeout` counts timeout and stepout, `gave_up` unknown, `failed` a prover error.
     """
     raw_costs = report.get("unproven_goal_costs")
     if not isinstance(raw_costs, list):
         return {}, len(report.get("unproven_goals") or [])
     provers = report.get("wp_provers")
-    names = [p for p in provers if isinstance(p, str)] if isinstance(provers, list) else []
-    if len(names) != 1:
-        return {}, len(raw_costs)
-    counts = {"timeout": 0, "gave_up": 0, "failed": 0}
+    names = [p.strip() for p in provers if isinstance(p, str) and p.strip()] if isinstance(provers, list) else []
+    canonical = {n.lower(): n for n in names}
+    by_prover: dict[str, dict[str, int]] = {}
     missing = 0
     for cost in raw_costs:
-        kind = _verdict_kind(cost)
-        if kind in TIMEOUT_KINDS:
-            counts["timeout"] += 1
-        elif kind == "unknown":
-            counts["gave_up"] += 1
-        elif kind == "failed":
-            counts["failed"] += 1
+        raw_ppv = cost.get("per_prover_verdicts") if isinstance(cost, dict) else None
+        attributed = False
+        if isinstance(raw_ppv, dict) and raw_ppv:
+            parsed: list[tuple[str, str]] = []
+            valid = True
+            for raw_p, raw_v in raw_ppv.items():
+                if not isinstance(raw_p, str) or not isinstance(raw_v, str):
+                    valid = False
+                    break
+                p_low = raw_p.strip().lower()
+                if not p_low or p_low == "qed":
+                    continue
+                bucket = _verdict_bucket(raw_v)
+                if bucket is None:
+                    valid = False
+                    break
+                parsed.append((canonical.get(p_low, p_low), bucket))
+            if valid and parsed:
+                for pname, bucket in parsed:
+                    counts = by_prover.setdefault(pname, {"timeout": 0, "gave_up": 0, "failed": 0})
+                    counts[bucket] += 1
+                attributed = True
+        if attributed:
+            continue
+        if len(names) != 1:
+            missing += 1
+            continue
+        bucket = _verdict_bucket(_verdict_kind(cost))
+        if bucket is not None:
+            counts = by_prover.setdefault(names[0], {"timeout": 0, "gave_up": 0, "failed": 0})
+            counts[bucket] += 1
         else:
             missing += 1
-    return ({names[0]: counts} if any(counts.values()) else {}), missing
+    return {p: c for p, c in sorted(by_prover.items()) if any(c.values())}, missing
 
 
 def function_record(report: dict, report_rel: str) -> tuple[dict, list[dict]]:
@@ -432,7 +470,8 @@ def census(run_dir: Path, near_miss: int = DEFAULT_NEAR_MISS) -> dict:
     if without_prover_data:
         notes.append(
             f"{without_prover_data} unproved goal(s) have no per-prover data: WP records one merged verdict per "
-            "goal, so a goal counts for a prover only in a report whose run had exactly one prover (wp_provers); "
+            "goal, so a goal counts for a prover only when per_prover_verdicts is recorded (from -wp-status) "
+            "or the report's run had exactly one prover (wp_provers); "
             "goals of a report without unproven_goal_costs count as rows"
         )
     ambiguous = ambiguous_function_names(run_dir, notes)
@@ -536,7 +575,7 @@ def render_table(data: dict) -> str:
         out += [f"### Unproved goals by {title}", ""]
         out += _table([title.capitalize(), "Goals"], [[k, v] for k, v in totals[key].items()] or [["-", 0]])
 
-    out += ["### Unproved goals by prover (single-prover runs only)", ""]
+    out += ["### Unproved goals by prover", ""]
     out += _table(
         ["Prover", "Timed out", "Gave up", "Failed"],
         [[p, c["timeout"], c["gave_up"], c["failed"]] for p, c in totals["unproved_by_prover"].items()]

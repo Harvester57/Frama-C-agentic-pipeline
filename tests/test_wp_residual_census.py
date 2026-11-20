@@ -176,6 +176,67 @@ def test_verdicts_by_prover_only_for_single_prover_runs(tmp_path: Path) -> None:
     assert "| z3 | 2 | 1 | 1 |" in table and "Goals without per-prover data: 5" in table
 
 
+def test_verdicts_by_prover_uses_per_prover_verdicts_on_multi_prover_runs(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    goals = [_goal(20, "q1"), _goal(21, "q2"), _goal(22, "q3")]
+    # Multi-prover run carrying per_prover_verdicts from Frama-C 34 -wp-status:
+    # goal 1: Alt-Ergo timeout, CVC5 unknown (masked by timeout), Z3 timeout
+    # goal 2: all three provers timeout
+    # goal 3: Alt-Ergo stepout, CVC5 failed, Z3 unknown
+    multi_costs = [
+        {
+            **_cost("multi_assert_rte_mem_access", "timeout", 20),
+            "per_prover_verdicts": {"Alt-Ergo": "timeout", "CVC5": "unknown", "Z3": "timeout"},
+        },
+        {
+            **_cost("multi_assert_rte_mem_access_2", "timeout", 21),
+            "per_prover_verdicts": {"Alt-Ergo": "timeout", "CVC5": "timeout", "Z3": "timeout"},
+        },
+        {
+            **_cost("multi_assert_rte_mem_access_3", "stepout", 22),
+            "per_prover_verdicts": {"Alt-Ergo": "stepout", "CVC5": "failed", "Z3": "unknown"},
+        },
+    ]
+    _write(run, "multi", _report("multi", goals, 5, costs=multi_costs, wp_provers=["alt-ergo", "z3", "cvc5"]))
+    # Legacy multi-prover report without per_prover_verdicts still falls back to without_prover_data.
+    legacy_multi_costs = [_cost("leg_assert_rte_mem_access", "timeout", 20)]
+    _write(
+        run,
+        "legacy_multi",
+        _report("legacy_multi", goals[:1], 5, costs=legacy_multi_costs, wp_provers=["alt-ergo", "z3"]),
+    )
+    # Single-prover report aggregates into the same canonical lowercase prover name ("z3").
+    single_costs = [_cost("one_assert_rte_mem_access", "unknown", 20)]
+    _write(run, "single", _report("single", goals[:1], 5, costs=single_costs, wp_provers=["z3"]))
+    # Malformed per_prover_verdicts fails closed into without_prover_data.
+    bad_costs = [{**_cost("bad_assert_rte_mem_access", "timeout", 20), "per_prover_verdicts": {"Alt-Ergo": "weird"}}]
+    _write(run, "bad_ppv", _report("bad_ppv", goals[:1], 5, costs=bad_costs, wp_provers=["alt-ergo", "z3"]))
+
+    data = census_mod.census(run)
+    fns = _by_fn(data)
+    assert fns["multi"]["without_prover_data"] == 0
+    assert fns["multi"]["by_prover"] == {
+        "alt-ergo": {"timeout": 3, "gave_up": 0, "failed": 0},
+        "cvc5": {"timeout": 1, "gave_up": 1, "failed": 1},
+        "z3": {"timeout": 2, "gave_up": 1, "failed": 0},
+    }
+    assert fns["legacy_multi"]["by_prover"] == {} and fns["legacy_multi"]["without_prover_data"] == 1
+    assert fns["single"]["by_prover"] == {"z3": {"timeout": 0, "gave_up": 1, "failed": 0}}
+    assert fns["bad_ppv"]["by_prover"] == {} and fns["bad_ppv"]["without_prover_data"] == 1
+    assert data["totals"]["unproved_by_prover"] == {
+        "alt-ergo": {"timeout": 3, "gave_up": 0, "failed": 0},
+        "cvc5": {"timeout": 1, "gave_up": 1, "failed": 1},
+        "z3": {"timeout": 2, "gave_up": 2, "failed": 0},
+    }
+    assert data["totals"]["unproved_without_prover_data"] == 2
+    table = census_mod.render_table(data)
+    assert "### Unproved goals by prover\n" in table
+    assert "| alt-ergo | 3 | 0 | 0 |" in table
+    assert "| cvc5 | 1 | 1 | 1 |" in table
+    assert "| z3 | 2 | 2 | 0 |" in table
+    assert "Goals without per-prover data: 2" in table
+
+
 def test_report_counts_fail_closed(census_run: Path) -> None:
     data = census_mod.census(census_run)
     reports = data["reports"]

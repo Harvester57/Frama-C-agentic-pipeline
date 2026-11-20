@@ -1301,8 +1301,8 @@ def unchecked_clause_hints(res: dict) -> list[str]:
     if any("loop variant using GMP" in r for r in reasons):
         hints.append(
             "E-ACSL executes a loop variant only when it can compute it in a C integer type: it does with 'int' "
-            "operands, while a difference of 'size_t' values or a 'logic integer' function such as the prelude's "
-            "'strlen' needs GMP and is ignored. The termination of that loop was not checked at runtime: it rests "
+            "or 'unsigned int' operands, while a difference of 'size_t' values or a 'logic integer' function "
+            "needs GMP and is ignored. The termination of that loop was not checked at runtime: it rests "
             "on the WP proof alone."
         )
     if any("quantification" not in r and "loop variant using GMP" not in r for r in reasons):
@@ -1483,6 +1483,63 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
 
     if status in ("compile_error", "guardrail_error"):
         comp = res.get("compile") or {}
+        comp_kill = (
+            "killed"
+            if comp.get("killed")
+            else (
+                "killed_suspected"
+                if comp.get("killed_suspected")
+                else fuzz_build._detect_stage_kill(
+                    comp.get("returncode"),
+                    str(comp.get("stdout") or ""),
+                    str(comp.get("stderr") or ""),
+                )
+            )
+        )
+        stage_killed = (
+            res.get("reason") == "eacsl_stage_killed"
+            or comp.get("reason") == "eacsl_stage_killed"
+            or comp_kill is not None
+        )
+        if stage_killed:
+            if comp_kill == "killed":
+                _add(
+                    "E-ACSL build stage was killed (SIGKILL): most likely out of memory (container memory "
+                    "limit) or a hard limit, not an ACSL annotation error. Check `docker events` for an "
+                    "`oom` event and retry with a larger memory budget; do not rewrite your ACSL contract "
+                    "for this failure."
+                )
+            else:
+                _add(
+                    "E-ACSL stage 1 stopped in Frama-C without a Frama-C diagnostic message "
+                    "(`aborted by Frama-C` only): most likely killed by the container memory limit (OOM), "
+                    "not an ACSL annotation or unsupported-construct error. Check `docker events` for an "
+                    "`oom` event and retry with a larger memory budget; do not rewrite your ACSL contract "
+                    "for this failure."
+                )
+            for hint in unchecked_clause_hints(res):
+                _add(hint)
+            return hints
+        eacsl_att = res.get("eacsl_compile_attempt") or {}
+        if not res.get("build_attempts") and isinstance(eacsl_att, dict) and eacsl_att:
+            eacsl_kill = (
+                "killed"
+                if eacsl_att.get("killed")
+                else (
+                    "killed_suspected"
+                    if eacsl_att.get("killed_suspected")
+                    else fuzz_build._detect_stage_kill(
+                        eacsl_att.get("returncode"),
+                        str(eacsl_att.get("stdout") or ""),
+                        str(eacsl_att.get("stderr") or ""),
+                    )
+                )
+            )
+            if eacsl_att.get("reason") == "eacsl_stage_killed" or eacsl_kill is not None:
+                _add(
+                    "The E-ACSL build attempt was killed (most likely container memory limit / OOM; check "
+                    "`docker events` for an `oom` event) before falling back to sanitizers."
+                )
         log_blob = "\n".join(
             [
                 str(res.get("reason") or ""),
@@ -1507,7 +1564,7 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
             )
         if any(
             k in log_blob.lower()
-            for k in ("not yet supported", "unsupported", "axiomatic", "no body", "comparison of", "with")
+            for k in ("not yet supported", "unsupported", "axiomatic", "no body", "comparison of", "\\with")
         ):
             _add(
                 "E-ACSL encountered an unsupported ACSL construct (such as an uninterpreted 'axiomatic' logic "

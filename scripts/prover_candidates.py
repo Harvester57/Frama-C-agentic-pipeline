@@ -50,7 +50,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from acsl_ast import (  # noqa: E402
-    _parse_acsl_inner_segments,
+    _kernel_views,
     added_top_level_acsl_declarations,
     is_trivial_predicate,
     tokenize_c_acsl,
@@ -97,10 +97,16 @@ LEGACY_RANK = "legacy"
 # trivial precondition adds no goal of the function's own, and dropping it changes nothing.
 TRIVIAL_CANDIDATE_KINDS = frozenset({"ensures", "assert", "check", "invariant", "loop invariant"})
 MAX_TRIVIAL_CLAUSES_KEPT = 20
+_BINDER_RE = re.compile(r"\\(?:forall|exists|let)\b")
+_CLAUSE_LABEL_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(?!:)")
 _CLAUSE_HEAD_RE = re.compile(
-    r"^\s*(?P<kind>loop\s+invariant|ensures|assert|check|invariant)\b\s*"
-    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*:(?!:)\s*)*(?P<pred>.*?)\s*;?\s*$",
-    re.DOTALL,
+    r"(?<![\\\w])(?:"
+    r"(?:(?:check|admit)\s+)?(?P<loop>loop\s+(?:invariant|assigns|variant|allocates|frees))"
+    r"|(?:(?:check|admit)\s+)?(?P<clause>requires|ensures|assumes|assigns|allocates|frees|terminates|exits|"
+    r"breaks|continues|returns|decreases|invariant|variant|assert)"
+    r"|(?P<check>check)"
+    r"|(?P<decl>predicate|logic|lemma|type|(?:global|strong)\s+invariant|(?:complete|disjoint)\s+behaviors)"
+    r")\b(?!\s*:)"
 )
 
 # Far above what a holder needs (milliseconds), and above the 120 s after which run_lock breaks a dead holder's lock.
@@ -353,10 +359,65 @@ def _added_acsl_texts(base: bytes | None, work: bytes | None) -> list[tuple[str,
         return []
 
 
-def _acsl_inner(text: str) -> str:
-    if text.startswith("/*@"):
-        return text[3:-2] if text.endswith("*/") else text[3:]
-    return text[3:] if text.startswith("//@") else text
+def _scan_clause_end(masked: str, start: int) -> int:
+    """Index of the first `;` at or after `start` at bracket depth 0 relative to `start`, not closing a binder."""
+    depth = 0
+    pending = 0
+    n = len(masked)
+    i = start
+    while i < n:
+        ch = masked[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return n
+            depth -= 1
+        elif depth == 0:
+            if ch == "\\":
+                m = _BINDER_RE.match(masked, i)
+                if m is not None:
+                    pending += 1
+                    i = m.end()
+                    continue
+            elif ch == ";":
+                if pending:
+                    pending -= 1
+                else:
+                    return i
+        i += 1
+    return n
+
+
+def _iter_annotation_clauses(annotation: str) -> Iterator[tuple[str, str, int]]:
+    """
+    Yield `(kind, predicate, offset)` for each ACSL clause the Frama-C kernel reads in `annotation`,
+    including statement-level `assert` and `check` annotations. Comments (`//`, nested `//@` outside
+    ghost code), doxygen comments (`/*@*`, `/*@{`, `/*@}`), `@` whitespace, and literals follow
+    `acsl_ast._kernel_views`.
+    """
+    masked, visible = _kernel_views(annotation)
+    n = len(annotation)
+    i = 0
+    while i < n:
+        m = _CLAUSE_HEAD_RE.search(masked, i)
+        if m is None:
+            break
+        end = _scan_clause_end(masked, m.end())
+        if end >= n:
+            i = m.end()
+            continue
+        if m.group("decl") is not None:
+            i = end + 1
+            continue
+        raw_kind = m.group("loop") or m.group("clause") or m.group("check") or ""
+        kind = " ".join(raw_kind.split())
+        raw = visible[m.end() : end]
+        while (lab := _CLAUSE_LABEL_RE.match(raw)) is not None:
+            raw = raw[lab.end() :]
+        predicate = " ".join(raw.split())
+        yield kind, predicate, m.start()
+        i = end + 1
 
 
 def trivial_added_clauses(scratch: Path, budget: dict, contents: dict[str, bytes | None]) -> list[dict]:
@@ -371,20 +432,10 @@ def trivial_added_clauses(scratch: Path, budget: dict, contents: dict[str, bytes
         if not is_safe_relative_path(rel):
             continue
         for text, line in _added_acsl_texts(_read_regular(scratch, f"base/{rel}"), contents[rel]):
-            try:
-                segments = _parse_acsl_inner_segments(_acsl_inner(text), line)
-            except Exception:
-                continue
-            for seg in segments:
-                # Continuation lines of a block may start with `@`, which is not part of the predicate.
-                raw = " ".join(seg.raw_text.replace("@", " ").split())
-                m = _CLAUSE_HEAD_RE.match(raw)
-                if m is None:
-                    continue
-                kind = " ".join(m.group("kind").split())
-                predicate = m.group("pred")
+            for kind, predicate, offset in _iter_annotation_clauses(text):
                 if kind in TRIVIAL_CANDIDATE_KINDS and predicate and is_trivial_predicate(predicate):
-                    found.append({"file": rel, "line": seg.line, "kind": kind, "predicate": predicate})
+                    clause_line = line + text.count("\n", 0, offset)
+                    found.append({"file": rel, "line": clause_line, "kind": kind, "predicate": predicate})
     return found
 
 

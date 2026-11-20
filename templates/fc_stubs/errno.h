@@ -8,6 +8,12 @@
  * crashes in shadow_alloca instead. Under __FRAMAC_EACSL__, errno therefore becomes an ordinary
  * global that E-ACSL tracks.
  *
+ * `fc_compat_types.h` (force-included into every translation unit) also defines `__fc_eacsl_errno`
+ * weakly and maps `errno` to it so shared-header `assigns errno;` contracts parse in TUs that do
+ * not include `<errno.h>`. Here we `#undef errno` before `#include_next <errno.h>` so glibc's
+ * `<errno.h>` defines `errno` cleanly without a macro-redefinition warning, then re-map `errno` to
+ * `__fc_eacsl_errno` (defining it weakly if `fc_compat_types.h` was not force-included).
+ *
  * libc never writes that global itself. The build links a generated errno shim
  * (`<out>_errno_shim/eacsl_errno_shim.o`, `-Wl,--wrap=<fn>`) for the errno-setting libc
  * functions the slice calls (eacsl_toolchain.ERRNO_SHIM_FUNCTIONS): each wrapper hands the global
@@ -18,9 +24,15 @@
  */
 #ifndef FC_STUBS_ERRNO_H
 #define FC_STUBS_ERRNO_H
+#ifdef __FRAMAC_EACSL__
+#undef errno
+#endif
 #include_next <errno.h>
 #ifdef __FRAMAC_EACSL__
-int __fc_eacsl_errno; /* tentative definition: one object however many slice files include this */
+#ifndef __FC_EACSL_ERRNO_DEFINED
+#define __FC_EACSL_ERRNO_DEFINED 1
+int __fc_eacsl_errno __attribute__((weak)); /* merges across TUs under -fno-common and links with eacsl_errno_shim.o */
+#endif
 #undef errno
 #define errno __fc_eacsl_errno
 #endif

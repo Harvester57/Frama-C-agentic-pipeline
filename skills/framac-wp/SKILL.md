@@ -105,7 +105,8 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
    - On the first iteration, run with `--slots auto --prepare` without `--complete`.
    - `--slots auto` = `recommend().max_agents` minus running tasks. On high-spec hardware, this scales dynamically up to 32 agents on $\ge 32$ CPUs and 64 agents on $\ge 64$ CPUs.
    - Finished provers merge eagerly without waiting for unrelated module provers, unblocking callers immediately.
-   - Newly ready tasks in `next.tasks[]` provide the `agent_id`, `role`, and `brief_file` for newly spawned agents.
+   - Newly ready tasks in `next.tasks[]` (including any previously unprepared running tasks healed by `--prepare`, marked `retroactively_prepared: true`) provide the `agent_id`, `role`, and `brief_file` for newly spawned agents.
+   - `step --prepare` and `next --prepare` also atomically write the complete prepared brief list to `state/last_prepared_briefs.json` and return `"briefs_file": "state/last_prepared_briefs.json"`. Always read `briefs_file` whole rather than relying on terminal stdout (which may be truncated), spawn one subagent per entry in `tasks[]`, and verify `spawned count == prepared count` (`count`) before ending your turn.
    - `next.parent_tasks[]` are `repair` tasks for you, the parent. They take no agent slot:
      1. Record the attempt:
         ```text
@@ -141,6 +142,7 @@ Repeat until `python3 /opt/framac-pipeline/scripts/wp_scheduler.py status` repor
 
 **Recovery:**
 - An agent that never returns: `wp_scheduler.py requeue --stale-minutes <N>` (or `--agent-id <id>`) puts its task back and returns its units to `planned`. If its result arrives later anyway, `complete` still accepts it.
+- Prepared briefs never spawned (`dispatch_lost`): `status` and `over_budget_tasks` flag any running task whose `brief.md` exists with zero post-prepare agent activity past the grace period (`DISPATCH_LOST_GRACE_S`, 600s). Either spawn its `brief_file` or run `wp_scheduler.py requeue --agent-id <id>` (which refunds `dispatches` because no agent ran).
 - `status` reports `"stuck": true` when nothing is ready or running yet tasks remain. That usually means a gate is waiting on a repair or verify task (see `gates`), or an agent never returned. Resolve it before looping again.
 - **Fallback:** `FRAMAC_SCHEDULER=waves` makes `next` hand out tasks wave by wave, with strict barriers between waves. Use it for comparison or debugging.
 

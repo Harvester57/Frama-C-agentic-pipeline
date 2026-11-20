@@ -121,3 +121,100 @@ def test_c5_parse_link_stub_abort_asan_and_eacsl_excerpts() -> None:
 
     # Non-anchored mention inside target text must not match.
     assert failure_identity.parse_link_stub_abort("note: FRAMAC_LINK_STUB_CALLED: far_fn\n") is None
+
+
+def test_parse_sanitizer_failure_recognizes_ubsan_segv_and_deadly_signals(tmp_path, monkeypatch) -> None:
+    """
+    libmnl / mpack E-ACSL builds emit Clang UBSan standalone deadly-signal reports
+    (`UndefinedBehaviorSanitizer:DEADLYSIGNAL` / `ERROR: UndefinedBehaviorSanitizer: SEGV ...`)
+    when ASan is absent. parse_sanitizer_failure and parse_runtime_failure must parse them
+    consistently with ASan SEGV, extracting site, access direction, kind, alarm_kind, message,
+    and an address-independent fingerprint.
+    """
+    monkeypatch.chdir(tmp_path)
+    src = tmp_path / "src" / "attr.c"
+    src.parent.mkdir(parents=True)
+    lines = ["int dummy;\n"] * 41 + ["    return attr->nla_len;\n"]
+    src.write_text("".join(lines), encoding="utf-8")
+
+    ubsan_segv_read = (
+        "INFO: Running with entropic power schedule (0xFF, 100).\n"
+        "UndefinedBehaviorSanitizer:DEADLYSIGNAL\n"
+        "==7==ERROR: UndefinedBehaviorSanitizer: SEGV on unknown address 0x76a8a3763c30 (pc 0x5fd4a2ce31af T7)\n"
+        "==7==The signal is caused by a READ memory access.\n"
+        "    #0 0x5fd4a2ce31af in mnl_attr_ok src/attr.c:42:12\n"
+        "    #1 0x5fd4a2ce3c04 in mnl_attr_parse src/attr.c:1139:13\n"
+        "    #2 0x5fd4a2ce9a55 in LLVMFuzzerTestOneInput workspace/harnesses/harness_attr.c:88:3\n"
+        "    #3 0x5fd4a2c9b8ea in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/w/guard.bin+0x368ea)\n"
+        "UndefinedBehaviorSanitizer can not provide additional info.\n"
+        "SUMMARY: UndefinedBehaviorSanitizer: SEGV src/attr.c:42:12 in mnl_attr_ok\n"
+        "==7==ABORTING\n"
+    )
+    f = failure_identity.parse_sanitizer_failure(ubsan_segv_read)
+    assert f is not None
+    assert f["file"] == "src/attr.c"
+    assert f["line"] == 42
+    assert f["function"] == "mnl_attr_ok"
+    assert f["kind"] == "ubsan_segv"
+    assert f["alarm_kind"] == "mem_access"
+    assert f["is_rte"] is True
+    assert f["predicate"].startswith("rte: mem_access: UndefinedBehaviorSanitizer: SEGV (READ) [line ")
+    assert "SEGV on unknown address 0x76a8a3763c30" in f["message"]
+    assert not failure_identity.needs_attribution(f)
+    assert failure_identity.parse_runtime_failure(ubsan_segv_read) == f
+
+    # A different faulting address at the same site produces the exact same fingerprint.
+    other_addr = ubsan_segv_read.replace("0x76a8a3763c30", "0x000000000000").replace("0x5fd4a2ce31af", "0x555555551111")
+    f_other = failure_identity.parse_sanitizer_failure(other_addr)
+    assert f_other is not None
+    assert failure_identity.failure_fingerprint(f) == failure_identity.failure_fingerprint(f_other)
+
+    # WRITE memory access is distinguished in the predicate.
+    ubsan_segv_write = ubsan_segv_read.replace("READ memory access", "WRITE memory access")
+    f_write = failure_identity.parse_sanitizer_failure(ubsan_segv_write)
+    assert f_write is not None
+    assert "SEGV (WRITE)" in f_write["predicate"]
+
+    # An E-ACSL `.instrumented.c` stack frame is parsed cleanly AND flagged for sanitizer attribution.
+    inst_path = "/framac-run/workspace/harnesses/fuzz_attr.instrumented.c"
+    inst_segv = ubsan_segv_read.replace("src/attr.c:42:12", f"{inst_path}:874:30")
+    f_inst = failure_identity.parse_sanitizer_failure(inst_segv)
+    assert f_inst is not None
+    assert (f_inst["file"], f_inst["line"], f_inst["function"]) == (inst_path, 874, "mnl_attr_ok")
+    assert f_inst["kind"] == "ubsan_segv"
+    assert failure_identity.needs_attribution(f_inst)
+
+    # Bare libc / runtime frames are skipped in favor of the target caller, matching ASan attribution.
+    libc_segv = (
+        "UndefinedBehaviorSanitizer:DEADLYSIGNAL\n"
+        "==19==ERROR: UndefinedBehaviorSanitizer: SEGV on unknown address 0x000000000000 (pc 0x7f T19)\n"
+        "==19==The signal is caused by a READ memory access.\n"
+        "    #0 0x7ffff7a00111 in strlen (/lib/x86_64-linux-gnu/libc.so.6+0x1234)\n"
+        "    #1 0x55555558a222 in mnl_attr_ok src/attr.c:42:12\n"
+        "    #2 0x55555558a333 in LLVMFuzzerTestOneInput workspace/harnesses/harness_attr.c:10:3\n"
+        "SUMMARY: UndefinedBehaviorSanitizer: SEGV (/lib/x86_64-linux-gnu/libc.so.6+0x1234) in strlen\n"
+    )
+    f_libc = failure_identity.parse_sanitizer_failure(libc_segv)
+    assert f_libc is not None
+    assert (f_libc["file"], f_libc["line"], f_libc["function"]) == ("src/attr.c", 42, "mnl_attr_ok")
+    assert " in strlen from mnl_attr_ok" in f_libc["predicate"]
+
+    # UBSan FPE maps to division_by_zero.
+    ubsan_fpe = (
+        "UndefinedBehaviorSanitizer:DEADLYSIGNAL\n"
+        "==21==ERROR: UndefinedBehaviorSanitizer: FPE on unknown address 0x555555581234 (pc 0x555555581234 T21)\n"
+        "    #0 0x555555581234 in div_mod src/attr.c:42:10\n"
+    )
+    f_fpe = failure_identity.parse_sanitizer_failure(ubsan_fpe)
+    assert f_fpe is not None
+    assert f_fpe["kind"] == "ubsan_fpe" and f_fpe["alarm_kind"] == "division_by_zero"
+
+    # Stackless report falls back to SUMMARY location.
+    stackless = (
+        "==31==ERROR: UndefinedBehaviorSanitizer: SEGV on unknown address 0x0 (pc 0x1 T31)\n"
+        "SUMMARY: UndefinedBehaviorSanitizer: SEGV src/attr.c:42:12 in mnl_attr_ok\n"
+    )
+    f_sum = failure_identity.parse_sanitizer_failure(stackless)
+    assert f_sum is not None
+    assert (f_sum["file"], f_sum["line"], f_sum["function"]) == ("src/attr.c", 42, "mnl_attr_ok")
+    assert f_sum["kind"] == "ubsan_segv"
