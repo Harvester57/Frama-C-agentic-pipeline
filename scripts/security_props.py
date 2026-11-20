@@ -355,19 +355,7 @@ class _Model:
         formals = self.formals(ref)
         if formals is None:
             return None
-        sig = self._signature(ref)
-        types: list[str] = []
-        if sig.endswith(")") and "(" in sig:
-            depth, start = 0, sig.index("(") + 1
-            for i in range(start, len(sig)):
-                c = sig[i]
-                if c in "([":
-                    depth += 1
-                elif c in ")]" and depth:
-                    depth -= 1
-                elif (c == "," and not depth) or i == len(sig) - 1:
-                    types.append(sig[start:i].strip())
-                    start = i + 1
+        types = _split_params(self._signature(ref))
         out: dict[str, str] = {}
         for i, p in enumerate(formals):
             ref_text = f"${{arg{i}}}"
@@ -381,6 +369,25 @@ class _Model:
                     ref_text = f"(({kind}){ref_text})"
             out[str(p.get("name"))] = ref_text
         return out
+
+    def param_types(self, fid: str) -> dict[str, str] | None:
+        """
+        Parameter name -> its type, from the model's `signature` (`_Bool(struct s *,int)`), with the
+        qualifiers dropped (_norm_type). None when the function has no signature, or one whose
+        parameter count does not match its `formals`.
+        """
+        f = self.functions.get(fid) or {}
+        formals, sig = f.get("formals"), str(f.get("signature") or "")
+        if not isinstance(formals, list) or not sig:
+            return None
+        types = [_norm_type(t) for t in _split_params(sig)]
+        if types and types[-1] == "...":
+            types = types[:-1]
+        if not formals and types in ([], ["void"]):
+            return {}
+        if len(types) != len(formals):
+            return None
+        return {str(p.get("name")): t for p, t in zip(formals, types, strict=True)}
 
     def callers_of(self, ref: str) -> set[str]:
         """Project functions calling `ref` (a project function or an external one)."""
@@ -429,6 +436,32 @@ class _Model:
 
 def _ident(text: str) -> str:
     return re.sub(r"\W", "_", text)
+
+
+def _split_params(sig: str) -> list[str]:
+    """The parameter types of a model signature `ret(T1,T2)`, split at its top-level commas."""
+    types: list[str] = []
+    if sig.endswith(")") and "(" in sig:
+        depth, start = 0, sig.index("(") + 1
+        for i in range(start, len(sig)):
+            c = sig[i]
+            if c in "([":
+                depth += 1
+            elif c in ")]" and depth:
+                depth -= 1
+            elif (c == "," and not depth) or i == len(sig) - 1:
+                types.append(sig[start:i].strip())
+                start = i + 1
+    return types
+
+
+_QUALIFIER_RE = re.compile(r"\b(?:const|volatile|restrict|__restrict__|__restrict)\b")
+
+
+def _norm_type(text: str) -> str:
+    """A C type with its qualifiers dropped and its spacing made uniform (`struct s const*` -> `struct s *`)."""
+    text = re.sub(r"\s+", " ", _QUALIFIER_RE.sub(" ", text)).strip()
+    return re.sub(r"(?<=[\w\]])\s*\*", " *", text)
 
 
 def _has_crlf(text: str) -> bool:
@@ -1123,6 +1156,153 @@ class _Gen:
             "files": [],
         }
 
+    def _named_types(self, fid: str, names: list[str]) -> dict[str, str | None]:
+        """The parameters of `fid` among `names`, with their types (None: the model does not give it)."""
+        own = [str(p.get("name")) for p in self.m.functions[fid].get("formals") or []]
+        types = self.m.param_types(fid) or {}
+        return {n: types.get(n) for n in names if n in own}
+
+    def _typed_params(
+        self,
+        names: list[str],
+        lvalue: str,
+        anchors: list[set[str]],
+        what: str,
+        pool: Iterable[str] | None = None,
+    ) -> dict | None:
+        """
+        `\\formal(p)->field` types only where `p` is of the asset's type: a function whose parameter of
+        one of `names` has another type (nanopb's `pb_istream_t *stream` beside the `pb_ostream_t
+        *stream` that holds `bytes_written`) stops Frama-C ("Cannot find field"), in its own WP run and
+        in every whole-module parse (\\targets reaches the functions of the parse, not the instances).
+        The asset's type is that of the parameters of those names in the first `anchors` group that
+        has one (the declared writers and readers; a gate), else the one type every parameter of one
+        of the names has across the model. Returns None when the functions of `pool` (default: every
+        function of the model, test units too) give those parameters one type, or when the asset's type
+        cannot be told (a warning: every function keeps the guard, today's behaviour). Else
+        {type, source, other, mixed, wrong}, `wrong` the other types per function, each of `other`
+        and `mixed` a {function id: reason}:
+          other  its parameters of those names all have another type: the asset is not reached
+                 through them (as in a function without them, where \\tguard makes the clause \\true);
+                 leave the targets and the instances, recorded under `param_type`;
+          mixed  it may hold the asset (a parameter of the asset's type or of unknown type, or the C
+                 name of an `other` one: MetAcsl targets by name), but also has one that stops
+                 Frama-C: it leaves the targets and is `unchecked` (its unit is never credited).
+        A function whose parameter's type the model does not give stays in (a wrong guard stops the
+        run loudly; a wrong exclusion would lose the check silently).
+        """
+        fids = sorted(self.m.functions if pool is None else {f for f in pool if f in self.m.functions})
+        typed = {f: named for f in fids if (named := self._named_types(f, names))}
+        known = sorted({t for d in typed.values() for t in d.values() if t})
+        if len(known) <= 1:
+            return None
+        asset_type: str | None = None
+        source = ""
+        for group in anchors:
+            seen: dict[str, set[str]] = defaultdict(set)
+            for f in sorted(group):
+                for held in self._named_types(f, names).values():
+                    if held:
+                        seen[held].add(self.m.name(f))
+            if len(seen) > 1:
+                disagree = "; ".join(f"`{t}` in " + ", ".join(sorted(v)) for t, v in sorted(seen.items()))
+                self.warnings.append(
+                    f"{what}: the parameters named {' or '.join(names)} of the functions that handle `{lvalue}` "
+                    f"disagree on its type ({disagree}): every function with such a parameter keeps the guard, "
+                    "and Frama-C stops where the lvalue does not type"
+                )
+                return None
+            if seen:
+                asset_type, holders = next(iter(seen.items()))
+                source = f"the type of its parameter in {', '.join(sorted(holders))}"
+                break
+        if asset_type is None:
+            every = [f for f in self.m.functions if self._named_types(f, names)]
+            unanimous: dict[str, list[str]] = defaultdict(list)
+            for n in names:
+                types = {one for f in every if (one := self._named_types(f, [n]).get(n))}
+                if len(types) == 1:
+                    unanimous[types.pop()].append(n)
+            if len(unanimous) != 1:
+                self.warnings.append(
+                    f"{what}: the parameters named {' or '.join(names)} have {len(known)} types "
+                    f"({', '.join(f'`{t}`' for t in known)}) and nothing tells which one holds `{lvalue}` (no "
+                    "declared writer or reader takes it, and no parameter name has one type everywhere): every "
+                    "function with such a parameter keeps the guard, and Frama-C stops where the lvalue does not "
+                    "type. Declare a writer or reader that takes the object, or add a parameter name used only "
+                    "for it to `params`"
+                )
+                return None
+            asset_type, used = next(iter(unanimous.items()))
+            source = f"the type every parameter named {' or '.join(used)} has"
+        other: dict[str, str] = {}
+        mixed: dict[str, str] = {}
+        wrong_types: dict[str, list[str]] = {}
+        for f, d in typed.items():
+            wrong = [n for n, t in d.items() if t and t != asset_type]
+            if not wrong:
+                continue
+            wrong_types[f] = sorted({str(d[n]) for n in wrong})
+            desc = ", ".join(f"{n} is a `{d[n]}`" for n in wrong)
+            right = [n for n, t in d.items() if n not in wrong]
+            if right:
+                mixed[f] = (
+                    f"its parameter {desc}, where `{lvalue}` does not type (Frama-C would stop), but "
+                    f"{', '.join(right)} may hold the asset: left out of the property's targets, not checked"
+                )
+            else:
+                other[f] = f"its parameter {desc}, not the asset's `{asset_type}`: it does not hold `{lvalue}`"
+        out_names = {self.m.name(f): f for f in sorted([*other, *mixed])}
+        for f in sorted(typed):
+            if f not in other and f not in mixed and self.m.name(f) in out_names:
+                mixed[f] = (
+                    f"shares its C name with {out_names[self.m.name(f)]}, which leaves the property's targets "
+                    "(MetAcsl targets by name): not checked"
+                )
+        return {"type": asset_type, "source": source, "other": other, "mixed": mixed, "wrong": wrong_types}
+
+    def _type_record(self, split: dict | None, lvalue: str, keep: Iterable[str] | None = None) -> dict:
+        """
+        What a property records of _typed_params' result: `param_type` (the asset's type and the
+        functions left out as not holding it), the `unchecked` entries, and a note. `keep`: only the
+        functions among these (a property listing its targets).
+        """
+        if not split:
+            return {"param_type": None, "unchecked": [], "notes": []}
+        keep_set = None if keep is None else set(keep)
+        other = {f: r for f, r in split["other"].items() if keep_set is None or f in keep_set}
+        mixed = {f: r for f, r in split["mixed"].items() if keep_set is None or f in keep_set}
+        if not other and not mixed:
+            return {"param_type": None, "unchecked": [], "notes": []}
+        names = sorted({self.m.name(f) for f in other})
+        some = ", ".join(names[:8]) + (f" and {len(names) - 8} more" if len(names) > 8 else "")
+        types = sorted({t for f in other for t in split["wrong"][f]})
+        notes = [
+            f"{lvalue}: the object is a `{split['type']}` ({split['source']}); "
+            + (
+                f"{len(other)} function(s) whose parameter of that name has another type "
+                f"({', '.join(f'`{t}`' for t in types)}) do not hold it and are left out of the targets and the "
+                f"instances (`param_type.excluded`): {some}"
+                if other
+                else ""
+            )
+            + (
+                f"{'; ' if other else ''}{len(mixed)} function(s) that may also hold it are left out unchecked "
+                "(`unchecked`)"
+                if mixed
+                else ""
+            )
+        ]
+        return {
+            "param_type": {
+                "type": split["type"],
+                "source": split["source"],
+                "excluded": [{"function": f, "reason": r} for f, r in sorted(other.items())],
+            },
+            "unchecked": [{"function": f, "reason": r} for f, r in sorted(mixed.items())],
+            "notes": notes,
+        }
+
     def assets(self) -> None:
         """
         Threat model `assets` (package D1): L3_writers_<name>, only the declared writers write the
@@ -1148,14 +1328,29 @@ class _Gen:
             meta = {"asset": asset, "lvalue": item.get("lvalue")}
             writers = [w for w in (self._one(str(r), f"{what} writers") for r in item.get("writers") or []) if w]
             writer_fids = {f for w in writers for f in self.m.resolve(w)}
+            readers: list[str] = []
+            if item.get("readers") is not None:
+                readers = [r for r in (self._one(str(r), f"{what} readers") for r in item.get("readers") or []) if r]
+            reader_fids = {f for r in readers for f in self.m.resolve(r)}
+            # A function whose parameter of those names has another type leaves the property (the
+            # guard would not type there); the declared writers and readers tell the asset's type.
+            split = (
+                self._typed_params(lv["names"], str(item["lvalue"]), [writer_fids | reader_fids], what)
+                if variant == "formal"
+                else None
+            )
+            typed = self._type_record(split, str(item["lvalue"]))
+            out_fids = {e["function"] for e in (typed["param_type"] or {}).get("excluded") or []}
+            out_fids |= {u["function"] for u in typed["unchecked"]}
+            type_extra = {"param_type": typed["param_type"]} if typed["param_type"] else {}
             name = self._unique(f"{NAME_PREFIX['asset_writers']}{_ident(asset)}")
             facts = self._writing_facts(writer_fids, None, f"{what} ({name})")
             instances = (pointer_writers | self.m.direct_writers(root) | facts["writers"]) - writer_fids
-            instances -= facts["excluded"]
+            instances -= facts["excluded"] | out_fids
             predicate = " &&\n      ".join(
                 self.t.render("l3_asset", f"writers_{variant}", lvalue=a) for a in lv["acsl"]
             )
-            targets = self._targets(None, self._but(writers, facts["excluded"]))
+            targets = self._targets(None, self._but(writers, facts["excluded"] | out_fids))
             checks, unchecked = self._init_write_checks(
                 name, instances, variant, lv["names"], lv["path"], str(item["lvalue"])
             )
@@ -1165,22 +1360,21 @@ class _Gen:
                 self.t.render("l3_asset", "writers", name=name, targets=targets, predicate=predicate),
                 instances,
                 sources=lv["files"],
-                notes=note + self._init_note(checks),
+                notes=note + typed["notes"] + self._init_note(checks),
                 threat_model={**meta, "writers": writers},
                 targets=f"every function but {', '.join(writers)}" if writers else "every function",
                 variant=variant,
                 direct_writers=sorted(self.m.direct_writers(root) - writer_fids),
                 init_checks=checks,
-                unchecked=facts["unchecked"] + unchecked,
+                unchecked=facts["unchecked"] + typed["unchecked"] + unchecked,
                 declared_callees=facts["declared_callees"],
+                **type_extra,
             )
             if item.get("readers") is None:
                 continue
-            readers = [r for r in (self._one(str(r), f"{what} readers") for r in item.get("readers") or []) if r]
-            reader_fids = {f for r in readers for f in self.m.resolve(r)}
             name = self._unique(f"{NAME_PREFIX['asset_readers']}{_ident(asset)}")
             # Any function may read it through a pointer: every function but the readers is an instance
-            # (for a parameter-held asset, those with a parameter of one of the names).
+            # (for a parameter-held asset, those with a parameter of one of the names, of its type).
             pool = set(self.m.live)
             if variant == "formal":
                 pool = {
@@ -1188,7 +1382,7 @@ class _Gen:
                     for f in pool
                     if {str(p.get("name")) for p in self.m.functions[f].get("formals") or []} & set(lv["names"])
                 }
-            instances = pool - reader_fids
+            instances = pool - reader_fids - out_fids
             if len(instances) > INSTANCE_WARN:
                 self.warnings.append(
                     f"{what} ({name}): {len(instances)} functions carry a unit of this property (every function but the "
@@ -1204,15 +1398,17 @@ class _Gen:
                     "l3_asset",
                     "readers",
                     name=name,
-                    targets=self._targets(None, self._but(readers, [])),
+                    targets=self._targets(None, self._but(readers, out_fids)),
                     predicate=predicate,
                 ),
                 instances,
                 sources=lv["files"],
-                notes=list(note),
+                notes=note + typed["notes"],
                 threat_model={**meta, "readers": readers},
                 targets=f"every function but {', '.join(readers)}" if readers else "every function",
                 variant=variant,
+                unchecked=list(typed["unchecked"]),
+                **type_extra,
             )
 
     # -- L4 -----------------------------------------------------------------------------------------
@@ -1246,12 +1442,25 @@ class _Gen:
                 else [f"{state} hangs off a parameter: checked only in functions with a parameter named {root}"]
             )
             gate_fids = set(self.m.resolve(gate))
+            protect_fids = {f for p in protects for f in self.m.resolve(p)}
+            # A function whose parameter named like the state's root has another type leaves the
+            # properties (the guard would not type there); the gate, else the protected functions,
+            # tell the state's type.
+            split = (
+                self._typed_params([root], str(state), [gate_fids, protect_fids], f"auth gate {gate}")
+                if variant == "formal"
+                else None
+            )
+            typed = self._type_record(split, str(state))
+            out_fids = {e["function"] for e in (typed["param_type"] or {}).get("excluded") or []}
+            out_fids |= {u["function"] for u in typed["unchecked"]}
             name = self._unique(f"{NAME_PREFIX['auth_state']}{_ident(gate)}")
             # What declared callees assign counts as a write of their caller (MetAcsl reads their `assigns`).
             facts = self._writing_facts(gate_fids, None, f"auth gate {gate} ({name})")
             writes = (set(writers) | self.m.direct_writers(root) | facts["writers"]) - gate_fids - facts["excluded"]
+            writes -= out_fids
             acsl = self.t.render(
-                "l4_auth_state", variant, name=name, gate=self._but([gate], facts["excluded"]), state=lv
+                "l4_auth_state", variant, name=name, gate=self._but([gate], facts["excluded"] | out_fids), state=lv
             )
             path = str(state)[len(root) :]
             checks, unchecked = self._init_write_checks(name, writes, variant, [root], path, str(state))
@@ -1261,17 +1470,35 @@ class _Gen:
                 acsl,
                 writes,
                 sources=files,
-                notes=note + self._init_note(checks),
+                notes=note + typed["notes"] + self._init_note(checks),
                 threat_model={"auth_gate": gate, "state": state},
                 targets=f"every function but {gate}",
                 direct_writers=sorted(self.m.direct_writers(root) - gate_fids),
                 init_checks=checks,
-                unchecked=facts["unchecked"] + unchecked,
+                unchecked=facts["unchecked"] + typed["unchecked"] + unchecked,
                 declared_callees=facts["declared_callees"],
+                **({"param_type": typed["param_type"]} if typed["param_type"] else {}),
             )
             if not protects:
                 continue
             name = self._unique(f"{NAME_PREFIX['auth_required']}{_ident(gate)}")
+            # A protected function whose parameter of that name has another type cannot be asked for
+            # the state through it: it leaves the targets, with a warning (the threat model named it).
+            required = self._type_record(split, str(state), keep=protect_fids)
+            dropped = {e["function"] for e in (required["param_type"] or {}).get("excluded") or []}
+            dropped |= {u["function"] for u in required["unchecked"]}
+            state_type = split["type"] if split else ""
+            if dropped:
+                self.warnings.append(
+                    f"auth gate {gate} ({name}): {', '.join(sorted({self.m.name(f) for f in dropped}))} "
+                    f"take(s) a parameter named {root} of another type than the state's `{state_type}`: "
+                    "left out of the protected functions (the precondition would not type there)"
+                )
+            dropped_names = {self.m.name(f) for f in dropped}
+            declared_protects = list(protects)
+            protects = [p for p in protects if p.split("#")[-1] not in dropped_names]
+            if not protects:
+                continue
             acsl = self.t.render("l4_auth_required", variant, name=name, protects=", ".join(protects), state=lv)
             callers: set[str] = set()
             entry: list[str] = []
@@ -1291,10 +1518,11 @@ class _Gen:
                 acsl,
                 callers | set(entry),
                 sources=files,
-                notes=notes,
-                threat_model={"auth_gate": gate, "state": state, "protects": protects},
+                notes=notes + required["notes"],
+                threat_model={"auth_gate": gate, "state": state, "protects": declared_protects},
                 targets=", ".join(protects),
                 entry_points=sorted(entry),
+                **({"param_type": required["param_type"]} if required["param_type"] else {}),
             )
 
     def _gate_on_failure(self, item: dict, gate: str, variant: str, lv: str, root: str) -> None:
@@ -1367,10 +1595,22 @@ class _Gen:
                     continue
                 order = ">=" if item.get("direction") == "down" else "<="
                 facts = self._writing_facts(set(), scope, f"{what} ({name})")
+                # A function of the targets whose parameter of that name has another type leaves them
+                # (the guard would not type there). Nothing declares who handles the lvalue: its type
+                # is the one every parameter of that name has across the model, if any.
+                in_scope = None if scope_names is None else {f for s in scope_names for f in self.m.resolve(s)}
+                split = (
+                    self._typed_params(lv["names"], str(item["lvalue"]), [], what, in_scope)
+                    if lv["variant"] == "formal"
+                    else None
+                )
+                typed = self._type_record(split, str(item["lvalue"]))
+                out_fids = {e["function"] for e in (typed["param_type"] or {}).get("excluded") or []}
+                out_fids |= {u["function"] for u in typed["unchecked"]}
                 instances = pointer_writers | self.m.direct_writers(lv["root"]) | facts["writers"]
-                instances = (instances & (scope if scope is not None else self.m.live)) - facts["excluded"]
+                instances = (instances & (scope if scope is not None else self.m.live)) - facts["excluded"] - out_fids
                 template = "monotonic" if lv["variant"] == "global" else "monotonic_formal"
-                targets = self._targets(scope_names, self._but([], facts["excluded"]))
+                targets = self._targets(scope_names, self._but([], facts["excluded"] | out_fids))
                 # A transition cannot be written as one in-code check: initializer calls are unchecked.
                 _, unchecked = self._init_write_checks(
                     name, instances, lv["variant"], lv["names"], lv["path"], str(item["lvalue"]), transition=True
@@ -1385,14 +1625,16 @@ class _Gen:
                     sources=lv["files"],
                     notes=[
                         f"{item['lvalue']} only moves {'down' if order == '>=' else 'up'}, at every write; "
-                        "\\at(x, Before) is not evaluated by Eva: `engines` leaves it out"
+                        "\\at(x, Before) is not evaluated by Eva: `engines` leaves it out",
+                        *typed["notes"],
                     ],
                     threat_model={**meta, "lvalue": item["lvalue"], "direction": item.get("direction") or "up"},
                     targets=", ".join(scope_names) if scope_names else "every function",
                     variant=template,
                     engines=[e for e in META_ENGINES if e != "eva"],
-                    unchecked=facts["unchecked"] + unchecked,
+                    unchecked=facts["unchecked"] + typed["unchecked"] + unchecked,
                     declared_callees=facts["declared_callees"],
+                    **({"param_type": typed["param_type"]} if typed["param_type"] else {}),
                 )
             else:
                 problem = (

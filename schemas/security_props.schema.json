@@ -225,7 +225,18 @@
             "minItems": 1
           },
           "direct_writers": {"type": "array", "items": {"type": "string"}},
-          "entry_points": {"type": "array", "items": {"type": "string"}}
+          "entry_points": {"type": "array", "items": {"type": "string"}},
+          "param_type": {
+            "$comment": "an lvalue reached from a parameter (`\\formal(p)->field`) whose name other functions give a parameter of another type: the object's type (`source`: how it was told) and the functions left out of the targets and the instances because their parameters of that name all have another type (they do not hold the lvalue; the guard would not type there). Not a coverage gap: such a function is like one without the parameter. One that may also hold it is under `unchecked` instead",
+            "type": "object",
+            "properties": {
+              "type": {"type": "string", "minLength": 1},
+              "source": {"type": "string", "minLength": 1},
+              "excluded": {"type": "array", "items": {"$ref": "#/definitions/site"}}
+            },
+            "required": ["type", "source", "excluded"],
+            "additionalProperties": false
+          }
         },
         "required": ["name", "layer", "kind", "obligation_class", "acsl", "instances", "sources", "notes"],
         "additionalProperties": false

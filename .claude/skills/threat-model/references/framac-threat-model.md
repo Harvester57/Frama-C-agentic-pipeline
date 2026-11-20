@@ -107,6 +107,7 @@ Each item has `name`, `lvalue`, `writers` and `description`.
 - **`writers`:** the functions allowed to write it. Every other function is checked.
 - **`readers`:** optional; the functions allowed to read it. Leave it out when reads are not restricted: with it, every other function of the build is checked.
 - **`params`:** optional; for an `lvalue` reached from a parameter, the other parameter names the same object is passed under.
+- **When other functions use the same parameter name for another type** (nanopb's decoders take a `pb_istream_t *stream`, its encoders a `pb_ostream_t *stream`), the pipeline leaves the other-typed functions out of the property. It takes the object's type from the `writers` and `readers` that take it. With no such writer or reader, it uses a name in `params` that has one type everywhere. List at least one writer or reader that takes the object. If nothing tells the type, the generator keeps every function and warns, and Frama-C stops on the others.
 
 ### `invariants` (optional): predicates the code keeps
 

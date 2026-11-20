@@ -10,7 +10,9 @@
  *   formal  the asset hangs off a parameter (`c->mode`): one clause per parameter name the object
  *           is passed as (the lvalue's root and the threat model's `params`), each checked in the
  *           functions that have a parameter of that name (\tguard: \true elsewhere). A helper that
- *           takes the object under another name escapes the check: list that name.
+ *           takes the object under another name escapes the check: list that name. A function
+ *           whose parameter of that name has another type (no such field: Frama-C would stop)
+ *           is left out of the targets by security_props.py (the property's `param_type`).
  * A call placed in an initializer gets no \writing instance from the callee's assigns (MetAcsl
  * 0.12): security_props.py writes `init_write` as a `check` into the work tree there, `region`
  * being what the callee assigns with the call's arguments in place of its parameters.
