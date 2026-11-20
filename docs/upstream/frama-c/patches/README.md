@@ -74,3 +74,17 @@ with the second version of the patch), adds `tests/libc/strlcat.c` with its orac
 updates `tests/libc/oracle/string_h.0.res.oracle` (an unknown check and two unknown preconditions
 become valid; two line numbers move). `fc_libc.0.res.oracle` does not change. It was run with
 `revalidate.sh package 44` in a container of `framac-master-audit:b80fcac`.
+
+**`47-*`, `48-*` and `49-*` (2026-11-20, not filed)** are patches for MetAcsl (`pub/meta`), not
+`pub/frama-c`, one commit each on `pub/meta` `master` `4f43801390`, authored with the GitLab
+noreply address. Apply them to a clone of `pub/meta` with `git am --keep-non-patch` (subjects
+`[meta]` and `[fold]`). 47 maps the callee's `Old`/`Pre` labels to MetAcsl's `Before` in
+`meta_annotate.ml` and adds `tests/meta/callee_labels.c` with four oracles; 48 passes the
+property's location to folded calls and to the `external_assigns`/`passthrough_from` wrappers and
+updates `tests/meta-wp/oracle_fold/typing.0.res.oracle`; 49 adds a `no-footprint` warning with a
+test. 47 and 48 apply stacked (checked); 49 conflicts with them on one `CHANGELOG.md` line. They
+were built and their suites run in throwaway containers of `framac-analysis:latest` (34.0~beta),
+with `meta_parse.ml`'s `PLpointer_comparable` line removed because 34.0~beta lacks it; that
+removal is not in the patches. Lint, the header check and the `meta-deduce` deduction checks
+(SWI-Prolog absent) were not run. The oracles of 47 and 49 contain lines ending in spaces, as
+Frama-C prints them; `git am` warns about them.

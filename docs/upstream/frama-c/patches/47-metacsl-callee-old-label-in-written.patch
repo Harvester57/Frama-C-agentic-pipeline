@@ -1,0 +1,547 @@
+From c4cf440793e93ac74cae322950c7bde16ebdb9b3 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Fri, 20 Nov 2026 00:50:28 +0100
+Subject: [PATCH] [meta] do not copy callee Old/Pre labels into \written and
+ \read instances
+
+When a \writing or \reading property is checked at a call to a function
+whose footprint comes from its contract (an undefined callee, under the
+default -meta-check-ext, or -meta-check-callee-assigns), inspect_contract
+substitutes the formals of each assigns location (or \from location, for
+\read) and of the assumes clauses by the actual arguments, and the result
+becomes \written or \read in an assertion attached to the call.
+
+The terms are copied with the labels of the contract. In an assigns
+clause, a labelled logic function called without a label (strlen(s) in the
+libc specification of strcpy, for instance) is typed with Old, and a user
+may write \old(*p) or \at(*p, Pre). In the generated assertion:
+
+- Old is not a valid label in a statement annotation. -check reports
+  "Logic label Old is not declared in this scope", the kernel rejects the
+  printed code ("logic label `Old' not found"), WP stops with
+  Wp__NormAtLabels.LabelError and E-ACSL with "invalid label 'Old' within
+  statement annotation 'Assertion'".
+- Pre is valid but denotes the pre-state of the caller, not the state
+  before the call, so the instance silently checks another location.
+
+Both labels denote the pre-state of the callee, which is the state just
+before the call. Map them to the meta label Before in the substitution
+visitor: replace_after_before already turns it into Here when the
+assertion precedes the call, and into a C label on the call when it is
+placed after it (a property that uses After).
+
+New test tests/meta/callee_labels.c covers an implicit Old, \old, \at(.,
+Pre) and an After property for \written, and Old and Pre in \from parts
+and assumes clauses for \read, in the default and fold configurations.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |   3 +
+ meta_annotate.ml                              |  10 ++
+ tests/meta/callee_labels.c                    |  58 ++++++++++
+ tests/meta/oracle/callee_labels.0.res.oracle  |  81 ++++++++++++++
+ tests/meta/oracle/callee_labels.1.res.oracle  |  90 +++++++++++++++
+ .../oracle_fold/callee_labels.0.res.oracle    |  95 ++++++++++++++++
+ .../oracle_fold/callee_labels.1.res.oracle    | 103 ++++++++++++++++++
+ 7 files changed, 440 insertions(+)
+ create mode 100644 tests/meta/callee_labels.c
+ create mode 100644 tests/meta/oracle/callee_labels.0.res.oracle
+ create mode 100644 tests/meta/oracle/callee_labels.1.res.oracle
+ create mode 100644 tests/meta/oracle_fold/callee_labels.0.res.oracle
+ create mode 100644 tests/meta/oracle_fold/callee_labels.1.res.oracle
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f09d668..cb86b8a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,9 @@
+ # Version dev
+ 
+ - options `-meta-fold` and `-meta-quantify-range` to obtain instances that are better suited to E-ACSL instrumentation
++- the `\written` and `\read` instances built from the contract of a callee no longer keep the
++  `Old` and `Pre` labels of that contract, which are not valid (or denote another state) in the
++  assertion generated at the call
+ 
+ # Version 0.11
+ 
+diff --git a/meta_annotate.ml b/meta_annotate.ml
+index 03447cf..d9db2af 100644
+--- a/meta_annotate.ml
++++ b/meta_annotate.ml
+@@ -563,6 +563,16 @@ let inspect_contract process stmt ckf args =
+           (Option.get oargs) args ;
+       h
+ 
++    (* In the contract of the callee, Old and Pre denote its pre-state, that is
++       the state just before the call. The instance is a statement annotation,
++       where Old is not allowed and Pre denotes the pre-state of the caller.
++       Use the meta label Before instead: replace_after_before turns it into
++       Here when the annotation precedes the call, and into a label on the call
++       when it follows it. *)
++    method! vlogic_label = function
++      | BuiltinLabel (Old | Pre) -> Cil.ChangeTo (FormalLabel "Before")
++      | _ -> Cil.DoChildren
++
+     method! vterm _ =
+       Cil.DoChildrenPost (fun term -> match term.term_node with
+           | TLval (host, _) | TAddrOf (host, _) | TStartOf (host, _) ->
+diff --git a/tests/meta/callee_labels.c b/tests/meta/callee_labels.c
+new file mode 100644
+index 0000000..fea7a1f
+--- /dev/null
++++ b/tests/meta/callee_labels.c
+@@ -0,0 +1,58 @@
++/* run.config*
++OPT: @META@ @PRINT@
++OPT: @META@ -meta-quantify-range @PRINT@
++*/
++
++/* The \written and \read instances of a call come from the assigns clauses
++   and their \from parts in the contract of the callee. Old and Pre in these
++   clauses, and Pre in the assumes clauses, denote the pre-state of the callee,
++   that is the state just before the call. */
++
++int secret;
++int n;
++
++/*@ logic integer len{L}(int *p) = \at(*p, L); */
++
++/*@ assigns d[0 .. len(p)]; */ // implicit label Old
++void fill_len(char *d, int *p);
++
++/*@ assigns d[0 .. \old(*p)]; */
++void fill_old(char *d, int *p);
++
++/*@ assigns d[0 .. \at(*p, Pre)]; */
++void fill_pre(char *d, int *p);
++
++/*@ behavior big:
++      assumes \at(*p, Pre) > 2;
++      assigns d[0] \from s[0 .. len(p)];
++    behavior small:
++      assumes *p <= 2;
++      assigns d[0] \from s[0 .. \old(*p)];
++*/
++void copy(char *d, const char *s, int *p);
++
++void before(char *buf) {
++  fill_len(buf, &n);
++  fill_old(buf, &n);
++  fill_pre(buf, &n);
++}
++
++void after(char *buf) {
++  fill_len(buf, &n);
++}
++
++void reader(char *d, const char *s) {
++  copy(d, s, &n);
++}
++
++/*@ meta \prop, \name(no_write_secret), \targets({before}), \context(\writing),
++      \separated(\written, &secret);
++*/
++
++/*@ meta \prop, \name(secret_unchanged), \targets({after}), \context(\writing),
++      \separated(\written, &secret) || \at(secret, After) == \at(secret, Before);
++*/
++
++/*@ meta \prop, \name(no_read_secret), \targets({reader}), \context(\reading),
++      \separated(\read, &secret);
++*/
+diff --git a/tests/meta/oracle/callee_labels.0.res.oracle b/tests/meta/oracle/callee_labels.0.res.oracle
+new file mode 100644
+index 0000000..e7d9d87
+--- /dev/null
++++ b/tests/meta/oracle/callee_labels.0.res.oracle
+@@ -0,0 +1,81 @@
++[kernel] Parsing callee_labels.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 3 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++int secret;
++int n;
++/*@ logic ℤ len{L}(int *p) = \at(*p,L);
++ */
++/*@ assigns *(d + (0 .. len{Old}(p))); */
++void fill_len(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \old(*p))); */
++void fill_old(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \at(*p,Pre))); */
++void fill_pre(char *d, int *p);
++
++/*@ behavior big:
++      assumes \at(*p,Pre) > 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. len{Old}(p)));
++    
++    behavior small:
++      assumes *p ≤ 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. \old(*p)));
++ */
++void copy(char *d, char const *s, int *p);
++
++void before(char *buf)
++{
++  /*@ assert
++        no_write_secret: meta: \separated(buf + (0 .. len(&n)), &secret);
++  */
++  fill_len(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          \separated(buf + (0 .. \at(*(&n),Here)), &secret);
++  */
++  fill_old(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          \separated(buf + (0 .. \at(*(&n),Here)), &secret);
++  */
++  fill_pre(buf,& n);
++  return;
++}
++
++void after(char *buf)
++{
++  meta_pre_0: fill_len(buf,& n);
++  /*@
++  assert
++    secret_unchanged: meta:
++      \separated(buf + (0 .. len{meta_pre_0}(&n)), &secret) ∨
++      \at(secret,Here) ≡ \at(secret,meta_pre_0);
++   */
++  ;
++  return;
++}
++
++void reader(char *d, char const *s)
++{
++  /*@ assert
++        no_read_secret: meta:
++          \at(*(&n),Here) > 2 ⇒ \separated(s + (0 .. len(&n)), &secret);
++  */
++  /*@ assert
++        no_read_secret: meta:
++          *(&n) ≤ 2 ⇒ \separated(s + (0 .. \at(*(&n),Here)), &secret);
++  */
++  copy(d,s,& n);
++  return;
++}
++
++/*@ \meta::meta "no_write_secret"; */
++/*@ \meta::meta "secret_unchanged"; */
++/*@ \meta::meta "no_read_secret";
++*/
++
+diff --git a/tests/meta/oracle/callee_labels.1.res.oracle b/tests/meta/oracle/callee_labels.1.res.oracle
+new file mode 100644
+index 0000000..97ef542
+--- /dev/null
++++ b/tests/meta/oracle/callee_labels.1.res.oracle
+@@ -0,0 +1,90 @@
++[kernel] Parsing callee_labels.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 3 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++int secret;
++int n;
++/*@ logic ℤ len{L}(int *p) = \at(*p,L);
++ */
++/*@ assigns *(d + (0 .. len{Old}(p))); */
++void fill_len(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \old(*p))); */
++void fill_old(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \at(*p,Pre))); */
++void fill_pre(char *d, int *p);
++
++/*@ behavior big:
++      assumes \at(*p,Pre) > 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. len{Old}(p)));
++    
++    behavior small:
++      assumes *p ≤ 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. \old(*p)));
++ */
++void copy(char *d, char const *s, int *p);
++
++void before(char *buf)
++{
++  /*@ assert
++        no_write_secret: meta:
++          ∀ ℤ __i0; 0 ≤ __i0 ≤ len(&n) ⇒ \separated(buf + __i0, &secret);
++  */
++  fill_len(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          ∀ ℤ __i0;
++            0 ≤ __i0 ≤ \at(*(&n),Here) ⇒ \separated(buf + __i0, &secret);
++  */
++  fill_old(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          ∀ ℤ __i0;
++            0 ≤ __i0 ≤ \at(*(&n),Here) ⇒ \separated(buf + __i0, &secret);
++  */
++  fill_pre(buf,& n);
++  return;
++}
++
++void after(char *buf)
++{
++  meta_pre_0: fill_len(buf,& n);
++  /*@
++  assert
++    secret_unchanged: meta:
++      ∀ ℤ __i0;
++        0 ≤ __i0 ≤ len{meta_pre_0}(&n) ⇒
++        \separated(buf + __i0, &secret) ∨
++        \at(secret,Here) ≡ \at(secret,meta_pre_0);
++   */
++  ;
++  return;
++}
++
++void reader(char *d, char const *s)
++{
++  /*@ assert
++        no_read_secret: meta:
++          ∀ ℤ __i0;
++            0 ≤ __i0 ≤ len(&n) ⇒
++            \at(*(&n),Here) > 2 ⇒ \separated(s + __i0, &secret);
++  */
++  /*@ assert
++        no_read_secret: meta:
++          ∀ ℤ __i0;
++            0 ≤ __i0 ≤ \at(*(&n),Here) ⇒
++            *(&n) ≤ 2 ⇒ \separated(s + __i0, &secret);
++  */
++  copy(d,s,& n);
++  return;
++}
++
++/*@ \meta::meta "no_write_secret"; */
++/*@ \meta::meta "secret_unchanged"; */
++/*@ \meta::meta "no_read_secret";
++*/
++
+diff --git a/tests/meta/oracle_fold/callee_labels.0.res.oracle b/tests/meta/oracle_fold/callee_labels.0.res.oracle
+new file mode 100644
+index 0000000..a84a45f
+--- /dev/null
++++ b/tests/meta/oracle_fold/callee_labels.0.res.oracle
+@@ -0,0 +1,95 @@
++[kernel] Parsing callee_labels.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 3 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++int secret;
++int n;
++/*@ logic ℤ len{L}(int *p) = \at(*p,L);
++ */
++/*@
++predicate meta_no_write_secret{Before}(set<char *>  _written) =
++  \separated(_written, &secret);
++ */
++/*@
++predicate meta_secret_unchanged{After, Before}(set<char *>  _written) =
++  \separated(_written, \at(&secret,After)) ∨
++  \at(secret,After) ≡ \at(secret,Before);
++ */
++/*@
++predicate meta_no_read_secret{Before}(char **_read) =
++  \separated(_read, &secret);
++ */
++/*@
++predicate meta_no_read_secret{Before}(set<char const *>  _read) =
++  \at(*(&n),Before) > 2 ⇒ \separated(_read, &secret);
++ */
++/*@ assigns *(d + (0 .. len{Old}(p))); */
++void fill_len(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \old(*p))); */
++void fill_old(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \at(*p,Pre))); */
++void fill_pre(char *d, int *p);
++
++/*@ behavior big:
++      assumes \at(*p,Pre) > 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. len{Old}(p)));
++    
++    behavior small:
++      assumes *p ≤ 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. \old(*p)));
++ */
++void copy(char *d, char const *s, int *p);
++
++void before(char *buf)
++{
++  /*@ assert
++        no_write_secret: meta: meta_no_write_secret(buf + (0 .. len(&n)));
++  */
++  fill_len(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          meta_no_write_secret(buf + (0 .. \at(*(&n),Here)));
++  */
++  fill_old(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          meta_no_write_secret(buf + (0 .. \at(*(&n),Here)));
++  */
++  fill_pre(buf,& n);
++  return;
++}
++
++void after(char *buf)
++{
++  meta_pre_0: fill_len(buf,& n);
++  /*@
++  assert
++    secret_unchanged: meta:
++      meta_secret_unchanged{Here, meta_pre_0}(buf +
++                                              (0 .. len{meta_pre_0}(&n)));
++   */
++  ;
++  return;
++}
++
++void reader(char *d, char const *s)
++{
++  /*@ assert no_read_secret: meta: meta_no_read_secret(s + (0 .. len(&n)));
++  */
++  /*@ assert
++        no_read_secret: meta: meta_no_read_secret(s + (0 .. \at(*(&n),Here)));
++  */
++  copy(d,s,& n);
++  return;
++}
++
++/*@ \meta::meta "no_write_secret"; */
++/*@ \meta::meta "secret_unchanged"; */
++/*@ \meta::meta "no_read_secret";
++*/
++
+diff --git a/tests/meta/oracle_fold/callee_labels.1.res.oracle b/tests/meta/oracle_fold/callee_labels.1.res.oracle
+new file mode 100644
+index 0000000..f711f0f
+--- /dev/null
++++ b/tests/meta/oracle_fold/callee_labels.1.res.oracle
+@@ -0,0 +1,103 @@
++[kernel] Parsing callee_labels.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 3 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++int secret;
++int n;
++/*@ logic ℤ len{L}(int *p) = \at(*p,L);
++ */
++/*@
++predicate meta_no_write_secret{Before}(char *_written) =
++  \separated(_written, &secret);
++ */
++/*@
++predicate meta_secret_unchanged{After, Before}(char *_written) =
++  \separated(_written, \at(&secret,After)) ∨
++  \at(secret,After) ≡ \at(secret,Before);
++ */
++/*@
++predicate meta_no_read_secret{Before}(char *_read) =
++  \at(*(&n),Before) > 2 ⇒ \separated(_read, &secret);
++ */
++/*@
++predicate meta_no_read_secret{Before}(char **_read) =
++  \separated(_read, &secret);
++ */
++/*@ assigns *(d + (0 .. len{Old}(p))); */
++void fill_len(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \old(*p))); */
++void fill_old(char *d, int *p);
++
++/*@ assigns *(d + (0 .. \at(*p,Pre))); */
++void fill_pre(char *d, int *p);
++
++/*@ behavior big:
++      assumes \at(*p,Pre) > 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. len{Old}(p)));
++    
++    behavior small:
++      assumes *p ≤ 2;
++      assigns *(d + 0);
++      assigns *(d + 0) \from *(s + (0 .. \old(*p)));
++ */
++void copy(char *d, char const *s, int *p);
++
++void before(char *buf)
++{
++  /*@ assert
++        no_write_secret: meta:
++          ∀ ℤ __i0; 0 ≤ __i0 ≤ len(&n) ⇒ meta_no_write_secret(buf + __i0);
++  */
++  fill_len(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          ∀ ℤ __i0;
++            0 ≤ __i0 ≤ \at(*(&n),Here) ⇒ meta_no_write_secret(buf + __i0);
++  */
++  fill_old(buf,& n);
++  /*@ assert
++        no_write_secret: meta:
++          ∀ ℤ __i0;
++            0 ≤ __i0 ≤ \at(*(&n),Here) ⇒ meta_no_write_secret(buf + __i0);
++  */
++  fill_pre(buf,& n);
++  return;
++}
++
++void after(char *buf)
++{
++  meta_pre_0: fill_len(buf,& n);
++  /*@
++  assert
++    secret_unchanged: meta:
++      ∀ ℤ __i0;
++        0 ≤ __i0 ≤ len{meta_pre_0}(&n) ⇒
++        meta_secret_unchanged{Here, meta_pre_0}(buf + __i0);
++   */
++  ;
++  return;
++}
++
++void reader(char *d, char const *s)
++{
++  /*@ assert
++        no_read_secret: meta:
++          ∀ ℤ __i0; 0 ≤ __i0 ≤ len(&n) ⇒ meta_no_read_secret(s + __i0);
++  */
++  /*@ assert
++        no_read_secret: meta:
++          ∀ ℤ __i0;
++            0 ≤ __i0 ≤ \at(*(&n),Here) ⇒ meta_no_read_secret(s + __i0);
++  */
++  copy(d,s,& n);
++  return;
++}
++
++/*@ \meta::meta "no_write_secret"; */
++/*@ \meta::meta "secret_unchanged"; */
++/*@ \meta::meta "no_read_secret";
++*/
++
+-- 
+2.56.0.windows.4
+

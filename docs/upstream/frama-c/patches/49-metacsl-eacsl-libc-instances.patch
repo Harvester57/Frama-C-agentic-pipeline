@@ -1,0 +1,347 @@
+From fa66c0f8a418252119d9ee4673c4000b340f2999 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Fri, 20 Nov 2026 00:52:13 +0100
+Subject: [PATCH] [meta] warn on calls to functions without specification in
+ reading/writing contexts
+
+A call to an undefined function is checked through the callee's assigns
+(writing) or \from (reading) clauses. A behavior without assigns gives the
+warning "Cannot analyze footprint of function f: no assigns clause", but a
+function declared without any specification has no behavior at all, so the
+call was skipped silently. This is the case of every libc function when the
+code is parsed with the system headers (-no-frama-c-stdlib, the default of
+e-acsl-gcc): memcpy(&protected, ...) gets no instance and no message.
+
+Emit the same warning in that case, and give both a warning category,
+no-footprint, so that it can be silenced or made an error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |  1 +
+ README.md                                     |  5 ++-
+ meta_annotate.ml                              | 19 ++++++---
+ meta_options.ml                               |  2 +
+ meta_options.mli                              |  4 ++
+ tests/meta/no_footprint.i                     | 30 ++++++++++++++
+ tests/meta/oracle/no_footprint.0.res.oracle   | 39 ++++++++++++++++++
+ tests/meta/oracle/no_footprint.1.res.oracle   | 35 ++++++++++++++++
+ .../oracle_fold/no_footprint.0.res.oracle     | 41 +++++++++++++++++++
+ .../oracle_fold/no_footprint.1.res.oracle     | 37 +++++++++++++++++
+ 10 files changed, 207 insertions(+), 6 deletions(-)
+ create mode 100644 tests/meta/no_footprint.i
+ create mode 100644 tests/meta/oracle/no_footprint.0.res.oracle
+ create mode 100644 tests/meta/oracle/no_footprint.1.res.oracle
+ create mode 100644 tests/meta/oracle_fold/no_footprint.0.res.oracle
+ create mode 100644 tests/meta/oracle_fold/no_footprint.1.res.oracle
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f09d668..45c4867 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,7 @@
+ # Version dev
+ 
+ - options `-meta-fold` and `-meta-quantify-range` to obtain instances that are better suited to E-ACSL instrumentation
++- warn (category `no-footprint`) when a reading/writing property meets a call to a function declared without any specification, as already done for a behavior without assigns
+ 
+ # Version 0.11
+ 
+diff --git a/README.md b/README.md
+index b93d3d0..a8a399d 100644
+--- a/README.md
++++ b/README.md
+@@ -157,7 +157,10 @@ hold. It can be one of the following :
+     specification) is considered to be **equivalent to assignments in the
+     body of `f`** and thus will be checked at the callsite.
+   + In that case, if `g` does not specify a memory footprint, it is **assumed** that it
+-    respects all related meta-properties.
++    respects all related meta-properties. A warning of category `no-footprint` is
++    emitted at each such call (`-meta-warn-key no-footprint=inactive` to hide it).
++    This happens in particular for libc functions when the code is parsed with the
++    system headers (`-no-frama-c-stdlib`, the default of `e-acsl-gcc`).
+   + This treatment can be disabled with option `-meta-no-check-ext`
+   + This special treatment can also be enforced for a set of functions, with or
+     without definitions, by option `-meta-check-callee-assigns` taking a list of
+diff --git a/meta_annotate.ml b/meta_annotate.ml
+index 03447cf..1137ad4 100644
+--- a/meta_annotate.ml
++++ b/meta_annotate.ml
+@@ -577,7 +577,15 @@ let inspect_contract process stmt ckf args =
+           | _ -> term
+         )
+   end in
++  let no_footprint () =
++    Self.warning ~wkey:Meta_options.no_footprint_wkey
++      "Cannot analyze footprint of function %a: no assigns \
++       clause. Assuming meta-properties with reading/writing contexts are \
++       valid in this function." Kernel_function.pretty ckf
++  in
++  let has_behavior = ref false in
+   let f b =
++    has_behavior := true ;
+     let ass =
+       Annotations.fold_assumes
+         (fun _ p old ->
+@@ -587,13 +595,14 @@ let inspect_contract process stmt ckf args =
+         ckf b.b_name []
+     in
+     match b.b_assigns with
+-      | WritesAny ->
+-        Self.warning "Cannot analyze footprint of function %a: no assigns \
+-                      clause. Assuming meta-properties with reading/writing contexts are \
+-                      valid in this function." Kernel_function.pretty ckf
++      | WritesAny -> no_footprint ()
+       | Writes l -> process ckf stmt vis l ass
+   in
+-  Annotations.iter_behaviors f ckf
++  Annotations.iter_behaviors f ckf ;
++  (* A function declared without any specification (e.g. a libc function
++     parsed with the system headers) has no behavior at all: it is assumed to
++     respect the properties as well, so say it. *)
++  if not !has_behavior then no_footprint ()
+ 
+ let quantify_ranges t =
+   let quant = ref [] in
+diff --git a/meta_options.ml b/meta_options.ml
+index fe4cf11..e901b6a 100644
+--- a/meta_options.ml
++++ b/meta_options.ml
+@@ -110,6 +110,8 @@ module Fold_instances = Self.False (struct
+ let unknown_func_wkey = Self.register_warn_category "unknown-func"
+ let () = Self.set_warn_status unknown_func_wkey Log.Wabort
+ 
++let no_footprint_wkey = Self.register_warn_category "no-footprint"
++
+ type meta_flags = {
+   check_external : bool;
+   check_callee_assigns: Kernel_function.Set.t;
+diff --git a/meta_options.mli b/meta_options.mli
+index a4a6565..f0569fd 100644
+--- a/meta_options.mli
++++ b/meta_options.mli
+@@ -54,6 +54,10 @@ module Fold_instances: Parameter_sig.Bool
+ 
+ val unknown_func_wkey: Self.warn_category
+ 
++(** a callee whose footprint is unknown (no specification, or a behavior
++    without assigns) is assumed to respect reading/writing properties. *)
++val no_footprint_wkey: Self.warn_category
++
+ (** record with all the options as set at the start
+     of the analysis. *)
+ type meta_flags =  {
+diff --git a/tests/meta/no_footprint.i b/tests/meta/no_footprint.i
+new file mode 100644
+index 0000000..239f0bf
+--- /dev/null
++++ b/tests/meta/no_footprint.i
+@@ -0,0 +1,30 @@
++/* run.config*
++   OPT: @META@ @PRINT@
++   OPT: @META@ -meta-warn-key no-footprint=inactive @PRINT@
++*/
++
++int protected;
++int other;
++
++/* Declared without any specification, as libc functions are when the code is
++   parsed with the system headers: the call must give a warning. */
++extern void *copy(void *dst, const void *src, unsigned long n);
++
++/* A behavior without assigns: the call gives the same warning. */
++/*@ requires \true; */
++extern void touch(int *p);
++
++/* A footprint: the call is checked, no warning. */
++/*@ assigns ((char *)dst)[0 .. n - 1] \from ((char *)src)[0 .. n - 1]; */
++extern void copy_spec(void *dst, const void *src, unsigned long n);
++
++void f(const char *in)
++{
++  copy(&protected, in, sizeof(protected));
++  touch(&protected);
++  copy_spec(&other, in, sizeof(other));
++}
++
++/*@ meta \prop, \name(no_write), \targets({f}), \context(\writing),
++      \separated(\written, &protected);
++*/
+diff --git a/tests/meta/oracle/no_footprint.0.res.oracle b/tests/meta/oracle/no_footprint.0.res.oracle
+new file mode 100644
+index 0000000..42ebd2f
+--- /dev/null
++++ b/tests/meta/oracle/no_footprint.0.res.oracle
+@@ -0,0 +1,39 @@
++[kernel] Parsing no_footprint.i (no preprocessing)
++[meta] Translation is enabled
++[meta] Will process 1 properties
++[meta:no-footprint] Warning: 
++  Cannot analyze footprint of function copy: no assigns clause. Assuming meta-properties with reading/writing contexts are valid in this function.
++[meta:no-footprint] Warning: 
++  Cannot analyze footprint of function touch: no assigns clause. Assuming meta-properties with reading/writing contexts are valid in this function.
++[meta] Successful translation
++/* Generated by Frama-C */
++int protected;
++int other;
++extern void *copy(void *dst, void const *src, unsigned long n);
++
++/*@ requires \true; */
++extern void touch(int *p);
++
++/*@ assigns *((char *)dst + (0 .. n - 1));
++    assigns *((char *)dst + (0 .. n - 1))
++      \from *((char *)src + (0 .. n - 1));
++ */
++extern void copy_spec(void *dst, void const *src, unsigned long n);
++
++void f(char const *in)
++{
++  copy((void *)(& protected),(void const *)in,sizeof(protected));
++  touch(& protected);
++  /*@ assert
++        no_write: meta:
++          \separated(
++            (char *)((void *)(&other)) + (0 .. sizeof(int) - 1), &protected
++            );
++  */
++  copy_spec((void *)(& other),(void const *)in,sizeof(other));
++  return;
++}
++
++/*@ \meta::meta "no_write";
++*/
++
+diff --git a/tests/meta/oracle/no_footprint.1.res.oracle b/tests/meta/oracle/no_footprint.1.res.oracle
+new file mode 100644
+index 0000000..accbdaf
+--- /dev/null
++++ b/tests/meta/oracle/no_footprint.1.res.oracle
+@@ -0,0 +1,35 @@
++[kernel] Parsing no_footprint.i (no preprocessing)
++[meta] Translation is enabled
++[meta] Will process 1 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++int protected;
++int other;
++extern void *copy(void *dst, void const *src, unsigned long n);
++
++/*@ requires \true; */
++extern void touch(int *p);
++
++/*@ assigns *((char *)dst + (0 .. n - 1));
++    assigns *((char *)dst + (0 .. n - 1))
++      \from *((char *)src + (0 .. n - 1));
++ */
++extern void copy_spec(void *dst, void const *src, unsigned long n);
++
++void f(char const *in)
++{
++  copy((void *)(& protected),(void const *)in,sizeof(protected));
++  touch(& protected);
++  /*@ assert
++        no_write: meta:
++          \separated(
++            (char *)((void *)(&other)) + (0 .. sizeof(int) - 1), &protected
++            );
++  */
++  copy_spec((void *)(& other),(void const *)in,sizeof(other));
++  return;
++}
++
++/*@ \meta::meta "no_write";
++*/
++
+diff --git a/tests/meta/oracle_fold/no_footprint.0.res.oracle b/tests/meta/oracle_fold/no_footprint.0.res.oracle
+new file mode 100644
+index 0000000..72a1057
+--- /dev/null
++++ b/tests/meta/oracle_fold/no_footprint.0.res.oracle
+@@ -0,0 +1,41 @@
++[kernel] Parsing no_footprint.i (no preprocessing)
++[meta] Translation is enabled
++[meta] Will process 1 properties
++[meta:no-footprint] Warning: 
++  Cannot analyze footprint of function copy: no assigns clause. Assuming meta-properties with reading/writing contexts are valid in this function.
++[meta:no-footprint] Warning: 
++  Cannot analyze footprint of function touch: no assigns clause. Assuming meta-properties with reading/writing contexts are valid in this function.
++[meta] Successful translation
++/* Generated by Frama-C */
++int protected;
++int other;
++/*@
++predicate meta_no_write{Before}(set<char *>  _written) =
++  \separated(_written, &protected);
++ */
++extern void *copy(void *dst, void const *src, unsigned long n);
++
++/*@ requires \true; */
++extern void touch(int *p);
++
++/*@ assigns *((char *)dst + (0 .. n - 1));
++    assigns *((char *)dst + (0 .. n - 1))
++      \from *((char *)src + (0 .. n - 1));
++ */
++extern void copy_spec(void *dst, void const *src, unsigned long n);
++
++void f(char const *in)
++{
++  copy((void *)(& protected),(void const *)in,sizeof(protected));
++  touch(& protected);
++  /*@ assert
++        no_write: meta:
++          meta_no_write((char *)((void *)(&other)) + (0 .. sizeof(int) - 1));
++  */
++  copy_spec((void *)(& other),(void const *)in,sizeof(other));
++  return;
++}
++
++/*@ \meta::meta "no_write";
++*/
++
+diff --git a/tests/meta/oracle_fold/no_footprint.1.res.oracle b/tests/meta/oracle_fold/no_footprint.1.res.oracle
+new file mode 100644
+index 0000000..46dd7d8
+--- /dev/null
++++ b/tests/meta/oracle_fold/no_footprint.1.res.oracle
+@@ -0,0 +1,37 @@
++[kernel] Parsing no_footprint.i (no preprocessing)
++[meta] Translation is enabled
++[meta] Will process 1 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++int protected;
++int other;
++/*@
++predicate meta_no_write{Before}(set<char *>  _written) =
++  \separated(_written, &protected);
++ */
++extern void *copy(void *dst, void const *src, unsigned long n);
++
++/*@ requires \true; */
++extern void touch(int *p);
++
++/*@ assigns *((char *)dst + (0 .. n - 1));
++    assigns *((char *)dst + (0 .. n - 1))
++      \from *((char *)src + (0 .. n - 1));
++ */
++extern void copy_spec(void *dst, void const *src, unsigned long n);
++
++void f(char const *in)
++{
++  copy((void *)(& protected),(void const *)in,sizeof(protected));
++  touch(& protected);
++  /*@ assert
++        no_write: meta:
++          meta_no_write((char *)((void *)(&other)) + (0 .. sizeof(int) - 1));
++  */
++  copy_spec((void *)(& other),(void const *)in,sizeof(other));
++  return;
++}
++
++/*@ \meta::meta "no_write";
++*/
++
+-- 
+2.56.0.windows.4
+
