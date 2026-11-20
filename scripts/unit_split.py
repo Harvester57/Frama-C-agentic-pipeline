@@ -499,12 +499,26 @@ def link_stubs_for_files(
     `address_refs`, `global_refs`, and global initializers) without defining them. Reached functions
     and reached globals are never listed.
     """
-    in_files = [k for k in all_keys if set(_defining_c_files(functions.get(k))) & files]
-    defined = set(in_files) | {k for k in all_keys if (functions.get(k) or {}).get("header")} | set(reached_fns)
     all_set = set(all_keys)
+    in_files = [k for k in all_keys if set(_defining_c_files(functions.get(k))) & files]
+    # Header `static inline` functions called by `.c` files in `files` are compiled into those
+    # translation units too, so their `global_refs` and non-header callees create link relocations.
+    compiled_fns: set[str] = set(in_files)
+    hwork = list(in_files)
+    while hwork:
+        k = hwork.pop()
+        rec = functions.get(k) or {}
+        indirect = set(rec.get("indirect_callees") or [])
+        cands = [c for c in rec.get("internal_callees") or [] if c not in indirect]
+        cands.extend(rec.get("address_refs") or [])
+        for c in cands:
+            if c in all_set and c not in compiled_fns and (functions.get(c) or {}).get("header"):
+                compiled_fns.add(c)
+                hwork.append(c)
+    defined = compiled_fns | {k for k in all_keys if (functions.get(k) or {}).get("header")} | set(reached_fns)
     named: set[str] = set()
     named_globals: set[str] = set()
-    for k in in_files:
+    for k in compiled_fns:
         rec = functions[k]
         indirect = set(rec.get("indirect_callees") or [])
         named.update(c for c in rec.get("internal_callees") or [] if c not in indirect)

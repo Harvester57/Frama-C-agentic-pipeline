@@ -2367,3 +2367,26 @@ def test_tail_merged_string_literals_do_not_fail_valid_read_in_the_analysis_imag
     assert res["returncode"] == 0, out[-4000:]
     assert "RUN_OK" in proc.stdout, out[-4000:]
     assert res["literal_registrations_reordered"], res
+
+
+def test_rewrite_sync_builtins_restores_polymorphic_names_and_skips_comments_and_strings():
+    src = (
+        "/* compiler builtin:\n"
+        "   int __sync_bool_compare_and_swap_uint64_t(unsigned long volatile *, unsigned long, unsigned long); */\n"
+        'const char *msg = "__sync_fetch_and_add_int32_t(p, 1)";\n'
+        "int f(unsigned long volatile *lock, unsigned long value, int volatile *cnt) {\n"
+        "  int ok = __sync_bool_compare_and_swap_uint64_t(lock, 0UL, value);\n"
+        "  int prev = __sync_fetch_and_add_int32_t(cnt, 1);\n"
+        "  __sync_synchronize();\n"
+        "  return ok + prev;\n"
+        "}\n"
+    )
+    out, n = T.rewrite_sync_builtins(src)
+    assert n == 2
+    assert "__sync_bool_compare_and_swap(lock, 0UL, value);" in out
+    assert "__sync_fetch_and_add(cnt, 1);" in out
+    assert "__sync_synchronize();" in out
+    # Comments and string literals stay intact.
+    assert "int __sync_bool_compare_and_swap_uint64_t(unsigned long volatile *" in out
+    assert '"__sync_fetch_and_add_int32_t(p, 1)"' in out
+    assert T.rewrite_sync_builtins("int plain(void) { return 0; }\n") == ("int plain(void) { return 0; }\n", 0)

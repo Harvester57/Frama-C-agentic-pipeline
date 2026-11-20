@@ -23,7 +23,7 @@ def _flow_run_dir(tmp_path: Path, reach: str = "address_flow") -> Path:
         (work / rel).write_text("int x;\n", encoding="utf-8")
     reports = tmp_path / "workspace" / "reports"
     reports.mkdir(parents=True)
-    functions = {
+    functions: dict[str, dict[str, object]] = {
         "main": {"name": "main", "file": "daemon/main.c", "module": "kvd"},
         "server_start": {"name": "server_start", "file": "daemon/state.c", "module": "kvd"},
         "conn_close": {"name": "conn_close", "file": "daemon/conn.c", "module": "kvd"},
@@ -285,7 +285,7 @@ def test_preseed_recomputes_stubs_for_widened_flow_build_sources(tmp_path: Path,
     harnesses = tmp_path / "workspace" / "harnesses"
     harnesses.mkdir(parents=True)
 
-    functions = {
+    functions: dict[str, dict[str, object]] = {
         "daemon/state.c#entry_fn": {
             "name": "entry_fn",
             "file": "daemon/state.c",
@@ -341,7 +341,7 @@ def test_preseed_recomputes_stubs_for_widened_flow_build_sources(tmp_path: Path,
             "global_refs": [],
         },
     }
-    global_variables = {
+    global_variables: dict[str, dict[str, object]] = {
         "daemon/extra.c#g_extra_stub": {
             "name": "g_extra_stub",
             "file": "daemon/extra.c",
@@ -466,3 +466,114 @@ def test_build_module_binary_does_not_rerun_eacsl_after_non_link_compile_error(t
     assert san_calls == 2
     assert out["engine_fallback_reason"] == "eacsl_compile_failed"
     assert out["eacsl_compile_attempt"]["returncode"] == 1
+
+
+def test_header_inline_global_refs_are_preseeded_and_static_header_helpers_excluded_from_flow_functions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """
+    Header `static inline` helpers (nginx `ngx_crc32_update`, `ngx_write_fd`):
+    - `link_stubs_for_files` traverses header callees of compiled `.c` files so globals they
+      reference (`ngx_crc32_table256`) are pre-seeded on Attempt 1.
+    - `_flow_cluster_functions` omits `header` + `is_static` helpers from `-e-acsl-functions`
+      (unless they are explicit harness entry points), avoiding Stage 1 `no function` aborts.
+    """
+    work = tmp_path / "workspace" / "work"
+    for rel in ("daemon/state.c", "daemon/crc.c"):
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text("int placeholder(void) { return 0; }\n", encoding="utf-8")
+    reports = tmp_path / "workspace" / "reports"
+    reports.mkdir(parents=True)
+
+    functions: dict[str, dict[str, object]] = {
+        "daemon/state.c#entry_fn": {
+            "name": "entry_fn",
+            "file": "daemon/state.c",
+            "module": "kvd",
+            "internal_callees": ["daemon/util.h#inline_helper"],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "daemon/state.c#unreached_in_state": {
+            "name": "unreached_in_state",
+            "file": "daemon/state.c",
+            "module": "kvd",
+            "internal_callees": ["daemon/crc.h#crc_update"],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "daemon/util.h#inline_helper": {
+            "name": "inline_helper",
+            "file": "daemon/util.h",
+            "header": True,
+            "is_static": True,
+            "module": "kvd",
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "daemon/crc.h#crc_update": {
+            "name": "crc_update",
+            "file": "daemon/crc.h",
+            "header": True,
+            "is_static": True,
+            "module": "kvd",
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": ["daemon/crc.c#crc_table256"],
+        },
+    }
+    global_variables: dict[str, dict[str, object]] = {
+        "daemon/crc.c#crc_table256": {
+            "name": "crc_table256",
+            "file": "daemon/crc.c",
+            "static": False,
+            "size": 1024,
+            "init_functions": [],
+            "init_globals": [],
+        }
+    }
+    import unit_split
+
+    stubs = unit_split.link_stubs_for_files(
+        functions,
+        global_variables,
+        sorted(functions),
+        {"daemon/state.c"},
+    )
+    assert stubs["globals"] == ["daemon/crc.c#crc_table256"]
+
+    dag = {
+        "functions": functions,
+        "global_variables": global_variables,
+        "module_kind": "link_unit",
+        "modules": {
+            "kvd": {
+                "module": "kvd",
+                "unit": "daemon/kvd",
+                "files": ["daemon/state.c", "daemon/crc.c"],
+                "functions": sorted(functions),
+            }
+        },
+        "submodules": {
+            FLOW_CLUSTER: {
+                "unit": "kvd",
+                "anchors": ["daemon/state.c#entry_fn"],
+                "functions": ["daemon/state.c#entry_fn", "daemon/util.h#inline_helper"],
+                "reach": "address_flow",
+                "build_sources": ["daemon/state.c"],
+                "link_stubs": stubs,
+            }
+        },
+    }
+    dag_path = reports / "callgraph_dag.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    scoped = fuzz_build._flow_cluster_functions(dag_path, FLOW_CLUSTER, ["workspace/work/daemon/state.c"])
+    assert scoped == ["entry_fn"]
+    assert "inline_helper" not in (scoped or [])

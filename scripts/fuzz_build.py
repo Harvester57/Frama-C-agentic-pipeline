@@ -61,6 +61,7 @@ from eacsl_toolchain import (
     reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
     rewrite_sound_verdict_resets,
+    rewrite_sync_builtins,
     rewrite_trailing_alignas,
     select_eacsl_binary,
     skip_va_list_initialized_checks,
@@ -1105,19 +1106,26 @@ def _compile_eacsl_binary_uncached(
             ]
             return (cmd1, *_run_tool(cmd1, runner))
 
-        cmd1, rc, out, err = _stage1(target_fns)
+        remaining = list(target_fns)
+        dropped: list[str] = []
+        cmd1, rc, out, err = _stage1(remaining)
         _record(cmd1, rc, out, err)
-        if rc != 0 and target_fns:
-            missing = [f for f in parse_missing_functions(out + "\n" + err) if f in target_fns]
-            if missing:
-                result["rte_select_dropped"] = missing
-                remaining = [f for f in target_fns if f not in missing]
-                if meta_file and not remaining:
-                    result["security_meta"].update(
-                        applied=False, reason="Frama-C knows none of the listed target functions"
-                    )
-                cmd1, rc, out, err = _stage1(remaining)
-                _record(cmd1, rc, out, err)
+        for _ in range(8):
+            if rc == 0 or not remaining:
+                break
+            missing = [f for f in parse_missing_functions(out + "\n" + err) if f in remaining]
+            if not missing:
+                break
+            dropped.extend(missing)
+            remaining = [f for f in remaining if f not in missing]
+            if meta_file and not remaining:
+                result["security_meta"].update(
+                    applied=False, reason="Frama-C knows none of the listed target functions"
+                )
+            cmd1, rc, out, err = _stage1(remaining)
+            _record(cmd1, rc, out, err)
+        if dropped:
+            result["rte_select_dropped"] = dropped
         _note_const_unions(out, err)  # the last frontend run only: a retry preprocesses the same files again
         frontend.update(output=out + "\n" + err, instrumented=rc == 0 and instrumented_c.is_file())
         if rc != 0:
@@ -1134,6 +1142,16 @@ def _compile_eacsl_binary_uncached(
                 log_parts.append(
                     f"Rewrote {n_alignas} _Alignas(N) printed after a declarator as __attribute__((__aligned__(N))) "
                     "(the Frama-C printer misplaces member alignment; the alignment is kept).\n"
+                )
+
+            # Without this, Frama-C's typed `__sync_*_uint64_t` overload names fail at Stage 2 link.
+            c_text, n_sync = rewrite_sync_builtins(c_text)
+            if n_sync:
+                c_modified = True
+                result["sync_builtin_rewrites"] = n_sync
+                log_parts.append(
+                    f"Rewrote {n_sync} typed __sync_*_<intN>_t builtin call(s) back to polymorphic __sync_* "
+                    "(Frama-C's gcc_builtins.json overloads are not linker symbols).\n"
                 )
 
             if rte_initialized:
@@ -2061,6 +2079,11 @@ def _flow_cluster_functions(
     names: set[str] = set(_harness_header_entries(sources))
     for fk in reached_keys:
         rec = dag_fns.get(fk)
+        if isinstance(rec, dict) and rec.get("header") and rec.get("is_static"):
+            # Static inline header helpers are frequently omitted or inlined out of Frama-C's AST
+            # (e.g. nginx ngx_write_fd / ngx_strlchr); public header entry points already come from
+            # `_harness_header_entries(sources)` above.
+            continue
         name = str((rec or {}).get("name") or str(fk).rsplit("#", 1)[-1])
         if (
             name
