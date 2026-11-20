@@ -671,6 +671,29 @@ def test_a_build_the_properties_break_is_redone_without_them(run_dir, monkeypatc
     assert failed["security_props"]["reason"].endswith("; the build without them fails too")
 
 
+@pytest.mark.unit
+def test_a_properties_build_killed_at_the_time_limit_is_not_redone_without_the_libc_contracts(run_dir, monkeypatch):
+    # nginx run-5: a whole-program E-ACSL build ran into the build class's fixed limit (S14). Rebuilding
+    # the properties without the libc writers' assigns would spend that limit again for nothing: the
+    # contracts did not stop the build, its size did.
+    write_props(DEFAULT_PROPS, fixture_props(["eacsl"]))
+
+    def stage1(cmd, n):
+        if cmd[-1].endswith(failure_identity.SECURITY_META_SUFFIX):
+            raise subprocess.TimeoutExpired(cmd, 3600.0, output=b"", stderr=b"")
+        return 0, "", "", PLAIN_INSTRUMENTED
+
+    fake = FakeToolchain(stage1)
+    comp = build(monkeypatch, fake)["compile"]
+    # The properties build with the libc contracts, then straight to the plain build.
+    assert comp["returncode"] == 0 and len(fake.stage1_cmds) == 2
+    assert not fake.stage1_cmds[1][-1].endswith(failure_identity.SECURITY_META_SUFFIX)
+    record = comp["security_props"]
+    assert record["status"] == "dropped"
+    assert record["reason"] == "the E-ACSL build failed with the properties (eacsl_build_timeout)"
+    assert record["libc_contracts"]["status"] == "loaded"
+
+
 LIBC_CALLS_INSTRUMENTED = (
     META_INSTRUMENTED
     + "\nint process(unsigned char const *data, size_t n)\n{\n  memcpy((void *)(& auth_ok),(void const *)(work),4UL);\n"

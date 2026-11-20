@@ -651,7 +651,8 @@ def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | 
     instances; not for a precondition, which is checked in its target), `rejected`, `left_out`,
     `libc_contracts` and `libc_unchecked`.
     The meta file first carries the assigns of the libc writers (eacsl_security_meta_text). A build
-    they make fail, for a reason other than a property MetAcsl rejects, is redone once without them:
+    they make fail, for a reason other than a property MetAcsl rejects or the build time limit
+    (`eacsl_build_timeout`), is redone once without them:
     `libc_contracts` is then {status: dropped, functions, reason, log} (the failed build's log kept as
     `<out>.security_meta_libc.log`), else {status: loaded, functions}, or {status: missing, reason}
     when the contracts file is not found. `libc_unchecked` maps each libc function that writes or
@@ -689,7 +690,9 @@ def _build_with_security_meta(plan: dict, out_bin: Path, build) -> tuple[dict | 
         if hit and hit[0] in written["properties"] and len(rejected) < SECURITY_META_MAX_REJECTED:
             rejected.append({"property": hit[0], "reason": hit[1]})
             continue
-        if written["libc_contracts"] and not hit:
+        # A build killed at the time limit was stopped by its size, not by the contracts: redoing it
+        # without them would spend the limit again (nginx run-5, S14).
+        if written["libc_contracts"] and not hit and res.get("reason") != "eacsl_build_timeout":
             libc_log = Path(out_bin).with_suffix(SECURITY_META_LIBC_LOG_SUFFIX)
             with contextlib.suppress(OSError):
                 libc_log.write_text(log_text, encoding="utf-8", newline="\n")
