@@ -3,7 +3,12 @@
  * function, two output sinks and a secret. Correct as it is; each VIOLATE_* macro plants one
  * violation of a MetAcsl property of the test's security_props.json, and RTE_BUG an ordinary
  * out-of-bounds write. process() dispatches on the first input byte.
+ * VIOLATE_MEMCPY writes the authentication state through memcpy, which the E-ACSL build checks only
+ * with the libc writers' assigns (templates/metacsl/eacsl_libc_writers.h); RTE_MEMCPY is an ordinary
+ * overflow through memcpy, whose identity must not change once those assigns give the call a check.
  */
+#include <string.h>
+
 #include "prog.h"
 
 int auth_ok;
@@ -139,6 +144,20 @@ int process(const unsigned char *data, size_t n)
         rc = logmsg(line);
         break;
     }
+    case 'W':
+        /* a libc write into a local: correct. */
+        memcpy(line, work, 8);
+        break;
+#ifdef VIOLATE_MEMCPY
+    case 'X':
+        memcpy(&auth_ok, work, sizeof auth_ok);
+        break;
+#endif
+#ifdef RTE_MEMCPY
+    case 'O':
+        memcpy(out, work, m);
+        break;
+#endif
     default:
         break;
     }

@@ -259,6 +259,48 @@ This section is newer than the ones below and wins where they differ.
     analysis is in [`./frama-c-libc-sched-cpu-set.md`](./frama-c-libc-sched-cpu-set.md).
   - **Pipeline workaround:** `templates/fc_stubs/fc_compat_types.h` (`cb78e8b`).
   - **Not done:** no patch, no MR text, no issue, and not listed in #2832.
+- **Drafted, not filed: 47, 48 and 49** (2026-11-20), three MetAcsl reports for
+  [`pub/meta`](https://git.frama-c.com/pub/meta/-/issues) found while adding MetAcsl properties to
+  the E-ACSL build (package C of [`../../plans/metacsl-exploitation-plan.md`](../../plans/metacsl-exploitation-plan.md)). Each has an analysis
+  draft, an issue text, an MR text, a `git format-patch` file on `pub/meta` `master`
+  `4f43801390`, and a reproducer run in `framac-analysis:latest` (Frama-C 34.0~beta, MetAcsl
+  0.12~beta). The patches were built in throwaway containers of that image, on `master` with one
+  line of `meta_parse.ml` (`PLpointer_comparable`, absent from 34.0~beta) removed; that removal is
+  not in the patches. Both `tests/meta` and `tests/meta-wp` (default and `fold` configurations) were
+  run for every patch with zero regressions; lint/header checks and `meta-deduce` deduction checks
+  (no SWI-Prolog) were not run. Stacked with `git am --keep-non-patch --3way` (47, 48, 49),
+  `meta_annotate.ml` auto-merges cleanly (only the `# Version dev` line of `CHANGELOG.md`
+  conflicts), all three reproducers exit 0, and all ten new test oracles match byte-for-byte.
+  - **47:** at a call to a function known by its contract, MetAcsl copies the callee's `Old`, `Pre`
+    and `Here` labels into the `\written` and `\read` instances placed in the caller. `Old` makes
+    the kernel, WP (`LabelError`) and E-ACSL (`invalid label 'Old' within statement annotation`)
+    refuse the annotation; `Pre` is accepted but means the caller's pre-state, and `Here` in
+    `assumes` or `assigns` means the post-state under an `After` property, so WP proves false
+    properties in both cases. The fault is MetAcsl's, not E-ACSL's, contrary to the first
+    troubleshooting entry. The patch maps `Old`, `Pre` and `Here` to MetAcsl's `Before` and adds
+    `tests/meta/callee_labels.c` (behavior-guarded `assumes` checks marked `\flags(fold:no)` so the
+    fold oracles do not encode `-meta-fold`'s pre-existing `assumes` sharing bug). Related, not the
+    same: pub/meta#4.
+  - **48:** under `-meta-fold`, `create_call` in `meta_annotate.ml` builds the call without
+    `~loc`, so every folded instance has no location (`<unknown>:0` at run time under E-ACSL). The
+    `post`/`post_fold` wrappers of `external_assigns`/`passthrough_from` drop it too, with or
+    without folding. The patch passes the property's location, adds a `CHANGELOG.md` entry and
+    regression test `tests/meta/fold_location.c` (exercising `create_call`, `post` and `post_fold`
+    under `-report`), and updates `tests/meta-wp/oracle_fold/typing.0.res.oracle`.
+  - **49:** feature request. A call to a function without any specification (libc from the host
+    headers under `e-acsl-gcc`) gets no `\writing`/`\reading` instance and no warning, unlike a
+    behavior without `assigns`. The patch puts all three missing-footprint warnings (no
+    specification, `WritesAny` and `\reading`'s `FromAny`) under warning category `no-footprint`
+    with call-site locations (`~loc`), and adds `tests/meta/no_footprint.i` covering `\writing` and
+    `\reading`. Not patched: MetAcsl's `addr_of_tlval` and `Logic_const.term` calls in
+    `meta_annotate.ml` omit `~loc` (defaulting to `Kernel.gen_loc`), so every `\written`, `\read`
+    and `\called` term carries `<unknown>:0` — an ordinary out-of-bounds `*p = 1` write as well as
+    an overflowing `memcpy` stops in the instance's E-ACSL validity guard at `<unknown>:0` before
+    the RTE/libc check; the issue asks the maintainers about fixing term locations and optionally
+    validity-guarding instances. The issue cites 47 and 48 as `#ISSUE-47` and `#ISSUE-48`.
+  - **Not done:** no issue, no branch, no merge request, and not listed in #2832.
+    [`../../../tools/upstream_audit/file_upstream.py`](../../../tools/upstream_audit/file_upstream.py)
+    files on `pub/frama-c` only.
 - **Candidates from the hunt of 2026-11-18, not drafted:** more defects of the same families
   (a literal read twice, hand-written text matching, WP's constant folding, the contracts of
   Frama-C's libc), found by the session that drafted 43 and its four subagents, and every one
@@ -535,6 +577,9 @@ All paths below are relative to this folder.
 | 42 | WP | Hexadecimal floating-point literals not read: `DBL_MAX` bound dropped, lemma stops WP, and `0x1.8p1f` read as 0 under `-wp-model +real` (**soundness**); `f32`/`f64` suffixes rejected | [draft](./frama-c-wp-hexadecimal-float-literals.md) | [issue](./filing/42-wp-hexadecimal-float-literals-issue.md), filed [#2831](https://git.frama-c.com/pub/frama-c/-/work_items/2831) | [MR](./filing/42-wp-hexadecimal-float-literals-mr.md), opened [!59](https://git.frama-c.com/pub/frama-c/-/merge_requests/59) | [sh](./repro/42-wp-hexadecimal-float-literals.sh) | [validated](./patches/42-wp-hexadecimal-float-literals.patch) on `b80fcac74f` (one function and a test, 6 files) |
 | 43 | E-ACSL | Real constants that are not exactly a `double`: unexpected error with an exponent or in hexadecimal (`1e-9`), and a `long double` one (`0.1L`) is 0 at run time | [draft](./frama-c-eacsl-real-constant-notation.md) | [issue](./filing/43-eacsl-real-constant-notation-issue.md), **not filed** | [MR](./filing/43-eacsl-real-constant-notation-mr.md), **not opened** | [sh](./repro/43-eacsl-real-constant-notation.sh) | [validated](./patches/43-eacsl-real-constant-notation.patch) on `b80fcac74f` (one function and a test, 5 files) |
 | 44 | Libc | `strlcat`: the result is stated against `dest` after the call, and `assigns` covers a byte past `n`; Eva gives a wrong result without an alarm, WP proves a false postcondition (**soundness**) | [draft](./frama-c-libc-strlcat-contract.md) | [issue](./filing/44-libc-strlcat-contract-issue.md), **not filed** | [MR](./filing/44-libc-strlcat-contract-mr.md), **not opened** | [sh](./repro/44-libc-strlcat-contract.sh) | [validated](./patches/44-libc-strlcat-contract.patch) on `b80fcac74f` (four clauses and a test, 4 files) |
+| 47 | MetAcsl | Callee `Old`/`Pre`/`Here` labels copied into `\written`/`\read` instances at a call: `Old` aborts E-ACSL and WP, `Pre` and `Here` (under `After`) let WP prove false properties (**soundness**) | [draft](./frama-c-metacsl-callee-old-label-in-written.md) | [issue](./filing/47-metacsl-callee-old-label-in-written-issue.md), **not filed** (pub/meta) | [MR](./filing/47-metacsl-callee-old-label-in-written-mr.md), **not opened** | [sh](./repro/47-metacsl-callee-old-label-in-written.sh) | [built](./patches/47-metacsl-callee-old-label-in-written.patch) on pub/meta `4f43801390` (one visitor and a test) |
+| 48 | MetAcsl | `-meta-fold`: folded instances have no location (`<unknown>:0` under E-ACSL) | [draft](./frama-c-metacsl-fold-annotation-location.md) | [issue](./filing/48-metacsl-fold-annotation-location-issue.md), **not filed** (pub/meta) | [MR](./filing/48-metacsl-fold-annotation-location-mr.md), **not opened** | [sh](./repro/48-metacsl-fold-annotation-location.sh) | [built](./patches/48-metacsl-fold-annotation-location.patch) on pub/meta `4f43801390` (locations passed, new test + one oracle) |
+| 49 | MetAcsl | Feature: a call to a function without specification gets no `\writing`/`\reading` instance and no warning (libc under `e-acsl-gcc`); `\written`/`\read` terms lack locations (`<unknown>:0` E-ACSL guards) | [draft](./frama-c-metacsl-eacsl-libc-instances.md) | [issue](./filing/49-metacsl-eacsl-libc-instances-issue.md), **not filed** (pub/meta) | [MR](./filing/49-metacsl-eacsl-libc-instances-mr.md), **not opened** | [sh](./repro/49-metacsl-eacsl-libc-instances.sh) | [built](./patches/49-metacsl-eacsl-libc-instances.patch) on pub/meta `4f43801390` (warning only) |
 
 Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11. 43 and 44 wait for the owner's
 go-ahead.
@@ -632,6 +677,7 @@ points the maintainers may raise, and are no longer blocking. 41 and 42 were fil
 | 43 | File it? If so: one issue for the two symptoms (current), or the silent 0 of `0.1L` on its own? Report a suffixed constant as not yet supported (current), or give it the value of the target's `long double`? A `plugins/e-acsl/doc/Changelog` entry? The patch has none. |
 | 44 | File it? Decided on 2026-11-18: the patch also strengthens the `separation` precondition to `src+(0..strlen(src))` (measured: no oracle of `tests/libc` or of the E-ACSL suite changes with it; both texts say it can be dropped). Rename the check `imprecise` of `tests/libc/string_h.c`, which becomes valid? |
 | 45 | File it on `pub/meta`? If so: issue only (current), or build the draft patch first and send a merge request with it? |
+| 47 to 49 | File them on `pub/meta` (issues and MRs)? 49 cites 47 and 48, so file those first and replace `#ISSUE-47` and `#ISSUE-48`. List them in #2832 as was done for 45? `file_upstream.py` knows project 780 only, so they are filed by hand. |
 | hunt | Which of the candidates of [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md) to turn into packages, and in which order? That document ranks them ("Order of criticity"); N1 (enumeration constants), L2 (`pclose`) and L1 (`void` objects under WP) come first. N1 reverts a deliberate upstream change, so it needs the argument from C11 and gcc. |
 
 ## Identified, not filed

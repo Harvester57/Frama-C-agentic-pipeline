@@ -10,6 +10,7 @@ tests/fixtures/metacsl_eacsl in the analysis image (FRAMAC_DOCKER_TESTS=1).
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,7 @@ import eacsl_toolchain
 import failure_identity
 import fingerprint
 import fuzz_build
+import run_eacsl_fuzz
 import run_wp_function
 import security_props as sp
 from conftest import ANALYSIS_IMAGE, ROOT, require_docker_images
@@ -234,6 +236,88 @@ def test_the_eacsl_meta_file_drops_the_libc_include_and_keeps_every_line():
     assert names == ALL_PROPERTY_NAMES
     # A text that does not start with the include is left as it is.
     assert eacsl_toolchain.eacsl_meta_file_text("/*@ x */\n", sp.META_INCLUDE) == "/*@ x */\n"
+
+
+ACSL_READING = r"""/*@ meta \prop, \name(L6_no_leak_read), \targets(\callees({emit, logmsg})), \context(\reading),
+      \flags(translate:check),
+      \separated(\read, &session_key[0 .. 15]);
+*/"""
+
+
+@pytest.mark.unit
+def test_the_eacsl_meta_file_guards_each_writing_and_reading_predicate_on_its_own_lines():
+    text = "\n".join(
+        ["/* note */", ACSL_AUTH_STATE, ACSL_AUTH_REQUIRED, ACSL_SANITIZED_EMIT, ACSL_WIPED, ACSL_READING, ""]
+    )
+    guarded = eacsl_toolchain.eacsl_meta_guarded_text(text)
+    assert guarded.count("\n") == text.count("\n")
+    assert sp.meta_line_names(guarded) == sp.meta_line_names(text)
+    assert r"\valid(\written) ==> (\separated(\written, &auth_ok));" in guarded
+    assert r"\valid_read(\read) ==> (\separated(\read, &session_key[0 .. 15]));" in guarded
+    assert r"\flags(translate:check)," in guarded
+    # A precondition, a call rule and a postcondition are left as they are.
+    for untouched in (ACSL_AUTH_REQUIRED, ACSL_SANITIZED_EMIT, ACSL_WIPED):
+        assert untouched in guarded
+    # The formal variant's \tguard and a monotonic disjunction are guarded as a whole.
+    formal = ACSL_AUTH_STATE.replace(r"\separated(\written, &auth_ok)", r"\tguard(\separated(\written, &c->auth))")
+    assert r"\valid(\written) ==> (\tguard(\separated(\written, &c->auth)));" in (
+        eacsl_toolchain.eacsl_meta_guarded_text(formal)
+    )
+    monotonic = ACSL_AUTH_STATE.replace(
+        r"\separated(\written, &auth_ok)", r"\separated(\written, &st) || \at(st, Before) <= \at(st, After)"
+    )
+    assert r"\valid(\written) ==> (\separated(\written, &st) || \at(st, Before) <= \at(st, After));" in (
+        eacsl_toolchain.eacsl_meta_guarded_text(monotonic)
+    )
+
+
+@pytest.mark.unit
+def test_every_writing_and_reading_template_is_guarded_in_the_eacsl_meta_file():
+    templates = sorted((ROOT / "templates" / "metacsl").glob("*.acsl"))
+    seen = 0
+    for path in templates:
+        for variant, body in sp.load_template(path.stem).items():
+            if not re.search(r"\\context\(\\(writing|reading)\)", body):
+                continue
+            text = re.sub(r"\$\{\w+\}", "x", body)
+            guarded = eacsl_toolchain.eacsl_meta_guarded_text(text)
+            access = r"\valid(\written)" if r"\context(\writing)" in text else r"\valid_read(\read)"
+            assert f"{access} ==> (" in guarded and guarded.count("\n") == text.count("\n"), (path.name, variant)
+            seen += 1
+    assert seen >= 6
+
+
+@pytest.mark.unit
+def test_the_libc_contracts_declare_exactly_the_listed_writers_with_glibcs_formals():
+    text = eacsl_toolchain.eacsl_meta_libc_text()
+    assert text is not None
+    declared = re.findall(r"^extern [^(]*?\b(\w+)\(", text, re.MULTILINE)
+    assert declared == list(eacsl_toolchain.EACSL_META_LIBC_WRITERS)
+    assert not set(declared) & set(eacsl_toolchain.EACSL_META_LIBC_UNCHECKED)
+    # glibc's formal names, which MetAcsl keeps from the first declaration it meets.
+    contracts = "\n".join(ln for ln in text.splitlines() if ln.lstrip().startswith(("/*@", "assigns", "extern")))
+    assert "__dest" in contracts and not re.search(r"\b(dest|src|n|s|c)\b", contracts)
+    # Nothing in it is a property, so the sidecar's line map stops at the last one.
+    assert "meta" not in contracts
+
+
+@pytest.mark.unit
+def test_libc_writer_calls_lists_the_calls_in_the_module_functions_only():
+    printed = (
+        "extern char *strcpy(char * restrict __dest, char const * restrict __src);\n"
+        "int process(unsigned char const *data,\n            size_t n)\n{\n"
+        '  __e_acsl_builtin_strcpy(line, (char const *)data);\n  n = (size_t)sprintf(out, "%d", 1);\n'
+        "  return 0;\n}\n\n"
+        "static void mix(unsigned char *dst)\n{\n  memcpy((void *)dst, (void const *)src, 4UL);\n}\n\n"
+        "int LLVMFuzzerTestOneInput(uint8_t const *data, size_t size)\n{\n  read(0, buf, 4UL);\n  return 0;\n}\n"
+    )
+    names = [*eacsl_toolchain.EACSL_META_LIBC_UNCHECKED, "memcpy"]
+    assert eacsl_toolchain.libc_writer_calls(printed, ["process", "mix"], names) == {
+        "memcpy": ["mix"],
+        "sprintf": ["process"],
+        "strcpy": ["process"],
+    }
+    assert eacsl_toolchain.libc_writer_calls(printed, ["process"], []) == {}
 
 
 METACSL_REJECTION = """[kernel] Parsing m.security_meta.c (with preprocessing)
@@ -495,7 +579,13 @@ def test_with_the_eacsl_engine_stage_1_runs_metacsl_before_rte(run_dir, monkeypa
     record = comp["security_props"]
     assert record["status"] == "loaded" and Path(record["props"]) == DEFAULT_PROPS
     assert record["meta_file"] == meta_file.as_posix() and record["properties"] == ALL_PROPERTY_NAMES
-    assert record["line_names"] == {str(k): v for k, v in sp.meta_line_names(text).items()}
+    # The libc writers' assigns follow the last property; the line map covers the properties only.
+    contracts = eacsl_toolchain.eacsl_meta_libc_text()
+    assert contracts and text.endswith(contracts)
+    properties_text = text[: -len(contracts)]
+    assert record["line_names"] == {str(k): v for k, v in sp.meta_line_names(properties_text).items()}
+    assert record["libc_contracts"] == {"status": "loaded", "functions": list(eacsl_toolchain.EACSL_META_LIBC_WRITERS)}
+    assert record["libc_unchecked"] == {}
     assert sorted(record["translated"]) == ["L4_auth_state_login", "L5_sanitized_emit", "L6_wiped_session_key"]
     assert record["translated"]["L4_auth_state_login"] == {"checks": 2, "functions": ["backdoor", "mix"]}
     assert record["not_translated"] == ["L4_auth_required_login", "L5_sanitized_logmsg", "L6_no_leak_session_key"]
@@ -564,18 +654,76 @@ def test_a_build_the_properties_break_is_redone_without_them(run_dir, monkeypatc
     fake = FakeToolchain(stage1)
     comp = build(monkeypatch, fake)["compile"]
     assert comp["returncode"] == 0 and comp["command"] == reference["command"]
-    assert len(fake.stage1_cmds) == 2 and fake.stage1_cmds[1] == fake_plain.stage1_cmds[0]
+    # With the libc writers' assigns, again without them, then the plain build.
+    assert len(fake.stage1_cmds) == 3 and fake.stage1_cmds[2] == fake_plain.stage1_cmds[0]
     record = comp["security_props"]
     assert record["status"] == "dropped" and record["properties"] == ALL_PROPERTY_NAMES
     assert record["reason"] == "the E-ACSL build failed with the properties (eacsl_instrumentation_failed)"
     assert "cannot translate" in Path(record["log"]).read_text(encoding="utf-8")
     assert Path(record["log"]) == OUT_BIN.with_suffix(fuzz_build.SECURITY_META_LOG_SUFFIX)
+    assert record["libc_contracts"]["status"] == "dropped"
+    assert Path(record["libc_contracts"]["log"]) == OUT_BIN.with_suffix(fuzz_build.SECURITY_META_LIBC_LOG_SUFFIX)
 
     # A module that does not build either way: the properties are not what broke it.
     broken = FakeToolchain(lambda cmd, n: (1, "", "[kernel] User Error: syntax error\n", ""))
     failed = build(monkeypatch, broken)["compile"]
-    assert failed["returncode"] != 0 and len(broken.stage1_cmds) == 2
+    assert failed["returncode"] != 0 and len(broken.stage1_cmds) == 3
     assert failed["security_props"]["reason"].endswith("; the build without them fails too")
+
+
+LIBC_CALLS_INSTRUMENTED = (
+    META_INSTRUMENTED
+    + "\nint process(unsigned char const *data, size_t n)\n{\n  memcpy((void *)(& auth_ok),(void const *)(work),4UL);\n"
+    + '  __e_acsl_builtin_strcpy(line,"abc");\n  return 0;\n}\n'
+)
+
+
+@pytest.mark.unit
+def test_a_build_the_libc_contracts_break_keeps_the_properties_without_them(run_dir, monkeypatch):
+    write_props(DEFAULT_PROPS, fixture_props(["eacsl"]))
+    with_contracts: list[bool] = []
+
+    def stage1(cmd, n):
+        if not cmd[-1].endswith(failure_identity.SECURITY_META_SUFFIX):
+            return 0, "", "", PLAIN_INSTRUMENTED
+        with_contracts.append("extern void *memcpy" in Path(cmd[-1]).read_text(encoding="utf-8"))
+        if with_contracts[-1]:
+            err = "x.c:9:50: error: use of undeclared identifier '__dest'\ne-acsl-gcc: fatal error: aborted\n"
+            return 1, "", err, ""
+        return 0, "", "", LIBC_CALLS_INSTRUMENTED
+
+    fake = FakeToolchain(stage1)
+    comp = build(monkeypatch, fake)["compile"]
+    assert comp["returncode"] == 0 and with_contracts == [True, False] and len(fake.stage1_cmds) == 2
+    record = comp["security_props"]
+    assert record["status"] == "loaded" and record["properties"] == ALL_PROPERTY_NAMES
+    libc = record["libc_contracts"]
+    assert libc["status"] == "dropped" and libc["functions"] == list(eacsl_toolchain.EACSL_META_LIBC_WRITERS)
+    assert libc["reason"].startswith("the E-ACSL build failed with them (")
+    assert "__dest" in Path(libc["log"]).read_text(encoding="utf-8")
+    # Without the contracts memcpy is unchecked too; harness functions are not listed.
+    assert record["libc_unchecked"] == {"memcpy": ["process"], "strcpy": ["process"]}
+    warnings = run_eacsl_fuzz.security_props_warnings(record)
+    assert any(w.startswith("libc contracts dropped: the assigns of memcpy, memmove") for w in warnings), warnings
+    assert any(
+        w.startswith("libc unchecked: memcpy (called in process); strcpy (called in process): no contract")
+        for w in warnings
+    ), warnings
+    # The meta file left next to the binary is the one the binary was built from.
+    assert "extern void *memcpy" not in Path(record["meta_file"]).read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+def test_a_build_with_the_libc_contracts_lists_only_the_writers_without_one():
+    record = {
+        "status": "loaded",
+        "libc_contracts": {"status": "loaded", "functions": list(eacsl_toolchain.EACSL_META_LIBC_WRITERS)},
+        "libc_unchecked": {},
+    }
+    assert run_eacsl_fuzz.security_props_warnings(record) == []
+    # A build that lost every property says so once: the libc lines would only repeat it.
+    lost = {**record, "status": "dropped", "libc_unchecked": {"strcpy": ["process"]}}
+    assert [w.split(":")[0] for w in run_eacsl_fuzz.security_props_warnings(lost)] == ["dropped"]
 
 
 @pytest.mark.unit
@@ -958,6 +1106,41 @@ def test_in_the_image_each_planted_violation_is_reported_under_its_property(imag
     campaign = image_result["campaign"]
     assert campaign["rc"] != 0 and campaign["artifacts"] and campaign["artifacts"][0].startswith("crash-"), campaign
     assert campaign["artifact_bytes"][0] == "B" and campaign["fingerprint"] == runs["backdoor"]["fingerprint"]
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_in_the_image_a_libc_write_into_the_state_is_reported_and_an_overflow_keeps_its_identity(image_result):
+    builds, runs = image_result["builds"], image_result["runs"]
+    for tag in ("ok", "viol", "direct"):
+        record = builds[tag]["security_props"]
+        assert record["libc_contracts"] == {
+            "status": "loaded",
+            "functions": list(eacsl_toolchain.EACSL_META_LIBC_WRITERS),
+        }, (tag, record)
+        assert record["libc_unchecked"] == {}, (tag, record)
+    # memcpy into the authentication state: a violation of the property, in the caller.
+    got = runs["viol"]["memcpy_auth"]
+    assert got["rc"] != 0 and "failure" in got, got
+    failure = got["failure"]
+    assert (failure["meta_property"], failure["function"], failure["kind"]) == (
+        "L4_auth_state_login",
+        "process",
+        "assertion",
+    ), failure
+    assert got["fingerprint"].startswith("src/prog.c#process::meta_l4_auth_state_login::"), got["fingerprint"]
+    # A correct memcpy runs clean, with and without the planted violations.
+    for tag in ("ok", "viol"):
+        assert runs[tag]["memcpy_ok"]["rc"] == 0 and "failure" not in runs[tag]["memcpy_ok"], runs[tag]
+    # An overflow through memcpy is reported by E-ACSL's replacement, as without the properties:
+    # the property's validity guard (eacsl_meta_guarded_text) keeps its check from firing first.
+    plain, meta = runs["viol_plain"]["memcpy_overflow"], runs["viol"]["memcpy_overflow"]
+    assert plain["rc"] != 0 and plain["fingerprint"], plain
+    assert meta["fingerprint"] == plain["fingerprint"], (plain, meta)
+    # A zero-length memcpy writes nothing: the empty range must not fail the guard or the property.
+    for tag in ("viol_plain", "viol"):
+        empty = runs[tag]["memcpy_empty"]
+        assert empty["rc"] == 0 and "failure" not in empty, (tag, empty)
 
 
 @pytest.mark.integration
