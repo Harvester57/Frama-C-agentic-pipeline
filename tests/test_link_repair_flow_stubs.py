@@ -272,3 +272,197 @@ def test_c4_static_collision_build_only_sidecar_sync_and_slice_discovery(tmp_pat
     assert "clash" in discovered
     assert "__framac_link_stub_called" not in discovered
     assert "__framac_write_all" not in discovered
+
+
+def test_preseed_recomputes_stubs_for_widened_flow_build_sources(tmp_path: Path, monkeypatch) -> None:
+    """When harness sidecar widens flow_build_sources past DAG build_sources, Attempt 1 pre-seeds the widened stubs."""
+    work = tmp_path / "workspace" / "work"
+    for rel in ("daemon/state.c", "daemon/init.c", "daemon/extra.c", "daemon/dead.c"):
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text("int placeholder(void) { return 0; }\n", encoding="utf-8")
+    reports = tmp_path / "workspace" / "reports"
+    reports.mkdir(parents=True)
+    harnesses = tmp_path / "workspace" / "harnesses"
+    harnesses.mkdir(parents=True)
+
+    functions = {
+        "daemon/state.c#entry_fn": {
+            "name": "entry_fn",
+            "file": "daemon/state.c",
+            "module": "kvd",
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "daemon/state.c#dead_in_state": {
+            "name": "dead_in_state",
+            "file": "daemon/state.c",
+            "module": "kvd",
+            "internal_callees": ["daemon/dead.c#dead_callee"],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "daemon/init.c#init_helper": {
+            "name": "init_helper",
+            "file": "daemon/init.c",
+            "module": "kvd",
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "daemon/init.c#dead_in_init": {
+            "name": "dead_in_init",
+            "file": "daemon/init.c",
+            "module": "kvd",
+            "internal_callees": ["daemon/extra.c#extra_stub_fn"],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": ["daemon/extra.c#g_extra_stub"],
+        },
+        "daemon/extra.c#extra_stub_fn": {
+            "name": "extra_stub_fn",
+            "file": "daemon/extra.c",
+            "module": "kvd",
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+        "daemon/dead.c#dead_callee": {
+            "name": "dead_callee",
+            "file": "daemon/dead.c",
+            "module": "kvd",
+            "internal_callees": [],
+            "indirect_callees": [],
+            "address_refs": [],
+            "global_refs": [],
+        },
+    }
+    global_variables = {
+        "daemon/extra.c#g_extra_stub": {
+            "name": "g_extra_stub",
+            "file": "daemon/extra.c",
+            "static": False,
+            "size": 64,
+            "init_functions": [],
+            "init_globals": [],
+        }
+    }
+    dag = {
+        "functions": functions,
+        "global_variables": global_variables,
+        "module_kind": "link_unit",
+        "modules": {
+            "kvd": {
+                "module": "kvd",
+                "unit": "daemon/kvd",
+                "files": ["daemon/state.c", "daemon/init.c", "daemon/extra.c", "daemon/dead.c"],
+                "functions": sorted(functions),
+            }
+        },
+        "submodules": {
+            FLOW_CLUSTER: {
+                "unit": "kvd",
+                "anchors": ["daemon/state.c#entry_fn"],
+                "functions": ["daemon/state.c#entry_fn"],
+                "reach": "address_flow",
+                "build_sources": ["daemon/state.c"],
+                "link_stubs": {"functions": ["daemon/dead.c#dead_callee"], "globals": []},
+            }
+        },
+    }
+    dag_path = reports / "callgraph_dag.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+    (harnesses / f"harness_{FLOW_CLUSTER}.c").write_text(
+        "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { init_helper(); entry_fn(); return 0; }\n",
+        encoding="utf-8",
+    )
+    (harnesses / f"harness_{FLOW_CLUSTER}.json").write_text(
+        json.dumps({"module": FLOW_CLUSTER, "flow_build_sources": ["daemon/state.c", "daemon/init.c"]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+    out_bin = Path("workspace/build/fuzz_kvd__c1")
+    fn_file = (FLOW_STUB_DIR / fuzz_build.LINK_STUBS_FILE).as_posix()
+    seen_functions: list[list[str] | None] = []
+
+    def fake_eacsl(srcs, out, *a, **k):
+        seen_functions.append(k.get("functions"))
+        text = Path(fn_file).read_text(encoding="utf-8") if fn_file in srcs else ""
+        # Both the original DAG stub AND the widened file's function + .bss global stubs are pre-seeded on Attempt 1.
+        assert '"dead_callee:\\n"' in text
+        assert '"extra_stub_fn:\\n"' in text
+        assert '"g_extra_stub: .zero 64\\n"' in text
+        return {"engine": "eacsl", "returncode": 0, "binary": str(out)}
+
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", fake_eacsl)
+    out = R.build_module_binary(
+        [
+            "workspace/work/daemon/state.c",
+            "workspace/work/daemon/init.c",
+            f"workspace/harnesses/harness_{FLOW_CLUSTER}.c",
+        ],
+        out_bin,
+        engine="auto",
+        apply_selftest=False,
+        dag_path=dag_path,
+        link_module=FLOW_CLUSTER,
+    )
+    assert out["compile"]["returncode"] == 0
+    assert "link_repair" not in out
+    assert [s["name"] for s in out["preseeded_stubs"]["functions"]] == ["dead_callee", "extra_stub_fn"]
+    assert [(g["name"], g["size"]) for g in out["preseeded_stubs"]["globals"]] == [("g_extra_stub", 64)]
+    # E-ACSL instrumentation is scoped to reachable cluster + harness-called functions (dead_in_state/dead_in_init excluded).
+    assert seen_functions == [["entry_fn", "init_helper"]]
+
+
+def test_build_module_binary_does_not_rerun_eacsl_after_non_link_compile_error(tmp_path: Path, monkeypatch) -> None:
+    """When auto-mode E-ACSL fails with a Stage 2 C compile error (no undefined refs), repair retries stay on sanitizers."""
+    dag_path = _flow_run_dir(tmp_path)
+    dag = json.loads(dag_path.read_text(encoding="utf-8"))
+    dag["submodules"][FLOW_CLUSTER]["link_stubs"] = {"functions": [], "globals": []}
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    out_bin = Path("workspace/build/fuzz_kvd__c1")
+    fn_file = (FLOW_STUB_DIR / fuzz_build.LINK_STUBS_FILE).as_posix()
+    eacsl_calls = 0
+    san_calls = 0
+
+    def fake_eacsl(srcs, out, *a, **k):
+        nonlocal eacsl_calls
+        eacsl_calls += 1
+        return {
+            "engine": "eacsl",
+            "returncode": 1,
+            "reason": "eacsl_compile_failed",
+            "stderr": "instrumented.c:10: error: invalid application of 'alignof' to an incomplete type 'DIR'\n",
+        }
+
+    def fake_sanitizer(srcs, out, *a, **k):
+        nonlocal san_calls
+        san_calls += 1
+        text = Path(fn_file).read_text(encoding="utf-8") if fn_file in srcs else ""
+        if '"kv_put:\\n"' not in text:
+            return {"engine": "sanitizers", "returncode": 1, "stderr": _undefined_refs("kv_put")}
+        return {"engine": "sanitizers", "returncode": 0, "binary": str(out)}
+
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", fake_eacsl)
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", fake_sanitizer)
+    out = R.build_module_binary(
+        ["workspace/work/daemon/state.c"],
+        out_bin,
+        engine="auto",
+        apply_selftest=False,
+        dag_path=dag_path,
+        link_module=FLOW_CLUSTER,
+    )
+    assert out["compile"]["returncode"] == 0
+    assert out["engine_used"] == "sanitizers"
+    assert eacsl_calls == 1
+    assert san_calls == 2
+    assert out["engine_fallback_reason"] == "eacsl_compile_failed"
+    assert out["eacsl_compile_attempt"]["returncode"] == 1

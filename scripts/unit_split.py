@@ -486,6 +486,42 @@ def _over_limit(n_fns: int, n_lines: int, max_functions: int, max_lines: int) ->
     return ", ".join(why)
 
 
+def link_stubs_for_files(
+    functions: dict[str, dict],
+    global_vars: dict[str, dict],
+    all_keys: list[str],
+    files: set[str],
+    reached_fns: Iterable[str] = (),
+    reached_globals: Iterable[str] = (),
+) -> dict[str, list[str]]:
+    """
+    The functions and globals of the unit's link closure (`all_keys`) that `files` name (direct calls,
+    `address_refs`, `global_refs`, and global initializers) without defining them. Reached functions
+    and reached globals are never listed.
+    """
+    in_files = [k for k in all_keys if set(_defining_c_files(functions.get(k))) & files]
+    defined = set(in_files) | {k for k in all_keys if (functions.get(k) or {}).get("header")} | set(reached_fns)
+    all_set = set(all_keys)
+    named: set[str] = set()
+    named_globals: set[str] = set()
+    for k in in_files:
+        rec = functions[k]
+        indirect = set(rec.get("indirect_callees") or [])
+        named.update(c for c in rec.get("internal_callees") or [] if c not in indirect)
+        named.update(rec.get("address_refs") or [])
+        named_globals.update(rec.get("global_refs") or [])
+    file_globals = {g for g, r in global_vars.items() if set(_defining_c_files(r)) & files}
+    for g in file_globals:
+        named.update((global_vars[g] or {}).get("init_functions") or [])
+        named_globals.update((global_vars[g] or {}).get("init_globals") or [])
+    defined_globals = file_globals | set(reached_globals)
+    stub_fns = sorted(k for k in named - defined if k in all_set and not (functions.get(k) or {}).get("is_static"))
+    stub_globals = sorted(
+        g for g in named_globals - defined_globals if g in global_vars and not (global_vars[g] or {}).get("static")
+    )
+    return {"functions": stub_fns, "globals": stub_globals}
+
+
 def build_plan(
     functions: dict[str, dict],
     global_vars: dict[str, dict],
@@ -508,29 +544,9 @@ def build_plan(
             files.update(_defining_c_files(functions[k]))
     for g in globs:
         files.update(_defining_c_files(global_vars.get(g)))
-    in_files = [k for k in all_keys if set(_defining_c_files(functions.get(k))) & files]
-    defined = set(in_files) | {k for k in all_keys if functions[k].get("header")} | set(fns)
-    all_set = set(all_keys)
-    named: set[str] = set()
-    named_globals: set[str] = set()
-    for k in in_files:
-        rec = functions[k]
-        indirect = set(rec.get("indirect_callees") or [])
-        named.update(c for c in rec.get("internal_callees") or [] if c not in indirect)
-        named.update(rec.get("address_refs") or [])
-        named_globals.update(rec.get("global_refs") or [])
-    file_globals = {g for g, r in global_vars.items() if set(_defining_c_files(r)) & files}
-    for g in file_globals:
-        named.update(global_vars[g].get("init_functions") or [])
-        named_globals.update(global_vars[g].get("init_globals") or [])
-    defined_globals = file_globals | set(globs)
-    stub_fns = sorted(k for k in named - defined if k in all_set and not functions[k].get("is_static"))
-    stub_globals = sorted(
-        g for g in named_globals - defined_globals if g in global_vars and not global_vars[g].get("static")
-    )
     return {
         "build_sources": sorted(files),
-        "link_stubs": {"functions": stub_fns, "globals": stub_globals},
+        "link_stubs": link_stubs_for_files(functions, global_vars, all_keys, files, fns, globs),
     }
 
 

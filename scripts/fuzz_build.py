@@ -1936,7 +1936,18 @@ def _place_global(records: list[dict], ctx: dict) -> tuple[str, dict, str]:
     return "stub", records[0], ""
 
 
-def _flow_sub_stub_info(dag_path: Path, module: str | None) -> tuple[str, set[str]]:
+def _record_in_flow_files(rec: dict | None, flow_files: set[str]) -> bool:
+    """Whether a DAG/model function or global record is compiled by any `.c` file in `flow_files`."""
+    if not isinstance(rec, dict):
+        return False
+    file = _dag_tree_path(str(rec.get("file") or ""))
+    if file and file in flow_files:
+        return True
+    compiled_in = rec.get("compiled_in")
+    return isinstance(compiled_in, list) and any(_dag_tree_path(str(cf)) in flow_files for cf in compiled_in)
+
+
+def _flow_sub_stub_info(dag_path: Path, module: str | None, flow_files: set[str] | None = None) -> tuple[str, set[str]]:
     """(sub_unit, explicit_stub_fn_names) for an address-flow cluster, or ('', set())."""
     if not module:
         return "", set()
@@ -1947,13 +1958,118 @@ def _flow_sub_stub_info(dag_path: Path, module: str | None) -> tuple[str, set[st
     if not isinstance(sub, dict) or sub.get("reach") != "address_flow":
         return "", set()
     fns = dag.get("functions") or {}
+    gvars = dag.get("global_variables") or {}
+    stub_keys: set[str] = set((sub.get("link_stubs") or {}).get("functions") or [])
+    if flow_files is not None:
+        base_files = {_dag_tree_path(str(f)) for f in sub.get("build_sources") or []}
+        if flow_files != base_files:
+            import unit_split
+
+            unit_name = str(sub.get("unit") or "")
+            _own_keys, all_keys = unit_split.unit_closure_keys(dag, unit_name)
+            if all_keys:
+                recomputed = unit_split.link_stubs_for_files(fns, gvars, all_keys, flow_files)
+                stub_keys |= set(recomputed["functions"])
     explicit: set[str] = set()
-    for fk in (sub.get("link_stubs") or {}).get("functions") or []:
+    for fk in stub_keys:
         rec = fns.get(fk) if isinstance(fns, dict) else None
+        if flow_files is not None and _record_in_flow_files(rec, flow_files):
+            continue
         name = str((rec or {}).get("name") or str(fk).split("#")[-1])
         if name:
             explicit.add(name)
     return str(sub.get("unit") or ""), explicit
+
+
+def _flow_cluster_functions(
+    dag_path: Path | str | None,
+    module: str | None,
+    sources: list[str],
+) -> list[str] | None:
+    """
+    Reachable target function names for an address-flow cluster's E-ACSL `-rte-select` /
+    `-e-acsl-functions` selection.
+
+    An address-flow cluster links whole `.c` files (`build_sources` / `flow_build_sources`) that
+    also contain many unreachable functions outside the cluster. Passing every function defined in
+    those files to Frama-C RTE + E-ACSL bloats `instrumented.c` and instruments dead code. This
+    computes the address-flow reach of the cluster's anchors plus any functions/globals referenced
+    by the cluster's harness source(s), keeping E-ACSL instrumentation scoped to reachable code.
+    Returns None when `module` is not an address-flow cluster or has no reachable names.
+    """
+    if not dag_path or not module:
+        return None
+    dp = Path(dag_path)
+    dag = load_json_optional(dp, None)
+    if not isinstance(dag, dict):
+        return None
+    sub = (dag.get("submodules") or {}).get(module)
+    if (
+        not isinstance(sub, dict)
+        or sub.get("reach") != "address_flow"
+        or not isinstance(sub.get("build_sources"), list)
+    ):
+        return None
+    import unit_split
+
+    dag_fns: dict[str, dict] = dag.get("functions") or {}
+    dag_gvars: dict[str, dict] = dag.get("global_variables") or {}
+    unit_name = str(sub.get("unit") or "")
+    _own_keys, all_keys = unit_split.unit_closure_keys(dag, unit_name)
+    all_set = set(all_keys)
+    anchors = [k for k in sub.get("anchors") or [] if k in all_set]
+
+    reached_keys: set[str]
+    if all_set and anchors:
+        harness_words: set[str] = set()
+        for src in sources:
+            p = Path(src)
+            if not p.is_file():
+                continue
+            if not p.name.startswith("harness_"):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            harness_words |= set(_C_IDENT_RE.findall(_C_COMMENT_RE.sub(" ", text)))
+        extra_fns: set[str] = set()
+        extra_globs: set[str] = set()
+        if harness_words:
+            for fk in all_keys:
+                rec = dag_fns.get(fk)
+                if not isinstance(rec, dict):
+                    continue
+                if rec.get("is_static") and not rec.get("header"):
+                    continue
+                fname = str(rec.get("name") or fk.rsplit("#", 1)[-1])
+                if fname in harness_words:
+                    extra_fns.add(fk)
+            for gk, grec in dag_gvars.items():
+                if not isinstance(grec, dict) or grec.get("static"):
+                    continue
+                gname = str(grec.get("name") or gk.rsplit("#", 1)[-1])
+                if gname in harness_words:
+                    extra_globs.add(gk)
+        starts = [*anchors, *sorted(extra_fns - set(anchors))]
+        reached_keys, _globs = unit_split.flow_reach(
+            dag_fns, dag_gvars, starts, all_set, extra_globals=extra_globs or None
+        )
+    else:
+        reached_keys = {str(k) for k in sub.get("functions") or [] if isinstance(k, str)}
+
+    names: set[str] = set(_harness_header_entries(sources))
+    for fk in reached_keys:
+        rec = dag_fns.get(fk)
+        name = str((rec or {}).get("name") or str(fk).rsplit("#", 1)[-1])
+        if (
+            name
+            and name not in ("eva_main", "main", "__framac_link_stub_called", "__framac_write_all")
+            and not is_harness_fuzz_function(name)
+            and name not in TYPE_MODIFIERS_AND_PRIMITIVES
+        ):
+            names.add(name)
+    return sorted(names) if names else None
 
 
 def _preseed_flow_stubs(
@@ -1963,9 +2079,10 @@ def _preseed_flow_stubs(
     link_module: str | None,
 ) -> tuple[list[str], dict | None, list[dict], list[dict]]:
     """
-    Pre-generate `<out_bin>_link_globals/link_stubs.c` from `sub["link_stubs"]` before Attempt 1
-    for an address-flow cluster (B9: avoids running E-ACSL Stage 1 + Stage 2 twice). Returns
-    `(sources_with_stubs, preseeded_record_or_None, fn_stubs, bss_global_stubs)`.
+    Pre-generate `<out_bin>_link_globals/link_stubs.c` from `sub["link_stubs"]` (recomputed over
+    widened `flow_files` when harness snippets or extra sources extend `sub["build_sources"]`)
+    before Attempt 1 for an address-flow cluster (B9: avoids running E-ACSL Stage 1 + Stage 2
+    twice). Returns `(sources_with_stubs, preseeded_record_or_None, fn_stubs, bss_global_stubs)`.
     """
     if not dag_path or not link_module:
         return list(sources), None, [], []
@@ -1986,11 +2103,26 @@ def _preseed_flow_stubs(
     dag_gvars = dag.get("global_variables") or {}
     model_gvars = _model_global_variables(dp)
 
+    stub_fn_keys: list[str] = list(link_stubs.get("functions") or [])
+    stub_glob_keys: list[str] = list(link_stubs.get("globals") or [])
+    base_files = {_dag_tree_path(str(f)) for f in sub.get("build_sources") or []}
+    if flow_files != base_files:
+        import unit_split
+
+        unit_name = str(sub.get("unit") or "")
+        _own_keys, all_keys = unit_split.unit_closure_keys(dag, unit_name)
+        if all_keys:
+            recomputed = unit_split.link_stubs_for_files(dag_fns, dag_gvars, all_keys, flow_files)
+            stub_fn_keys = sorted(set(stub_fn_keys) | set(recomputed["functions"]))
+            stub_glob_keys = sorted(set(stub_glob_keys) | set(recomputed["globals"]))
+
     fn_stubs: list[dict] = []
     seen_fns: set[str] = set()
-    for fk in link_stubs.get("functions") or []:
+    for fk in stub_fn_keys:
         rec = dag_fns.get(fk) if isinstance(dag_fns, dict) else None
         if isinstance(rec, dict) and rec.get("is_static") is True:
+            continue
+        if _record_in_flow_files(rec, flow_files):
             continue
         name = str((rec or {}).get("name") or str(fk).split("#")[-1])
         file = _dag_tree_path(str((rec or {}).get("file") or ""))
@@ -2001,12 +2133,14 @@ def _preseed_flow_stubs(
 
     global_stubs: list[dict] = []
     seen_globs: set[str] = set()
-    for gk in link_stubs.get("globals") or []:
+    for gk in stub_glob_keys:
         grec = dag_gvars.get(gk) if isinstance(dag_gvars, dict) else None
         gname = str((grec or {}).get("name") or str(gk).rpartition("#")[2] or gk)
         mrecs = model_gvars.get(gname) or []
         mrec = next((r for r in mrecs if f"{r['file']}#{r['name']}" == gk), mrecs[0] if mrecs else None)
         if isinstance(grec, dict) and grec.get("static"):
+            continue
+        if _record_in_flow_files(grec, flow_files):
             continue
         file = _dag_tree_path(str((grec or {}).get("file") or (mrec or {}).get("file") or ""))
         if not gname or gname in seen_globs or (file and file in flow_files):
@@ -2087,7 +2221,9 @@ def repair_sources_for_link(
     known_fn_stubs = {s["name"] for s in stubbed_functions or []}
     new_fn_stubs: list[dict] = []
     flow_files = _flow_cluster_files(dp, module, sources=sources) if stub_dir is not None else None
-    sub_unit, explicit_fn_stubs = _flow_sub_stub_info(dp, module) if flow_files is not None else ("", set())
+    sub_unit, explicit_fn_stubs = (
+        _flow_sub_stub_info(dp, module, flow_files=flow_files) if flow_files is not None else ("", set())
+    )
     global_vars: dict[str, list[dict]] | None = None
     ctx: dict = {}
     for sym in syms:
@@ -2396,14 +2532,35 @@ def build_module_binary(
     `security_props`. The sanitizer build never does. Without `eacsl` in `meta_engines` nothing changes.
     """
 
+    seeded_sources, preseeded, pre_fns, pre_globs = _preseed_flow_stubs(sources, dag_path, out_bin, link_module)
+    effective_functions = (
+        functions if functions is not None else _flow_cluster_functions(dag_path, link_module, seeded_sources)
+    )
+    sticky_fallback: list[tuple[dict | None, str | None]] = []
+    # Previous attempt's (non-generated target sources, eacsl_attempt, fallback_reason, eacsl_had_undef):
+    # if a link-repair round only writes/updates generated stub files without adding any target source,
+    # re-running E-ACSL after a non-link Stage 1/2 failure cannot change the outcome.
+    prev_eacsl_state: dict[str, Any] = {}
+
     def _attempt(srcs: list[str]) -> tuple[dict, dict | None, str | None]:
         eacsl_attempt = None
         fallback_reason = None
         comp = None
-        if engine in ("auto", "eacsl"):
+        non_gen = {s.replace("\\", "/") for s in srcs if not _is_generated_build_source(s)}
+        if (
+            not sticky_fallback
+            and prev_eacsl_state
+            and not prev_eacsl_state["had_undef"]
+            and non_gen == prev_eacsl_state["non_gen"]
+        ):
+            sticky_fallback.append((prev_eacsl_state["attempt"], prev_eacsl_state["reason"]))
+        if sticky_fallback:
+            eacsl_attempt, fallback_reason = sticky_fallback[0]
+        elif engine in ("auto", "eacsl"):
             blocked = selftest_blocks_eacsl(selftest_json) if engine == "auto" and apply_selftest else None
             if blocked:
                 fallback_reason = blocked
+                sticky_fallback.append((None, fallback_reason))
             else:
                 meta = resolve_security_meta(security_props, srcs, Path(out_bin))
                 # Only when the run's properties are on: the call of a run without them is today's.
@@ -2415,7 +2572,7 @@ def build_module_binary(
                     cppflags,
                     rte,
                     True,
-                    functions=functions,
+                    functions=effective_functions,
                     ldflags_extra=ldflags,
                     variadic_translation=variadic_translation,
                     warn_unsigned_downcast=warn_unsigned_downcast,
@@ -2427,6 +2584,15 @@ def build_module_binary(
                 if comp["returncode"] != 0 and engine == "auto":
                     eacsl_attempt = comp
                     fallback_reason = comp.get("reason") or "eacsl_compile_failed"
+                    eacsl_log = "\n".join(str(comp.get(k) or "") for k in ("stdout", "stderr"))
+                    had_undef = bool(parse_undefined_references(eacsl_log))
+                    prev_eacsl_state.update(
+                        non_gen=non_gen, attempt=eacsl_attempt, reason=fallback_reason, had_undef=had_undef
+                    )
+                    if not had_undef and comp.get("reason") in ("eacsl_compile_failed", "eacsl_build_timeout"):
+                        # Stage 2 C compile error (no undefined references) or build timeout:
+                        # link repair for the sanitizer fallback cannot fix E-ACSL.
+                        sticky_fallback.append((eacsl_attempt, fallback_reason))
                     comp = None
         if comp is None:
             comp = compile_sanitizer_binary(srcs, out_bin, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
@@ -2473,7 +2639,6 @@ def build_module_binary(
         last.update(eacsl_attempt=eacsl_attempt, fallback_reason=fallback_reason)
         return comp
 
-    seeded_sources, preseeded, pre_fns, pre_globs = _preseed_flow_stubs(sources, dag_path, out_bin, link_module)
     comp = _noted_attempt(list(seeded_sources))
     comp, current, link_repair = repair_link_rounds(
         comp,

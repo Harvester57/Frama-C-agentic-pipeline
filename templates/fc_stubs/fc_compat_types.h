@@ -1216,6 +1216,14 @@ struct tcp_info {
 
 #endif /* __FRAMAC_EACSL__ */
 
+/* GCC/Clang legacy full memory barrier builtin (`void __sync_synchronize(void)`). Neither
+ * Frama-C's __fc_libc nor host glibc declares it, so Frama-C invents `extern int
+ * __sync_synchronize(void)` on first call; in E-ACSL output clang rejects that prototype as
+ * conflicting with the `void (void)` builtin (nginx `ngx_spinlock` / `ngx_memory_barrier`), and
+ * in Eva/WP it triggers a missing-spec warning. A barrier touches no C object directly. */
+/*@ assigns \nothing; */
+void __sync_synchronize(void);
+
 #if defined(__has_include)
 #if __has_include("../acsl/acsl_vocabulary.h")
 #include "../acsl/acsl_vocabulary.h"
