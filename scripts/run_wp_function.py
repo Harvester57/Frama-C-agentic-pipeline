@@ -42,6 +42,7 @@ import math
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -65,11 +66,17 @@ from acsl_ast import (  # noqa: E402
     AcslError,
     contract_shape,
     find_named_clause,
+    find_target_unsound_axioms_or_admits,
+    find_top_level_lemmas,
+    find_unsound_recursive_logic,
     is_trivial_predicate,
+    mask_comments_and_literals,
 )
 from framac_common import (  # noqa: E402
     _CPP_ERROR_RE,
+    STATUS_ASSUMED,
     STATUS_DEAD,
+    STATUS_INCONSISTENT,
     STATUS_INVALID,
     STATUS_INVALID_UNDER_HYP,
     STATUS_NEVER_TRIED,
@@ -85,6 +92,7 @@ from framac_common import (  # noqa: E402
     normalize_flag_args,
     parse_missing_spec,
     read_report_csv,
+    resolve_fc_stubs_dir,
     scan_undeclared_functions,
     stub_repair_action,
     utc_now,
@@ -157,24 +165,27 @@ _SMOKE_FAIL_RE = re.compile(
     re.IGNORECASE,
 )
 _MM_HYP_RE = re.compile(r"Memory model hypotheses for function '([^']+)'")
+_MM_HYP_BLOCK_RE = re.compile(r"Memory model hypotheses for function '([^']+)':\s*/\*@(.*?)\*/", re.DOTALL)
+_MM_REQ_CLAUSE_RE = re.compile(r"\brequires\s+([^;]+);")
+_WHY3_ANOMALY_RE = re.compile(r"\[Why3 Error\]\s*anomaly:\s*([^\n]+)", re.IGNORECASE)
 _SKIPPED_RTE_RE = re.compile(
     r"(?:Skipped RTE guards:\s*([^\n)]+\))|([^\n]*Through function pointer[^\n]*cannot generate[^\n]*))"
 )
 _INDIRECT_CALL_UNSOUND_RE = re.compile(r"Missing 'calls'|Unknown callee")
 _FPV_DEGEN_RE = re.compile(
-    r"^\[wp\] \[(?:Timeout|Unknown|Failed|Stepout)\] ([A-Za-z0-9_]+_assert_rte_pointer_value[A-Za-z0-9_]*) .*\(Degenerated(?:, [^)]*)?\)",
+    r"^\[wp\] \[(?:Timeout|Unknown|Failed|Failure|Stepout)\] ([A-Za-z0-9_]+_assert_rte_pointer_value[A-Za-z0-9_]*) .*\(Degenerated(?:, [^)]*)?\)",
     re.MULTILINE,
 )
 # With -wp-counter-examples, failed goals carry a witness model: "[wp] [Unsuccess] <goal> (<prover>) (Model)"
 # (upstream plugins/wp/tests/wp_ce oracle format), or with Frama-C 34's tags
 # "[wp] [Unknown] <goal> (Qed 2ms) (CVC5) (Cached) (Model)".
 _MODEL_GOAL_RE = re.compile(
-    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout)\] ([A-Za-z_]\w*)((?: \([^)\n]*\))*?) \(Model\)",
+    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Failure|Timeout|Stepout)\] ([A-Za-z_]\w*)((?: \([^)\n]*\))*?) \(Model\)",
     re.MULTILINE,
 )
 # Every goal WP reports as not proved, with or without a model.
 _FAILED_GOAL_RE = re.compile(
-    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Timeout|Stepout|Incorrect|Invalid)\] ([A-Za-z_]\w*)", re.MULTILINE
+    r"^\[wp\] \[(?:Unsuccess|Unknown|Failed|Failure|Timeout|Stepout|Incorrect|Invalid)\] ([A-Za-z_]\w*)", re.MULTILINE
 )
 _PAREN_TAG_RE = re.compile(r"\(([^)\n]*)\)")
 # Artifact suffix of the -wp-counter-examples pass (run_wp_on_function): it never decides a status.
@@ -210,12 +221,18 @@ def parse_failed_wp_goals(log: str) -> set[str]:
 # `(Cached)` also appears on a first run under `-wp-cache update`, so a log-sourced entry never has a
 # time either.
 GOAL_COSTS_ENV = "FRAMAC_WP_GOAL_COSTS"
-_VERDICT_KINDS = {"timeout": "timeout", "stepout": "stepout", "unknown": "unknown", "failed": "failed"}
+_VERDICT_KINDS = {
+    "timeout": "timeout",
+    "stepout": "stepout",
+    "unknown": "unknown",
+    "failed": "failed",
+    "failure": "failed",
+}
 SLOWEST_PROVED_MAX = 5
 # "Well under the timeout" for an Unknown, and "at the timeout" for a Timeout, as fractions of -wp-timeout.
 UNKNOWN_FAST_FRACTION = 0.5
 TIMEOUT_REACHED_FRACTION = 0.9
-_COST_LINE_RE = re.compile(r"^\[wp\] \[(Timeout|Stepout|Unknown|Failed)\] ([A-Za-z_]\w*)(.*)$", re.MULTILINE)
+_COST_LINE_RE = re.compile(r"^\[wp\] \[(Timeout|Stepout|Unknown|Failed|Failure)\] ([A-Za-z_]\w*)(.*)$", re.MULTILINE)
 _COST_TAGS_RE = re.compile(r"(?:[ \t]+\([^()\n]*\))*[ \t]*")
 _PROVER_TAG_RE = re.compile(r"^(?:Alt-Ergo|Z3|CVC4|CVC5|Colibri2?|Vampire|Eprover|Coq|Rocq|Script)$", re.IGNORECASE)
 _WP_STATUS_SEP_RE = re.compile(r"^-{20,}\s*$")
@@ -223,7 +240,7 @@ _WP_STATUS_FN_RE = re.compile(r"^\s+Function\s+([A-Za-z_]\w*)\s*$")
 _WP_STATUS_SECTION_RE = re.compile(r"^\s+(?:Global|Axiomatic\b|Lemma\b)")
 _WP_STATUS_PROVER_RE = re.compile(
     r"^Prover\s+(?P<prover>.+?)\s+returns\s+"
-    r"(?P<verdict>Step\s+limit|Timeout|Unknown|Failed|Valid|Invalid|Stepout|NoResult)\b(?P<tail>.*)$"
+    r"(?P<verdict>Step\s+limit|Timeout|Unknown|Failed|Failure|Valid|Invalid|Stepout|NoResult)\b(?P<tail>.*)$"
 )
 _WP_STATUS_VERDICT_MAP = {
     "timeout": "timeout",
@@ -231,6 +248,7 @@ _WP_STATUS_VERDICT_MAP = {
     "stepout": "stepout",
     "unknown": "unknown",
     "failed": "failed",
+    "failure": "failed",
     "valid": "valid",
     "invalid": "invalid",
 }
@@ -661,7 +679,7 @@ def goal_costs_from_log(log: str) -> list[dict]:
                 "property": None,
                 "file": None,
                 "line": None,
-                "verdict_kind": m.group(1).lower(),
+                "verdict_kind": _VERDICT_KINDS.get(m.group(1).lower(), m.group(1).lower()),
                 "provers": provers,
                 "time_ms": None,
                 "cached": cached,
@@ -1011,23 +1029,32 @@ def _bytes_retry_trigger(res: dict, log_text: str) -> str | None:
     """
     Why a `Typed` verdict that is not all_proven is worth one retry under `Bytes`, or None. Only for the
     obstacles `Bytes` can remove: `union` when soundness fails solely on WP's union warning, or
-    `pointer_cast` when the run is sound and the unproven goals come from byte-wise casts (the cast probe
-    proved everything, WP warned `Cast with incompatible pointers types`, or every unproven goal is a
-    `memcpy`-style builtin precondition or a pointer-cast annotation).
+    `pointer_cast` when the run is sound (or aborted solely on a Why3 anomaly during Typed pointer-cast
+    translation) and the unproven/failed goals come from byte-wise casts (the cast probe proved everything,
+    WP warned `Cast with incompatible pointers types`, or every unproven goal is a `memcpy`-style builtin
+    precondition or a pointer-cast annotation).
     """
     soundness = res.get("soundness") or {}
-    if soundness.get("tier_a_aborts") or res.get("budget_exhausted"):
+    if res.get("budget_exhausted"):
+        return None
+    tier_a = list(soundness.get("tier_a_aborts") or [])
+    if tier_a and not all(_WHY3_ANOMALY_RE.search(msg) for msg in tier_a):
         return None
     unsound = list(soundness.get("tier_b_unsound") or [])
     if unsound:
+        if tier_a:
+            return None
         return "union" if all(_UNION_UNSOUND_RE.search(msg) for msg in unsound) else None
     goals = res.get("unproven_goals") or []
-    if not goals:
+    if not goals and not tier_a:
         return None
     if (
         res.get("wp_cast_limitation")
         or _INCOMPATIBLE_CAST_RE.search(log_text or "")
-        or all(_MEM_BUILTIN_PRECOND_RE.search(str(g.get("kind") or "")) or _is_pointer_cast_goal(g) for g in goals)
+        or (
+            goals
+            and all(_MEM_BUILTIN_PRECOND_RE.search(str(g.get("kind") or "")) or _is_pointer_cast_goal(g) for g in goals)
+        )
     ):
         return "pointer_cast"
     return None
@@ -1148,7 +1175,11 @@ def scan_wp_log_soundness(
     function-pointer value goals (`\\valid_function`).
     """
     messages = fold_messages(log_text)
-    tier_a_aborts = sorted({m.folded for m in messages if _TIER_A_RE.search(m.folded)})
+    tier_a_set = {m.folded for m in messages if _TIER_A_RE.search(m.folded) or _WHY3_ANOMALY_RE.search(m.folded)}
+    if not any(_WHY3_ANOMALY_RE.search(msg) for msg in tier_a_set):
+        for m_anom in _WHY3_ANOMALY_RE.finditer(log_text or ""):
+            tier_a_set.add(m_anom.group(0).strip())
+    tier_a_aborts = sorted(tier_a_set)
     tier_b_unsound_set = {m.folded for m in messages if any(p in m.folded for p in _TIER_B_PATTERNS)}
     for m in messages:
         specs = parse_missing_spec(m.folded)
@@ -1161,6 +1192,16 @@ def scan_wp_log_soundness(
         tier_b_unsound_set.add(m_smoke.group(1).strip())
 
     mm_functions = sorted({m.group(1) for msg in messages for m in _MM_HYP_RE.finditer(msg.folded)})
+    mm_reqs_by_fn: dict[str, list[str]] = {fn: [] for fn in mm_functions}
+    for msg in messages:
+        for m_blk in _MM_HYP_BLOCK_RE.finditer(msg.folded):
+            fn_name = m_blk.group(1)
+            bucket = mm_reqs_by_fn.setdefault(fn_name, [])
+            for req in _MM_REQ_CLAUSE_RE.findall(m_blk.group(2)):
+                cleaned = " ".join(req.split())
+                if cleaned and cleaned not in bucket:
+                    bucket.append(cleaned)
+    checked_mm_hyps = [{"function": fn, "requires": mm_reqs_by_fn.get(fn, [])} for fn in mm_functions]
     if mm_functions and not check_memory_model:
         tier_b_unsound_set.add(
             f"Memory model hypotheses for function(s) {', '.join(mm_functions)} unchecked (-wp-no-check-memory-model)"
@@ -1195,10 +1236,146 @@ def scan_wp_log_soundness(
         "tier_a_aborts": tier_a_aborts,
         "tier_b_unsound": tier_b_unsound,
         "checked_memory_model_functions": mm_functions if check_memory_model else [],
+        "checked_memory_model_hypotheses": checked_mm_hyps if check_memory_model else [],
         "skipped_rte_guards": skipped_rte,
         "assumed_function_pointer_goals": fpv_goals,
         "reduced_checks": reduced_checks,
     }
+
+
+def _is_excluded_target_scan_path(path: Path) -> bool:
+    """True when `path` sits in Frama-C's `share/libc`, `/usr/`, or `templates/fc_stubs/`."""
+    for candidate in (path, path.resolve(strict=False)):
+        norm = candidate.as_posix().lower()
+        if (
+            norm.startswith("/usr/")
+            or "/share/libc/" in norm
+            or "/share/frama-c/libc/" in norm
+            or "/frama-c/libc/" in norm
+            or "/templates/fc_stubs/" in norm
+            or norm.startswith("templates/fc_stubs/")
+            or norm.startswith("framac_share/libc/")
+        ):
+            return True
+    fc_stubs = resolve_fc_stubs_dir()
+    if fc_stubs is not None:
+        with contextlib.suppress(ValueError, OSError):
+            path.resolve(strict=False).relative_to(fc_stubs.resolve(strict=False))
+            return True
+    return False
+
+
+def _extract_target_include_dirs(cppflags: str) -> list[Path]:
+    """Extract `-iquote` and `-I` include directories from `cppflags` in search order."""
+    if not cppflags or not cppflags.strip():
+        return []
+    try:
+        tokens = shlex.split(cppflags, posix=(os.name != "nt"))
+    except ValueError:
+        tokens = cppflags.split()
+    if os.name == "nt":
+        tokens = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"') else t for t in tokens]
+    iquote_dirs: list[Path] = []
+    inc_dirs: list[Path] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-iquote" and i + 1 < len(tokens):
+            iquote_dirs.append(Path(tokens[i + 1]))
+            i += 2
+        elif tok.startswith("-iquote") and len(tok) > len("-iquote"):
+            iquote_dirs.append(Path(tok[len("-iquote") :]))
+            i += 1
+        elif tok == "-I" and i + 1 < len(tokens):
+            inc_dirs.append(Path(tokens[i + 1]))
+            i += 2
+        elif tok.startswith("-I") and len(tok) > 2:
+            inc_dirs.append(Path(tok[2:]))
+            i += 1
+        else:
+            i += 1
+    return iquote_dirs + inc_dirs
+
+
+def collect_target_sources_in_scope(
+    c_file: Path,
+    extra_sources: list[str] | None = None,
+    cppflags: str = "",
+    max_files: int = 512,
+) -> list[Path]:
+    """
+    Collect target source files in scope for `-wp-fct`: `c_file`, `extra_sources`, plus recursively
+    resolved local quoted `#include "..."` headers inside the target tree, strictly excluding
+    Frama-C's `share/libc`, `/usr/`, and `templates/fc_stubs/`.
+    """
+    include_dirs = [d for d in _extract_target_include_dirs(cppflags) if not _is_excluded_target_scan_path(d)]
+    queue: list[Path] = [Path(c_file), *(Path(s) for s in (extra_sources or []))]
+    seen: set[Path] = set()
+    collected: list[Path] = []
+
+    while queue and len(collected) < max_files:
+        cur = queue.pop(0)
+        if _is_excluded_target_scan_path(cur):
+            continue
+        if not cur.is_file():
+            continue
+        resolved = cur.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        collected.append(cur)
+        try:
+            raw = cur.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        masked = mask_comments_and_literals(raw, acsl="blank", literals=False, on_error="mask")
+        for inc in _QUOTED_INCLUDE_RE.findall(masked):
+            search_roots = [cur.parent, *include_dirs]
+            for root in search_roots:
+                cand = root / inc
+                if cand.is_file() and not _is_excluded_target_scan_path(cand):
+                    if cand.resolve(strict=False) not in seen:
+                        queue.append(cand)
+                    break
+    return collected
+
+
+def scan_target_sources_soundness(
+    c_file: Path,
+    extra_sources: list[str] | None = None,
+    cppflags: str = "",
+) -> tuple[list[str], list[str]]:
+    """
+    Scan target source files in scope for constructs that Frama-C 34 `-wp-fct` silently assumes
+    without emitting `-report-csv` rows:
+    1. Top-level global `lemma` declarations (never proved by `-wp-fct`, yet assumed as axioms).
+    2. Target-file `axiom` / `axiomatic` / `admit` constructs.
+    3. Non-well-founded recursive `logic` / `predicate` definitions.
+    Returns `(tier_b_issues, target_lemma_names)`.
+    """
+    tier_b_issues: list[str] = []
+    target_lemmas: list[str] = []
+    for path in collect_target_sources_in_scope(c_file, extra_sources=extra_sources, cppflags=cppflags):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        path_str = str(path)
+        with contextlib.suppress(AcslError):
+            target_lemmas.extend(find_top_level_lemmas(text, path=path_str))
+        with contextlib.suppress(AcslError):
+            tier_b_issues.extend(find_target_unsound_axioms_or_admits(text, path=path_str))
+        with contextlib.suppress(AcslError):
+            tier_b_issues.extend(find_unsound_recursive_logic(text, path=path_str))
+    unique_lemmas = list(dict.fromkeys(target_lemmas))
+    if unique_lemmas:
+        shown = ", ".join(unique_lemmas[:10])
+        suffix = f" (+{len(unique_lemmas) - 10} more)" if len(unique_lemmas) > 10 else ""
+        tier_b_issues.append(
+            f"Unproven lemma(s) in scope ({shown}{suffix}): "
+            "-wp-fct does not prove global lemmas yet WP assumes them as hypotheses"
+        )
+    return list(dict.fromkeys(tier_b_issues)), unique_lemmas
 
 
 def extract_vc_goal_dumps(log_text: str, max_dumps: int = 5) -> list[str]:
@@ -1381,10 +1558,10 @@ _WP_TIMEOUT_COUNT_RE = re.compile(r"^(?:\[wp\])?\s*Timeout:\s*(\d+)", re.MULTILI
 _WP_GOALS_SCHEDULED_RE = re.compile(r"^\[wp\]\s+(\d+)\s+goals?\s+scheduled\b", re.MULTILINE)
 _PARTIAL_WP_GOAL_COLON_RE = re.compile(
     r"^\[wp\]\s+\[[^\]\n]+\]\s+Goal\s+([A-Za-z_]\w*)\s*:\s*"
-    r"(Valid|Proved|Timeout|Stepout|Step\s+limit|Unknown|Failed|Invalid|Unsuccess|Incorrect)\b(.*)$"
+    r"(Valid|Proved|Timeout|Stepout|Step\s+limit|Unknown|Failed|Failure|Invalid|Unsuccess|Incorrect)\b(.*)$"
 )
 _PARTIAL_WP_BRACKET_RE = re.compile(
-    r"^\[wp\]\s+\[(Valid|Proved|Timeout|Stepout|Step\s+limit|Unknown|Failed|Invalid|Unsuccess|Incorrect)\]\s+"
+    r"^\[wp\]\s+\[(Valid|Proved|Timeout|Stepout|Step\s+limit|Unknown|Failed|Failure|Invalid|Unsuccess|Incorrect)\]\s+"
     r"([A-Za-z_]\w*)(.*)$"
 )
 _PARTIAL_VERDICT_CATEGORY: dict[str, str] = {
@@ -1395,6 +1572,7 @@ _PARTIAL_VERDICT_CATEGORY: dict[str, str] = {
     "step limit": "timed_out",
     "unknown": "unknown",
     "failed": "failed",
+    "failure": "failed",
     "invalid": "failed",
     "unsuccess": "failed",
     "incorrect": "failed",
@@ -1973,7 +2151,9 @@ def derive_wp_diagnostic_hints(
         "'requires \\separated(p1 + (0 .. n1 - 1), p2 + (0 .. n2 - 1));' preconditions for distinct "
         "pointer parameters."
     )
-    has_mm_hyp = bool("Memory model hypotheses" in aborts_and_unsound or soundness.get("checked_memory_model_functions"))
+    has_mm_hyp = bool(
+        "Memory model hypotheses" in aborts_and_unsound or soundness.get("checked_memory_model_functions")
+    )
     if not soundness.get("ok", True) or status in ("wp_aborted", "unsound_proof"):
         if "Missing assigns clause" in aborts_and_unsound or "using unguarded behavior assigns" in aborts_and_unsound:
             _add(
@@ -2002,6 +2182,9 @@ def derive_wp_diagnostic_hints(
                 for g in (res.get("unproven_goals") or [])
                 if "lemma" in str(g.get("kind") or "").lower()
             ]
+            lemma_names.extend(
+                str(n).strip() for n in (soundness.get("unproven_global_lemmas") or []) if str(n).strip()
+            )
             lemma_names = [n for n in dict.fromkeys(lemma_names) if n]
             named = f" ({', '.join(lemma_names[:5])})" if lemma_names else ""
             _add(
@@ -2010,6 +2193,14 @@ def derive_wp_diagnostic_hints(
                 "it with a file-scope ghost function (forbidden by the brief and refused at merge); if the "
                 "goal requires induction WP cannot prove inline, stop with status 'stalled_after_k_retries' "
                 "and proof_gap (reason: 'inductive lemma required: ...')."
+            )
+        if res.get("wp_why3_anomaly") or _WHY3_ANOMALY_RE.search(aborts_and_unsound):
+            _add(
+                "Why3 backend anomaly during WP goal translation ([Why3 Error] anomaly, e.g. "
+                'Invalid_argument("missing free variable") or "unbound variable in of_term" on incompatible '
+                "pointer casts): the SMT provers aborted before evaluating the failed goal(s), so this is a "
+                "WP/Why3 backend failure rather than a missing precondition. Retry with `--wp-model Bytes` "
+                "if pointer casts are present, or report status 'blocked' if the anomaly persists."
             )
         if _SMOKE_FAIL_RE.search(aborts_and_unsound):
             _add(
@@ -2094,12 +2285,16 @@ def derive_wp_diagnostic_hints(
         goal_annot_blob = " ".join(f"{g.get('kind') or ''} {g.get('annotation') or ''}" for g in unproven_goals)
         if _PTR_DIFF_EQ_RE.search(goal_annot_blob) or _PTR_DIFF_EQ_RE.search(full_log):
             _add(
-                "Pointer-difference equality bridge (`p_end - p == 0 ==> p == p_end` or `\\base_addr(p) == \\base_addr(p_end)`): "
-                "Frama-C WP's Typed model does not export `b1 == b2 ==> (ofs1 - ofs2 == 0 ==> p1 == p2)` for two "
-                "symbolic pointers even with `\\base_addr`. Anchor BOTH pointers to the same base `\\at(p, Pre)` via "
-                "explicit offset invariants (`loop invariant 0 <= p - \\at(p, Pre) <= p_end - \\at(p, Pre);` and "
-                "`loop invariant p == \\at(p, Pre) + (p - \\at(p, Pre));` plus `/*@ assert p_end == \\at(p, Pre) + (p_end - \\at(p, Pre)); */`) "
-                "so Qed reduces `p == p_end` to integer offset equality."
+                r"Pointer-walk anchoring (`p_end - p == 0 ==> p == p_end` or `\base_addr(p) == \base_addr(p_end)`): "
+                r"use the ghost-index idiom rather than `p == base + (p - base)` (which breaks E-matching and fails "
+                r"on stride > 1 / `Bytes`). Capture an unmodified base pointer (`base`, or "
+                r"`/*@ ghost const T *base = p; */`), add `requires \base_addr(base) == \base_addr(p_end);`, "
+                r"introduce `/*@ ghost size_t idx = 0; */`, state `loop invariant idx_bound: 0 <= idx <= p_end - base;` "
+                r"and `loop invariant ptr_idx: p == base + idx;`, include `idx` in `loop assigns`, and increment "
+                r"`/*@ ghost idx++; */`. For pointer-advancing helpers, export "
+                r"`ensures res_base: \result != \null ==> \base_addr(\result) == \base_addr(\old(buf));` and "
+                r"`ensures res_bound: \result != \null ==> 0 <= \result - \old(buf) <= \old(buf_end) - \old(buf);` "
+                r"(callers resynchronize via `/*@ ghost idx = (size_t)(p - buf); */`)."
             )
 
         if buckets.get("step_a_assigns"):
@@ -3401,6 +3596,19 @@ def _run_wp_on_function_locked(call_args: dict[str, Any]) -> dict:
         return error_res
     goal_dumps = extract_vc_goal_dumps(combined_log) if dump_goal else []
 
+    # Frama-C 34 `-wp-fct` never schedules global lemmas and `-report-csv` omits global lemmas and axioms
+    # completely, while WP still feeds them (and non-well-founded recursive logic/predicates) to provers.
+    target_source_issues, target_lemmas = scan_target_sources_soundness(
+        c_file, extra_sources=extra_sources, cppflags=cppflags
+    )
+    if target_lemmas:
+        soundness["unproven_global_lemmas"] = target_lemmas
+    if target_source_issues:
+        for issue in target_source_issues:
+            if issue not in soundness["tier_b_unsound"]:
+                soundness["tier_b_unsound"].append(issue)
+        soundness["ok"] = False
+
     if sarif and sav_path.exists():
         subprocess.run(
             [
@@ -3424,6 +3632,7 @@ def _run_wp_on_function_locked(call_args: dict[str, Any]) -> dict:
     unproven_goals: list[dict] = []
     unproven_lemmas: list[dict] = []
     dead_goals: list[dict] = []
+    partially_proven_count = 0
     buckets: dict[str, list[dict]] = {
         "step_a_assigns": [],
         "step_b_loop_invariant": [],
@@ -3482,6 +3691,8 @@ def _run_wp_on_function_locked(call_args: dict[str, Any]) -> dict:
             if st == STATUS_VALID:
                 proven_goals.append(item)
                 counts["proven"] += 1
+                if str(row["status_raw"]).strip().lower() == "partially proven":
+                    partially_proven_count += 1
                 if cls in LAYER_CLASSES:
                     layer_goals.append(item)
             elif st == STATUS_VALID_UNDER_HYP:
@@ -3514,6 +3725,45 @@ def _run_wp_on_function_locked(call_args: dict[str, Any]) -> dict:
                 counts["unproven"] += 1
             elif st == STATUS_DEAD:
                 dead_goals.append(item)
+            elif st == STATUS_INCONSISTENT:
+                soundness["tier_b_unsound"].append(
+                    f"Inconsistent property status in report CSV for '{item['function']}' "
+                    f"({item['kind']} at line {item['line']}: {item['annotation'][:160]})"
+                )
+                soundness["ok"] = False
+                bkey = classify_unproven_goal(item)
+                item["diagnostic_bucket"] = bkey
+                unproven_goals.append(item)
+                buckets[bkey].append(item)
+                counts["unproven"] += 1
+            elif st == STATUS_ASSUMED:
+                # Rows with `row_fn != fn_name` (extern libc/stub contracts) were already skipped above.
+                # Ignore any global libc/stub row if Frama-C emits empty-fn axioms in future releases;
+                # an assumed (`Considered valid`) property on `fn_name` itself is unsound.
+                row_path = _report_row_path(row)
+                if (
+                    not row_fn
+                    and row_path
+                    and (_is_libc_header(row_path) or _is_excluded_target_scan_path(Path(row_path)))
+                ):
+                    continue
+                soundness["tier_b_unsound"].append(
+                    f"Assumed ('Considered valid') property in report CSV for '{item['function']}' "
+                    f"({item['kind']} at line {item['line']}: {item['annotation'][:160]})"
+                )
+                soundness["ok"] = False
+                bkey = classify_unproven_goal(item)
+                item["diagnostic_bucket"] = bkey
+                unproven_goals.append(item)
+                buckets[bkey].append(item)
+                counts["unproven"] += 1
+            else:
+                # Fail closed on STATUS_OTHER or any unrecognised future Frama-C status.
+                bkey = classify_unproven_goal(item)
+                item["diagnostic_bucket"] = bkey
+                unproven_goals.append(item)
+                buckets[bkey].append(item)
+                counts["unproven"] += 1
 
     if unproven_lemmas:
         soundness["tier_b_unsound"].append(
@@ -3758,6 +4008,7 @@ def _run_wp_on_function_locked(call_args: dict[str, Any]) -> dict:
         "counter_example_goals": model_goals,
         "total_goals": total_goals,
         "proven_count": len(proven_goals),
+        "partially_proven_count": partially_proven_count,
         "proven_under_hyp_count": len(under_hyp_goals),
         "unproven_count": len(unproven_goals),
         "dead_count": len(dead_goals),
@@ -3938,6 +4189,8 @@ def _run_wp_on_function_locked(call_args: dict[str, Any]) -> dict:
         res["bytes_retry"] = record
     if _WHY3_MEMADDR_ERR_RE.search(combined_log):
         res["wp_why3_memaddr_limitation"] = True
+    if _WHY3_ANOMALY_RE.search(combined_log):
+        res["wp_why3_anomaly"] = True
     if soundness.get("macro_loop_warnings"):
         res["wp_macro_loop_limitation"] = True
     res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, combined_log)
@@ -4020,13 +4273,34 @@ def classify_vacuity_log(log_text: str, returncode: int | None = 0) -> dict:
     dead = sorted(set(dead_matches))
     if doomed:
         return {"status": "contradictory", "doomed": doomed, "dead_goals": len(dead)}
-    if returncode != 0 or "Smoke Tests" not in log_text:
+    if returncode != 0:
         return {
             "status": "inconclusive",
             "reason": f"smoke pass produced no result (rc={returncode})",
             "doomed": [],
             "dead_goals": len(dead),
         }
+    if "Smoke Tests" not in log_text:
+        # Clean leaf functions without `requires`, branches, loops, or calls emit `Proved goals:` with
+        # 0 smoke goals and no `Smoke Tests:` line. Treat a clean rc=0 pass with no failures or doomed
+        # goals as consistent (`smoke_goals: 0`) rather than inconclusive.
+        has_failed = bool(
+            "[wp] [Failed]" in log_text
+            or "[wp] [Failure]" in log_text
+            or re.search(r"^\s*Failed\s*:", log_text, re.MULTILINE)
+        )
+        if "Proved goals:" in log_text and not _ANY_DOOMED_RE.search(log_text) and not has_failed:
+            return {"status": "consistent", "doomed": [], "dead_goals": 0, "smoke_goals": 0}
+        unknown_no_summary = sorted({g for g in _ANY_DOOMED_RE.findall(log_text) if g not in set(dead)})
+        out: dict[str, Any] = {
+            "status": "inconclusive",
+            "reason": f"smoke pass produced no result (rc={returncode})",
+            "doomed": [],
+            "dead_goals": len(dead),
+        }
+        if unknown_no_summary:
+            out["unknown_doomed"] = unknown_no_summary
+        return out
     m_count = _SMOKE_COUNT_RE.search(log_text)
     if not m_count:
         return {
@@ -4044,7 +4318,7 @@ def classify_vacuity_log(log_text: str, returncode: int | None = 0) -> dict:
             "dead_goals": len(dead),
         }
     dead_set = set(dead)
-    unknown_doomed = [g for g in _ANY_DOOMED_RE.findall(log_text) if g not in dead_set]
+    unknown_doomed = sorted({g for g in _ANY_DOOMED_RE.findall(log_text) if g not in dead_set})
     # Frama-C 34 WP with P configured provers prints `[Failed] (Doomed) <goal>` once per prover
     # and counts each report in the `Smoke Tests: k / n` denominator (e.g. 1 dead_code goal under
     # alt-ergo,z3,cvc5 prints 3 lines and `Smoke Tests: 2 / 5`), so match `n - k` against the raw
@@ -4056,8 +4330,10 @@ def classify_vacuity_log(log_text: str, returncode: int | None = 0) -> dict:
             "reason": f"smoke test failure ({k}/{n}) without recognised doomed goals",
             "doomed": [],
             "dead_goals": len(dead),
+            "unknown_doomed": unknown_doomed,
+            "unexplained_fails": max(0, unexplained_fails),
         }
-    return {"status": "consistent", "doomed": [], "dead_goals": len(dead)}
+    return {"status": "consistent", "doomed": [], "dead_goals": len(dead), "smoke_goals": n}
 
 
 def _read_goal_source(goal: dict, c_file: Path) -> str | None:
@@ -4181,9 +4457,34 @@ def apply_verdict_limits(
         "missing_spec_callees": missing_spec,
         **layer_clause_limits(res.get("layer_goals") or [], c_file),
     }
+    mm_hyps = list(soundness.get("checked_memory_model_hypotheses") or [])
+    if not mm_hyps:
+        mm_fns = [str(fn).strip() for fn in (soundness.get("checked_memory_model_functions") or []) if str(fn).strip()]
+        if mm_fns:
+            mm_hyps = [{"function": fn, "requires": []} for fn in mm_fns]
+    if mm_hyps:
+        res["limits"]["memory_model_hypotheses"] = mm_hyps
+
+    unknown_doomed = list(vacuity.get("unknown_doomed") or []) if isinstance(vacuity, dict) else []
+    raw_unexplained = vacuity.get("unexplained_fails") if isinstance(vacuity, dict) else 0
+    unexplained_fails = (
+        raw_unexplained if isinstance(raw_unexplained, int) and not isinstance(raw_unexplained, bool) else 0
+    )
     if vacuity and vacuity["status"] == "contradictory":
         names = ", ".join(vacuity["doomed"])
         soundness.setdefault("tier_b_unsound", []).append(f"Failed smoke-test: contract is contradictory ({names})")
+        soundness["ok"] = False
+        res["soundness"] = soundness
+        res["status"] = "unsound_proof"
+        res["next_synthesis_focus"] = "tier_b_soundness_fix_required"
+        res["diagnostic_hints"] = derive_wp_diagnostic_hints(res, "")
+    elif vacuity and (unknown_doomed or unexplained_fails > 0):
+        parts: list[str] = []
+        if unknown_doomed:
+            parts.append(f"unrecognised doomed smoke goals: {', '.join(str(g) for g in unknown_doomed[:5])}")
+        if unexplained_fails > 0:
+            parts.append(f"{unexplained_fails} unexplained smoke test failure(s)")
+        soundness.setdefault("tier_b_unsound", []).append(f"Failed smoke-test: {'; '.join(parts)}")
         soundness["ok"] = False
         res["soundness"] = soundness
         res["status"] = "unsound_proof"

@@ -1191,3 +1191,44 @@ def test_c5_ingest_fuzz_filters_link_stub_aborts_and_creates_no_candidates(run_d
     assert load(run_dir / "candidates.json") == []
     assert any(e["result"] == "fuzz_link_stub_abort" for e in _unit(run_dir, "rte")["evidence"])
     assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_wp_records_memory_model_hypothesis_assumption_and_validates_schema(run_dir):
+    """Tier 1: checked WP Typed memory-model hypotheses are recorded as explicit assumptions without failing credit."""
+    seed(run_dir)
+    report = wp_report(
+        by_obligation_class={
+            "rte": {"proven": 5, "proven_under_hyp": 0, "unproven": 0},
+            "l2_termination": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
+            "l3_frame": {"proven": 1, "proven_under_hyp": 0, "unproven": 0},
+        },
+    )
+    report["limits"]["memory_model_hypotheses"] = [{"function": "snmp_parse_pdu", "requires": [r"\separated(p, &g)"]}]
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", report)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    unit = _unit(run_dir, "rte")
+    assert unit["status"] == "covered"
+    mm_assumptions = [a for a in unit["assumptions"] if a["kind"] == "memory_model_hypothesis"]
+    assert len(mm_assumptions) == 1
+    assert r"\separated(p, &g)" in mm_assumptions[0]["description"]
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_wp_unsound_proof_reads_checked_memory_model_functions(run_dir):
+    """Tier 1: unsound_proof/wp_aborted summary reads checked_memory_model_functions alongside legacy key."""
+    seed(run_dir)
+    report = wp_report(
+        status="unsound_proof",
+        soundness={
+            "ok": False,
+            "tier_a_aborts": [],
+            "tier_b_unsound": [],
+            "checked_memory_model_functions": ["snmp_parse_pdu"],
+        },
+    )
+    write_json(run_dir / "workspace/reports/wp/snmp_parse_pdu.json", report)
+    L.cmd_ingest_wp([run_dir / "workspace/reports/wp/snmp_parse_pdu.json"])
+    unit = _unit(run_dir, "rte")
+    assert unit["status"] == "blocked"
+    assert any("snmp_parse_pdu" in item for item in unit["unresolved"])
+    assert list(validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []

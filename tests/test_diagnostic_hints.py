@@ -826,3 +826,87 @@ def test_wp_hints_bool_pred_syntax_hint_recommends_implications_not_iff(error_li
     assert "'==>'" in bool_hint
     assert "(p1 ==> p2) && (p2 ==> p1)" in bool_hint
     assert all("<==>" not in h for h in hints), hints
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("unproven_goals", "log_text"),
+    [
+        ([{"kind": "assertion", "annotation": "p_end - p == 0 ==> p == p_end"}], ""),
+        ([{"kind": "loop_invariant", "annotation": "p != p_end ==> p_end - p > 0"}], ""),
+        ([{"kind": "requires", "annotation": r"\base_addr(p) == \base_addr(p_end)"}], ""),
+        ([], r"[wp] Goal typed_f_assert: Unknown (\base_addr(p) == \base_addr(p_end))"),
+    ],
+)
+def test_wp_hints_pointer_walk_recommends_ghost_index_not_ptr_anchor(unproven_goals: list[dict], log_text: str) -> None:
+    res = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "unproven_goals": unproven_goals,
+    }
+    hints = derive_wp_diagnostic_hints(res, log_text)
+    ptr_hint = next((h for h in hints if "Pointer-walk anchoring" in h), None)
+    assert ptr_hint is not None, hints
+    for expected in (
+        "/*@ ghost size_t idx = 0; */",
+        "loop invariant idx_bound: 0 <= idx <= p_end - base;",
+        "loop invariant ptr_idx: p == base + idx;",
+        r"requires \base_addr(base) == \base_addr(p_end);",
+        "/*@ ghost idx++; */",
+        r"ensures res_base: \result != \null ==> \base_addr(\result) == \base_addr(\old(buf));",
+        r"ensures res_bound: \result != \null ==> 0 <= \result - \old(buf) <= \old(buf_end) - \old(buf);",
+        "/*@ ghost idx = (size_t)(p - buf); */",
+    ):
+        assert expected in ptr_hint, expected
+    for forbidden in (
+        "ptr_anchor",
+        "end_anchor",
+        "res_anchor",
+        "ofs1 - ofs2",
+        r"p == \at(p, Pre) + (p - \at(p, Pre))",
+        r"p_end == \at(p, Pre) + (p_end - \at(p, Pre))",
+        "Pointer-difference equality bridge",
+    ):
+        assert all(forbidden not in h for h in hints), (forbidden, hints)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "anomaly_line",
+    [
+        '[wp] Warning: Goal Property: running prover Z3:4.13.3 failed ([Why3 Error] anomaly: Invalid_argument("missing free variable"))',
+        '[wp] Warning: Goal Property: running prover Alt-Ergo failed ([Why3 Error] anomaly: Invalid_argument("unbound variable in of_term"))',
+    ],
+)
+def test_wp_hints_why3_anomaly_emits_backend_hint_without_valid_p(anomaly_line: str) -> None:
+    res = {
+        "status": "wp_aborted",
+        "wp_why3_anomaly": True,
+        "soundness": {"ok": False, "tier_a_aborts": [anomaly_line], "tier_b_unsound": []},
+        "unproven_goals": [{"kind": "mem_access", "annotation": r"\valid_read(&b->header)"}],
+        "unproven_by_bucket": {"step_c_rte_obligation": [{"kind": "mem_access"}]},
+    }
+    hints = derive_wp_diagnostic_hints(res, anomaly_line)
+    assert any("Why3 backend anomaly" in h for h in hints), hints
+    assert all(r"requires \valid(p)" not in h for h in hints), hints
+
+
+@pytest.mark.unit
+def test_wp_hints_unproven_global_lemmas_named_from_soundness() -> None:
+    res = {
+        "status": "unsound_proof",
+        "soundness": {
+            "ok": False,
+            "tier_a_aborts": [],
+            "tier_b_unsound": [
+                "Unproven lemma(s) in scope (unprovable, provable): -wp-fct does not prove global lemmas yet WP assumes them as hypotheses"
+            ],
+            "unproven_global_lemmas": ["unprovable", "provable"],
+        },
+        "unproven_goals": [],
+    }
+    hints = derive_wp_diagnostic_hints(res)
+    lemma_hint = next((h for h in hints if "Unproven global ACSL lemma in scope" in h), None)
+    assert lemma_hint is not None, hints
+    assert "(unprovable, provable)" in lemma_hint
+    assert "inductive lemma required" in lemma_hint

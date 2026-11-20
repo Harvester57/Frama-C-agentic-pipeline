@@ -630,3 +630,87 @@ def test_real_layer_clause_is_credited(tmp_path):
     )
     assert res["status"] == "all_proven"
     assert res["limits"]["classes_without_real_clause"] == []
+
+
+@pytest.mark.unit
+def test_vacuity_zero_smoke_goals_clean_leaf_is_consistent():
+    # Verbatim Frama-C 34 vacuity log from MIT-licensed sysprog21/frama-c-mcp indirect-call-annotated.c :: seta
+    seta_log = (
+        "[kernel] Parsing fixtures/indirect-call-annotated.c (with preprocessing)\n"
+        "[wp] Running WP plugin...\n"
+        "[wp] Warning: Missing RTE guards\n"
+        "[wp] 2 goals scheduled\n"
+        "[wp] Proved goals:    4 / 4\n"
+        "  Terminating:     1\n"
+        "  Unreachable:     1\n"
+        "  Qed:             2\n"
+    )
+    res = W.classify_vacuity_log(seta_log, returncode=0)
+    assert res == {"status": "consistent", "doomed": [], "dead_goals": 0, "smoke_goals": 0}
+    assert wp_limits_problem({"vacuity": res}) is None
+
+    # A log with Failed / [wp] [Failed] and no Smoke Tests line must NEVER be classified consistent.
+    failed_no_smoke = "[wp] [Failed] typed_f_ensures (Qed)\n[wp] Proved goals: 1 / 2\n  Failed: 1\n"
+    res_fail = W.classify_vacuity_log(failed_no_smoke, returncode=0)
+    assert res_fail["status"] == "inconclusive"
+
+
+@pytest.mark.unit
+def test_vacuity_unknown_doomed_and_unexplained_fails_rejected_by_limits_and_apply():
+    log = (
+        "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s3 (Qed)\n"
+        "[wp] [Failed] (Doomed) typed_f_wp_smoke_unknown_kind (Qed)\n"
+        "  Smoke Tests:     2 / 4\n"
+    )
+    vac = W.classify_vacuity_log(log, returncode=0)
+    assert vac["status"] == "inconclusive"
+    assert vac["unknown_doomed"] == ["typed_f_wp_smoke_unknown_kind"]
+    assert vac["unexplained_fails"] == 1
+
+    # wp_limits_problem refuses unknown_doomed and unexplained_fails, while keeping plain inconclusive allowed.
+    prob = wp_limits_problem({"vacuity": vac})
+    assert prob is not None and "unrecognised doomed" in prob
+    prob_unexp = wp_limits_problem({"vacuity": {"status": "inconclusive", "unexplained_fails": 2}})
+    assert prob_unexp is not None and "unexplained smoke" in prob_unexp
+    assert wp_limits_problem({"vacuity": {"status": "inconclusive"}}) is None
+
+    # apply_verdict_limits fails the proof as unsound_proof.
+    applied = W.apply_verdict_limits(_report(), Path("a.c"), vac)
+    assert applied["status"] == "unsound_proof"
+    assert applied["soundness"]["ok"] is False
+    assert any("Failed smoke-test" in m for m in applied["soundness"]["tier_b_unsound"])
+    assert applied["diagnostic_hints"]
+
+
+@pytest.mark.unit
+def test_apply_verdict_limits_propagates_memory_model_hypotheses():
+    # Explicit hypotheses from scan_wp_log_soundness
+    rpt = _report(
+        soundness={
+            "ok": True,
+            "tier_a_aborts": [],
+            "tier_b_unsound": [],
+            "checked_memory_model_functions": ["two"],
+            "checked_memory_model_hypotheses": [{"function": "two", "requires": [r"\separated(p, &g)"]}],
+        }
+    )
+    out = W.apply_verdict_limits(rpt, Path("a.c"), {"status": "consistent", "doomed": [], "dead_goals": 0})
+    assert out["status"] == "all_proven"
+    assert out["limits"]["memory_model_hypotheses"] == [{"function": "two", "requires": [r"\separated(p, &g)"]}]
+    assert wp_limits_problem(out["limits"]) is None
+
+    # Fallback from legacy checked_memory_model_functions alone
+    rpt_fallback = _report(
+        soundness={
+            "ok": True,
+            "tier_a_aborts": [],
+            "tier_b_unsound": [],
+            "checked_memory_model_functions": ["two"],
+        }
+    )
+    out_fb = W.apply_verdict_limits(rpt_fallback, Path("a.c"), {"status": "consistent", "doomed": [], "dead_goals": 0})
+    assert out_fb["limits"]["memory_model_hypotheses"] == [{"function": "two", "requires": []}]
+
+    # Omitted when empty
+    out_clean = W.apply_verdict_limits(_report(), Path("a.c"), {"status": "consistent", "doomed": [], "dead_goals": 0})
+    assert "memory_model_hypotheses" not in out_clean["limits"]

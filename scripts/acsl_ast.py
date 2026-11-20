@@ -618,7 +618,11 @@ def _added_aligned_requires(base_tokens: list[Token], work_tokens: list[Token], 
 
 def find_unsound_acsl_keywords(tokens: list[Token], path: str = "<input>") -> list[str]:
     """Check all ACSL tokens in `tokens` for unsound or hazardous ACSL constructs."""
-    return _check_unsound_acsl(tokens, set(), path) + find_empty_named_behaviors(tokens, path)
+    return (
+        _check_unsound_acsl(tokens, set(), path)
+        + find_empty_named_behaviors(tokens, path)
+        + _find_unsound_recursive_logic_tokens(tokens, path)
+    )
 
 
 def verify_acsl_only(
@@ -640,6 +644,10 @@ def verify_acsl_only(
         base_acsl = {t.text for t in base_tokens if t.kind in ("acsl_block", "acsl_line")}
         errors.extend(_check_unsound_acsl(work_tokens, base_acsl, path))
         errors.extend(_added_aligned_requires(base_tokens, work_tokens, path))
+        base_rec_keys = {key for key, _msg in _find_unsound_recursive_logic_entries(base_tokens, path)}
+        errors.extend(
+            msg for key, msg in _find_unsound_recursive_logic_entries(work_tokens, path) if key not in base_rec_keys
+        )
 
     base_c = [t for t in base_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
     work_c = [t for t in work_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
@@ -2079,6 +2087,787 @@ def extract_top_level_acsl_declarations(source: str, path: str = "<input>") -> l
                     )
 
     return decls
+
+
+_TARGET_UNSOUND_AXIOM_ADMIT_RE = re.compile(r"\b(admit|axiom|axiomatic)\b")
+_MODIFIED_LEMMA_RE = re.compile(r"^\s*(?:admit|check)\s+lemma\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_SENTINEL_INDEX_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\[\s*([^\]]+)\s*\]$")
+_SENTINEL_DEREF_RE = re.compile(r"^\*\s*([A-Za-z_][A-Za-z0-9_]*)$")
+_POS_INT_RE = re.compile(r"^(\d+)[uUlL]*$")
+_CMP_OP_RE = re.compile(r"<=|>=|==|!=|<(?!=)|>(?!=)")
+
+
+def _classify_wp_inactive_cond(word: str, directive: str) -> tuple[bool, bool]:
+    """
+    Classify a preprocessor conditional arm for WP visibility.
+    Returns `(arm_inactive_for_wp, else_inactive_for_wp)`:
+    - `#if defined(__FRAMAC_EACSL__)` / `#ifdef __FRAMAC_EACSL__` / `#if 0` -> `(True, False)`
+    - `#ifndef __FRAMAC_EACSL__` / `#if !defined(__FRAMAC_EACSL__)` / `#if 1` -> `(False, True)`
+    - Any other directive -> `(False, False)`
+    """
+    rest = _COND_DIRECTIVE_RE.sub("", _DIRECTIVE_NOISE_RE.sub(" ", directive), count=1).strip()
+    if word == "ifdef":
+        return (rest == "__FRAMAC_EACSL__", False)
+    if word == "ifndef":
+        return (False, rest == "__FRAMAC_EACSL__")
+    cond = re.sub(r"\s+", "", _DEFINED_OPERAND_RE.sub(lambda m: f"defined({m.group(1) or m.group(2)})", rest))
+    cond = _strip_outer_parens(cond)
+    if cond == "0":
+        return (True, False)
+    if cond == "1":
+        return (False, True)
+    if cond in ("defined(__FRAMAC_EACSL__)", "__FRAMAC_EACSL__"):
+        return (True, False)
+    if cond.startswith("!"):
+        inner = _strip_outer_parens(cond[1:])
+        if inner in ("defined(__FRAMAC_EACSL__)", "__FRAMAC_EACSL__"):
+            return (False, True)
+    if len(_split_top_level(cond, "||")) == 1:
+        for part in _split_top_level(cond, "&&"):
+            atom = _strip_outer_parens(part)
+            if atom in ("0", "defined(__FRAMAC_EACSL__)", "__FRAMAC_EACSL__"):
+                return (True, False)
+    return (False, False)
+
+
+def _eacsl_only_token_indices(tokens: list[Token]) -> set[int]:
+    """Token indices inside `#if defined(__FRAMAC_EACSL__)` (or `#if 0`) blocks that WP never parses."""
+    skipped: set[int] = set()
+    # Each frame: [parent_inactive, current_inactive, else_inactive]
+    stack: list[list[bool]] = []
+    for idx, tok in enumerate(tokens):
+        if tok.kind == "pp_directive":
+            m = _COND_DIRECTIVE_RE.match(tok.text.lstrip())
+            if m:
+                word = m.group(1)
+                if word in ("if", "ifdef", "ifndef"):
+                    parent_in = bool(stack and (stack[-1][0] or stack[-1][1]))
+                    cur_in, else_in = _classify_wp_inactive_cond(word, tok.text)
+                    stack.append([parent_in, cur_in, else_in])
+                elif word == "elif" and stack:
+                    parent_in, _old_cur, old_else = stack[-1]
+                    cur_in, new_else = _classify_wp_inactive_cond(word, tok.text)
+                    stack[-1] = [parent_in, True if old_else else cur_in, old_else or new_else]
+                elif word == "else" and stack:
+                    parent_in, _old_cur, old_else = stack[-1]
+                    stack[-1] = [parent_in, old_else, False]
+                elif word == "endif" and stack:
+                    stack.pop()
+                continue
+        if stack and (stack[-1][0] or stack[-1][1]):
+            skipped.add(idx)
+    return skipped
+
+
+def _iter_wp_top_level_acsl_segments(tokens: list[Token]) -> Iterator[_AcslSegment]:
+    """
+    Yield top-level ACSL segments visible to WP, ignoring C comments, string/char literals,
+    doxygen comments (`/*@{`, `/*@}`, `/*@*`, `//@{`, ...), `/*@ ghost ... */` blocks, and
+    `#if defined(__FRAMAC_EACSL__)` conditional blocks. Expands `axiomatic { ... }` bodies.
+    """
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
+    eacsl_skipped = _eacsl_only_token_indices(tokens)
+    brace_depth = 0
+    paren_depth = 0
+
+    def _yield_segments(inner_text: str, start_line: int) -> Iterator[_AcslSegment]:
+        for seg in _parse_acsl_inner_segments(inner_text, start_line):
+            yield seg
+            if seg.kind == "axiomatic":
+                open_b = seg.raw_text.find("{")
+                close_b = seg.raw_text.rfind("}")
+                if open_b != -1 and close_b > open_b:
+                    ax_line = seg.line + seg.raw_text.count("\n", 0, open_b)
+                    yield from _yield_segments(seg.raw_text[open_b + 1 : close_b], ax_line)
+
+    for tok_idx, tok in enumerate(tokens):
+        if tok_idx in linkage:
+            continue
+        if tok.kind == "c_token":
+            if tok.text == "{":
+                brace_depth += 1
+            elif tok.text == "}":
+                brace_depth = max(0, brace_depth - 1)
+            elif tok.text == "(":
+                paren_depth += 1
+            elif tok.text == ")":
+                paren_depth = max(0, paren_depth - 1)
+            continue
+
+        if tok_idx in eacsl_skipped:
+            continue
+        if brace_depth == 0 and paren_depth == 0 and tok.kind in ("acsl_block", "acsl_line"):
+            if _is_doxygen_comment(tok.text):
+                continue
+            raw_inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
+            if _GHOST_ANNOTATION_RE.match(raw_inner):
+                continue
+            _shape, visible = _kernel_views(tok.text)
+            vis_inner = visible[3:-2] if tok.kind == "acsl_block" else visible[3:]
+            yield from _yield_segments(vis_inner, tok.line)
+
+
+def find_top_level_lemmas(source: str, path: str = "<input>") -> list[str]:
+    """
+    Return names of top-level ACSL `lemma` declarations (standalone or inside `axiomatic`) in `source`,
+    ignoring C/ACSL comments, string/char literals, doxygen comments, and `#if defined(__FRAMAC_EACSL__)` blocks.
+    """
+    tokens = tokenize_c_acsl(source, path=path)
+    lemmas: list[str] = []
+    for seg in _iter_wp_top_level_acsl_segments(tokens):
+        if seg.kind == "lemma" and seg.name:
+            lemmas.append(seg.name)
+        elif seg.kind in ("admit", "check"):
+            m_mod = _MODIFIED_LEMMA_RE.match(seg.raw_text)
+            if m_mod:
+                lemmas.append(m_mod.group(1))
+    return list(dict.fromkeys(lemmas))
+
+
+def find_target_unsound_axioms_or_admits(source: str, path: str = "<input>") -> list[str]:
+    """
+    Return soundness errors for any `axiom`, `axiomatic`, or `admit` ACSL construct in `source`
+    (ignoring C/ACSL comments, string/char literals, doxygen comments, and `#if defined(__FRAMAC_EACSL__)` blocks).
+    """
+    tokens = tokenize_c_acsl(source, path=path)
+    eacsl_skipped = _eacsl_only_token_indices(tokens)
+    errors: list[str] = []
+    for idx, tok in enumerate(tokens):
+        if idx in eacsl_skipped or tok.kind not in ("acsl_block", "acsl_line"):
+            continue
+        if _is_doxygen_comment(tok.text):
+            continue
+        flat = _scrub_acsl_literals(tok.text).replace("@", " ")
+        seen_kws = list(dict.fromkeys(m.group(1) for m in _TARGET_UNSOUND_AXIOM_ADMIT_RE.finditer(flat)))
+        for kw in seen_kws:
+            errors.append(f"{path}:{tok.line}: forbidden unsound ACSL construct '{kw}' in target source")
+    return errors
+
+
+@dataclass(slots=True, frozen=True)
+class _LogicDef:
+    kind: str  # "logic" | "predicate"
+    name: str
+    params: tuple[str, ...]
+    body: str
+    line: int
+
+
+def _mask_expr_literals(expr: str) -> str:
+    """Blank string and char literal contents in an ACSL expression while keeping exact length."""
+    return mask_comments_and_literals(expr, acsl="keep", literals=True, on_error="mask")
+
+
+def _extract_logic_param_names(header: str, decl_name: str) -> tuple[str, ...]:
+    """Extract parameter identifier names from a `logic` / `predicate` header before `=`."""
+    masked = _mask_expr_literals(header)
+    pos = -1
+    for m in re.finditer(rf"\b{re.escape(decl_name)}\b", masked):
+        pos = m.end()
+        tail = masked[pos:].lstrip()
+        if not tail or tail[0] in "(<{":
+            break
+    if pos == -1:
+        return ()
+    i = pos
+    n = len(masked)
+    while i < n:
+        while i < n and masked[i].isspace():
+            i += 1
+        if i < n and masked[i] in "<{":
+            open_ch = masked[i]
+            close_ch = ">" if open_ch == "<" else "}"
+            depth = 1
+            i += 1
+            while i < n and depth > 0:
+                if masked[i] == open_ch:
+                    depth += 1
+                elif masked[i] == close_ch:
+                    depth -= 1
+                i += 1
+            continue
+        break
+    if i >= n or masked[i] != "(":
+        return ()
+    depth = 1
+    i += 1
+    p_start = i
+    raw_params: list[str] = []
+    while i < n and depth > 0:
+        ch = masked[i]
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            depth -= 1
+            if depth == 0:
+                raw_params.append(header[p_start:i])
+                break
+        elif ch == "," and depth == 1:
+            raw_params.append(header[p_start:i])
+            p_start = i + 1
+        i += 1
+    names: list[str] = []
+    for raw in raw_params:
+        cleaned = re.sub(r"\[[^\]]*\]", "", raw).strip()
+        if not cleaned or cleaned == "void":
+            continue
+        ids = _IDENT_RE.findall(cleaned)
+        if not ids:
+            continue
+        candidate = ids[-1]
+        if candidate.lower() in _C_TYPE_KEYWORDS:
+            continue
+        names.append(candidate)
+    return tuple(names)
+
+
+def _extract_logic_def(seg: _AcslSegment) -> _LogicDef | None:
+    """Parse a `logic ... = body;` or `predicate ... = body;` segment; None when it has no `=` body."""
+    if seg.kind not in ("logic", "predicate") or not seg.name:
+        return None
+    raw = seg.raw_text
+    masked = _mask_expr_literals(raw)
+    depth = 0
+    eq_pos = -1
+    n = len(masked)
+    i = 0
+    while i < n:
+        ch = masked[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and ch == "=":
+            prev_ch = masked[i - 1] if i > 0 else ""
+            next_ch = masked[i + 1] if i + 1 < n else ""
+            if prev_ch not in ("=", "!", "<", ">") and next_ch != "=":
+                eq_pos = i
+                break
+        i += 1
+    if eq_pos == -1:
+        return None
+    header = raw[:eq_pos]
+    body = raw[eq_pos + 1 :].strip()
+    if body.endswith(";"):
+        body = body[:-1].strip()
+    if not body:
+        return None
+    params = _extract_logic_param_names(header, seg.name)
+    return _LogicDef(kind=seg.kind, name=seg.name, params=params, body=body, line=seg.line)
+
+
+def _split_call_args(args_text: str) -> list[str]:
+    """Split a comma-separated ACSL call argument list respecting brackets and literals."""
+    if not args_text.strip():
+        return []
+    masked = _mask_expr_literals(args_text)
+    depth = 0
+    parts: list[str] = []
+    start = 0
+    for i, ch in enumerate(masked):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            parts.append(args_text[start:i].strip())
+            start = i + 1
+    parts.append(args_text[start:].strip())
+    return parts
+
+
+def _extract_logic_calls(body: str, zero_arg_names: frozenset[str]) -> list[tuple[str, int, list[str]]]:
+    """
+    Extract all logic/predicate calls `(name, arity, args)` occurring in `body` (including nested calls
+    inside arguments and `\\at(...)`), skipping literals, backslash builtins, and struct member accesses.
+    """
+    masked = _mask_expr_literals(body)
+    n = len(masked)
+    calls: list[tuple[str, int, list[str]]] = []
+    i = 0
+    while i < n:
+        ch = masked[i]
+        if ch == "\\":
+            m_bs = _IDENT_RE.match(masked, i + 1)
+            i = m_bs.end() if m_bs else (i + 1)
+            continue
+        m_id = _IDENT_RE.match(masked, i)
+        if not m_id:
+            i += 1
+            continue
+        name = m_id.group(0)
+        prev_idx = i - 1
+        while prev_idx >= 0 and masked[prev_idx].isspace():
+            prev_idx -= 1
+        is_member = prev_idx >= 0 and (
+            masked[prev_idx] == "." or (masked[prev_idx] == ">" and prev_idx > 0 and masked[prev_idx - 1] == "-")
+        )
+        j = m_id.end()
+        if not is_member:
+            k = j
+            while k < n and masked[k].isspace():
+                k += 1
+            # Skip optional `{L1, L2}` label arguments on a logic/predicate call
+            if k < n and masked[k] == "{":
+                b_depth = 1
+                k += 1
+                while k < n and b_depth > 0:
+                    if masked[k] == "{":
+                        b_depth += 1
+                    elif masked[k] == "}":
+                        b_depth -= 1
+                    k += 1
+                while k < n and masked[k].isspace():
+                    k += 1
+            if k < n and masked[k] == "(":
+                p_depth = 1
+                m_pos = k + 1
+                while m_pos < n and p_depth > 0:
+                    if masked[m_pos] == "(":
+                        p_depth += 1
+                    elif masked[m_pos] == ")":
+                        p_depth -= 1
+                    m_pos += 1
+                if p_depth == 0:
+                    args = _split_call_args(body[k + 1 : m_pos - 1])
+                    calls.append((name, len(args), args))
+                    # Advance only past the identifier so nested calls inside arguments are also scanned.
+            elif name in zero_arg_names:
+                calls.append((name, 0, []))
+        i = j
+    return calls
+
+
+def _split_top_level_masked(expr: str, op: str) -> list[str]:
+    """Split `expr` on top-level `op` outside brackets and string/char literals."""
+    masked = _mask_expr_literals(expr)
+    top = _top_level_positions(masked)
+    parts: list[str] = []
+    start = i = 0
+    while i < len(masked):
+        if top[i] and masked.startswith(op, i) and not (op == "==>" and i > 0 and masked[i - 1] == "<"):
+            parts.append(expr[start:i].strip())
+            i += len(op)
+            start = i
+        else:
+            i += 1
+    parts.append(expr[start:].strip())
+    return parts
+
+
+def _split_top_level_ternary(expr: str) -> tuple[str, str, str] | None:
+    """If `expr` is a top-level `cond ? then_expr : else_expr`, return `(cond, then_expr, else_expr)`."""
+    masked = _mask_expr_literals(expr)
+    top = _top_level_positions(masked)
+    q_pos = -1
+    for i, ch in enumerate(masked):
+        if top[i] and ch == "?":
+            q_pos = i
+            break
+    if q_pos == -1:
+        return None
+    q_depth = 1
+    for j in range(q_pos + 1, len(masked)):
+        if not top[j]:
+            continue
+        if masked[j] == "?":
+            q_depth += 1
+        elif masked[j] == ":":
+            q_depth -= 1
+            if q_depth == 0:
+                return expr[:q_pos].strip(), expr[q_pos + 1 : j].strip(), expr[j + 1 :].strip()
+    return None
+
+
+def _strip_outer_parens_masked(expr: str) -> str:
+    """Strip balanced outer parentheses from `expr`, ignoring parentheses inside literals."""
+    text = expr.strip()
+    while text.startswith("(") and text.endswith(")"):
+        masked = _mask_expr_literals(text)
+        depth = 0
+        closes_early = False
+        for i, ch in enumerate(masked):
+            depth += (ch == "(") - (ch == ")")
+            if depth == 0 and i < len(masked) - 1:
+                closes_early = True
+                break
+        if closes_early or depth != 0:
+            return text
+        text = text[1:-1].strip()
+    return text
+
+
+def _record_rel_constraint(
+    out: dict[str, list[tuple[str, str | None]]],
+    lhs: str,
+    op: str,
+    rhs: str,
+    polarity: str,
+    param_set: frozenset[str],
+) -> None:
+    """
+    Record guarded descent/advance directions from one atomic relation `lhs op rhs`.
+    `polarity == 'base_when_true'` means the relation triggers the base case (its negation holds in recursion);
+    `polarity == 'rec_when_true'` means the relation holds in the recursive branch.
+    """
+    if polarity == "rec_when_true":
+        flip = {"<=": ">", "<": ">=", ">=": "<", ">": "<=", "==": "!=", "!=": "=="}
+        op = flip[op]
+    lhs = _strip_outer_parens_masked(lhs)
+    rhs = _strip_outer_parens_masked(rhs)
+
+    def _add(p: str, direction: str, partner: str | None = None) -> None:
+        entry = (direction, partner)
+        lst = out.setdefault(p, [])
+        if entry not in lst:
+            lst.append(entry)
+
+    # Sentinel base checks: `s[0] == '\0'`, `*s == '\0'`, `buf[i] == '\0'` (or symmetric)
+    if op == "==":
+        for side in (lhs, rhs):
+            m_idx = _SENTINEL_INDEX_RE.match(side)
+            if m_idx:
+                base_id, idx_expr = m_idx.group(1), _strip_outer_parens_masked(m_idx.group(2))
+                if base_id in param_set and _POS_INT_RE.match(idx_expr):
+                    _add(base_id, "up")
+                elif idx_expr in param_set:
+                    _add(idx_expr, "up")
+            m_deref = _SENTINEL_DEREF_RE.match(side)
+            if m_deref and m_deref.group(1) in param_set:
+                _add(m_deref.group(1), "up")
+
+    lhs_is_p = lhs in param_set
+    rhs_is_p = rhs in param_set
+    if op in ("<=", "<"):
+        # Base `lhs <= rhs`: in recursion `lhs > rhs` (lhs bounded below -> down; rhs bounded above -> up)
+        if lhs_is_p:
+            _add(lhs, "down", rhs if rhs_is_p else None)
+        if rhs_is_p:
+            _add(rhs, "up", lhs if lhs_is_p else None)
+    elif op in (">=", ">"):
+        # Base `lhs >= rhs`: in recursion `lhs < rhs` (lhs bounded above -> up; rhs bounded below -> down)
+        if lhs_is_p:
+            _add(lhs, "up", rhs if rhs_is_p else None)
+        if rhs_is_p:
+            _add(rhs, "down", lhs if lhs_is_p else None)
+    elif op == "==":
+        if lhs_is_p and rhs_is_p and lhs != rhs:
+            _add(lhs, "down", rhs)
+            _add(lhs, "up", rhs)
+            _add(rhs, "down", lhs)
+            _add(rhs, "up", lhs)
+        elif lhs_is_p:
+            m_lit = _POS_INT_RE.match(rhs)
+            if m_lit and int(m_lit.group(1)) in (0, 1):
+                _add(lhs, "down")
+        elif rhs_is_p:
+            m_lit = _POS_INT_RE.match(lhs)
+            if m_lit and int(m_lit.group(1)) in (0, 1):
+                _add(rhs, "down")
+
+
+def _extract_guard_constraints(
+    cond: str, polarity: str, param_set: frozenset[str], out: dict[str, list[tuple[str, str | None]]]
+) -> None:
+    """Populate `out` with guarded parameter directions guaranteed to hold in the recursive branch."""
+    cur = _strip_outer_parens_masked(cond)
+    if not cur:
+        return
+    if cur.startswith("!") and not cur.startswith("!="):
+        inner = cur[1:].strip()
+        if inner.startswith("(") and _strip_outer_parens_masked(inner) != inner:
+            flipped = "rec_when_true" if polarity == "base_when_true" else "base_when_true"
+            _extract_guard_constraints(inner, flipped, param_set, out)
+            return
+    # Boolean duality: base(A || B) => rec(!A && !B); rec(A && B) => rec(A) and rec(B).
+    split_op = "||" if polarity == "base_when_true" else "&&"
+    parts = _split_top_level_masked(cur, split_op)
+    if len(parts) > 1:
+        for part in parts:
+            _extract_guard_constraints(part, polarity, param_set, out)
+        return
+    # Reject the dual connective (base(A && B) or rec(A || B) does not guarantee both hold).
+    dual_op = "&&" if polarity == "base_when_true" else "||"
+    if len(_split_top_level_masked(cur, dual_op)) > 1:
+        return
+    masked = _mask_expr_literals(cur)
+    top = _top_level_positions(masked)
+    ops = [
+        m
+        for m in _CMP_OP_RE.finditer(masked)
+        if top[m.start()]
+        and not (m.group(0) == "==" and m.end() < len(masked) and masked[m.end()] == ">")
+        and not (m.group(0) == "<=" and m.end() < len(masked) and masked[m.end()] == "=")
+    ]
+    if len(ops) == 1:
+        m = ops[0]
+        _record_rel_constraint(out, cur[: m.start()], m.group(0), cur[m.end() :], polarity, param_set)
+    elif len(ops) == 2 and polarity == "rec_when_true":
+        # Chained ACSL comparison `0 <= lo < hi` is a conjunction in rec_when_true.
+        m1, m2 = ops
+        _record_rel_constraint(out, cur[: m1.start()], m1.group(0), cur[m1.end() : m2.start()], polarity, param_set)
+        _record_rel_constraint(out, cur[m1.end() : m2.start()], m2.group(0), cur[m2.end() :], polarity, param_set)
+
+
+def _match_param_step(arg: str, param: str) -> tuple[str, int] | None:
+    """
+    Classify how `arg` changes `param`:
+    - `param` -> `("same", 0)`
+    - `param - c` (integer `c > 0`) -> `("down", c)`
+    - `param + c` or `c + param` (integer `c > 0`) -> `("up", c)`
+    - anything else -> `None`
+    """
+    cur = _strip_outer_parens_masked(arg)
+    if cur == param:
+        return ("same", 0)
+    masked = _mask_expr_literals(cur)
+    top = _top_level_positions(masked)
+    ops: list[tuple[int, str]] = []
+    for idx, ch in enumerate(masked):
+        if top[idx] and ch in "+-" and idx > 0:
+            # Skip `->` pointer arrow
+            if ch == "-" and idx + 1 < len(masked) and masked[idx + 1] == ">":
+                continue
+            ops.append((idx, ch))
+    if len(ops) != 1:
+        return None
+    op_idx, op = ops[0]
+    lhs = _strip_outer_parens_masked(cur[:op_idx])
+    rhs = _strip_outer_parens_masked(cur[op_idx + 1 :])
+    if op == "-" and lhs == param:
+        m_c = _POS_INT_RE.match(rhs)
+        if m_c and int(m_c.group(1)) > 0:
+            return ("down", int(m_c.group(1)))
+    elif op == "+":
+        if lhs == param:
+            m_c = _POS_INT_RE.match(rhs)
+            if m_c and int(m_c.group(1)) > 0:
+                return ("up", int(m_c.group(1)))
+        elif rhs == param:
+            m_c = _POS_INT_RE.match(lhs)
+            if m_c and int(m_c.group(1)) > 0:
+                return ("up", int(m_c.group(1)))
+    return None
+
+
+def _is_well_founded_self_recursion(d: _LogicDef, self_calls: list[list[str]]) -> bool:
+    """
+    Return True iff direct self-recursion in `d` has BOTH:
+    (a) a terminating base-case guard on a parameter (`? :`, `==>`, `||`, or `&&`), AND
+    (b) every recursive call strictly descends/advances on that guarded parameter in the guarded direction.
+    """
+    if not d.params or not self_calls:
+        return False
+    arity = len(d.params)
+    param_set = frozenset(d.params)
+    param_index = {p: idx for idx, p in enumerate(d.params)}
+    zero_names = frozenset({d.name}) if arity == 0 else frozenset()
+
+    def _has_self_call(expr: str) -> bool:
+        return any(name == d.name and ca == arity for name, ca, _args in _extract_logic_calls(expr, zero_names))
+
+    constraints: dict[str, list[tuple[str, str | None]]] = {}
+    found_base_split = False
+    cur = _strip_outer_parens_masked(d.body)
+    # Descend through chained base-case guards (e.g. `p == \null ? 0 : n <= 0 ? 0 : f(p, n - 1)`)
+    for _ in range(16):
+        tern = _split_top_level_ternary(cur)
+        if tern is not None:
+            cond, then_e, else_e = tern
+            then_rec, else_rec = _has_self_call(then_e), _has_self_call(else_e)
+            if not then_rec and else_rec:
+                found_base_split = True
+                _extract_guard_constraints(cond, "base_when_true", param_set, constraints)
+                cur = _strip_outer_parens_masked(else_e)
+                continue
+            if then_rec and not else_rec:
+                found_base_split = True
+                _extract_guard_constraints(cond, "rec_when_true", param_set, constraints)
+                cur = _strip_outer_parens_masked(then_e)
+                continue
+            break
+        imp = _split_top_level_masked(cur, "==>")
+        if len(imp) >= 2:
+            lhs = imp[0]
+            rhs = " ==> ".join(imp[1:])
+            if not _has_self_call(lhs) and _has_self_call(rhs):
+                found_base_split = True
+                _extract_guard_constraints(lhs, "rec_when_true", param_set, constraints)
+                cur = _strip_outer_parens_masked(rhs)
+                continue
+        disj = _split_top_level_masked(cur, "||")
+        if len(disj) >= 2:
+            non_rec = [p for p in disj if not _has_self_call(p)]
+            rec = [p for p in disj if _has_self_call(p)]
+            if non_rec and rec:
+                found_base_split = True
+                for g in non_rec:
+                    _extract_guard_constraints(g, "base_when_true", param_set, constraints)
+                if len(rec) == 1:
+                    cur = _strip_outer_parens_masked(rec[0])
+                    continue
+                break
+        conj = _split_top_level_masked(cur, "&&")
+        if len(conj) >= 2:
+            non_rec = [p for p in conj if not _has_self_call(p)]
+            rec = [p for p in conj if _has_self_call(p)]
+            if non_rec and rec:
+                found_base_split = True
+                for g in non_rec:
+                    _extract_guard_constraints(g, "rec_when_true", param_set, constraints)
+                if len(rec) == 1:
+                    cur = _strip_outer_parens_masked(rec[0])
+                    continue
+                break
+        break
+
+    if not found_base_split or not constraints:
+        return False
+
+    for p, dirs in constraints.items():
+        p_idx = param_index[p]
+        for direction, partner in dirs:
+            opposite = "up" if direction == "down" else "down"
+            ok = True
+            for args in self_calls:
+                if len(args) != arity:
+                    ok = False
+                    break
+                step = _match_param_step(args[p_idx], p)
+                if step is None or step[0] != direction:
+                    ok = False
+                    break
+                if partner is not None and partner in param_index:
+                    q_idx = param_index[partner]
+                    q_step = _match_param_step(args[q_idx], partner)
+                    if q_step is None or q_step[0] not in ("same", opposite):
+                        ok = False
+                        break
+            if ok:
+                return True
+    return False
+
+
+def _tarjan_scc(
+    nodes: list[tuple[str, int]], edges: dict[tuple[str, int], set[tuple[str, int]]]
+) -> list[list[tuple[str, int]]]:
+    """Tarjan's strongly connected components algorithm over directed graph `(nodes, edges)`."""
+    index_counter = 0
+    indices: dict[tuple[str, int], int] = {}
+    lowlink: dict[tuple[str, int], int] = {}
+    stack: list[tuple[str, int]] = []
+    on_stack: set[tuple[str, int]] = set()
+    sccs: list[list[tuple[str, int]]] = []
+
+    def strongconnect(v: tuple[str, int]) -> None:
+        nonlocal index_counter
+        indices[v] = index_counter
+        lowlink[v] = index_counter
+        index_counter += 1
+        stack.append(v)
+        on_stack.add(v)
+        for w in sorted(edges.get(v, ())):
+            if w not in indices:
+                strongconnect(w)
+                lowlink[v] = min(lowlink[v], lowlink[w])
+            elif w in on_stack:
+                lowlink[v] = min(lowlink[v], indices[w])
+        if lowlink[v] == indices[v]:
+            comp: list[tuple[str, int]] = []
+            while True:
+                w = stack.pop()
+                on_stack.remove(w)
+                comp.append(w)
+                if w == v:
+                    break
+            sccs.append(comp)
+
+    for node in nodes:
+        if node not in indices:
+            strongconnect(node)
+    return sccs
+
+
+def _find_unsound_recursive_logic_entries(tokens: list[Token], path: str = "<input>") -> list[tuple[str, str]]:
+    """
+    Detect mutually recursive or non-well-founded self-recursive top-level `logic`/`predicate` definitions.
+    Returns `[(stable_key, error_message), ...]` so callers can diff against baseline without line-shift noise.
+    """
+    defs: list[_LogicDef] = []
+    for seg in _iter_wp_top_level_acsl_segments(tokens):
+        d = _extract_logic_def(seg)
+        if d is not None:
+            defs.append(d)
+    if not defs:
+        return []
+
+    defs_by_key: dict[tuple[str, int], list[_LogicDef]] = {}
+    for d in defs:
+        defs_by_key.setdefault((d.name, len(d.params)), []).append(d)
+    nodes = list(defs_by_key.keys())
+    node_set = set(nodes)
+    zero_arg_names = frozenset(name for name, arity in nodes if arity == 0)
+
+    edges: dict[tuple[str, int], set[tuple[str, int]]] = {k: set() for k in nodes}
+    self_calls_by_def: dict[int, list[list[str]]] = {}
+    for d_idx, d in enumerate(defs):
+        src_key = (d.name, len(d.params))
+        calls = _extract_logic_calls(d.body, zero_arg_names)
+        sc: list[list[str]] = []
+        for cname, carity, cargs in calls:
+            dst_key = (cname, carity)
+            if dst_key in node_set:
+                edges[src_key].add(dst_key)
+                if dst_key == src_key:
+                    sc.append(cargs)
+        self_calls_by_def[d_idx] = sc
+
+    mutual_nodes: dict[tuple[str, int], list[str]] = {}
+    for comp in _tarjan_scc(nodes, edges):
+        if len(comp) > 1:
+            names = sorted({n for n, _a in comp})
+            for k in comp:
+                mutual_nodes[k] = names
+
+    entries: list[tuple[str, str]] = []
+    for d_idx, d in enumerate(defs):
+        key = (d.name, len(d.params))
+        if key in mutual_nodes:
+            cycle_txt = ", ".join(mutual_nodes[key])
+            entries.append(
+                (
+                    f"mutual:{d.kind}:{d.name}/{len(d.params)}",
+                    f"{path}:{d.line}: unsound mutually recursive ACSL {d.kind} '{d.name}' "
+                    f"(cycle: {cycle_txt}); recursive ACSL definitions without well-founded termination "
+                    "make WP hypotheses inconsistent",
+                )
+            )
+            continue
+        sc = self_calls_by_def[d_idx]
+        if sc and not _is_well_founded_self_recursion(d, sc):
+            entries.append(
+                (
+                    f"self:{d.kind}:{d.name}/{len(d.params)}",
+                    f"{path}:{d.line}: unsound non-well-founded recursive ACSL {d.kind} '{d.name}' "
+                    "(requires both a terminating base-case guard and strict descent/advance on a guarded parameter)",
+                )
+            )
+    return entries
+
+
+def _find_unsound_recursive_logic_tokens(tokens: list[Token], path: str = "<input>") -> list[str]:
+    return [msg for _key, msg in _find_unsound_recursive_logic_entries(tokens, path=path)]
+
+
+def find_unsound_recursive_logic(source: str, path: str = "<input>") -> list[str]:
+    """
+    Detect non-well-founded recursive or mutually recursive top-level ACSL `logic`/`predicate`
+    definitions in `source` (skipping comments, literals, doxygen comments, and
+    `#if defined(__FRAMAC_EACSL__)` conditional blocks).
+    """
+    tokens = tokenize_c_acsl(source, path=path)
+    return _find_unsound_recursive_logic_tokens(tokens, path=path)
 
 
 def added_top_level_acsl_declarations(base_text: str, agent_text: str, path: str = "<input>") -> list[str]:

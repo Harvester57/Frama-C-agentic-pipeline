@@ -1809,3 +1809,357 @@ def test_run_wp_on_function_oom_before_wp_omits_partial_verdicts(
     assert res["reason"] == "oom_killed"
     assert "partial_verdicts" not in res
     assert any("Frama-C WP terminated before producing a report" in h for h in res["diagnostic_hints"])
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 Soundness & Classification Tests (Frama-C 34 logs/CSVs from
+# MIT-licensed sysprog21/frama-c-mcp fixtures, commit 4b935a0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_collect_target_sources_in_scope_resolves_local_headers_and_excludes_libc_and_stubs(
+    tmp_path: Path,
+) -> None:
+    src_dir = tmp_path / "src"
+    inc_dir = tmp_path / "include"
+    libc_dir = tmp_path / "share" / "libc"
+    stubs_dir = tmp_path / "templates" / "fc_stubs"
+    for d in (src_dir, inc_dir, libc_dir, stubs_dir):
+        d.mkdir(parents=True)
+
+    (inc_dir / "b.h").write_text("/*@ lemma hidden_in_b: \\false; */\n", encoding="utf-8")
+    (src_dir / "a.h").write_text('#include "b.h"\n', encoding="utf-8")
+    (libc_dir / "fake_libc.h").write_text("/*@ axiom libc_ax: \\true; */\n", encoding="utf-8")
+    (stubs_dir / "fake_stub.h").write_text("/*@ axiom stub_ax: \\true; */\n", encoding="utf-8")
+    c_file = src_dir / "main.c"
+    c_file.write_text(
+        '#include "a.h"\n'
+        '#include "fake_libc.h"\n'
+        '#include "fake_stub.h"\n'
+        '/* #include "commented.h" */\n'
+        "int main(void) { return 0; }\n",
+        encoding="utf-8",
+    )
+
+    found = W.collect_target_sources_in_scope(
+        c_file,
+        cppflags=f"-I{inc_dir} -I{libc_dir} -I{stubs_dir}",
+    )
+    names = [p.name for p in found]
+    assert names == ["main.c", "a.h", "b.h"]
+
+
+@pytest.mark.unit
+def test_run_wp_rejects_global_lemma_axiom_and_recursive_logic_in_target_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_dir = tmp_path / "wp"
+
+    def _run_case(name: str, c_text: str, fn_name: str, header_text: str | None = None) -> dict:
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        if header_text is not None:
+            (case_dir / "defs.h").write_text(header_text, encoding="utf-8")
+        c_file = case_dir / f"{name}.c"
+        c_file.write_text(c_text, encoding="utf-8")
+
+        # Frama-C 34 -wp-fct emits 4/4 Valid and 0 lemma/axiom rows in -report-csv.
+        csv_body = (
+            CSV_HEADER
+            + f".\t{c_file.name}\t{fn_name}\t5\tpostcondition\tValid\t\\result == 42\n"
+            + f".\t{c_file.name}\t{fn_name}\t7\tassigns clause\tValid\tassigns \\nothing;\n"
+        )
+        wp_log = (
+            f"[kernel] Parsing {c_file.name} (with preprocessing)\n"
+            "[wp] Running WP plugin...\n"
+            "[wp] 2 goals scheduled\n"
+            "[wp] Proved goals:    4 / 4\n"
+            "  Terminating:       1\n"
+            "  Unreachable:       1\n"
+            "  Qed:               1\n"
+            "  Alt-Ergo 2.4.3:    1 (4ms)\n"
+        )
+
+        def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "-report-csv" in cmd:
+                Path(cmd[cmd.index("-report-csv") + 1]).write_text(csv_body, encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout=wp_log, stderr="")
+
+        monkeypatch.setattr(W.subprocess, "run", fake_run)
+        return W.run_wp_on_function(
+            c_file, fn_name, out_dir / name, cache_dir="off", retry_bitwise=False, retry_tail=False, retry_bytes=False
+        )
+
+    # 1. Probe 1a: lemma without requires (MIT: adapted from sysprog21/frama-c-mcp lemma-unproved.c)
+    res_lem = _run_case(
+        "lemma_no_req",
+        "/*@ lemma unprovable: \\false; */\n"
+        "/*@ assigns \\nothing; ensures \\result == 42; */\n"
+        "int lemma_dependent_noreq(int x) { return x; }\n",
+        "lemma_dependent_noreq",
+    )
+    assert res_lem["status"] == "unsound_proof"
+    assert res_lem["soundness"]["ok"] is False
+    assert res_lem["soundness"]["unproven_global_lemmas"] == ["unprovable"]
+    assert any("unproven lemma" in m.lower() and "unprovable" in m for m in res_lem["soundness"]["tier_b_unsound"])
+    assert any("Unproven global ACSL lemma in scope (unprovable)" in h for h in res_lem["diagnostic_hints"])
+
+    # 1b. Lemma included from a local quoted header
+    res_hdr_lem = _run_case(
+        "hdr_lemma",
+        '#include "defs.h"\n/*@ assigns \\nothing; */\nint fn_hdr(int x) { return x; }\n',
+        "fn_hdr",
+        header_text="/*@ lemma hdr_lem: \\false; */\n",
+    )
+    assert res_hdr_lem["status"] == "unsound_proof"
+    assert res_hdr_lem["soundness"]["unproven_global_lemmas"] == ["hdr_lem"]
+
+    # 2. Global axiom in target file (MIT: sysprog21/frama-c-mcp axiom-licensed.c :: main)
+    res_ax = _run_case(
+        "axiom_main",
+        "/*@ axiom bogus: \\false; */\nint main(void) { return 0; }\n",
+        "main",
+    )
+    assert res_ax["status"] == "unsound_proof"
+    assert res_ax["soundness"]["ok"] is False
+    assert any("'axiom'" in m for m in res_ax["soundness"]["tier_b_unsound"])
+
+    # 3. Non-well-founded recursive logic (MIT: sysprog21/frama-c-mcp recursive-logic-unsound.c :: f)
+    res_rec = _run_case(
+        "rec_logic",
+        "/*@ logic integer bad(integer n) = bad(n) + 1; */\n"
+        "/*@ assigns \\nothing; ensures bad(x) >= 0 ==> \\result == 998; */\n"
+        "int f(int x) { return 0; }\n",
+        "f",
+    )
+    assert res_rec["status"] == "unsound_proof"
+    assert res_rec["soundness"]["ok"] is False
+    assert any("recursive ACSL" in m and "bad" in m for m in res_rec["soundness"]["tier_b_unsound"])
+
+
+@pytest.mark.unit
+def test_run_wp_csv_fails_closed_on_inconsistent_assumed_other_and_counts_partially_proven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c_file = tmp_path / "csv_cases.c"
+    c_file.write_text("int f(int x) { return x; }\n", encoding="utf-8")
+
+    def _run_csv(tag: str, rows: list[str], proved_line: str = "[wp] Proved goals: 2 / 2\n") -> dict:
+        def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "-report-csv" in cmd:
+                Path(cmd[cmd.index("-report-csv") + 1]).write_text(CSV_HEADER + "".join(rows), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout=proved_line, stderr="")
+
+        monkeypatch.setattr(W.subprocess, "run", fake_run)
+        return W.run_wp_on_function(
+            c_file, "f", tmp_path / tag, cache_dir="off", retry_bitwise=False, retry_tail=False, retry_bytes=False
+        )
+
+    # 1. Inconsistent row on fn_name -> unsound + unproven
+    r_inc = _run_csv(
+        "inc",
+        [
+            ".\tcsv_cases.c\tf\t1\tpostcondition\tInconsistent\t\\result == 1\n",
+            ".\tcsv_cases.c\tf\t2\tassigns clause\tValid\tassigns \\nothing;\n",
+        ],
+    )
+    assert r_inc["status"] == "unproven_goals_remain"
+    assert r_inc["soundness"]["ok"] is False
+    assert r_inc["unproven_count"] == 1
+    assert any("Inconsistent property status" in m for m in r_inc["soundness"]["tier_b_unsound"])
+
+    # 2. Considered valid on fn_name itself -> unsound + unproven, while extern callee row is skipped
+    r_ass = _run_csv(
+        "ass",
+        [
+            ".\tcsv_cases.c\tspecified\t1\tpostcondition\tConsidered valid\t\\result == 0\n",
+            ".\tcsv_cases.c\tf\t2\tpostcondition\tConsidered valid\t\\result == 1\n",
+            ".\tcsv_cases.c\tf\t3\tassigns clause\tValid\tassigns \\nothing;\n",
+        ],
+    )
+    assert r_ass["status"] == "unproven_goals_remain"
+    assert r_ass["soundness"]["ok"] is False
+    assert r_ass["unproven_count"] == 1
+    assert any("Considered valid" in m for m in r_ass["soundness"]["tier_b_unsound"])
+
+    # 2b. Considered valid ONLY on extern callee (`row_fn != fn_name`) keeps fn_name all_proven
+    r_ext = _run_csv(
+        "ext",
+        [
+            ".\tcsv_cases.c\tspecified\t1\tpostcondition\tConsidered valid\t\\result == 0\n",
+            ".\tcsv_cases.c\tf\t3\tassigns clause\tValid\tassigns \\nothing;\n",
+        ],
+    )
+    assert r_ext["status"] == "all_proven"
+    assert r_ext["soundness"]["ok"] is True
+
+    # 3. Unknown future CSV status -> fails closed as unproven
+    r_oth = _run_csv(
+        "oth",
+        [
+            ".\tcsv_cases.c\tf\t1\tpostcondition\tUnrecognisedFutureStatus\t\\result == 1\n",
+            ".\tcsv_cases.c\tf\t2\tassigns clause\tValid\tassigns \\nothing;\n",
+        ],
+    )
+    assert r_oth["status"] == "unproven_goals_remain"
+    assert r_oth["unproven_count"] == 1
+
+    # 4. Real Frama-C 34 assumption-unproved.c :: assumption_carrier CSV rows (MIT: sysprog21/frama-c-mcp)
+    r_part = _run_csv(
+        "part",
+        [
+            "fixtures\tassumption-unproved.c\tf\t14\tpostcondition\tPartially proven\t\\result >= 0\n",
+            "fixtures\tassumption-unproved.c\tf\t16\tpostcondition\tValid\t\\false\n",
+            "fixtures\tassumption-unproved.c\tf\t16\ttermination clause\tValid\t\\true\n",
+            "fixtures\tassumption-unproved.c\tf\t25\tuser assertion\tUnknown\tx >= 0 && x < 100\n",
+        ],
+        proved_line="[wp] Proved goals: 3 / 4\n",
+    )
+    assert r_part["status"] == "unproven_goals_remain"
+    assert r_part["partially_proven_count"] == 1
+    assert r_part["proven_count"] == 3
+    assert r_part["unproven_count"] == 1
+
+
+@pytest.mark.unit
+def test_scan_wp_log_soundness_extracts_checked_memory_model_hypotheses() -> None:
+    # Verbatim Frama-C 34 log from MIT-licensed sysprog21/frama-c-mcp memory-model-hypothesis.c :: two
+    log = (
+        "[wp] 4 goals scheduled\n"
+        "[wp] Proved goals:    6 / 6\n"
+        "  Terminating:     1\n"
+        "  Unreachable:     1\n"
+        "  Qed:             4\n"
+        "[wp] fixtures/memory-model-hypothesis.c:18: Warning: \n"
+        "  Memory model hypotheses for function 'two':\n"
+        "  /*@ behavior wp_typed:\n"
+        "        requires \\separated(p, &g); */\n"
+        "  void two(int *p);\n"
+    )
+    checked = W.scan_wp_log_soundness(log, check_memory_model=True)
+    assert checked["ok"] is True
+    assert checked["checked_memory_model_functions"] == ["two"]
+    assert checked["checked_memory_model_hypotheses"] == [{"function": "two", "requires": [r"\separated(p, &g)"]}]
+
+    unchecked = W.scan_wp_log_soundness(log, check_memory_model=False)
+    assert unchecked["ok"] is False
+    assert unchecked["checked_memory_model_hypotheses"] == []
+
+
+@pytest.mark.unit
+def test_why3_anomaly_and_failure_goal_parsing_and_bytes_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Verbatim Frama-C 34 log & CSV from MIT-licensed sysprog21/frama-c-mcp pointer-cast-anomaly.c :: nextblk
+    typed_log = (
+        "[wp] fixtures/pointer-cast-anomaly.c:30: Warning: \n"
+        "  Cast with incompatible pointers types (source: blk*) (target: sint8*)\n"
+        "[wp] 4 goals scheduled\n"
+        "[wp] Warning: Goal Property:\n"
+        '    running prover Z3:4.13.3 failed ([Why3 Error] anomaly: Invalid_argument("missing free variable"))\n'
+        "[wp] Warning: Goal Property:\n"
+        '    running prover CVC5:1.1.2 failed ([Why3 Error] anomaly: Invalid_argument("missing free variable"))\n'
+        "[wp] Warning: Goal Property:\n"
+        '    running prover Alt-Ergo:2.4.3 failed ([Why3 Error] anomaly: Invalid_argument("missing free variable"))\n'
+        "[wp] [Failure] typed_nextblk_ensures (Qed 1ms) (Alt-Ergo) (Stronger, 3 warnings)\n"
+        "[wp] [Failure] typed_nextblk_assert_rte_mem_access (Qed 0.67ms) (Alt-Ergo) (Stronger)\n"
+        "[wp] [Failure] typed_nextblk_assert_rte_pointer_value (Qed 0.90ms) (Alt-Ergo) (Stronger, 2 warnings)\n"
+        "[wp] Proved goals:    3 / 6\n"
+        "  Terminating:     1\n"
+        "  Unreachable:     1\n"
+        "  Qed:             1 (0.67ms-0.65ms-1ms)\n"
+        "  Failed:          3\n"
+    )
+    typed_csv = (
+        CSV_HEADER
+        + "fixtures\tpointer-cast-anomaly.c\tnextblk\t26\tpostcondition\tUnknown\t\\valid(&\\result->prev)\n"
+        + "fixtures\tpointer-cast-anomaly.c\tnextblk\t28\tassigns clause\tPartially proven\tassigns \\nothing;\n"
+        + "fixtures\tpointer-cast-anomaly.c\tnextblk\t30\tmem_access\tUnknown\t\\valid_read(&b->header)\n"
+        + "fixtures\tpointer-cast-anomaly.c\tnextblk\t30\tpointer_value\tUnknown\t\\null == (char *)b + b->header\n"
+    )
+    bytes_log = (
+        "[wp] 4 goals scheduled\n"
+        "[wp] Proved goals:    6 / 6\n"
+        "  Terminating:       1\n"
+        "  Unreachable:       1\n"
+        "  Qed:               1\n"
+        "  Alt-Ergo 2.4.3:    3 (28ms-36ms-47ms)\n"
+    )
+    bytes_csv = (
+        CSV_HEADER
+        + "fixtures\tpointer-cast-anomaly.c\tnextblk\t26\tpostcondition\tValid\t\\valid(&\\result->prev)\n"
+        + "fixtures\tpointer-cast-anomaly.c\tnextblk\t30\tmem_access\tValid\t\\valid_read(&b->header)\n"
+    )
+
+    # 1. [wp] [Failure] goals captured in failed goal set & goal costs
+    assert W.parse_failed_wp_goals(typed_log) == {
+        "typed_nextblk_ensures",
+        "typed_nextblk_assert_rte_mem_access",
+        "typed_nextblk_assert_rte_pointer_value",
+    }
+    costs = W.goal_costs_from_log(typed_log)
+    assert len(costs) == 3
+    assert all(c["verdict_kind"] == "failed" for c in costs)
+
+    # 2. scan_wp_log_soundness records Why3 anomaly in tier_a_aborts
+    snd = W.scan_wp_log_soundness(typed_log)
+    assert snd["ok"] is False
+    assert any("missing free variable" in m for m in snd["tier_a_aborts"])
+
+    c_file = tmp_path / "pointer-cast-anomaly.c"
+    c_file.write_text("void *nextblk(void *b) { return b; }\n", encoding="utf-8")
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        model = cmd[cmd.index("-wp-model") + 1] if "-wp-model" in cmd else "Typed"
+        if "-report-csv" in cmd:
+            csv_p = Path(cmd[cmd.index("-report-csv") + 1])
+            csv_p.write_text(bytes_csv if model == "Bytes" else typed_csv, encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout=bytes_log if model == "Bytes" else typed_log, stderr="")
+
+    monkeypatch.setattr(W.subprocess, "run", fake_run)
+
+    # 3. Default run with retry_bytes=True still triggers Bytes retry and succeeds cleanly
+    res_default = W.run_wp_on_function(
+        c_file,
+        "nextblk",
+        tmp_path / "default",
+        cache_dir="off",
+        retry_bitwise=False,
+        retry_tail=False,
+        retry_bytes=True,
+    )
+    assert res_default["status"] == "all_proven"
+    assert res_default["wp_model"] == "Bytes"
+    assert res_default["soundness"]["ok"] is True
+    assert res_default["bytes_retry"]["kept"] is True
+
+    # 4. No-retry Typed ends wp_aborted with Why3 anomaly hint and NO misleading requires \valid(p) hint
+    res_noretry = W.run_wp_on_function(
+        c_file,
+        "nextblk",
+        tmp_path / "noretry",
+        cache_dir="off",
+        retry_bitwise=False,
+        retry_tail=False,
+        retry_bytes=False,
+    )
+    assert res_noretry["status"] == "wp_aborted"
+    assert res_noretry["soundness"]["ok"] is False
+    assert res_noretry["wp_why3_anomaly"] is True
+    assert any("Why3 backend anomaly" in h for h in res_noretry["diagnostic_hints"])
+    assert not any("requires \\valid(p)" in h for h in res_noretry["diagnostic_hints"])
+
+    # 5. Typed+nocast also ends wp_aborted with Why3 anomaly hint
+    res_nocast = W.run_wp_on_function(
+        c_file,
+        "nextblk",
+        tmp_path / "nocast",
+        wp_model="Typed+nocast",
+        cache_dir="off",
+        retry_bitwise=False,
+        retry_tail=False,
+    )
+    assert res_nocast["status"] == "wp_aborted"
+    assert res_nocast["wp_why3_anomaly"] is True
+    assert any("Why3 backend anomaly" in h for h in res_nocast["diagnostic_hints"])

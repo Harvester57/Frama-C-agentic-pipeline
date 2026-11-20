@@ -133,7 +133,7 @@ def test_rendered_brief_shows_facts_and_slice_and_only_the_sections_that_apply(t
     assert "Start from the **Deterministic Function Context**" in brief
     assert "One String Vocabulary" not in brief
     assert "Floating-point comparisons" not in brief
-    assert "Pointer-Difference Equality Bridge" not in brief
+    assert "Pointer-Walk Ghost Index" not in brief
     assert "Distinguishing Establishment vs. Preservation Failures" in brief
     assert "Struct / union equality" in brief
     assert not MARKER_RE.search(brief)

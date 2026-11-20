@@ -9,6 +9,8 @@ Unit tests for scripts/acsl_ast.py:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from acsl_ast import (
@@ -20,8 +22,13 @@ from acsl_ast import (
     contract_shape,
     dedup_acsl_declarations,
     extract_top_level_acsl_declarations,
+    find_target_unsound_axioms_or_admits,
+    find_top_level_lemmas,
+    find_unsound_acsl_keywords,
+    find_unsound_recursive_logic,
     function_returns_void,
     splice_prover_changes,
+    tokenize_c_acsl,
     verify_acsl_only,
 )
 
@@ -451,3 +458,140 @@ class TestContractShape:
         assert function_returns_void(source, "alloc", is_header=True) is False
         assert function_returns_void(source, "alloc") is None
         assert function_returns_void(source, "missing") is None
+
+
+class TestTier1SoundnessChecks:
+    """Tier 1 soundness checks: global lemmas, target axioms/admits, and recursive logic/predicates.
+
+    Trap snippets adapted from MIT-licensed sysprog21/frama-c-mcp fixtures (commit 4b935a0).
+    """
+
+    @pytest.mark.unit
+    def test_find_top_level_lemmas_standalone_axiomatic_and_ignores_non_wp(self) -> None:
+        src = (
+            "/*@ lemma unprovable: \\false; */\n"
+            "/*@ lemma provable: \\forall integer i; i + 0 == i; */\n"
+            "/*@ axiomatic Ax { lemma in_ax: \\true; } */\n"
+            "/*@ admit lemma adm_lem: \\false; */\n"
+            "/*@{ lemma doxygen_ignored: \\false; */\n"
+            "/* // lemma c_comment_ignored: \\false; */\n"
+            "/*@ // lemma inner_acsl_comment_ignored: \\false;\n"
+            "    predicate ok(integer n) = n >= 0;\n"
+            "*/\n"
+            'const char *msg = "/*@ lemma string_ignored: \\false; */";\n'
+            "#if defined(__FRAMAC_EACSL__)\n"
+            "/*@ lemma eacsl_only_ignored: \\false; */\n"
+            "#endif\n"
+            "#ifdef __FRAMAC_EACSL__\n"
+            "/*@ lemma eacsl_ifdef_ignored: \\false; */\n"
+            "#else\n"
+            "/*@ lemma wp_else_seen: \\true; */\n"
+            "#endif\n"
+            "int f(int x) { return x; }\n"
+        )
+        assert find_top_level_lemmas(src, path="lemma-unproved.c") == [
+            "unprovable",
+            "provable",
+            "in_ax",
+            "adm_lem",
+            "wp_else_seen",
+        ]
+
+    @pytest.mark.unit
+    def test_find_target_unsound_axioms_or_admits(self) -> None:
+        # MIT fixture: sysprog21/frama-c-mcp axiom-licensed.c
+        axiom_src = "/*@ axiom bogus: \\false; */\nint main(void) { return 0; }\n"
+        hits = find_target_unsound_axioms_or_admits(axiom_src, path="axiom-licensed.c")
+        assert len(hits) == 1
+        assert "'axiom'" in hits[0]
+
+        admit_src = (
+            "/*@{ axiom dox_ignored: \\false; */\n"
+            'const char *s = "/*@ admit \\false; */";\n'
+            "#if defined(__FRAMAC_EACSL__)\n"
+            "/*@ axiom eacsl_ignored: \\false; */\n"
+            "#endif\n"
+            "void f(int x) {\n"
+            "  /*@ ghost int y = x; //@ admit y == 0;\n"
+            "  */\n"
+            "}\n"
+        )
+        admit_hits = find_target_unsound_axioms_or_admits(admit_src, path="admit.c")
+        assert len(admit_hits) == 1
+        assert "'admit'" in admit_hits[0]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "bad_src",
+        [
+            # MIT fixture: sysprog21/frama-c-mcp recursive-logic-unsound.c
+            "/*@ logic integer bad(integer n) = bad(n) + 1; */\nint f(int x) { return 0; }\n",
+            # Unbounded descent without base-case guard
+            "/*@ logic integer bad(integer n) = bad(n - 1) + 1; */\n",
+            # Base guard exists, but call does not descend
+            "/*@ logic integer bad(integer n) = n <= 0 ? 0 : bad(n) + 1; */\n",
+            # Lower-bound guard with wrong-direction recursion
+            "/*@ logic integer bad(integer n) = n <= 0 ? 0 : bad(n + 1) + 1; */\n",
+            # Inverted ternary puts recursive call in base branch
+            "/*@ logic integer bad(integer n) = n <= 0 ? bad(n - 1) : 0; */\n",
+            # One descending call and one non-descending call
+            "/*@ logic integer bad(integer n) = n <= 0 ? 0 : bad(n - 1) + bad(n); */\n",
+            # Mutual recursion cycle
+            "/*@ logic integer a(integer n) = b(n);\n    logic integer b(integer n) = a(n); */\n",
+            # Mutual recursion cycle even with guards
+            (
+                "/*@ logic integer a(integer n) = n <= 0 ? 0 : b(n - 1);\n"
+                "    logic integer b(integer n) = n <= 0 ? 0 : a(n - 1); */\n"
+            ),
+            # Non-well-founded recursive predicate
+            "/*@ predicate bad_p(integer n) = bad_p(n); */\n",
+            # Zero-arg self-recursion
+            "/*@ logic integer bad_const = bad_const + 1; */\n",
+            # Sentinel guard without advance
+            "/*@ logic integer bad_str(char *s) = s[0] == '\\0' ? 0 : 1 + bad_str(s); */\n",
+            # Partner upper bound moving away instead of staying fixed/converging
+            "/*@ logic integer bad_rng(int *a, integer lo, integer hi) = lo >= hi ? 0 : a[lo] + bad_rng(a, lo + 1, hi + 1); */\n",
+        ],
+    )
+    def test_find_unsound_recursive_logic_rejects_unsound_definitions(self, bad_src: str) -> None:
+        direct_errs = find_unsound_recursive_logic(bad_src, path="rec.c")
+        assert direct_errs, bad_src
+        kw_errs = find_unsound_acsl_keywords(tokenize_c_acsl(bad_src, path="rec.c"), path="rec.c")
+        assert any("recursive ACSL" in e for e in kw_errs), kw_errs
+        base = "int f(int x) { return 0; }\n"
+        if "int f(" not in bad_src:
+            verify_errs = verify_acsl_only(base, bad_src + base, path="rec.c")
+        else:
+            verify_errs = verify_acsl_only(base, bad_src, path="rec.c")
+        assert any("recursive ACSL" in e for e in verify_errs), verify_errs
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "good_src",
+        [
+            "/*@ logic integer sum(integer n) = n <= 0 ? 0 : n + sum(n - 1); */\n",
+            "/*@ logic integer sum_eq(integer n) = n == 0 ? 0 : n + sum_eq(n - 1); */\n",
+            "/*@ logic integer sum_flip(integer n) = n > 0 ? n + sum_flip(n - 1) : 0; */\n",
+            "/*@ logic integer fib(integer n) = n <= 1 ? n : fib(n - 1) + fib(n - 2); */\n",
+            "/*@ logic integer rng(int *a, integer lo, integer hi) = lo >= hi ? 0 : a[lo] + rng(a, lo + 1, hi); */\n",
+            "/*@ logic integer rng2(int *a, integer lo, integer hi) = lo < hi ? a[hi - 1] + rng2(a, lo, hi - 1) : 0; */\n",
+            "/*@ logic integer c_strlen(char *s) = (s[0] == '\\0') ? 0 : 1 + c_strlen(s + 1); */\n",
+            "/*@ logic integer star_strlen(char *s) = *s == '\\0' ? 0 : 1 + star_strlen(s + 1); */\n",
+            "/*@ predicate all_pos(int *a, integer n) = n <= 0 || (a[n - 1] > 0 && all_pos(a, n - 1)); */\n",
+            "/*@ predicate all_pos_imp(int *a, integer n) = n > 0 ==> (a[n - 1] > 0 && all_pos_imp(a, n - 1)); */\n",
+            "/*@ logic integer chained(int *a, integer n) = a == \\null ? 0 : n <= 0 ? 0 : a[n - 1] + chained(a, n - 1); */\n",
+            # E-ACSL-only block is skipped even if non-well-founded
+            "#if defined(__FRAMAC_EACSL__)\n/*@ logic integer eacsl_only(integer n) = eacsl_only(n) + 1; */\n#endif\n",
+        ],
+    )
+    def test_find_unsound_recursive_logic_accepts_well_founded_and_eacsl_blocks(self, good_src: str) -> None:
+        assert find_unsound_recursive_logic(good_src, path="ok.c") == []
+        assert find_unsound_acsl_keywords(tokenize_c_acsl(good_src, path="ok.c"), path="ok.c") == []
+
+    @pytest.mark.unit
+    def test_fc_compat_types_eacsl_strlen_passes_recursive_logic_check(self) -> None:
+        compat = Path(__file__).resolve().parent.parent / "templates" / "fc_stubs" / "fc_compat_types.h"
+        text = compat.read_text(encoding="utf-8")
+        assert find_unsound_recursive_logic(text, path=str(compat)) == []
+        assert find_top_level_lemmas(text, path=str(compat)) == []
+        assert find_target_unsound_axioms_or_admits(text, path=str(compat)) == []

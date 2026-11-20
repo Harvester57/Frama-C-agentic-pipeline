@@ -848,7 +848,7 @@ def test_strict_rules_survive_for_the_plainest_function() -> None:
         ("floats", "Floating-point comparisons"),
         ("unions", "Struct / union equality"),
         ("structs", "Padded-struct / union"),
-        ("pointer_walk", "Pointer-Difference Equality Bridge"),
+        ("pointer_walk", "Pointer-Walk Ghost Index"),
         ("pointer_walk", "ghost size_t idx"),
         ("indirect_calls", "For functions with indirect calls"),
         ("assert_literal", 'Unreachable `assert(!"string_literal")` Branches'),

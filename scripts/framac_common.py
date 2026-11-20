@@ -152,9 +152,18 @@ def wp_limits_problem(limits: object) -> str | None:
     """Why the verdict limits of a WP report (run_wp_function.py) do not allow crediting its proof, or None."""
     if not isinstance(limits, dict):
         return "the WP report records no verdict limits"
-    vacuity = (limits.get("vacuity") or {}).get("status")
+    vac = limits.get("vacuity")
+    vac_dict = vac if isinstance(vac, dict) else {}
+    vacuity = vac_dict.get("status")
     if vacuity not in ("consistent", "inconclusive"):
         return f"the contract consistency check did not pass (status: {vacuity})"
+    unknown_doomed = vac_dict.get("unknown_doomed")
+    if isinstance(unknown_doomed, list) and unknown_doomed:
+        names = ", ".join(str(g) for g in unknown_doomed[:5])
+        return f"the contract consistency check reported unrecognised doomed smoke goal(s): {names}"
+    unexplained = vac_dict.get("unexplained_fails")
+    if isinstance(unexplained, int) and not isinstance(unexplained, bool) and unexplained > 0:
+        return f"the contract consistency check had {unexplained} unexplained smoke test failure(s)"
     return None
 
 

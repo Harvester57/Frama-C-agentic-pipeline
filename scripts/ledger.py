@@ -323,6 +323,25 @@ def add_wp_limit_assumptions(unit: dict, limits: dict, function: str, model_assu
         add_assumption(unit, "other", guardrail)
     for text in unchecked_clause_notes(limits, function):
         add_assumption(unit, "other", text)
+    mm_hyps = limits.get("memory_model_hypotheses") or []
+    if isinstance(mm_hyps, list) and mm_hyps:
+        parts: list[str] = []
+        for entry in mm_hyps:
+            if isinstance(entry, dict):
+                fn_label = str(entry.get("function") or function).strip()
+                reqs = [str(r).strip() for r in (entry.get("requires") or []) if str(r).strip()]
+                if reqs:
+                    parts.append(f"{fn_label}: {'; '.join(reqs)}")
+                elif fn_label:
+                    parts.append(fn_label)
+            elif isinstance(entry, str) and entry.strip():
+                parts.append(entry.strip())
+        if parts:
+            add_assumption(
+                unit,
+                "memory_model_hypothesis",
+                f"WP Typed memory-model separation hypothesis assumed (not written in contract): {'; '.join(parts)}.",
+            )
 
 
 # `limits.guardrail.status` of a parent WP report (workspace_overlay.py): the E-ACSL guardrail ran and passed.
@@ -3344,6 +3363,10 @@ def cmd_ingest_wp(paths: list[Path], sweep: bool = False) -> dict:
                 + soundness.get("tier_b_unsound", [])
                 + soundness.get("tier_b_unsound_warnings", [])
                 + soundness.get("memory_model_hypotheses", [])
+                + [
+                    f"Memory model hypotheses for function '{fn_name}'"
+                    for fn_name in soundness.get("checked_memory_model_functions", [])
+                ]
                 + soundness.get("unproven_global_lemmas", [])
             )
             summary = "; ".join(issues[:3]) if issues else f"WP reported {report['status']}"

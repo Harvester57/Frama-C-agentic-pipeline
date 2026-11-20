@@ -233,3 +233,40 @@ def test_prover_brief_worked_patterns_never_recommends_axiomatic():
     assert "top-level declaration" in line.lower()
     for expected in ("`bsearch.c`", "`find.i`", "`euclid.c`", r"loop variant \abs(b)"):
         assert expected in line, expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pointer_walk", [True, False])
+def test_prover_brief_pointer_walk_uses_ghost_index_not_ptr_anchor(pointer_walk: bool) -> None:
+    text = _PROVER_BRIEF.read_text(encoding="utf-8")
+    for forbidden in (
+        "ptr_anchor",
+        "end_anchor",
+        "res_anchor",
+        "ofs1 - ofs2",
+        r"p == \at(p, Pre) + (p - \at(p, Pre))",
+        r"\result == \old(buf) + (\result - \old(buf))",
+        "Pointer-Difference Equality Bridge",
+    ):
+        assert forbidden not in text, forbidden
+
+    kept_asserts = next(ln for ln in text.splitlines() if "The asserts this brief asks for" in ln)
+    assert "`unreachable_branch`" in kept_asserts
+    assert r"`fp \in {...}`" in kept_asserts
+    assert "end_anchor" not in kept_asserts
+
+    rendered = function_facts.render_conditionals(text, {"loops": pointer_walk, "pointer_walk": pointer_walk})
+    assert "<!-- if:" not in rendered and "<!-- endif -->" not in rendered
+    for expected in (
+        "Pointer-Walk Ghost Index",
+        "/*@ ghost const T *base = p; */",
+        "/*@ ghost size_t idx = 0; */",
+        "loop invariant idx_bound: 0 <= idx <= p_end - base;",
+        "loop invariant ptr_idx: p == base + idx;",
+        "/*@ ghost idx++; */",
+        r"\base_addr(base) == \base_addr(p_end)",
+        r"ensures res_base: \result != \null ==> \base_addr(\result) == \base_addr(\old(buf));",
+        r"ensures res_bound: \result != \null ==> 0 <= \result - \old(buf) <= \old(buf_end) - \old(buf);",
+        "/*@ ghost idx = (size_t)(p - buf); */",
+    ):
+        assert (expected in rendered) is pointer_walk, (pointer_walk, expected)

@@ -22,7 +22,7 @@
     "assumption": {
       "type": "object",
       "properties": {
-        "kind": {"type": "string", "enum": ["callee_contract_hypothesis", "caller_requires_unverified", "stub_contract", "boundary_assumption", "valid_under_hyp", "other"]},
+        "kind": {"type": "string", "enum": ["callee_contract_hypothesis", "caller_requires_unverified", "stub_contract", "boundary_assumption", "valid_under_hyp", "memory_model_hypothesis", "other"]},
         "description": {"type": "string", "minLength": 1, "visibleContent": true},
         "related_units": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/definitions/coverage_id"}}
       },

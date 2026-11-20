@@ -246,7 +246,7 @@ def test_normalize_status_maps_partially_proven_to_valid():
 def test_wp_diagnostics_and_tail_retry_and_macro_loop_filter(tmp_path, monkeypatch):
     import run_wp_function as RWF
 
-    # 1. Why3 MemAddr.addr vs int diagnostic hint + pointer-difference equality hint
+    # 1. Why3 MemAddr.addr vs int diagnostic hint + pointer-walk anchoring hint
     res_unproven = {
         "status": "unproven_goals_remain",
         "soundness": {"ok": True, "tier_a_aborts": [], "tier_b_unsound": []},
@@ -268,7 +268,7 @@ def test_wp_diagnostics_and_tail_retry_and_macro_loop_filter(tmp_path, monkeypat
         "[Why3 Error] Type mismatch between frama_c_wp.memaddr.MemAddr.addr and int",
     )
     assert any("MemAddr.addr and int" in h and "unreachable_branch" in h for h in hints)
-    assert any("Pointer-difference equality bridge" in h for h in hints)
+    assert any("Pointer-walk anchoring" in h and "ptr_idx: p == base + idx" in h for h in hints)
     assert any("file-scope `#define` macro" in h for h in hints)
 
     # 2. Macro-loop line detection + filtering Missing assigns clause on macro-loop line
