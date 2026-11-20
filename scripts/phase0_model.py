@@ -108,6 +108,7 @@ import target_env  # noqa: E402
 from framac_common import (  # noqa: E402
     atomic_write_json,
     augment_framac_cppflags,
+    fold_messages,
     is_pre_c99_std,
     load_json_optional,
     utc_now,
@@ -372,6 +373,259 @@ def first_error(log: str) -> str:
 
 
 # ---------------------------------------------------------------------------------------------------
+# Parse-loss warning census (Tier 2 Part B)
+# ---------------------------------------------------------------------------------------------------
+
+# Benign GCC/Clang optimization, diagnostic and hint attributes that do not alter C layout, ABI,
+# linkage, or control flow (normalized by stripping paired leading/trailing `__`).
+BENIGN_UNKNOWN_ATTRS: frozenset[str] = frozenset(
+    {
+        "cold",
+        "hot",
+        "format",
+        "warn_unused_result",
+        "nonnull",
+        "visibility",
+        "deprecated",
+        "format_arg",
+        "returns_nonnull",
+        "unused",
+        "used",
+        "pure",
+        "const",
+        "noreturn",
+        "noinline",
+        "always_inline",
+        "flatten",
+        "malloc",
+        "alloc_size",
+        "alloc_align",
+        "returns_twice",
+        "nothrow",
+        "leaf",
+        "artificial",
+        "fallthrough",
+        "access",
+        "sentinel",
+        "gnu_inline",
+        "externally_visible",
+        "no_sanitize",
+        "no_sanitize_address",
+        "no_sanitize_undefined",
+        "optimize",
+        "target",
+        "error",
+        "warning",
+    }
+)
+
+# Semantically impactful attributes affecting layout, ABI, linkage, lifetime, or calling convention.
+SEMANTIC_UNKNOWN_ATTRS: frozenset[str] = frozenset(
+    {
+        "packed",
+        "aligned",
+        "transparent_union",
+        "cleanup",
+        "constructor",
+        "destructor",
+        "weak",
+        "alias",
+        "section",
+        "weakref",
+        "ifunc",
+        "common",
+        "nocommon",
+        "mode",
+        "vector_size",
+        "may_alias",
+        "ms_struct",
+        "gcc_struct",
+        "designated_init",
+        "interrupt",
+        "naked",
+        "regparm",
+        "stdcall",
+        "cdecl",
+        "fastcall",
+        "dllexport",
+        "dllimport",
+        "init_priority",
+        "tls_model",
+    }
+)
+
+# Benign or separately tracked [kernel:...] warning categories that do not indicate C parse loss:
+# standard void*-to-typed-pointer C conversions, variadic calls (tracked by variadic_calls.py),
+# and global -std= forwarding notices from -cpp-extra-args-per-file.
+BENIGN_KERNEL_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "typing:implicit-conv-void-ptr",
+        "typing:variadic",
+        "pp:extra-args-std",
+    }
+)
+
+_ATTR_UNKNOWN_RE = re.compile(r"Ignoring unknown attribute:\s*([A-Za-z_][A-Za-z0-9_]*)")
+_ATTR_STMT_RE = re.compile(r"unexpected statement attribute\s+([A-Za-z_][A-Za-z0-9_]*)")
+_NO_ANNOT_LIBC_RE = re.compile(r"Unable to locate ACSL predicate\b")
+PARSE_WARNING_SAMPLE_CAP = 10
+PARSE_WARNING_SAMPLE_CHARS = 200
+
+
+def normalize_attr_name(name: str) -> str:
+    """Strip paired double underscores from a GCC/Clang attribute name (`__packed__` -> `packed`)."""
+    if len(name) > 4 and name.startswith("__") and name.endswith("__"):
+        return name[2:-2]
+    return name
+
+
+def parse_warnings_has_loss(pw: dict[str, Any]) -> bool:
+    """Whether a `parse_warnings` summary reports any actionable C parse loss or silent AST alteration."""
+    asm_count = int((pw.get("asm_clobber") or {}).get("count") or 0)
+    attrs = pw.get("attrs_unknown") or {}
+    uncls = pw.get("unclassified_categories") or {}
+    return (
+        asm_count > 0
+        or bool(attrs.get("semantic"))
+        or bool(attrs.get("unclassified"))
+        or any(int(v.get("project_count") or 0) > 0 for v in uncls.values() if isinstance(v, dict))
+    )
+
+
+def summarize_parse_warnings(log: str, tree: str) -> dict[str, Any]:
+    """
+    Count and classify `[kernel:...]` warnings from a Frama-C `-no-annot` Phase 0 parse log.
+    Separates `asm:clobber`, semantically impactful vs. benign vs. unclassified `attrs:unknown`
+    (and Frama-C 34 benign statement `[kernel:attrs]` warnings), benign/already-tracked kernel
+    categories, unclassified `[kernel:...]` categories (project-tree vs. total counts), and
+    `-no-annot` `libc:frama-c` noise.
+    """
+    asm_count = 0
+    asm_project_count = 0
+    asm_samples: list[str] = []
+
+    attrs_semantic: Counter[str] = Counter()
+    attrs_benign: Counter[str] = Counter()
+    attrs_unclassified: Counter[str] = Counter()
+    attrs_semantic_samples: list[str] = []
+    attrs_unclassified_samples: list[str] = []
+
+    benign_categories: Counter[str] = Counter()
+    unclassified: dict[str, dict[str, Any]] = {}
+    no_annot_libc_skipped = 0
+
+    for m in fold_messages(log):
+        if m.plugin != "kernel" or m.kind.lower() != "warning" or not m.category:
+            continue
+        rel = tree_rel(m.file, tree) if (m.file and tree) else None
+        is_project = rel is not None
+        loc = f"{rel or m.file}:{m.line}" if m.file else ""
+
+        if m.category == "libc:frama-c" and _NO_ANNOT_LIBC_RE.search(m.text):
+            no_annot_libc_skipped += 1
+            continue
+
+        if m.category == "asm:clobber":
+            asm_count += 1
+            if is_project:
+                asm_project_count += 1
+            if len(asm_samples) < PARSE_WARNING_SAMPLE_CAP:
+                asm_samples.append(loc or m.text[:PARSE_WARNING_SAMPLE_CHARS])
+            continue
+
+        if m.category == "attrs:unknown":
+            match = _ATTR_UNKNOWN_RE.search(m.text)
+            raw = match.group(1) if match else ""
+            norm = normalize_attr_name(raw) if raw else "<unparsed>"
+            if norm in SEMANTIC_UNKNOWN_ATTRS:
+                attrs_semantic[norm] += 1
+                if len(attrs_semantic_samples) < PARSE_WARNING_SAMPLE_CAP:
+                    sample = f"{loc}: {norm}" if loc else norm
+                    attrs_semantic_samples.append(sample[:PARSE_WARNING_SAMPLE_CHARS])
+            elif norm in BENIGN_UNKNOWN_ATTRS:
+                attrs_benign[norm] += 1
+            else:
+                attrs_unclassified[norm] += 1
+                if len(attrs_unclassified_samples) < PARSE_WARNING_SAMPLE_CAP:
+                    sample = f"{loc}: {norm}" if loc else norm
+                    attrs_unclassified_samples.append(sample[:PARSE_WARNING_SAMPLE_CHARS])
+            continue
+
+        if m.category == "attrs":
+            match = _ATTR_STMT_RE.search(m.text)
+            if match:
+                norm = normalize_attr_name(match.group(1))
+                if norm in BENIGN_UNKNOWN_ATTRS:
+                    attrs_benign[norm] += 1
+                    continue
+
+        if m.category in BENIGN_KERNEL_CATEGORIES:
+            benign_categories[m.category] += 1
+            continue
+
+        entry = unclassified.setdefault(
+            m.category,
+            {"count": 0, "project_count": 0, "sample": "", "_has_project_sample": False},
+        )
+        entry["count"] += 1
+        sample_text = (f"{loc}: {m.text}" if loc else m.text)[:PARSE_WARNING_SAMPLE_CHARS]
+        if is_project:
+            entry["project_count"] += 1
+            if not entry["_has_project_sample"]:
+                entry["sample"] = sample_text
+                entry["_has_project_sample"] = True
+        elif not entry["sample"]:
+            entry["sample"] = sample_text
+
+    cleaned_unclassified = {
+        cat: {k: v for k, v in rec.items() if k != "_has_project_sample"} for cat, rec in sorted(unclassified.items())
+    }
+    summary: dict[str, Any] = {
+        "asm_clobber": {
+            "count": asm_count,
+            "project_count": asm_project_count,
+            "samples": asm_samples,
+        },
+        "attrs_unknown": {
+            "semantic": dict(sorted(attrs_semantic.items())),
+            "benign": dict(sorted(attrs_benign.items())),
+            "unclassified": dict(sorted(attrs_unclassified.items())),
+            "semantic_samples": attrs_semantic_samples,
+            "unclassified_samples": attrs_unclassified_samples,
+        },
+        "benign_categories": dict(sorted(benign_categories.items())),
+        "unclassified_categories": cleaned_unclassified,
+        "no_annot_libc_skipped": no_annot_libc_skipped,
+        "has_parse_loss": False,
+    }
+    summary["has_parse_loss"] = parse_warnings_has_loss(summary)
+    return summary
+
+
+def _format_parse_loss_warning(units: list[str], pw: dict[str, Any]) -> str:
+    """Concise model warning summarizing actionable C parse-loss warnings for a parse job."""
+    parts: list[str] = []
+    asm = pw.get("asm_clobber") or {}
+    if asm.get("count"):
+        parts.append(f"asm:clobber ({asm['project_count']}/{asm['count']})")
+    attrs = pw.get("attrs_unknown") or {}
+    if attrs.get("semantic"):
+        sem = ", ".join(f"{k}x{v}" for k, v in sorted(attrs["semantic"].items()))
+        parts.append(f"semantic attrs:unknown ({sem})")
+    if attrs.get("unclassified"):
+        uncls = ", ".join(f"{k}x{v}" for k, v in sorted(attrs["unclassified"].items()))
+        parts.append(f"unclassified attrs:unknown ({uncls})")
+    proj_cats = [
+        f"{cat} ({info['project_count']}/{info['count']})"
+        for cat, info in sorted((pw.get("unclassified_categories") or {}).items())
+        if info.get("project_count")
+    ]
+    if proj_cats:
+        parts.append("kernel warnings: " + ", ".join(proj_cats))
+    return f"{', '.join(units)}: Frama-C -no-annot parse warnings ({'; '.join(parts)})"
+
+
+# ---------------------------------------------------------------------------------------------------
 # Running tools
 # ---------------------------------------------------------------------------------------------------
 
@@ -477,7 +731,12 @@ def framac_parse(
             dump = json.loads(out.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             return {"status": "parse_failed", "error": f"unreadable dump: {exc}", "seconds": seconds}
-        res: dict[str, Any] = {"status": "ok", "dump": dump, "seconds": seconds}
+        res: dict[str, Any] = {
+            "status": "ok",
+            "dump": dump,
+            "seconds": seconds,
+            "parse_warnings": summarize_parse_warnings(log, tree),
+        }
         if alias_module is not None:
             res["alias"] = read_alias_report(alias_out, rc, log)
     return res
@@ -1229,6 +1488,11 @@ def build_model(
             "seconds": res["seconds"],
         }
         if res["status"] == "ok":
+            pw = res.get("parse_warnings")
+            if isinstance(pw, dict):
+                entry["parse_warnings"] = pw
+                if pw.get("has_parse_loss"):
+                    model["warnings"].append(_format_parse_loss_warning(job["units"], pw))
             report = res.get("alias") or ({"status": "unavailable"} if alias else None)
             if report is not None:
                 entry["alias"] = {
@@ -1281,6 +1545,8 @@ def build_model(
                 "job": j["key"],
                 "seconds": j["seconds"],
             }
+            if j["status"] == "ok" and isinstance(j.get("parse_warnings"), dict):
+                rec["parse"]["warnings"] = j["parse_warnings"]
             if j["status"] != "ok":
                 rec["parse"]["error"] = j["error"]
             if rec["parse"]["status"] == STATUS_UNPARSED:

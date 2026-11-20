@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from acsl_ast import (
+    AcslError,
     ScopeViolationError,
     _extract_decl_param_types,
     _is_acsl_comment_or_whitespace_only,
@@ -22,6 +23,7 @@ from acsl_ast import (
     contract_shape,
     dedup_acsl_declarations,
     extract_top_level_acsl_declarations,
+    find_in_body_ghost_declarations,
     find_target_unsound_axioms_or_admits,
     find_top_level_lemmas,
     find_unsound_acsl_keywords,
@@ -595,3 +597,283 @@ class TestTier1SoundnessChecks:
         assert find_unsound_recursive_logic(text, path=str(compat)) == []
         assert find_top_level_lemmas(text, path=str(compat)) == []
         assert find_target_unsound_axioms_or_admits(text, path=str(compat)) == []
+
+
+_IN_BODY_BASE = (
+    "int walk(const char *buf, const char *p, int n, int cond) {\n  (void)buf; (void)p; (void)cond;\n  return n;\n}\n"
+)
+
+
+def _with_body_snippet(snippet: str) -> str:
+    return _IN_BODY_BASE.replace("  return n;\n", f"  {snippet}\n  return n;\n")
+
+
+class TestInBodyGhostDeclarations:
+    """Reject block-scope ghost function prototypes/definitions/externs/contracts while allowing valid ghost code."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "bad_snippet",
+        [
+            r"/*@ ghost /@ ensures \false; @/ extern void fake(void); fake(); */",
+            r"/*@ ghost /@ requires \true; ensures \result == 42; @/ int fake(int x); */",
+            "/*@ ghost extern void fake(void); */",
+            "/*@ ghost extern int ghost_global; */",
+            "/*@ ghost void fake(void); */",
+            "/*@ ghost int fake(int x); */",
+            "/*@ ghost int fake(); */",
+            "/*@ ghost const char *fake(const char *s); */",
+            "/*@ ghost const struct foo *fake(size_t n); */",
+            "/*@ ghost my_typedef_t fake(int x); */",
+            "/*@ ghost my_typedef_t *fake(int x); */",
+            "/*@ ghost void helper(int n) { if (n <= 0) return; helper(n - 1); } */",
+            "/*@ ghost static void helper(void) { } */",
+            "/*@ ghost static inline int helper(int x) { return x + 1; } */",
+            "/*@ ghost int helper(x) int x; { return x; } */",
+            "/*@ ghost int (fake)(int x); */",
+            "/*@ ghost int (*fake(int x))(int); */",
+            "/*@ ghost int a = 0, fake(int x); */",
+            "/*@ ghost { extern void fake(void); fake(); } */",
+            "/*@ ghost if (cond) { void fake(void); fake(); } */",
+            "/*@ ghost int r = ({ void fake(void); fake(); }); */",
+            r"/*@ ghost /@ ensures \false; @/ int x = 0; */",
+            "/*@ ghost\n  @ /@ ensures \\false; @/\n  @ void fake(void);\n  @*/",
+            "//@ ghost extern void fake(void);",
+            "//@ ghost void fake(void);",
+            "//@ ghost static void helper(void) { }",
+            r"//@ ghost /@ requires \true; ensures \result == 42; @/ int fake(int x);",
+            "//@ ghost void\n  //@ ghost fake(void);",
+            "/*@ ghost void */ /*@ ghost fake(void); */",
+        ],
+        ids=[
+            "contract-extern-proto-and-call",
+            "contract-proto-with-requires-ensures",
+            "extern-void-proto",
+            "extern-var-decl",
+            "plain-void-proto",
+            "plain-int-proto",
+            "empty-param-proto",
+            "const-ptr-proto",
+            "const-struct-ptr-proto",
+            "typedef-ret-proto",
+            "typedef-ptr-ret-proto",
+            "recursive-ghost-fn-def",
+            "static-void-fn-def",
+            "static-inline-fn-def",
+            "kr-fn-def",
+            "parenthesized-fn-declarator",
+            "fn-returning-fn-ptr-proto",
+            "mixed-var-and-fn-proto",
+            "nested-compound-extern-proto",
+            "if-body-fn-proto",
+            "gnu-stmt-expr-fn-proto",
+            "contract-on-ghost-var-decl",
+            "at-margin-contract-and-proto",
+            "line-form-extern-proto",
+            "line-form-plain-proto",
+            "line-form-static-fn-def",
+            "line-form-contract-and-proto",
+            "split-line-form-proto",
+            "split-block-form-proto",
+        ],
+    )
+    def test_rejects_forbidden_in_body_ghost_declarations(self, bad_snippet: str) -> None:
+        src = _with_body_snippet(bad_snippet)
+        direct_errs = find_in_body_ghost_declarations(src, path="m.c")
+        assert direct_errs, bad_snippet
+        assert all("forbidden" in e and "in-body ghost" in e for e in direct_errs), direct_errs
+
+        kw_errs = find_unsound_acsl_keywords(tokenize_c_acsl(src, path="m.c"), path="m.c")
+        assert any("in-body ghost" in e for e in kw_errs), kw_errs
+
+        verify_errs = verify_acsl_only(_IN_BODY_BASE, src, path="m.c")
+        assert any("in-body ghost" in e for e in verify_errs), verify_errs
+
+    @pytest.mark.unit
+    def test_rejects_active_else_arm_of_eacsl_guard(self) -> None:
+        src = _with_body_snippet(
+            "#if defined(__FRAMAC_EACSL__)\n"
+            "  /*@ ghost size_t idx = 0; */\n"
+            "#else\n"
+            "  /*@ ghost void fake(void); */\n"
+            "#endif"
+        )
+        errs = find_in_body_ghost_declarations(src, path="m.c")
+        assert len(errs) == 1
+        assert "'fake'" in errs[0]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "good_snippet",
+        [
+            # Ghost variable declarations & initializers (including Tier 3a idioms)
+            "/*@ ghost size_t idx = 0; */",
+            "/*@ ghost int k = (int)n; */",
+            "/*@ ghost const char *base = p; */",
+            "/*@ ghost const struct foo *q = ptr; */",
+            "/*@ ghost unsigned long acc = 0UL; */",
+            "/*@ ghost size_t len = strlen(p); */",
+            "/*@ ghost int r = foo(n, cond); */",
+            "/*@ ghost int arr[8] = {0}; */",
+            "/*@ ghost static int local_cnt = 0; */",
+            "/*@ ghost int (*fp)(int) = &cb; */",
+            "/*@ ghost int (*fp)(int); */",
+            "/*@ ghost my_t (*fp)(int); */",
+            "/*@ ghost struct tmp { int a; int b; } st = { 1, 2 }; */",
+            "/*@ ghost typeof(p) base = p; */",
+            # Ghost assignments, casts, and control-flow statements
+            "/*@ ghost idx++; */",
+            "/*@ ghost idx = (size_t)(p - buf); */",
+            "/*@ ghost (void)idx; */",
+            "/*@ ghost (void)lemma_strlen_step(p, n); */",
+            "/*@ ghost (*fp)(n); */",
+            "/*@ ghost get_fn(arg)(n); */",
+            "/*@ ghost if (cond) { idx += 1; } */",
+            "/*@ ghost if (cond) lemma_strlen_step(p, n); else fc_lemma_foo(p, buf); */",
+            "/*@ ghost while (idx < n) { idx++; } */",
+            "/*@ ghost for (size_t i = 0; i < (size_t)n; i++) { acc += i; } */",
+            "/*@ ghost do { idx++; } while (0); */",
+            "/*@ ghost switch (n) { case 0: fc_lemma_foo(p, buf); break; default: lemma_strlen_step(p, n); break; } */",
+            "/*@ ghost done: fc_lemma_foo(p, buf); */",
+            "/*@ ghost return fc_lemma_foo(p, buf); */",
+            # Ghost function calls (no return type before identifier)
+            "/*@ ghost lemma_strlen_step(p, n); */",
+            "/*@ ghost fc_lemma_foo(p, buf); */",
+            # Embedded ghost loop annotations & assertions (not contracts attached to declarations)
+            "/*@ ghost size_t i = 0; /@ loop invariant 0 <= i <= n; loop assigns i; loop variant n - i; @/ while (i < (size_t)n) { i++; } */",
+            "/*@ ghost size_t idx = 0; /@ assert idx == 0; @/ idx++; */",
+            "/*@ ghost size_t idx = 0; //@ assert idx == 0;\n  */",
+            "/*@ ghost size_t idx = 0; /@ // ensures \\false;\n assert idx == 0; @/ size_t k = idx; */",
+            # Line-form legitimate ghost statements
+            "//@ ghost size_t idx = 0;\n  //@ ghost idx++;\n  //@ ghost lemma_strlen_step(p, n);",
+            # Frama-C ghost actual-argument syntax
+            "/*@ ghost (p, n) */",
+            # Commented-out or string-literal fake prototypes inside ghost blocks
+            "/*@ ghost // extern void fake(void);\n  size_t idx = 0; */",
+            r'/*@ ghost const char *msg = "extern void fake(void); /@ ensures \false; @/"; */',
+            # Non-ghost identifier starting with `ghost`
+            "/*@ ghost_label: assert n >= 0; */",
+        ],
+    )
+    def test_allows_legitimate_in_body_ghost_code(self, good_snippet: str) -> None:
+        src = _with_body_snippet(good_snippet)
+        assert find_in_body_ghost_declarations(src, path="ok.c") == [], good_snippet
+        assert find_unsound_acsl_keywords(tokenize_c_acsl(src, path="ok.c"), path="ok.c") == [], good_snippet
+        assert verify_acsl_only(_IN_BODY_BASE, src, path="ok.c") == [], good_snippet
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "ignored_snippet",
+        [
+            "#if defined(__FRAMAC_EACSL__)\n  /*@ ghost extern void fake(void); */\n#endif",
+            "#ifdef __FRAMAC_EACSL__\n  /*@ ghost void helper(void) { } */\n#endif",
+            "#if 0\n  /*@ ghost /@ ensures \\false; @/ extern void fake(void); */\n#endif",
+            "#if !defined(__FRAMAC_EACSL__)\n  /*@ ghost size_t idx = 0; */\n#else\n  /*@ ghost void fake(void); */\n#endif",
+            "/*@{ ghost extern void fake(void); */",
+            "/*@* ghost void helper(void) { } */",
+            "//@{ ghost extern void fake(void);",
+            "/* /*@ ghost extern void fake(void); */ */",
+            "// /*@ ghost extern void fake(void); */",
+            'const char *lit = "/*@ ghost extern void fake(void); */";',
+        ],
+        ids=[
+            "if-defined-eacsl",
+            "ifdef-eacsl",
+            "if-0",
+            "else-of-not-eacsl",
+            "doxygen-block-open",
+            "doxygen-block-star",
+            "doxygen-line-open",
+            "c-block-comment",
+            "c-line-comment",
+            "c-string-literal",
+        ],
+    )
+    def test_ignores_inactive_preprocessor_comments_literals_and_doxygen(self, ignored_snippet: str) -> None:
+        src = _with_body_snippet(ignored_snippet)
+        assert find_in_body_ghost_declarations(src, path="ok.c") == []
+
+    @pytest.mark.unit
+    def test_file_scope_ghost_extern_c_and_struct_ghost_fields(self) -> None:
+        # File-scope ghost function (brace_depth == 0) is NOT an in-body ghost declaration
+        assert find_in_body_ghost_declarations(_GHOST + _BASE, path="top.c") == []
+
+        # File-scope ghost function inside `extern "C" { ... }` stays at brace_depth == 0
+        extern_c_ok = (
+            '#ifdef __cplusplus\nextern "C" {\n#endif\n'
+            + _GHOST
+            + "int f(int n) { /*@ ghost size_t idx = 0; */ return n; }\n"
+            + "#ifdef __cplusplus\n}\n#endif\n"
+        )
+        assert find_in_body_ghost_declarations(extern_c_ok, path="hdr.h") == []
+
+        # In-body ghost prototype inside `extern "C" { ... }` IS caught
+        extern_c_bad = 'extern "C" {\n  int f(int n) { /*@ ghost extern void fake(void); */ return n; }\n}\n'
+        errs = find_in_body_ghost_declarations(extern_c_bad, path="hdr.h")
+        assert len(errs) == 1 and "'fake'" in errs[0]
+
+        # Struct ghost fields (including function-pointer fields) are allowed
+        struct_src = (
+            "struct S {\n  int x;\n  /*@ ghost size_t ghost_len; */\n  /*@ ghost void (*ghost_cb)(int); */\n};\n"
+        )
+        assert find_in_body_ghost_declarations(struct_src, path="s.h") == []
+
+    @pytest.mark.unit
+    def test_verify_acsl_only_and_splice_prover_changes_end_to_end(self) -> None:
+        # 1. Legitimate Tier 3a ghost index + pointer anchor + cast + increment + ghost call splices cleanly
+        good_agent = _IN_BODY_BASE.replace(
+            "  (void)buf; (void)p; (void)cond;\n",
+            "  (void)buf; (void)p; (void)cond;\n"
+            "  /*@ ghost const char *base = p; */\n"
+            "  /*@ ghost size_t idx = 0; */\n"
+            "  /*@ ghost idx = (size_t)(p - buf); */\n"
+            "  /*@ ghost idx++; */\n"
+            "  /*@ ghost lemma_strlen_step(base, n); */\n",
+        )
+        assert verify_acsl_only(_IN_BODY_BASE, good_agent, path="walk.c") == []
+        assert splice_prover_changes(_IN_BODY_BASE, good_agent, _IN_BODY_BASE, "walk", path="walk.c") == good_agent
+
+        # 2. Forbidden in-body ghost declarations are rejected by both verify_acsl_only and splice_prover_changes
+        for bad_snippet in (
+            r"/*@ ghost /@ ensures \false; @/ extern void fake(void); fake(); */",
+            r"/*@ ghost /@ requires \true; ensures \result == 42; @/ int fake(int x); */",
+            "/*@ ghost extern void fake(void); */",
+            "/*@ ghost void helper(int n) { if (n > 0) helper(n - 1); } */",
+            "/*@ ghost static void helper(void) { } */",
+            "//@ ghost extern void fake(void);",
+        ):
+            bad_agent = _with_body_snippet(bad_snippet)
+            v_errs = verify_acsl_only(_IN_BODY_BASE, bad_agent, path="walk.c")
+            assert any("in-body ghost" in e for e in v_errs), (bad_snippet, v_errs)
+            with pytest.raises(AcslError, match=r"in-body ghost"):
+                splice_prover_changes(_IN_BODY_BASE, bad_agent, _IN_BODY_BASE, "walk", path="walk.c")
+
+        # 3. Header `static inline` body with forbidden in-body ghost declaration is also rejected on splice
+        hdr_base = "static inline int hfn(int x) {\n  return x;\n}\n"
+        hdr_bad = "static inline int hfn(int x) {\n  //@ ghost extern void fake(void);\n  return x;\n}\n"
+        with pytest.raises(AcslError, match=r"in-body ghost"):
+            splice_prover_changes(hdr_base, hdr_bad, hdr_base, "hfn", is_header=True, path="walk.h")
+
+        # 4. Baseline preservation: pre-existing in-body ghost declaration is not blamed on line shifts,
+        #    while adding a second one or attaching a contract to it IS flagged
+        preexisting_base = _with_body_snippet("/*@ ghost void legacy_proto(void); */")
+        shifted_ok = "/*@ assigns \\nothing; */\n" + preexisting_base
+        assert verify_acsl_only(preexisting_base, shifted_ok, path="legacy.c") == []
+
+        upgraded_with_contract = preexisting_base.replace(
+            "/*@ ghost void legacy_proto(void); */",
+            r"/*@ ghost /@ ensures \false; @/ void legacy_proto(void); */",
+        )
+        assert any(
+            "in-body ghost" in e for e in verify_acsl_only(preexisting_base, upgraded_with_contract, path="legacy.c")
+        )
+
+        added_second = preexisting_base.replace(
+            "  return n;\n",
+            "  /*@ ghost void legacy_proto(void); */\n  return n;\n",
+        )
+        assert any("in-body ghost" in e for e in verify_acsl_only(preexisting_base, added_second, path="legacy.c"))
+
+        # 5. check_unsound=False skips the soundness check consistently with other unsound checks
+        bad_agent = _with_body_snippet("/*@ ghost extern void fake(void); */")
+        assert verify_acsl_only(_IN_BODY_BASE, bad_agent, path="walk.c", check_unsound=False) == []

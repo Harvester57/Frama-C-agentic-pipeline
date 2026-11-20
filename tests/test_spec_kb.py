@@ -435,3 +435,323 @@ def test_mine_after_complete_fills_both_stores_unless_switched_off(
     assert out["mined_agents"] == 2 and out["evolved_items"] >= 1
     kb = run_dir / "workspace" / "reports" / "kb"
     assert (kb / "evolved.json").is_file() and (kb / spec_kb.OBSTRUCTIONS_FILE).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Curated specification patterns (FRAMAC_SPEC_KB_CURATED)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_curated_enabled_defaults_off_and_respects_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
+    assert spec_kb.enabled() is True
+    assert spec_kb.curated_enabled() is False
+
+    for truthy in ("on", "1", "true", "yes", "enabled", "ON"):
+        monkeypatch.setenv(spec_kb.CURATED_ENV, truthy)
+        assert spec_kb.curated_enabled() is True, truthy
+
+    for falsy in ("off", "0", "false", "no", "disabled", ""):
+        monkeypatch.setenv(spec_kb.CURATED_ENV, falsy)
+        assert spec_kb.curated_enabled() is False, falsy
+
+    # Parent kill-switch FRAMAC_SPEC_KB=off disables curated patterns even when FRAMAC_SPEC_KB_CURATED=on.
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+    monkeypatch.setenv(spec_kb.KB_ENV, "off")
+    assert spec_kb.curated_enabled() is False
+    record = {"features": {"pointer_len_params": True, "loops": True, "pointer_walk": True}}
+    assert spec_kb.curated_patterns_for(record) == []
+
+
+@pytest.mark.unit
+def test_curated_patterns_match_features_independent_of_stopwords_and_top_g(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    overlay = tmp_path / "workspace"
+    kb_dir = spec_kb.kb_dir_of(overlay)
+    kb_dir.mkdir(parents=True)
+    # Simulate a 544+ item noisy manual seed KB whose entries share all non-stopword query keywords.
+    noisy_items = [
+        {
+            "id": f"manual.md#{i}-{i + 2}",
+            "source": f"manual.md:{i}-{i + 2}",
+            "title": f"Manual Section {i}",
+            "content": f"loop pointer walk array string buffer section {i}",
+            "keywords": sorted(
+                spec_kb._keywords("loop pointer walk array string buffer valid_read offset base_addr read-only range")
+            ),
+        }
+        for i in range(600)
+    ]
+    (kb_dir / "seed.json").write_text(
+        json.dumps({"schema": spec_kb.KB_SCHEMA, "kind": "seed", "items": noisy_items}), encoding="utf-8"
+    )
+    record = {
+        "return_type": "int",
+        "formals": [
+            {"name": "buf", "kind": "pointer"},
+            {"name": "len", "kind": "scalar"},
+        ],
+        "derived_pointers": {"p": "buf"},
+        "return_paths": [{"value": "-1", "in_loop": True}, {"value": "0", "in_loop": False}],
+        "loops": [
+            {
+                "header": "while (i >= 0)",
+                "scalars": [{"var": "i", "updates": ["i - 1"]}],
+                "exits": [{"kind": "return", "condition": "a[i] == target", "line": 10}],
+            }
+        ],
+        "features": {
+            "loops": True,
+            "pointer_walk": True,
+            "pointer_len_params": True,
+            "read_only_loop": True,
+            "arrays": True,
+            "strings": True,
+        },
+    }
+
+    # Baseline (FRAMAC_SPEC_KB_CURATED unset/off): exact legacy format, no curated slot.
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
+    off_section = spec_kb.kb_section_for(overlay, record)
+    assert "Curated Specification Patterns" not in off_section
+    assert "Manual & Evolved Matches" not in off_section
+    assert off_section.count("### Manual Section ") == spec_kb.TOP_G
+
+    # Treatment (FRAMAC_SPEC_KB_CURATED=on): curated items appear in their own bounded slot (<= 2)
+    # without evicting any of the TOP_G = 3 manual/evolved items.
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+    curated = spec_kb.curated_patterns_for(record)
+    assert len(curated) == spec_kb.MAX_CURATED_ITEMS
+    on_section = spec_kb.kb_section_for(overlay, record)
+    assert "### Curated Specification Patterns (Feature-Matched)" in on_section
+    assert "### Manual & Evolved Matches" in on_section
+    assert on_section.count("#### ") == spec_kb.MAX_CURATED_ITEMS
+    assert on_section.count("### Manual Section ") == spec_kb.TOP_G
+    for item in curated:
+        assert item["title"] in on_section
+        assert item["source"] in on_section
+
+
+@pytest.mark.unit
+def test_curated_slot_renders_when_seed_has_no_overlap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    overlay = tmp_path / "workspace"
+    kb_dir = spec_kb.kb_dir_of(overlay)
+    kb_dir.mkdir(parents=True)
+    (kb_dir / "seed.json").write_text(
+        json.dumps({"schema": spec_kb.KB_SCHEMA, "kind": "seed", "items": []}), encoding="utf-8"
+    )
+    record = {"features": {"pointer_len_params": True}}
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
+    assert spec_kb.kb_section_for(overlay, record) == ""
+
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+    section = spec_kb.kb_section_for(overlay, record)
+    assert "## Retrieved ACSL Knowledge" in section
+    assert "### Curated Specification Patterns (Feature-Matched)" in section
+    assert "### Manual & Evolved Matches" not in section
+    assert "curated:acsl-skills@4f913e2/parsers.md" in section
+
+
+@pytest.mark.unit
+def test_curated_patterns_feature_and_metadata_precision(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+
+    # 1. void function with < 2 pointer formals is excluded from parser_progress;
+    #    void function with >= 2 pointer formals (input + output pointer) matches.
+    void_logger = {
+        "return_type": "void",
+        "formals": [{"name": "buf", "kind": "pointer"}, {"name": "len", "kind": "scalar"}],
+        "features": {"pointer_len_params": True},
+    }
+    assert spec_kb.curated_patterns_for(void_logger) == []
+
+    void_parser = {
+        "return_type": "void",
+        "formals": [
+            {"name": "buf", "kind": "pointer"},
+            {"name": "len", "kind": "scalar"},
+            {"name": "eaten", "kind": "pointer"},
+        ],
+        "features": {"pointer_len_params": True},
+    }
+    assert [p["id"] for p in spec_kb.curated_patterns_for(void_parser)] == ["curated:parser_progress"]
+
+    # 2. Backward-scanning search loop ranks search_loop_witness first and caps at MAX_CURATED_ITEMS.
+    backward_search = {
+        "return_type": "int",
+        "formals": [{"name": "a", "kind": "pointer"}, {"name": "n", "kind": "scalar"}],
+        "return_paths": [{"value": "i", "in_loop": True}, {"value": "-1", "in_loop": False}],
+        "loops": [
+            {
+                "header": "while (i >= 0)",
+                "scalars": [{"var": "i", "updates": ["i - 1"]}],
+                "exits": [{"kind": "return", "condition": "a[i] == target", "line": 7}],
+            }
+        ],
+        "features": {"loops": True, "read_only_loop": True, "arrays": True, "pointer_len_params": True},
+    }
+    got = [p["id"] for p in spec_kb.curated_patterns_for(backward_search)]
+    assert got == ["curated:search_loop_witness", "curated:parser_progress"]
+
+    # 3. Non-search write loop (arrays=True only, read_only_loop=False, no exits/decrements)
+    #    matches quantified_base_restate and does NOT spuriously match search_loop_witness.
+    write_loop = {
+        "return_type": "void",
+        "formals": [{"name": "a", "kind": "pointer"}, {"name": "n", "kind": "scalar"}],
+        "loops": [{"header": "for (i = 0; i < n; i++)", "scalars": [{"var": "i", "updates": ["i + 1"]}], "exits": []}],
+        "features": {"loops": True, "arrays": True, "read_only_loop": False, "pointer_len_params": True},
+    }
+    assert [p["id"] for p in spec_kb.curated_patterns_for(write_loop)] == ["curated:quantified_base_restate"]
+
+    # 4. Minimal features-only record degrades gracefully.
+    minimal = {"features": {"loops": True, "pointer_walk": True}}
+    assert [p["id"] for p in spec_kb.curated_patterns_for(minimal)] == ["curated:quantified_base_restate"]
+
+
+@pytest.mark.unit
+def test_curated_toggle_leaves_obstructions_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import function_facts as ff
+    import workspace_overlay
+
+    refs = _fake_references(tmp_path)
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "mod.h").write_text("int parse_hdr(const unsigned char *buf, int len);\n", encoding="utf-8")
+    (target / "mod.c").write_text(
+        '#include "mod.h"\nint parse_hdr(const unsigned char *buf, int len) { return len > 0 && buf ? 0 : -1; }\n',
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    overlay = run_dir / "workspace"
+    workspace_overlay.init_overlay(target, overlay)
+    kb_dir = spec_kb.kb_dir_of(overlay)
+    kb_dir.mkdir(parents=True)
+    (kb_dir / "seed.json").write_text(json.dumps(spec_kb.build_seed_kb(refs)), encoding="utf-8")
+    (kb_dir / spec_kb.OBSTRUCTIONS_FILE).write_text(
+        json.dumps(
+            {
+                "schema": spec_kb.OBSTRUCTION_SCHEMA,
+                "items": [
+                    {
+                        "id": "guard:parse_hdr:abc123",
+                        "kind": "guardrail_refutation",
+                        "function": "parse_hdr",
+                        "file": "mod.c",
+                        "predicate": "len <= 64",
+                        "label": "cap",
+                        "line": 1,
+                        "annotation_rte": False,
+                        "source": "prove-prev",
+                        "candidate": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    facts_dir = overlay / "reports" / "facts"
+    facts_dir.mkdir(parents=True)
+    (facts_dir / "mod.json").write_text(
+        json.dumps(
+            {
+                "schema": ff.FACTS_SCHEMA,
+                "module": "mod",
+                "functions": {
+                    "mod.c#parse_hdr": {
+                        "name": "parse_hdr",
+                        "return_type": "int",
+                        "features": {"loops": True, "pointer_len_params": True},
+                        "frame_skeleton": {"status": "ok", "separated": [], "assigns": []},
+                        "loops": [],
+                        "may_alias": [],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FRAMAC_REFERENCES_HOST", str(refs))
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "off")
+    prep_off = workspace_overlay.prepare_agent(
+        run_dir=run_dir,
+        agent_id="prover_off",
+        role="prover",
+        module="mod",
+        function="parse_hdr",
+        c_file="mod.c",
+        header_file="mod.h",
+    )
+    brief_off = (run_dir / prep_off["brief_file"]).read_text(encoding="utf-8")
+    assert "## Known Dead Ends (Do Not Repeat)" in brief_off
+    assert "`len <= 64`" in brief_off
+    assert "## Retrieved ACSL Knowledge" in brief_off
+    assert "Curated Specification Patterns" not in brief_off
+
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+    prep_on = workspace_overlay.prepare_agent(
+        run_dir=run_dir,
+        agent_id="prover_on",
+        role="prover",
+        module="mod",
+        function="parse_hdr",
+        c_file="mod.c",
+        header_file="mod.h",
+    )
+    brief_on = (run_dir / prep_on["brief_file"]).read_text(encoding="utf-8")
+    assert "## Known Dead Ends (Do Not Repeat)" in brief_on
+    assert "`len <= 64`" in brief_on
+    assert "### Curated Specification Patterns (Feature-Matched)" in brief_on
+    assert "curated:acsl-skills@4f913e2/parsers.md" in brief_on
+
+    # Parent FRAMAC_SPEC_KB=off kills everything even when FRAMAC_SPEC_KB_CURATED=on.
+    monkeypatch.setenv(spec_kb.KB_ENV, "off")
+    prep_kill = workspace_overlay.prepare_agent(
+        run_dir=run_dir,
+        agent_id="prover_kill",
+        role="prover",
+        module="mod",
+        function="parse_hdr",
+        c_file="mod.c",
+        header_file="mod.h",
+    )
+    brief_kill = (run_dir / prep_kill["brief_file"]).read_text(encoding="utf-8")
+    assert "## Known Dead Ends (Do Not Repeat)" not in brief_kill
+    assert "`len <= 64`" not in brief_kill
+    assert "Retrieved ACSL Knowledge" not in brief_kill
+    assert "Curated Specification Patterns" not in brief_kill
+
+
+@pytest.mark.unit
+def test_curated_patterns_pass_eacsl_hygiene_invariants() -> None:
+    import re
+
+    assert len(spec_kb.CURATED_PATTERNS) == 3
+    seen_ids: set[str] = set()
+    for entry in spec_kb.CURATED_PATTERNS:
+        pid = entry["id"]
+        assert pid not in seen_ids
+        seen_ids.add(pid)
+        assert str(entry["source"]).startswith("curated:acsl-skills@4f913e2/")
+        content = str(entry["content"])
+        assert 0 < len(content) <= spec_kb.MAX_CURATED_CHARS, (pid, len(content))
+        for forbidden in (
+            r"buf == \null || \valid_read",
+            "LoopEntry",
+            "<==>",
+            r"assigns \result \from",
+            r"\forall int ",
+            r"\exists int ",
+            "logic int",
+        ):
+            assert forbidden not in content, (pid, forbidden)
+        # No unguarded pointer dereference inside \old(...): any * inside \old(...) must be ternary-guarded.
+        for old_arg in re.findall(r"\\old\(([^)]*)\)", content):
+            if "*" in old_arg:
+                assert "?" in old_arg, (pid, old_arg)

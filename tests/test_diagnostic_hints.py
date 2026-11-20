@@ -910,3 +910,66 @@ def test_wp_hints_unproven_global_lemmas_named_from_soundness() -> None:
     assert lemma_hint is not None, hints
     assert "(unprovable, provable)" in lemma_hint
     assert "inductive lemma required" in lemma_hint
+
+
+@pytest.mark.unit
+def test_wp_hints_pointer_value_emits_before_null_classification_hint() -> None:
+    res = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "unproven_by_bucket": {
+            "step_c_rte_obligation": [
+                {"kind": "pointer_value", "annotation": r"\null == buf + len || \object_pointer(buf + len)"}
+            ],
+        },
+        "unproven_goals": [
+            {"kind": "pointer_value", "annotation": r"\null == buf + len || \object_pointer(buf + len)"},
+        ],
+    }
+    hints = derive_wp_diagnostic_hints(res)
+    pv_hint = next((h for h in hints if "Unproven pointer formation" in h), None)
+    assert pv_hint is not None, hints
+    assert "-warn-invalid-pointer" in pv_hint
+    assert r"\object_pointer" in pv_hint
+    assert "BEFORE any later NULL or empty-window guard runs" in pv_hint
+    assert "never edit C code" in pv_hint
+    assert "fault_hypothesis" in pv_hint and "proof_gap" in pv_hint
+    assert "rejected_overconstrained" in pv_hint
+    assert not any("pointer/array access ('mem_access' / 'index_bound')" in h for h in hints), hints
+
+
+@pytest.mark.unit
+def test_wp_hints_pointer_value_skips_valid_function_and_coexists_with_mem_access() -> None:
+    # 1. Function-pointer \valid_function pointer_value goal must NOT trigger the data-pointer formation hint.
+    res_fp = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "unproven_by_bucket": {
+            "step_c_rte_obligation": [{"kind": "pointer_value", "annotation": r"\null == fp || \valid_function(fp)"}],
+        },
+        "unproven_goals": [
+            {"kind": "pointer_value", "annotation": r"\null == fp || \valid_function(fp)"},
+        ],
+    }
+    hints_fp = derive_wp_diagnostic_hints(res_fp)
+    assert not any("Unproven pointer formation" in h for h in hints_fp), hints_fp
+    assert not any("pointer/array access ('mem_access' / 'index_bound')" in h for h in hints_fp), hints_fp
+
+    # 2. Mixed data pointer_value + mem_access emits both hints.
+    res_mixed = {
+        "status": "unproven_goals_remain",
+        "soundness": {"ok": True},
+        "unproven_by_bucket": {
+            "step_c_rte_obligation": [
+                {"kind": "pointer_value", "annotation": r"\null == buf + len || \object_pointer(buf + len)"},
+                {"kind": "mem_access", "annotation": r"\valid_read(buf + i)"},
+            ],
+        },
+        "unproven_goals": [
+            {"kind": "pointer_value", "annotation": r"\null == buf + len || \object_pointer(buf + len)"},
+            {"kind": "mem_access", "annotation": r"\valid_read(buf + i)"},
+        ],
+    }
+    hints_mixed = derive_wp_diagnostic_hints(res_mixed)
+    assert any("Unproven pointer formation" in h for h in hints_mixed), hints_mixed
+    assert any("pointer/array access ('mem_access' / 'index_bound')" in h for h in hints_mixed), hints_mixed

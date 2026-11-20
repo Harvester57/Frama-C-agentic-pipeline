@@ -12,10 +12,15 @@ KBSpec's C@All, 2606.21339v2), complementing WP pass/fail:
   assert, assigns) unproven, the spec rejects the wrong code.
   precision = rejected/total.
 - trivial stub (Shirobokov et al., Appendix I.1): replace the body with one that
-  does nothing (`{ }` for void, `{ return 0; }` for scalar and pointer returns).
-  A contract that still proves against it constrains no result. It is prepended
-  to the implementation mutants (outside max_mutants); FRAMAC_MUTATION_STUB=off
-  disables it for A/B runs.
+  does nothing (`{ }` for void, `{ return 0; }` for scalar and pointer returns),
+  plus up to 2 `{ return <param>; }` stubs for parameters whose normalized C type
+  matches the return type (also valid for by-value struct/union returns; skips
+  stubs token-identical to the original body before applying the cap). A contract
+  that still proves against any applicable trivial stub constrains too little of
+  the result (`trivial_body_rejected` is True iff every applicable stub is
+  rejected, False if any survives, None when none are applicable). Trivial stubs
+  are prepended to the implementation mutants (outside max_mutants);
+  FRAMAC_MUTATION_STUB=off disables all of them for A/B runs.
 
 Rejection criterion. The original function is all_proven with the same solver
 budget, so a mutant goal the solvers can no longer prove is evidence that the
@@ -81,6 +86,7 @@ from framac_common import (  # noqa: E402
 MUTATION_SCHEMA = 1
 DEFAULT_MAX_FUNCTIONS = 20
 DEFAULT_MAX_MUTANTS = 6
+DEFAULT_MAX_PARAM_STUBS = 2
 
 _REL_OP_FLIP = [("<=", "<"), (">=", ">"), ("<", "<="), (">", ">=")]
 _C_PUNCT = frozenset("-+*/%&|^!~<>=?:")
@@ -91,8 +97,69 @@ _DEC_INT_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 # WP report statuses that carry goal results; any other status is a failed run.
 _ANALYSED_STATUSES = ("all_proven", "unproven_goals_remain")
 _DECL_DROP = frozenset({"static", "inline", "__inline", "__inline__", "extern", "_Noreturn", "__extension__"})
+_TYPE_STRIP = _DECL_DROP | frozenset(
+    {
+        "const",
+        "__const",
+        "__const__",
+        "volatile",
+        "__volatile",
+        "__volatile__",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "_Atomic",
+        "register",
+        "auto",
+        "_Thread_local",
+        "__thread",
+    }
+)
+_INT_SPECIFIERS = frozenset({"signed", "__signed", "__signed__", "unsigned", "char", "short", "int", "long"})
+_FLOAT_SPECIFIERS = frozenset({"float", "double", "long", "_Complex", "__complex__"})
+_C_DECL_KEYWORDS = _TYPE_STRIP | frozenset(
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "signed",
+        "__signed",
+        "__signed__",
+        "unsigned",
+        "float",
+        "double",
+        "_Bool",
+        "bool",
+        "_Complex",
+        "__complex__",
+        "_Imaginary",
+        "struct",
+        "union",
+        "enum",
+        "typedef",
+        "typeof",
+        "__typeof__",
+    }
+)
 _ATTRIBUTE_KEYWORDS = frozenset({"__attribute__", "__attribute", "__declspec", "__asm__", "__asm", "asm"})
+_OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
+_CLOSE_DELIMS = frozenset(")]}")
+_PARAM_HEAD_FORBIDDEN = frozenset("()[]{}=;")
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+_NormalizedType = tuple[tuple[str, ...], int]
+
+
+@dataclass(frozen=True)
+class _ParsedDeclarator:
+    """Header of a C function definition split into return type and typed parameters."""
+
+    ret_tokens: list[str]
+    ret_norm_type: _NormalizedType | None
+    params: tuple[tuple[str, _NormalizedType], ...]
+    is_kr: bool
 
 
 def _flip_rel_ops(clause_text: str) -> str:
@@ -255,15 +322,166 @@ def _strip_attributes(toks: list[str]) -> list[str] | None:
     return out
 
 
-def trivial_stub_mutant(span_text: str, brace_offset: int | None) -> tuple[str, str] | None:
+def _normalize_type(tokens: Sequence[str], *, extra_ptr_depth: int = 0) -> _NormalizedType | None:
     """
-    The body that does nothing for this function: ("trivial-noop-body", "{ }") for
-    a `void` return, ("trivial-zero-body", "{ return 0; }") for integer, floating,
-    enum, _Bool and pointer returns. None for a by-value struct/union return (a
-    scalar `return 0;` does not compile) and for a declarator that cannot be
-    parsed. A typedef'd struct return is not recognisable from the declarator; its
-    stub fails to compile and the WP run is recorded as not_applicable.
+    Canonicalize a C type specifier + pointer stars to `(canonical_base_tokens, ptr_depth)`,
+    or None when the token sequence is not a supported concrete C type.
+
+    Qualifiers (`const`, `volatile`, `restrict`, `_Atomic`) and storage/function specifiers
+    are stripped (Frama-C 34 accepts returning `const T *` from `T *`, so `strchr`-style
+    functions still get parameter stubs). Integer specifier order and redundant `int`/`signed`
+    are canonicalized, while `char`, `signed char`, and `unsigned char` stay distinct.
     """
+    kept = [t for t in tokens if t not in _TYPE_STRIP]
+    if not kept:
+        return None
+    first_star = kept.index("*") if "*" in kept else len(kept)
+    base = kept[:first_star]
+    stars = kept[first_star:]
+    if not base or any(t != "*" for t in stars):
+        return None
+    if not all(_IDENT_RE.fullmatch(t) for t in base):
+        return None
+    ptr_depth = len(stars) + extra_ptr_depth
+
+    if "void" in base:
+        return (("void",), ptr_depth) if base == ["void"] else None
+
+    if base[0] in ("struct", "union", "enum"):
+        if len(base) == 2 and base[1] not in _C_DECL_KEYWORDS:
+            return ((base[0], base[1]), ptr_depth)
+        return None
+    if any(t in ("struct", "union", "enum") for t in base):
+        return None
+
+    if base in (["_Bool"], ["bool"]):
+        return (("_Bool",), ptr_depth)
+
+    if any(t in ("float", "double", "_Complex", "__complex__") for t in base):
+        if not all(t in _FLOAT_SPECIFIERS for t in base):
+            return None
+        norm_f = ["_Complex" if t == "__complex__" else t for t in base]
+        n_complex = norm_f.count("_Complex")
+        n_float = norm_f.count("float")
+        n_double = norm_f.count("double")
+        n_long = norm_f.count("long")
+        if n_complex > 1:
+            return None
+        if (n_float, n_double, n_long) == (1, 0, 0):
+            canon: tuple[str, ...] = ("float",)
+        elif (n_float, n_double, n_long) == (0, 1, 0):
+            canon = ("double",)
+        elif (n_float, n_double, n_long) == (0, 1, 1):
+            canon = ("long", "double")
+        else:
+            return None
+        if n_complex == 1:
+            canon = (*canon, "_Complex")
+        return (canon, ptr_depth)
+
+    if all(t in _INT_SPECIFIERS for t in base):
+        norm_i = ["signed" if t in ("__signed", "__signed__") else t for t in base]
+        n_signed = norm_i.count("signed")
+        n_unsigned = norm_i.count("unsigned")
+        n_char = norm_i.count("char")
+        n_short = norm_i.count("short")
+        n_int = norm_i.count("int")
+        n_long = norm_i.count("long")
+        if n_signed + n_unsigned > 1 or n_char > 1 or n_short > 1 or n_int > 1 or n_long > 2:
+            return None
+        if n_char and (n_short or n_int or n_long):
+            return None
+        if n_short and n_long:
+            return None
+        if n_char:
+            if n_signed:
+                return (("signed", "char"), ptr_depth)
+            if n_unsigned:
+                return (("unsigned", "char"), ptr_depth)
+            return (("char",), ptr_depth)
+        if n_short:
+            return (("unsigned", "short"), ptr_depth) if n_unsigned else (("short",), ptr_depth)
+        if n_long == 2:
+            return (("unsigned", "long", "long"), ptr_depth) if n_unsigned else (("long", "long"), ptr_depth)
+        if n_long == 1:
+            return (("unsigned", "long"), ptr_depth) if n_unsigned else (("long",), ptr_depth)
+        return (("unsigned", "int"), ptr_depth) if n_unsigned else (("int",), ptr_depth)
+
+    if len(base) == 1 and base[0] not in _C_DECL_KEYWORDS:
+        return ((base[0],), ptr_depth)
+    return None
+
+
+def _parse_params(param_toks: Sequence[str]) -> tuple[tuple[str, _NormalizedType], ...]:
+    """
+    Parse a prototype parameter token list into `((name, normalized_type), ...)`.
+    Skips unnamed parameters, variadics (`...`), function-pointer and pointer-to-array
+    parameters, multi-dimensional arrays (>= 2 dims), and inline anonymous structs/unions.
+    Decays 1D array parameters (`T a[]`, `T a[N]`) to `T *`.
+    """
+    if not param_toks or list(param_toks) == ["void"]:
+        return ()
+    parts: list[list[str]] = []
+    cur: list[str] = []
+    stack: list[str] = []
+    for tok in param_toks:
+        if tok in _OPEN_TO_CLOSE:
+            stack.append(_OPEN_TO_CLOSE[tok])
+            cur.append(tok)
+        elif tok in _CLOSE_DELIMS:
+            if not stack or stack[-1] != tok:
+                return ()
+            stack.pop()
+            cur.append(tok)
+        elif tok == "," and not stack:
+            parts.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    if stack:
+        return ()
+    parts.append(cur)
+
+    out: list[tuple[str, _NormalizedType]] = []
+    for p in parts:
+        if not p or p == [".", ".", "."] or "..." in p:
+            continue
+        array_dims = 0
+        end = len(p)
+        unbalanced = False
+        while end > 0 and p[end - 1] == "]":
+            depth = 0
+            idx = end - 1
+            while idx >= 0:
+                if p[idx] == "]":
+                    depth += 1
+                elif p[idx] == "[":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                idx -= 1
+            if depth != 0:
+                unbalanced = True
+                break
+            array_dims += 1
+            end = idx
+        if unbalanced or array_dims > 1:
+            continue
+        head = p[:end]
+        if any(t in _PARAM_HEAD_FORBIDDEN for t in head):
+            continue
+        if len(head) < 2 or not _IDENT_RE.fullmatch(head[-1]) or head[-1] in _C_DECL_KEYWORDS:
+            continue
+        name = head[-1]
+        norm = _normalize_type(head[:-1], extra_ptr_depth=array_dims)
+        if norm is None:
+            continue
+        out.append((name, norm))
+    return tuple(out)
+
+
+def _parse_declarator(span_text: str, brace_offset: int | None) -> _ParsedDeclarator | None:
+    """Parse a C function definition header before `{`, returning None if unparseable or nested."""
     if brace_offset is None or brace_offset <= 0:
         return None
     try:
@@ -274,17 +492,141 @@ def trivial_stub_mutant(span_text: str, brace_offset: int | None) -> tuple[str, 
     if not toks or "(" not in toks:
         return None
     paren = toks.index("(")
-    if paren == 0 or not _IDENT_RE.fullmatch(toks[paren - 1]):
+    if paren == 0 or not _IDENT_RE.fullmatch(toks[paren - 1]) or toks[paren - 1] in _C_DECL_KEYWORDS:
         return None
-    ret = [t for t in toks[: paren - 1] if t not in _DECL_DROP]
-    if not ret:
+    depth = 0
+    close_paren: int | None = None
+    for idx in range(paren, len(toks)):
+        if toks[idx] == "(":
+            depth += 1
+        elif toks[idx] == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = idx
+                break
+    if close_paren is None:
         return None
+    trailing = toks[close_paren + 1 :]
+    if trailing and trailing[0] in ("(", "["):
+        return None
+    ret_tokens = [t for t in toks[: paren - 1] if t not in _DECL_DROP]
+    if not ret_tokens:
+        return None
+    is_kr = ";" in trailing
+    ret_norm_type = _normalize_type(ret_tokens)
+    params = () if is_kr else _parse_params(toks[paren + 1 : close_paren])
+    return _ParsedDeclarator(
+        ret_tokens=ret_tokens,
+        ret_norm_type=ret_norm_type,
+        params=params,
+        is_kr=is_kr,
+    )
+
+
+def _body_is_return_param(body_text: str, param_name: str) -> bool:
+    """Whether `body_text` is `{ return <param_name>; }` (ignoring comments, ACSL, and outer parens)."""
+    try:
+        tokens = tokenize_c_acsl(body_text, path="<body>")
+    except Exception:
+        return False
+    code_toks = [t for t in tokens if t.kind not in ("whitespace", "c_comment", "acsl_block", "acsl_line")]
+    if len(code_toks) < 5 or any(t.kind != "c_token" for t in code_toks):
+        return False
+    texts = [t.text for t in code_toks]
+    if texts[:2] != ["{", "return"] or texts[-2:] != [";", "}"]:
+        return False
+    expr = texts[2:-2]
+    while len(expr) >= 3 and expr[0] == "(" and expr[-1] == ")":
+        expr = expr[1:-1]
+    return expr == [param_name]
+
+
+def _base_stub_from_decl(decl: _ParsedDeclarator | None) -> tuple[str, str] | None:
+    if decl is None or not decl.ret_tokens:
+        return None
+    ret = decl.ret_tokens
     pointer = "*" in ret
     if not pointer and ("struct" in ret or "union" in ret):
         return None
     if not pointer and "void" in ret:
         return ("trivial-noop-body", "{ }")
     return ("trivial-zero-body", "{ return 0; }")
+
+
+def _param_stubs_from_decl(
+    decl: _ParsedDeclarator | None,
+    *,
+    body_text: str | None = None,
+    max_stubs: int = DEFAULT_MAX_PARAM_STUBS,
+) -> list[tuple[str, str]]:
+    if max_stubs <= 0 or decl is None or decl.ret_norm_type is None or decl.is_kr:
+        return []
+    if decl.ret_norm_type == (("void",), 0):
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for name, param_type in decl.params:
+        if name in seen or param_type != decl.ret_norm_type:
+            continue
+        if body_text is not None and _body_is_return_param(body_text, name):
+            continue
+        seen.add(name)
+        out.append((f"trivial-param-{name}-body", f"{{ return {name}; }}"))
+        if len(out) >= max_stubs:
+            break
+    return out
+
+
+def trivial_stub_mutant(span_text: str, brace_offset: int | None) -> tuple[str, str] | None:
+    """
+    The body that does nothing for this function: ("trivial-noop-body", "{ }") for
+    a `void` return, ("trivial-zero-body", "{ return 0; }") for integer, floating,
+    enum, _Bool and pointer returns. None for a by-value struct/union return (a
+    scalar `return 0;` does not compile) and for a declarator that cannot be
+    parsed. A typedef'd struct return is not recognisable from the declarator; its
+    stub fails to compile and the WP run is recorded as not_applicable.
+    """
+    return _base_stub_from_decl(_parse_declarator(span_text, brace_offset))
+
+
+def param_stub_mutants(
+    span_text: str,
+    brace_offset: int | None,
+    *,
+    body_text: str | None = None,
+    max_stubs: int = DEFAULT_MAX_PARAM_STUBS,
+) -> list[tuple[str, str]]:
+    """
+    Up to `max_stubs` `{ return <param>; }` stub mutants for parameters whose normalized
+    C type matches the normalized return type, in left-to-right declaration order.
+    Skips parameter stubs token-identical to `body_text` (defaulting to
+    `span_text[brace_offset:]` when `body_text` is None) before applying the cap.
+    """
+    decl = _parse_declarator(span_text, brace_offset)
+    effective_body = body_text
+    if effective_body is None and brace_offset is not None and brace_offset < len(span_text):
+        effective_body = span_text[brace_offset:]
+    return _param_stubs_from_decl(decl, body_text=effective_body, max_stubs=max_stubs)
+
+
+def trivial_stub_mutants(
+    span_text: str,
+    brace_offset: int | None,
+    *,
+    body_text: str | None = None,
+    max_param_stubs: int = DEFAULT_MAX_PARAM_STUBS,
+) -> list[tuple[str, str]]:
+    """
+    All trivial-body stubs for this function: the base zero/noop stub (when applicable)
+    followed by up to `max_param_stubs` `{ return <param>; }` parameter stubs.
+    """
+    decl = _parse_declarator(span_text, brace_offset)
+    base = _base_stub_from_decl(decl)
+    effective_body = body_text
+    if effective_body is None and brace_offset is not None and brace_offset < len(span_text):
+        effective_body = span_text[brace_offset:]
+    params = _param_stubs_from_decl(decl, body_text=effective_body, max_stubs=max_param_stubs)
+    return ([base] if base is not None else []) + params
 
 
 def _is_rejection(report: dict) -> tuple[bool, str]:
@@ -401,11 +743,15 @@ def check_function(
     Mutate the contract and the body of `fn` in `c_file`, run WP per mutant, and
     return {function, file, spec_mutants, spec_not_applicable, equivalent,
     impl_mutants, impl_not_applicable, rejected, completeness, precision,
-    trivial_body_rejected (only with the stub on), details}. Mutants whose WP run
-    yields no goal results are counted in the *_not_applicable fields and left out
-    of the denominators. `wp_runner` defaults to run_wp_function.run_wp_on_function
-    with default options (run_mutation_check passes one with the proof's model and
-    checks) and is injectable for tests.
+    trivial_body_rejected (only with the stub on), details}. When the stub switch
+    is on, prepends the base zero/noop stub (when applicable) and up to
+    DEFAULT_MAX_PARAM_STUBS `{ return <param>; }` stubs outside `max_mutants`;
+    `trivial_body_rejected` is True iff every applicable trivial stub is rejected,
+    False if any applicable trivial stub survives, and None when no trivial stub
+    is applicable. Mutants whose WP run yields no goal results are counted in the
+    *_not_applicable fields and left out of the denominators. `wp_runner` defaults
+    to run_wp_function.run_wp_on_function with default options (run_mutation_check
+    passes one with the proof's model and checks) and is injectable for tests.
     """
     runner = wp_runner or _default_runner()
     text = c_file.read_text(encoding="utf-8", errors="replace")
@@ -430,11 +776,12 @@ def check_function(
         "details": [],
     }
     impl = impl_mutants(body, max_mutants)
-    stub_name: str | None = None
+    stub_names: set[str] = set()
+    stub_results: list[bool] = []
     if stub_enabled():
         result["trivial_body_rejected"] = None
-        stub = trivial_stub_mutant(span.text, brace)
-        if stub is None:
+        stubs = trivial_stub_mutants(span.text, brace, body_text=body)
+        if not stubs:
             result["details"].append(
                 {
                     "mutant": "trivial-stub",
@@ -446,8 +793,8 @@ def check_function(
                 }
             )
         else:
-            stub_name = stub[0]
-            impl = [stub, *impl]  # the stub does not count against max_mutants
+            stub_names = {name for name, _ in stubs}
+            impl = [*stubs, *impl]  # trivial stubs do not count against max_mutants
     first_preprocess_error = ""
     with tempfile.TemporaryDirectory(prefix="framac-mutation-") as tmp:
         tmp_path = Path(tmp)
@@ -493,8 +840,8 @@ def check_function(
                     else:
                         result["impl_mutants"] += 1
                         result["rejected"] += int(rej)
-                    if name == stub_name:
-                        result["trivial_body_rejected"] = None if verdict == "not_applicable" else rej
+                        if name in stub_names:
+                            stub_results.append(rej)
                     detail = {
                         "mutant": name,
                         "kind": "impl",
@@ -515,6 +862,8 @@ def check_function(
                             "",
                         )
                 result["details"].append(detail)
+    if stub_enabled():
+        result["trivial_body_rejected"] = all(stub_results) if stub_results else None
     if result["spec_mutants"]:
         result["completeness"] = round(1 - result["equivalent"] / result["spec_mutants"], 4)
     if result["impl_mutants"]:

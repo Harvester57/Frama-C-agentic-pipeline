@@ -943,5 +943,191 @@ def test_selftest_passes_in_the_image():
     assert json.loads(proc.stdout)["ok"] is True
 
 
+# ---------------------------------------------------------------- parse-loss census (Tier 2 Part B)
+
+
+@pytest.mark.unit
+def test_summarize_parse_warnings_folds_and_classifies_attributes_and_categories():
+    tree = "/framac-scratch/tree"
+    log = "\n".join(
+        [
+            # -no-annot libc:frama-c noise -> skipped, not parse loss.
+            "[kernel:libc:frama-c] FRAMAC_SHARE/libc/string.h:10: Warning:",
+            "  Unable to locate ACSL predicate valid_read_string.",
+            # Multi-line wrapped asm:clobber in project file + snapshot header.
+            "[kernel:asm:clobber] src/low.c:42: Warning:",
+            '  Clobber list contains "memory" argument.',
+            "  Assuming no side-effect beyond those mentioned in operands.",
+            "[kernel:asm:clobber] /framac-run/workspace/snapshot/root/usr/include/ext.h:9: Warning:",
+            '  Clobber list contains "cc" argument.',
+            # Benign GCC/Clang attributes (paired __ and bare) + Frama-C 34 statement attrs -> benign only.
+            "[kernel:attrs:unknown] src/a.c:1: Warning: Ignoring unknown attribute: __warn_unused_result__",
+            "[kernel:attrs:unknown] src/a.c:2: Warning: Ignoring unknown attribute: cold",
+            "[kernel:attrs:unknown] src/a.c:3: Warning: Ignoring unknown attribute: format",
+            "[kernel:attrs:unknown] src/a.c:4: Warning: Ignoring unknown attribute: visibility",
+            "[kernel:attrs:unknown] src/a.c:5: Warning: Ignoring unknown attribute: deprecated",
+            "[kernel:attrs] src/a.c:6: Warning: unexpected statement attribute cold",
+            "[kernel:attrs] src/a.c:7: Warning: unexpected statement attribute __hot__",
+            # Semantic attributes (paired __ and bare).
+            "[kernel:attrs:unknown] src/u.h:12: Warning: Ignoring unknown attribute: transparent_union",
+            "[kernel:attrs:unknown] src/u.h:15: Warning: Ignoring unknown attribute: __cleanup__",
+            "[kernel:attrs:unknown] src/u.h:18: Warning: Ignoring unknown attribute: packed",
+            # Unclassified custom attribute.
+            "[kernel:attrs:unknown] src/u.h:22: Warning: Ignoring unknown attribute: __custom_magic__",
+            # Benign/tracked kernel categories.
+            "[kernel:typing:implicit-conv-void-ptr] src/a.c:30: Warning: implicit conversion from void * to int *",
+            "[kernel:typing:variadic] src/a.c:31: Warning: Incorrect type for argument 2.",
+            "[kernel:pp:extra-args-std] Warning: Preprocessing options contain '-std='.",
+            # Snapshot-header storm + project-file occurrence of typing:incompatible-types-call (safestack.h style).
+            "[kernel:typing:incompatible-types-call] /framac-run/workspace/snapshot/root/usr/include/openssl/safestack.h:208: Warning:",
+            "  implicit conversion between incompatible function types",
+            "[kernel:typing:incompatible-types-call] /framac-run/workspace/snapshot/root/usr/include/openssl/safestack.h:209: Warning:",
+            "  implicit conversion between incompatible function types",
+            "[kernel:typing:incompatible-types-call] src/http.c:127: Warning:",
+            "  implicit conversion between incompatible function types in project file",
+            # Implicit function declaration in project code.
+            "[kernel:typing:implicit-function-declaration] src/net.c:63: Warning:",
+            "  Calling undeclared function accept4. Old style K&R code?",
+        ]
+    )
+    pw = pm.summarize_parse_warnings(log, tree)
+    assert pw["no_annot_libc_skipped"] == 1
+    assert pw["asm_clobber"] == {
+        "count": 2,
+        "project_count": 1,
+        "samples": ["src/low.c:42", "/framac-run/workspace/snapshot/root/usr/include/ext.h:9"],
+    }
+    assert pw["attrs_unknown"]["benign"] == {
+        "cold": 2,
+        "deprecated": 1,
+        "format": 1,
+        "hot": 1,
+        "visibility": 1,
+        "warn_unused_result": 1,
+    }
+    assert pw["attrs_unknown"]["semantic"] == {"cleanup": 1, "packed": 1, "transparent_union": 1}
+    assert pw["attrs_unknown"]["unclassified"] == {"custom_magic": 1}
+    assert pw["attrs_unknown"]["semantic_samples"] == [
+        "src/u.h:12: transparent_union",
+        "src/u.h:15: cleanup",
+        "src/u.h:18: packed",
+    ]
+    assert pw["attrs_unknown"]["unclassified_samples"] == ["src/u.h:22: custom_magic"]
+    assert pw["benign_categories"] == {
+        "pp:extra-args-std": 1,
+        "typing:implicit-conv-void-ptr": 1,
+        "typing:variadic": 1,
+    }
+    incompat = pw["unclassified_categories"]["typing:incompatible-types-call"]
+    assert incompat["count"] == 3 and incompat["project_count"] == 1
+    # Project-file sample must be preferred over snapshot-header sample.
+    assert incompat["sample"].startswith("src/http.c:127:")
+    assert pw["unclassified_categories"]["typing:implicit-function-declaration"]["project_count"] == 1
+    assert pw["has_parse_loss"] is True
+
+
+@pytest.mark.unit
+def test_summarize_parse_warnings_benign_and_snapshot_only_have_no_parse_loss():
+    tree = "/framac-scratch/tree"
+    log = "\n".join(
+        [
+            "[kernel:libc:frama-c] FRAMAC_SHARE/libc/stdio.h:1: Warning: Unable to locate ACSL predicate valid_read_string.",
+            "[kernel:attrs:unknown] src/a.c:1: Warning: Ignoring unknown attribute: nonnull",
+            "[kernel:attrs] src/a.c:2: Warning: unexpected statement attribute cold",
+            "[kernel:typing:implicit-conv-void-ptr] src/a.c:3: Warning: implicit conversion from void * to char *",
+            "[kernel:typing:variadic] src/a.c:4: Warning: cast int to unsigned int",
+            "[kernel:pp:extra-args-std] Warning: Preprocessing options contain '-std='.",
+            "[kernel:typing:incompatible-types-call] /framac-run/workspace/snapshot/root/usr/include/openssl/safestack.h:10: Warning: incompatible",
+        ]
+    )
+    pw = pm.summarize_parse_warnings(log, tree)
+    assert pw["has_parse_loss"] is False
+    assert pw["no_annot_libc_skipped"] == 1
+    assert pw["attrs_unknown"]["benign"] == {"cold": 1, "nonnull": 1}
+    assert pw["unclassified_categories"]["typing:incompatible-types-call"]["count"] == 1
+    assert pw["unclassified_categories"]["typing:incompatible-types-call"]["project_count"] == 0
+
+
+@pytest.mark.unit
+def test_build_model_attaches_parse_warnings_and_warns_only_on_parse_loss(tmp_path, monkeypatch):
+    import validate_artifacts as va
+
+    tree = tmp_path / "tree"
+    (tree / "src").mkdir(parents=True)
+    for f in ("clean.c", "loss.c", "bad.c"):
+        (tree / "src" / f).write_text("int f(void) { return 0; }\n", encoding="utf-8")
+    capture = {
+        "status": "ok",
+        "scratch": {"tree": str(tree)},
+        "compiles": [
+            {"source": "src/clean.c", "object": "clean.o", "flags": [], "system_flags": []},
+            {"source": "src/loss.c", "object": "loss.o", "flags": [], "system_flags": []},
+            {"source": "src/bad.c", "object": "bad.o", "flags": [], "system_flags": []},
+        ],
+        "units": {
+            "libclean.a": {
+                "kind": "static_lib",
+                "test": False,
+                "objects": ["clean.o"],
+                "files": ["src/clean.c"],
+                "links": [],
+            },
+            "libloss.a": {
+                "kind": "static_lib",
+                "test": False,
+                "objects": ["loss.o"],
+                "files": ["src/loss.c"],
+                "links": [],
+            },
+            "libbad.a": {
+                "kind": "static_lib",
+                "test": False,
+                "objects": ["bad.o"],
+                "files": ["src/bad.c"],
+                "links": [],
+            },
+        },
+    }
+    cap = tmp_path / "cap.json"
+    cap.write_text(json.dumps(capture), encoding="utf-8")
+    monkeypatch.setattr(pm, "compile_dump_module", lambda *a, **k: (tmp_path / "dump.cmxs", ""))
+    monkeypatch.setattr(pm, "macro_aliases", lambda *a, **k: [])
+
+    def fake_runner(cmd, **kw):
+        env = kw.get("env") or {}
+        src = next(a for a in cmd if a.endswith(".c"))
+        if src.endswith("bad.c"):
+            return subprocess.CompletedProcess(cmd, 1, "", "src/bad.c:1: syntax error\n")
+        Path(env[pm.DUMP_OUT_ENV]).write_text(
+            json.dumps({"functions": [], "globals": [], "externals": []}), encoding="utf-8"
+        )
+        if src.endswith("clean.c"):
+            out = "[kernel:attrs:unknown] src/clean.c:1: Warning: Ignoring unknown attribute: cold\n"
+        else:
+            out = (
+                "[kernel:attrs:unknown] src/loss.c:2: Warning: Ignoring unknown attribute: transparent_union\n"
+                "[kernel:typing:implicit-function-declaration] src/loss.c:5: Warning: Calling undeclared function accept4.\n"
+            )
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    monkeypatch.setattr(
+        pm,
+        "gcc_callgraph",
+        lambda *a, **k: {"status": "ok", "errors": [], "functions": {}, "edges": [], "indirect": []},
+    )
+    model, rc = pm.build_model(cap, tmp_path / "model.json", broker=False, runner=fake_runner)
+    assert rc == 0 and model["status"] == "ok"
+    assert list(va.validate_phase0_model(model)) == []
+    assert model["units"]["libclean.a"]["parse"]["warnings"]["has_parse_loss"] is False
+    assert model["units"]["libclean.a"]["parse"]["warnings"]["attrs_unknown"]["benign"] == {"cold": 1}
+    assert model["units"]["libloss.a"]["parse"]["warnings"]["has_parse_loss"] is True
+    assert "warnings" not in model["units"]["libbad.a"]["parse"]  # gcc_fallback untouched
+    # Model warning emitted for libloss.a, NOT for libclean.a.
+    assert any(
+        "libloss.a: Frama-C -no-annot parse warnings" in w and "transparent_union" in w for w in model["warnings"]
+    )
+    assert not any("libclean.a: Frama-C -no-annot parse warnings" in w for w in model["warnings"])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -175,17 +175,20 @@ def test_check_function_stub_rejected_with_unknown_verdict(tmp_path: Path) -> No
     c_file = _write(tmp_path, "a.c", ADD_SRC)
 
     def runner(c_file, fn, out_dir, cppflags="-I."):
-        if "{ return 0; }" in Path(c_file).read_text(encoding="utf-8"):
+        text = Path(c_file).read_text(encoding="utf-8")
+        if any(body in text for body in ("{ return 0; }", "{ return a; }", "{ return b; }")):
             return _unproven(("ensures", "Unknown"))
         return {"status": "all_proven"}
 
     f = mc.check_function(c_file, "add", "-I.", tmp_path / "out", wp_runner=runner)
     assert f["trivial_body_rejected"] is True
-    stub = next(d for d in f["details"] if d["mutant"] == "trivial-zero-body")
-    assert stub["rejected"] is True and stub["verdict"] == "unknown"
-    # No relational operator and no constant return: the stub is the only impl mutant,
+    by_name = {d["mutant"]: d for d in f["details"] if d["kind"] == "impl"}
+    assert list(by_name) == ["trivial-zero-body", "trivial-param-a-body", "trivial-param-b-body"]
+    for name in ("trivial-zero-body", "trivial-param-a-body", "trivial-param-b-body"):
+        assert by_name[name]["rejected"] is True and by_name[name]["verdict"] == "unknown"
+    # No relational operator and no constant return: the 3 trivial stubs are the only impl mutants,
     # so this function now gets a precision at all.
-    assert f["impl_mutants"] == 1 and f["rejected"] == 1 and f["precision"] == 1.0
+    assert f["impl_mutants"] == 3 and f["rejected"] == 3 and f["precision"] == 1.0
 
 
 def test_check_function_failed_runs_are_not_applicable(tmp_path: Path) -> None:
@@ -193,7 +196,7 @@ def test_check_function_failed_runs_are_not_applicable(tmp_path: Path) -> None:
 
     def runner(c_file, fn, out_dir, cppflags="-I."):
         text = Path(c_file).read_text(encoding="utf-8")
-        if "{ return 0; }" in text:
+        if "{ return 0; }" in text or "{ return n; }" in text:
             raise RuntimeError("frama-c: parse error")
         if "ensures \\true;" in text:
             return {"status": "analysis_error"}
@@ -203,9 +206,10 @@ def test_check_function_failed_runs_are_not_applicable(tmp_path: Path) -> None:
 
     f = mc.check_function(c_file, "sum", "-I.", tmp_path / "out", wp_runner=runner)
     assert f["trivial_body_rejected"] is None
-    assert f["impl_not_applicable"] == 1 and f["spec_not_applicable"] == 1
-    stub = next(d for d in f["details"] if d["mutant"] == "trivial-zero-body")
-    assert stub["verdict"] == "not_applicable" and stub["rejected"] is False
+    assert f["impl_not_applicable"] == 2 and f["spec_not_applicable"] == 1
+    for stub_name in ("trivial-zero-body", "trivial-param-n-body"):
+        stub = next(d for d in f["details"] if d["mutant"] == stub_name)
+        assert stub["verdict"] == "not_applicable" and stub["rejected"] is False
     impl = [d for d in f["details"] if d["kind"] == "impl" and d["verdict"] != "not_applicable"]
     assert f["impl_mutants"] == len(impl) and f["rejected"] == 1
     assert f["precision"] == round(1 / len(impl), 4)
@@ -267,13 +271,12 @@ def test_run_mutation_check_trivial_body_totals(tmp_path: Path) -> None:
         )
 
     def runner(c_file, fn, out_dir, cppflags="-I."):
-        text = Path(c_file).read_text(encoding="utf-8")
         if fn == "clamp":
             return {"status": "all_proven"}
-        if "{ return 0; }" in text and fn == "add":
+        if fn == "add" and "wp-impl-trivial-" in Path(out_dir).name:
             return _unproven(("ensures", "Unknown"))
-        if "{ return 0; }" in text:
-            return {"status": "analysis_error"}  # sum: stub not applicable
+        if fn == "sum" and "wp-impl-trivial-" in Path(out_dir).name:
+            return {"status": "analysis_error"}  # sum: stubs not applicable
         return _unproven(("ensures", "Invalid"))
 
     totals = mc.run_mutation_check(run_dir, wp_runner=runner)["totals"]
@@ -281,7 +284,7 @@ def test_run_mutation_check_trivial_body_totals(tmp_path: Path) -> None:
     assert totals["trivial_body_checked"] == 2
     assert totals["trivial_body_accepted"] == 1
     assert totals["trivial_body_accepted_functions"] == ["clamp"]
-    assert totals["impl_not_applicable"] == 1
+    assert totals["impl_not_applicable"] == 2
 
 
 def test_default_runner_requests_no_counter_examples(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -930,3 +933,487 @@ def test_run_mutation_check_ignores_non_report_artifacts_under_work(tmp_path: Pa
     doc = mc.run_mutation_check(run_dir, wp_runner=lambda *a, **k: {"status": "all_proven"})
     assert list(doc["functions"]) == ["sum"]
     assert doc["totals"]["functions"] == 1
+
+
+def _param_stubs(src: str, *, max_stubs: int = mc.DEFAULT_MAX_PARAM_STUBS) -> list[tuple[str, str]]:
+    return mc.param_stub_mutants(src, _find_body_brace_offset(src), max_stubs=max_stubs)
+
+
+def _all_stubs(src: str, *, max_param_stubs: int = mc.DEFAULT_MAX_PARAM_STUBS) -> list[tuple[str, str]]:
+    return mc.trivial_stub_mutants(src, _find_body_brace_offset(src), max_param_stubs=max_param_stubs)
+
+
+@pytest.mark.unit
+def test_param_stub_mutants_type_matching_and_normalization() -> None:
+    # Basic multi-param match
+    assert _param_stubs("int max(int a, int b) { return a > b ? a : b; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    # Qualifiers, storage specifiers, and multi-token integer permutations
+    assert _param_stubs(
+        "static inline unsigned long int f(const long unsigned x, register unsigned long y, unsigned long z) { return 0; }"
+    ) == [
+        ("trivial-param-x-body", "{ return x; }"),
+        ("trivial-param-y-body", "{ return y; }"),
+    ]
+    assert _param_stubs("signed f(int a, __signed__ int b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs("unsigned f(unsigned int a, int unsigned b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs("long long int f(signed long long a, long int long b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs("unsigned long long f(long unsigned long int a) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+    ]
+    assert _param_stubs("short int f(signed short a, short b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs("unsigned short f(short unsigned int a) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+    ]
+    # Boolean and floating-point / complex canonicalization
+    assert _param_stubs("_Bool f(bool a, const _Bool b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs("long double f(double long a, const long double b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs("float _Complex f(_Complex float a, __complex__ float b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    # Pointer depths, void *, and const/volatile/restrict qualifiers on pointers (accepted by Frama-C 34)
+    assert _param_stubs("char *pick_ptr(const char *a, char * restrict b) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs("void *f(void *p, int *q) { return 0; }") == [
+        ("trivial-param-p-body", "{ return p; }"),
+    ]
+    assert _param_stubs("int * const *f(const int * volatile *p, int *q) { return 0; }") == [
+        ("trivial-param-p-body", "{ return p; }"),
+    ]
+    # Single-dimension array decay (including static qualifier, sizeof bound, and char *argv[])
+    assert _param_stubs("int *find(const int arr[], int n, int buf[16]) { return 0; }") == [
+        ("trivial-param-arr-body", "{ return arr; }"),
+        ("trivial-param-buf-body", "{ return buf; }"),
+    ]
+    assert _param_stubs("const char *f(const char b[static 4], char c[sizeof(int)]) { return 0; }") == [
+        ("trivial-param-b-body", "{ return b; }"),
+        ("trivial-param-c-body", "{ return c; }"),
+    ]
+    assert _param_stubs("char **shift(char *argv[], int argc) { return 0; }") == [
+        ("trivial-param-argv-body", "{ return argv; }"),
+    ]
+    # Tag types (struct/union/enum) by value and by pointer
+    assert _all_stubs("struct s inc_s(const struct s a) { struct s r = a; return r; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+    ]
+    assert _all_stubs("union u f(union u x) { union u r = x; return r; }") == [
+        ("trivial-param-x-body", "{ return x; }"),
+    ]
+    assert _param_stubs("enum color f(const enum color c, int n) { return 0; }") == [
+        ("trivial-param-c-body", "{ return c; }"),
+    ]
+    assert _param_stubs("struct s *f(const struct s *p, struct other *q) { return 0; }") == [
+        ("trivial-param-p-body", "{ return p; }"),
+    ]
+    # Matching typedefs
+    assert _param_stubs("size_t f(const size_t n, unsigned long m) { return 0; }") == [
+        ("trivial-param-n-body", "{ return n; }"),
+    ]
+    assert _all_stubs("Box inc_box(Box b) { Box r = b; return r; }") == [
+        ("trivial-zero-body", "{ return 0; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    # Attributes on return type, parameters, and post-parameter suffix
+    assert _param_stubs(
+        "__attribute__((nonnull(1))) char *f(char *p __attribute__((unused))) __attribute__((pure)) { return 0; }"
+    ) == [
+        ("trivial-param-p-body", "{ return p; }"),
+    ]
+
+
+@pytest.mark.unit
+def test_param_stub_mutants_skips_non_matching_and_unsupported() -> None:
+    # void return, void param list, empty ()
+    assert _param_stubs("void f(int x, void *p) { (void)x; (void)p; }") == []
+    assert _param_stubs("int f(void) { return 1; }") == []
+    assert _param_stubs("int f() { return 1; }") == []
+    # Unnamed parameters (including qualified typedefs, struct tags, pointers, arrays)
+    assert _param_stubs("int f(int, const size_t, struct s, int * const, int[], const int[]) { return 1; }") == []
+    assert _param_stubs("size_t f(size_t, const size_t) { return 1; }") == []
+    assert _param_stubs("struct s f(struct s) { struct s r = {0}; return r; }") == []
+    # Multi-dimensional arrays (>= 2 dims decay to pointer-to-array, not T **)
+    assert _param_stubs("int **mat(int m[][4], int n[3][4], int **p) { return 0; }") == [
+        ("trivial-param-p-body", "{ return p; }"),
+    ]
+    # Function-pointer params, pointer-to-array params, parenthesized declarator, variadics
+    assert _param_stubs("int f(int (*cb)(int), int a, ...) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+    ]
+    assert _param_stubs("int *f(int (*a)[10], int *p) { return 0; }") == [
+        ("trivial-param-p-body", "{ return p; }"),
+    ]
+    assert _param_stubs("int f(int (a)) { return 0; }") == []
+    # char, signed char, and unsigned char stay distinct
+    assert _param_stubs("char *f(unsigned char *u, signed char *s, char *c) { return 0; }") == [
+        ("trivial-param-c-body", "{ return c; }"),
+    ]
+    assert _param_stubs("signed char f(char c, unsigned char u, signed char s) { return 0; }") == [
+        ("trivial-param-s-body", "{ return s; }"),
+    ]
+    assert _param_stubs("unsigned char f(char c, signed char s, unsigned char u) { return 0; }") == [
+        ("trivial-param-u-body", "{ return u; }"),
+    ]
+    # Typedef alias mismatches are skipped conservatively
+    assert _param_stubs("size_t f(unsigned long x) { return 0; }") == []
+    # K&R definitions: base zero stub still works, parameter stubs skipped cleanly
+    kr_src = "int kr(a, b) int a; int b; { return a + b; }"
+    assert _stub(kr_src) == ("trivial-zero-body", "{ return 0; }")
+    assert _param_stubs(kr_src) == []
+    # Nested function-pointer and pointer-to-array returns: both base and param stubs return None / []
+    for nested in (
+        "unsigned int (*get_cb(int x))(int) { return 0; }",
+        "int (*get_cb2(int x))(int) { return 0; }",
+        "my_t (*get_cb3(int x))(int) { return 0; }",
+        "struct s (*get_cb4(int x))(int) { return 0; }",
+        "my_t (*get_arr(int x))[4] { return 0; }",
+    ):
+        assert _stub(nested) is None, nested
+        assert _param_stubs(nested) == [], nested
+    # Inline anonymous struct/union in param list or return type
+    assert _param_stubs("int f(struct { int x, y; } s, int a) { return 0; }") == [
+        ("trivial-param-a-body", "{ return a; }"),
+    ]
+    assert _all_stubs("struct { int x; } f(int a) { return a; }") == []
+    # Macro-decorated return type: base zero stub still works, param stubs skipped cleanly
+    macro_src = "EXPORT_API int f(int a) { return a + 1; }"
+    assert _stub(macro_src) == ("trivial-zero-body", "{ return 0; }")
+    assert _param_stubs(macro_src) == []
+    # Invalid specifier mixes in _normalize_type
+    for bad in (
+        ["signed", "unsigned", "int"],
+        ["short", "long"],
+        ["char", "int"],
+        ["long", "long", "long"],
+        ["float", "double"],
+        ["long", "long", "double"],
+        ["void", "int"],
+        ["int", "*", "int"],
+        ["struct"],
+    ):
+        assert mc._normalize_type(bad) is None, bad
+
+
+@pytest.mark.unit
+def test_param_stub_mutants_cap_and_order(tmp_path: Path) -> None:
+    src = """\
+/*@ ensures \\result == a + b + c + d; */
+int sum4(int a, int b, int c, int d) {
+  if (a < b) return 0;
+  return a + b + c + d;
+}
+"""
+    assert _param_stubs(src) == [
+        ("trivial-param-a-body", "{ return a; }"),
+        ("trivial-param-b-body", "{ return b; }"),
+    ]
+    assert _param_stubs(src, max_stubs=0) == []
+    assert [name for name, _ in _param_stubs(src, max_stubs=3)] == [
+        "trivial-param-a-body",
+        "trivial-param-b-body",
+        "trivial-param-c-body",
+    ]
+    # Trivial stubs (base + capped param stubs) come first and do not consume max_mutants.
+    c_file = _write(tmp_path, "sum4.c", src)
+    f = mc.check_function(
+        c_file, "sum4", "-I.", tmp_path / "out", wp_runner=lambda *a, **k: {"status": "all_proven"}, max_mutants=1
+    )
+    assert [d["mutant"] for d in f["details"] if d["kind"] == "impl"] == [
+        "trivial-zero-body",
+        "trivial-param-a-body",
+        "trivial-param-b-body",
+        "flip-<",
+    ]
+
+
+@pytest.mark.unit
+def test_param_stub_skips_body_identical_return(tmp_path: Path) -> None:
+    id_src = "/*@ ensures \\result == x; */\nint id(int x) { return x; }\n"
+    id_paren_src = "int id_p(int x) { /*@ assert x >= 0; */ // comment\n return ((x)); }\n"
+    first_src = "int first(int a, int b, int c) { return a; }\n"
+
+    assert _param_stubs(id_src) == []
+    assert _all_stubs(id_src) == [("trivial-zero-body", "{ return 0; }")]
+    assert _param_stubs(id_paren_src) == []
+    # Cap is applied AFTER filtering the body-identical parameter `a`, so both `b` and `c` are kept.
+    assert _param_stubs(first_src) == [
+        ("trivial-param-b-body", "{ return b; }"),
+        ("trivial-param-c-body", "{ return c; }"),
+    ]
+    # Non-identical bodies are NOT filtered out.
+    assert _param_stubs("int f(int x) { return x + 0; }") == [("trivial-param-x-body", "{ return x; }")]
+    assert _param_stubs("int f(int x) { return (int)x; }") == [("trivial-param-x-body", "{ return x; }")]
+    assert _param_stubs('const char *f(const char *x) { return "x"; }') == [
+        ("trivial-param-x-body", "{ return x; }"),
+    ]
+    # End-to-end check_function on an identity function: only trivial-zero-body runs.
+    c_file = _write(tmp_path, "id.c", id_src)
+    res = mc.check_function(
+        c_file,
+        "id",
+        "-I.",
+        tmp_path / "out",
+        wp_runner=lambda *a, **k: _unproven(("ensures", "Unknown")),
+    )
+    assert [d["mutant"] for d in res["details"] if d["kind"] == "impl"] == ["trivial-zero-body"]
+    assert res["trivial_body_rejected"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "outcomes,expected_rejected,expected_impl_mutants,expected_na",
+    [
+        # (a) all 3 stubs rejected -> True
+        (
+            {
+                "trivial-zero-body": _unproven(("ensures", "Unknown")),
+                "trivial-param-a-body": _unproven(("ensures", "Invalid")),
+                "trivial-param-b-body": _unproven(("ensures", "Unknown")),
+            },
+            True,
+            3,
+            0,
+        ),
+        # (b) zero rejected + one param survives (proved) -> False
+        (
+            {
+                "trivial-zero-body": _unproven(("ensures", "Unknown")),
+                "trivial-param-a-body": {"status": "all_proven"},
+                "trivial-param-b-body": _unproven(("ensures", "Unknown")),
+            },
+            False,
+            3,
+            0,
+        ),
+        # (c) zero rejected + one param survives (rte_only) -> False
+        (
+            {
+                "trivial-zero-body": _unproven(("ensures", "Unknown")),
+                "trivial-param-a-body": _unproven(("rte_signed_overflow", "Unknown")),
+                "trivial-param-b-body": _unproven(("ensures", "Invalid")),
+            },
+            False,
+            3,
+            0,
+        ),
+        # (d) zero survives + both params rejected -> False
+        (
+            {
+                "trivial-zero-body": {"status": "all_proven"},
+                "trivial-param-a-body": _unproven(("ensures", "Invalid")),
+                "trivial-param-b-body": _unproven(("ensures", "Invalid")),
+            },
+            False,
+            3,
+            0,
+        ),
+        # (e) zero not_applicable + params rejected -> True (e.g. typedef struct Box)
+        (
+            {
+                "trivial-zero-body": {"status": "acsl_syntax_error"},
+                "trivial-param-a-body": _unproven(("ensures", "Unknown")),
+                "trivial-param-b-body": _unproven(("ensures", "Invalid")),
+            },
+            True,
+            2,
+            1,
+        ),
+        # (f) zero not_applicable + one param survives -> False
+        (
+            {
+                "trivial-zero-body": {"status": "acsl_syntax_error"},
+                "trivial-param-a-body": {"status": "all_proven"},
+                "trivial-param-b-body": _unproven(("ensures", "Invalid")),
+            },
+            False,
+            2,
+            1,
+        ),
+        # (g) all stubs not_applicable -> None
+        (
+            {
+                "trivial-zero-body": {"status": "analysis_error"},
+                "trivial-param-a-body": {"status": "analysis_error"},
+                "trivial-param-b-body": {"status": "analysis_error"},
+            },
+            None,
+            0,
+            3,
+        ),
+    ],
+)
+def test_trivial_body_rejected_aggregation(
+    tmp_path: Path,
+    outcomes: dict[str, dict],
+    expected_rejected: bool | None,
+    expected_impl_mutants: int,
+    expected_na: int,
+) -> None:
+    c_file = _write(tmp_path, "add.c", ADD_SRC)
+
+    def runner(mut_file, fn, out_dir, cppflags="-I."):
+        name = Path(out_dir).name
+        if name.startswith("wp-impl-"):
+            return outcomes[name[len("wp-impl-") :]]
+        return {"status": "all_proven"}
+
+    res = mc.check_function(c_file, "add", "-I.", tmp_path / "out", wp_runner=runner)
+    assert res["trivial_body_rejected"] is expected_rejected
+    assert res["impl_mutants"] == expected_impl_mutants
+    assert res["impl_not_applicable"] == expected_na
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "param_report,expected", [(_unproven(("ensures", "Unknown")), True), ({"status": "all_proven"}, False)]
+)
+def test_by_value_struct_runs_param_stub_without_synthetic_na(
+    tmp_path: Path, param_report: dict, expected: bool
+) -> None:
+    src = (
+        "struct s { int x; };\n"
+        "/*@ ensures \\result.x == a.x + 1; */\n"
+        "struct s inc_s(const struct s a) { struct s r = a; r.x += 1; return r; }\n"
+    )
+    c_file = _write(tmp_path, "s.c", src)
+    seen_impl: list[str] = []
+
+    def runner(mut_file, fn, out_dir, cppflags="-I."):
+        name = Path(out_dir).name
+        if name.startswith("wp-impl-"):
+            seen_impl.append(name[len("wp-impl-") :])
+            return param_report
+        return {"status": "all_proven"}
+
+    res = mc.check_function(c_file, "inc_s", "-I.", tmp_path / "out", wp_runner=runner)
+    assert seen_impl == ["trivial-param-a-body"]
+    assert [d["mutant"] for d in res["details"] if d["kind"] == "impl"] == ["trivial-param-a-body"]
+    assert res["trivial_body_rejected"] is expected
+    assert res["impl_mutants"] == 1 and res["impl_not_applicable"] == 0
+    assert res["precision"] == (1.0 if expected else 0.0)
+
+
+@pytest.mark.unit
+def test_stub_switch_off_drops_param_stubs_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FRAMAC_MUTATION_STUB", "off")
+    add_file = _write(tmp_path, "a.c", ADD_SRC)
+    res_add = mc.check_function(
+        add_file, "add", "-I.", tmp_path / "out_add", wp_runner=lambda *a, **k: _unproven(("ensures", "Unknown"))
+    )
+    assert "trivial_body_rejected" not in res_add
+    assert not any(d["mutant"].startswith("trivial") for d in res_add["details"])
+    assert res_add["impl_mutants"] == 0 and res_add["precision"] is None
+
+    sum_file = _write(tmp_path, "m.c", SRC)
+    res_sum = mc.check_function(
+        sum_file, "sum", "-I.", tmp_path / "out_sum", wp_runner=lambda *a, **k: _unproven(("ensures", "Invalid"))
+    )
+    assert "trivial_body_rejected" not in res_sum
+    assert [d["mutant"] for d in res_sum["details"] if d["kind"] == "impl"] == ["flip-<", "return-0-to-1"]
+    assert res_sum["impl_mutants"] == 2 and res_sum["rejected"] == 2 and res_sum["precision"] == 1.0
+
+
+@pytest.mark.unit
+def test_spec_quality_renders_function_accepting_param_stub(tmp_path: Path) -> None:
+    max_weak_src = """\
+/*@ ensures \\result >= a; */
+int max_weak(int a, int b) {
+  return a >= b ? a : b;
+}
+"""
+    run_dir = tmp_path / "run"
+    (run_dir / "workspace" / "work").mkdir(parents=True)
+    (run_dir / "workspace" / "work" / "m.c").write_text(max_weak_src, encoding="utf-8")
+    wp_dir = run_dir / "workspace" / "reports" / "wp"
+    wp_dir.mkdir(parents=True)
+    (wp_dir / "max_weak.json").write_text(
+        json.dumps({"status": "all_proven", "function": "max_weak", "file": "m.c"}),
+        encoding="utf-8",
+    )
+
+    def runner(mut_file, fn, out_dir, cppflags="-I."):
+        name = Path(out_dir).name
+        if name == "wp-impl-trivial-param-a-body":
+            return {"status": "all_proven"}  # weak contract accepts `{ return a; }`
+        return _unproven(("ensures", "Unknown"))
+
+    doc = mc.run_mutation_check(run_dir, wp_runner=runner)
+    assert doc["functions"]["max_weak"]["trivial_body_rejected"] is False
+    assert doc["totals"]["trivial_body_checked"] == 1
+    assert doc["totals"]["trivial_body_accepted"] == 1
+    assert doc["totals"]["trivial_body_accepted_functions"] == ["max_weak"]
+
+    section = "\n".join(gr.spec_quality_section({"run_dir": run_dir, "ledger": [], "mutation": doc}))
+    assert "1 accept a body that does nothing: `max_weak`" in section
+    assert "trivial stub rejected: no" in section
+
+
+@pytest.mark.unit
+def test_validate_run_accepts_mutation_totals_with_param_stubs(tmp_path: Path) -> None:
+    import benchmark
+
+    run_dir = _fake_run(tmp_path)
+    doc = mc.run_mutation_check(run_dir, wp_runner=lambda *a, **k: _unproven(("ensures", "Unknown")))
+    out = run_dir / "workspace" / "reports" / "mutation.json"
+    summary = mc.summarize_mutation(out)
+    assert summary == doc["totals"]
+
+    zero_rate = {"passed": 0, "failed": 0, "undecided": 0, "over_decided": None, "strict": None}
+    bench_run = {
+        "schema_version": 1,
+        "run_id": "tier5-check",
+        "created_at": "2026-11-20T00:00:00Z",
+        "mode": "deterministic",
+        "pipeline": {"commit": "abc1234", "dirty": False, "content_digest": "0" * 64},
+        "toolchain": {},
+        "machine": {},
+        "limits": {"wp_memlimit_mb": 1000, "fuzz_rss_limit_mb": 512, "replay_per_input_timeout_s": 5},
+        "selection": {},
+        "targets": {
+            "t": {
+                "set": "comparison",
+                "revision": "a" * 40,
+                "harness_digest": "b" * 64,
+                "status": "ok",
+                "problems": [],
+                "stages": {},
+                "wall_s": 1.0,
+                "cpu_s": 1.0,
+                "dag": {},
+                "modules": {},
+                "functions_with_unknown": [],
+                "functions_with_unknown_count": 0,
+                "functions_with_unknown_no_unit": [],
+                "prover_tasks": {},
+                "units": {"total": zero_rate, "by_wave": {}, "by_class": {}, "covered": [], "candidate": []},
+                "mutation": summary,
+                "candidates": {},
+            }
+        },
+        "recall": benchmark.recall_block({}),
+        "briefs": None,
+        "totals": {"wall_s": 1.0, "cpu_s": 1.0},
+    }
+    assert benchmark.validate_run(bench_run) == []

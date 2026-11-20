@@ -38,16 +38,20 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from framac_common import atomic_write_json, load_json_optional, run_lock, utc_now  # noqa: E402
 
 KB_ENV = "FRAMAC_SPEC_KB"
+CURATED_ENV = "FRAMAC_SPEC_KB_CURATED"
 KB_SENTINEL = "<!-- spec-kb -->"
 KB_SCHEMA = 1
 MAX_ITEM_CHARS = 1200
 TOP_G = 3
+MAX_CURATED_ITEMS = 2
+MAX_CURATED_CHARS = 900
 TOP_L_EVOLVED = 50
 MAX_REPAIR_HINTS = 3
 
@@ -82,6 +86,13 @@ _ACSL_LINE_RE = re.compile(
 def enabled() -> bool:
     """FRAMAC_SPEC_KB=off: no knowledge base, for A/B comparisons."""
     return (os.environ.get(KB_ENV) or "").strip().lower() not in ("off", "0", "false", "no", "disabled")
+
+
+def curated_enabled() -> bool:
+    """FRAMAC_SPEC_KB_CURATED=on: include the feature-matched curated ACSL pattern slot in prover briefs.
+    Off by default until Phase 3 A/B passes, and off whenever FRAMAC_SPEC_KB=off disables the KB."""
+    wanted = (os.environ.get(CURATED_ENV) or "").strip().lower() in ("on", "1", "true", "yes", "enabled")
+    return wanted and enabled()
 
 
 def _keywords(text: str) -> set[str]:
@@ -197,6 +208,190 @@ def function_query(record: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Curated specification patterns (feature-matched, separate from seed/evolved)
+# ---------------------------------------------------------------------------
+#
+# Curated ACSL specification patterns adapted from evdenis/acsl-skills@4f913e2
+# (MIT License, Copyright (c) 2026 Denis Efremov). Rewritten in this pipeline's
+# own words and constrained to the WP + E-ACSL intersection (pure-ACSL, no C
+# edits, no unguarded \old dereferences, no loop-entry labels, no nullable-or-
+# valid_read disjunctions, no <==>).
+
+CURATED_PATTERNS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "curated:parser_progress",
+        "source": "curated:acsl-skills@4f913e2/parsers.md",
+        "title": "Parser progress bounds, errors without behaviors, and offset exports",
+        "priority": 30,
+        "content": r"""/*@ requires window: len > 0 ==> \valid_read(buf + (0 .. len - 1));
+    requires out:    \valid(out) && \valid(eaten);
+    requires sep:    \separated(out, eaten, buf + (0 .. len - 1));
+    terminates \true;
+    exits \false;
+    assigns *out, *eaten;
+    ensures sign:     \result == 0 || \result == -1;
+    ensures progress: \result == 0 ==> 1 <= *eaten <= len;
+*/
+Both halves of `progress` matter: `*eaten <= len` proves the caller's `remain -= eaten` safe, and `1 <= *eaten` decreases `loop variant remain;`.
+Use guarded `ensures` (`\result == 0 ==> ...`), not named `behavior` blocks; for an in-out `*off`, guard `\old` derefs (`\old(off == \null ? (size_t)0 : *off) < *off <= len`).
+For cursor returns, export `\base_addr(\result) == \base_addr(\old(buf))` and `0 <= \result - \old(buf) <= \old(len)`. Keep `assigns \nothing;` on pure parsers; never edit C code.""",
+    },
+    {
+        "id": "curated:quantified_base_restate",
+        "source": "curated:acsl-skills@4f913e2/loops.md",
+        "title": "Restate quantified loop invariants over the entry/base pointer",
+        "priority": 20,
+        "content": r"""/*@ ghost const unsigned char *base = buf; */
+buf += 2;
+/*@ loop invariant bound: 0 <= i <= 4;
+    loop invariant cur:   \forall integer k; 0 <= k < i     ==> '0' <= buf[k] <= '9';
+    loop invariant entry: \forall integer k; 2 <= k < i + 2 ==> '0' <= base[k] <= '9';
+    loop assigns i;
+    loop variant 4 - i;
+*/
+SMT solvers match `\forall` triggers syntactically: an invariant stated only over an advanced pointer `buf[k]` can stall or return `Unknown` on a later precondition or `ensures` written over the entry pointer (`base[10]` or `\old(buf)[10]`).
+Capture an unmodified base pointer via a formal or `/*@ ghost const T *base = buf; */` and restate the quantified fact directly over `base[k]` with chained `integer` bounds (`lo <= k < hi`).
+Avoid loop-entry labels (skipped by E-ACSL) and keep quantified invariants on bounded loops.""",
+    },
+    {
+        "id": "curated:search_loop_witness",
+        "source": "curated:acsl-skills@4f913e2/loops.md",
+        "title": "Backward scan signed -1 bound and search/running-result witness",
+        "priority": 10,
+        "content": r"""/* Backward scan (signed index, stops at i == -1 when not found): */
+/*@ loop invariant bound: -1 <= i <= n - 1;
+    loop invariant miss:  \forall integer k; i + 1 <= k < n ==> a[k] != target;
+    loop assigns i;
+    loop variant i + 1;
+*/
+/* Running best/match (universal bound + existential witness): */
+/*@ loop invariant bound: 1 <= i <= n;
+    loop invariant upper: \forall integer k; 0 <= k < i ==> a[k] <= m;
+    loop invariant wit:   \exists integer k; 0 <= k < i && a[k] == m;
+    loop assigns i, m;
+    loop variant n - i;
+*/
+A backward scan over a signed index exits at `i == -1`: state `-1 <= i <= n - 1`, `loop variant i + 1;` (non-negative), and chained suffix bounds `i + 1 <= k < n` (E-ACSL requires `<=` on the lower bound).
+Pair a running-result universal invariant with an existential witness (`\exists integer k; 0 <= k < i && ...`) or ghost index.""",
+    },
+)
+
+_INT_RETURN_RE = re.compile(r"\b(?:int|long|short|s?size_t|ptrdiff_t|off_t|u?int[A-Za-z0-9_]*)\b")
+_DECREMENT_RE = re.compile(r"--|-=\s*1\b|-\s*1\b")
+
+
+def _is_integer_return_type(ret: Any) -> bool:
+    text = " ".join(str(ret or "").split())
+    if not text or "*" in text or text == "void":
+        return False
+    if any(tok in text.split() for tok in ("struct", "union", "enum", "float", "double", "_Bool", "bool")):
+        return False
+    return bool(_INT_RETURN_RE.search(text))
+
+
+def _pointer_formal_count(record: dict[str, Any]) -> int:
+    return sum(1 for f in record.get("formals") or [] if isinstance(f, dict) and f.get("kind") == "pointer")
+
+
+def _loop_has_decrement(loop: dict[str, Any]) -> bool:
+    if _DECREMENT_RE.search(str(loop.get("header") or "")):
+        return True
+    for scalar in loop.get("scalars") or []:
+        if not isinstance(scalar, dict):
+            continue
+        for upd in scalar.get("updates") or []:
+            if _DECREMENT_RE.search(str(upd or "")):
+                return True
+    return False
+
+
+def _loop_has_early_exit(loop: dict[str, Any]) -> bool:
+    return any(isinstance(ex, dict) and ex.get("kind") in ("return", "break") for ex in loop.get("exits") or [])
+
+
+def _has_in_loop_return(record: dict[str, Any]) -> bool:
+    return any(isinstance(p, dict) and bool(p.get("in_loop")) for p in record.get("return_paths") or [])
+
+
+def _has_search_or_backward_loop(record: dict[str, Any]) -> bool:
+    loops = [lp for lp in record.get("loops") or [] if isinstance(lp, dict)]
+    return any(_loop_has_decrement(lp) or _loop_has_early_exit(lp) for lp in loops) or _has_in_loop_return(record)
+
+
+def _curated_match_score(pattern_id: str, record: dict[str, Any], feats: dict[str, Any]) -> int:
+    if pattern_id == "curated:parser_progress":
+        base = bool(feats.get("pointer_len_params")) or (bool(feats.get("pointer_walk")) and bool(feats.get("strings")))
+        if not base:
+            return 0
+        if str(record.get("return_type") or "").strip() == "void" and _pointer_formal_count(record) < 2:
+            return 0
+        score = 1
+        if _is_integer_return_type(record.get("return_type")):
+            score += 2
+        if len(record.get("return_paths") or []) >= 2:
+            score += 1
+        if bool(feats.get("pointer_walk")):
+            score += 1
+        return score
+
+    if pattern_id == "curated:quantified_base_restate":
+        base = bool(feats.get("loops")) and (
+            bool(feats.get("pointer_walk"))
+            or bool(feats.get("in_place_loop"))
+            or bool(feats.get("loop_reads_earlier_writes"))
+            or bool(feats.get("arrays"))
+            or bool(feats.get("strings"))
+        )
+        if not base:
+            return 0
+        score = 1
+        if bool(feats.get("pointer_walk")) or bool(record.get("derived_pointers")):
+            score += 3
+        if bool(feats.get("in_place_loop")) or bool(feats.get("loop_reads_earlier_writes")):
+            score += 2
+        if bool(feats.get("arrays")) or bool(feats.get("strings")):
+            score += 1
+        return score
+
+    if pattern_id == "curated:search_loop_witness":
+        base = (
+            bool(feats.get("loops"))
+            and (bool(feats.get("read_only_loop")) or bool(feats.get("strings")) or bool(feats.get("arrays")))
+            and (_has_search_or_backward_loop(record) or bool(feats.get("read_only_loop")))
+        )
+        if not base:
+            return 0
+        loops = [lp for lp in record.get("loops") or [] if isinstance(lp, dict)]
+        score = 1
+        if any(_loop_has_decrement(lp) for lp in loops):
+            score += 3
+        if any(_loop_has_early_exit(lp) for lp in loops) or _has_in_loop_return(record):
+            score += 2
+        if bool(feats.get("read_only_loop")):
+            score += 1
+        return score
+
+    return 0
+
+
+def curated_patterns_for(record: dict[str, Any] | None, max_items: int = MAX_CURATED_ITEMS) -> list[dict[str, Any]]:
+    """Feature-keyed curated ACSL patterns for one function (immune to _STOPWORDS and seed KB pool)."""
+    if not curated_enabled() or record is None or max_items <= 0:
+        return []
+    feats = record.get("features") or {}
+    if not isinstance(feats, dict):
+        return []
+    scored: list[tuple[int, int, str, dict[str, Any]]] = []
+    for entry in CURATED_PATTERNS:
+        pid = str(entry.get("id") or "")
+        score = _curated_match_score(pid, record, feats)
+        if score > 0:
+            scored.append((score, int(entry.get("priority") or 0), pid, entry))
+    scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+    return [dict(entry) for _, _, _, entry in scored[:max_items]]
+
+
+# ---------------------------------------------------------------------------
 # Loading and rendering
 # ---------------------------------------------------------------------------
 
@@ -233,23 +428,44 @@ def kb_section_for(overlay: Path, record: dict | None, top_g: int = TOP_G) -> st
     """The brief's 'Retrieved ACSL Knowledge' section, or "" when disabled/empty."""
     if not enabled() or record is None:
         return ""
+    curated = curated_patterns_for(record)
     items = query_kb(load_kb(overlay), function_query(record), top_g)
-    if not items:
+    if not curated and not items:
         return ""
-    lines = [
-        "## Retrieved ACSL Knowledge",
-        "",
-        "Top matches from the specification knowledge base (seeded from the reference manuals under "
-        "`{references_dir}`, evolved from earlier prover runs on this target) for this function's features. "
-        "Read the relevant entry before writing annotations:",
-        "",
-    ]
-    for item in items:
-        title = item.get("title") or item.get("error") or item.get("id") or "item"
-        lines.append(f"### {title} (`{item.get('source', '')}`)")
-        lines.append("```")
-        lines.append(str(item.get("content") or item.get("fix") or "")[:MAX_ITEM_CHARS])
-        lines.append("```")
+    lines = ["## Retrieved ACSL Knowledge", ""]
+    if curated:
+        lines.extend(
+            [
+                "### Curated Specification Patterns (Feature-Matched)",
+                "",
+                "Feature-matched ACSL idioms (WP + E-ACSL intersection; capped at "
+                f"{MAX_CURATED_ITEMS} items, kept separate from the manual/evolved top-{top_g} pool):",
+                "",
+            ]
+        )
+        for item in curated:
+            title = item.get("title") or item.get("id") or "pattern"
+            lines.append(f"#### {title} (`{item.get('source', '')}`)")
+            lines.append("```")
+            lines.append(str(item.get("content") or "")[:MAX_CURATED_CHARS])
+            lines.append("```")
+        if items:
+            lines.extend(["", "### Manual & Evolved Matches", ""])
+    if items:
+        lines.extend(
+            [
+                "Top matches from the specification knowledge base (seeded from the reference manuals under "
+                "`{references_dir}`, evolved from earlier prover runs on this target) for this function's features. "
+                "Read the relevant entry before writing annotations:",
+                "",
+            ]
+        )
+        for item in items:
+            title = item.get("title") or item.get("error") or item.get("id") or "item"
+            lines.append(f"### {title} (`{item.get('source', '')}`)")
+            lines.append("```")
+            lines.append(str(item.get("content") or item.get("fix") or "")[:MAX_ITEM_CHARS])
+            lines.append("```")
     return "\n".join(lines) + "\n"
 
 

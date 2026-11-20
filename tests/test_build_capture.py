@@ -1445,5 +1445,218 @@ def test_a_driver_is_marked_only_when_another_product_unit_holds_its_sources(oth
     assert all(not u["test"] for n, u in units.items() if n not in ("app", "runner2", "testlib.a"))
 
 
+# ---------------------------------------------------------------- semantic compiler flags (Tier 2 Part A)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["cc", "-fwrapv", "-c", "a.c"], ["-fwrapv"]),
+        (["cc", "-fno-strict-overflow", "-c", "a.c"], ["-fno-strict-overflow"]),
+        (["cc", "-funsigned-char", "-c", "a.c"], ["-funsigned-char"]),
+        (["cc", "-fno-signed-char", "-c", "a.c"], ["-funsigned-char"]),
+        (["cc", "-fshort-enums", "-c", "a.c"], ["-fshort-enums"]),
+        (["cc", "-fpack-struct", "-c", "a.c"], ["-fpack-struct"]),
+        (["cc", "-fpack-struct=1", "-c", "a.c"], ["-fpack-struct=1"]),
+        (["cc", "-fpack-struct=4", "-c", "a.c"], ["-fpack-struct=4"]),
+        (["cc", "-fshort-wchar", "-c", "a.c"], ["-fshort-wchar"]),
+        (["cc", "-funsigned-bitfields", "-c", "a.c"], ["-funsigned-bitfields"]),
+        (["cc", "-fno-signed-bitfields", "-c", "a.c"], ["-funsigned-bitfields"]),
+        # Negating pairs: last flag wins in both directions.
+        (["cc", "-fwrapv", "-fno-wrapv", "-c", "a.c"], []),
+        (["cc", "-fno-wrapv", "-fwrapv", "-c", "a.c"], ["-fwrapv"]),
+        (["cc", "-fno-strict-overflow", "-fstrict-overflow", "-c", "a.c"], []),
+        (["cc", "-fstrict-overflow", "-fno-strict-overflow", "-c", "a.c"], ["-fno-strict-overflow"]),
+        (["cc", "-funsigned-char", "-fsigned-char", "-c", "a.c"], []),
+        (["cc", "-funsigned-char", "-fno-unsigned-char", "-c", "a.c"], []),
+        (["cc", "-fsigned-char", "-fno-signed-char", "-c", "a.c"], ["-funsigned-char"]),
+        (["cc", "-fshort-enums", "-fno-short-enums", "-c", "a.c"], []),
+        (["cc", "-fno-short-enums", "-fshort-enums", "-c", "a.c"], ["-fshort-enums"]),
+        (["cc", "-fshort-wchar", "-fno-short-wchar", "-c", "a.c"], []),
+        (["cc", "-fno-short-wchar", "-fshort-wchar", "-c", "a.c"], ["-fshort-wchar"]),
+        (["cc", "-funsigned-bitfields", "-fsigned-bitfields", "-c", "a.c"], []),
+        (["cc", "-funsigned-bitfields", "-fno-unsigned-bitfields", "-c", "a.c"], []),
+        (["cc", "-fsigned-bitfields", "-fno-signed-bitfields", "-c", "a.c"], ["-funsigned-bitfields"]),
+        # -fpack-struct prefix/value precedence.
+        (["cc", "-fpack-struct=2", "-fpack-struct=4", "-c", "a.c"], ["-fpack-struct=4"]),
+        (["cc", "-fpack-struct=4", "-fpack-struct", "-c", "a.c"], ["-fpack-struct"]),
+        (["cc", "-fpack-struct=1", "-fno-pack-struct", "-c", "a.c"], []),
+        (["cc", "-fpack-struct=2", "-fpack-struct=0", "-c", "a.c"], []),
+        (["cc", "-fpack-struct", "-fpack-struct=0", "-c", "a.c"], []),
+        (["cc", "-fpack-struct=0", "-fpack-struct=8", "-c", "a.c"], ["-fpack-struct=8"]),
+        # Option-argument immunity (_ARG_OPTS operands are skipped).
+        (["cc", "-D", "FOO=-fwrapv", "-o", "-fwrapv", "-I", "-fshort-enums", "-c", "a.c"], []),
+        (["cc", "-DFOO=-funsigned-char", "-c", "a.c"], []),
+        # Canonical ordering across multiple active families.
+        (
+            ["cc", "-funsigned-bitfields", "-fpack-struct=2", "-fwrapv", "-fno-signed-char", "-c", "a.c"],
+            ["-fwrapv", "-funsigned-char", "-fpack-struct=2", "-funsigned-bitfields"],
+        ),
+    ],
+)
+def test_extract_semantic_flags(args: list[str], expected: list[str]):
+    assert bc.extract_semantic_flags(args) == expected
+
+
+@pytest.mark.unit
+def test_response_file_expansion_propagates_semantic_flags(tmp_path):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    rsp = tree / "flags.rsp"
+    rsp.write_text("-fwrapv -fpack-struct=2 -fno-signed-char\n", encoding="utf-8")
+    execs = [
+        {"exe": "/usr/bin/cc", "args": ["cc", "@flags.rsp", "-c", "a.c", "-o", "a.o"], "cwd": tree.as_posix()},
+    ]
+    cap = bc.classify_executions(execs, tree.as_posix())
+    assert cap["compiles"]["a.o"]["semantic_flags"] == ["-fwrapv", "-funsigned-char", "-fpack-struct=2"]
+
+
+@pytest.mark.unit
+def test_unit_semantic_flags_uniform_partial_and_conflicting():
+    # Uniform across all compiles -> scope: "all".
+    uniform = bc.unit_semantic_flags(
+        [
+            {"source": "a.c", "semantic_flags": ["-fwrapv"]},
+            {"source": "b.c", "semantic_flags": ["-fwrapv"]},
+        ]
+    )
+    assert uniform == [
+        {"flag": "-fwrapv", "family": "wrapv", "category": "overflow", "scope": "all", "files": ["a.c", "b.c"]}
+    ]
+
+    # Partial -> only affected files listed, scope: "partial".
+    partial = bc.unit_semantic_flags(
+        [
+            {"source": "a.c", "semantic_flags": ["-fwrapv"]},
+            {"source": "b.c", "semantic_flags": []},
+        ]
+    )
+    assert partial == [
+        {"flag": "-fwrapv", "family": "wrapv", "category": "overflow", "scope": "partial", "files": ["a.c"]}
+    ]
+
+    # Conflicting values in one link unit -> two separate entries, both scope: "partial".
+    conflicting = bc.unit_semantic_flags(
+        [
+            {"source": "a.c", "semantic_flags": ["-fpack-struct=1"]},
+            {"source": "b.c", "semantic_flags": ["-fpack-struct=4"]},
+        ]
+    )
+    assert conflicting == [
+        {
+            "flag": "-fpack-struct=1",
+            "family": "pack_struct",
+            "category": "layout",
+            "scope": "partial",
+            "files": ["a.c"],
+        },
+        {
+            "flag": "-fpack-struct=4",
+            "family": "pack_struct",
+            "category": "layout",
+            "scope": "partial",
+            "files": ["b.c"],
+        },
+    ]
+    assert bc.unit_semantic_flags([]) == []
+
+
+@pytest.mark.unit
+def test_analyse_and_cmd_run_semantic_flags_warnings_schema_and_snapshot_digest(tmp_path, monkeypatch, capsys):
+    snap_src = tmp_path / "ext.h"
+    snap_src.write_text("#define EXT 1\n", encoding="utf-8")
+
+    def _run_case(prod_flags_a: list[str], prod_flags_b: list[str], test_flags: list[str], subdir: str):
+        base = tmp_path / subdir
+        base.mkdir(parents=True, exist_ok=True)
+        tree = base / "tree"
+        target = base / "target"
+        for f in ("src/a.c", "src/b.c", "tests/t.c"):
+            (tree / f).parent.mkdir(parents=True, exist_ok=True)
+            (tree / f).write_text("int f(void) { return 0; }\n", encoding="utf-8")
+            (target / f).parent.mkdir(parents=True, exist_ok=True)
+            (target / f).write_text("int f(void) { return 0; }\n", encoding="utf-8")
+        t_posix = tree.as_posix()
+        execs = [
+            _cc(t_posix, *prod_flags_a, "-c", "-o", "a.o", "src/a.c"),
+            _cc(t_posix, *prod_flags_b, "-c", "-o", "b.o", "src/b.c"),
+            {"exe": "/usr/bin/ar", "args": ["ar", "rcs", "libdemo.a", "a.o", "b.o"], "cwd": t_posix},
+            _cc(t_posix, *test_flags, "-o", "tests/runner", "tests/t.c"),
+        ]
+        cap = bc.classify_executions(execs, t_posix)
+        monkeypatch.chdir(base)
+        monkeypatch.setattr(bc, "compile_deps", lambda c, t: ([c["object"], snap_src.as_posix()], None))
+        monkeypatch.setattr(bc, "compile_symbols", lambda c, t, tmp, i: ({"f": ("T", None)}, None))
+        monkeypatch.setattr(bc, "try_install", lambda *a: ([], "no install"))
+        monkeypatch.setattr(bc, "run_tool", lambda *a, **k: (0, "", ""))
+        monkeypatch.setattr(
+            bc,
+            "classify_system_paths",
+            lambda paths: {p: {"package": "libext-dev", "class": "package"} for p in paths},
+        )
+        report: dict = {
+            "schema_version": bc.SCHEMA_VERSION,
+            "generated_at": "2026-11-20T00:00:00Z",
+            "status": bc.STATUS_OK,
+            "target": target.as_posix(),
+            "build": {
+                "returncode": 0,
+                "timed_out": False,
+                "seconds": 0.1,
+                "executions": len(execs),
+                "log": "build.log",
+                "events": "events.jsonl",
+            },
+            "warnings": [],
+            "seconds": 0.2,
+        }
+        bc.analyse(report, cap, tree, base / "scratch", {}, 60, 1)
+        assert bc.validate_report(report) == []
+
+        monkeypatch.setattr(bc, "capture", lambda a: (report, 0))
+        out_path = base / "out.json"
+        ns = argparse.Namespace(target=target.as_posix(), out=str(out_path), state="")
+        rc = bc.cmd_run(ns)
+        assert rc == 0
+        summary = json.loads(capsys.readouterr().out)
+        return report, summary
+
+    clean_rep, clean_sum = _run_case([], [], [], "clean")
+    assert all(c["semantic_flags"] == [] for c in clean_rep["compiles"])
+    assert all(u["semantic_flags"] == [] for u in clean_rep["units"].values())
+    assert "semantic_flags" not in clean_sum
+    assert not any("semantic compiler flag" in w for w in clean_rep["warnings"])
+
+    # Test-only flags: recorded on test unit, no top-level warning, absent from cmd_run summary.
+    testonly_rep, testonly_sum = _run_case([], [], ["-fshort-enums"], "testonly")
+    assert testonly_rep["units"]["tests/runner"]["test"] is True
+    assert testonly_rep["units"]["tests/runner"]["semantic_flags"] == [
+        {"flag": "-fshort-enums", "family": "short_enums", "category": "layout", "scope": "all", "files": ["tests/t.c"]}
+    ]
+    assert not any("semantic compiler flag" in w for w in testonly_rep["warnings"])
+    assert "semantic_flags" not in testonly_sum
+
+    # Non-test unit with partial + uniform flags: warning emitted, cmd_run summary populated, snapshot digest unchanged.
+    flagged_rep, flagged_sum = _run_case(["-fwrapv", "-fpack-struct=2"], ["-fwrapv"], ["-fshort-enums"], "flagged")
+    lib = flagged_rep["units"]["libdemo.a"]
+    assert lib["semantic_flags"] == [
+        {"flag": "-fwrapv", "family": "wrapv", "category": "overflow", "scope": "all", "files": ["src/a.c", "src/b.c"]},
+        {
+            "flag": "-fpack-struct=2",
+            "family": "pack_struct",
+            "category": "layout",
+            "scope": "partial",
+            "files": ["src/a.c"],
+        },
+    ]
+    assert any(
+        "libdemo.a: built with semantic compiler flag(s) -fwrapv, -fpack-struct=2 (partial: 1/2 files)" in w
+        for w in flagged_rep["warnings"]
+    )
+    assert flagged_sum["semantic_flags"] == {"libdemo.a": ["-fwrapv", "-fpack-struct=2"]}
+    assert flagged_rep["snapshot"]["digest"] == clean_rep["snapshot"]["digest"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

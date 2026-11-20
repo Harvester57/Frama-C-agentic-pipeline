@@ -38,6 +38,55 @@
       },
       "required": ["threat_model", "functions", "untrusted", "boundary", "api"],
       "additionalProperties": false
+    },
+    "parse_warnings": {
+      "$comment": "Phase 0 Frama-C (-no-annot) C-level [kernel:...] parse-loss summary: asm:clobber, attribute-filtered attrs:unknown (semantic/benign/unclassified), benign/tracked kernel categories, unclassified [kernel:...] categories with project_count vs total count, and skipped -no-annot libc:frama-c warnings.",
+      "type": "object",
+      "properties": {
+        "asm_clobber": {
+          "type": "object",
+          "properties": {
+            "count": {"type": "integer", "minimum": 0},
+            "project_count": {"type": "integer", "minimum": 0},
+            "samples": {"type": "array", "items": {"type": "string"}}
+          },
+          "required": ["count", "project_count", "samples"],
+          "additionalProperties": false
+        },
+        "attrs_unknown": {
+          "type": "object",
+          "properties": {
+            "semantic": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+            "benign": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+            "unclassified": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+            "semantic_samples": {"type": "array", "items": {"type": "string"}},
+            "unclassified_samples": {"type": "array", "items": {"type": "string"}}
+          },
+          "required": ["semantic", "benign", "unclassified", "semantic_samples", "unclassified_samples"],
+          "additionalProperties": false
+        },
+        "benign_categories": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 1}
+        },
+        "unclassified_categories": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "count": {"type": "integer", "minimum": 1},
+              "project_count": {"type": "integer", "minimum": 0},
+              "sample": {"type": "string"}
+            },
+            "required": ["count", "project_count", "sample"],
+            "additionalProperties": false
+          }
+        },
+        "no_annot_libc_skipped": {"type": "integer", "minimum": 0},
+        "has_parse_loss": {"type": "boolean"}
+      },
+      "required": ["asm_clobber", "attrs_unknown", "unclassified_categories", "no_annot_libc_skipped", "has_parse_loss"],
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -82,7 +131,8 @@
               "job": {"type": "string"},
               "seconds": {"type": "number", "minimum": 0},
               "error": {"$comment": "Frama-C's first error, when the unit fell back to GCC or is unparsed", "type": "string"},
-              "gcc_error": {"$comment": "The GCC fallback's first error, when the unit is unparsed", "type": "string"}
+              "gcc_error": {"$comment": "The GCC fallback's first error, when the unit is unparsed", "type": "string"},
+              "warnings": {"$ref": "#/definitions/parse_warnings"}
             },
             "required": ["status"]
           },
@@ -274,6 +324,7 @@
           "seconds": {"type": "number", "minimum": 0},
           "error": {"type": "string"},
           "gcc_fallback": {"type": "object"},
+          "parse_warnings": {"$ref": "#/definitions/parse_warnings"},
           "alias": {
             "type": "object",
             "properties": {

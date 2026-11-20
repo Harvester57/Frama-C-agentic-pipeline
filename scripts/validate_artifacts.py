@@ -681,11 +681,88 @@ def _schema_check(name: str, data: Any) -> Errors:
 
 
 def validate_build_capture(data: Any) -> Errors:
-    return _schema_check("build_capture", data)
+    errors = _schema_check("build_capture", data)
+    if errors:
+        return errors
+    from build_capture import semantic_flag_meta
+
+    for idx, comp in enumerate(data.get("compiles") or []):
+        seen_families: dict[str, str] = {}
+        for fidx, flag in enumerate(comp.get("semantic_flags") or []):
+            where = f"$.compiles[{idx}].semantic_flags[{fidx}]"
+            try:
+                family, _ = semantic_flag_meta(flag)
+            except ValueError as exc:
+                errors.add(f"{where}: {exc}")
+                continue
+            if family in seen_families:
+                errors.add(
+                    f"{where}: duplicate semantic flag family {family!r} ({seen_families[family]!r} and {flag!r})"
+                )
+            else:
+                seen_families[family] = flag
+    for name, u in (data.get("units") or {}).items():
+        unit_files = set(u.get("files") or [])
+        seen_flags: set[str] = set()
+        for idx, entry in enumerate(u.get("semantic_flags") or []):
+            where = f"$.units[{name!r}].semantic_flags[{idx}]"
+            flag = entry["flag"]
+            if flag in seen_flags:
+                errors.add(f"{where}.flag: duplicate semantic flag {flag!r}")
+            seen_flags.add(flag)
+            try:
+                expected_family, expected_cat = semantic_flag_meta(flag)
+            except ValueError as exc:
+                errors.add(f"{where}.flag: {exc}")
+            else:
+                if entry["family"] != expected_family:
+                    errors.add(
+                        f"{where}.family: {entry['family']!r} does not match flag {flag!r} "
+                        f"(expected {expected_family!r})"
+                    )
+                if entry["category"] != expected_cat:
+                    errors.add(
+                        f"{where}.category: {entry['category']!r} does not match flag {flag!r} "
+                        f"(expected {expected_cat!r})"
+                    )
+            unknown_files = [f for f in entry["files"] if f not in unit_files]
+            if unknown_files:
+                errors.add(f"{where}.files: not in unit files: {unknown_files[:5]}")
+            if entry["scope"] == "all" and unit_files and set(entry["files"]) != unit_files:
+                errors.add(f"{where}.scope: 'all' must cover every file of the unit")
+    return errors
+
+
+def _check_parse_warnings(pw: dict[str, Any], where: str, errors: Errors) -> None:
+    from phase0_model import parse_warnings_has_loss
+
+    asm = pw["asm_clobber"]
+    if asm["project_count"] > asm["count"]:
+        errors.add(f"{where}.asm_clobber: project_count ({asm['project_count']}) exceeds count ({asm['count']})")
+    for cat, info in pw["unclassified_categories"].items():
+        if info["project_count"] > info["count"]:
+            errors.add(
+                f"{where}.unclassified_categories[{cat!r}]: "
+                f"project_count ({info['project_count']}) exceeds count ({info['count']})"
+            )
+    expected = parse_warnings_has_loss(pw)
+    if pw["has_parse_loss"] != expected:
+        errors.add(f"{where}.has_parse_loss: must be {expected} for the recorded warning counts")
 
 
 def validate_phase0_model(data: Any) -> Errors:
-    return _schema_check("phase0_model", data)
+    errors = _schema_check("phase0_model", data)
+    if errors:
+        return errors
+    for idx, job in enumerate(data.get("parse_jobs") or []):
+        pw = job.get("parse_warnings")
+        if isinstance(pw, dict):
+            _check_parse_warnings(pw, f"$.parse_jobs[{idx}].parse_warnings", errors)
+    for name, u in (data.get("units") or {}).items():
+        pw = (u.get("parse") or {}).get("warnings")
+        if isinstance(pw, dict):
+            _check_parse_warnings(pw, f"$.units[{name!r}].parse.warnings", errors)
+    return errors
 
 
 def validate_security_props(data: Any) -> Errors:

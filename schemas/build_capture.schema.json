@@ -137,6 +137,7 @@
           "arguments": {"type": "array", "items": {"type": "string"}},
           "flags": {"$comment": "-I -iquote -isystem -idirafter -include -imacros (value as next token, relative to the target root), -D -U (joined), -std=", "type": "array", "items": {"type": "string"}},
           "system_flags": {"$comment": "include options naming directories or files outside the tree (absolute)", "type": "array", "items": {"type": "string"}},
+          "semantic_flags": {"$comment": "Effective semantic compiler flags after last-flag-wins evaluation across negating pairs; empty when none. Absent in older captures.", "type": "array", "uniqueItems": true, "items": {"$ref": "#/definitions/semantic_flag_token"}},
           "headers": {"$comment": "project headers the compiler's dependency list names (generated ones included)", "type": "array", "items": {"type": "string"}},
           "includes_setjmp_h": {"$comment": "the dependency list names the libc's <setjmp.h> (not bits/setjmp.h, which glibc's <pthread.h> includes): E-ACSL cannot build it (build_callgraph_dag.route_nonlocal_jumps)", "type": "boolean"},
           "defined_functions": {"$comment": "functions the object defines (nm), as `file#name` ids: compared with the model by build_callgraph_dag (build_only_functions)", "type": "array", "items": {"type": "string"}},
@@ -166,6 +167,7 @@
           },
           "compiler": {"type": ["string", "null"]},
           "cppflags": {"type": "array", "items": {"type": "string"}},
+          "semantic_flags": {"$comment": "Effective semantic compiler flags across the unit's own compiles, with scope (all/partial) and affected files; empty when none. Absent in older captures.", "type": "array", "items": {"$ref": "#/definitions/semantic_flag_entry"}},
           "entry_points": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
           "embedded_api": {"$comment": "executables: globals of non-main files declared in the project headers they include", "type": "array", "items": {"$ref": "#/definitions/function_id"}}
         },
@@ -237,6 +239,25 @@
         "via": {"type": "string", "enum": ["link", "needed"]}
       },
       "required": ["path", "package", "class"]
+    },
+    "semantic_flag_token": {
+      "type": "string",
+      "pattern": "^(?:-fwrapv|-fno-strict-overflow|-funsigned-char|-fshort-enums|-fshort-wchar|-funsigned-bitfields|-fpack-struct(?:=[1-9][0-9]*)?)$"
+    },
+    "semantic_flag_entry": {
+      "type": "object",
+      "properties": {
+        "flag": {"$ref": "#/definitions/semantic_flag_token"},
+        "family": {
+          "type": "string",
+          "enum": ["wrapv", "no_strict_overflow", "unsigned_char", "short_enums", "pack_struct", "short_wchar", "unsigned_bitfields"]
+        },
+        "category": {"type": "string", "enum": ["overflow", "signedness", "layout"]},
+        "scope": {"type": "string", "enum": ["all", "partial"]},
+        "files": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      },
+      "required": ["flag", "family", "category", "scope", "files"],
+      "additionalProperties": false
     }
   }
 }

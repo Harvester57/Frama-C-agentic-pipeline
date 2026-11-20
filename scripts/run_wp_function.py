@@ -2334,11 +2334,29 @@ def derive_wp_diagnostic_hints(
             or buckets.get("step_c_contract_postcondition")
         ):
             goal_text = " ".join(f"{g.get('kind') or ''} {g.get('annotation') or ''}".lower() for g in unproven_goals)
-            if any(k in goal_text for k in ("mem_access", "index_bound", "pointer_value")):
+            if any(k in goal_text for k in ("mem_access", "index_bound")):
                 _add(
                     "Unproven pointer/array access ('mem_access' / 'index_bound'): add 'requires \\valid(p);' or "
                     "'requires n > 0 ==> \\valid_read(buf + (0 .. n - 1));' (guarding 'n > 0' so (NULL, 0) passes "
                     "E-ACSL) and bound loop indices with 'loop invariant 0 <= i <= n;'."
+                )
+            has_data_pointer_value = any(
+                "pointer_value" in f"{g.get('kind') or ''} {g.get('annotation') or ''}".lower()
+                and "\\valid_function" not in str(g.get("annotation") or "").lower()
+                for g in unproven_goals
+            )
+            if has_data_pointer_value:
+                _add(
+                    r"Unproven pointer formation ('pointer_value' under -warn-invalid-pointer, e.g. "
+                    r"`\object_pointer(p + n)`): WP checks pointer arithmetic at the formation site (such as "
+                    r"`end = buf + len`), BEFORE any later NULL or empty-window guard runs; "
+                    r"`requires len > 0 ==> \valid_read(buf + (0 .. len - 1));` alone does not discharge `buf + len` "
+                    r"when `buf == \null` or on an empty window. Pure-ACSL triage (never edit C code): (1) if the API "
+                    r"contract forbids NULL and the corpus never passes it, require `buf != \null` (with "
+                    r"`len > 0 ==> \valid_read(buf + (0 .. len - 1))` or `\object_pointer(buf + len)`); (2) if "
+                    r"reachable callers or corpus inputs pass `(NULL, 0)` (so `buf != \null` triggers "
+                    r"`rejected_overconstrained` or violates Rule 3 on an untrusted entry), classify it as a "
+                    r"`fault_hypothesis` (invalid pointer formation before NULL/empty-window check) or `proof_gap`."
                 )
             if any(k in goal_text for k in ("signed_overflow", "unsigned_overflow", "division_by_zero", "shift")):
                 _add(

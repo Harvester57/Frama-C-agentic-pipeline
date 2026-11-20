@@ -546,3 +546,177 @@ def test_spec_quality_ignores_non_report_artifacts_under_work(tmp_path):
     assert "- **unknown**: 1" in text
     assert "**prover_limited**" not in text
     assert "**spec_limited**" not in text
+
+
+def test_report_semantic_flags_section_absent_when_clean_and_rendered_when_active(tmp_path):
+    from generate_report import semantic_flags_lines
+
+    build_run(tmp_path)
+    generate(tmp_path, tmp_path)
+    baseline_report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "### Semantic compiler flags" not in baseline_report
+
+    # Clean capture (empty semantic_flags) produces byte-for-byte identical REPORT.md.
+    clean_capture = {
+        "schema_version": 1,
+        "generated_at": "2026-11-20T00:00:00Z",
+        "status": "ok",
+        "target": "/target",
+        "compiles": [],
+        "units": {
+            "libsnmp.a": {
+                "kind": "static_lib",
+                "test": False,
+                "test_reason": None,
+                "files": ["src/a.c"],
+                "objects": [],
+                "links": [],
+                "external_libs": [],
+                "compiler": None,
+                "cppflags": [],
+                "semantic_flags": [],
+                "entry_points": [],
+                "embedded_api": [],
+            }
+        },
+        "warnings": [],
+    }
+    write_json(tmp_path / "workspace/reports/build_capture.json", clean_capture)
+    generate(tmp_path, tmp_path)
+    assert (tmp_path / "REPORT.md").read_text(encoding="utf-8") == baseline_report
+
+    # Test-only unit with flags produces zero diff too.
+    test_only = json.loads(json.dumps(clean_capture))
+    test_only["units"]["tests/unit_test"] = {
+        **test_only["units"]["libsnmp.a"],
+        "kind": "executable",
+        "test": True,
+        "test_reason": "directory",
+        "files": ["tests/t.c"],
+        "semantic_flags": [
+            {"flag": "-fwrapv", "family": "wrapv", "category": "overflow", "scope": "all", "files": ["tests/t.c"]}
+        ],
+    }
+    assert semantic_flags_lines(test_only) == []
+    write_json(tmp_path / "workspace/reports/build_capture.json", test_only)
+    generate(tmp_path, tmp_path)
+    assert (tmp_path / "REPORT.md").read_text(encoding="utf-8") == baseline_report
+
+    # Non-test unit with overflow + partial layout flags renders warning + table in Section 1.
+    many_files = [f"src/f{i}.c" for i in range(7)]
+    flagged = json.loads(json.dumps(test_only))
+    flagged["units"]["libsnmp.a"]["files"] = many_files
+    flagged["units"]["libsnmp.a"]["semantic_flags"] = [
+        {"flag": "-fwrapv", "family": "wrapv", "category": "overflow", "scope": "all", "files": many_files},
+        {
+            "flag": "-fpack-struct=2",
+            "family": "pack_struct",
+            "category": "layout",
+            "scope": "partial",
+            "files": ["src/f0.c"],
+        },
+    ]
+    write_json(tmp_path / "workspace/reports/build_capture.json", flagged)
+    generate(tmp_path, tmp_path)
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    sec1 = report.split("## 2.")[0]
+    assert "### Semantic compiler flags" in sec1
+    assert "> [!WARNING]" in sec1
+    assert "| `libsnmp.a` | `-fwrapv` | `overflow` | `all` |" in sec1
+    assert "(+ 2 more)" in sec1
+    assert "| `libsnmp.a` | `-fpack-struct=2` | `layout` | `partial` | `src/f0.c` |" in sec1
+    assert "tests/unit_test" not in sec1
+
+
+def test_report_parse_loss_section_in_phase0_parse(tmp_path):
+    from generate_report import fallback_lines, parse_loss_lines
+
+    clean_pw = {
+        "asm_clobber": {"count": 0, "project_count": 0, "samples": []},
+        "attrs_unknown": {
+            "semantic": {},
+            "benign": {"cold": 4},
+            "unclassified": {},
+            "semantic_samples": [],
+            "unclassified_samples": [],
+        },
+        "benign_categories": {"typing:variadic": 1},
+        "unclassified_categories": {},
+        "no_annot_libc_skipped": 2,
+        "has_parse_loss": False,
+    }
+    clean_model = {
+        "schema_version": 2,
+        "generated_at": "2026-11-20T00:00:00Z",
+        "status": "ok",
+        "capture": "workspace/reports/build_capture.json",
+        "units": {
+            "libclean.a": {
+                "kind": "static_lib",
+                "test": False,
+                "files": ["src/a.c"],
+                "links": [],
+                "parse": {"status": "ok", "job": "k1", "seconds": 0.1, "warnings": clean_pw},
+                "concurrent": False,
+            }
+        },
+        "warnings": [],
+    }
+    assert parse_loss_lines(clean_model) == []
+    assert fallback_lines(clean_model, []) == []
+
+    # Non-test unit with parse loss + a gcc_fallback unit share one `### Phase 0 parse` heading.
+    loss_pw = {
+        "asm_clobber": {"count": 2, "project_count": 1, "samples": ["src/asm.c:9"]},
+        "attrs_unknown": {
+            "semantic": {"transparent_union": 1},
+            "benign": {"hot": 3},
+            "unclassified": {"vendor_ext": 2},
+            "semantic_samples": ["src/u.h:3: transparent_union"],
+            "unclassified_samples": ["src/u.h:8: vendor_ext"],
+        },
+        "benign_categories": {},
+        "unclassified_categories": {
+            "typing:implicit-function-declaration": {"count": 5, "project_count": 5, "sample": "src/a.c:12: accept4"},
+            "typing:incompatible-types-call": {"count": 100, "project_count": 2, "sample": "src/a.c:20: cast"},
+        },
+        "no_annot_libc_skipped": 0,
+        "has_parse_loss": True,
+    }
+    mixed_model = json.loads(json.dumps(clean_model))
+    mixed_model["units"]["libloss.a"] = {
+        "kind": "static_lib",
+        "test": False,
+        "files": ["src/asm.c"],
+        "links": [],
+        "parse": {"status": "ok", "job": "k2", "seconds": 0.2, "warnings": loss_pw},
+        "concurrent": False,
+    }
+    mixed_model["units"]["libfb.a"] = {
+        "kind": "static_lib",
+        "test": False,
+        "files": ["src/fb.c"],
+        "links": [],
+        "parse": {"status": "gcc_fallback", "job": "k3", "seconds": 0.1, "error": "syntax error"},
+        "concurrent": False,
+    }
+    lines = fallback_lines(mixed_model, [])
+    text = "\n".join(lines)
+    assert text.count("### Phase 0 parse") == 1
+    assert "| `libloss.a` | 1 / 2 |" in text
+    assert "`transparent_union` (1)" in text
+    assert "`vendor_ext` (2, unclassified)" in text
+    assert "`typing:implicit-function-declaration` (5/5)" in text
+    assert "`typing:incompatible-types-call` (2/100)" in text
+    assert "-no-annot" in text
+    assert "7 benign GCC/Clang attribute warning(s) were filtered out." in text
+    assert "`libclean.a`" not in text
+
+    # End-to-end generate() renders the parse-loss table in Section 1.
+    build_run(tmp_path)
+    write_json(tmp_path / "workspace/reports/phase0_model.json", mixed_model)
+    generate(tmp_path, tmp_path)
+    report = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    sec1 = report.split("## 2.")[0]
+    assert sec1.count("### Phase 0 parse") == 1
+    assert "`libloss.a`" in sec1

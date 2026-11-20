@@ -368,6 +368,7 @@ def load_inputs(run_dir: Path) -> dict:
         "candidates": load_json_optional(run_dir / "candidates.json", []),
         "coverage": load_coverage_reports(run_dir),
         "mutation": load_json_optional(run_dir / "workspace/reports/mutation.json", None),
+        "capture": load_json_optional(run_dir / "workspace/reports/build_capture.json", None),
         "model": load_json_optional(run_dir / "workspace/reports/phase0_model.json", None),
         "security_props": load_json_optional(run_dir / "workspace/reports/security_props.json", None),
         "merge_notes": load_merge_notes(run_dir),
@@ -1352,13 +1353,121 @@ def trust_lines(model: dict | None) -> list[str]:
     return out
 
 
+SEMANTIC_FILES_MAX = 5
+
+
+def semantic_flags_lines(capture: dict | None) -> list[str]:
+    """
+    Non-test link units built with compiler flags that alter signed-overflow, signedness, or
+    struct-layout semantics relative to Frama-C `-machdep gcc_x86_64` (Tier 2 Part A). Empty when
+    `build_capture.json` is absent or no non-test unit carries any active semantic flag.
+    """
+    if not isinstance(capture, dict):
+        return []
+    units = capture.get("units") or {}
+    rows: list[tuple[str, dict]] = []
+    for name, u in sorted(units.items()):
+        if not isinstance(u, dict) or u.get("test"):
+            continue
+        sem = u.get("semantic_flags") or []
+        for entry in sorted(sem, key=lambda e: str(e.get("flag") or "")):
+            if isinstance(entry, dict) and entry.get("flag"):
+                rows.append((name, entry))
+    if not rows:
+        return []
+    out = [
+        "### Semantic compiler flags",
+        "",
+        "> [!WARNING]",
+        "> The non-test link unit(s) below were built with compiler flags that change signed-overflow, "
+        "signedness, or struct-layout semantics. Frama-C (`-machdep gcc_x86_64`, RTE/Eva/WP) and Phase 1 "
+        "builds (E-ACSL, Clang sanitizers) analysed them without these flags: `signed_overflow` alarms "
+        "under `-fwrapv`/`-fno-strict-overflow` may be false positives, and layout/signedness flags may "
+        "cause alarms and proofs to refer to a different ABI.",
+        "",
+        "| Unit | Flag | Category | Scope | Affected files |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
+    for name, entry in rows:
+        files = [str(f) for f in entry.get("files") or []]
+        shown = ", ".join(f"`{md_escape(f)}`" for f in files[:SEMANTIC_FILES_MAX])
+        if len(files) > SEMANTIC_FILES_MAX:
+            shown += f" (+ {len(files) - SEMANTIC_FILES_MAX} more)"
+        out.append(
+            f"| `{md_escape(name)}` | `{md_escape(str(entry['flag']))}` | "
+            f"`{md_escape(str(entry.get('category') or ''))}` | `{md_escape(str(entry.get('scope') or ''))}` | "
+            f"{shown or 'none'} |"
+        )
+    out.append("")
+    return out
+
+
+def parse_loss_lines(model: dict | None) -> list[str]:
+    """
+    Non-test Frama-C-parsed units that emitted C-level `[kernel:...]` parse-loss warnings under
+    Phase 0's `-no-annot` parse (Tier 2 Part B). Returns body lines to place under `### Phase 0 parse`,
+    or `[]` when no non-test parsed unit has `has_parse_loss == True`.
+    """
+    if not isinstance(model, dict):
+        return []
+    units = model.get("units") or {}
+    affected: list[tuple[str, dict]] = []
+    benign_filtered = 0
+    for name, u in sorted(units.items()):
+        if not isinstance(u, dict) or u.get("test"):
+            continue
+        parse = u.get("parse") or {}
+        if parse.get("status") != "ok":
+            continue
+        pw = parse.get("warnings")
+        if not isinstance(pw, dict):
+            continue
+        benign_filtered += sum(int(v) for v in ((pw.get("attrs_unknown") or {}).get("benign") or {}).values())
+        if pw.get("has_parse_loss"):
+            affected.append((name, pw))
+    if not affected:
+        return []
+    out = [
+        "Non-test link units parsed by Frama-C (`-no-annot`) with C-level parse-loss or silent "
+        "AST-alteration warnings:",
+        "",
+        "| Unit | asm:clobber | Semantic / unknown attrs | Unclassified [kernel:...] categories (project / total) |",
+        "| :--- | ---: | :--- | :--- |",
+    ]
+    for name, pw in affected:
+        asm = pw.get("asm_clobber") or {}
+        asm_cell = f"{asm.get('project_count', 0)} / {asm.get('count', 0)}" if asm.get("count") else "0"
+        attrs = pw.get("attrs_unknown") or {}
+        attr_parts = [f"`{md_escape(k)}` ({v})" for k, v in sorted((attrs.get("semantic") or {}).items())]
+        attr_parts += [
+            f"`{md_escape(k)}` ({v}, unclassified)" for k, v in sorted((attrs.get("unclassified") or {}).items())
+        ]
+        attr_cell = ", ".join(attr_parts) or "none"
+        uncls = pw.get("unclassified_categories") or {}
+        cat_parts = [
+            f"`{md_escape(cat)}` ({info.get('project_count', 0)}/{info.get('count', 0)})"
+            for cat, info in sorted(
+                uncls.items(), key=lambda kv: (-int((kv[1] or {}).get("project_count") or 0), kv[0])
+            )
+            if isinstance(info, dict)
+        ]
+        cat_cell = ", ".join(cat_parts) or "none"
+        out.append(f"| `{md_escape(name)}` | {asm_cell} | {attr_cell} | {cat_cell} |")
+    note = "Phase 0 parses with `-no-annot` (C-level parse losses only; annotation warnings are checked in Eva/WP)."
+    if benign_filtered > 0:
+        note += f" {benign_filtered} benign GCC/Clang attribute warning(s) were filtered out."
+    out += ["", note, ""]
+    return out
+
+
 def fallback_lines(model: dict | None, ledger: list[dict]) -> list[str]:
     """
     Link units Frama-C could not parse (decision D2): their call graph comes from GCC, they are fuzzed
     with the sanitizers, and their Eva and WP units are deferred (`callgraph_fallback: ...` in the
     ledger). One row per unit: Frama-C's first error and what was deferred. Units the GCC fallback could
     not parse either (`unparsed`) come first, with both first errors. With `--alias`, the model's Alias
-    narrowing is summarized after it. Empty when no unit fell back or is unparsed and Alias was off.
+    narrowing is summarized after it. Non-test parsed units with Phase 0 `-no-annot` C parse-loss
+    warnings are listed under the same heading. Empty when none of those applies.
     """
     if not isinstance(model, dict):
         return []
@@ -1380,7 +1489,8 @@ def fallback_lines(model: dict | None, ledger: list[dict]) -> list[str]:
     }
     raw_alias = model.get("alias")
     alias: dict = raw_alias if isinstance(raw_alias, dict) else {}
-    if not fallback and not unparsed and not alias.get("enabled"):
+    parse_loss = parse_loss_lines(model)
+    if not fallback and not unparsed and not alias.get("enabled") and not parse_loss:
         return []
     out = ["### Phase 0 parse", ""]
     if unparsed:
@@ -1424,6 +1534,7 @@ def fallback_lines(model: dict | None, ledger: list[dict]) -> list[str]:
             f"{alias.get('dropped_candidates', 0)} type-match candidate(s) dropped.",
             "",
         ]
+    out += parse_loss
     return out
 
 
@@ -1618,6 +1729,7 @@ def render_report(data: dict) -> str:
     out += ledger_bar_lines(ledger)
     out += wp_meta_run_lines(data.get("wp_meta_runs") or [])
     out += fuzz_meta_note_lines(fuzz_meta)
+    out += semantic_flags_lines(data.get("capture"))
     out += fallback_lines(data.get("model"), ledger)
 
     out += ["## 2. Summary", ""]

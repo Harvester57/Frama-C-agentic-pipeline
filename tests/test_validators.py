@@ -725,3 +725,190 @@ def test_agent_result_in_agent_dir_without_schedule_checks_directory_agent_id(tm
     (run / "state" / "wp_schedule.json").write_text("{corrupt", encoding="utf-8")
     write_json(p_path, prover_result(agent_id="prover-1"))
     assert _run_agent_result_cli(capsys, [str(p_path)])[0] == 0
+
+
+def _sample_build_capture() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generated_at": "2026-11-20T00:00:00Z",
+        "status": "ok",
+        "target": "/target",
+        "compiles": [
+            {
+                "source": "src/a.c",
+                "object": "a.o",
+                "cwd": ".",
+                "compiler": "cc",
+                "arguments": ["cc", "-c", "src/a.c"],
+                "flags": [],
+                "system_flags": [],
+                "headers": [],
+            },
+            {
+                "source": "src/b.c",
+                "object": "b.o",
+                "cwd": ".",
+                "compiler": "cc",
+                "arguments": ["cc", "-c", "src/b.c"],
+                "flags": [],
+                "system_flags": [],
+                "headers": [],
+            },
+        ],
+        "units": {
+            "liba.a": {
+                "kind": "static_lib",
+                "test": False,
+                "test_reason": None,
+                "files": ["src/a.c", "src/b.c"],
+                "objects": ["a.o", "b.o"],
+                "links": [],
+                "external_libs": [],
+                "compiler": None,
+                "cppflags": [],
+                "entry_points": [],
+                "embedded_api": [],
+            }
+        },
+        "warnings": [],
+    }
+
+
+def test_validate_build_capture_semantic_flags_invariants():
+    # Legacy capture without semantic_flags stays valid.
+    base = _sample_build_capture()
+    assert list(validate_artifacts.validate_build_capture(base)) == []
+
+    # Empty semantic_flags is valid.
+    empty = json.loads(json.dumps(base))
+    for c in empty["compiles"]:
+        c["semantic_flags"] = []
+    empty["units"]["liba.a"]["semantic_flags"] = []
+    assert list(validate_artifacts.validate_build_capture(empty)) == []
+
+    # Populated valid semantic_flags (all + partial) passes.
+    good = json.loads(json.dumps(empty))
+    good["compiles"][0]["semantic_flags"] = ["-fwrapv", "-fpack-struct=2"]
+    good["compiles"][1]["semantic_flags"] = ["-fwrapv"]
+    good["units"]["liba.a"]["semantic_flags"] = [
+        {"flag": "-fwrapv", "family": "wrapv", "category": "overflow", "scope": "all", "files": ["src/a.c", "src/b.c"]},
+        {
+            "flag": "-fpack-struct=2",
+            "family": "pack_struct",
+            "category": "layout",
+            "scope": "partial",
+            "files": ["src/a.c"],
+        },
+    ]
+    assert list(validate_artifacts.validate_build_capture(good)) == []
+
+    # Unknown flag token rejected by schema pattern.
+    bad_tok = json.loads(json.dumps(good))
+    bad_tok["compiles"][0]["semantic_flags"] = ["-fpack-struct=0"]
+    assert any("pattern" in e for e in validate_artifacts.validate_build_capture(bad_tok))
+
+    # Duplicate family on one compile rejected (-fpack-struct and -fpack-struct=2 violate last-flag-wins).
+    bad_fam = json.loads(json.dumps(good))
+    bad_fam["compiles"][0]["semantic_flags"] = ["-fpack-struct", "-fpack-struct=2"]
+    assert any("duplicate semantic flag family" in e for e in validate_artifacts.validate_build_capture(bad_fam))
+
+    # Mismatched family / category rejected.
+    bad_meta = json.loads(json.dumps(good))
+    bad_meta["units"]["liba.a"]["semantic_flags"][0]["family"] = "no_strict_overflow"
+    bad_meta["units"]["liba.a"]["semantic_flags"][0]["category"] = "layout"
+    errs = list(validate_artifacts.validate_build_capture(bad_meta))
+    assert any(".family:" in e for e in errs) and any(".category:" in e for e in errs)
+
+    # Duplicate flag in same unit rejected.
+    bad_dup = json.loads(json.dumps(good))
+    bad_dup["units"]["liba.a"]["semantic_flags"].append(dict(bad_dup["units"]["liba.a"]["semantic_flags"][0]))
+    assert any("duplicate semantic flag" in e for e in validate_artifacts.validate_build_capture(bad_dup))
+
+    # File not in unit files rejected.
+    bad_file = json.loads(json.dumps(good))
+    bad_file["units"]["liba.a"]["semantic_flags"][1]["files"] = ["src/missing.c"]
+    assert any("not in unit files" in e for e in validate_artifacts.validate_build_capture(bad_file))
+
+    # scope: "all" with proper subset of unit files rejected.
+    bad_scope = json.loads(json.dumps(good))
+    bad_scope["units"]["liba.a"]["semantic_flags"][0]["files"] = ["src/a.c"]
+    assert any("'all' must cover every file" in e for e in validate_artifacts.validate_build_capture(bad_scope))
+
+
+def test_validate_phase0_model_parse_warnings_invariants():
+    base_model: dict[str, Any] = {
+        "schema_version": 2,
+        "generated_at": "2026-11-20T00:00:00Z",
+        "status": "ok",
+        "capture": "workspace/reports/build_capture.json",
+        "units": {
+            "liba.a": {
+                "kind": "static_lib",
+                "test": False,
+                "files": ["src/a.c"],
+                "links": [],
+                "parse": {"status": "ok", "job": "abc", "seconds": 0.2},
+                "concurrent": False,
+            }
+        },
+        "parse_jobs": [{"key": "abc", "units": ["liba.a"], "sources": ["src/a.c"], "status": "ok", "seconds": 0.2}],
+        "warnings": [],
+    }
+    # Legacy model without parse_warnings passes.
+    assert list(validate_artifacts.validate_phase0_model(base_model)) == []
+
+    pw_loss = {
+        "asm_clobber": {"count": 1, "project_count": 1, "samples": ["src/a.c:10"]},
+        "attrs_unknown": {
+            "semantic": {"transparent_union": 1},
+            "benign": {"cold": 2},
+            "unclassified": {},
+            "semantic_samples": ["src/a.c:4: transparent_union"],
+            "unclassified_samples": [],
+        },
+        "benign_categories": {"typing:variadic": 1},
+        "unclassified_categories": {
+            "typing:implicit-function-declaration": {"count": 2, "project_count": 1, "sample": "src/a.c:5: Calling f"}
+        },
+        "no_annot_libc_skipped": 1,
+        "has_parse_loss": True,
+    }
+    good = json.loads(json.dumps(base_model))
+    good["parse_jobs"][0]["parse_warnings"] = pw_loss
+    good["units"]["liba.a"]["parse"]["warnings"] = pw_loss
+    assert list(validate_artifacts.validate_phase0_model(good)) == []
+
+    # project_count > count on asm_clobber and unclassified_categories rejected.
+    bad_counts = json.loads(json.dumps(good))
+    bad_counts["parse_jobs"][0]["parse_warnings"]["asm_clobber"]["project_count"] = 2
+    bad_counts["units"]["liba.a"]["parse"]["warnings"]["unclassified_categories"][
+        "typing:implicit-function-declaration"
+    ]["project_count"] = 3
+    errs = list(validate_artifacts.validate_phase0_model(bad_counts))
+    assert any("asm_clobber: project_count" in e for e in errs)
+    assert any("unclassified_categories['typing:implicit-function-declaration']: project_count" in e for e in errs)
+
+    # Mismatched has_parse_loss rejected (both directions).
+    bad_flag = json.loads(json.dumps(good))
+    bad_flag["parse_jobs"][0]["parse_warnings"]["has_parse_loss"] = False
+    assert any("has_parse_loss" in e for e in validate_artifacts.validate_phase0_model(bad_flag))
+
+    clean_pw = {
+        "asm_clobber": {"count": 0, "project_count": 0, "samples": []},
+        "attrs_unknown": {
+            "semantic": {},
+            "benign": {"cold": 3},
+            "unclassified": {},
+            "semantic_samples": [],
+            "unclassified_samples": [],
+        },
+        "benign_categories": {"typing:implicit-conv-void-ptr": 2},
+        "unclassified_categories": {
+            "typing:incompatible-types-call": {"count": 10, "project_count": 0, "sample": "/usr/include/x.h:1: warn"}
+        },
+        "no_annot_libc_skipped": 2,
+        "has_parse_loss": True,  # wrong: no project-code parse loss
+    }
+    bad_clean = json.loads(json.dumps(base_model))
+    bad_clean["units"]["liba.a"]["parse"]["warnings"] = clean_pw
+    assert any("has_parse_loss: must be False" in e for e in validate_artifacts.validate_phase0_model(bad_clean))

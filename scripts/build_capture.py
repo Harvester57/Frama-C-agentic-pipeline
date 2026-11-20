@@ -812,7 +812,15 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
             probes += 1
             continue
         flags, system = split_flags(d["pp"], cwd, tree)
-        base = {"cwd": rel_cwd, "compiler": args[0], "arguments": args, "flags": flags, "system_flags": system}
+        sem_flags = extract_semantic_flags(args)
+        base = {
+            "cwd": rel_cwd,
+            "compiler": args[0],
+            "arguments": args,
+            "flags": flags,
+            "system_flags": system,
+            "semantic_flags": sem_flags,
+        }
         if d["mode"] == "compile":
             for src, raw in zip(srcs, d["sources"], strict=True):
                 obj = d["output"] if d["output"] and len(d["sources"]) == 1 else Path(raw).with_suffix(".o").name
@@ -1803,6 +1811,127 @@ def target_diagnostics(arch: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------------
+# 5c. Semantic compiler flags (report-only; Part A of Tier 2)
+# ---------------------------------------------------------------------------------------------------
+
+# Order used for per-compile `semantic_flags` (canonical deterministic ordering across the 7 families).
+SEMANTIC_FLAG_ORDER: tuple[str, ...] = (
+    "wrapv",
+    "no_strict_overflow",
+    "unsigned_char",
+    "short_enums",
+    "pack_struct",
+    "short_wchar",
+    "unsigned_bitfields",
+)
+SEMANTIC_CATEGORY_ORDER: dict[str, int] = {"overflow": 0, "signedness": 1, "layout": 2}
+# family -> (category, enable_tokens, disable_tokens, canonical_flag, value_prefix)
+# All defaults assume -machdep gcc_x86_64 (signed char, signed bitfields, strict signed overflow,
+# unpacked structs, 4-byte wchar_t, standard enum width).
+SEMANTIC_FLAG_SPECS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...], str, str | None]] = {
+    "wrapv": ("overflow", ("-fwrapv",), ("-fno-wrapv",), "-fwrapv", None),
+    "no_strict_overflow": ("overflow", ("-fno-strict-overflow",), ("-fstrict-overflow",), "-fno-strict-overflow", None),
+    "unsigned_char": (
+        "signedness",
+        ("-funsigned-char", "-fno-signed-char"),
+        ("-fsigned-char", "-fno-unsigned-char"),
+        "-funsigned-char",
+        None,
+    ),
+    "short_enums": ("layout", ("-fshort-enums",), ("-fno-short-enums",), "-fshort-enums", None),
+    "pack_struct": ("layout", ("-fpack-struct",), ("-fno-pack-struct",), "-fpack-struct", "-fpack-struct="),
+    "short_wchar": ("layout", ("-fshort-wchar",), ("-fno-short-wchar",), "-fshort-wchar", None),
+    "unsigned_bitfields": (
+        "signedness",
+        ("-funsigned-bitfields", "-fno-signed-bitfields"),
+        ("-fsigned-bitfields", "-fno-unsigned-bitfields"),
+        "-funsigned-bitfields",
+        None,
+    ),
+}
+_PACK_STRUCT_VAL_RE = re.compile(r"^-fpack-struct=([0-9]+)$")
+_PACK_STRUCT_CANON_RE = re.compile(r"^-fpack-struct=[1-9][0-9]*$")
+_SEMANTIC_ENABLE_TO_FAMILY: dict[str, tuple[str, str]] = {
+    tok: (fam, canon) for fam, (_, enables, _, canon, _) in SEMANTIC_FLAG_SPECS.items() for tok in enables
+}
+_SEMANTIC_DISABLE_TO_FAMILY: dict[str, str] = {
+    tok: fam for fam, (_, _, disables, _, _) in SEMANTIC_FLAG_SPECS.items() for tok in disables
+}
+_SEMANTIC_CANON_META: dict[str, tuple[str, str]] = {
+    canon: (fam, cat) for fam, (cat, _, _, canon, _) in SEMANTIC_FLAG_SPECS.items()
+}
+_SEMANTIC_FAMILY_RANK: dict[str, int] = {fam: idx for idx, fam in enumerate(SEMANTIC_FLAG_ORDER)}
+
+
+def extract_semantic_flags(arguments: list[str]) -> list[str]:
+    """
+    Effective x86_64 semantic compiler flags after left-to-right, last-flag-wins evaluation over a
+    compile's expanded argument list (`arguments[1:]`), skipping option operands in `_ARG_OPTS`.
+    """
+    state: dict[str, str | None] = {}
+    i = 1
+    while i < len(arguments):
+        a = arguments[i]
+        if a in _ARG_OPTS and i + 1 < len(arguments):
+            i += 2
+            continue
+        if a in _SEMANTIC_ENABLE_TO_FAMILY:
+            fam, canon = _SEMANTIC_ENABLE_TO_FAMILY[a]
+            state[fam] = canon
+        elif a in _SEMANTIC_DISABLE_TO_FAMILY:
+            state[_SEMANTIC_DISABLE_TO_FAMILY[a]] = None
+        elif (m := _PACK_STRUCT_VAL_RE.match(a)) is not None:
+            align = int(m.group(1))
+            state["pack_struct"] = None if align == 0 else f"-fpack-struct={align}"
+        i += 1
+    return [tok for fam in SEMANTIC_FLAG_ORDER if (tok := state.get(fam)) is not None]
+
+
+def semantic_flag_meta(flag: str) -> tuple[str, str]:
+    """Return `(family, category)` for a canonical semantic flag token, or raise `ValueError`."""
+    if flag in _SEMANTIC_CANON_META:
+        return _SEMANTIC_CANON_META[flag]
+    if _PACK_STRUCT_CANON_RE.match(flag):
+        return ("pack_struct", "layout")
+    raise ValueError(f"unknown semantic compiler flag: {flag!r}")
+
+
+def unit_semantic_flags(compiles: Iterable[dict]) -> list[dict[str, Any]]:
+    """
+    Aggregate effective semantic compiler flags across a link unit's own compiles. Each distinct
+    canonical flag becomes one entry with `scope` (`all` when every compile carries it, else
+    `partial`) and its sorted unique affected `files`.
+    """
+    own = list(compiles)
+    if not own:
+        return []
+    by_flag: dict[str, set[str]] = defaultdict(set)
+    counts: dict[str, int] = defaultdict(int)
+    for c in own:
+        flags = c.get("semantic_flags")
+        if flags is None:
+            flags = extract_semantic_flags(c.get("arguments") or [])
+        for flag in dict.fromkeys(flags):
+            by_flag[flag].add(c["source"])
+            counts[flag] += 1
+    out: list[dict[str, Any]] = []
+    total = len(own)
+    for flag, files in by_flag.items():
+        family, category = semantic_flag_meta(flag)
+        out.append(
+            {
+                "flag": flag,
+                "family": family,
+                "category": category,
+                "scope": "all" if counts[flag] == total else "partial",
+                "files": sorted(files),
+            }
+        )
+    out.sort(key=lambda e: (SEMANTIC_CATEGORY_ORDER[e["category"]], _SEMANTIC_FAMILY_RANK[e["family"]], e["flag"]))
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------
 # 6. Recipe
 # ---------------------------------------------------------------------------------------------------
 
@@ -2228,6 +2357,19 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     for name, u in units.items():
         own = [compiles[o] for o in u["objects"]]
         u["cppflags"] = unit_cppflags(own)
+        u["semantic_flags"] = unit_semantic_flags(own)
+        if not u["test"] and u["semantic_flags"]:
+            total_files = len(u["files"])
+            parts = [
+                f"{e['flag']} (partial: {len(e['files'])}/{total_files} files)"
+                if e["scope"] == "partial"
+                else e["flag"]
+                for e in u["semantic_flags"]
+            ]
+            report["warnings"].append(
+                f"{name}: built with semantic compiler flag(s) {', '.join(parts)}: "
+                "Frama-C (-machdep gcc_x86_64) and Phase 1 builds do not apply them"
+            )
         entries_: set[str] = set()
         embedded: set[str] = set()
         globals_: dict[str, str] = {}
@@ -2261,6 +2403,8 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
         u["embedded_api"] = sorted(embedded)
     report["units"] = {n: units[n] for n in sorted(units)}
     report["entry_points"] = sorted({e for u in units.values() if not u["test"] for e in u["entry_points"]})
+    for c in entries:
+        c.setdefault("semantic_flags", extract_semantic_flags(c.get("arguments") or []))
     report["compiles"] = [
         {
             k: c[k]
@@ -2272,6 +2416,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
                 "arguments",
                 "flags",
                 "system_flags",
+                "semantic_flags",
                 "headers",
                 "includes_setjmp_h",
                 "defined_functions",
@@ -2467,6 +2612,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         summary["units"] = {n: [u["kind"], len(u["files"]), u["test"]] for n, u in report["units"].items()}
         summary["snapshot_digest"] = (report.get("snapshot") or {}).get("digest")
         summary["seconds"] = report.get("seconds")
+        sem_summary = {
+            n: [e["flag"] for e in u["semantic_flags"]]
+            for n, u in report["units"].items()
+            if not u["test"] and u.get("semantic_flags")
+        }
+        if sem_summary:
+            summary["semantic_flags"] = sem_summary
     elif report.get("diagnostics"):
         d = report["diagnostics"]
         summary.update(

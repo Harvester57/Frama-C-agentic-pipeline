@@ -622,6 +622,7 @@ def find_unsound_acsl_keywords(tokens: list[Token], path: str = "<input>") -> li
         _check_unsound_acsl(tokens, set(), path)
         + find_empty_named_behaviors(tokens, path)
         + _find_unsound_recursive_logic_tokens(tokens, path)
+        + _find_in_body_ghost_declarations_tokens(tokens, path)
     )
 
 
@@ -648,6 +649,7 @@ def verify_acsl_only(
         errors.extend(
             msg for key, msg in _find_unsound_recursive_logic_entries(work_tokens, path) if key not in base_rec_keys
         )
+        errors.extend(_added_in_body_ghost_declarations(base_tokens, work_tokens, path))
 
     base_c = [t for t in base_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
     work_c = [t for t in work_tokens if t.kind not in ("whitespace", "acsl_block", "acsl_line")]
@@ -2868,6 +2870,1049 @@ def find_unsound_recursive_logic(source: str, path: str = "<input>") -> list[str
     """
     tokens = tokenize_c_acsl(source, path=path)
     return _find_unsound_recursive_logic_tokens(tokens, path=path)
+
+
+# ---------------------------------------------------------------------------
+# In-body (block-scope) ghost function / extern / contract declaration check
+# ---------------------------------------------------------------------------
+
+_GHOST_BLOCK_START_RE = re.compile(r"[ \t\r\n@]*ghost\b")
+_GHOST_CONTRACT_CLAUSE_RE = re.compile(
+    r"(?<![\\\w])(?:(loop)\s+)?(requires|terminates|decreases|exits|assigns|ensures|behavior|assumes|"
+    r"allocates|frees|(?:complete|disjoint)\s+behaviors)\b(?!\s*:)"
+)
+_GHOST_STORAGE_KWS = frozenset({"extern", "static", "auto", "register", "_Thread_local"})
+_GHOST_FUNC_SPEC_KWS = frozenset({"inline", "__inline", "__inline__", "_Noreturn", "__extension__"})
+_GHOST_TYPE_QUAL_KWS = frozenset(
+    {
+        "const",
+        "__const",
+        "__const__",
+        "volatile",
+        "__volatile",
+        "__volatile__",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "_Atomic",
+    }
+)
+_GHOST_BUILTIN_TYPE_KWS = frozenset(
+    {
+        "void",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "__signed",
+        "__signed__",
+        "unsigned",
+        "_Bool",
+        "_Complex",
+        "__complex__",
+        "_Imaginary",
+        "__int128",
+        "__uint128_t",
+        "__int128_t",
+        "_Float128",
+    }
+)
+_GHOST_KNOWN_TYPEDEFS = frozenset(
+    {
+        "bool",
+        "size_t",
+        "ssize_t",
+        "ptrdiff_t",
+        "intptr_t",
+        "uintptr_t",
+        "int8_t",
+        "int16_t",
+        "int32_t",
+        "int64_t",
+        "uint8_t",
+        "uint16_t",
+        "uint32_t",
+        "uint64_t",
+    }
+)
+_GHOST_TAG_KWS = frozenset({"struct", "union", "enum"})
+_GHOST_TYPEOF_KWS = frozenset({"typeof", "__typeof", "__typeof__"})
+_GHOST_ATTR_SPEC_KWS = frozenset({"__attribute__", "__attribute", "_Alignas"})
+_GHOST_DECL_SPEC_KWS = (
+    _GHOST_STORAGE_KWS
+    | _GHOST_FUNC_SPEC_KWS
+    | _GHOST_TYPE_QUAL_KWS
+    | _GHOST_BUILTIN_TYPE_KWS
+    | _GHOST_TAG_KWS
+    | _GHOST_TYPEOF_KWS
+    | _GHOST_ATTR_SPEC_KWS
+)
+_GHOST_NOT_TYPE_KWS = frozenset(
+    {
+        "if",
+        "else",
+        "while",
+        "for",
+        "do",
+        "switch",
+        "case",
+        "default",
+        "return",
+        "goto",
+        "break",
+        "continue",
+        "sizeof",
+        "_Alignof",
+        "__alignof",
+        "__alignof__",
+        "_Generic",
+        "_Static_assert",
+        "asm",
+        "__asm",
+        "__asm__",
+        "typedef",
+    }
+)
+_GHOST_PARAM_BAD_OPS = frozenset(
+    {
+        "+",
+        "-",
+        "/",
+        "%",
+        "=",
+        "==",
+        "!=",
+        "<",
+        ">",
+        "<=",
+        ">=",
+        "&&",
+        "||",
+        "&",
+        "|",
+        "^",
+        "!",
+        "~",
+        "->",
+        ".",
+        "++",
+        "--",
+        "?",
+        ":",
+        "+=",
+        "-=",
+        "*=",
+        "/=",
+        "%=",
+        "&=",
+        "|=",
+        "^=",
+        "<<",
+        ">>",
+        "<<=",
+        ">>=",
+    }
+)
+_GHOST_TWO_CHAR_OPS = frozenset(
+    {"->", "++", "--", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="}
+)
+_GHOST_THREE_CHAR_OPS = frozenset({"...", "<<=", ">>="})
+_GHOST_DECL_REASON = (
+    "(block-scope ghost function declarations, extern declarations, and embedded contracts are forbidden "
+    "inside function bodies)"
+)
+
+
+@dataclass(slots=True, frozen=True)
+class _GhostToken:
+    """A lexical token inside an ACSL ghost block (`/*@ ghost ... */` or `//@ ghost ...`)."""
+
+    kind: str  # ident | number | literal | punct | ghost_annot | ghost_line_annot
+    text: str
+    line: int
+
+
+def _has_ghost_contract_clause(annot_text: str) -> bool:
+    """Return True if an embedded ghost annotation (`/@ ... @/` or `//@ ...`) contains a non-loop contract clause."""
+    if annot_text.startswith("/@"):
+        inner = annot_text[2:-2] if annot_text.endswith("@/") else annot_text[2:]
+    elif annot_text.startswith("/*@"):
+        inner = annot_text[3:-2] if annot_text.endswith("*/") else annot_text[3:]
+    elif annot_text.startswith("//@"):
+        inner = annot_text[3:]
+    else:
+        inner = annot_text
+    flat = mask_comments_and_literals(inner, acsl="blank", literals=True, on_error="mask").replace("@", " ")
+    return any(m.group(1) is None for m in _GHOST_CONTRACT_CLAUSE_RE.finditer(flat))
+
+
+def _tokenize_ghost_body(body: str, base_line: int) -> list[_GhostToken]:
+    """Tokenize the C body of an ACSL ghost annotation, preserving embedded `/@ ... @/` and `//@ ...` annotations."""
+    tokens: list[_GhostToken] = []
+    n = len(body)
+    i = 0
+    line = base_line
+
+    while i < n:
+        ch = body[i]
+        # Whitespace and `@` margins (Frama-C treats `@` as whitespace inside annotations)
+        if ch in " \t\r\n\f\v@":
+            if ch == "\n":
+                line += 1
+            i += 1
+            continue
+
+        # Embedded `/@ ... @/` block annotation inside `/*@ ghost ... */`
+        if ch == "/" and i + 1 < n and body[i + 1] == "@":
+            start = i
+            start_line = line
+            close = body.find("@/", i + 2)
+            end = n if close == -1 else close + 2
+            text = body[start:end]
+            line += text.count("\n")
+            tokens.append(_GhostToken("ghost_annot", text, start_line))
+            i = end
+            continue
+
+        # Line comment `// ...` or nested line annotation `//@ ...`
+        if ch == "/" and i + 1 < n and body[i + 1] == "/":
+            start = i
+            start_line = line
+            nl = body.find("\n", i + 2)
+            end = n if nl == -1 else nl
+            text = body[start:end]
+            if text.startswith("//@") and not _is_doxygen_comment(text):
+                tokens.append(_GhostToken("ghost_line_annot", text, start_line))
+            i = end
+            continue
+
+        # Inline `/* ... */` comment (possible inside `//@ ghost ...`)
+        if ch == "/" and i + 1 < n and body[i + 1] == "*":
+            start = i
+            start_line = line
+            is_acsl = i + 2 < n and body[i + 2] == "@" and (i + 3 >= n or body[i + 3] != "/")
+            close = body.find("*/", i + 2)
+            end = n if close == -1 else close + 2
+            text = body[start:end]
+            line += text.count("\n")
+            if is_acsl and not _is_doxygen_comment(text):
+                tokens.append(_GhostToken("ghost_annot", text, start_line))
+            i = end
+            continue
+
+        # String or character literal
+        if ch in ('"', "'"):
+            quote = ch
+            start = i
+            start_line = line
+            i += 1
+            while i < n:
+                c = body[i]
+                if c == "\\":
+                    if i + 1 < n and body[i + 1] == "\n":
+                        line += 1
+                    i += 2
+                    continue
+                if c == "\n":
+                    break
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            tokens.append(_GhostToken("literal", body[start:i], start_line))
+            continue
+
+        m_id = _IDENT_RE.match(body, i)
+        if m_id:
+            tokens.append(_GhostToken("ident", m_id.group(0), line))
+            i = m_id.end()
+            continue
+
+        m_num = _NUMBER_RE.match(body, i)
+        if m_num:
+            tokens.append(_GhostToken("number", m_num.group(0), line))
+            i = m_num.end()
+            continue
+
+        if body[i : i + 3] in _GHOST_THREE_CHAR_OPS:
+            tokens.append(_GhostToken("punct", body[i : i + 3], line))
+            i += 3
+            continue
+
+        if body[i : i + 2] in _GHOST_TWO_CHAR_OPS:
+            tokens.append(_GhostToken("punct", body[i : i + 2], line))
+            i += 2
+            continue
+
+        tokens.append(_GhostToken("punct", ch, line))
+        i += 1
+
+    return tokens
+
+
+def _skip_ghost_delim(gtoks: list[_GhostToken], open_idx: int, open_ch: str, close_ch: str) -> int:
+    """Return index immediately after matching `close_ch` for `gtoks[open_idx] == open_ch`, or `len(gtoks)`."""
+    depth = 0
+    n = len(gtoks)
+    i = open_idx
+    while i < n:
+        tok = gtoks[i]
+        if tok.kind == "punct":
+            if tok.text == open_ch:
+                depth += 1
+            elif tok.text == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return n
+
+
+def _skip_ghost_attrs(gtoks: list[_GhostToken], idx: int) -> int:
+    """Skip consecutive GCC attribute / asm / alignment specifiers starting at `idx`."""
+    n = len(gtoks)
+    cur = idx
+    while cur < n and gtoks[cur].kind == "ident" and gtoks[cur].text in (_DECL_SUFFIX_KWS | _GHOST_ATTR_SPEC_KWS):
+        nxt = cur + 1
+        if nxt < n and gtoks[nxt].text == "(":
+            cur = _skip_ghost_delim(gtoks, nxt, "(", ")")
+            continue
+        break
+    return cur
+
+
+def _is_ghost_plausible_param_list(
+    gtoks: list[_GhostToken],
+    open_paren: int,
+    close_paren: int,
+    *,
+    require_typed: bool = False,
+) -> bool:
+    """Return True if `gtoks[open_paren + 1 : close_paren]` looks like a C function parameter list."""
+    inner = [t for t in gtoks[open_paren + 1 : close_paren] if t.kind not in ("ghost_annot", "ghost_line_annot")]
+    if not inner:
+        return not require_typed
+    parts: list[list[_GhostToken]] = [[]]
+    depth = 0
+    for tok in inner:
+        if tok.kind == "punct" and tok.text in ("(", "[", "{"):
+            depth += 1
+        elif tok.kind == "punct" and tok.text in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif tok.kind == "punct" and tok.text == "," and depth == 0:
+            parts.append([])
+            continue
+        parts[-1].append(tok)
+
+    has_explicit_type = False
+    for part in parts:
+        if not part:
+            return False
+        if len(part) == 1 and part[0].text in ("...", "void"):
+            has_explicit_type = True
+            continue
+        depth = 0
+        ident_count = 0
+        for tok in part:
+            if tok.kind == "punct" and tok.text in ("(", "[", "{"):
+                depth += 1
+                continue
+            if tok.kind == "punct" and tok.text in (")", "]", "}"):
+                depth = max(0, depth - 1)
+                continue
+            if depth > 0:
+                continue
+            if tok.kind in ("literal", "number"):
+                return False
+            if tok.kind == "punct":
+                if tok.text == "*":
+                    has_explicit_type = True
+                elif tok.text in _GHOST_PARAM_BAD_OPS:
+                    return False
+                continue
+            if tok.kind == "ident":
+                if tok.text in _GHOST_NOT_TYPE_KWS:
+                    return False
+                ident_count += 1
+                if tok.text in _GHOST_DECL_SPEC_KWS or tok.text in _GHOST_KNOWN_TYPEDEFS:
+                    has_explicit_type = True
+        if ident_count == 0:
+            return False
+        if ident_count >= 2:
+            has_explicit_type = True
+
+    return has_explicit_type if require_typed else True
+
+
+def _parse_ghost_declarator(
+    gtoks: list[_GhostToken], idx: int
+) -> tuple[str, str | None, int, int, tuple[int, int] | None, list[tuple[int, int]]] | None:
+    """
+    Parse a C declarator at `idx` inside ghost tokens.
+    Returns `(name, kind, name_line, end_idx, func_paren_span, all_paren_spans)` where `kind` is
+    `"func"`, `"pointer"`, `"array"`, or `None` (plain identifier), or `None` if not a declarator.
+    """
+    n = len(gtoks)
+    cur = idx
+    has_ptr = False
+    while cur < n:
+        cur = _skip_ghost_attrs(gtoks, cur)
+        if cur < n and gtoks[cur].kind == "punct" and gtoks[cur].text == "*":
+            has_ptr = True
+            cur += 1
+            while cur < n:
+                cur = _skip_ghost_attrs(gtoks, cur)
+                if cur < n and gtoks[cur].kind == "ident" and gtoks[cur].text in _GHOST_TYPE_QUAL_KWS:
+                    cur += 1
+                else:
+                    break
+            continue
+        break
+
+    if cur >= n:
+        return None
+
+    inner_kind: str | None = None
+    func_paren: tuple[int, int] | None = None
+    all_parens: list[tuple[int, int]] = []
+    if gtoks[cur].kind == "ident" and gtoks[cur].text not in (_GHOST_DECL_SPEC_KWS | _GHOST_NOT_TYPE_KWS):
+        name = gtoks[cur].text
+        name_line = gtoks[cur].line
+        cur += 1
+    elif gtoks[cur].kind == "punct" and gtoks[cur].text == "(":
+        inner = _parse_ghost_declarator(gtoks, cur + 1)
+        if inner is None:
+            return None
+        name, inner_kind, name_line, inner_end, func_paren, inner_parens = inner
+        all_parens.extend(inner_parens)
+        inner_end = _skip_ghost_attrs(gtoks, inner_end)
+        if inner_end >= n or gtoks[inner_end].kind != "punct" or gtoks[inner_end].text != ")":
+            return None
+        cur = inner_end + 1
+    else:
+        return None
+
+    first_suffix_kind: str | None = None
+    first_paren_span: tuple[int, int] | None = None
+    while cur < n:
+        cur = _skip_ghost_attrs(gtoks, cur)
+        if cur >= n:
+            break
+        if gtoks[cur].kind == "punct" and gtoks[cur].text == "(":
+            after = _skip_ghost_delim(gtoks, cur, "(", ")")
+            if after > n or after == cur + 1 or gtoks[after - 1].text != ")":
+                return None
+            span = (cur, after - 1)
+            all_parens.append(span)
+            if first_suffix_kind is None:
+                first_suffix_kind = "func"
+                first_paren_span = span
+            cur = after
+        elif gtoks[cur].kind == "punct" and gtoks[cur].text == "[":
+            after = _skip_ghost_delim(gtoks, cur, "[", "]")
+            if after > n or after == cur + 1 or gtoks[after - 1].text != "]":
+                return None
+            if first_suffix_kind is None:
+                first_suffix_kind = "array"
+            cur = after
+        else:
+            break
+
+    cur = _skip_ghost_attrs(gtoks, cur)
+    if inner_kind is not None:
+        kind: str | None = inner_kind
+    elif first_suffix_kind is not None:
+        kind = first_suffix_kind
+        if kind == "func":
+            func_paren = first_paren_span
+    elif has_ptr:
+        kind = "pointer"
+    else:
+        kind = None
+
+    return (name, kind, name_line, cur, func_paren, all_parens)
+
+
+def _looks_like_paren_declarator_after(gtoks: list[_GhostToken], open_paren_idx: int) -> bool:
+    """Whether `gtoks[open_paren_idx:]` is a parenthesized declarator followed by `(...)` or `[...]`."""
+    after = _skip_ghost_delim(gtoks, open_paren_idx, "(", ")")
+    if after >= len(gtoks) or gtoks[after - 1].text != ")":
+        return False
+    after = _skip_ghost_attrs(gtoks, after)
+    return after < len(gtoks) and gtoks[after].kind == "punct" and gtoks[after].text in ("(", "[")
+
+
+def _parse_ghost_decl_specifiers(gtoks: list[_GhostToken], idx: int) -> tuple[int, list[int], bool] | None:
+    """
+    Parse C declaration specifiers at `idx`.
+    Returns `(end_idx, extern_indices, has_decl_kw)` if at least one specifier was consumed, else None.
+    """
+    n = len(gtoks)
+    cur = idx
+    extern_indices: list[int] = []
+    has_decl_kw = False
+    has_type_spec = False
+    consumed_any = False
+
+    while cur < n:
+        tok = gtoks[cur]
+        if tok.kind != "ident":
+            break
+        word = tok.text
+        if word in _GHOST_NOT_TYPE_KWS:
+            break
+        if word in _GHOST_STORAGE_KWS:
+            if word == "extern":
+                extern_indices.append(cur)
+            has_decl_kw = True
+            consumed_any = True
+            cur += 1
+            continue
+        if word in _GHOST_FUNC_SPEC_KWS or word in _GHOST_TYPE_QUAL_KWS:
+            has_decl_kw = True
+            consumed_any = True
+            cur += 1
+            continue
+        if word in _GHOST_ATTR_SPEC_KWS:
+            has_decl_kw = True
+            consumed_any = True
+            cur += 1
+            if cur < n and gtoks[cur].text == "(":
+                cur = _skip_ghost_delim(gtoks, cur, "(", ")")
+            continue
+        if word in _GHOST_TYPEOF_KWS:
+            has_decl_kw = True
+            has_type_spec = True
+            consumed_any = True
+            cur += 1
+            if cur < n and gtoks[cur].text == "(":
+                cur = _skip_ghost_delim(gtoks, cur, "(", ")")
+            continue
+        if word in _GHOST_BUILTIN_TYPE_KWS:
+            has_decl_kw = True
+            has_type_spec = True
+            consumed_any = True
+            cur += 1
+            continue
+        if word in _GHOST_TAG_KWS:
+            has_decl_kw = True
+            has_type_spec = True
+            consumed_any = True
+            cur += 1
+            cur = _skip_ghost_attrs(gtoks, cur)
+            if (
+                cur < n
+                and gtoks[cur].kind == "ident"
+                and gtoks[cur].text not in (_GHOST_DECL_SPEC_KWS | _GHOST_NOT_TYPE_KWS)
+            ):
+                cur += 1
+            cur = _skip_ghost_attrs(gtoks, cur)
+            if cur < n and gtoks[cur].text == "{":
+                cur = _skip_ghost_delim(gtoks, cur, "{", "}")
+            continue
+        if not has_type_spec:
+            nxt = cur + 1
+            while nxt < n and gtoks[nxt].kind == "ident":
+                nw = gtoks[nxt].text
+                if nw in (_GHOST_STORAGE_KWS | _GHOST_FUNC_SPEC_KWS | _GHOST_TYPE_QUAL_KWS):
+                    nxt += 1
+                elif nw in _GHOST_ATTR_SPEC_KWS:
+                    nxt += 1
+                    if nxt < n and gtoks[nxt].text == "(":
+                        nxt = _skip_ghost_delim(gtoks, nxt, "(", ")")
+                else:
+                    break
+            if nxt < n and (
+                gtoks[nxt].text == "*"
+                or (gtoks[nxt].kind == "ident" and gtoks[nxt].text not in (_GHOST_DECL_SPEC_KWS | _GHOST_NOT_TYPE_KWS))
+                or (
+                    gtoks[nxt].text == "("
+                    and _looks_like_paren_declarator_after(gtoks, nxt)
+                    and _parse_ghost_declarator(gtoks, nxt) is not None
+                )
+            ):
+                has_type_spec = True
+                if word in _GHOST_KNOWN_TYPEDEFS:
+                    has_decl_kw = True
+                consumed_any = True
+                cur += 1
+                continue
+        break
+
+    if not consumed_any:
+        return None
+    return (cur, extern_indices, has_decl_kw)
+
+
+def _ghost_kr_body_brace(gtoks: list[_GhostToken], start_idx: int, open_paren: int, close_paren: int) -> int:
+    """Return index of body `{` for a K&R function definition (`int f(x) int x; { ... }`), or -1."""
+    inner = [t for t in gtoks[open_paren + 1 : close_paren] if t.kind not in ("ghost_annot", "ghost_line_annot")]
+    if not inner or len(inner) % 2 == 0:
+        return -1
+    kr_idents: set[str] = set()
+    for i, tok in enumerate(inner):
+        if i % 2 == 1:
+            if tok.text != ",":
+                return -1
+        else:
+            if tok.kind != "ident" or tok.text in (_GHOST_DECL_SPEC_KWS | _GHOST_NOT_TYPE_KWS):
+                return -1
+            kr_idents.add(tok.text)
+
+    n = len(gtoks)
+    cur = start_idx
+    decl_count = 0
+    while cur < n:
+        cur = _skip_ghost_attrs(gtoks, cur)
+        if cur >= n:
+            return -1
+        if gtoks[cur].text == "{":
+            return cur if decl_count >= 1 else -1
+        p_depth = 0
+        decl_idents: set[str] = set()
+        found_semi = False
+        while cur < n:
+            tok = gtoks[cur]
+            if tok.kind in ("ghost_annot", "ghost_line_annot"):
+                cur += 1
+                continue
+            if tok.text == "(":
+                p_depth += 1
+            elif tok.text == ")":
+                if p_depth == 0:
+                    return -1
+                p_depth -= 1
+            elif tok.text == "{" and p_depth == 0:
+                cur = _skip_ghost_delim(gtoks, cur, "{", "}")
+                continue
+            elif tok.text == "}" and p_depth == 0:
+                return -1
+            elif tok.text == ";" and p_depth == 0:
+                if not (decl_idents & kr_idents):
+                    return -1
+                decl_count += 1
+                cur += 1
+                found_semi = True
+                break
+            elif p_depth == 0 and (tok.text == "=" or tok.text in _KR_FORBIDDEN_DECL_TOKENS):
+                return -1
+            elif tok.kind == "ident":
+                decl_idents.add(tok.text)
+            cur += 1
+        if not found_semi:
+            return -1
+    return -1
+
+
+def _scan_ghost_tokens(
+    gtoks: list[_GhostToken],
+    path: str,
+    entries: list[tuple[tuple[str, str, bool, bool], str]],
+) -> None:
+    """Scan a token stream from in-body ghost block(s) for forbidden prototypes, definitions, externs, and contracts."""
+    n = len(gtoks)
+    handled_extern_indices: set[int] = set()
+
+    def _skip_expr_until(start: int, stop_texts: frozenset[str]) -> int:
+        p_depth = 0
+        b_depth = 0
+        k_depth = 0
+        cur = start
+        while cur < n:
+            tok = gtoks[cur]
+            if tok.kind == "punct":
+                if p_depth == 0 and b_depth == 0 and k_depth == 0 and tok.text in stop_texts:
+                    return cur
+                if tok.text == "(":
+                    if cur + 1 < n and gtoks[cur + 1].kind == "punct" and gtoks[cur + 1].text == "{":
+                        # GNU statement-expression `({ ... })`: scan its compound body recursively.
+                        after_brace = _skip_ghost_delim(gtoks, cur + 1, "{", "}")
+                        body_end = (
+                            after_brace - 1
+                            if after_brace > cur + 2 and gtoks[after_brace - 1].text == "}"
+                            else after_brace
+                        )
+                        _scan_ghost_tokens(gtoks[cur + 2 : body_end], path, entries)
+                        handled_extern_indices.update(range(cur + 2, body_end))
+                        p_depth += 1
+                        cur = after_brace
+                        continue
+                    p_depth += 1
+                elif tok.text == ")":
+                    p_depth = max(0, p_depth - 1)
+                elif tok.text == "{":
+                    b_depth += 1
+                elif tok.text == "}":
+                    b_depth = max(0, b_depth - 1)
+                elif tok.text == "[":
+                    k_depth += 1
+                elif tok.text == "]":
+                    k_depth = max(0, k_depth - 1)
+            cur += 1
+        return n
+
+    def _emit_func_violation(
+        decl_kind: str,
+        name: str,
+        line: int,
+        has_extern: bool,
+        has_contract: bool,
+    ) -> None:
+        ext_txt = "'extern' " if has_extern else ""
+        contract_txt = " with embedded contract '/@ ... @/'" if has_contract else ""
+        entries.append(
+            (
+                (decl_kind, name, has_extern, has_contract),
+                f"{path}:{line}: forbidden in-body ghost {ext_txt}function {decl_kind} '{name}'{contract_txt} "
+                f"{_GHOST_DECL_REASON}",
+            )
+        )
+
+    pos = 0
+    pending_contract: _GhostToken | None = None
+    while pos < n:
+        tok = gtoks[pos]
+
+        # Compound delimiters and empty statements reset pending contract
+        if tok.kind == "punct" and tok.text in ("{", "}", ";"):
+            pending_contract = None
+            pos += 1
+            continue
+
+        # Embedded `/@ ... @/` or nested `//@ ...` annotation
+        if tok.kind in ("ghost_annot", "ghost_line_annot"):
+            if _has_ghost_contract_clause(tok.text) and pending_contract is None:
+                pending_contract = tok
+            pos += 1
+            continue
+
+        # Control-flow statements & labels
+        if tok.kind == "ident":
+            w = tok.text
+            if w in ("if", "while", "for", "switch"):
+                pending_contract = None
+                pos += 1
+                if pos < n and gtoks[pos].text == "(":
+                    after_paren = _skip_ghost_delim(gtoks, pos, "(", ")")
+                    # Check any GNU statement-expressions `({ ... })` inside the condition/header
+                    inner_cur = pos + 1
+                    inner_end = (
+                        after_paren - 1 if after_paren > pos + 1 and gtoks[after_paren - 1].text == ")" else after_paren
+                    )
+                    while inner_cur < inner_end:
+                        if (
+                            gtoks[inner_cur].text == "("
+                            and inner_cur + 1 < inner_end
+                            and gtoks[inner_cur + 1].text == "{"
+                        ):
+                            ab = _skip_ghost_delim(gtoks, inner_cur + 1, "{", "}")
+                            be = ab - 1 if ab > inner_cur + 2 and gtoks[ab - 1].text == "}" else ab
+                            _scan_ghost_tokens(gtoks[inner_cur + 2 : be], path, entries)
+                            handled_extern_indices.update(range(inner_cur + 2, be))
+                            inner_cur = ab
+                        else:
+                            inner_cur += 1
+                    pos = after_paren
+                continue
+            if w in ("else", "do"):
+                pending_contract = None
+                pos += 1
+                continue
+            if w == "default":
+                pending_contract = None
+                pos += 1
+                if pos < n and gtoks[pos].text == ":":
+                    pos += 1
+                continue
+            if w == "case":
+                pending_contract = None
+                pos += 1
+                p_depth = 0
+                k_depth = 0
+                q_depth = 0
+                while pos < n:
+                    ct = gtoks[pos]
+                    if ct.kind == "punct":
+                        if ct.text == "(":
+                            p_depth += 1
+                        elif ct.text == ")":
+                            p_depth = max(0, p_depth - 1)
+                        elif ct.text == "[":
+                            k_depth += 1
+                        elif ct.text == "]":
+                            k_depth = max(0, k_depth - 1)
+                        elif ct.text == "?" and p_depth == 0 and k_depth == 0:
+                            q_depth += 1
+                        elif ct.text == ":" and p_depth == 0 and k_depth == 0:
+                            if q_depth > 0:
+                                q_depth -= 1
+                            else:
+                                pos += 1
+                                break
+                        elif ct.text in ("{", "}", ";") and p_depth == 0 and k_depth == 0:
+                            break
+                    pos += 1
+                continue
+            if w in ("return", "goto", "break", "continue"):
+                pending_contract = None
+                pos = _skip_expr_until(pos + 1, frozenset({";", "}"}))
+                if pos < n and gtoks[pos].text == ";":
+                    pos += 1
+                continue
+            if pos + 1 < n and gtoks[pos + 1].kind == "punct" and gtoks[pos + 1].text == ":":
+                pending_contract = None
+                pos += 2
+                continue
+            if w == "typedef":
+                if pending_contract is not None:
+                    entries.append(
+                        (
+                            ("contract", "typedef", False, True),
+                            f"{path}:{pending_contract.line}: forbidden embedded ghost contract '/@ ... @/' "
+                            f"attached to in-body ghost typedef declaration {_GHOST_DECL_REASON}",
+                        )
+                    )
+                pending_contract = None
+                pos = _skip_expr_until(pos + 1, frozenset({";", "}"}))
+                if pos < n and gtoks[pos].text == ";":
+                    pos += 1
+                continue
+
+        # Attempt to parse a C declaration starting at `pos`
+        decl_spec = _parse_ghost_decl_specifiers(gtoks, pos)
+        if decl_spec is not None:
+            spec_end, extern_indices, has_decl_kw = decl_spec
+            has_extern = bool(extern_indices)
+            if spec_end < n and gtoks[spec_end].text == ";":
+                if has_extern:
+                    handled_extern_indices.update(extern_indices)
+                    entries.append(
+                        (
+                            ("extern", "", True, pending_contract is not None),
+                            f"{path}:{gtoks[extern_indices[0]].line}: forbidden in-body ghost 'extern' declaration "
+                            f"{_GHOST_DECL_REASON}",
+                        )
+                    )
+                elif pending_contract is not None:
+                    entries.append(
+                        (
+                            ("contract", "", False, True),
+                            f"{path}:{pending_contract.line}: forbidden embedded ghost contract '/@ ... @/' "
+                            f"attached to in-body ghost declaration {_GHOST_DECL_REASON}",
+                        )
+                    )
+                pending_contract = None
+                pos = spec_end + 1
+                continue
+
+            # Parse comma-separated declarator list (or function definition)
+            cur = spec_end
+            parsed_any_decl = False
+            reported_func = False
+            first_decl_name = ""
+            first_decl_line = gtoks[pos].line
+            parsed_ok = False
+            next_pos = pos
+            func_hits: list[tuple[str, str, int]] = []  # (decl_kind, name, line)
+
+            while cur < n:
+                decl_start = cur
+                decl = _parse_ghost_declarator(gtoks, cur)
+                if decl is None:
+                    break
+                name, kind, name_line, after_decl, func_paren, all_parens = decl
+                if not parsed_any_decl:
+                    first_decl_name = name
+                    first_decl_line = name_line
+                parsed_any_decl = True
+
+                # Function definition `{ ... }`
+                if after_decl < n and gtoks[after_decl].text == "{":
+                    if kind == "func":
+                        func_hits.append(("definition", name, name_line))
+                        reported_func = True
+                        parsed_ok = True
+                        # Step inside `{` so any nested declarations/externs inside the body are scanned too.
+                        next_pos = after_decl + 1
+                        break
+                    break
+
+                # K&R function definition (`int f(x) int x; { ... }`)
+                if (
+                    kind == "func"
+                    and func_paren is not None
+                    and after_decl < n
+                    and gtoks[after_decl].text not in (";", ",", "=")
+                ):
+                    kr_brace = _ghost_kr_body_brace(gtoks, after_decl, func_paren[0], func_paren[1])
+                    if kr_brace != -1:
+                        func_hits.append(("definition", name, name_line))
+                        reported_func = True
+                        parsed_ok = True
+                        next_pos = kr_brace + 1
+                        break
+
+                # Optional initializer `= expr` (only for non-function declarators)
+                if after_decl < n and gtoks[after_decl].text == "=":
+                    after_decl = _skip_expr_until(after_decl + 1, frozenset({",", ";", "}"}))
+
+                if after_decl < n and gtoks[after_decl].text in (";", ","):
+                    if kind == "func":
+                        is_real_proto = has_decl_kw
+                        if not is_real_proto:
+                            if gtoks[decl_start].text == "(":
+                                is_real_proto = any(
+                                    _is_ghost_plausible_param_list(gtoks, p_o, p_c, require_typed=True)
+                                    for p_o, p_c in all_parens
+                                )
+                            elif gtoks[decl_start].text == "*":
+                                is_real_proto = func_paren is not None and _is_ghost_plausible_param_list(
+                                    gtoks, func_paren[0], func_paren[1], require_typed=False
+                                )
+                            else:
+                                # Adjacent identifiers (`my_t fake(...)`) cannot be a C expression.
+                                is_real_proto = True
+                        if is_real_proto:
+                            func_hits.append(("prototype", name, name_line))
+                            reported_func = True
+                    if gtoks[after_decl].text == ";":
+                        parsed_ok = True
+                        next_pos = after_decl + 1
+                        break
+                    cur = after_decl + 1
+                    continue
+                break
+
+            if parsed_ok:
+                if has_extern:
+                    handled_extern_indices.update(extern_indices)
+                has_contract = pending_contract is not None
+                if reported_func:
+                    for decl_kind, fname, fline in func_hits:
+                        _emit_func_violation(decl_kind, fname, fline, has_extern, has_contract)
+                elif has_extern:
+                    contract_txt = " with embedded contract '/@ ... @/'" if has_contract else ""
+                    entries.append(
+                        (
+                            ("extern", first_decl_name, True, has_contract),
+                            f"{path}:{first_decl_line}: forbidden in-body ghost 'extern' declaration "
+                            f"'{first_decl_name}'{contract_txt} {_GHOST_DECL_REASON}",
+                        )
+                    )
+                elif pending_contract is not None:
+                    entries.append(
+                        (
+                            ("contract", first_decl_name, False, True),
+                            f"{path}:{pending_contract.line}: forbidden embedded ghost contract '/@ ... @/' "
+                            f"attached to in-body ghost declaration '{first_decl_name}' {_GHOST_DECL_REASON}",
+                        )
+                    )
+                pending_contract = None
+                pos = next_pos
+                continue
+
+        # Not a declaration: skip expression statement up to `;` or `}`
+        pending_contract = None
+        end_expr = _skip_expr_until(pos, frozenset({";", "}"}))
+        if end_expr < n and gtoks[end_expr].text == ";":
+            pos = end_expr + 1
+        elif end_expr > pos:
+            pos = end_expr
+        else:
+            pos += 1
+
+    # Fallback: flag any remaining `extern` keyword inside the ghost block not already handled above.
+    for idx, tok in enumerate(gtoks):
+        if tok.kind == "ident" and tok.text == "extern" and idx not in handled_extern_indices:
+            entries.append(
+                (
+                    ("extern", "", True, False),
+                    f"{path}:{tok.line}: forbidden in-body ghost 'extern' declaration {_GHOST_DECL_REASON}",
+                )
+            )
+
+
+def _find_in_body_ghost_declarations_entries(
+    tokens: list[Token], path: str = "<input>"
+) -> list[tuple[tuple[str, str, bool, bool], str]]:
+    """
+    Find forbidden block-scope (`brace_depth > 0`) ghost function prototypes, definitions, `extern`
+    declarations, and embedded `/@ ... @/` contracts attached to declarations inside in-body ghost blocks.
+    Returns `[(stable_key, error_message), ...]` for line-shift-insensitive baseline diffing.
+    """
+    delims = _conditional_delims(tokens)
+    linkage = _linkage_block_braces(tokens, delims) | delims.ignored
+    eacsl_skipped = _eacsl_only_token_indices(tokens)
+    brace_depth = 0
+    entries: list[tuple[tuple[str, str, bool, bool], str]] = []
+    group: list[_GhostToken] = []
+
+    def _flush_group() -> None:
+        if group:
+            _scan_ghost_tokens(group, path, entries)
+            group.clear()
+
+    for tok_idx, tok in enumerate(tokens):
+        if tok_idx in linkage:
+            if tok.kind not in ("whitespace", "c_comment"):
+                _flush_group()
+            continue
+        if tok_idx in eacsl_skipped:
+            _flush_group()
+            continue
+        if tok.kind in ("whitespace", "c_comment"):
+            continue
+        if tok.kind == "c_token":
+            _flush_group()
+            if tok.text == "{":
+                brace_depth += 1
+            elif tok.text == "}":
+                brace_depth = max(0, brace_depth - 1)
+            continue
+        if tok.kind in ("acsl_block", "acsl_line") and brace_depth > 0:
+            if _is_doxygen_comment(tok.text):
+                continue
+            raw_inner = tok.text[3:-2] if tok.kind == "acsl_block" else tok.text[3:]
+            m_ghost = _GHOST_BLOCK_START_RE.match(raw_inner)
+            if m_ghost is not None:
+                body = raw_inner[m_ghost.end() :]
+                body_line = tok.line + raw_inner.count("\n", 0, m_ghost.end())
+                group.extend(_tokenize_ghost_body(body, body_line))
+                continue
+        _flush_group()
+
+    _flush_group()
+    return entries
+
+
+def _find_in_body_ghost_declarations_tokens(tokens: list[Token], path: str = "<input>") -> list[str]:
+    return [msg for _key, msg in _find_in_body_ghost_declarations_entries(tokens, path=path)]
+
+
+def _added_in_body_ghost_declarations(base_tokens: list[Token], work_tokens: list[Token], path: str) -> list[str]:
+    """In-body ghost declarations introduced by `work_tokens` relative to `base_tokens` (line-shift insensitive)."""
+    known = Counter(key for key, _msg in _find_in_body_ghost_declarations_entries(base_tokens, path=path))
+    errors: list[str] = []
+    for key, msg in _find_in_body_ghost_declarations_entries(work_tokens, path=path):
+        if known[key] > 0:
+            known[key] -= 1
+            continue
+        errors.append(msg)
+    return errors
+
+
+def find_in_body_ghost_declarations(source: str, path: str = "<input>") -> list[str]:
+    """
+    Detect block-scope (`brace_depth > 0`) ghost function prototypes, ghost function definitions,
+    `extern` declarations, and embedded ACSL contracts (`/@ ... @/`) attached to declarations inside
+    in-body ghost blocks (`/*@ ghost ... */`, `//@ ghost ...`), ignoring C comments, string/char
+    literals, doxygen comments, and `#if defined(__FRAMAC_EACSL__)` / `#if 0` blocks.
+    """
+    tokens = tokenize_c_acsl(source, path=path)
+    return _find_in_body_ghost_declarations_tokens(tokens, path=path)
 
 
 def added_top_level_acsl_declarations(base_text: str, agent_text: str, path: str = "<input>") -> list[str]:

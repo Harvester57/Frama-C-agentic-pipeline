@@ -270,3 +270,37 @@ def test_prover_brief_pointer_walk_uses_ghost_index_not_ptr_anchor(pointer_walk:
         "/*@ ghost idx = (size_t)(p - buf); */",
     ):
         assert (expected in rendered) is pointer_walk, (pointer_walk, expected)
+
+
+@pytest.mark.unit
+def test_header_architect_brief_progress_guidance_and_no_assigns_result_from() -> None:
+    arch = _ARCHITECT_BRIEF.read_text(encoding="utf-8")
+    for expected in (
+        "two-sided `progress`",
+        r"ensures progress: \result >= 0 ==> 0 <= \result <= len;",
+        r"ensures progress: \result == 0 ==> 1 <= *eaten <= len;",
+        r"\old(off == \null ? (size_t)0 : *off) < *off <= len",
+        "Prefer guarded `ensures`",
+        r"ensures res_base: \result != \null ==> \base_addr(\result) == \base_addr(\old(buf));",
+        r"ensures res_bound: \result != \null ==> 0 <= \result - \old(buf) <= \old(len);",
+        "| **Parser `progress` & error returns** |",
+    ):
+        assert expected in arch, expected
+
+    for forbidden in (
+        r"assigns \result \from",
+        "<==>",
+        r"buf == \null || \valid_read",
+    ):
+        assert forbidden not in arch, forbidden
+
+    # Mirrors stay byte-for-byte identical.
+    for mirror in (
+        ROOT / ".agents" / "skills" / "framac-wp" / "header_architect_brief.md",
+        ROOT / ".claude" / "skills" / "framac-wp" / "header_architect_brief.md",
+    ):
+        assert mirror.read_text(encoding="utf-8") == arch, mirror
+
+    # prover_brief.md stays untouched (no parser progress cheat-sheet row added there).
+    prover_text = _PROVER_BRIEF.read_text(encoding="utf-8")
+    assert "**Parser `progress` & error returns**" not in prover_text
