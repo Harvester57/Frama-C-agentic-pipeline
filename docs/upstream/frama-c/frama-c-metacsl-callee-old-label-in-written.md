@@ -273,8 +273,9 @@ Searched on 2026-11-20 through the read-only API (`glab api`):
 - Target: `pub/meta`. [`../../../tools/upstream_audit/file_upstream.py`](../../../tools/upstream_audit/file_upstream.py)
   files on `pub/frama-c` (project 780) only, so this one is filed by hand or after the tool
   learns a project option.
-- Not filed: no branch was pushed, and no issue or merge request was created. The MR text holds
-  `#<issue>`. The patch applies with `git am --keep-non-patch` on `4f43801390` (checked).
+- Not filed: no branch was pushed, and no issue or merge request was created. Listed in the annex
+  of #2832 (ref `47`) since 2026-11-20. The MR text holds `#<issue>`. The patch applies with
+  `git am --keep-non-patch` on `4f43801390` (checked).
 
 ## For the pipeline
 

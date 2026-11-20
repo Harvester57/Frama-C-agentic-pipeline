@@ -186,10 +186,10 @@ On 2026-11-20, read-only through `glab api`:
   calling contexts with switch cases"); none is about folding or locations. One merge request,
   !1 (merged, "Adding check-callee-assigns option").
 - `pub/frama-c` (project 780): search `fold` and search `metacsl`; nothing about MetAcsl folding or
-  annotation locations. The overview issue #2832 mentions MetAcsl only for report 45.
+  annotation locations.
 
 ## Filing
 
-Not filed, and nothing posted. File the issue on `pub/meta` first, then replace `#<issue>` in the
-MR text and open the MR from a fork branch `fix/fold-instance-location` with
-`git am --keep-non-patch`. The overview issue #2832 does not list this report yet.
+Not filed, and nothing posted on `pub/meta`. Listed in the annex of #2832 (ref `48`) since
+2026-11-20. File the issue on `pub/meta` first, then replace `#<issue>` in the MR text and open
+the MR from a fork branch `fix/fold-instance-location` with `git am --keep-non-patch`.

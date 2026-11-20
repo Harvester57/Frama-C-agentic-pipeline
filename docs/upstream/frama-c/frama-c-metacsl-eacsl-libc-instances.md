@@ -236,4 +236,5 @@ hits the protected object from the property to the memory check).
   files on `pub/frama-c` (project 780) only, so this one is filed by hand.
 - Placeholders to replace before sending: `#<issue>` in the MR text, `#ISSUE-47` and `#ISSUE-48`
   (both `pub/meta`) in the issue text. File 47 and 48 first.
-- Filing is paused until the maintainers answer #2832, like 45.
+- Filing is paused until the maintainers answer #2832, like 45. Listed in the annex of #2832 (ref
+  `49`) since 2026-11-20.

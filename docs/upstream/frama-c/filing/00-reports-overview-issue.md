@@ -86,6 +86,10 @@ would like it (question 2). Everything below has a reproducer of a few lines tha
 *Edit, 18 November: added a request about the MetAcsl plug-in (reference 45, at the end of the
 annex). It would go to `pub/meta`, and it is not filed either.*
 
+*Edit, 20 November: added guarded `\old`/`\at` evaluation (E-ACSL), `<sched.h>` `cpu_set_t`
+(Libc, reference 46), and three MetAcsl reports for `pub/meta` (references 47 to 49, including a
+wrong proof in 47; patches ready, and 45's patch is now built too).*
+
 One of them is a question before it is a report, because the behaviour is deliberate.
 
 **Enumeration constants.** Since the change "Fix enumeration typing by making sure all items are
@@ -156,8 +160,9 @@ Thank you for the triage so far, and for opening the fork settings.
 
 One line each, so that you can say which ones you want. The references are my own labels (the
 gaps are findings I dropped). Each has a reproducer of a few lines, run on `master`
-(`b80fcac74f`) and on `34.0~beta`, except the two marked "`master` only" and reference 45 (MetAcsl),
-which was run on `34.0~beta` only.
+(`b80fcac74f`) and on `34.0~beta`, except the two marked "`master` only" and the four MetAcsl
+reports (45, 47 to 49), which were run on Frama-C `34.0~beta` (MetAcsl `0.12~beta` and `pub/meta`
+`4f43801390`).
 
 **Kernel, C front end**
 
@@ -224,6 +229,7 @@ which was run on `34.0~beta` only.
 | 43 | A real constant with an exponent (`1e-9`) stops Frama-C with `Not_a_decimal`, and `0.1L` is 0 at run time. Patch ready. | unexpected error, wrong run-time check |
 | H11 | `(double)` of a real is truncated (`mpq_get_d`), not rounded: with `double e = 0.1;`, `e == (double)0.1` fails, and it passes for the `double` just below 0.1. | wrong run-time check, both ways |
 | H15 | `x < 1e40f` in an annotation gives `x < inf` in the generated code. | the generated code does not compile |
+| old-guard | An `\old` or `\at` term is evaluated at its label even when a guard (`\old(p) == \null ==> ...`, disjunction, or `assumes`) makes it unneeded (`Translate_ats.for_stmt`): valid calls abort at run time with default options, including Frama-C's libc `recvfrom(..., NULL, NULL)` under `e-acsl-gcc -L`. | false alarm on valid code |
 | L4 | `typing was not performed on construct 1` on a call to `stpncpy` or `strlcat`, and on a quantifier bounded by a logic function without a definition. Possibly related to #2806. For `strlcat` it comes from the `ensures` clause of 44 (Libc): with that clause rewritten, the translation ends normally. | internal error |
 | L6 | A call to `getaddrinfo` prints lines `Failure: Interval inference was not performed on construct \result`, with exit code 0. | cosmetic |
 
@@ -237,6 +243,7 @@ which was run on `34.0~beta` only.
 | N6 | `getpwnam_r`, `getpwuid_r`: Eva gives `NULL` as the only result, so the success branch is dead. | lost code for Eva |
 | L5 | `syslog` in a file that includes only `<syslog.h>`: "Unable to locate ACSL predicate valid_read_string", and an unterminated `%s` argument raises no alarm. | lost alarm |
 | N20 | `wprintf` in a file that includes only `<wchar.h>`: "Unable to locate global __fc_stdout"; the effect on the stream is missing. | minor |
+| 46 | `<sched.h>` lacks glibc's `cpu_set_t`, `CPU_*` macros and `sched_setaffinity`/`sched_getaffinity` under `_GNU_SOURCE`. | header gap |
 
 **Other**
 
@@ -248,4 +255,7 @@ which was run on `34.0~beta` only.
 
 | Ref | What happens | Kind |
 | :-- | :-- | :-- |
-| 45 | `\result` is refused in a `\postcond` property (`\result meaningless`), although the property becomes an `ensures` clause of its target, so "when the function fails, the state is unchanged" cannot be a meta-property. Run on `34.0~beta` with MetAcsl `0.12~beta` only; `meta_parse.ml` is the same file on MetAcsl `master`. I have a patch that I have not built. | feature request |
+| 45 | `\result` is refused in a `\postcond` property (`\result meaningless`), although the property becomes an `ensures` clause of its target, so "when the function fails, the state is unchanged" cannot be a meta-property. Patch ready. | feature request |
+| 47 | At a call to a callee known by its contract, `\written`/`\read` instances copy the callee's `Old`, `Pre` and `Here` labels unchanged: `Old` aborts WP and E-ACSL, while `Pre` and `Here` (under `After`) refer to the wrong state so WP proves false properties. Patch ready. | wrong proof, internal error |
+| 48 | Under `-meta-fold`, `create_call` (and the `post`/`post_fold` wrappers) drops `~loc`, so folded instances have no source location (`<unknown>:0` at run time under E-ACSL). Patch ready. | missing locations |
+| 49 | A call to a function without any specification (such as host libc under `e-acsl-gcc`) gets no `\writing`/`\reading` instance and no warning (patch ready for a `no-footprint` warning); `\written`/`\read`/`\called` terms also omit `~loc` (`<unknown>:0` in E-ACSL validity guards). | feature request |

@@ -2,7 +2,7 @@
 
 **Status:** draft, not filed, no package number. Filing is paused until the maintainers answer on
 [#2832](https://git.frama-c.com/pub/frama-c/-/work_items/2832), see [`./README.md`](./README.md).
-This finding is not in the annex of #2832.
+Listed in the annex of #2832 (ref `old-guard`) since 2026-11-20.
 
 **Found on:** libmodbus `run-1`, 2026-11-18, candidate
 `src/modbus-rtu.c#modbus_rtu_set_serial_mode::rte::2820aa2803`, which the run's crash verifier

@@ -5,7 +5,7 @@
 - **Reproducer:** [`./repro/46-libc-sched-cpu-set.c`](./repro/46-libc-sched-cpu-set.c)
 - **Pipeline entry:** [`../../troubleshooting/kernel-and-stubs.md`](../../troubleshooting/kernel-and-stubs.md) (the `cpu_set_t` symptom)
 
-**Status:** drafted on 2026-11-19 and not filed. There is no issue, merge request or patch.
+**Status:** drafted on 2026-11-19 and not filed. Listed in the annex of [#2832](https://git.frama-c.com/pub/frama-c/-/work_items/2832) (ref `46`) since 2026-11-20. There is no issue, merge request or patch.
 
 ## Summary
 
@@ -45,5 +45,5 @@ The tests compare the layout and 223,498 macro evaluations with glibc's. The sam
 ## Not done
 
 - No patch against `share/libc/sched.h`, and no test under `tests/libc`.
-- No check for duplicates beyond [`./frama-c-e-acsl-issues.md`](./frama-c-e-acsl-issues.md) and the 2026-11-09 work-items snapshot, which has no match for `cpu_set_t`, `sched_setaffinity` or `affinity`.
+- Live duplicate check on `pub/frama-c` (2026-11-20, `glab api` searches `cpu_set_t`, `sched_setaffinity`, `sched.h`): no matches.
 - Filing needs the owner's go-ahead.

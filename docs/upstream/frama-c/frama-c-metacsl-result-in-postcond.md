@@ -206,8 +206,8 @@ removal is not in the exported patch). The built `MetAcsl.cmxs` replaced the ins
 - Target: `pub/meta`. [`../../../tools/upstream_audit/file_upstream.py`](../../../tools/upstream_audit/file_upstream.py)
   files on `pub/frama-c` (project 780) only, so this one is filed by hand or after the tool
   learns a project option.
-- Filing is paused until the maintainers answer #2832. No branch was pushed, no issue or merge
-  request was created on `pub/meta`, and #2832 was not edited (the overview issue and its local
-  copy [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md) already
-  list this finding since 2026-11-18 as reference 45 in the annex, under MetAcsl). The MR text
-  holds `#<issue>`.
+- Filing is paused until the maintainers answer #2832. No branch was pushed and no issue or merge
+  request was created on `pub/meta`. The overview issue #2832 and its local copy
+  [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md) list this
+  finding as reference 45 in the annex under MetAcsl (added 2026-11-18; updated 2026-11-20 to note
+  the built patch and `pub/meta` `4f43801390` run). The MR text holds `#<issue>`.
