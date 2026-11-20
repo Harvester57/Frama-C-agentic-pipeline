@@ -264,3 +264,21 @@ def test_param_types_split_nested_parentheses():
     )
     assert m.param_types("a.c#f") == {"s": "struct s *", "cb": "int (*)(int, char *)", "n": "unsigned long"}
     assert m.param_types("a.c#g") is None
+
+
+@pytest.mark.unit
+def test_anonymous_struct_counters_do_not_split_one_type():
+    """`typedef struct {...} conf_t` is `__anonstruct_conf_t_<N>`, N counted per parse."""
+    model = _stream_model(
+        **{
+            "out.c#flush": _func("flush", "out.c", "void(struct __anonstruct_out_t_1 *)", ["stream"]),
+            "out.c#emit": _func("emit", "out.c", "void(struct __anonstruct_out_t_4 *,int)", ["stream", "n"]),
+            # No typedef: nothing names it the same in two parses, so its type is unknown: it stays in.
+            "z.c#bare": _func("bare", "z.c", "void(struct __anonstruct_9 *)", ["stream"]),
+        }
+    )
+    doc = _props(model, assets=[ASSET])
+    prop = _prop(doc, "L3_writers_out_count")
+    assert prop["param_type"]["type"] == "struct __anonstruct_out_t *"
+    assert _excluded(prop) == {"in.c#take"}
+    assert set(prop["instances"]) == {"out.c#emit", "z.c#bare"}

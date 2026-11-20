@@ -387,7 +387,8 @@ class _Model:
             return {}
         if len(types) != len(formals):
             return None
-        return {str(p.get("name")): t for p, t in zip(formals, types, strict=True)}
+        # A parameter whose type cannot be compared across parses is left out (unknown).
+        return {str(p.get("name")): t for p, t in zip(formals, types, strict=True) if t is not None}
 
     def callers_of(self, ref: str) -> set[str]:
         """Project functions calling `ref` (a project function or an external one)."""
@@ -458,9 +459,22 @@ def _split_params(sig: str) -> list[str]:
 _QUALIFIER_RE = re.compile(r"\b(?:const|volatile|restrict|__restrict__|__restrict)\b")
 
 
-def _norm_type(text: str) -> str:
-    """A C type with its qualifiers dropped and its spacing made uniform (`struct s const*` -> `struct s *`)."""
+# Frama-C names an anonymous struct after its typedef and a counter of the parse (`__anonstruct_conf_t_3`),
+# or after the counter alone (`__anonstruct_7`). The counter may differ between two parses.
+_ANON_TYPEDEF_RE = re.compile(r"\b(__anon(?:struct|union|enum)_\w+?)_\d+\b")
+_ANON_BARE_RE = re.compile(r"\b__anon(?:struct|union|enum)_\d+\b")
+
+
+def _norm_type(text: str) -> str | None:
+    """
+    A C type with its qualifiers dropped and its spacing made uniform (`struct s const*` -> `struct s *`),
+    an anonymous type named after its typedef without the parse's counter; None for an anonymous
+    type with no typedef (nothing names it the same in two parses).
+    """
     text = re.sub(r"\s+", " ", _QUALIFIER_RE.sub(" ", text)).strip()
+    if _ANON_BARE_RE.search(text):
+        return None
+    text = _ANON_TYPEDEF_RE.sub(r"\1", text)
     return re.sub(r"(?<=[\w\]])\s*\*", " *", text)
 
 
