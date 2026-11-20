@@ -4,7 +4,8 @@
 - **Original design:** [`./unit-split-address-flow.md`](./unit-split-address-flow.md)
 - **Review findings:** [`./unit-split-address-flow-review.md`](./unit-split-address-flow-review.md) (verdict: **Rework**, blocking issues `B1`–`B9`)
 - **Base branch:** `claude/unit-split-indirect-edges` (`63cddeb`..`d1466bd`, on top of `origin/main` `7957660`)
-- **Status:** Proposed (not implemented); open decisions `D1`–`D4` below.
+- **Implementation branch:** `fix/unit-split-address-flow` (commits `3dc1bfd` [C1], `a921072` [C2], `bb81795` [C3], `9462e81` [C4], `7aa4b3d` [C5], `36ba45f` [C6], `9b4a184` [C7.1], `e10d660` & `1fbe43a` [C7.2 nginx build fixes], plus C7.3 docs; not yet merged to `main`).
+- **Status:** Implemented (`C0`–`C7` complete); decisions settled as **D1(b)**, **D2(a)**, **D3(a)**, **D4(a)**. See [`./unit-split-address-flow.md`](./unit-split-address-flow.md) Section 2 and Section 6 for measured real nginx 1.31.9 dump-schema-6 and C7.2 validation numbers.
 
 This plan turns the nine blocking issues (`B1`–`B9`) and non-blocking defects recorded in [`./unit-split-address-flow-review.md`](./unit-split-address-flow-review.md) into ordered, independently testable implementation steps (`C0`–`C7`) for future implementation.
 
