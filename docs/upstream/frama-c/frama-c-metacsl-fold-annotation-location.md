@@ -21,10 +21,10 @@ in the implication from a callee behavior's `assumes`.
 
 ## Where the pipeline meets it
 
-Measured on 2026-11-19 (`docs/plans/metacsl-exploitation-plan.md`, section "`-meta-fold` and
+Measured on 2026-11-19 ([`../../plans/metacsl-exploitation-plan.md`](../../plans/metacsl-exploitation-plan.md), section "`-meta-fold` and
 `-meta-quantify-range` in the E-ACSL build"): with `-meta-fold`, a meta failure in the E-ACSL build
 is reported at `<unknown>:0`, and its `pred_txt` is the call (`meta_L4_auth_state_login(dst + i)`).
-`failure_identity.py` maps a meta failure to its file through the meta file's line, so the
+[`../../../scripts/failure_identity.py`](../../../scripts/failure_identity.py) maps a meta failure to its file through the meta file's line, so the
 fingerprint loses its file part (`unknown#...`) and its hash changes. That is one of the reasons
 the plan keeps both options off. A fix upstream removes the line problem; the plan's other
 condition (map by property name and function through the sidecar) stands on its own.
@@ -109,15 +109,24 @@ All in `meta_annotate.ml` of `master` `4f43801390`:
 one commit on `pub/meta` `master` `4f43801390`, subject prefix `[fold]` as in the commits of the
 `-meta-fold` series (`6e83cce7`, "[fold] avoid having qualifier in parameters of predicates"):
 
-- `create_call` takes `~loc`; `create_instance` passes `inst.pred_loc`, the location of the instance
-  the call stands for.
-- `post` and `post_fold` in both visitors give `pimplies` and `pforall` the location of the
-  predicate they wrap (`prop.pred_loc`). With that, `inst.pred_loc` is the property's location even
-  when `post` applies.
+- `meta_annotate.ml`:
+  - `create_call` takes `~loc`; `create_instance` passes `inst.pred_loc`, the location of the
+    instance the call stands for.
+  - `post` and `post_fold` in both visitors give `pimplies` and `pforall` the location of the
+    predicate they wrap (`prop.pred_loc`). With that, `inst.pred_loc` is the property's location
+    even when `post` applies.
+- `CHANGELOG.md`: concise entry under `# Version dev`.
+- `tests/meta/fold_location.c` with `tests/meta/oracle/fold_location.0.res.oracle` and
+  `tests/meta/oracle_fold/fold_location.0.res.oracle`: regression test using `-report` (`PLUGIN:
+  @PTEST_PLUGIN@ report`) covering folded calls (`create_call`, both via `-meta-fold` and
+  `\flags(fold:yes)`), callee behavior `assumes` (`post` in both `\writing` and `\reading`, using a
+  global in `assumes` on a single-behavior callee), and callee ranges with `-meta-quantify-range`
+  (`post_fold` in both `\writing` and `\reading`), in both the default and `fold` configurations.
 - `tests/meta-wp/oracle_fold/typing.0.res.oracle`: the goal line now has `("typing.c", line 22)`.
-  This oracle is the regression test; no new test file.
 
-Checked: `git apply --check --cached` on a pristine clone of `4f43801390`, no CR in the patch.
+Checked: `git apply --check` and `git apply --check --cached` on a pristine clone of `4f43801390`,
+`git am --keep-non-patch` on a fresh clone of `4f43801390` (0 warnings, no trailing whitespace, no
+CR in the patch).
 Not run: `make lint`, the header check.
 
 ### Builds
@@ -125,27 +134,49 @@ Not run: `make lint`, the header check.
 - MetAcsl `master` declares `frama-c {>= "34.0~" & < "35.0~"}` but does not build on 34.0~beta:
   `meta_parse.ml` line 483 matches `PLpointer_comparable`, which the installed `Logic_ptree` does
   not have (most likely from the merge `4f43801390` itself, "pointer-comparable-const", a sync with
-  frama-c!6051; the clone is shallow, so this was not checked with `git blame`). Every `master` build here removed that line first, in a throwaway container only.
-- Before: the installed 0.12~beta, and `master` with that line removed. After: `master` with that
-  line removed and the patch. Each build was `dune build @install && dune install` in a
-  `docker run --rm` container of `framac-analysis:latest`.
-- Suites: `meta`, `meta-wp` and `meta-deduce`, default and fold configurations, on `master` and on
-  `master` with the patch. The two sets of result logs are identical except
-  `meta-wp/result_fold/typing.0.res.log`, and the updated oracle has the same blob id as the patched
-  log (`b17e019`). `meta-deduce` failed the same way in both: SWI-Prolog is not
-  installed in the image (`env: ‘swipl’: No such file or directory`, after the CRLF line ends of the
-  Windows checkout were stripped from `deduce/` in a rerun of that suite alone), so its deduction
-  checks were not exercised. The image lacks a few files listed in frama-c's `dune-package` (doc and
-  man pages); they were created empty in the container so that dune would run the tests.
+  frama-c!6051; the clone is shallow, so this was not checked with `git blame`). Every `master` build
+  here removed that line first, in a throwaway container only.
+- Before: the installed 0.12~beta, and `master` with that line removed. After: `master` with the
+  patch applied via `git am --keep-non-patch` and that line removed for the build only. Each build
+  was `dune build @install && dune install --prefix /home/opam/.opam/5.5` in a `docker run --rm`
+  container of `framac-analysis:latest`. The image lacks a few doc/man files listed in frama-c's
+  `dune-package` (`doc/frama-c/{LICENSE,README.md}`, `man/man1/*.1`); they were created empty in the
+  container so that dune would run `@ptests`.
+- **Reproducer** ([`./repro/48-metacsl-fold-annotation-location.sh`](./repro/48-metacsl-fold-annotation-location.sh)):
+  fails on installed 0.12~beta (exit 1) and unpatched `master` (exit 1), printing
+  `(generated by Frama-C kernel)` and `<unknown>:0`; passes after the patch (exit 0), printing
+  `("48-metacsl-fold-annotation-location.c", line 30)` and
+  `48-metacsl-fold-annotation-location.c:30`.
+- **New regression test (`tests/meta/fold_location.c`):** fails on unpatched `master`
+  (`dune build @tests/meta/fold_location.diff` exits 1: 5 of 6 assertions in `default` —
+  `direct_folded`, `write_assumes`, `read_assumes`, `write_range`, `read_range` — and all 6 of 6 in
+  `fold` print `(generated by Frama-C kernel)` instead of lines 37, 43, 48, 53, 58 and 63); passes
+  with the patch in both configurations (exit 0).
+- **Suites:** `dune build @tests/meta/ptests @tests/meta-wp/ptests` (default and `fold`
+  configurations):
+  - On unpatched `master`: exit 0 (`tests/meta`: 21 + 21 logs; `tests/meta-wp`: 12 + 12 logs).
+  - On patched `master` (from `git am --keep-non-patch` of the patch file): exit 0 (`tests/meta`:
+    22 + 22 logs including `fold_location.c`; `tests/meta-wp`: 12 + 12 logs including the updated
+    `oracle_fold/typing.0.res.oracle`). Zero unintended regressions.
+  - `meta-deduce` was not exercised here because SWI-Prolog (`swipl`) is not installed in
+    `framac-analysis:latest`.
 
 ## Not in this report
 
-- **A folded predicate can capture a caller's variable.** With `assumes.c` (`set(&auth_ok, n)` in
-  `caller(int n)`, callee behavior `assumes n > 0`), `-meta-fold -meta-no-simpl -print` gives the
-  global predicate `meta_auth_assumes{Before}(int *_written) = n > 0 ⇒ \separated(_written,
-  &auth_ok);`: `post` is applied when the predicate body is built, so the first instance's
-  `assumes`, written over the caller's formal `n`, becomes part of a global predicate shared by
-  every instance of the same type signature. Seen once, not analysed further, not filed.
+- **A folded predicate can capture a caller's variable and mix `assumes` across behaviors (WP
+  soundness bug).** With `assumes.c` (`set(&auth_ok, n)` in `caller(int n)`, callee behavior
+  `assumes n > 0`), `-meta-fold -meta-no-simpl -print` gives the global predicate
+  `meta_auth_assumes{Before}(int *_written) = n > 0 ⇒ \separated(_written, &auth_ok);`: `post` is
+  applied when the predicate body is built, so the first instance's `assumes`, written over the
+  caller's formal `n`, becomes part of a global predicate shared by every instance of the same type
+  signature. This is also a WP soundness bug: a second behavior (or callsite) with the same type
+  signature inherits the first behavior's `assumes` through the cached predicate, letting WP prove a
+  false property. Seen during this investigation, not filed here.
+- **Missing term locations on E-ACSL RTE guards (even unfolded).** `addr_of_tlval` and
+  `lval_to_term_lval` in `meta_annotate.ml` build substituted terms without source locations, so
+  E-ACSL's validity guards on `\separated` operands still report `<unknown>:0` even without
+  `-meta-fold`. That is tracked separately in draft 49
+  ([`./frama-c-metacsl-eacsl-libc-instances.md`](./frama-c-metacsl-eacsl-libc-instances.md)).
 
 ## Duplicate check
 

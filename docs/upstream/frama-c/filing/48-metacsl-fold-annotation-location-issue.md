@@ -1,4 +1,4 @@
-# [MetAcsl] `-meta-fold` drops the location of the folded instances
+# `-meta-fold` drops the location of the folded instances
 
 <!-- Everything below this line is the issue description. Tracker: pub/meta (MetAcsl), not pub/frama-c. -->
 
@@ -175,11 +175,13 @@ MetAcsl's own tests record it: in `tests/meta-wp/oracle_fold/typing.0.res.oracle
 - **A possible change.** Pass `~loc:inst.pred_loc` to the call in `create_instance`, and
   `~loc:prop.pred_loc` to the `pimplies` of `post` and the `pforall` of `post_fold` in both
   visitors. I tested it on the build of `master` described above: the report and E-ACSL then give
-  `fold.c:30` for `auth_folded`, the two other cases get the property's line, and the `meta`,
-  `meta-wp` and `meta-deduce` suites give the same results as `master` in both configurations
-  (SWI-Prolog is not installed on my setup, so the deduction checks of `meta-deduce` fail the same
-  way with and without it), except the fold oracle of `meta-wp/typing.c` quoted above, which then
-  reads `("typing.c", line 22)`. I am sending it as a merge request that refers to this issue.
+  `fold.c:30` for `auth_folded`, the two other cases get the property's line, a new regression test
+  covering all three paths (`tests/meta/fold_location.c`) fails on unpatched `master` and passes
+  with the change in both the default and `fold` configurations, and the `meta` and `meta-wp`
+  suites give the same results as `master` in both configurations except the fold oracle of
+  `meta-wp/typing.c` quoted above, which then reads `("typing.c", line 22)` (`meta-deduce` was not
+  exercised because SWI-Prolog is not installed on my setup). I am sending this as a merge request
+  that refers to this issue.
 
 The analysis was prepared with LLM assistance (Claude Code); I reviewed it and ran the
 reproducer described above.

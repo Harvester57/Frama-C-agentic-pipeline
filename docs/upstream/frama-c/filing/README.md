@@ -33,11 +33,12 @@ drafted the same day).
 and has an issue text only. It is written for the MetAcsl tracker,
 [`pub/meta`](https://git.frama-c.com/pub/meta/-/issues), so its title carries no plug-in tag.
 
-47, 48 and 49 (MetAcsl: callee labels in `\written` instances, folded instances without location,
-no instance and no warning for a call to a function without specification; drafted on 2026-11-20)
-are **not filed**. They are written for `pub/meta` too, with the title tag `[MetAcsl]`. Each has
-an issue and an MR text. `pub/meta` has no merge-request template, so their MR texts have no
-CONTRIBUTING/CLA checkboxes. 49 cites 47 and 48 as `#ISSUE-47` and `#ISSUE-48`.
+47, 48 and 49 (MetAcsl: callee labels in `\written`/`\read` instances, folded instances without
+location, no instance and no warning for a call to a function without specification; drafted on
+2026-11-20) are **not filed**. They are written for `pub/meta` too, so like 45 and the existing
+`pub/meta` issues their issue titles carry no plug-in tag. Each has an issue and an MR text.
+`pub/meta` has no merge-request template, so their MR texts have no CONTRIBUTING/CLA checkboxes.
+49 cites 47 and 48 as `#ISSUE-47` and `#ISSUE-48`.
 
 Every other text of this folder is filed (01 to 27 on 2026-11-15, 28 to 42 on 2026-11-18), and
 their placeholders now hold the real numbers. For a new package, write `#<issue>` for its own issue and

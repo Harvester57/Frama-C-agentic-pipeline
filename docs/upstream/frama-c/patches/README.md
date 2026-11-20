@@ -78,13 +78,18 @@ become valid; two line numbers move). `fc_libc.0.res.oracle` does not change. It
 **`47-*`, `48-*` and `49-*` (2026-11-20, not filed)** are patches for MetAcsl (`pub/meta`), not
 `pub/frama-c`, one commit each on `pub/meta` `master` `4f43801390`, authored with the GitLab
 noreply address. Apply them to a clone of `pub/meta` with `git am --keep-non-patch` (subjects
-`[meta]` and `[fold]`). 47 maps the callee's `Old`/`Pre` labels to MetAcsl's `Before` in
+`[meta]` and `[fold]`). 47 maps the callee's `Old`/`Pre`/`Here` labels to MetAcsl's `Before` in
 `meta_annotate.ml` and adds `tests/meta/callee_labels.c` with four oracles; 48 passes the
-property's location to folded calls and to the `external_assigns`/`passthrough_from` wrappers and
-updates `tests/meta-wp/oracle_fold/typing.0.res.oracle`; 49 adds a `no-footprint` warning with a
-test. 47 and 48 apply stacked (checked); 49 conflicts with them on one `CHANGELOG.md` line. They
-were built and their suites run in throwaway containers of `framac-analysis:latest` (34.0~beta),
-with `meta_parse.ml`'s `PLpointer_comparable` line removed because 34.0~beta lacks it; that
-removal is not in the patches. Lint, the header check and the `meta-deduce` deduction checks
-(SWI-Prolog absent) were not run. The oracles of 47 and 49 contain lines ending in spaces, as
-Frama-C prints them; `git am` warns about them.
+property's location to folded calls and to the `external_assigns`/`passthrough_from` wrappers,
+adds a `CHANGELOG.md` entry and `tests/meta/fold_location.c` (two oracles), and updates
+`tests/meta-wp/oracle_fold/typing.0.res.oracle`; 49 puts all three missing-footprint warnings
+(unspecified callee, `WritesAny` and `\reading`'s `FromAny`) under warning category `no-footprint`
+with call-site locations (`~loc`) and adds `tests/meta/no_footprint.i` covering `\writing` and
+`\reading` (four oracles). Stacked in order 47, 48, 49 with `git am --keep-non-patch --3way`,
+`meta_annotate.ml` merges cleanly (only the `# Version dev` line of `CHANGELOG.md` conflicts), all
+three reproducers pass and all ten new oracles match byte-for-byte. They were built and both
+`tests/meta` and `tests/meta-wp` (default and `fold` configurations) were run in throwaway
+containers of `framac-analysis:latest` (34.0~beta), with `meta_parse.ml`'s `PLpointer_comparable`
+line removed because 34.0~beta lacks it; that removal is not in the patches. Lint, the header
+check and the `meta-deduce` deduction checks (SWI-Prolog absent) were not run. The oracles of 47
+and 49 contain lines ending in spaces, as Frama-C prints them; `git am` warns about them.

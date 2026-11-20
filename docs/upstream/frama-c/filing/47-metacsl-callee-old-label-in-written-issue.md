@@ -1,4 +1,4 @@
-# [MetAcsl] The `\written` / `\read` instances at a call keep the `Old` / `Pre` labels of the callee's contract
+# The `\written` / `\read` instances at a call keep the `Old`, `Pre` and `Here` labels of the callee's contract
 
 <!-- Everything below this line is the issue description. Tracker: pub/meta (MetAcsl), not pub/frama-c. -->
 
@@ -18,6 +18,11 @@ contract are kept, and the instance is an assertion of the caller:
 - `Pre` is accepted in the callee's contract (where it is its pre-state) and is allowed in a
   statement annotation, but there it is the pre-state of the caller, not the state before the
   call. The instance checks another location, and WP proves a false property.
+- `Here` (in an `assumes` clause — where `\valid(p)`, a labelled logic function such as `len(p)`,
+  and `\at(*p, Here)` are typed with `Here` — or in an `assigns` clause as `\at(*p, Here)`)
+  denotes the callee's pre-state. When a property uses `After`, the assertion is placed after
+  the call, where `Here` evaluates in the post-state instead of the state before the call, and
+  WP can prove a false property (see the end).
 
 The same happens to `\read` with a `\reading` property (the `\from` part of the assigns clause)
 and to the assumes clauses added as hypotheses (see the end).
@@ -133,7 +138,7 @@ removed):
 [kernel] Parsing callee_labels.c (with preprocessing)
 [meta] Translation is enabled
 [meta] Will process 2 properties
-[kernel] callee_labels.c:15: Failure: 
+[kernel] callee_labels.c:12: Failure: 
   [AST Integrity Check]
   MetAcsl annotations
   Logic label Old is not declared in this scope
@@ -267,21 +272,35 @@ void caller(void)
   }
   ```
 
+- **`Here` under an `After` property.** In an `assumes` clause, `\valid(p)`, a labelled logic
+  function `len(p)`, and `\at(*p, Here)` are typed with `Here`, which denotes the callee's
+  pre-state (and WP also evaluates `Here` in the pre-state in `assigns`). When a property uses
+  `After`, the assertion is placed after the call and keeps `Here`. For example, with a callee
+  `behavior active: assumes len(p) > 0; assigns *p, *d; ensures *p == 0;` called as
+  `mutate(&n, &secret)` under `requires n == 1;` and an `After` property
+  `\separated(\written, &secret) || \at(secret, After) == \at(secret, Before)`, the generated
+  assertion after `mutate` is `len(&n) > 0 ==> \at(secret, Here) == \at(secret, meta_pre_0)`:
+  `len(&n)` evaluates in the post-state where `n == 0`, so the hypothesis is false and WP proves
+  all 3 goals even though `secret` may be modified.
 - **Where it comes from, as far as I can tell.** The visitor in `inspect_contract`
   (`meta_annotate.ml`) replaces the lvalues rooted at a formal by the actual arguments, and does
   not look at labels. The assumes clauses of the behavior, added as hypotheses, go through the
   same visitor.
 - **A possible change.** MetAcsl's own `Before` label already means "the state before the
   instrumented statement": `replace_after_before` turns it into `Here` when the assertion precedes
-  the call, and into a label on the call when it follows it. Mapping `BuiltinLabel (Old | Pre)` to
-  `FormalLabel "Before"` in that visitor gives the expected output above for the three variants,
-  in the default, `-meta-fold` and `-meta-quantify-range` modes, and with an `After` property
-  (`len{meta_pre_0}(&n)`, with `meta_pre_0` on the call). In the `\read` example, every
-  `Pre` and `Old` of the four assertions becomes `Here` (`\at(*(&n),Here)`, `len(&n)`), and WP
-  proves the six goals. I will send it as a merge request with a test.
+  the call, and into a label on the call (`meta_pre_N`, added by `instantiate`) when it follows it.
+  In a callee's `assumes`, `assigns` and `\from` clauses, `Old`, `Pre` and `Here` all denote the
+  callee's pre-state. Mapping `BuiltinLabel (Old | Pre | Here)` to `FormalLabel "Before"` in that
+  visitor gives the expected output above for the three variants, in the default, `-meta-fold` and
+  `-meta-quantify-range` modes, and with an `After` property (`len{meta_pre_0}(&n)`,
+  `\valid{meta_pre_0}(&n)`, `\at(*(&n), meta_pre_0)`). On the `mutate` example above, the
+  hypothesis becomes `len{meta_pre_0}(&n) > 0`, and WP no longer proves the false property (2 of 3
+  goals). On the `\read` example, every `Pre` and `Old` of the four assertions becomes `Here`
+  (`\at(*(&n),Here)`, `len(&n)`), and WP proves the six goals. I will send it as a merge request
+  with a test.
 - **Not covered by that change:** `Post` in an assigns clause (a location that depends on the
-  callee's post-state cannot be checked before the call), and an unlabelled read such as `*p` in
-  the location when the assertion is placed after the call.
+  callee's post-state cannot be checked before the call), and an unlabelled memory read such as
+  `*p` (in `assigns` or `assumes`) when the assertion is placed after the call.
 
 The analysis was prepared with LLM assistance (Claude Code); I reviewed it and ran the
 reproducer described above.

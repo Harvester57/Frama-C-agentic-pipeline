@@ -2,6 +2,7 @@
 
 int auth_ok;
 char out[4];
+int out_i[4];
 
 #ifdef USER_CONTRACT
 /* What the Frama-C libc says about memcpy, assigns and from only. */
@@ -10,6 +11,12 @@ char out[4];
 extern void *memcpy(void *restrict d, const void *restrict s, size_t n);
 #endif
 
+#ifdef OVERFLOW_PTR
+void process(int *p)
+{
+  *p = 1; /* ordinary out-of-bounds write, no libc and no callee contract */
+}
+#else
 void process(const char *in, size_t n)
 {
 #ifdef OVERFLOW
@@ -22,11 +29,16 @@ void process(const char *in, size_t n)
   memcpy(&auth_ok, in, sizeof auth_ok); /* writes the protected global */
 #endif
 }
+#endif
 
 int main(void)
 {
+#ifdef OVERFLOW_PTR
+  process(out_i + 10);
+#else
   char buf[8] = "abcdefg";
   process(buf, sizeof buf);
+#endif
   return 0;
 }
 

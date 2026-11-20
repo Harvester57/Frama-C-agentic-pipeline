@@ -1,4 +1,4 @@
-# [MetAcsl] E-ACSL builds: a `memcpy` into a `\writing`-protected global gets no instance and no warning, and an overflowing `memcpy` is reported at `<unknown>:0`
+# E-ACSL builds: a `memcpy` into a `\writing`-protected global gets no instance and no warning, and out-of-bounds writes are reported at `<unknown>:0`
 
 <!-- Everything below this line is the issue description. Tracker: pub/meta (MetAcsl), not pub/frama-c. -->
 
@@ -19,7 +19,9 @@ MetAcsl with E-ACSL as the back-end, through `e-acsl-gcc` (MetAcsl in a first st
 2. Once `memcpy` has an `assigns` clause, an overflowing `memcpy` is no longer reported by E-ACSL's
    `memcpy` check (`memcpy: insufficient space in destination space`). It stops earlier, in the
    validity guard E-ACSL puts on the `\separated` of the instance, and that guard has no location:
-   `<unknown>:0: Error: E-ACSL RTE failed`.
+   `<unknown>:0: Error: E-ACSL RTE failed`. The same `<unknown>:0` guard failure also happens on an
+   ordinary out-of-bounds C pointer write (`*p = 1`, with no libc and no callee contract), because
+   `meta_annotate.ml` constructs every `\written`, `\read` and `\called` term without `~loc`.
 
 ### Steps to reproduce the issue
 
@@ -30,6 +32,7 @@ MetAcsl with E-ACSL as the back-end, through `e-acsl-gcc` (MetAcsl in a first st
 
 int auth_ok;
 char out[4];
+int out_i[4];
 
 #ifdef USER_CONTRACT
 /* What the Frama-C libc says about memcpy, assigns and from only. */
@@ -38,6 +41,12 @@ char out[4];
 extern void *memcpy(void *restrict d, const void *restrict s, size_t n);
 #endif
 
+#ifdef OVERFLOW_PTR
+void process(int *p)
+{
+  *p = 1; /* ordinary out-of-bounds write, no libc and no callee contract */
+}
+#else
 void process(const char *in, size_t n)
 {
 #ifdef OVERFLOW
@@ -50,11 +59,16 @@ void process(const char *in, size_t n)
   memcpy(&auth_ok, in, sizeof auth_ok); /* writes the protected global */
 #endif
 }
+#endif
 
 int main(void)
 {
+#ifdef OVERFLOW_PTR
+  process(out_i + 10);
+#else
   char buf[8] = "abcdefg";
   process(buf, sizeof buf);
+#endif
   return 0;
 }
 
@@ -83,16 +97,17 @@ Point 2 (`-M` and `--libc-replacements` are needed for E-ACSL's own `memcpy` che
 ```
 $ e-acsl-gcc -M --libc-replacements -E -DOVERFLOW -c -o copy.frama.c -O copy copy.c && ./copy.e-acsl
 $ e-acsl-gcc -M --libc-replacements -E "-DOVERFLOW -DUSER_CONTRACT" -F -meta --then-last -c -o copy.frama.c -O copy copy.c && ./copy.e-acsl
+$ e-acsl-gcc -M --libc-replacements -E -DOVERFLOW_PTR -F -meta --then-last -c -o copy.frama.c -O copy copy.c && ./copy.e-acsl
 $ e-acsl-gcc -M --libc-replacements -E "-DOVERFLOW -DBY_HAND" -c -o copy.frama.c -O copy copy.c && ./copy.e-acsl
 ```
 
 ### Expected behaviour
 
-1. With the system headers, either the call gets its instance or MetAcsl warns that `memcpy` has
-   no footprint and that the property is assumed there, as it does for a behavior without
-   `assigns`.
-2. The overflow is reported as it is without the property, or at least at a location in
-   `copy.c`.
+1. With the system headers, either the call gets its instance or MetAcsl warns (with the call-site
+   location) that `memcpy` has no footprint and that the property is assumed there, as it does for
+   a behavior without `assigns`.
+2. The `memcpy` overflow is reported as it is without the property, or at least both the `memcpy`
+   overflow and the plain `*p = 1` out-of-bounds write are reported at a location in `copy.c`.
 
 ### Actual behaviour
 
@@ -133,7 +148,7 @@ property:
 
 ```
 copy.c: In function 'process'
-copy.c:39: Error: Assertion failed:
+copy.c:51: Error: Assertion failed:
 	The failing predicate is:
 	auth_state/meta:
 		\separated(
@@ -141,7 +156,7 @@ copy.c:39: Error: Assertion failed:
   ).
 ```
 
-Point 2. Without the property, the overflow is reported by E-ACSL's `memcpy`:
+Point 2. Without the property, the `memcpy` overflow is reported by E-ACSL's `memcpy`:
 
 ```
 memcpy: insufficient space in destination space , at least 8 bytes required
@@ -165,12 +180,29 @@ With the contract and the property:
 Aborted
 ```
 
-`-L` instead of the contract gives the same `<unknown>:0` report. The same `\separated` written
-by hand before the call (`-DOVERFLOW -DBY_HAND`, no property) is reported at its line:
+`-L` instead of the contract gives the same `<unknown>:0` report. An ordinary out-of-bounds write
+`*p = 1` (`-DOVERFLOW_PTR`, no libc and no callee contract) fails at `<unknown>:0` the same way
+(and its `\aligned(p,4)` guard in the instrumented file also has `file = "<unknown>", line = 0`):
+
+```
+<unknown>: In function 'process'
+<unknown>:0: Error: E-ACSL RTE failed:
+	The failing predicate is:
+	memory access:
+		\valid_read(p).
+	With values at failure point:
+	- "memory access": \valid_read(p): 0
+	- sizeof(int): 4
+	- p: 0x6338741f6288
+Aborted
+```
+
+The same `\separated` written by hand before the call (`-DOVERFLOW -DBY_HAND`, no property) is
+reported at its line:
 
 ```
 copy.c: In function 'process'
-copy.c:17: Error: E-ACSL RTE failed:
+copy.c:24: Error: E-ACSL RTE failed:
 	The failing predicate is:
 	memory access:
 		\valid_read(&out[0 .. n - 1]).
@@ -179,34 +211,48 @@ copy.c:17: Error: E-ACSL RTE failed:
 ### Proposal
 
 1. **Warn on a call to a function without specification (merge request attached).** In
-   `inspect_contract` (`meta_annotate.ml`), when the callee has no behavior at all, give the
-   same warning as for a behavior without `assigns`, and give both a warning category,
-   `no-footprint`, so that a user can silence it or make it an error. With the patch, the
-   `-no-frama-c-stdlib` run above prints:
+   `inspect_contract` (`meta_annotate.ml`), when the callee has no behavior at all, emit the
+   same warning as for a behavior without `assigns`; put all three missing-footprint warnings
+   (no specification, behavior with `WritesAny`, and `reading_visitor#passthrough_from` `FromAny`,
+   an `assigns` clause without `\from`) under a new warning category `no-footprint` so that a user
+   can silence them (`-meta-warn-key no-footprint=inactive`) or make them fatal (`=error`); and
+   pass the call-site statement location `~loc:(Cil_datatype.Stmt.loc stmt)` (with `~once:true`
+   matching `FromAny`, and `~loc` matching the `Indirect call` warnings) so each warning identifies
+   the call's file and line. With the patch, the `-no-frama-c-stdlib` run above prints:
 
    ```
-   [meta:no-footprint] Warning: 
+   [meta:no-footprint] copy.c:29: Warning: 
      Cannot analyze footprint of function memcpy: no assigns clause. Assuming meta-properties with reading/writing contexts are valid in this function.
    ```
 
    `unknown-func` is not the right category: it is about names in `\targets`, and aborts by
    default.
-2. **A location for the terms MetAcsl substitutes.** E-ACSL seems to take the location of a guard
-   from the term it guards: the assertion written by hand is reported at `copy.c:17`, and in the
-   `-L` build of point 1 the guard `\valid_read(&auth_ok)` of the instance has the line of the
-   property while the guard of the range built from `memcpy`'s `assigns` has `<unknown>`, line 0
-   (in the instrumented file). Giving the `\written` / `\read` terms built from a callee's
-   contract the location of the call statement would make the report point at the call. A
-   separate report, about `-meta-fold`, is about the location of the folded assertion itself
-   (#ISSUE-48); this one is about terms inside an unfolded instance.
+2. **A location for the terms MetAcsl substitutes.** E-ACSL takes the location of a guard from the
+   term it guards: the assertion written by hand is reported at `copy.c:24`, and in the `-L` build
+   of point 1 the guard `\valid_read(&auth_ok)` has the line of the property while the guard of the
+   `\written` term has `<unknown>`, line 0. In `meta_annotate.ml`, `addr_of_tlval` (lines 487-506,
+   called for `\written`, `\lhost_written`, `\read`, `\lhost_read`, and `\called`) calls
+   `Logic_utils.mk_logic_AddrOf` (and in the bitfield branch `Logic_utils.mk_cast`,
+   `Logic_const.term`, and `Logic_const.tinteger`) without `~loc`, and `writing_instance` (line
+   640) and `reading_instance` (line 729) also call `Logic_const.term (TLval ...)` without `~loc`.
+   Both `mk_logic_AddrOf` and `Logic_const.term` default `~loc` to `Kernel.gen_loc` (which E-ACSL
+   prints as `<unknown>:0`); in `mk_logic_AddrOf`, even the `TMem e, TNoOffset` case (`*p`) builds
+   a fresh `Logic_const.term ~loc e.term_node e.term_type`, discarding `e.term_loc`. As a result,
+   every `\written`, `\read`, and `\called` term — whether built from a plain C lvalue via
+   `Logic_utils.lval_to_term_lval` (lines 685, 691, 766) or from a callee's `assigns`/`\from`
+   contract — gets `Kernel.gen_loc`, unlike `\func` at line 371 which passes `~loc`
+   (`Property.location ump.ump_ip`). Passing the statement location (`Cil_datatype.Stmt.loc stmt`)
+   or the property location into `addr_of_tlval` and those `Logic_const.term` calls would locate
+   every guard in `copy.c`. A separate report, about `-meta-fold`, is about the location of the
+   folded assertion itself (#ISSUE-48); this one is about terms inside an unfolded instance.
 3. **An option for validity-guarded `\writing` / `\reading` instances.** Written by hand as
    `\valid(\written) ==> \separated(\written, &auth_ok)` (`-DGUARDED`), the overflow is reported
    by E-ACSL's `memcpy` again (`memcpy: insufficient space in destination space , at least 8
-   bytes required`), and the write into `auth_ok` is still caught at `copy.c:35`. An option such
+   bytes required`), and the write into `auth_ok` is still caught at `copy.c:47`. An option such
    as `-meta-guard-access` could produce `\valid(\written) ==> P` and `\valid_read(\read) ==> P`
    for a runtime back-end, leaving invalid accesses to the RTE and libc checks. It is a design
    choice: in this program the overflow also writes `auth_ok` (with `-e-acsl-no-rte-mem` the
-   unguarded instance fails as `auth_state/meta` at `copy.c:39`), and the guarded form leaves
+   unguarded instance fails as `auth_state/meta` at `copy.c:51`), and the guarded form leaves
    that case to the `memcpy` check.
 
 For point 1 of the summary there is also an E-ACSL side, which I did not file separately:

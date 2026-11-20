@@ -1,4 +1,4 @@
-# MetAcsl with E-ACSL: libc calls get no `\writing` instance and no warning; an overflow is reported by the instance's guard at `<unknown>:0`
+# MetAcsl with E-ACSL: libc calls get no `\writing` instance and no warning; out-of-bounds writes fail in RTE guards at `<unknown>:0`
 
 Draft for the **MetAcsl** issue tracker (https://git.frama-c.com/pub/meta/-/issues, project id
 869), not for `pub/frama-c`. **Not filed.** Package 49 of this folder, drafted on 2026-11-20. It is
@@ -22,9 +22,12 @@ a feature request with a merge request for its first point.
    libc) see. `e-acsl-gcc -L` gives the call its instance.
 2. With an `assigns` on `memcpy` (written by hand, or from `-L`), an overflowing `memcpy` is
    reported by E-ACSL's validity guard of the instance's `\separated`, at `<unknown>:0`, instead of
-   by E-ACSL's `memcpy` replacement (`memcpy: insufficient space in destination space`). The same
-   `\separated` written by hand is reported at its line, so the missing location comes from the
-   term MetAcsl builds from the callee's `assigns`.
+   by E-ACSL's `memcpy` replacement (`memcpy: insufficient space in destination space`). An
+   ordinary out-of-bounds C pointer write (`*p = 1;`, with no libc and no callee contract) fails
+   at `<unknown>:0: Error: E-ACSL RTE failed: \valid_read(p)` the exact same way, while the same
+   `\separated` written by hand is reported at its line: `meta_annotate.ml` builds every `\written`,
+   `\read`, and `\called` term without `~loc` (`addr_of_tlval` and `Logic_const.term` default to
+   `Kernel.gen_loc`, which E-ACSL prints as `<unknown>:0`).
 
 ## Where the pipeline meets it
 
@@ -59,32 +62,40 @@ with [`./repro/49-metacsl-eacsl-libc-instances.sh`](./repro/49-metacsl-eacsl-lib
 frama-c, Frama-C libc:          instance at memcpy: yes
 frama-c, system headers:        instance at memcpy: no, footprint warnings: 0
 e-acsl-gcc, write:              exit 0
-e-acsl-gcc -L, write:           exit 134, 49-metacsl-eacsl-libc-instances.c:39: Error: Assertion failed:
+e-acsl-gcc -L, write:           exit 134, 49-metacsl-eacsl-libc-instances.c:51: Error: Assertion failed:
 overflow, no property:          exit 134, memcpy: insufficient space in destination space , at least 8 bytes required
 overflow, contract:             exit 134, <unknown>:0: Error: E-ACSL RTE failed:
 overflow, -L:                   exit 134, <unknown>:0: Error: E-ACSL RTE failed:
-overflow, assertion by hand:    exit 134, 49-metacsl-eacsl-libc-instances.c:17: Error: E-ACSL RTE failed:
+overflow, plain *p = 1:         exit 134, <unknown>:0: Error: E-ACSL RTE failed:
+overflow, assertion by hand:    exit 134, 49-metacsl-eacsl-libc-instances.c:24: Error: E-ACSL RTE failed:
 overflow, contract, guarded:    exit 134, memcpy: insufficient space in destination space , at least 8 bytes required
-write, contract, guarded:       exit 134, 49-metacsl-eacsl-libc-instances.c:35: Error: Assertion failed:
+write, contract, guarded:       exit 134, 49-metacsl-eacsl-libc-instances.c:47: Error: Assertion failed:
 RESULT: the call without specification is skipped silently
 ```
 
 With the patch (MetAcsl `master` `4f43801390` plus the patch, built with dune and installed in a
 throwaway container of the same image, with the `PLpointer_comparable` line of `meta_parse.ml`
-removed for the 34.0~beta kernel), the second line reads `footprint warnings: 1`, the result line
-`RESULT: the call without specification is reported (no-footprint warning)`, and every other line
-is the same.
+removed for the 34.0~beta kernel), the second line reads
+`instance at memcpy: no, footprint warnings: 1 (49-metacsl-eacsl-libc-instances.c:29)`, the result
+line `RESULT: the call without specification is reported (no-footprint warning)` (exit 0), and
+every other line is the same.
 
 Other observations from the same session (scratch runs, not in the reproducer):
 
-- **The warning exists, for the other case.** A `memcpy` declared with `/*@ requires \true; */`
-  and no `assigns` gives `[meta] Warning: Cannot analyze footprint of function memcpy: no assigns
-  clause. ...` and no instance. The printed host declaration of `memcpy` has no specification at
-  all.
-- **The overflow does reach `auth_ok`.** With `--e-acsl-extra -e-acsl-no-rte-mem` the unguarded
-  instance is evaluated and fails as `auth_state/meta` at line 39: `out` is at `...274` and
-  `auth_ok` at `...278`. So the meta assertion is not wrong to fail; the request is about which
-  report a user gets and its location. `-e-acsl-rte 0` gives the same.
+- **The warning exists, for the other cases.** A `memcpy` declared with `/*@ requires \true; */`
+  and no `assigns` gives `Cannot analyze footprint of function memcpy: no assigns clause. ...` and
+  no instance; an `assigns *p;` without `\from` under `\reading` gives `Cannot fully analyze read
+  footprint of function ...: no \from part in some assigns clauses.` Neither carried a warning
+  category or call-site location before the patch. The printed host declaration of `memcpy` has no
+  specification at all.
+- **Plain `*p = 1;` instrumented guards.** In the E-ACSL instrumented C file for `-DOVERFLOW_PTR`
+  (`int out_i[4]; process(out_i + 10);` with `*p = 1;`), both `\aligned(p,4)` and `\valid_read(p)`
+  are emitted with `file = "<unknown>"` and `line = 0`; at run time `\valid_read(p)` aborts at
+  `<unknown>:0: Error: E-ACSL RTE failed`.
+- **The `memcpy` overflow does reach `auth_ok`.** With `--e-acsl-extra -e-acsl-no-rte-mem` the
+  unguarded instance is evaluated and fails as `auth_state/meta` at the property line: `out` sits
+  adjacent to `auth_ok` in memory. So the meta assertion is not wrong to fail; the request is about
+  which report a user gets and its location. `-e-acsl-rte 0` gives the same.
 - **`-meta-separate-annots`** does not change the order: the guard still fails first, now located
   in E-ACSL's temporary `.i` file.
 - **Without `-M`:** `--libc-replacements` aborts on the correct `memcpy(&auth_ok, ...)` with
@@ -103,14 +114,31 @@ Other observations from the same session (scratch runs, not in the reproducer):
   `WritesAny`. A prototype from the system headers has no behavior, so nothing runs and nothing
   is printed. The README's sentence "if `g` does not specify a memory footprint, it is
   **assumed** that it respects all related meta-properties" is honoured, silently.
+- In `reading_visitor#passthrough_from` (line 781), `FromAny` warns with `~once:true`, also
+  without a warning category or call-site location.
 - `unknown-func` (aborts by default) is about names in `\targets` (`meta_deduce.ml`, the target
   computation), not about callees; it does not cover this.
-- Part 2: E-ACSL evaluates `\separated` only on valid operands and adds a `\valid_read` guard per
-  operand; the guard is located where its term is. In the `-L` build's instrumented file the
-  guard of `&auth_ok` (written in the property) has the property's line, and the guard of the
-  range built from `memcpy`'s `assigns` (`writing_instance`, `addr_of_tlval`) has
-  `file = "<unknown>"`, `line = 0`. Not checked in the OCaml: which constructor drops the
-  location.
+- Part 2: E-ACSL evaluates `\separated` only on valid operands and adds a `\valid_read` (and
+  `\aligned`) guard per operand; the guard takes its location from the term it guards. In the `-L`
+  build's instrumented file the guard of `&auth_ok` (written in the property) has the property's
+  line, while the guard of the `\written` term has `file = "<unknown>"`, `line = 0` — both for
+  `memcpy`'s `assigns` range and for an ordinary `*p = 1;` write. Verified in `meta_annotate.ml`
+  and Frama-C 34.0's `logic_utils.ml` / `logic_const.ml`:
+  - `addr_of_tlval` (`meta_annotate.ml:487-506`, called for `\written`, `\lhost_written`, `\read`,
+    `\lhost_read`, and `\called` at lines 515, 634-635, and 723-724) calls
+    `Logic_utils.mk_logic_AddrOf` (and in the bitfield branch `Logic_utils.mk_cast`,
+    `Logic_const.term`, and `Logic_const.tinteger`) without passing `~loc`.
+  - `writing_instance` (`meta_annotate.ml:640`) and `reading_instance` (`meta_annotate.ml:729`)
+    also call `Logic_const.term (TLval ...)` without `~loc` (for `*\written` and `*\read`).
+  - Both `Logic_utils.mk_logic_AddrOf` (`logic_utils.ml:197`) and `Logic_const.term`
+    (`logic_const.ml:152`) default `~loc` to `Kernel.gen_loc` (`Fileloc.generated "kernel"`, no
+    source file or line, printed by E-ACSL as `<unknown>:0`). Even in `mk_logic_AddrOf`'s
+    `TMem e, TNoOffset` branch (`*p`), it executes `Logic_const.term ~loc e.term_node e.term_type`,
+    discarding `e.term_loc` and replacing it with `Kernel.gen_loc`.
+  - Therefore every `\written`, `\read`, and `\called` term — whether from a plain C assignment or
+    read (`Logic_utils.lval_to_term_lval` at lines 685, 691, 766) or from a callee's
+    `assigns`/`\from` contract (`external_assigns` / `passthrough_from`) — loses its location,
+    unlike `\func` at line 371 which passes `~loc` (`Property.location ump.ump_ip`).
 
 ## Tracker choice: one issue, on `pub/meta`
 
@@ -124,27 +152,45 @@ instrumentation" mode is a design question; it is asked at the end of the MetAcs
 offer to file it on `pub/frama-c` if the maintainers prefer. A separate `[e-acsl-gcc]` issue with
 no defect to show would get a one-line answer pointing at `-L`.
 
-Title tag: `[MetAcsl]`, as 47 and 48; issue 45, also for `pub/meta`, has no tag. They should be
-aligned before filing.
+Title convention: no `[MetAcsl]` prefix in the issue title, matching `pub/meta` tracker issues #1,
+#3, #4, and draft 45.
 
 ## Patch
 
 [`./patches/49-metacsl-eacsl-libc-instances.patch`](./patches/49-metacsl-eacsl-libc-instances.patch),
 author `Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>`, on `pub/meta` `master`
-`4f43801390` (`git apply --check` clean; after 47's and 48's patches, `git am --3way` merges
-`meta_annotate.ml` cleanly and conflicts on one line of `CHANGELOG.md` only, where 47 adds its
-own entry at the same place): `inspect_contract` warns when the callee has no
-behavior; new warning category `no-footprint` for both warnings; README and CHANGELOG sentences;
-new test `tests/meta/no_footprint.i` with oracles for the default and `fold` configurations
-(generated with the test's command line, since `make tests` does not run in the image). The MR
-text lists what was run: the `OPT` lines of `tests/meta` (21 runs, full output) and of
-`tests/meta-wp` and `tests/meta-deduce` (15 runs, `[meta]` lines) are unchanged. Not run: `make
-tests`, the `fold` configuration of the existing tests, `ocp-indent`, MetAcsl's CI. Subject
-prefix `[meta]`, as 47's patch.
+`4f43801390` (`git apply --check` clean on pristine `4f43801390`):
 
-No patch for parts 2 and 3 of the proposal: the location fix needs the right place in
-`writing_instance` / `addr_of_tlval` and a decision on which location (call or property) the
-maintainers want, and the guarded-instance option is a design choice (it moves an overflow that
+- `meta_options.ml` / `.mli`: new warning category `no-footprint` (default status: warning).
+- `meta_annotate.ml`: `inspect_contract` warns when the callee has no behavior, sharing a
+  `no_footprint` helper with `WritesAny` using `~once:true ~loc:(Cil_datatype.Stmt.loc stmt)
+  ~wkey:Meta_options.no_footprint_wkey`; `reading_visitor#passthrough_from` adds
+  `~loc:(Cil_datatype.Stmt.loc stmt) ~wkey:Meta_options.no_footprint_wkey` to its existing
+  `FromAny` warning (keeping `~once:true`).
+- `README.md` (`\writing` and `\reading` contexts) and `CHANGELOG.md`: document `no-footprint` and
+  call-site locations.
+- New test `tests/meta/no_footprint.i` covering both `\writing` (`f_write`) and `\reading`
+  (`f_read`) across four callees (`copy` with no specification, `touch` with `WritesAny`,
+  `assign_only` with `assigns *p;` / `FromAny`, and `copy_spec` with `assigns ... \from ...`), run
+  with default status (`.0`) and `-meta-warn-key no-footprint=inactive` (`.1`), with all four
+  oracles (`oracle/` and `oracle_fold/`) generated with `frama-c -check`.
+
+Verified in throwaway containers of `framac-analysis:latest` (with the 1-line
+`PLpointer_comparable` removal in `meta_parse.ml` inside the container build only, not in the
+patch): all 76 `frama-c-ptests`-generated commands across `tests/meta` (21 existing + 2 new,
+default and `fold`), `tests/meta-wp` (12 default + 12 `fold`), and `tests/meta-deduce` (3 default
++ 3 `fold`) were run before and after the patch. Zero unintended diffs across all 72 existing
+runs (all 42 existing `tests/meta` default and `fold` runs match their committed upstream oracles
+byte-for-byte, and zero existing tests emit any `no-footprint` warning). All four `no_footprint.i`
+runs fail before the patch and match their oracles after; extra checks verified `no-footprint=error`
+(exit 1), `no-footprint=once` (single global warning), and multi-clause `FromAny` across two call
+sites (one warning per call site). Not run: `dune build @ptests` directly (the image strips Frama-C
+doc/man files), SWI-Prolog deduction checks, `ocp-indent`, MetAcsl's CI. Subject prefix `[meta]`,
+as 47's patch.
+
+No patch for parts 2 and 3 of the proposal: the location fix needs a decision on which location
+(statement or property) the maintainers want in `addr_of_tlval` and `writing_instance` /
+`reading_instance`, and the guarded-instance option is a design choice (it moves an overflow that
 hits the protected object from the property to the memory check).
 
 ## Duplicate check (2026-11-20)

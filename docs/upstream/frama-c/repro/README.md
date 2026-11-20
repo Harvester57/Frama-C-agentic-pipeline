@@ -54,10 +54,11 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   in a `\postcond` property. It has only a "before" output: no patched build exists.
   47, 48 and 49 are about MetAcsl too and need `framac-analysis:latest`. Each prints one line per
   case and exits 1 while the defect is present. 47 runs three labels (`Old` through a labelled
-  logic function, `\old`, `Pre`) through a kernel reparse, WP and E-ACSL; 48 compares a folded and
-  an unfolded instance in `-report` and in an `e-acsl-gcc` binary; 49 compares the Frama-C libc
-  with the system headers and runs eight `e-acsl-gcc` binaries (needs gcc). Their "after" outputs
-  were taken with a patched MetAcsl built in a throwaway container of the same image.
+  logic function, `\old`, `Pre`) through a kernel reparse, WP and E-ACSL (`Here` under `After` is
+  covered in the patch's test); 48 compares a folded and an unfolded instance in `-report` and in
+  an `e-acsl-gcc` binary; 49 compares the Frama-C libc with the system headers and runs nine
+  `e-acsl-gcc` binaries (including a plain `*p = 1` out-of-bounds write; needs gcc). Their "after"
+  outputs were taken with a patched MetAcsl built in a throwaway container of the same image.
 - Patched images `framac-master-audit:3dff90f-p28` to `-p31` held `master` with one patch each
   (the "after" runs of 28 to 31). In the master image, install a rebuilt tree with
   `dune install --release --prefix /home/opam/.opam/5.5` (plain `dune install` fails with
