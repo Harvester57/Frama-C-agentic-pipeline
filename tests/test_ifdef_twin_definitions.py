@@ -198,7 +198,33 @@ def test_a_trust_boundary_violation_on_the_second_twin_of_an_entry_is_refused() 
     errors = workspace_overlay.entry_trust_boundary_errors(
         {"entry_fn": "f"}, "x.c", agent, agent, TWIN_SOURCE, TWIN_SOURCE
     )
-    assert errors and "n" in errors[0]
+    assert errors == [
+        "x.c: f: requires n <= 64; constrains attacker-controlled n (an untrusted_surface entry may only state memory shape)"
+    ]
+    clean = _annotate(TWIN_SOURCE, TWIN_SECOND, "ensures \\result == n + 2;")
+    assert (
+        workspace_overlay.entry_trust_boundary_errors({"entry_fn": "f"}, "x.c", clean, clean, TWIN_SOURCE, TWIN_SOURCE)
+        == []
+    )
+
+
+# One definition whose header or parameters are split across the arms is still one declaration, not twins.
+SPLIT_HEADER = (
+    "#ifdef A\nint g(int a) {\n#else\nint g(long a) {\n#endif\n    return 0;\n}\nint tail(void) { return 1; }\n"
+)
+SPLIT_PARAMS = "int g(int a,\n#ifdef A\n      int b)\n#else\n      long b)\n#endif\n{\n    return a;\n}\nint tail(void) { return 1; }\n"
+
+
+@pytest.mark.parametrize("source", [SPLIT_HEADER, SPLIT_PARAMS], ids=["split_header", "split_params"])
+@pytest.mark.parametrize("contract_only", [False, True])
+def test_a_definition_split_across_arms_stays_one_declaration(source: str, contract_only: bool) -> None:
+    decls = contract_declaration_spans(source, "g")
+    assert [d.kind for d in decls] == ["definition"]
+    agent = source[: decls[0].span.start_byte] + "/*@ assigns \\nothing; */\n" + source[decls[0].span.start_byte :]
+    assert splice_prover_changes(source, agent, source, "g", path="x.c", contract_only=contract_only) == agent
+    outside = _annotate(agent, "\nint tail", "ensures \\result == 1;")
+    with pytest.raises(ScopeViolationError, match="outside assigned function 'g'"):
+        splice_prover_changes(source, outside, source, "g", path="x.c")
 
 
 # ---------------------------------------------------------------------------
