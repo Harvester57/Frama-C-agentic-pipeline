@@ -75,21 +75,35 @@ updates `tests/libc/oracle/string_h.0.res.oracle` (an unknown check and two unkn
 become valid; two line numbers move). `fc_libc.0.res.oracle` does not change. It was run with
 `revalidate.sh package 44` in a container of `framac-master-audit:b80fcac`.
 
-**`47-*`, `48-*` and `49-*` (2026-11-20, not filed)** are patches for MetAcsl (`pub/meta`), not
-`pub/frama-c`, one commit each on `pub/meta` `master` `4f43801390`, authored with the GitLab
+**`45-*`, `47-*`, `48-*` and `49-*` (2026-11-20, not filed)** are patches for MetAcsl (`pub/meta`),
+not `pub/frama-c`, one commit each on `pub/meta` `master` `4f43801390`, authored with the GitLab
 noreply address. Apply them to a clone of `pub/meta` with `git am --keep-non-patch` (subjects
-`[meta]` and `[fold]`). 47 maps the callee's `Old`/`Pre`/`Here` labels to MetAcsl's `Before` in
-`meta_annotate.ml` and adds `tests/meta/callee_labels.c` with four oracles; 48 passes the
-property's location to folded calls and to the `external_assigns`/`passthrough_from` wrappers,
-adds a `CHANGELOG.md` entry and `tests/meta/fold_location.c` (two oracles), and updates
-`tests/meta-wp/oracle_fold/typing.0.res.oracle`; 49 puts all three missing-footprint warnings
-(unspecified callee, `WritesAny` and `\reading`'s `FromAny`) under warning category `no-footprint`
-with call-site locations (`~loc`) and adds `tests/meta/no_footprint.i` covering `\writing` and
-`\reading` (four oracles). Stacked in order 47, 48, 49 with `git am --keep-non-patch --3way`,
-`meta_annotate.ml` merges cleanly (only the `# Version dev` line of `CHANGELOG.md` conflicts), all
-three reproducers pass and all ten new oracles match byte-for-byte. They were built and both
-`tests/meta` and `tests/meta-wp` (default and `fold` configurations) were run in throwaway
+`[meta]` and `[fold]`):
+
+- **45:** threads `?(with_result=false)` from `process_property` (true only for `Postcond`) to
+  `process_meta_termassoc` in `meta_parse.ml`, adding `\result` via `Logic_typing.add_result` with
+  `Kernel_function.get_return_type` (plus `Ast_types.C.add_ghost` for ghost functions, guarded on
+  `Ast_types.C.is_fun` for `Meta_deduce.dummy_unpack`), documents `\result` in `README.md` and
+  `CHANGELOG.md`, and adds `tests/meta/postcond_result.c` with ten oracles (`oracle/` and
+  `oracle_fold/`, `.0` through `.4`).
+- **47:** maps the callee's `Old`/`Pre`/`Here` labels to MetAcsl's `Before` in `meta_annotate.ml`
+  and adds `tests/meta/callee_labels.c` with four oracles.
+- **48:** passes the property's location to folded calls and to the
+  `external_assigns`/`passthrough_from` wrappers, adds a `CHANGELOG.md` entry and
+  `tests/meta/fold_location.c` (two oracles), and updates
+  `tests/meta-wp/oracle_fold/typing.0.res.oracle`.
+- **49:** puts all three missing-footprint warnings (unspecified callee, `WritesAny` and
+  `\reading`'s `FromAny`) under warning category `no-footprint` with call-site locations (`~loc`),
+  documents it in `README.md` and `CHANGELOG.md`, and adds `tests/meta/no_footprint.i` covering
+  `\writing` and `\reading` (four oracles).
+
+Stacked with `git am --keep-non-patch --3way` (tested both `45, 47, 48, 49` and `47, 48, 49, 45`),
+`meta_parse.ml`, `meta_annotate.ml`, `README.md` and all tests merge cleanly (only the
+`# Version dev` line of `CHANGELOG.md` conflicts), all four reproducers exit 0, and all 31 + 31
+`tests/meta` and 12 + 12 `tests/meta-wp` runs match their oracles byte-for-byte. They were built
+and both `tests/meta` and `tests/meta-wp` (default and `fold` configurations) were run in throwaway
 containers of `framac-analysis:latest` (34.0~beta), with `meta_parse.ml`'s `PLpointer_comparable`
 line removed because 34.0~beta lacks it; that removal is not in the patches. Lint, the header
-check and the `meta-deduce` deduction checks (SWI-Prolog absent) were not run. The oracles of 47
-and 49 contain lines ending in spaces, as Frama-C prints them; `git am` warns about them.
+check and the `meta-deduce` Prolog proofs (SWI-Prolog absent) were not run. The oracles of 45, 47
+and 49 contain trailing spaces or blank lines at EOF as Frama-C prints them; `git am` warns about
+them.

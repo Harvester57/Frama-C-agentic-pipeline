@@ -62,8 +62,8 @@ as it does for a predicate without `\result` (`auth_ok == \old(auth_ok) || auth_
 
 - Frama-C installation mode: opam (Docker image)
 - Frama-C version: 34.0~beta (Selenium), with MetAcsl 0.12~beta
-- MetAcsl `master` (`4d5d0e91`): not run. Its `meta_parse.ml` is the same file as the installed
-  one (same git blob, `1dd7f375`), and that file is where the typing environment is built.
+- MetAcsl `master` (`4f43801390`): reproduced (built against the installed 34.0~beta kernel, minus
+  `master`'s one `PLpointer_comparable` case in `meta_parse.ml`).
 - OS name: Debian GNU/Linux
 - OS version: 13 (trixie)
 
@@ -75,14 +75,20 @@ as it does for a predicate without `\result` (`auth_ok == \old(auth_ok) || auth_
   the environment of every property from `append_here_label`, `append_pre_label` and
   `append_old_and_post_labels`, whatever the context, and nothing calls
   `Logic_typing.add_result`.
-- **A possible change.** Pass "this property is a `\postcond`" from the parsing of the property
-  down to `process_meta_termassoc` and, in that case only, extend the environment with
-  `Logic_typing.add_result env (Ctype <return type of the target>)`. `add_result` leaves the
-  environment unchanged for a function that returns `void`, so `\result` would stay an error
-  there. I would leave `\conditional_invariant` out, since its predicate is also used as an
-  `assumes`, where `\result` has no meaning. I wrote this as a patch against `meta_parse.ml`
-  but have not built it, so I am not sending a merge request with this issue. I can prepare one
-  if the change is welcome.
+- **A possible change.** Pass `~with_result:(mp_context = Postcond)` from `process_property`
+  through `delay_prop` to `process_meta_termassoc` and, when set and
+  `Ast_types.C.is_fun (Kernel_function.get_type kf)` holds (guarding against
+  `Cil_datatype.Kf.dummy` used by `Meta_deduce.dummy_unpack`, whose type is `Typ.dummy`), extend
+  the environment with `Logic_typing.add_result env (Ctype rt)` where `rt` is
+  `Kernel_function.get_return_type kf` (with `Ast_types.C.add_ghost` when
+  `Kernel_function.is_ghost kf`, matching `Logic_typing.funspec` and `Filecheck.check_ast`).
+  `add_result` leaves the environment unchanged for a function that returns `void`, so `\result`
+  stays an error there (and collapses to `\true` / `\false` under `\tguard` / `\fguard`).
+  `\conditional_invariant` and all other non-`\postcond` contexts stay out, since their predicates
+  are placed in clauses or assertions where `\result` has no meaning. I built and validated this
+  change on `master` `4f43801390` (reproducer, edge cases, `tests/meta` and `tests/meta-wp` in
+  both default and `fold` configurations); I will send it as a merge request with a regression
+  test.
 - **`\tguard` is not a way around it.** With the predicate under `\tguard`, the typing error
   makes the property `\true`, as the README says it does:
 

@@ -233,22 +233,38 @@ This section is newer than the ones below and wins where they differ.
     [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md).
   - **Not done:** no branch pushed, no issue of its own, no merge request. The MR text holds
     `#<issue>`.
-- **Drafted, not filed: 45** (2026-11-18): MetAcsl refuses `\result` in a `\postcond` property
-  (`\result meaningless`). It is a report for the MetAcsl tracker,
-  [`pub/meta`](https://git.frama-c.com/pub/meta/-/issues) (project id 869), kept in this folder
-  because its drafts follow the same layout. Found by package R of
-  `docs/plans/metacsl-exploitation-plan.md` (on the branch `metacsl-integ` until it is merged).
-  - **Package:** issue text and a reproducer (2 cases refused, on `34.0~beta` with MetAcsl
-    0.12~beta; not run on `master`, where `meta_parse.ml` is the same file). No MR text and no
-    patch file: the draft patch in
-    [`./frama-c-metacsl-result-in-postcond.md`](./frama-c-metacsl-result-in-postcond.md) was
-    never built.
+- **Drafted, not filed: 45** (2026-11-18; patch and MR built and validated on 2026-11-20): MetAcsl
+  refuses `\result` in a `\postcond` property (`\result meaningless`). It is a report for the
+  MetAcsl tracker, [`pub/meta`](https://git.frama-c.com/pub/meta/-/issues) (project id 869), kept
+  in this folder because its drafts follow the same layout. Found by package R of
+  [`../../plans/metacsl-exploitation-plan.md`](../../plans/metacsl-exploitation-plan.md).
+  - **Package:** analysis draft
+    ([`./frama-c-metacsl-result-in-postcond.md`](./frama-c-metacsl-result-in-postcond.md)), issue
+    text, MR text (holding `#<issue>`), `git format-patch` file on `pub/meta` `master`
+    `4f43801390`, and reproducer (2 cases refused before on `34.0~beta` / 0.12~beta and unpatched
+    `master` `4f43801390`; `plain: 3 / 3 proved`, `plain_violated: 2 / 3 proved`,
+    `guarded_violated: 2 / 3 proved` after).
+  - **Patch and validation:** threads `?(with_result=false)` from `process_property` (true only for
+    `Postcond`) to `process_meta_termassoc` in `meta_parse.ml`, calling `Logic_typing.add_result`
+    with `Kernel_function.get_return_type kf` (plus `Ast_types.C.add_ghost` for ghost functions,
+    guarded on `Ast_types.C.is_fun (Kernel_function.get_type kf)` so `Meta_deduce.dummy_unpack`
+    with `Cil_datatype.Kf.dummy` does not fatal in `getReturnType`, and without
+    `remove_qualifiers_deep` so `const int *` keeps its pointed-to `const` and passes `-check` and
+    `\assert_type`), updates `README.md` and `CHANGELOG.md`, and adds `tests/meta/postcond_result.c`
+    (10 oracles across `oracle/` and `oracle_fold/`). Built in a throwaway `framac-analysis:latest`
+    container (with only `meta_parse.ml`'s post-34.0~beta `PLpointer_comparable` line removed for
+    the container build; not in the patch); `tests/meta` (26 default + 26 fold) and `tests/meta-wp`
+    (12 default + 12 fold) pass with 0 diffs against unpatched `master` on all 66 existing runs,
+    and `tests/meta-deduce` has 0 diffs. Stacks cleanly with 47, 48 and 49 via
+    `git am --keep-non-patch --3way` in either order (`45, 47, 48, 49` or `47, 48, 49, 45`; only
+    `CHANGELOG.md`'s `# Version dev` conflicts; stacked build passes 31/31 `tests/meta`, 12/12
+    `tests/meta-wp` in both configurations and all four reproducers exit 0).
   - **Listed in #2832** since 2026-11-18, on the owner's request ("Draft upstream report, but
     don't fill it, update main discussion"): a dated note and a row `45` in a new MetAcsl table
-    at the end of the annex. The stored description was read back and is identical to
-    [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md).
+    at the end of the annex. Not edited on 2026-11-20.
   - **Not done:** no issue on `pub/meta`, no branch, no merge request.
-    `tools/upstream_audit/file_upstream.py` files on `pub/frama-c` only.
+    [`../../../tools/upstream_audit/file_upstream.py`](../../../tools/upstream_audit/file_upstream.py)
+    files on `pub/frama-c` only.
 - **Drafted, not filed: 46** (2026-11-19). The libc's `<sched.h>` has no `cpu_set_t`, no `CPU_*`
   macros and no `sched_setaffinity`/`sched_getaffinity` under `_GNU_SOURCE`. This stopped
   nginx-1.31.9 run-1 at Phase 0 (`no_unit_parsed`).
@@ -577,6 +593,7 @@ All paths below are relative to this folder.
 | 42 | WP | Hexadecimal floating-point literals not read: `DBL_MAX` bound dropped, lemma stops WP, and `0x1.8p1f` read as 0 under `-wp-model +real` (**soundness**); `f32`/`f64` suffixes rejected | [draft](./frama-c-wp-hexadecimal-float-literals.md) | [issue](./filing/42-wp-hexadecimal-float-literals-issue.md), filed [#2831](https://git.frama-c.com/pub/frama-c/-/work_items/2831) | [MR](./filing/42-wp-hexadecimal-float-literals-mr.md), opened [!59](https://git.frama-c.com/pub/frama-c/-/merge_requests/59) | [sh](./repro/42-wp-hexadecimal-float-literals.sh) | [validated](./patches/42-wp-hexadecimal-float-literals.patch) on `b80fcac74f` (one function and a test, 6 files) |
 | 43 | E-ACSL | Real constants that are not exactly a `double`: unexpected error with an exponent or in hexadecimal (`1e-9`), and a `long double` one (`0.1L`) is 0 at run time | [draft](./frama-c-eacsl-real-constant-notation.md) | [issue](./filing/43-eacsl-real-constant-notation-issue.md), **not filed** | [MR](./filing/43-eacsl-real-constant-notation-mr.md), **not opened** | [sh](./repro/43-eacsl-real-constant-notation.sh) | [validated](./patches/43-eacsl-real-constant-notation.patch) on `b80fcac74f` (one function and a test, 5 files) |
 | 44 | Libc | `strlcat`: the result is stated against `dest` after the call, and `assigns` covers a byte past `n`; Eva gives a wrong result without an alarm, WP proves a false postcondition (**soundness**) | [draft](./frama-c-libc-strlcat-contract.md) | [issue](./filing/44-libc-strlcat-contract-issue.md), **not filed** | [MR](./filing/44-libc-strlcat-contract-mr.md), **not opened** | [sh](./repro/44-libc-strlcat-contract.sh) | [validated](./patches/44-libc-strlcat-contract.patch) on `b80fcac74f` (four clauses and a test, 4 files) |
+| 45 | MetAcsl | `\result` is refused in a `\postcond` property (`\result meaningless`); under `\tguard` it collapses to `\true` | [draft](./frama-c-metacsl-result-in-postcond.md) | [issue](./filing/45-metacsl-result-in-postcond-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/45-metacsl-result-in-postcond-mr.md), **not opened** | [sh](./repro/45-metacsl-result-in-postcond.sh) | [built](./patches/45-metacsl-result-in-postcond.patch) on pub/meta `4f43801390` (`meta_parse.ml`, doc and a test) |
 | 47 | MetAcsl | Callee `Old`/`Pre`/`Here` labels copied into `\written`/`\read` instances at a call: `Old` aborts E-ACSL and WP, `Pre` and `Here` (under `After`) let WP prove false properties (**soundness**) | [draft](./frama-c-metacsl-callee-old-label-in-written.md) | [issue](./filing/47-metacsl-callee-old-label-in-written-issue.md), **not filed** (pub/meta) | [MR](./filing/47-metacsl-callee-old-label-in-written-mr.md), **not opened** | [sh](./repro/47-metacsl-callee-old-label-in-written.sh) | [built](./patches/47-metacsl-callee-old-label-in-written.patch) on pub/meta `4f43801390` (one visitor and a test) |
 | 48 | MetAcsl | `-meta-fold`: folded instances have no location (`<unknown>:0` under E-ACSL) | [draft](./frama-c-metacsl-fold-annotation-location.md) | [issue](./filing/48-metacsl-fold-annotation-location-issue.md), **not filed** (pub/meta) | [MR](./filing/48-metacsl-fold-annotation-location-mr.md), **not opened** | [sh](./repro/48-metacsl-fold-annotation-location.sh) | [built](./patches/48-metacsl-fold-annotation-location.patch) on pub/meta `4f43801390` (locations passed, new test + one oracle) |
 | 49 | MetAcsl | Feature: a call to a function without specification gets no `\writing`/`\reading` instance and no warning (libc under `e-acsl-gcc`); `\written`/`\read` terms lack locations (`<unknown>:0` E-ACSL guards) | [draft](./frama-c-metacsl-eacsl-libc-instances.md) | [issue](./filing/49-metacsl-eacsl-libc-instances-issue.md), **not filed** (pub/meta) | [MR](./filing/49-metacsl-eacsl-libc-instances-mr.md), **not opened** | [sh](./repro/49-metacsl-eacsl-libc-instances.sh) | [built](./patches/49-metacsl-eacsl-libc-instances.patch) on pub/meta `4f43801390` (warning only) |
@@ -676,7 +693,7 @@ points the maintainers may raise, and are no longer blocking. 41 and 42 were fil
 | 42 | Filed on 2026-11-18 as one issue for the three symptoms. Still open for the maintainers: the wrong proof under `-wp-model +real` on its own issue? A `plugins/wp/Changelog` entry? The patch has none, as 19's. |
 | 43 | File it? If so: one issue for the two symptoms (current), or the silent 0 of `0.1L` on its own? Report a suffixed constant as not yet supported (current), or give it the value of the target's `long double`? A `plugins/e-acsl/doc/Changelog` entry? The patch has none. |
 | 44 | File it? Decided on 2026-11-18: the patch also strengthens the `separation` precondition to `src+(0..strlen(src))` (measured: no oracle of `tests/libc` or of the E-ACSL suite changes with it; both texts say it can be dropped). Rename the check `imprecise` of `tests/libc/string_h.c`, which becomes valid? |
-| 45 | File it on `pub/meta`? If so: issue only (current), or build the draft patch first and send a merge request with it? |
+| 45 | File it on `pub/meta` (issue and validated MR are ready, still paused)? Stacks cleanly with 47 to 49 (only `CHANGELOG.md` conflicts). `file_upstream.py` knows project 780 only, so it is filed by hand. |
 | 47 to 49 | File them on `pub/meta` (issues and MRs)? 49 cites 47 and 48, so file those first and replace `#ISSUE-47` and `#ISSUE-48`. List them in #2832 as was done for 45? `file_upstream.py` knows project 780 only, so they are filed by hand. |
 | hunt | Which of the candidates of [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md) to turn into packages, and in which order? That document ranks them ("Order of criticity"); N1 (enumeration constants), L2 (`pclose`) and L1 (`void` objects under WP) come first. N1 reverts a deliberate upstream change, so it needs the argument from C11 and gcc. |
 

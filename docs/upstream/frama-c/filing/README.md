@@ -29,9 +29,11 @@ The texts of 43 (E-ACSL real constants, drafted on 2026-11-18) are **not filed**
 text still holds `#<issue>`. The same goes for the texts of 44 (the contract of `strlcat`,
 drafted the same day).
 
-45 (MetAcsl refuses `\result` in a `\postcond` property, drafted on 2026-11-18) is **not filed**
-and has an issue text only. It is written for the MetAcsl tracker,
-[`pub/meta`](https://git.frama-c.com/pub/meta/-/issues), so its title carries no plug-in tag.
+45 (MetAcsl refuses `\result` in a `\postcond` property; issue drafted on 2026-11-18, MR text
+added on 2026-11-20) is **not filed**. Like 47, 48 and 49, it is written for the MetAcsl tracker,
+[`pub/meta`](https://git.frama-c.com/pub/meta/-/issues), so its issue title carries no plug-in tag,
+and its MR text has no CONTRIBUTING/CLA checkboxes (`pub/meta` has no merge-request template) and
+holds `#<issue>`.
 
 47, 48 and 49 (MetAcsl: callee labels in `\written`/`\read` instances, folded instances without
 location, no instance and no warning for a call to a function without specification; drafted on

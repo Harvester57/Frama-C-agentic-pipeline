@@ -5,13 +5,11 @@
 # proved. This is a report for the MetAcsl tracker (pub/meta), not pub/frama-c.
 #
 # Image: framac-analysis:latest (Frama-C 34.0~beta, MetAcsl 0.12~beta). Needs
-# Alt-Ergo. There is no patched build: the "after" block below is what the
-# script expects, not an output that was observed.
-# Command, from this directory:
+# Alt-Ergo. Command, from this directory:
 #   docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:latest \
 #     45-metacsl-result-in-postcond.sh
 #
-# Output before (34.0~beta, MetAcsl 0.12~beta):
+# Output before (34.0~beta, MetAcsl 0.12~beta and unpatched master 4f43801390):
 #   34.0~beta (Selenium)
 #   plain: refused: \result meaningless
 #   plain_violated: refused: \result meaningless
@@ -20,9 +18,16 @@
 #   by_hand_violated: 2 / 3 proved
 #   RESULT: \result is refused in \postcond (2 of 2 cases)
 #
-# Expected once \result is accepted (not observed):
+# Output after, observed with MetAcsl master 4f43801390 + the patch, built
+# against the installed 34.0~beta kernel (master minus its one
+# PLpointer_comparable case, a constructor 34.0~beta does not have):
+#   34.0~beta (Selenium)
 #   plain: 3 / 3 proved
 #   plain_violated: 2 / 3 proved
+#   guarded_violated: 2 / 3 proved
+#   by_hand: 3 / 3 proved
+#   by_hand_violated: 2 / 3 proved
+#   RESULT: \result is accepted in \postcond
 #
 # guarded_violated is printed for information and does not count: \tguard is
 # documented to give \true when the predicate does not type.

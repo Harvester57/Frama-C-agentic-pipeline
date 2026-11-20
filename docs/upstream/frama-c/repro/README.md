@@ -51,7 +51,8 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   `framac-master-audit:b80fcac`; `34.0~beta` gives the same "before" lines.
   45 is about the MetAcsl plug-in: it needs `framac-analysis:latest` (the audit image's MetAcsl
   does not load) and Alt-Ergo, prints one line per case, and exits 1 while `\result` is refused
-  in a `\postcond` property. It has only a "before" output: no patched build exists.
+  in a `\postcond` property (0 once fixed). Its "after" output was taken with a patched MetAcsl
+  built in a throwaway container of the same image, as for 47 to 49.
   47, 48 and 49 are about MetAcsl too and need `framac-analysis:latest`. Each prints one line per
   case and exits 1 while the defect is present. 47 runs three labels (`Old` through a labelled
   logic function, `\old`, `Pre`) through a kernel reparse, WP and E-ACSL (`Here` under `After` is

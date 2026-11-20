@@ -1,0 +1,586 @@
+From 17afeff3238c76592239b962f5ece4a22a100439 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Fri, 20 Nov 2026 09:28:25 +0000
+Subject: [PATCH] [meta] allow \result in \postcond properties
+
+A meta-property with \context(\postcond) is translated into an ensures
+clause of each target function, but process_meta_termassoc in
+meta_parse.ml built the logic typing environment from append_here_label,
+append_pre_label and append_old_and_post_labels only, without calling
+Logic_typing.add_result. Any \postcond predicate mentioning \result was
+therefore rejected with "\result meaningless" (or collapsed to \true
+under \tguard).
+
+Thread an optional ?(with_result=false) flag from process_property
+(enabled only when mp_context = Postcond) through delay_prop to
+process_meta_termassoc. When set, and when the kernel function has a
+function type (guarding against Cil_datatype.Kf.dummy used by
+Meta_deduce.dummy_unpack, whose type is Typ.dummy rather than a TFun),
+extend the environment with Logic_typing.add_result on the function's
+return type (adding ghost when Kernel_function.is_ghost kf, matching
+Logic_typing.funspec and Filecheck.check_ast).
+
+- Non-void return types (scalars, top-level const, typedefs, pointers to
+  const, structs and ghost functions) pass AST integrity checking
+  (-check) and preserve pointed-to qualifiers and typedef names.
+- Void-returning targets remain refused with "\result meaningless"
+  because Logic_typing.add_result is a no-op on void (and collapse to
+  \true / \false under \tguard / \fguard).
+- All other contexts (\precond, \weak_invariant, \strong_invariant,
+  \conditional_invariant, \writing, \reading, \calling) remain refused.
+
+Add regression test tests/meta/postcond_result.c with its default and
+fold oracles, and document the behaviour in README.md and CHANGELOG.md.
+---
+ CHANGELOG.md                                  |   1 +
+ README.md                                     |   5 +-
+ meta_parse.ml                                 |  26 ++++-
+ .../meta/oracle/postcond_result.0.res.oracle  |  91 +++++++++++++++
+ .../meta/oracle/postcond_result.1.res.oracle  |   9 ++
+ .../meta/oracle/postcond_result.2.res.oracle  |   9 ++
+ .../meta/oracle/postcond_result.3.res.oracle  |   9 ++
+ .../meta/oracle/postcond_result.4.res.oracle  |  11 ++
+ .../oracle_fold/postcond_result.0.res.oracle  |  91 +++++++++++++++
+ .../oracle_fold/postcond_result.1.res.oracle  |   9 ++
+ .../oracle_fold/postcond_result.2.res.oracle  |   9 ++
+ .../oracle_fold/postcond_result.3.res.oracle  |   9 ++
+ .../oracle_fold/postcond_result.4.res.oracle  |   9 ++
+ tests/meta/postcond_result.c                  | 108 ++++++++++++++++++
+ 14 files changed, 390 insertions(+), 6 deletions(-)
+ create mode 100644 tests/meta/oracle/postcond_result.0.res.oracle
+ create mode 100644 tests/meta/oracle/postcond_result.1.res.oracle
+ create mode 100644 tests/meta/oracle/postcond_result.2.res.oracle
+ create mode 100644 tests/meta/oracle/postcond_result.3.res.oracle
+ create mode 100644 tests/meta/oracle/postcond_result.4.res.oracle
+ create mode 100644 tests/meta/oracle_fold/postcond_result.0.res.oracle
+ create mode 100644 tests/meta/oracle_fold/postcond_result.1.res.oracle
+ create mode 100644 tests/meta/oracle_fold/postcond_result.2.res.oracle
+ create mode 100644 tests/meta/oracle_fold/postcond_result.3.res.oracle
+ create mode 100644 tests/meta/oracle_fold/postcond_result.4.res.oracle
+ create mode 100644 tests/meta/postcond_result.c
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f09d668..9a0af43 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,7 @@
+ # Version dev
+ 
+ - options `-meta-fold` and `-meta-quantify-range` to obtain instances that are better suited to E-ACSL instrumentation
++- allow `\result` in `\postcond` meta-properties (for non-`void` target functions)
+ 
+ # Version 0.11
+ 
+diff --git a/README.md b/README.md
+index b93d3d0..3902fd4 100644
+--- a/README.md
++++ b/README.md
+@@ -137,7 +137,10 @@ hold. It can be one of the following :
+ - `\precond` : the property `P` is a precondition of the target function and it
+     must hold at each of its callsites.
+ - `\postcond` : the property `P` holds at the end of the target function for
+-    every initial state satisfying the preconditions of the function.
++    every initial state satisfying the preconditions of the function. In this
++    context, `P` can refer to `\result` when the target function returns a
++    non-`void` value (for `void` targets, `\result` triggers a typing error and
++    can be guarded with `\tguard` or `\fguard`).
+ - `\weak_invariant` : the property `P` is guaranteed to be verified at the
+   beginning and end of the target function.
+ - `\strong_invariant` : the property `P` must hold at every point of the target
+diff --git a/meta_parse.ml b/meta_parse.ml
+index 7740483..d5d0da7 100644
+--- a/meta_parse.ml
++++ b/meta_parse.ml
+@@ -177,7 +177,7 @@ let meta_type_term termassoc quantifiers kf loc orig_ctxt meta_ctxt env expr =
+ (* Given an association table, combine the previous functions to type
+  * a full custom predicate
+  *)
+-let process_meta_termassoc typing_context loc kf termassoc expr =
++let process_meta_termassoc ?(with_result=false) typing_context loc kf termassoc expr =
+   let quantifiers = Str_Hashtbl.create 5 in
+   let meta_tc =
+     {typing_context with
+@@ -188,7 +188,21 @@ let process_meta_termassoc typing_context loc kf termassoc expr =
+   let fenv = Logic_typing.append_here_label meta_tc.pre_state in
+   let fenv2 = Logic_typing.append_pre_label fenv in
+   let fenv3 = Logic_typing.append_old_and_post_labels fenv2 in
+-  let pred = meta_tc.type_predicate meta_tc fenv3 expr in
++  (* \result only has a meaning in a \postcond property, which becomes an
++     ensures clause of [kf]. Guard on [is_fun] because [Meta_deduce.dummy_unpack]
++     types properties with [Cil_datatype.Kf.dummy], whose type is [Typ.dummy]
++     rather than a function type. [add_result] leaves the environment unchanged
++     when [kf] returns void. *)
++  let fenv4 =
++    if with_result && Ast_types.C.is_fun (Kernel_function.get_type kf) then
++      let rt = Kernel_function.get_return_type kf in
++      let rt =
++        if Kernel_function.is_ghost kf then Ast_types.C.add_ghost rt else rt
++      in
++      Logic_typing.add_result fenv3 (Ctype rt)
++    else fenv3
++  in
++  let pred = meta_tc.type_predicate meta_tc fenv4 expr in
+   Meta_bindings.after_parse meta_tc pred quantifiers
+ 
+ (* Check that a given lexpr refer to a C function and return its varinfo *)
+@@ -251,7 +265,7 @@ let typing_error hloc mp_name kf_name metavars (loc, error_msg) =
+     error_msg
+     metav_msg
+ 
+-let delay_prop tc name lexpr kf aslist =
++let delay_prop ?(with_result=false) tc name lexpr kf aslist =
+   let dfind_var ?label:_ var =
+     (* Tweak find_var so it can find things after link *)
+     try tc.find_var var
+@@ -274,7 +288,7 @@ let delay_prop tc name lexpr kf aslist =
+                             find_type = dft} in
+   let loc = lexpr.lexpr_loc in
+   delayed_tc.on_error
+-    (process_meta_termassoc delayed_tc loc kf aslist)
++    (process_meta_termassoc ~with_result delayed_tc loc kf aslist)
+     (typing_error loc name (Kernel_function.get_name kf) aslist)
+     lexpr
+ 
+@@ -544,7 +558,9 @@ let process_property tc loc = function
+     (* Execute macros in property *)
+     let expanded = expand_macros tc loc eproperty in
+     (* Delegate typing of property *)
+-    let mp_property = delay_prop tc mp_name expanded in
++    let mp_property =
++      delay_prop ~with_result:(mp_context = Postcond) tc mp_name expanded
++    in
+     let mp_used_meta_vars = extract_meta_vars expanded in
+     gathered_props :=
+       {mp_name; mp_target; mp_context; mp_proof_method; mp_translation;
+diff --git a/tests/meta/oracle/postcond_result.0.res.oracle b/tests/meta/oracle/postcond_result.0.res.oracle
+new file mode 100644
+index 0000000..a8f24de
+--- /dev/null
++++ b/tests/meta/oracle/postcond_result.0.res.oracle
+@@ -0,0 +1,91 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 6 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++typedef int ret_t;
++struct S {
++   int x ;
++   int const y ;
++};
++int auth_ok;
++int const g_cval = 2;
++/*@ ensures
++      unchanged_on_failure: meta: \result ≢ 0 ⇒ auth_ok ≡ \old(auth_ok);
++ */
++int login(int pw)
++{
++  int __retres;
++  if (pw != 42) {
++    __retres = -1;
++    goto return_label;
++  }
++  auth_ok = 1;
++  __retres = 0;
++  return_label: return __retres;
++}
++
++/*@ ensures res_zero_types: meta: \result ≡ 0;
++    ensures res_tguard: meta: \result ≡ 0;
++    ensures res_fguard: meta: \result ≡ 0;
++ */
++int get_const_int(void)
++{
++  int __retres;
++  __retres = 0;
++  return __retres;
++}
++
++/*@ ensures res_zero_types: meta: \result ≡ 0; */
++ret_t get_typedef(void)
++{
++  ret_t __retres;
++  __retres = 0;
++  return __retres;
++}
++
++/*@ ensures
++      res_ptr_const: meta:
++        \result ≢ \null ∧ \valid_read(\result) ∧ *\result ≡ 2;
++ */
++int const *get_ptr(void)
++{
++  int const *__retres;
++  __retres = & g_cval;
++  return __retres;
++}
++
++/*@ ensures res_struct: meta: \result.x ≡ 1 ∧ \result.y ≡ 2; */
++struct S get_struct(void)
++{
++  struct S s = {.x = 1, .y = 2};
++  return s;
++}
++
++/*@ ghost
++  /@ ensures res_zero_types: meta: \result ≡ 0; @/
++  int get_ghost(void)
++  {
++    int __retres;
++    __retres = 0;
++    return __retres;
++  }
++
++*/
++
++/*@ ensures res_tguard: meta: \true;
++    ensures res_fguard: meta: \false; */
++void do_void(void)
++{
++  auth_ok = 0;
++  return;
++}
++
++/*@ \meta::meta "unchanged_on_failure"; */
++/*@ \meta::meta "res_zero_types"; */
++/*@ \meta::meta "res_ptr_const"; */
++/*@ \meta::meta "res_struct"; */
++/*@ \meta::meta "res_tguard"; */
++/*@ \meta::meta "res_fguard";
++*/
++
+diff --git a/tests/meta/oracle/postcond_result.1.res.oracle b/tests/meta/oracle/postcond_result.1.res.oracle
+new file mode 100644
+index 0000000..d374289
+--- /dev/null
++++ b/tests/meta/oracle/postcond_result.1.res.oracle
+@@ -0,0 +1,9 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'void_err' (postcond_result.c:87)
++  Where:       in function 'do_void', at postcond_result.c:87
++  Why:         \result meaningless
++  Environment: there were no meta-variables.
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/oracle/postcond_result.2.res.oracle b/tests/meta/oracle/postcond_result.2.res.oracle
+new file mode 100644
+index 0000000..4399422
+--- /dev/null
++++ b/tests/meta/oracle/postcond_result.2.res.oracle
+@@ -0,0 +1,9 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'precond_err' (postcond_result.c:93)
++  Where:       in function 'login', at postcond_result.c:93
++  Why:         \result meaningless
++  Environment: there were no meta-variables.
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/oracle/postcond_result.3.res.oracle b/tests/meta/oracle/postcond_result.3.res.oracle
+new file mode 100644
+index 0000000..d776999
+--- /dev/null
++++ b/tests/meta/oracle/postcond_result.3.res.oracle
+@@ -0,0 +1,9 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'cond_inv_err' (postcond_result.c:100)
++  Where:       in function 'login', at postcond_result.c:100
++  Why:         \result meaningless
++  Environment: there were no meta-variables.
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/oracle/postcond_result.4.res.oracle b/tests/meta/oracle/postcond_result.4.res.oracle
+new file mode 100644
+index 0000000..42c5bee
+--- /dev/null
++++ b/tests/meta/oracle/postcond_result.4.res.oracle
+@@ -0,0 +1,11 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'writing_err' (postcond_result.c:106)
++  Where:       in function 'login', at postcond_result.c:106
++  Why:         \result meaningless
++  Environment: meta-variables were: (\func, &login)(\written, &auth_ok)
++  (\lhost_written, &auth_ok)
++  (\written__mem__, auth_ok)
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/oracle_fold/postcond_result.0.res.oracle b/tests/meta/oracle_fold/postcond_result.0.res.oracle
+new file mode 100644
+index 0000000..a8f24de
+--- /dev/null
++++ b/tests/meta/oracle_fold/postcond_result.0.res.oracle
+@@ -0,0 +1,91 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 6 properties
++[meta] Successful translation
++/* Generated by Frama-C */
++typedef int ret_t;
++struct S {
++   int x ;
++   int const y ;
++};
++int auth_ok;
++int const g_cval = 2;
++/*@ ensures
++      unchanged_on_failure: meta: \result ≢ 0 ⇒ auth_ok ≡ \old(auth_ok);
++ */
++int login(int pw)
++{
++  int __retres;
++  if (pw != 42) {
++    __retres = -1;
++    goto return_label;
++  }
++  auth_ok = 1;
++  __retres = 0;
++  return_label: return __retres;
++}
++
++/*@ ensures res_zero_types: meta: \result ≡ 0;
++    ensures res_tguard: meta: \result ≡ 0;
++    ensures res_fguard: meta: \result ≡ 0;
++ */
++int get_const_int(void)
++{
++  int __retres;
++  __retres = 0;
++  return __retres;
++}
++
++/*@ ensures res_zero_types: meta: \result ≡ 0; */
++ret_t get_typedef(void)
++{
++  ret_t __retres;
++  __retres = 0;
++  return __retres;
++}
++
++/*@ ensures
++      res_ptr_const: meta:
++        \result ≢ \null ∧ \valid_read(\result) ∧ *\result ≡ 2;
++ */
++int const *get_ptr(void)
++{
++  int const *__retres;
++  __retres = & g_cval;
++  return __retres;
++}
++
++/*@ ensures res_struct: meta: \result.x ≡ 1 ∧ \result.y ≡ 2; */
++struct S get_struct(void)
++{
++  struct S s = {.x = 1, .y = 2};
++  return s;
++}
++
++/*@ ghost
++  /@ ensures res_zero_types: meta: \result ≡ 0; @/
++  int get_ghost(void)
++  {
++    int __retres;
++    __retres = 0;
++    return __retres;
++  }
++
++*/
++
++/*@ ensures res_tguard: meta: \true;
++    ensures res_fguard: meta: \false; */
++void do_void(void)
++{
++  auth_ok = 0;
++  return;
++}
++
++/*@ \meta::meta "unchanged_on_failure"; */
++/*@ \meta::meta "res_zero_types"; */
++/*@ \meta::meta "res_ptr_const"; */
++/*@ \meta::meta "res_struct"; */
++/*@ \meta::meta "res_tguard"; */
++/*@ \meta::meta "res_fguard";
++*/
++
+diff --git a/tests/meta/oracle_fold/postcond_result.1.res.oracle b/tests/meta/oracle_fold/postcond_result.1.res.oracle
+new file mode 100644
+index 0000000..d374289
+--- /dev/null
++++ b/tests/meta/oracle_fold/postcond_result.1.res.oracle
+@@ -0,0 +1,9 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'void_err' (postcond_result.c:87)
++  Where:       in function 'do_void', at postcond_result.c:87
++  Why:         \result meaningless
++  Environment: there were no meta-variables.
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/oracle_fold/postcond_result.2.res.oracle b/tests/meta/oracle_fold/postcond_result.2.res.oracle
+new file mode 100644
+index 0000000..4399422
+--- /dev/null
++++ b/tests/meta/oracle_fold/postcond_result.2.res.oracle
+@@ -0,0 +1,9 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'precond_err' (postcond_result.c:93)
++  Where:       in function 'login', at postcond_result.c:93
++  Why:         \result meaningless
++  Environment: there were no meta-variables.
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/oracle_fold/postcond_result.3.res.oracle b/tests/meta/oracle_fold/postcond_result.3.res.oracle
+new file mode 100644
+index 0000000..d776999
+--- /dev/null
++++ b/tests/meta/oracle_fold/postcond_result.3.res.oracle
+@@ -0,0 +1,9 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'cond_inv_err' (postcond_result.c:100)
++  Where:       in function 'login', at postcond_result.c:100
++  Why:         \result meaningless
++  Environment: there were no meta-variables.
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/oracle_fold/postcond_result.4.res.oracle b/tests/meta/oracle_fold/postcond_result.4.res.oracle
+new file mode 100644
+index 0000000..6628d53
+--- /dev/null
++++ b/tests/meta/oracle_fold/postcond_result.4.res.oracle
+@@ -0,0 +1,9 @@
++[kernel] Parsing postcond_result.c (with preprocessing)
++[meta] Translation is enabled
++[meta] Will process 7 properties
++[meta] User Error: Error during the typing of a HILARE!
++  What:        the HILARE named 'writing_err' (postcond_result.c:106)
++  Where:       in function 'login', at postcond_result.c:106
++  Why:         \result meaningless
++  Environment: there were no meta-variables.
++[kernel] Plug-in meta aborted: invalid user input.
+diff --git a/tests/meta/postcond_result.c b/tests/meta/postcond_result.c
+new file mode 100644
+index 0000000..989a5e2
+--- /dev/null
++++ b/tests/meta/postcond_result.c
+@@ -0,0 +1,108 @@
++/* run.config*
++   OPT: @META@ @PRINT@
++   EXIT: 1
++   OPT: -cpp-extra-args="-DVOID_ERR" @META@ @PRINT@
++   OPT: -cpp-extra-args="-DPRECOND_ERR" @META@ @PRINT@
++   OPT: -cpp-extra-args="-DCOND_INV_ERR" @META@ @PRINT@
++   OPT: -cpp-extra-args="-DWRITING_ERR" @META@ @PRINT@
++*/
++
++/* Check that \result is accepted in \postcond properties for non-void targets
++   (including const-qualified, pointer-to-const, typedef, struct and ghost
++   return types), while staying refused on void targets (unless guarded) and
++   in every non-\postcond context. */
++
++typedef int ret_t;
++struct S {
++  int x;
++  const int y;
++};
++
++int auth_ok;
++const int g_cval = 2;
++
++int login(int pw) {
++  if (pw != 42)
++    return -1;
++  auth_ok = 1;
++  return 0;
++}
++
++const int get_const_int(void) {
++  return 0;
++}
++
++ret_t get_typedef(void) {
++  return 0;
++}
++
++const int *get_ptr(void) {
++  return &g_cval;
++}
++
++struct S get_struct(void) {
++  struct S s = {1, 2};
++  return s;
++}
++
++/*@ ghost
++  int get_ghost(void) {
++    return 0;
++  }
++*/
++
++void do_void(void) {
++  auth_ok = 0;
++}
++
++/*@ meta \prop, \name(unchanged_on_failure), \targets({login}),
++      \context(\postcond),
++      \result != 0 ==> auth_ok == \old(auth_ok);
++
++    meta \prop, \name(res_zero_types),
++      \targets({get_const_int, get_typedef, get_ghost}),
++      \context(\postcond),
++      \result == 0;
++
++    meta \prop, \name(res_ptr_const), \targets({get_ptr}),
++      \context(\postcond),
++      \assert_type((const int *) \result) && \result != \null &&
++      \valid_read(\result) && *\result == 2;
++
++    meta \prop, \name(res_struct), \targets({get_struct}),
++      \context(\postcond),
++      \result.x == 1 && \result.y == 2;
++
++    meta \prop, \name(res_tguard), \targets({do_void, get_const_int}),
++      \context(\postcond),
++      \tguard(\result == 0);
++
++    meta \prop, \name(res_fguard), \targets({do_void, get_const_int}),
++      \context(\postcond),
++      \fguard(\result == 0);
++*/
++
++#ifdef VOID_ERR
++/*@ meta \prop, \name(void_err), \targets({do_void}), \context(\postcond),
++      \result == 0;
++*/
++#endif
++
++#ifdef PRECOND_ERR
++/*@ meta \prop, \name(precond_err), \targets({login}), \context(\precond),
++      \result == 0;
++*/
++#endif
++
++#ifdef COND_INV_ERR
++/*@ meta \prop, \name(cond_inv_err), \targets({login}),
++      \context(\conditional_invariant),
++      \result == 0;
++*/
++#endif
++
++#ifdef WRITING_ERR
++/*@ meta \prop, \name(writing_err), \targets({login}), \context(\writing),
++      \result == 0;
++*/
++#endif
+-- 
+2.47.3
