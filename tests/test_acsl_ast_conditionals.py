@@ -229,7 +229,10 @@ def test_a_function_defined_only_in_an_else_arm_stays_locatable() -> None:
 def test_the_same_function_defined_in_both_arms_keeps_the_first_definition() -> None:
     source = "#ifdef A\nint f(void) { return 1; }\n#else\nint f(void) { return 2; }\n#endif\n"
     assert locate_all_definition_spans(source)["f"].text == "int f(void) { return 1; }"
-    assert [d.span.text for d in contract_declaration_spans(source, "f")] == ["int f(void) { return 1; }"]
+    assert [d.span.text for d in contract_declaration_spans(source, "f")] == [
+        "int f(void) { return 1; }",
+        "int f(void) { return 2; }",
+    ]
     assert len(function_declaration_spans(source, "f")) == 2
 
 
