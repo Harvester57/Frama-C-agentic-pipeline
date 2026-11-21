@@ -4,7 +4,8 @@
  * separated from the state. A helper the gate delegates the write to must be a gate of its own.
  *   global  the state is a global lvalue (`auth_ok`, `session.authed`): program-wide
  *   formal  the state hangs off a parameter (`ctx->authed`): checked in the functions that have a
- *           parameter of that name (\tguard: \true elsewhere)
+ *           parameter of that name (\tguard: \true elsewhere); one whose parameter of that name has
+ *           another type is left out of the targets (security_props.py, `param_type`)
  *   on_failure  plan step M7, the gate's threat model gives its `success` value: when the gate returns
  *           anything else, the state is what it was on entry. MetAcsl's \postcond cannot name
  *           \result, so security_props.py writes this `check` into the work tree before each

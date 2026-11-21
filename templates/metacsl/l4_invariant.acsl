@@ -14,7 +14,8 @@
  *                It uses \at(x, Before) and \at(x, After), which Eva does not evaluate: the
  *                property's `engines` leave `eva` out.
  *   monotonic_formal  the same for a state that hangs off a parameter (`c->phase`): checked in the
- *                functions that have a parameter of that name (\tguard: \true elsewhere).
+ *                functions that have a parameter of that name (\tguard: \true elsewhere); one whose
+ *                parameter of that name has another type is left out (`param_type`).
  * A call placed in an initializer gets no \strong_invariant instance (MetAcsl 0.12, with its default
  * simplification): security_props.py writes `init_strong` as a `check` into the work tree after the
  * declaration.
