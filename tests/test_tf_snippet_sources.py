@@ -84,7 +84,17 @@ TFS_DAG: dict = {
             "required_sources": ["tools/check.c", "lib/util/progname.c", "lib/util/fmt.c"],
             "linked_modules": ["libutil_so"],
         },
+        # An archive nothing links in the project, calling back what its users define (sudo's fuzz stubs).
+        "libcb_a": {
+            "unit": "lib/cb/.libs/libcb.a",
+            "kind": "static_lib",
+            "files": ["lib/cb/cb.c"],
+            "required_sources": ["lib/cb/cb.c"],
+            "linked_modules": [],
+            "external_callees": ["progname_init"],
+        },
     },
+    "macro_aliases": {"strdup": "alias_check"},
     "functions": {
         "json_parse": {"name": "json_parse", "file": "lib/io/json.c", "module": "libio_a", "lexer_module": "io"},
         "ev_free": {"name": "ev_free", "file": "lib/ev/free.c", "module": "libev_a", "lexer_module": "evfree"},
@@ -190,6 +200,23 @@ def test_a_project_function_of_another_program_still_resolves(tmp_path):
     merged = _tfs_merge(run, "alias_check(t); disable_coredump();", module_name="h", unit="libio_a", flow_meta=meta)
     assert merged == [*TFS_IO_SOURCES, "tools/check.c", *TFS_UTIL_SOURCES, *TFS_PROG_SOURCES]
     assert "names_outside_link" not in meta
+
+
+def test_what_an_archive_calls_is_no_system_function(tmp_path):
+    # Only a final link (a program, a shared library) says a name is resolved outside the project.
+    run = _tfs_run(tmp_path)
+    out = run / "workspace/harnesses"
+    merged = G._merge_dag_harness_sources(
+        out, ["lib/cb/cb.c"], False, "progname_init()", module_name="h", unit="libcb_a"
+    )
+    assert merged == ["lib/cb/cb.c", "lib/util/progname.c"]
+
+
+def test_a_macro_alias_is_judged_by_the_function_it_names(tmp_path):
+    # `strdup` is a system name, but the build makes it the tool's project function alias_check.
+    run = _tfs_run(tmp_path)
+    merged = _tfs_merge(run, "strdup(s)", module_name="h", unit="libio_a", system_names={"strdup"})
+    assert merged == [*TFS_IO_SOURCES, "tools/check.c", *TFS_UTIL_SOURCES]
 
 
 def test_a_library_harness_keeps_the_libraries_a_program_links_with_it(tmp_path):

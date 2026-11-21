@@ -2723,7 +2723,11 @@ def _merge_dag_harness_sources(
     external_of: dict[str, list[str]] = {}
     if link_modules is not None:
         for mod_key, info in modules_map.items():
-            for callee in (info.get("external_callees") if isinstance(info, dict) else None) or []:
+            if not isinstance(info, dict) or info.get("kind") == "static_lib":
+                # An archive's link is not final: what it calls a program may define (sudo's fuzz stub
+                # library calls sudo_gettime_mono_v1, which libsudo_util defines).
+                continue
+            for callee in info.get("external_callees") or []:
                 if isinstance(callee, str):
                     external_of.setdefault(callee, []).append(str(mod_key))
 
@@ -2733,7 +2737,7 @@ def _merge_dag_harness_sources(
         return {m for m in mods if isinstance(m, str)}
 
     def _system_name(ident: str) -> bool:
-        """Whether `ident` is a system function: declared by the system headers, or one a unit calls as such."""
+        """Whether `ident` is a system function: declared by the system headers, or one a final link calls as such."""
         if ident in system_names:
             return True
         keys = [ident] if ident in functions_map else colliding.get(ident) or []
@@ -2786,15 +2790,12 @@ def _merge_dag_harness_sources(
                 # Every external definition lies outside the link (an ambiguous name stays silent).
                 outside_link.setdefault(ident, set()).update(outs)
         # A macro alias the build defines (the Phase 0 model's): alias -> DAG keys it expands to.
+        # Judged by the function's own name: `strlcpy` expanding to the project's `sudo_strlcpy` is no
+        # system function, whatever libc declares.
         alias_keys = aliases.get(ident) if isinstance(aliases, dict) else None
-        _take(
-            ident,
-            [
-                k
-                for k in ([alias_keys] if isinstance(alias_keys, str) else alias_keys or [])
-                if isinstance(k, str) and k in functions_map
-            ],
-        )
+        for key in [alias_keys] if isinstance(alias_keys, str) else alias_keys or []:
+            if isinstance(key, str) and isinstance(functions_map.get(key), dict):
+                _take(str(functions_map[key].get("name") or key.rpartition("#")[2]), [key])
     if outside_link and flow_meta is not None:
         flow_meta["names_outside_link"] = [
             {"name": name, "definitions": sorted(keys)} for name, keys in sorted(outside_link.items())
