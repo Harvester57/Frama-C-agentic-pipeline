@@ -247,7 +247,30 @@
       "properties": {
         "id": {"type": "string", "minLength": 1},
         "source": {"type": "string", "minLength": 1},
-        "initialize": {"type": "boolean"}
+        "initialize": {"type": "boolean"},
+        "link": {
+          "$comment": "How the module's `sources` were chosen (generate_harness.target_fuzzer_link_sources): `from: build_capture` when the capture links the fuzzer (`unit`, its files), else `from: unit`: the unit's sources without each file that defines, with external linkage, a symbol the fuzzer defines itself (`excluded_sources`: source and symbols; `definitions`: `preprocessed` when the fuzzer's own definitions were read from its `gcc -E` output, `source_text` from the file as it is, `none` without a DAG).",
+          "type": "object",
+          "properties": {
+            "from": {"enum": ["build_capture", "unit"]},
+            "unit": {"type": "string"},
+            "definitions": {"enum": ["preprocessed", "source_text"]},
+            "excluded_sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source": {"type": "string"},
+                  "symbols": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["source", "symbols"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["from"],
+          "additionalProperties": false
+        }
       },
       "required": ["id", "source", "initialize"],
       "additionalProperties": false

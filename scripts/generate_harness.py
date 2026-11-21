@@ -792,6 +792,271 @@ def target_fuzzer_max_input_size(out_dir: Path, src: str, fuzzer_id: str | None 
     return TARGET_FUZZER_DEFAULT_MAX_INPUT_SIZE
 
 
+# How long the target fuzzer's own preprocessing may take (its definitions are read from it).
+_DRIVER_PREPROCESS_TIMEOUT_S = 120
+_LINE_MARKER_RE = re.compile(r'^#\s+\d+\s+"((?:[^"\\]|\\.)*)"')
+_C_BLANK_RE = re.compile(r"/\*.*?\*/|//[^\n]*|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
+_C_DECL_SKIP_WORDS = frozenset({"typedef", "extern", "static", "_Static_assert"})
+_FN_POINTER_NAME_RE = re.compile(r"\(\s*\*+\s*(?:(?:const|volatile|restrict)\s+)*([A-Za-z_]\w*)\s*\)")
+_TRAILING_IDENT_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$")
+
+
+def _driver_own_text(preprocessed: str, driver: str) -> str:
+    """The lines of `gcc -E` output that come from `driver` itself (line markers decide), the headers dropped."""
+    want = _normalize_run_rel_dir(driver)
+    keep = True
+    out: list[str] = []
+    for line in preprocessed.splitlines():
+        m = _LINE_MARKER_RE.match(line)
+        if m:
+            name = _normalize_run_rel_dir(m.group(1).replace("\\\\", "\\"))
+            keep = name == want or name.endswith("/" + want) or want.endswith("/" + name)
+            continue
+        if keep and not line.lstrip().startswith("#"):
+            out.append(line)
+    return "\n".join(out)
+
+
+def _top_level_variable_names(text: str) -> list[str]:
+    """
+    The variables a C text defines at file scope with external linkage: every declarator of a top-level
+    declaration that is not `typedef`, `extern` or `static` and declares no function. Comments and
+    literals are blanked first; function bodies and brace initializers are skipped.
+    """
+    code = _C_BLANK_RE.sub(lambda m: " " * len(m.group(0)), text)
+    code = "\n".join("" if ln.lstrip().startswith("#") else ln for ln in code.split("\n"))
+    names: list[str] = []
+    chunk: list[str] = []
+    depth = 0
+    brace_open = -1
+    i = 0
+    while i < len(code):
+        ch = code[i]
+        if ch == "{":
+            if depth == 0:
+                brace_open = len(chunk)
+            depth += 1
+            chunk.append(ch)
+        elif ch == "}":
+            depth = max(0, depth - 1)
+            chunk.append(ch)
+            if depth == 0:
+                head = "".join(chunk[:brace_open]).rstrip()
+                head = re.sub(r"__attribute__\s*\(\(.*\)\)\s*$", "", head).rstrip()
+                if head.endswith(")") and "=" not in head:
+                    chunk = []  # a function body: no `;` follows
+        elif ch == ";" and depth == 0:
+            names.extend(_declarator_names("".join(chunk)))
+            chunk = []
+        else:
+            chunk.append(ch)
+        i += 1
+    return list(dict.fromkeys(names))
+
+
+def _declarator_names(decl: str) -> list[str]:
+    """The variable names one top-level declaration (without its `;`) defines; [] for a type or a prototype."""
+    # The brace groups (a struct body, an initializer) blanked; `body_end`: where the type's own body ends.
+    outside: list[str] = []
+    depth = 0
+    body_end = -1
+    seen_equals = False
+    for ch in decl:
+        if ch == "{":
+            depth += 1
+            outside.append(" ")
+        elif ch == "}":
+            depth -= 1
+            outside.append(" ")
+            if depth == 0 and not seen_equals and body_end < 0:
+                body_end = len(outside)
+        elif depth > 0:
+            outside.append(" ")
+        else:
+            seen_equals = seen_equals or ch == "="
+            outside.append(ch)
+    text = "".join(outside)
+    if set(re.findall(r"[A-Za-z_]\w*", _split_top_level_equals(text))) & _C_DECL_SKIP_WORDS:
+        return []
+    declarators_from = body_end if body_end >= 0 else 0
+    parts: list[str] = []
+    level = 0
+    current = ""
+    for i, ch in enumerate(text):
+        if ch in "([":
+            level += 1
+        elif ch in ")]":
+            level -= 1
+        if ch == "," and level == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+        if i + 1 == declarators_from:
+            current = " " * len(current)  # the type and its body name no variable
+    parts.append(current)
+    names: list[str] = []
+    for n, part in enumerate(parts):
+        lhs = _split_top_level_equals(part)
+        fp = _FN_POINTER_NAME_RE.search(lhs)
+        if fp:
+            names.append(fp.group(1))
+            continue
+        if "(" in lhs:
+            continue  # a prototype
+        m = _TRAILING_IDENT_RE.search(lhs.rstrip())
+        if not m or m.group(1) in _TYPE_KEYWORDS_FOR_DECLS:
+            continue
+        before = lhs[: m.start()].split()
+        if (n == 0 and not before) or (before and before[-1] in ("struct", "union", "enum")):
+            continue  # `struct s;` or a lone identifier: no object (a later declarator has no type of its own)
+        names.append(m.group(1))
+    return names
+
+
+def _split_top_level_equals(part: str) -> str:
+    """`part` up to its first `=` outside parentheses and brackets."""
+    level = 0
+    for i, ch in enumerate(part):
+        if ch in "([":
+            level += 1
+        elif ch in ")]":
+            level -= 1
+        elif ch == "=" and level == 0:
+            return part[:i]
+    return part
+
+
+_TYPE_KEYWORDS_FOR_DECLS = frozenset(
+    {"int", "char", "long", "short", "unsigned", "signed", "float", "double", "void", "_Bool", "const", "volatile"}
+)
+
+
+def _preprocess_driver(driver: str, cppflags: str) -> str | None:
+    """`gcc -E` of the target fuzzer with the harness flags (and the run snapshot's), or None when it fails."""
+    from target_env import with_include_flags
+
+    try:
+        flags = shlex.split(with_include_flags(cppflags))
+    except ValueError:
+        return None
+    if shutil.which("gcc") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["gcc", "-E", *flags, driver],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_DRIVER_PREPROCESS_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def target_fuzzer_definitions(driver: str, cppflags: str) -> tuple[set[str], str]:
+    """
+    The functions and variables the target fuzzer `driver` defines with external linkage, and how they
+    were read: `preprocessed` (its own lines of `gcc -E` with the harness flags, so `#ifdef` picks what the
+    build compiles), else `source_text` (the file as it is, both branches of a conditional).
+    """
+    from c_definitions import extract_functions_from_code
+
+    path = Path(driver)
+    if not path.is_file():
+        path = Path("workspace/work") / driver
+    pre = _preprocess_driver(path.as_posix(), cppflags)
+    method = "preprocessed"
+    text = _driver_own_text(pre, path.as_posix()) if pre is not None else None
+    if text is None:
+        method = "source_text"
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return set(), method
+    names: set[str] = set()
+    try:
+        for fn in extract_functions_from_code(text, path=path.as_posix()):
+            if "static" not in {t.text for t in fn.get("decl_tokens") or []}:
+                names.add(str(fn["name"]))
+    except Exception:  # noqa: BLE001 - an unreadable driver defines nothing we can name
+        pass
+    names.update(_top_level_variable_names(text))
+    # Its entry points, under their own names or as the sidecar cppflags rename them: no unit file has them.
+    names -= {"LLVMFuzzerTestOneInput", "LLVMFuzzerInitialize", TARGET_EMBEDDED_ENTRY, TARGET_EMBEDDED_INIT}
+    return names, method
+
+
+def _tree_rel(path: str) -> str:
+    """A source as the DAG names it: run-relative `workspace/work/` and container prefixes dropped."""
+    norm = _normalize_run_rel_dir(path)
+    return norm[len("workspace/work/") :] if norm.startswith("workspace/work/") else norm
+
+
+def target_fuzzer_link_sources(
+    out_dir: Path, driver: str, sources: list[str], cppflags: str
+) -> tuple[list[str], dict[str, Any] | None]:
+    """
+    The sources a target fuzz module links, and the record of how they were chosen (sidecar
+    `target_fuzzer.link`; None, `sources` unchanged, without a DAG to read the definitions from). The target links its fuzzer against a few objects and libraries of its own
+    choosing (sudo's `FUZZ_POLICY_OBJS`), and the fuzzer overrides functions and globals of the unit it
+    exercises (`user_is_exempt`, `audit_msg`, `iolog_swapids`, `sudo_regex_compile_v1`): linked with the
+    whole unit, it fails on "multiple definition" and Frama-C on "has different initializer" (sudo run-1).
+
+    - The build capture links the fuzzer (`units[*].files` names it): its own files, `from: build_capture`
+      with the `unit`. A file its libraries define is added by the link repair, as an archive member is.
+    - Otherwise `sources` without every file that defines, with external linkage (the DAG's functions and
+      the model's globals: what the link repair reads), a symbol the fuzzer defines itself:
+      `from: unit` and `excluded_sources` [{source, symbols}], `definitions` saying how the fuzzer's own
+      were read (`target_fuzzer_definitions`). A file the link repair adds back for another symbol
+      it defines brings the conflict back: then the fuzzer needs the target's own object list.
+    """
+    import fuzz_build as fb
+
+    reports = next(
+        (d for d in (out_dir.parent / "reports", Path("workspace/reports")) if (d / "callgraph_dag.json").is_file()),
+        None,
+    )
+    driver_rel = _tree_rel(driver)
+    capture_dir = _capture_reports_dir(out_dir)
+    capture = load_json_optional(capture_dir / "build_capture.json", None) if capture_dir is not None else None
+    units = capture.get("units") if isinstance(capture, dict) else None
+    for key, unit in sorted(units.items()) if isinstance(units, dict) else []:
+        files = [str(f) for f in (unit or {}).get("files") or [] if isinstance(f, str)]
+        if driver_rel in files:
+            return [driver if f == driver_rel else f for f in files], {"from": "build_capture", "unit": key}
+    if reports is None:
+        return list(sources), None
+    own, method = target_fuzzer_definitions(driver, cppflags)
+    dag_path = reports / "callgraph_dag.json"
+    dag = load_json_optional(dag_path, None)
+    definers: dict[str, set[str]] = {}
+    # Every file defining it, not the one the link repair picks: the fuzzer's own record may come first.
+    for key, rec in ((dag or {}).get("functions") or {}).items() if isinstance(dag, dict) else []:
+        if not isinstance(rec, dict) or rec.get("is_static") is True or rec.get("header"):
+            continue
+        name = str(rec.get("name") or str(key).split("#")[-1])
+        file = str(rec.get("file") or "")
+        if name in own and file and not file.lower().endswith((".h", ".hh", ".hpp", ".hxx", ".inc")):
+            definers.setdefault(_tree_rel(file), set()).add(name)
+    for name, recs in fb._model_global_variables(dag_path).items():
+        if name in own:
+            for rec in recs:
+                definers.setdefault(_tree_rel(str(rec.get("file") or "")), set()).add(name)
+    kept: list[str] = []
+    excluded: list[dict[str, Any]] = []
+    for src in sources:
+        rel = _tree_rel(src)
+        if rel != driver_rel and rel in definers:
+            excluded.append({"source": src, "symbols": sorted(definers[rel])})
+        else:
+            kept.append(src)
+    return kept, {"from": "unit", "excluded_sources": excluded, "definitions": method}
+
+
 def _target_fuzzer_prelude(initialize: bool) -> str:
     """Declarations (and the run-once LLVMFuzzerInitialize call) a target fuzz harness needs."""
     lines = [
@@ -1579,11 +1844,70 @@ _STD_HEADER_OF: dict[str, str] = {
 }
 
 
+_INCLUDED_FROM_RE = re.compile(r"^In file included from (?P<file>.+?):(?P<line>\d+):\s*$")
+_DIAG_SYMBOL_LINE_RE = re.compile(
+    r"^(?P<file>.*?):(?P<line>\d+):\d+:\s+(?:fatal\s+)?error:\s+"
+    r"(?:unknown type name|use of undeclared identifier)\s+'(?P<sym>[A-Za-z_]\w*)'"
+)
+_INCLUDE_LINE_RE = re.compile(r"^\s*#\s*include\b")
+
+
+def _diagnostic_roots(output: str, harness_file: Path, lines: list[str]) -> dict[str, set[str] | None]:
+    """
+    For each unresolved identifier, the harness `#include` lines (their text) its errors are reached
+    through: the first `In file included from <harness>:N:` of the include chain clang prints above an
+    error in a header. clang prints that chain only when it differs from the previous diagnostic's, so a
+    header error without one is reached through the last chain printed. None for an identifier one of whose
+    errors is in the harness's own code, or reached through no `#include` line of the harness: the caller
+    then keeps the module header as the place.
+    """
+    name = harness_file.name
+    roots: dict[str, set[str] | None] = {}
+    chain_root: int | None = None  # the harness line of the last include chain clang printed
+    in_chain = False
+    for line in output.splitlines():
+        m = _INCLUDED_FROM_RE.match(line)
+        if m:
+            if not in_chain:
+                in_chain = True
+                from_harness = Path(m.group("file").replace("\\", "/")).name == name
+                chain_root = int(m.group("line")) if from_harness else None
+            continue
+        in_chain = False
+        d = _DIAG_SYMBOL_LINE_RE.match(line)
+        if not d:
+            continue
+        sym = d.group("sym")
+        in_harness = Path(d.group("file").replace("\\", "/")).name == name
+        text = lines[chain_root - 1].strip() if chain_root is not None and 0 < chain_root <= len(lines) else ""
+        known = roots.get(sym, set())
+        if in_harness or not _INCLUDE_LINE_RE.match(text):
+            roots[sym] = None
+        elif known is not None:
+            roots[sym] = known | {text}
+    return roots
+
+
+def _merge_roots(roots_of: dict[str, set[str] | None], header: str, roots: set[str] | None) -> None:
+    """Add one identifier's roots to the header's that defines it; None (no place known) wins."""
+    known = roots_of.get(header, set())
+    roots_of[header] = None if roots is None or known is None else known | roots
+
+
+def _first_line_of(lines: list[str], texts: set[str] | None, limit: int | None = None) -> int | None:
+    """The index of the first of `lines` (above `limit`) whose stripped text is one of `texts`, or None."""
+    if not texts:
+        return None
+    end = len(lines) if limit is None else limit
+    return next((i for i in range(end) if lines[i].strip() in texts), None)
+
+
 def _insert_prelude_includes(
     harness_file: Path,
     header_include: str,
     new_headers: list[tuple[str, str | None]],
     anchor: str | None = None,
+    roots: dict[str, set[str] | None] | None = None,
 ) -> None:
     """
     Insert `#include "<hdr>"` lines into the harness. Each entry is (header,
@@ -1592,6 +1916,14 @@ def _insert_prelude_includes(
     before the module header line (preserving discovery order). Without a module
     header line, the headers go before `anchor`, the first line of the harness's
     header slot (a declaration synthesized from the sources needs them too).
+
+    When clang showed where the identifiers a header resolves are reached from (`roots[hdr]`: the
+    harness `#include` lines their include chains start at, `_diagnostic_roots`), the header goes right
+    before the first of them instead. The module header may not need it at all: it may be the target's
+    configuration header (`--header config.h`), which every target file includes first, and a project
+    header put above it is read without the configuration macros (sudo run-1: `sudo_iolog.h` above
+    `config.h` lost its `HAVE_ZLIB_H` union member, and the harness's `struct iolog_file` no longer
+    matched the library's: "Definitions of struct iolog_file are not isomorphic").
     """
     lines = harness_file.read_text(encoding="utf-8").splitlines(keepends=True)
     module_line = f'#include "{header_include}"'
@@ -1605,6 +1937,8 @@ def _insert_prelude_includes(
 
     for hdr, before in new_headers:
         idx = _find(f'#include "{before}"') if before else None
+        if idx is None:
+            idx = _first_line_of(lines, (roots or {}).get(hdr))
         if idx is None:
             idx = _find(module_line)
         if idx is None and anchor and anchor.strip():
@@ -1622,13 +1956,21 @@ EXTRA_INCLUDE_FIRST_MARK = "/* auto-prelude: moved before the header that needs 
 
 
 def _move_extra_include_first(
-    harness_file: Path, extra: str, header_include: str, failing_names: set[str], anchor: str | None = None
+    harness_file: Path,
+    extra: str,
+    header_include: str,
+    failing_names: set[str],
+    anchor: str | None = None,
+    roots: set[str] | None = None,
 ) -> str | None:
     """
     Move the `#include "<extra>"` line of the harness up, before the first of: the module header line
     (without one, the `anchor` line), and any earlier quoted include of a file in `failing_names` (the
-    basenames clang reported the unresolved identifiers in). Returns the harness text as it was, to
-    restore when the move does not help, or None when the line is not below such a line (nothing moved).
+    basenames clang reported the unresolved identifiers in). When clang showed which harness includes the
+    errors are reached through (`roots`, `_diagnostic_roots`), it goes before the first of those above it
+    instead, never above a module header that needed nothing (`_insert_prelude_includes`). Returns the
+    harness text as it was, to restore when the move does not help, or None when the line is not below
+    such a line (nothing moved).
     """
     before_text = harness_file.read_text(encoding="utf-8")
     lines = before_text.splitlines(keepends=True)
@@ -1637,8 +1979,8 @@ def _move_extra_include_first(
     )
     if src is None:
         return None
-    dst: int | None = None
-    for i, line in enumerate(lines[:src]):
+    dst: int | None = _first_line_of(lines, roots, src)
+    for i, line in enumerate(lines[:src] if dst is None else []):
         m = _QUOTED_INCLUDE_RE.match(line)
         included = m.group(1) if m else None
         if (
@@ -1676,7 +2018,9 @@ def resolve_prelude_headers(
     -I directories for a definition (typedef, closing `} X;`, `#define X`, enum
     constant) and rewrites the harness so the defining headers are included
     before `#include "<header_include>"` (without one, before the `anchor` line:
-    the first line of the harness's header slot). Repeats up to `max_iterations`
+    the first line of the harness's header slot), or, when the identifiers failed
+    only in an include below it, right before that include: the module header may
+    be the target's `config.h`, which must stay first. Repeats up to `max_iterations`
     rewrite rounds, re-running clang after each one.
 
     Identifiers no header of the -I directories defines (the search reads only the
@@ -1759,10 +2103,15 @@ def resolve_prelude_headers(
         """
         failing_all = {Path(f.replace("\\", "/")).name for files in symbols.values() for f in files}
         n_errors = len(_DIAG_ERROR_RE.findall(output))
+        sym_roots = _diagnostic_roots(output, harness_file, harness_file.read_text(encoding="utf-8").splitlines())
+        roots: set[str] | None = set()
+        for sym in symbols:
+            mine = sym_roots.get(sym)
+            roots = None if mine is None or roots is None else roots | mine
         for ext in extra_includes or []:
             if ext in moved_first:
                 continue
-            before_text = _move_extra_include_first(harness_file, ext, module_line_include, failing_all, anchor)
+            before_text = _move_extra_include_first(harness_file, ext, module_line_include, failing_all, anchor, roots)
             if before_text is None:
                 continue
             try:
@@ -1851,7 +2200,12 @@ def resolve_prelude_headers(
         new_headers: list[tuple[str, str | None]] = []
         chosen_names: list[str] = []
         unresolved: list[str] = []
+        # The harness includes each chosen header's identifiers are reached through: it goes before the
+        # first of them (None: one of its identifiers failed elsewhere, the module header is the place).
+        sym_roots = _diagnostic_roots(output, harness_file, harness_file.read_text(encoding="utf-8").splitlines())
+        roots_of: dict[str, set[str] | None] = {}
         for sym, cands in candidates.items():
+            failing_names = {Path(f.replace("\\", "/")).name for f in symbols[sym]}
             if not cands:
                 std = std_headers.get(sym)
                 if std is None:
@@ -1859,12 +2213,14 @@ def resolve_prelude_headers(
                 elif std not in chosen_names:
                     chosen_names.append(std)
                     new_headers.append((std, None))
+                if std is not None:
+                    _merge_roots(roots_of, std, sym_roots.get(sym))
                 continue
             best = sorted(cands, key=lambda p: (-coverage[p], len(str(p)), str(p)))[0]
+            _merge_roots(roots_of, best.name, sym_roots.get(sym))
             if best.name in chosen_names:
                 continue
             # If the symbol failed inside an earlier prelude header, the new header must precede it.
-            failing_names = {Path(f.replace("\\", "/")).name for f in symbols[sym]}
             before = next((h for h in prelude if h in failing_names), None)
             chosen_names.append(best.name)
             new_headers.append((best.name, before))
@@ -1877,7 +2233,7 @@ def resolve_prelude_headers(
             result["reason"] = "no defining header found in -I directories"
             return result
 
-        _insert_prelude_includes(harness_file, module_line_include, new_headers, anchor)
+        _insert_prelude_includes(harness_file, module_line_include, new_headers, anchor, roots_of)
         for hdr_name, before in new_headers:
             if before and before in prelude:
                 prelude.insert(prelude.index(before), hdr_name)
@@ -1986,6 +2342,40 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, u
                 forced.add(path)
         break
     return cppflags
+
+
+def _capture_reports_dir(out_dir: Path) -> Path | None:
+    """The reports directory holding the run's build capture: next to `out_dir`, else the run's."""
+    return next(
+        (d for d in (out_dir.parent / "reports", Path("workspace/reports")) if (d / "build_capture.json").is_file()),
+        None,
+    )
+
+
+def _capture_source_include_dirs(module_name: str, out_dir: Path, sources: Sequence[str], cppflags: str) -> str:
+    """
+    `cppflags` with the `-I` / `-iquote` directories the build capture's compiles of the harness `sources`
+    search and the flags lack (include_context.source_include_dirs): a source of another link unit (a
+    target fuzz module's, a cluster's) is parsed with the module's one set of flags, which must find its
+    headers too. Said on stderr; the build adds the same for the sources a link repair adds.
+    """
+    import include_context as ic
+
+    reports = _capture_reports_dir(out_dir)
+    if reports is None or not sources:
+        return cppflags
+    capture = load_json_optional(reports / "build_capture.json", None)
+    dag = load_json_optional(reports / "callgraph_dag.json", None)
+    if not isinstance(capture, dict):
+        return cppflags
+    target_dir = dag.get("target_dir") if isinstance(dag, dict) else None
+    out, added = ic.source_include_dirs(cppflags, list(sources), capture, str(target_dir) if target_dir else None)
+    if added:
+        _feature_warn(
+            module_name,
+            f"added the include directories of other link units' sources from the build capture: {' '.join(added)}",
+        )
+    return out
 
 
 def _drop_pre_c99_std(module_name: str, cppflags: str) -> str:
@@ -2841,6 +3231,19 @@ def _generate_module_harness(
         module_name=module_name,
         flow_meta=flow_meta,
     )
+    if target_fuzzer_record is not None:
+        # The fuzzer overrides functions and globals of its unit: not linked with the files defining them.
+        sources, tf_link = target_fuzzer_link_sources(out_dir, target_fuzzer_record["source"], sources, norm_cppflags)
+        if tf_link is not None:
+            target_fuzzer_record["link"] = tf_link
+        for ex in (tf_link or {}).get("excluded_sources") or []:
+            _feature_warn(
+                module_name,
+                f"left {ex['source']} out of the target fuzzer's sources: the fuzzer defines "
+                f"{', '.join(ex['symbols'])} itself (sidecar target_fuzzer.link.excluded_sources)",
+            )
+    # A source of another link unit brings that unit's include directories.
+    norm_cppflags = _capture_source_include_dirs(module_name, out_dir, sources, norm_cppflags)
 
     inc_lines: list[str] = []
     if norm_header:

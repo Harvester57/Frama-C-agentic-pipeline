@@ -572,3 +572,94 @@ def compiles_of_sources(capture: dict, sources: Iterable[str], tree_prefixes: Se
                 break
         wanted.add(rel)
     return [c for c in capture.get("compiles") or [] if isinstance(c, dict) and str(c.get("source")) in wanted]
+
+
+# ---------------------------------------------------------------------------
+# The include directories of the target's own compiles
+# ---------------------------------------------------------------------------
+
+# The search-path options a source's own compile brings, and the options of a flag string that already
+# search the same directory for it: `-I d` serves both include forms, `-iquote d` only `#include "..."`.
+_SATISFIED_BY = {"-I": ("-I", "-isystem", "-idirafter"), "-iquote": ("-I", "-iquote", "-isystem", "-idirafter")}
+_SEARCH_OPTIONS = ("-I", "-iquote", "-isystem", "-idirafter")
+DEFAULT_TREE_DIR = "workspace/work"
+
+
+def _dir_options(tokens: Sequence[str]) -> list[tuple[str, str]]:
+    """(option, directory) of each search-path option in `tokens`, joined (`-Idir`) or separate (`-I dir`)."""
+    out: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _SEARCH_OPTIONS and i + 1 < len(tokens):
+            out.append((tok, tokens[i + 1]))
+            i += 2
+            continue
+        joined = next((o for o in _SEARCH_OPTIONS if tok.startswith(o) and len(tok) > len(o)), None)
+        if joined is not None:
+            out.append((joined, tok[len(joined) :]))
+        i += 1
+    return out
+
+
+def _run_rel_dir(path: str) -> str:
+    """A directory as the run's flags spell it: `/framac-run/` and `./` dropped, no trailing `/`."""
+    norm = path.replace("\\", "/").strip()
+    if norm.startswith("/framac-run/"):
+        norm = norm[len("/framac-run/") :]
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.rstrip("/") or "."
+
+
+def _tree_dir(target_dir: str | None) -> str:
+    """
+    The target tree as the run's flags spell it. The DAG records it as `/framac-run/workspace/work`; a host
+    path to a run's `workspace/work` (a DAG written outside the container) is given from its `workspace/`.
+    """
+    tree = _run_rel_dir(target_dir or DEFAULT_TREE_DIR)
+    if tree.startswith("/") or re.match(r"^[A-Za-z]:/", tree):
+        at = tree.rfind("/workspace/")
+        tree = tree[at + 1 :] if at >= 0 else DEFAULT_TREE_DIR
+    return tree
+
+
+def source_include_dirs(
+    cppflags: str, sources: Iterable[str], capture: dict, target_dir: str | None = None
+) -> tuple[str, list[str]]:
+    """
+    `cppflags` followed by the `-I` / `-iquote` directories that the build capture's compiles of `sources`
+    search and `cppflags` does not, and the flags added. A module compiles files of other link units too (a
+    link repair adds `lib/eventlog/parse_json.c` to `libsudo_iolog_a`; sudo run-1), all with one set of
+    flags, as Frama-C parses every file with one: without that unit's own directories, `#include
+    <parse_json.h>` is not found. Only search directories are carried, after the given ones and in the order
+    the compiles name them, so a header the module's own directories find is still found there; a `-D` of
+    another unit is never carried, as it could contradict the module's own.
+
+    The capture's directories are tree-relative; they are given under `target_dir` (the DAG's `target_dir`,
+    `/framac-run/workspace/work`, spelled run-relative: `workspace/work/<dir>`). A directory the capture
+    records as absolute is outside the tree (a system one, which the run snapshot's options cover): never
+    added. `cppflags` comes back unchanged when nothing is missing.
+    """
+    tree = _tree_dir(target_dir)
+    raw_tree = (target_dir or "").replace("\\", "/").rstrip("/")
+    prefixes = [p for p in dict.fromkeys((tree, raw_tree)) if p and p != "."]
+    try:
+        tokens = shlex.split(cppflags or "")
+    except ValueError:
+        return cppflags, []
+    present = {(opt, _run_rel_dir(d)) for opt, d in _dir_options(tokens)}
+    added: list[str] = []
+    for comp in compiles_of_sources(capture, sources, prefixes):
+        for opt, rel in _dir_options([str(t) for t in comp.get("flags") or []]):
+            if opt not in ("-I", "-iquote") or rel.replace("\\", "/").startswith("/"):
+                continue
+            rel = _run_rel_dir(rel)
+            run_rel = tree if rel == "." else (rel if tree == "." else f"{tree}/{rel}")
+            if any((o, run_rel) in present for o in _SATISFIED_BY[opt]):
+                continue
+            present.add((opt, run_rel))
+            added.append(shlex.quote(f"-I{run_rel}") if opt == "-I" else f"-iquote {shlex.quote(run_rel)}")
+    if not added:
+        return cppflags, []
+    return f"{cppflags} {' '.join(added)}".strip(), added
