@@ -70,6 +70,7 @@ from eacsl_toolchain import (
     resolve_fuzz_init_source,
     rewrite_forward_array_sizes,
     rewrite_incomplete_alignof,
+    rewrite_misplaced_fallthrough,
     rewrite_sound_verdict_resets,
     rewrite_sync_builtins,
     rewrite_trailing_alignas,
@@ -1034,7 +1035,7 @@ def _compile_eacsl_binary_uncached(
     an instrumented main() would. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
     (`-Dregister=`, recorded in `full_mtracking_defines`). Between the stages the instrumented file
     is patched for printer and E-ACSL gaps, each counted in the result (`alignas_rewrites`,
-    `wrapper_result_inits`, `formal_inits`, `forward_array_sizes`, ...). A pointer-alignment check on a type the instrumented file
+    `wrapper_result_inits`, `formal_inits`, `forward_array_sizes`, `misplaced_fallthrough`, ...). A pointer-alignment check on a type the instrumented file
     leaves incomplete (an opaque handle) cannot compile; it is made vacuous and listed, with the assumption it
     leaves, in `incomplete_alignof` (eacsl_toolchain.rewrite_incomplete_alignof). Uninitialized reads are
     checked (`-rte-initialized @all`) unless `rte_initialized` is False, which is recorded in
@@ -1398,6 +1399,20 @@ def _compile_eacsl_binary_uncached(
                     log_parts.append(
                         f"Injected {n_resets} __e_acsl_sound_verdict = 1 reset(s) at LLVMFuzzerTestOneInput entry.\n"
                     )
+
+            # Without this, clang rejects a fallthrough attribute the kernel printed before `label: default:`.
+            # Last, so the lines it records are those of the file stage 2 compiles.
+            c_text, fallthrough = rewrite_misplaced_fallthrough(c_text)
+            if fallthrough["rewrites"]:
+                c_modified = True
+                result["misplaced_fallthrough"] = fallthrough
+                log_parts.append(
+                    f"Removed {fallthrough['rewrites']} __attribute__((__fallthrough__)) not directly followed by "
+                    f"a case or default label (instrumented lines {', '.join(map(str, fallthrough['lines'][:20]))}"
+                    f"{', ...' if len(fallthrough['lines']) > 20 else ''}): the Frama-C printer puts a goto label "
+                    "before `default:`, which clang rejects. Its `;` stays; the attribute only silences "
+                    "-Wimplicit-fallthrough, so control flow and checks are unchanged.\n"
+                )
 
             if c_modified:
                 instrumented_c.write_text(c_text, encoding="utf-8", newline="\n")
