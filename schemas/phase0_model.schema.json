@@ -179,6 +179,7 @@
           "address_refs": {"$comment": "Dump schema 6 (docs/plans/unit-split-address-flow.md): the project functions whose address its body takes (a direct call's callee is none). Absent: not recorded", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
           "global_refs": {"$comment": "Dump schema 6: the project globals (`global_variables` ids) its body names: read, written or address-taken. Absent: not recorded", "type": "array", "items": {"type": "string"}},
           "unresolved_global_refs": {"$comment": "Dump schema 6: names of globals its body names that its parse only declares and several other parses define (non-static): not in `global_refs`, so the unit split does not trust its address flow", "type": "array", "items": {"type": "string"}},
+          "relocated_from": {"$comment": "Dump schema 7: the location the parse gave, when a line directive put it outside the compiled source the definition was parsed from and the model attributed it to that source (line and end_line then come from the source text, 0 when it has no single definition of that name)", "type": "string"},
           "call_sites": {
             "$comment": "Dump schema 4 (plan steps M2, M5): each direct call of its body, with the string literals it passes (argument index -> text; bytes outside printable ASCII but CR, LF, tab and NUL read '?'). Absent: not recorded",
             "type": "array",
@@ -325,6 +326,16 @@
           "error": {"type": "string"},
           "gcc_fallback": {"type": "object"},
           "parse_warnings": {"$ref": "#/definitions/parse_warnings"},
+          "line_directives": {
+            "$comment": "sources parsed from a copy with their line directives blanked, and the files of the directives Frama-C still ignored (in headers)",
+            "type": "object",
+            "properties": {
+              "blanked": {"type": "array", "items": {"type": "string"}},
+              "ignored": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["blanked", "ignored"],
+            "additionalProperties": false
+          },
           "alias": {
             "type": "object",
             "properties": {

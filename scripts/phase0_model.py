@@ -59,6 +59,13 @@ narrowed to its initializer: that is why it stays off by default.
 
 Functions are identified as `file#name` (paths relative to the target root): same-named statics stay
 apart, and a function defined in a project header (static inline) belongs to every unit compiling it.
+A definition's file is the file whose text the build compiles. A source with line directives (flex's
+`toke.c`, bison's `gram.c`: `#line 1 "gram.y"`) is parsed, and compiled by the GCC fallback and the
+macro scan, from a copy with them blanked (blank_line_directives), so its definitions keep their own
+file and physical lines; the job records them under `line_directives` with the directives Frama-C
+ignored. When a line directive was in play anyway (one in a header), a definition located in a file
+that is not a compiled source and does not hold it goes to the compiled source it was parsed from
+(attribute_definition, dump schema 7 `root`) with `relocated_from` and a warning.
 Every function, edge and alias carries its source. The output is workspace/reports/phase0_model.json
 (schemas/phase0_model.schema.json). A failure is a status in the model, never a crash: the command exits
 0 when the model was written, 1 when no model could be built (missing capture, dump module error), and
@@ -105,6 +112,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import build_capture as bc  # noqa: E402
 import target_env  # noqa: E402
+from acsl_ast import AcslSyntaxError  # noqa: E402
+from c_definitions import extract_functions_from_code  # noqa: E402
 from framac_common import (  # noqa: E402
     atomic_write_json,
     augment_framac_cppflags,
@@ -153,6 +162,14 @@ _OBJECT_DEFINE_RE = re.compile(r"^#define\s+(?P<name>[A-Za-z_]\w*)\s+(?P<value>[
 _CI_NODE = re.compile(r'node: \{ title: "([^"]+)" label: "([^"\\]+)(?:\\n([^":]+):(\d+))?')
 _CI_EDGE = re.compile(r'edge: \{ sourcename: "([^"]+)" targetname: "([^"]+)"')
 _ERROR_RE = re.compile(r"\b(?:User Error|Error|error|Failure|fatal)\b")
+# A line directive in a C source: `#line 12 "gram.y"`, or the GNU marker form `# 12 "gram.y"`.
+_LINE_DIRECTIVE_RE = re.compile(rb"^[ \t]*#[ \t]*(?:line\b|[0-9])")
+# What Frama-C says when it ignores one (the file does not exist relative to its working directory).
+_IGNORED_LINE_DIRECTIVE_RE = re.compile(r"ignoring non-existing file '([^']*)', referenced in a line directive")
+LINE_DIRECTIVE_DIR = "line-directives"
+# Files whose text can hold a C definition the build compiles (a compiled source, a header, an included
+# fragment), unlike a `.y`/`.l` grammar a line directive names.
+C_TEXT_SUFFIXES = (".c", ".h", ".inc")
 
 _SELFTEST_FILES = {
     "a.c": (
@@ -365,6 +382,110 @@ def framac_file_flags(flags: list[str], tree: str) -> list[str]:
             continue
         out.append(shlex.quote(tok))
     return out
+
+
+def blank_line_directives(data: bytes, original: str) -> bytes | None:
+    """
+    The text `data` of the source `original` (absolute) with its line directives blanked, or None when
+    it has none.
+
+    Generated sources (flex, bison) carry `#line` directives naming their grammar (`toke.l`, `gram.y`)
+    and themselves, relative to the directory they were generated in. Frama-C ignores a directive whose
+    file does not exist relative to its own working directory, line number included, and with it every
+    return marker cpp writes after an `#include` (they name the same file): the definitions that follow
+    are then located in the last header entered (`toke.h`, a libc header), at lines that count on from
+    there. A directive it does follow moves them into the grammar file. Each directive line (and its
+    continuation lines) becomes an empty line, so every other line keeps its number, and a first
+    `#line 1 "<original>"` names the original: locations are the physical lines of the compiled source.
+    """
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    out: list[bytes] = []
+    found = in_directive = continued = False
+    for line in data.splitlines(keepends=True):
+        body = line.rstrip(b"\r\n")
+        # A line continuing the previous one is no directive of its own, but continues one.
+        in_directive = in_directive if continued else bool(_LINE_DIRECTIVE_RE.match(body))
+        continued = body.endswith(b"\\")
+        if in_directive:
+            found = True
+            out.append(line[len(body) :])
+        else:
+            out.append(line)
+    if not found:
+        return None
+    name = original.replace("\\", "\\\\").replace('"', '\\"')
+    return f'#line 1 "{name}"\n'.encode() + b"".join(out)
+
+
+def line_directive_copy(source: str, dest: Path) -> str | None:
+    """
+    `source` (absolute) written under the directory `dest` with its line directives blanked
+    (blank_line_directives), under its own name; None when it has none or cannot be read. The copy's
+    quoted includes need `-iquote <the source's directory>` first (line_directive_flags).
+    """
+    try:
+        data = Path(source).read_bytes()
+    except OSError:
+        return None
+    blanked = blank_line_directives(data, source)
+    if blanked is None:
+        return None
+    dest.mkdir(parents=True, exist_ok=True)
+    copy = dest / posixpath.basename(source)
+    copy.write_bytes(blanked)
+    return copy.as_posix()
+
+
+def line_directive_flags(source: str) -> list[str]:
+    """
+    The flags that make a copy of `source` include what `source` includes: a quoted include is searched
+    in the including file's directory first, then in the `-iquote` directories in order.
+    """
+    return ["-iquote", posixpath.dirname(source)]
+
+
+def within_file(lines: list[str] | None, first: int, last: int) -> bool:
+    """Whether lines first..last (1-based) are lines of the file whose `lines` these are (None: unreadable)."""
+    return lines is not None and 1 <= first <= last <= len(lines)
+
+
+def attribute_definition(
+    rel: str | None,
+    root: str | None,
+    first: int,
+    last: int,
+    sources: Iterable[str],
+    line_directives: bool,
+    read_lines: Callable[[str], list[str] | None],
+) -> tuple[str | None, bool]:
+    """
+    The file a definition the dump located in `rel` (tree-relative, None outside the tree) at lines
+    first..last belongs to, and whether that is `root` instead: the compiled source the parse read it
+    from (dump schema 7).
+
+    The location is used when it is one of the job's compiled `sources`, or when no line directive was
+    in play (`line_directives`: the parse ignored one, or a compiled source had one) and it is a C file.
+    Otherwise a C file is used when the lines lie within its text. A position a line directive left
+    stale cannot: once Frama-C ignores the return marker after an `#include`, it counts on from the end
+    of the header it was in, so every later definition lies past that header's last line (sudo's
+    `toke.h#sudoersparse` at line 800 of a 40-line header). The text need not name the function: an
+    included `.c` defines functions renamed by macros (sudo's `pwutil_impl.c`). A line directive's
+    grammar file (`gram.y`), a stale header or a missing file give way to `root` when that is a compiled
+    source of the job. A location outside the tree stays dropped: Frama-C's libc defines functions of
+    its own in headers the project includes.
+    """
+    srcs = set(sources)
+    if rel is None or rel in srcs:
+        return rel, False
+    c_text = rel.endswith(C_TEXT_SUFFIXES)
+    if not line_directives and c_text:
+        return rel, False
+    if root is None or root not in srcs:
+        return rel, False
+    if c_text and within_file(read_lines(rel), first, last):
+        return rel, False
+    return root, True
 
 
 def job_key(compiles: list[dict]) -> str:
@@ -704,10 +825,19 @@ def framac_parse(
         alias_out = Path(tmp) / "alias.json"
         spec = []
         system: list[str] = []
+        # Sources with line directives are parsed from a copy with them blanked (blank_line_directives).
+        copies: dict[str, str] = {}
+        for n, src in enumerate(sorted({c["source"] for c in compiles})):
+            copy = line_directive_copy(posixpath.join(tree, src), Path(tmp) / LINE_DIRECTIVE_DIR / str(n))
+            if copy is not None:
+                copies[src] = copy
         for c in compiles:
             flags = framac_file_flags(c["flags"], tree)
+            if c["source"] in copies:
+                flags = [shlex.quote(f) for f in line_directive_flags(posixpath.join(tree, c["source"]))] + flags
             if flags:
-                spec.append(f"{posixpath.join(tree, c['source'])}:{' '.join(f for f in flags if ',' not in f)}")
+                path = copies.get(c["source"]) or posixpath.join(tree, c["source"])
+                spec.append(f"{path}:{' '.join(f for f in flags if ',' not in f)}")
             system += c["system_flags"]
         extra = augment_framac_cppflags(" ".join(snapshot_dirs(snapshot_root, system)))
         cmd = [
@@ -722,7 +852,7 @@ def framac_parse(
         ]
         if spec:
             cmd.append("-cpp-extra-args-per-file=" + ",".join(spec))
-        cmd += sorted({posixpath.join(tree, c["source"]) for c in compiles})
+        cmd += sorted({copies.get(c["source"]) or posixpath.join(tree, c["source"]) for c in compiles})
         env = dict(os.environ, **{DUMP_OUT_ENV: str(out)})
         if alias_module is None:
             cmd += ["-load-module", str(module)]
@@ -742,12 +872,24 @@ def framac_parse(
             dump = json.loads(out.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             return {"status": "parse_failed", "error": f"unreadable dump: {exc}", "seconds": seconds}
+        # The copies' own path shows only as the root of what they define: name the original there.
+        back = {posixpath.normpath(copy): posixpath.join(tree, src) for src, copy in copies.items()}
+        for rec in [*(dump.get("functions") or []), *(dump.get("globals") or [])]:
+            root = posixpath.normpath(str(rec.get("root") or "")) if rec.get("root") else ""
+            if root in back:
+                rec["root"] = back[root]
         res: dict[str, Any] = {
             "status": "ok",
             "dump": dump,
             "seconds": seconds,
             "parse_warnings": summarize_parse_warnings(log, tree),
         }
+        directives = {
+            "blanked": sorted(copies),
+            "ignored": sorted(set(_IGNORED_LINE_DIRECTIVE_RE.findall(log))),
+        }
+        if any(directives.values()):
+            res["line_directives"] = directives
         if alias_module is not None:
             res["alias"] = read_alias_report(alias_out, rc, log)
     return res
@@ -780,8 +922,14 @@ def gcc_callgraph(job: dict, tree: str, snapshot_root: str | None, log_dir: Path
     with tempfile.TemporaryDirectory(prefix="framac-p0-gcc-") as tmp:
         for n, c in enumerate(job["compiles"]):
             base = f"{tmp}/{n}"
-            argv = bc.compile_argv(c["arguments"], posixpath.join(tree, c["source"]), f"{base}.o")
-            cmd = ["gcc", *argv[1:-4], *snapshot_dirs(snapshot_root, c["system_flags"]), *argv[-4:]]
+            source = posixpath.join(tree, c["source"])
+            argv = bc.compile_argv(c["arguments"], source, f"{base}.o")
+            # GCC names functions by the file a line directive gives too: compile the blanked copy.
+            copy = line_directive_copy(source, Path(tmp) / LINE_DIRECTIVE_DIR / str(n))
+            quote = line_directive_flags(source) if copy else []
+            if copy:
+                argv[-3] = copy
+            cmd = ["gcc", *quote, *argv[1:-4], *snapshot_dirs(snapshot_root, c["system_flags"]), *argv[-4:]]
             cmd += ["-fcallgraph-info", "-dumpbase", base]
             cwd = bc.absolute(c["cwd"], tree)
             rc, log = run_tool(cmd, cwd, GCC_TIMEOUT_S, runner=runner)
@@ -813,10 +961,16 @@ def gcc_callgraph(job: dict, tree: str, snapshot_root: str | None, log_dir: Path
 
 def macro_aliases(compile: dict, tree: str, snapshot_root: str | None, runner: Runner | None = None) -> list[dict]:
     """Object-like `#define a b` (b an identifier) written in a project file, from `gcc -E -dD`."""
-    argv = bc.compile_argv(compile["arguments"], posixpath.join(tree, compile["source"]), "/dev/null")
-    cmd = ["gcc", *argv[1:-4], *snapshot_dirs(snapshot_root, compile["system_flags"]), "-E", "-dD", argv[-3]]
+    source = posixpath.join(tree, compile["source"])
+    argv = bc.compile_argv(compile["arguments"], source, "/dev/null")
     cwd = bc.absolute(compile["cwd"], tree)
-    rc, out = run_tool(cmd, cwd, GCC_TIMEOUT_S, runner=runner)
+    with tempfile.TemporaryDirectory(prefix="framac-p0-defs-") as tmp:
+        # A define after a line directive is written in the source, not in the grammar it names.
+        copy = line_directive_copy(source, Path(tmp))
+        quote = line_directive_flags(source) if copy else []
+        snap = snapshot_dirs(snapshot_root, compile["system_flags"])
+        cmd = ["gcc", *quote, *argv[1:-4], *snap, "-E", "-dD", copy or argv[-3]]
+        rc, out = run_tool(cmd, cwd, GCC_TIMEOUT_S, runner=runner)
     if rc != 0:
         return []
     return parse_defines(out, tree, cwd)
@@ -1053,6 +1207,45 @@ class ModelBuilder:
         self.pending_refs: list[
             tuple[list[str], dict, list[str], list[str], dict[str, str], dict[str, str], str, str]
         ] = []
+        # Definitions a line directive located outside their compiled source (attribute_definition):
+        # {units, loc, id}, and the tree files read to decide it.
+        self.relocated: list[dict] = []
+        self._lines: dict[str, list[str] | None] = {}
+        self._spans: dict[str, dict[str, list[tuple[int, int]]]] = {}
+
+    def file_lines(self, rel: str) -> list[str] | None:
+        """The lines of a tree file (cached), None when it cannot be read."""
+        if rel not in self._lines:
+            try:
+                text = Path(posixpath.join(self.tree, rel)).read_text(encoding="utf-8", errors="replace")
+                self._lines[rel] = text.splitlines()
+            except OSError:
+                self._lines[rel] = None
+        return self._lines[rel]
+
+    def definition_span(self, rel: str, name: str) -> tuple[int, int] | None:
+        """The lines of the one definition of `name` written in the tree file `rel`, if it has exactly one."""
+        if rel not in self._spans:
+            spans: dict[str, list[tuple[int, int]]] = defaultdict(list)
+            lines = self.file_lines(rel)
+            try:
+                found = extract_functions_from_code("\n".join(lines or []), rel)
+            except AcslSyntaxError:
+                found = []
+            for f in found:
+                spans[f["name"]].append((int(f["line"]), int(f["end_line"])))
+            self._spans[rel] = spans
+        hits = self._spans[rel].get(name) or []
+        return hits[0] if len(hits) == 1 else None
+
+    def _attribute(
+        self, units: list[str], rec: dict, rel: str | None, first: int, last: int, sources: list[str], directives: bool
+    ) -> tuple[str | None, bool]:
+        root = tree_rel(str(rec.get("root") or ""), self.tree) if rec.get("root") else None
+        file, moved = attribute_definition(rel, root, first, last, sources, directives, self.file_lines)
+        if moved:
+            self.relocated.append({"units": list(units), "loc": str(rec.get("loc") or ""), "file": file})
+        return file, moved
 
     def _record_arg_sizes(self, caller: str, callee: str, call: dict) -> None:
         sizes = call.get("arg_sizes")
@@ -1093,23 +1286,42 @@ class ModelBuilder:
             rec["kernel_names"][unit] = record["kernel_name"]
         rec.pop("kernel_name", None)
 
-    def add_dump(self, units: list[str], dump: dict, alias: dict | None = None) -> None:
+    def add_dump(
+        self,
+        units: list[str],
+        dump: dict,
+        alias: dict | None = None,
+        sources: Iterable[str] = (),
+        line_directives: bool = False,
+    ) -> None:
         """
         One parse's dump. `alias` is that parse's Alias report (scripts/phase0_alias.ml) when the
         model runs with Alias, else None: its sites match the dump's indirect calls in order.
+        `sources` are the job's compiled sources (tree-relative) and `line_directives` whether a line
+        directive was in play in the parse: they decide where each definition belongs
+        (attribute_definition). A definition moved to its compiled source takes the lines of its
+        definition there when the text has exactly one of that name, else 0 (unknown), and records the
+        location the dump gave (`relocated_from`).
         """
+        srcs = [posixpath.normpath(str(s)) for s in sources]
         alias_sites = alias_site_queues(alias)
         kmap: dict[str, str] = {}
         sig: dict[str, str] = {}
         for fn in dump.get("functions") or []:
             loc = parse_location(fn.get("loc", ""))
-            rel = tree_rel(loc[0], self.tree) if loc else None
-            if loc is None or rel is None:
+            if loc is None:
+                continue
+            first, last = int(fn.get("first_line") or loc[1]), int(fn.get("last_line") or loc[1])
+            rel, moved = self._attribute(units, fn, tree_rel(loc[0], self.tree), first, last, srcs, line_directives)
+            if rel is None:
                 continue  # Frama-C's libc, the stubs, a snapshot header: not the project's code
+            relocated: dict[str, Any] = {}
+            if moved:
+                first, last = self.definition_span(rel, fn["name"]) or (0, 0)
+                relocated["relocated_from"] = str(fn.get("loc") or "")
             fid = f"{rel}#{fn['name']}"
             kmap[fn["kernel_name"]] = fid
             sig[fn["kernel_name"]] = fn.get("signature") or ""
-            first, last = int(fn.get("first_line") or loc[1]), int(fn.get("last_line") or loc[1])
             for u in units:
                 self.add_function(
                     fid,
@@ -1120,7 +1332,7 @@ class ModelBuilder:
                         "kernel_name": fn["kernel_name"],
                         "line": first,
                         "end_line": last,
-                        "lines": max(1, last - first + 1),
+                        "lines": max(1, last - first + 1) if first else None,
                         "static": bool(fn.get("static")),
                         "inline": bool(fn.get("inline")),
                         **({"constructor": bool(fn["constructor"])} if "constructor" in fn else {}),
@@ -1131,6 +1343,7 @@ class ModelBuilder:
                         "address_taken": False,
                         "source": SOURCE_FRAMAC,
                         **_body_facts(fn, int(dump.get("schema") or 0) >= 4),
+                        **relocated,
                     },
                 )
                 if not fn.get("static"):
@@ -1139,7 +1352,11 @@ class ModelBuilder:
         flow = int(dump.get("schema") or 0) >= 6
         for g in dump.get("globals") or []:
             gloc = parse_location(g.get("loc", ""))
-            grel = tree_rel(gloc[0], self.tree) if gloc else None
+            grel = None
+            if gloc is not None and g.get("name") and not str(g["name"]).startswith("__fc_"):
+                grel, _ = self._attribute(
+                    units, g, tree_rel(gloc[0], self.tree), gloc[1], gloc[1], srcs, line_directives
+                )
             # `__fc_*`: Frama-C's own globals (string literals), not the project's.
             if grel is not None and g.get("name") and not str(g["name"]).startswith("__fc_"):
                 gid = f"{grel}#{g['name']}"
@@ -1512,7 +1729,24 @@ def build_model(
                         f"{', '.join(job['units'])}: Alias {report.get('status')} ({report.get('error', '')}); "
                         "its indirect sites keep their type match"
                     )
-            builder.add_dump(job["units"], res["dump"], report)
+            directives = res.get("line_directives")
+            if directives:
+                entry["line_directives"] = directives
+            before = len(builder.relocated)
+            builder.add_dump(
+                job["units"],
+                res["dump"],
+                report,
+                sources=[c["source"] for c in job["compiles"]],
+                line_directives=bool(directives),
+            )
+            moved = builder.relocated[before:]
+            if moved:
+                model["warnings"].append(
+                    f"{', '.join(job['units'])}: {len(moved)} definition(s) a line directive located outside "
+                    "their compiled source were attributed to it: "
+                    + "; ".join(f"{m['loc']} -> {m['file']}" for m in moved[:5])
+                )
         else:
             entry["error"] = res["error"]
             g = res["gcc"]
