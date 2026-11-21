@@ -1494,7 +1494,7 @@ _SWITCH_LABEL_RE = re.compile(r"(?:case(?![\w$])|default[ \t\r\n]*:)")
 def rewrite_misplaced_fallthrough(c_text: str) -> tuple[str, dict[str, Any]]:
     """
     Work around the Frama-C printer putting a statement's goto label before its `default:` label (sudo
-    run-1 `libparsesudoers_a`, plugins/sudoers/fmtsudoers.c:113; Frama-C 34 and 35). The source has
+    run-1 `libparsesudoers_a`, plugins/sudoers/fmtsudoers.c:113; seen with Frama-C 34.0~beta). The source has
     `FALLTHROUGH; default: print_word:` (sudo's FALLTHROUGH is `__attribute__((__fallthrough__))`), the
     kernel prints `__attribute__((__fallthrough__)); print_word: default:`, and clang stops on
     "fallthrough annotation does not directly precede switch label". Plain `frama-c -print` does the same,

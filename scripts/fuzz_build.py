@@ -2773,8 +2773,12 @@ def repair_sources_for_link(
                 definers = _dag_function_definers(dp)
             recs = definers.get(sym) or [{"file": f, "module": fn_mod, "units": []}]
             kept = [r for r in recs if _dag_tree_path(r["file"]) not in excluded]
-            if len(kept) > 1:
-                # Several programs define it: link the one of this module's unit, never the first listed.
+            if not kept:
+                _stub_function(sym, recs[0]["file"], _excluded_reason(recs[0]["file"]), recs)
+                continue
+            if len(recs) > 1:
+                # Several programs define it: link the one of this module's unit, never the first listed
+                # (nor the one an excluded file leaves: sudo's stubs.c beside an excluded interfaces.c).
                 ctx = ctx or _link_unit_context(dp, module, sources=sources)
                 action, rec, reason = _place_function(kept, ctx, {_dag_tree_path(h) for h in have})
                 if action == "add":
@@ -2782,11 +2786,8 @@ def repair_sources_for_link(
                 else:
                     _stub_function(sym, rec["file"], reason, recs)
                     continue
-            elif kept:
-                f = kept[0]["file"]
             else:
-                _stub_function(sym, recs[0]["file"], _excluded_reason(recs[0]["file"]), recs)
-                continue
+                f = kept[0]["file"]
         elif sym in build_only_syms:
             # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed,
             # unless the target fuzzer's link leaves their file out.
@@ -2898,19 +2899,39 @@ def repair_sources_for_link(
             removed.add(stub_file.as_posix())
             with contextlib.suppress(OSError):
                 stub_file.unlink()
-    if (new_fn_stubs or new_bss_stubs) and stub_dir is not None:
-        stub_dir.mkdir(parents=True, exist_ok=True)
+    # A function is defined once too: a stub placed because no definer could be linked (`definers`:
+    # several programs define it, or its file is excluded) goes when a file this round links in is
+    # one of its definers, in either order. An address-flow cluster's stubs (no `definers`) stay.
+    prior_fns = list(stubbed_functions or [])
+    fn_dropped: list[dict] = []
+    if added:
+        added_tree = {_dag_tree_path(a) for a in added}
+
+        def _fn_linked(stub: dict) -> bool:
+            return any(d in added_tree for d in stub.get("definers") or [])
+
+        new_fn_stubs = [s for s in new_fn_stubs if not _fn_linked(s)]
+        fn_dropped = [s for s in prior_fns if _fn_linked(s)]
+    kept_fns = [s for s in prior_fns if s not in fn_dropped]
+    if (new_fn_stubs or new_bss_stubs or fn_dropped) and stub_dir is not None:
         fn_file = stub_dir / LINK_STUBS_FILE
-        fn_file.write_text(
-            link_stubs_source([*(stubbed_functions or []), *new_fn_stubs], [*prior_bss, *new_bss_stubs], module),
-            encoding="utf-8",
-            newline="\n",
-        )
-        if fn_file.as_posix() not in have:
-            have.add(fn_file.as_posix())
-            added.append(fn_file.as_posix())
+        if kept_fns or new_fn_stubs or prior_bss or new_bss_stubs:
+            stub_dir.mkdir(parents=True, exist_ok=True)
+            fn_file.write_text(
+                link_stubs_source([*kept_fns, *new_fn_stubs], [*prior_bss, *new_bss_stubs], module),
+                encoding="utf-8",
+                newline="\n",
+            )
+            if fn_file.as_posix() not in have:
+                have.add(fn_file.as_posix())
+                added.append(fn_file.as_posix())
+        else:
+            # No function or global left to define: the file leaves the build.
+            removed.add(fn_file.as_posix())
+            with contextlib.suppress(OSError):
+                fn_file.unlink()
     new_stubs = [*new_c_stubs, *new_bss_stubs]
-    changed = added or new_stubs or new_fn_stubs or dropped
+    changed = added or new_stubs or new_fn_stubs or dropped or fn_dropped
     info: dict = {"symbols": resolved, "added_sources": added} if changed else {}
     if new_stubs:
         info["stubbed_globals"] = new_stubs
@@ -2918,6 +2939,8 @@ def repair_sources_for_link(
         info["stubbed_functions"] = new_fn_stubs
     if dropped:
         info["unstubbed_globals"] = [s["name"] for s in dropped]
+    if fn_dropped:
+        info["unstubbed_functions"] = [s["name"] for s in fn_dropped]
     return [s for s in [*sources, *added] if s.replace("\\", "/") not in removed], info
 
 
@@ -2997,6 +3020,9 @@ def repair_link_rounds(
             gone = set(info.get("unstubbed_globals") or [])
             stubbed = [s for s in stubbed if s["name"] not in gone]
             round_stubbed = [s for s in round_stubbed if s["name"] not in gone]
+            gone_fns = set(info.get("unstubbed_functions") or [])
+            stubbed_fns = [s for s in stubbed_fns if s["name"] not in gone_fns]
+            round_stubbed_fns = [s for s in round_stubbed_fns if s["name"] not in gone_fns]
             stubbed += new_g
             stubbed_fns += new_f
             round_stubbed += new_g

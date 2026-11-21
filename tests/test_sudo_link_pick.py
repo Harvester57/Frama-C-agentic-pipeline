@@ -177,7 +177,10 @@ SLP_FILES = {
     # The parser library calls open_cfg, which each program defines for itself (sudo's open_sudoers).
     "parse/gram.c": "int open_cfg(const char *p);\nint util_fn(void);\nint parse(void) { return open_cfg(0) + util_fn(); }\n",
     "util/util.c": "int util_fn(void) { return 0; }\n",
-    "progs/cvt.c": "int open_cfg(const char *p) { return p != 0; }\nint main(void) { return open_cfg(0); }\n",
+    "progs/cvt.c": (
+        "int open_cfg(const char *p) { return p != 0; }\nint cvt_only(void) { return 1; }\n"
+        "int main(void) { return open_cfg(0); }\n"
+    ),
     "progs/visudo.c": "int open_cfg(const char *p) { return 2; }\nint main(void) { return open_cfg(0); }\n",
     # A library that links the one defining it: that one is linked.
     "open/open.c": "int open_cfg(const char *p) { return 3; }\n",
@@ -210,6 +213,7 @@ def _slp_run(tmp_path: Path) -> Path:
             # cvt.c first: the definer the DAG lists first, which the repair used to link.
             _slp_fn("open_cfg", "progs/cvt.c", "cvt", "progs/.libs/cvt"),
             _slp_fn("main", "progs/cvt.c", "cvt", "progs/.libs/cvt"),
+            _slp_fn("cvt_only", "progs/cvt.c", "cvt", "progs/.libs/cvt"),
             _slp_fn("open_cfg", "progs/visudo.c", "visudo", "progs/.libs/visudo"),
             _slp_fn("main", "progs/visudo.c", "visudo", "progs/.libs/visudo"),
             _slp_fn("open_cfg", "open/open.c", "libopen_a", SLP_OPEN_UNIT),
@@ -318,6 +322,47 @@ def test_link_repair_rounds_stub_it_and_stop(tmp_path, monkeypatch):
     assert not any("progs/" in s for s in current)
 
 
+@pytest.mark.parametrize("order", [("open_cfg", "cvt_only"), ("cvt_only", "open_cfg")])
+def test_no_stub_is_kept_for_a_function_a_file_the_same_round_links_defines(tmp_path, monkeypatch, order):
+    """cvt_only has one definer, cvt.c, which also defines open_cfg: a stub of it would be a second definition."""
+    dag = _slp_run(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    stub_dir = _slp_stub_dir("libparse_a")
+    sources = ["workspace/work/parse/gram.c"]
+    repaired, info = fuzz_build.repair_sources_for_link(
+        sources, _slp_undef(*order), dag, tmp_path, module="libparse_a", stub_dir=stub_dir
+    )
+    assert repaired == [*sources, "workspace/work/progs/cvt.c"]
+    assert "stubbed_functions" not in info
+    assert not (stub_dir / fuzz_build.LINK_STUBS_FILE).exists()
+
+
+def test_a_later_round_that_links_a_definer_drops_the_function_stub(tmp_path, monkeypatch):
+    dag = _slp_run(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out_bin = Path("workspace/harnesses/fuzz_libparse_a")
+    stubs_file = (_slp_stub_dir("libparse_a") / fuzz_build.LINK_STUBS_FILE).as_posix()
+    first = {"returncode": 1, "stdout": "", "stderr": _slp_undef("open_cfg")}
+    logs = [_slp_undef("cvt_only"), ""]
+    calls: list[list[str]] = []
+
+    def rebuild(srcs: list[str]) -> dict:
+        calls.append(list(srcs))
+        log = logs.pop(0)
+        return {"returncode": 1 if log else 0, "stdout": "", "stderr": log}
+
+    comp, current, record = fuzz_build.repair_link_rounds(
+        first, ["workspace/work/parse/gram.c"], rebuild, dag, out_bin, link_module="libparse_a"
+    )
+    assert comp["returncode"] == 0, calls
+    assert calls[0] == ["workspace/work/parse/gram.c", stubs_file]
+    assert current == ["workspace/work/parse/gram.c", "workspace/work/progs/cvt.c"]
+    assert record is not None
+    assert record["rounds"][1]["unstubbed_functions"] == ["open_cfg"]
+    assert "stubbed_functions" not in record and "functions_file" not in record
+    assert not Path(stubs_file).exists()
+
+
 # ---------------------------------------------------------------------------
 # C. A file the target fuzzer's link leaves out is never linked back
 # ---------------------------------------------------------------------------
@@ -330,7 +375,13 @@ SLP_TF_FILES = {
         '#include "audit.h"\nchar *audit_msg = "real";\nint audit_count;\n'
         "int audit_success(void) { return ++audit_count; }\nint audit_failure(void) { return 0; }\n"
     ),
-    "plugin/policy.c": '#include "audit.h"\nint policy_check(void) { return audit_success() + audit_count; }\n',
+    "plugin/policy.c": (
+        '#include "audit.h"\nint iface_get(void);\n'
+        "int policy_check(void) { return audit_success() + audit_count + iface_get(); }\n"
+    ),
+    # sudo's get_interfaces: interfaces.c (excluded) and stubs.c (testsudoers', visudo's) define it.
+    "plugin/iface.c": "int iface_get(void) { return 1; }\nint iface_set(void) { return 0; }\n",
+    "progs/stubs.c": "int iface_get(void) { return 0; }\nint stubs_only(void) { return 0; }\n",
     # sudo's regress/fuzz/fuzz_policy.c: overrides audit_msg and audit_failure.
     "plugin/fuzz/fuzz_pol.c": (
         '#include "../audit.h"\nchar *audit_msg = "fuzz";\nint audit_failure(void) { return 1; }\n'
@@ -354,10 +405,14 @@ def _slp_tf_run(tmp_path: Path) -> Path:
             _slp_fn("audit_success", "plugin/audit.c", "plugin_so", SLP_PLUGIN_UNIT),
             _slp_fn("audit_failure", "plugin/audit.c", "plugin_so", SLP_PLUGIN_UNIT),
             _slp_fn("policy_check", "plugin/policy.c", "plugin_so", SLP_PLUGIN_UNIT),
+            _slp_fn("iface_get", "plugin/iface.c", "plugin_so", SLP_PLUGIN_UNIT),
+            _slp_fn("iface_set", "plugin/iface.c", "plugin_so", SLP_PLUGIN_UNIT),
+            _slp_fn("iface_get", "progs/stubs.c", "tsudo", "progs/.libs/tsudo"),
+            _slp_fn("stubs_only", "progs/stubs.c", "tsudo", "progs/.libs/tsudo"),
             _slp_fn("audit_failure", "plugin/fuzz/fuzz_pol.c", "fuzz_pol", "plugin/fuzz_pol"),
         ]
     )
-    files = ["plugin/audit.c", "plugin/policy.c"]
+    files = ["plugin/audit.c", "plugin/policy.c", "plugin/iface.c"]
     dag = {
         "functions": functions,
         "module_kind": "link_unit",
@@ -379,7 +434,10 @@ def _slp_tf_run(tmp_path: Path) -> Path:
             "source": "workspace/work/plugin/fuzz/fuzz_pol.c",
             "link": {
                 "from": "unit",
-                "excluded_sources": [{"source": "plugin/audit.c", "symbols": ["audit_failure", "audit_msg"]}],
+                "excluded_sources": [
+                    {"source": "plugin/audit.c", "symbols": ["audit_failure", "audit_msg"]},
+                    {"source": "plugin/iface.c", "symbols": ["iface_set"]},
+                ],
             },
         },
     }
@@ -433,6 +491,19 @@ def test_an_excluded_source_is_recorded_unresolved_without_a_build_directory(tmp
     assert [u["name"] for u in fns] == ["audit_success"]
     assert [u["name"] for u in globs] == ["audit_count"]
     assert "leaves plugin/audit.c out" in globs[0]["reason"]
+
+
+def test_the_one_definer_an_excluded_file_leaves_is_placed_like_any_other(tmp_path, monkeypatch):
+    """sudo's get_interfaces: interfaces.c is excluded, stubs.c belongs to the test programs; neither links."""
+    dag = _slp_tf_run(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    stub_dir = _slp_stub_dir("tf_fuzz_pol")
+    repaired, info = fuzz_build.repair_sources_for_link(
+        SLP_TF_SOURCES, _slp_undef("iface_get"), dag, tmp_path, module="tf_fuzz_pol", stub_dir=stub_dir
+    )
+    assert not any(s.endswith(("progs/stubs.c", "plugin/iface.c")) for s in repaired)
+    (fn,) = info["stubbed_functions"]
+    assert fn["name"] == "iface_get" and fn["definers"] == ["plugin/iface.c", "progs/stubs.c"]
 
 
 def test_the_unit_harness_still_links_the_file_the_target_fuzzer_leaves_out(tmp_path, monkeypatch):
