@@ -311,7 +311,48 @@ The pipeline puts this directory first on the Frama-C include path and force-inc
   left out; nginx's uses in Eva).
 - **Force-included headers** now also include `<sched.h>`, `<netinet/in.h>` and `<netinet/tcp.h>` in every
   Eva / WP parse.
+- sudo's names (run-1, 2026-11-21; each stopped a unit, `tests/test_fc_glibc_gaps.py` checks them):
+  - glibc's internal type names (`__pid_t`, `__uid_t`, ... 46 typedefs of glibc 2.41's x86_64
+    `<bits/types.h>`, glibc's exact types), which glibc's `<sys/procfs.h>` uses through `-idirafter`.
+    `FC_STUBS_NO_GLIBC_INTERNAL_TYPES` drops them.
+  - The Linux `RLIMIT_*` names `__fc_libc` lacks (`RLIMIT_RSS` ... `RLIMIT_RTTIME`, `RLIMIT_NLIMITS`,
+    `RLIM_NLIMITS`, `RLIMIT_OFILE`), numbered after `__fc_libc`'s seven so no two collide (glibc's values
+    differ; only the names are portable). `FC_STUBS_NO_RLIMIT_DECLS`.
+  - `RTLD_NEXT` and `RTLD_DEFAULT` (glibc's pseudo-handles), the GNU `FNM_*` flags
+    (`FNM_CASEFOLD`, `FNM_LEADING_DIR`, `FNM_EXTMATCH`, `FNM_FILE_NAME`, `FNM_NOSYS`,
+    `FC_STUBS_NO_FNMATCH_DECLS`), and the lockf commands `F_ULOCK` ... `F_TEST` (`__fc_libc` declares
+    `lockf` without them). Each `#ifndef`-guarded.
+  - `mkdirat`, with `__fc_libc`'s `mkdir` contract plus the descriptor (`FC_STUBS_NO_MKDIRAT_DECL`).
+    It includes `<sys/types.h>` and `__fc_string_axiomatic.h`, not `<sys/stat.h>`, which includes
+    `<errno.h>`.
 - All of these sit in the `__fc_libc` branch only: E-ACSL builds take the real glibc declarations.
+
+## `__fc_libc` headers with glibc's structures (`fc_libc/`, Eva / WP)
+
+A structure `__fc_libc` declares with fewer members than glibc cannot be completed from this directory:
+Frama-C's `-I<share>/libc` comes first, and pre-empting the header from `fc_compat_types.h` would put its
+names (`EMPTY`, `ut_time`, `struct group`) and its includes (`<stdio.h>`, `<errno.h>`) in every unit.
+[`../../scripts/fc_cpp_wrapper.py`](../../scripts/fc_cpp_wrapper.py) (`with_libc_overrides`) puts
+[`./fc_libc/`](./fc_libc/grp.h) on the preprocessor's include path right before `__fc_libc`'s, whenever
+`__fc_libc` is read (never in the E-ACSL frontend). Its headers are `__fc_libc`'s own (guard, includes,
+contracts, the `fc_stdlib` marking) with glibc's structure, and a unit reads one only when it includes it:
+
+- [`./fc_libc/grp.h`](./fc_libc/grp.h): `struct group` with `gr_passwd` (sudo's group plugin).
+- [`./fc_libc/utmpx.h`](./fc_libc/utmpx.h): glibc 2.41's x86_64 `struct utmpx` with `ut_exit` and
+  `ut_session`; `ut_tv` is glibc's 32-bit pair, and `ut_exit`'s members answer to both glibc spellings.
+
+`FRAMAC_CPP_REWRITE=off` turns the wrapper off and `__fc_libc`'s headers come back. `__fc_libc.h`, which
+includes every libc header with quotes, still reads `__fc_libc`'s. `stub_check.py shipped` skips the
+directory (`<fc_libc/grp.h>` is not a real header); the layouts are compared with glibc's by the test.
+
+## `<link.h>`
+
+`__fc_libc` has no `<link.h>`, and glibc's stops Frama-C twice (GCC vector types in `<bits/link.h>`,
+`struct dl_phdr_info` behind `__USE_GNU`), in the E-ACSL frontend too. [`./link.h`](./link.h) includes
+[`./fc_link.h`](./fc_link.h) under `__FRAMAC__` (glibc's names and layouts, `dl_iterate_phdr` with a
+contract that cannot state the callback's calls) and `#include_next`s glibc's otherwise. The declarations
+are in `fc_link.h` because `stub_check.py shipped` compiles `link.h` without `_GNU_SOURCE`, where glibc's
+`struct dl_phdr_info` is incomplete.
 - The header assumes x86_64 LP64 (ioctl encoding, syscall numbers, `long` literals) and says so
   with a `_Static_assert` on `sizeof(long)` and `sizeof(void *)`: another machdep stops at parse time.
 - **What to add next:** [`../../scripts/libc_gap_report.py`](../../scripts/libc_gap_report.py) lists, over
