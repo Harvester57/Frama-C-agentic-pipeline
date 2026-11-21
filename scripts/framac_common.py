@@ -77,6 +77,19 @@ _STATUS_MAP = {
 # The formal Frama-C gives a variadic definition's `...`: `f(int n, ...)` is in the model as
 # `f(int n, void * const *__va_params)`, with a signature that no longer ends in `...`.
 VA_PARAMS = "__va_params"
+# The Variadic plugin translates a declaration too: Printer.pp_vdecl prints `long ptrace(enum
+# __ptrace_request __request, ...)` as `..., void * const *__va_params)`. Its `(` or `,`, the formal, and the `)`.
+_VA_PARAMS_FORMAL_RE = re.compile(rf"([(,])\s*void\s*\*\s*const\s*\*\s*{VA_PARAMS}\s*\)")
+
+
+def restore_variadic_proto(proto: str) -> str:
+    """
+    The C prototype of a declaration as the source wrote it: the Variadic plugin's `__va_params` formal
+    back to `...` (sudo run-1: a stub overlay redeclared glibc's `ptrace(enum __ptrace_request, ...)` with the
+    translated formal, a conflicting type for gcc). Anything after the parameter list (`__attribute__`) is kept.
+    """
+    return _VA_PARAMS_FORMAL_RE.sub(lambda m: "(...)" if m.group(1) == "(" else ", ...)", proto, count=1)
+
 
 # A prover's wall-clock budget per profile (docs/guides/v2-design.md Section 9): the brief states it and the
 # scheduler enforces it, so both read it here. FRAMAC_PROVER_WALL_BUDGET_S overrides it.

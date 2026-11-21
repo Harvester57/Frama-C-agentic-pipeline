@@ -69,8 +69,8 @@ them and restarts at the model; a model that parses clears it.
 
 Version 2 of the model (`schema_version`) records `external_calls`, `kernel_names`, `formals`, `writes`
 and `param_sizes` on its functions; (S2 of docs/plans/templates-and-stubs-improvement-plan.md) each external's
-first declaration and C text under `external_decls`, from which scripts/stub_gen.py writes the stub skeletons
-(a model without it gets no skeletons); and, from dump schema 4 on, the parsed functions' `call_sites`
+first declaration and C text under `external_decls` (a variadic one with its `...`: declared_record), from
+which scripts/stub_gen.py writes the stub skeletons (a model without it gets no skeletons); and, from dump schema 4 on, the parsed functions' `call_sites`
 (each direct call with its string-literal arguments); from dump schema 6 on, the address flow the unit split
 reads (scripts/unit_split.py): the parsed functions' `address_refs` (functions whose address the body takes)
 and `global_refs` (globals it names), and the `init_functions` and `init_globals` each global's initializer
@@ -111,6 +111,7 @@ from framac_common import (  # noqa: E402
     fold_messages,
     is_pre_c99_std,
     load_json_optional,
+    restore_variadic_proto,
     utc_now,
 )
 from kernel_ast import compile_dump_module  # noqa: E402
@@ -253,6 +254,16 @@ def header_declared_functions(model: dict, header: str) -> set[str]:
         if loc_file == norm_h:
             decls.add(name)
     return decls
+
+
+def declared_record(d: dict) -> dict:
+    """
+    One `external_decls` entry from a dump's declared function: its first declaration (`decl`), its C text
+    as the source wrote it (`proto`: the Variadic plugin's `__va_params` formal back to `...`, so a stub
+    redeclaration matches the real prototype and stub_check never calls it with a fabricated pointer), and
+    the kernel's `signature` (translated, as for definitions: `__va_params` still marks the variadic ones).
+    """
+    return {"decl": d["decl"], "proto": restore_variadic_proto(str(d["proto"])), "signature": d.get("signature") or ""}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1164,9 +1175,7 @@ class ModelBuilder:
             if d.get("name") and d.get("formals") is not None:
                 self.declared_formals.setdefault(d["name"], d["formals"])
             if d.get("name") and d.get("decl") and d.get("proto"):
-                self.declared_info.setdefault(
-                    d["name"], {"decl": d["decl"], "proto": d["proto"], "signature": d.get("signature") or ""}
-                )
+                self.declared_info.setdefault(d["name"], declared_record(d))
         taken_names = list(dump.get("address_taken") or [])
         for k in taken_names:
             if k in kmap:

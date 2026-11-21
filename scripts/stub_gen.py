@@ -23,8 +23,13 @@ frontend (eacsl_toolchain.build_eacsl_flag_sets), ahead of templates/fc_stubs.
      includes the header that declares it (`json-c/json.h`): the overlay header includes the real one
      (`#include_next`), then redeclares the functions with their contracts. A header that the library
      reaches only through a quoted sibling include (`#include "json_object.h"` inside json.h) is never
-     looked up on the include path, so the overlay shadows the sibling that includes it instead.
-  3. A new block is a skeleton: the real prototype and a conservative frame derived from the signature
+     looked up on the include path, so the overlay shadows the sibling that includes it instead. A header
+     that refuses to be included on its own (an `#error` naming the header to include "directly":
+     glibc 2.41 declares `ptrace` in <bits/ptrace-shared.h>, which demands <sys/ptrace.h>) is never
+     shadowed either: the overlay shadows the header its `#error` names.
+  3. A new block is a skeleton: the real prototype (a variadic one with its `...`, not the Variadic
+     plugin's `void * const *__va_params` that the model's dump printed: framac_common.restore_variadic_proto;
+     its clauses name the fixed parameters only) and a conservative frame derived from the signature
      (const pointers are read only; a pointer followed by its length bounds a range: `\\valid_read` or
      `\\valid` and, when written, `assigns p[0 .. n - 1]`; a fixed-size array parameter bounds its own
      range; any other written pointer `assigns *p`; a result `assigns \\result`; one `\\from` listing every
@@ -33,7 +38,10 @@ frontend (eacsl_toolchain.build_eacsl_flag_sets), ahead of templates/fc_stubs.
      until a stub author (the judgment half: skills/framac-slice/stub_author_brief.md) fills the contract
      from the library's documentation and removes the guard and the TODO line.
   4. Existing blocks are never rewritten: `run` only appends the blocks of functions it has not written
-     yet, so re-running it after the author keeps the author's contracts.
+     yet, so re-running it after the author keeps the author's contracts. Two exceptions, both on drafts
+     only: a draft that redeclares the `__va_params` translation is rewritten, and a header of drafts only
+     whose functions all moved to another header (an older run's shadow of a header that refuses direct
+     inclusion) is deleted (`removed` in the report).
   5. The report, workspace/reports/stubs.json, records each overlay header with its sha256 and each
      function's state: `draft` (still guarded), `incomplete` (guard removed, TODO left, or no `assigns`),
      `filled`, or `manual` (a header someone wrote without the markers). `ledger.py record-stub-contracts`
@@ -67,7 +75,15 @@ from acsl_ast import (  # noqa: E402
     tokenize_c_acsl,
 )
 from c_definitions import return_type_tokens, returns_void  # noqa: E402
-from framac_common import STUB_OVERLAY_REL, STUB_REPORT_REL, atomic_write_json, load_json_optional, utc_now  # noqa: E402
+from framac_common import (  # noqa: E402
+    STUB_OVERLAY_REL,
+    STUB_REPORT_REL,
+    VA_PARAMS,
+    atomic_write_json,
+    load_json_optional,
+    restore_variadic_proto,
+    utc_now,
+)
 from kernel_ast import parse_location  # noqa: E402
 from patterns import ASSIGNS_RE  # noqa: E402
 
@@ -85,6 +101,13 @@ DEFAULT_SYSTEM_DIRS = ("/usr/local/include", "/usr/include/x86_64-linux-gnu", "/
 # headers Frama-C's libc lacks under `libc/` (scripts/target_env.py). Both hold absolute paths.
 _SNAPSHOT_ROOT_RE = re.compile(r"^(?P<root>.*?/workspace/snapshot/(?:root|libc))(?P<path>/.+)$")
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+# A header that refuses to be included on its own names the one to include instead in an `#error`:
+# glibc's `# error "Never use <bits/ptrace-shared.h> directly; include <sys/ptrace.h> instead."`, GLib's
+# `#error "Only <glib.h> can be included directly."`.
+_DIRECT_INCLUDE_ERROR_RE = re.compile(r"^[ \t]*#[ \t]*error\b(?P<msg>[^\n]*\bdirectly\b[^\n]*)$", re.MULTILINE | re.I)
+_ANGLE_NAME_RE = re.compile(r"<([^<>\s]+)>")
+# A draft block written from a model that kept the Variadic plugin's translation (before restore_variadic_proto).
+_TRANSLATED_DECL_RE = re.compile(rf"\bvoid\s*\*\s*const\s*\*\s*{VA_PARAMS}\s*\)")
 _INCLUDE_DIR_OPTIONS = ("-isystem", "-idirafter", "-iquote", "-I")
 _LENGTH_NAME_RE = re.compile(r"(?:^|_)(?:n|len|length|size|sz|cap|capacity|count|nbytes|bytes|max|maxlen)$|len$|size$")
 _ARRAY_PARAM_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\[\s*(\d+)\s*\]")
@@ -203,6 +226,60 @@ def entry_header(real: Path, limit: int = 8) -> Path:
     return current
 
 
+def public_header_name(real: Path, sys_path: str) -> str | None:
+    """
+    The header to include instead of `real` when it refuses to be included on its own: the first other
+    `<name>` of an `#error` that says "directly" (glibc's bits/ headers, GLib's sub-headers). None otherwise.
+    """
+    try:
+        text = real.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for m in _DIRECT_INCLUDE_ERROR_RE.finditer(text):
+        for name in _ANGLE_NAME_RE.findall(m.group("msg")):
+            if name != posixpath.basename(sys_path) and not sys_path.endswith("/" + name):
+                return name
+    return None
+
+
+def resolve_include(name: str, roots: list[str], read_prefix: str = "") -> str | None:
+    """The path on the build's system of `#include <name>`: the first include root (longest first) holding it."""
+    for root in roots:
+        candidate = posixpath.join(root, name)
+        if Path(read_prefix + candidate).is_file():
+            return candidate
+    return None
+
+
+def shadow_header(
+    real: Path, sys_path: str, roots: list[str], read_prefix: str = "", limit: int = 4
+) -> tuple[str, str]:
+    """
+    (path on the build's system, include name) of the header the overlay shadows for a declaration in
+    `real`: its quoted-include entry (entry_header), then, while that one refuses to be included on its
+    own, the header its `#error` names. A shadow of such a header could never be included by stub_check's
+    ABI probe, and the target never includes it either. sudo run-1 (glibc 2.41): `ptrace` is declared in
+    <bits/ptrace-shared.h>, whose guard demands <sys/ptrace.h>.
+    """
+    for _ in range(limit):
+        entry_path = entry_header(real) if real.is_file() else real
+        entry_sys = posixpath.join(posixpath.dirname(sys_path), entry_path.name)
+        public = public_header_name(entry_path, entry_sys) if entry_path.is_file() else None
+        if public is None:
+            return entry_sys, include_name(entry_sys, roots)
+        found = resolve_include(public, roots, read_prefix)
+        if found is None:
+            # Not under a root here: the name the guard demands is still the one the target includes.
+            return public, public
+        real, sys_path = Path(read_prefix + found), found
+    return sys_path, include_name(sys_path, roots)
+
+
+def without_va_params(proto: str, formals: list[dict]) -> tuple[str, list[dict]]:
+    """The prototype as the source wrote it (`...`) and its named formals, the Variadic plugin's one dropped."""
+    return restore_variadic_proto(proto), [f for f in formals if f.get("name") != VA_PARAMS]
+
+
 # ---------------------------------------------------------------------------
 # Skeletons
 # ---------------------------------------------------------------------------
@@ -268,6 +345,13 @@ def skeleton_contract(proto: str, formals: list[dict]) -> list[str]:
             "\\from lists every parameter; add what the function reads through them (src[0 .. n - 1]), mark "
             "`indirect:` a pointer that only says where it writes (Eva writes a garbled mix of a direct "
             "pointer source's addresses), never drop a source the documentation does not rule out"
+        )
+    if re.search(r"\.\.\.\s*\)", proto):
+        # A contract on a `...` prototype names its fixed parameters only, as Frama-C's libc does (prctl,
+        # warnx); the Variadic plugin keeps it when it translates the declaration and each call.
+        notes.append(
+            "variadic (`...`): the clauses can name the fixed parameters only; say in a comment what the "
+            "documentation says the function reads or writes through the variable arguments"
         )
     lines = [*requires, f"assigns {frame}{from_part};"]
     return [*(f"// {TODO_MARK}: {n}" for n in notes), *lines]
@@ -374,17 +458,12 @@ def plan_headers(model: dict, capture: dict, read_root: str = "") -> tuple[dict[
             others[kind].append(entry)
             continue
         assert info is not None
-        sys_path, _ = system_path(path)
-        real = Path(read_root + path) if read_root else Path(path)
-        entry_path = entry_header(real) if real.is_file() else real
-        entry_sys = posixpath.join(posixpath.dirname(sys_path), entry_path.name)
-        hname = include_name(entry_sys, roots)
+        sys_path, prefix = system_path(path)
+        real = Path(read_root + path)
+        entry_sys, hname = shadow_header(real, sys_path, roots, read_root + prefix)
         rec = headers.setdefault(hname, {"real": entry_sys, "functions": {}})
-        rec["functions"][name] = {
-            "declared_in": sys_path,
-            "proto": str(info.get("proto") or ""),
-            "formals": formals.get(name) or [],
-        }
+        proto, named = without_va_params(str(info.get("proto") or ""), formals.get(name) or [])
+        rec["functions"][name] = {"declared_in": sys_path, "proto": proto, "formals": named}
     return headers, others
 
 
@@ -398,6 +477,13 @@ def write_overlay(overlay: Path, headers: dict[str, dict]) -> list[str]:
             continue  # a header written by hand without the markers: never touched
         text = old if old is not None else header_preamble(hname, rec["real"])
         have = split_blocks(text)
+        for fn, block in list(have.items()):
+            # A draft that redeclares the Variadic plugin's translation conflicts with the real prototype
+            # (gcc: conflicting types): written before restore_variadic_proto, rewritten from the model.
+            info = rec["functions"].get(fn)
+            if info and info["proto"] and block_state(block) == "draft" and _TRANSLATED_DECL_RE.search(block):
+                text = text.replace(block.rstrip("\n") + "\n", "", 1)
+                del have[fn]
         new = [
             draft_block(fn, info["proto"], info["formals"])
             for fn, info in sorted(rec["functions"].items())
@@ -410,6 +496,31 @@ def write_overlay(overlay: Path, headers: dict[str, dict]) -> list[str]:
         path.write_text(text, encoding="utf-8", newline="\n")
         written.append(path.as_posix())
     return written
+
+
+def retire_superseded(overlay: Path, headers: dict[str, dict]) -> dict[str, dict[str, str]]:
+    """
+    Delete the overlay headers this script wrote that hold drafts only, every one of them now planned in
+    another header (an older run shadowed a header that refuses direct inclusion: sudo run-1's
+    bits/ptrace-shared.h). A filled block is never deleted: its header stays, and stub_check keeps
+    reporting it until its author moves the contract. Returns {run-relative path: {function: new header}}.
+    """
+    placed = {fn: hname for hname, rec in headers.items() for fn in rec["functions"]}
+    removed: dict[str, dict[str, str]] = {}
+    if not overlay.is_dir():
+        return removed
+    for path in sorted(p for p in overlay.rglob("*.h") if p.is_file()):
+        rel = path.relative_to(overlay).as_posix()
+        if rel in headers:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        blocks = split_blocks(text)
+        if not blocks or "#include_next" not in text:
+            continue
+        if all(block_state(b) == "draft" and placed.get(fn) not in (None, rel) for fn, b in blocks.items()):
+            path.unlink()
+            removed[path.as_posix()] = {fn: placed[fn] for fn in sorted(blocks)}
+    return removed
 
 
 def describe_overlay(overlay: Path, headers: dict[str, dict], callers: dict[str, list[str]]) -> dict[str, dict]:
@@ -466,11 +577,13 @@ def cmd_run(model_path: Path, capture_path: Path, overlay: Path, out: Path, read
         headers: dict[str, dict] = {}
         others: dict[str, list] = {"unknown": [{"function": n} for n in sorted(model.get("externals") or [])]}
         written: list[str] = []
+        removed: dict[str, dict[str, str]] = {}
     else:
         report["status"] = "ok"
         headers, others = plan_headers(model, capture, read_root)
         overlay.mkdir(parents=True, exist_ok=True)
         written = write_overlay(overlay, headers)
+        removed = retire_superseded(overlay, headers)
     for entries in others.values():
         for e in entries:
             e["callers"] = callers.get(e["function"], [])
@@ -482,6 +595,7 @@ def cmd_run(model_path: Path, capture_path: Path, overlay: Path, out: Path, read
     report.update(
         overlay_digest=overlay_digest(overlay),
         written=written,
+        removed=removed,
         headers=described,
         other_externals={k: v for k, v in others.items() if v},
         counts=dict(sorted(counts.items())),
@@ -489,7 +603,14 @@ def cmd_run(model_path: Path, capture_path: Path, overlay: Path, out: Path, read
     atomic_write_json(out, report)
     print(
         json.dumps(
-            {"ok": True, "status": report["status"], "headers": len(described), "written": written, "counts": counts}
+            {
+                "ok": True,
+                "status": report["status"],
+                "headers": len(described),
+                "written": written,
+                "removed": sorted(removed),
+                "counts": counts,
+            }
         )
     )
     return 0
