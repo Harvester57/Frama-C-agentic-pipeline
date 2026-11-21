@@ -23,6 +23,11 @@
     "test_command": {"type": ["string", "null"]},
     "test_units": {"type": "array", "items": {"type": "string"}},
     "executables": {"type": "array", "items": {"type": "string"}},
+    "library_path": {
+      "$comment": "the tree's shared-library directories put before the recipe's LD_LIBRARY_PATH for the runs",
+      "type": "array",
+      "items": {"type": "string"}
+    },
     "functions": {
       "type": "object",
       "properties": {

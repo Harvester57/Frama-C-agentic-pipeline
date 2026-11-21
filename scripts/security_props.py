@@ -415,7 +415,8 @@ class _Model:
                     why.append(f"{w['pointer']} write(s) through a pointer")
             elif f.get("source") == "gcc-callgraph-info" or not self.has_writes:
                 sig = str(f.get("signature") or "")
-                if "(" in sig and "*" in sig[sig.find("(") :]:
+                params_at = _params_open(sig)
+                if params_at >= 0 and "*" in sig[params_at:]:
                     why.append("pointer parameter (no write facts in the model)")
             libc = sorted(set(f.get("external_calls") or []) & MEMORY_WRITERS)
             if libc:
@@ -439,11 +440,32 @@ def _ident(text: str) -> str:
     return re.sub(r"\W", "_", text)
 
 
+def _params_open(sig: str) -> int:
+    """
+    Index of the `(` opening a model signature's parameter list: the match of its last `)`, not its
+    first `(`, which may open an attribute (sudo's `sudo_dso_public`:
+    `unsigned long __attribute__((__visibility__("default")))(char *,unsigned char *,unsigned long)`).
+    -1 when the signature does not end in a parameter list.
+    """
+    if not sig.endswith(")"):
+        return -1
+    depth = 0
+    for i in range(len(sig) - 1, -1, -1):
+        if sig[i] == ")":
+            depth += 1
+        elif sig[i] == "(":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
 def _split_params(sig: str) -> list[str]:
     """The parameter types of a model signature `ret(T1,T2)`, split at its top-level commas."""
     types: list[str] = []
-    if sig.endswith(")") and "(" in sig:
-        depth, start = 0, sig.index("(") + 1
+    open_idx = _params_open(sig)
+    if open_idx >= 0:
+        depth, start = 0, open_idx + 1
         for i in range(start, len(sig)):
             c = sig[i]
             if c in "([":

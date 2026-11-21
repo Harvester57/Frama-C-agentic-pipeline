@@ -30,7 +30,9 @@ seed inputs for each harness module, in the byte layout that harness reads.
      `static inline`, are not;
   4. the recipe's test command runs under strace (`openat`), through sandbox_exec.py: no network (the
      container has none), capped time, CPU, processes and file sizes. A failing test suite is not an
-     error: seeds are an improvement, not a requirement;
+     error: seeds are an improvement, not a requirement. It, or each executable run on its own, has
+     the directories of the tree's built shared libraries before the recipe's LD_LIBRARY_PATH
+     (report `library_path`): libtool's `.libs/<prog>` carries only the install rpath;
   5. the calls go to workspace/seed_records/calls.jsonl (deduplicated, capped per function), the data
      files the tests opened for reading inside the target tree to workspace/seed_records/files/
      (capped by size and count), and the report to workspace/reports/seed_harvest.json.
@@ -160,7 +162,10 @@ _UNSIGNED_LEN_SCALARS = {"unsigned short", "unsigned int", "unsigned long", "uns
 _LEN_NAME_RE = re.compile(r"[Ll]en|[Ss]ize|[Cc]ount|[Cc]nt|[Bb]ytes|^n(?:[A-Z_0-9]|$)|^num|^N$")
 _CHAR_POINTEES = {"char", "signed char", "unsigned char", "void"}
 _QUALIFIERS_RE = re.compile(r"\b(?:const|volatile|restrict|__restrict|__restrict__)\b")
-_ATTR_RE = re.compile(r"\b__attribute__\s*\(\(.*?\)\)")
+# The start of a GCC attribute group; its end is the matching `)` (_strip_attributes).
+_ATTR_START_RE = re.compile(r"\b__attribute(?:__)?\s*\(")
+# A shared object: `libx.so`, `libx.so.0`, `libx.so.0.0.0`.
+_SHARED_OBJECT_RE = re.compile(r"\.so(?:\.\d+)*$")
 _TAG_RE = re.compile(r"^(struct|union|enum)\s+([A-Za-z_]\w*)$")
 _IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
 
@@ -174,14 +179,34 @@ class SeedError(RuntimeError):
 # ---------------------------------------------------------------------------------------------------
 
 
+def _strip_attributes(text: str) -> str:
+    """
+    `text` without its `__attribute__((...))` groups, each matched to its balanced closing parenthesis
+    (nested parentheses and string arguments included), however many follow each other. sudo's
+    `sudo_dso_public` gives model signatures such as
+    `unsigned long __attribute__((__visibility__("default")))(char *,unsigned char *,unsigned long)`.
+    An unbalanced group is left as it is: the signature is then not understood, never misread.
+    """
+    out: list[str] = []
+    i = 0
+    while (m := _ATTR_START_RE.search(text, i)) is not None:
+        end = _match_brace(text, m.end() - 1, "(", ")")
+        if end < 0:
+            break
+        out.append(text[i : m.start()] + " ")
+        i = end + 1
+    out.append(text[i:])
+    return "".join(out)
+
+
 def _norm_type(t: str) -> str:
-    cleaned = _ATTR_RE.sub(" ", _QUALIFIERS_RE.sub(" ", t))
+    cleaned = _QUALIFIERS_RE.sub(" ", _strip_attributes(t))
     return " ".join(cleaned.split()).replace(" *", "*").replace("*", " *").strip()
 
 
 def split_signature(sig: str) -> tuple[str, list[str], bool] | None:
     """(return type, parameter types, variadic) of a model signature such as `int(char *,_Bool)`."""
-    sig = _ATTR_RE.sub("", (sig or "").strip()).strip()
+    sig = _strip_attributes((sig or "").strip()).strip()
     i = sig.find("(")
     if i <= 0 or not sig.endswith(")") or sig[i:].startswith("(*"):
         return None
@@ -946,8 +971,13 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         return report, 0
 
     cwd = tree / str((recipe or {}).get("workdir") or ".")
+    # The relink keeps the build's environment (a library path there could shadow the toolchain's own
+    # libraries); the runs get the tree's shared-library directories (shared_library_dirs).
+    lib_dirs = shared_library_dirs(capture, tree)
+    report["library_path"] = lib_dirs
+    run_env = library_env(dict((recipe or {}).get("env") or {}), lib_dirs)
     if not command:
-        _run_executables(report, relinked, tree, cwd, scratch, args.timeout, dict((recipe or {}).get("env") or {}))
+        _run_executables(report, relinked, tree, cwd, scratch, args.timeout, run_env)
         _collect(report, out_dir, [], tree, started)
         return report, 0
     strace_log = work / "strace.txt"
@@ -957,7 +987,7 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
     else:
         report["warnings"].append("strace not found: no secondary seeds from files the tests open")
     t0 = time.monotonic()
-    res = _sandboxed(test_argv, cwd, scratch, args.timeout, dict((recipe or {}).get("env") or {}))
+    res = _sandboxed(test_argv, cwd, scratch, args.timeout, run_env)
     report["test"] = {
         "returncode": res.returncode,
         "timed_out": res.timed_out,
@@ -985,6 +1015,40 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         opened = strace_opened(strace_log.read_text(encoding="utf-8", errors="replace"), tree)
     _collect(report, out_dir, opened, tree, started)
     return report, 0
+
+
+def shared_library_dirs(capture: dict, tree: Path) -> list[str]:
+    """
+    The directories of the tree's own built shared libraries, for the loader of the relinked programs.
+
+    libtool's uninstalled `.libs/<prog>` carries only the install rpath, so it cannot load the tree's
+    library (sudo run-1: every relinked executable exited 127 on `libsudo_util.so.0: cannot open shared
+    object file`), and its `__real_<fn>` calls resolve there. The directories of the capture's shared
+    library link outputs (libtool leaves the soname link beside the real file); when it saw none, the
+    tree's directories holding a `*.so` or `*.so.*` file.
+    """
+    dirs: list[str] = []
+    for name, unit in sorted((capture.get("units") or {}).items()):
+        if isinstance(unit, dict) and unit.get("kind") == "shared_lib":
+            d = (tree / name).parent
+            if d.is_dir() and str(d) not in dirs:
+                dirs.append(str(d))
+    if dirs:
+        return dirs
+    skip = {".git", "CMakeFiles"}
+    for root, subdirs, files in os.walk(tree):
+        subdirs[:] = sorted(s for s in subdirs if s not in skip)
+        if any(_SHARED_OBJECT_RE.search(f) for f in files):
+            dirs.append(str(Path(root)))
+    return dirs
+
+
+def library_env(env: dict[str, str], lib_dirs: list[str]) -> dict[str, str]:
+    """The recipe's run environment with `lib_dirs` before its own LD_LIBRARY_PATH (no empty element)."""
+    if not lib_dirs:
+        return dict(env)
+    own = str(env.get("LD_LIBRARY_PATH") or "")
+    return {**env, "LD_LIBRARY_PATH": ":".join([*lib_dirs, *([own] if own else [])])}
 
 
 def _run_executables(
