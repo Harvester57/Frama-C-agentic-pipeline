@@ -548,3 +548,55 @@ def test_the_capture_link_of_the_driver_wins(tmp_path, monkeypatch):
 def test_without_a_dag_nothing_is_decided(tmp_path):
     kept, link = G.target_fuzzer_link_sources(tmp_path / "harnesses", SHG_DRIVER, SHG_TF_SOURCES, "-I.")
     assert kept == SHG_TF_SOURCES and link is None
+
+
+SHG_E2E_FUZZER = "workspace/work/fuzz/fuzz_parse.c"
+SHG_E2E_DAG = {
+    "target_dir": "/framac-run/workspace/work",
+    "functions": {
+        "src/parse.c#parse": {"name": "parse", "file": "src/parse.c", "module": "libparse"},
+        "src/hooks.c#parse_hook": {"name": "parse_hook", "file": "src/hooks.c", "module": "libparse"},
+    },
+}
+
+
+def test_generated_sidecar_links_the_fuzzer_without_what_it_overrides(tmp_path, monkeypatch):
+    from validate_artifacts import schema_warning
+
+    run = _shg_run(tmp_path, {"compiles": [], "units": {}}, SHG_E2E_DAG)
+    monkeypatch.chdir(run)
+    monkeypatch.setattr(G, "_preprocess_driver", lambda driver, cppflags: None)
+    for rel, text in (
+        (
+            "workspace/work/src/parse.c",
+            "int parse_hook(int x);\nint parse(const unsigned char *b, unsigned long n) "
+            "{ return n ? parse_hook(b[0]) : 0; }\n",
+        ),
+        ("workspace/work/src/hooks.c", "int parse_hook(int x) { return x; }\n"),
+        (
+            SHG_E2E_FUZZER,
+            "#include <stdint.h>\n#include <stddef.h>\nint parse(const uint8_t *b, size_t n);\n"
+            "int parse_hook(int x) { return -x; }\n"
+            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return parse(data, size); }\n",
+        ),
+    ):
+        (run / rel).parent.mkdir(parents=True, exist_ok=True)
+        (run / rel).write_text(text, encoding="utf-8")
+    argv = ["--module", "tf_fuzz_parse", "--unit", "libparse", "--target-fuzzer", SHG_E2E_FUZZER, "--no-auto-prelude"]
+    argv += [
+        "--sources",
+        "workspace/work/src/parse.c",
+        "workspace/work/src/hooks.c",
+        "--cppflags",
+        "-Iworkspace/work/src",
+    ]
+    assert G.main(argv) == 0
+    side = json.loads((run / "workspace/harnesses/harness_tf_fuzz_parse.json").read_text(encoding="utf-8"))
+    assert not any(s.endswith("hooks.c") for s in side["sources"])
+    assert any(s.endswith("parse.c") for s in side["sources"])
+    assert side["target_fuzzer"]["link"] == {
+        "from": "unit",
+        "definitions": "source_text",
+        "excluded_sources": [{"source": "workspace/work/src/hooks.c", "symbols": ["parse_hook"]}],
+    }
+    assert schema_warning("harness_sidecar", side) is None
