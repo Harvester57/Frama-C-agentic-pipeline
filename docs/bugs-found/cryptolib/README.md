@@ -5,8 +5,9 @@
 - **Evaluated Revision:** [`5b98c8b2561b22822a9d4e26c959677ed93c815a`](https://github.com/nasa/CryptoLib/tree/5b98c8b2561b22822a9d4e26c959677ed93c815a)
 - **Scope:** Core Telecommand (TC), Telemetry (TM), Advanced Orbiting Systems (AOS), Security Association (SA) in-memory backend, Key Management, and Monitoring & Control (MC) slices (`core`, `crypto`, `sa`, `key`, `mc`).
 - **Campaign Summary:**
-  - **Confirmed Findings:** 1 (1 Medium)
-  - **Needs Validation / C11 Hygiene:** 1 (`update_sa_from_ptr` self-overlapping `memcpy`)
+  - **Confirmed Findings:** 2 (2 Medium; `CRYPTOLIB-01` from the pipeline campaign, `CRYPTOLIB-02` not in the campaign record)
+  - **Upstream status (checked 2026-11-21):** both reported as private GitHub security advisories on 2026-11-05 (still in `triage`). `CRYPTOLIB-01` is fixed on `dev` by [`d65a49a`](https://github.com/nasa/CryptoLib/commit/d65a49ab55e31ab68b38ad233fe0563f9a82b704) (2026-11-18), not yet on `main`; `CRYPTOLIB-02` is still present on `dev`.
+  - **Needs Validation / C11 Hygiene:** 1 (`update_sa_from_ptr` self-overlapping `memcpy`; still present on `dev` on 2026-11-21)
   - **Rejected Candidates:** 7 (`5` unconfigured-harness artifacts, `1` dead `unsigned_downcast` sentinel initializer, `1` E-ACSL by-value struct parameter false alarm)
 
 ---
@@ -15,7 +16,8 @@
 
 | ID | Title | Location | Property / CWE | Severity | Upstream Ticket | Status |
 | :--- | :--- | :--- | :--- | :---: | :--- | :--- |
-| [`CRYPTOLIB-01`](#cryptolib-01-one-byte-out-of-bounds-read-in-crypto_tc_set_segment_header-on-5-byte-tc-frame) | One-byte out-of-bounds read of received TC frame buffer when a minimal 5-byte frame is processed with segmentation headers enabled | [`src/core/crypto_tc.c:1949`](https://github.com/nasa/CryptoLib/blob/5b98c8b2561b22822a9d4e26c959677ed93c815a/src/core/crypto_tc.c#L1949), [`:2025`](https://github.com/nasa/CryptoLib/blob/5b98c8b2561b22822a9d4e26c959677ed93c815a/src/core/crypto_tc.c#L2025) (`Crypto_TC_Set_Segment_Header`) | `mem_access` (CWE-125) | **Medium** | Pending / Not yet filed | Confirmed (Unreported) |
+| [`CRYPTOLIB-01`](#cryptolib-01-one-byte-out-of-bounds-read-in-crypto_tc_set_segment_header-on-5-byte-tc-frame) | One-byte out-of-bounds read of received TC frame buffer when a minimal 5-byte frame is processed with segmentation headers enabled | [`src/core/crypto_tc.c:1949`](https://github.com/nasa/CryptoLib/blob/5b98c8b2561b22822a9d4e26c959677ed93c815a/src/core/crypto_tc.c#L1949), [`:2025`](https://github.com/nasa/CryptoLib/blob/5b98c8b2561b22822a9d4e26c959677ed93c815a/src/core/crypto_tc.c#L2025) (`Crypto_TC_Set_Segment_Header`) | `mem_access` (CWE-125) | **Medium** | [GHSA-7f4g-c4pm-cvw8](https://github.com/nasa/CryptoLib/security/advisories/GHSA-7f4g-c4pm-cvw8) (private, filed 2026-11-05); fixed by [`d65a49a`](https://github.com/nasa/CryptoLib/commit/d65a49ab55e31ab68b38ad233fe0563f9a82b704) | Fixed on `dev` |
+| [`CRYPTOLIB-02`](#cryptolib-02-one-byte-out-of-bounds-read-in-crypto_tm_process_setup-on-6-byte-tm-frame-with-secondary-header-flag) | One-byte out-of-bounds read of received TM frame buffer when a 6-byte frame has the Secondary Header flag set | [`src/core/crypto_tm.c:1372`](https://github.com/nasa/CryptoLib/blob/0e4ef191943b3c1700519f49f61aaf65849594ef/src/core/crypto_tm.c#L1372) at v1.5.2 (`Crypto_TM_Process_Setup`); `:1384` on `dev` | `mem_access` (CWE-125) | **Medium** | [GHSA-mfqc-272c-5gwx](https://github.com/nasa/CryptoLib/security/advisories/GHSA-mfqc-272c-5gwx) (private, filed 2026-11-05) | Reported |
 
 ---
 
@@ -26,8 +28,8 @@
 | Field | Value |
 | :--- | :--- |
 | **Fingerprint** | `src/core/crypto_tc.c#Crypto_TC_Set_Segment_Header::mem_access::74b4df8a1f` |
-| **Status** | Confirmed (Unreported) |
-| **Upstream Ticket** | Pending / Not yet filed |
+| **Status** | Fixed on `dev` ([`d65a49a`](https://github.com/nasa/CryptoLib/commit/d65a49ab55e31ab68b38ad233fe0563f9a82b704), 2026-11-18); `main` (last merge `c216ede`, 2026-11-04) and every release up to v1.5.2 still affected |
+| **Upstream Ticket** | [GHSA-7f4g-c4pm-cvw8](https://github.com/nasa/CryptoLib/security/advisories/GHSA-7f4g-c4pm-cvw8) (private security advisory, filed 2026-11-05, state `triage`) |
 | **Severity** | **Medium** (1-byte heap/buffer out-of-bounds read past the end of an attacker-controlled TC frame; reproduced under both Frama-C E-ACSL and Clang AddressSanitizer) |
 | **Reachability** | `untrusted_surface` (`Crypto_TC_ProcessSecurity` / `Crypto_TC_ProcessSecurity_Cam`) |
 | **Location** | [`src/core/crypto_tc.c:1949`](https://github.com/nasa/CryptoLib/blob/5b98c8b2561b22822a9d4e26c959677ed93c815a/src/core/crypto_tc.c#L1949) (`Crypto_TC_Set_Segment_Header`) called from [`src/core/crypto_tc.c:2025`](https://github.com/nasa/CryptoLib/blob/5b98c8b2561b22822a9d4e26c959677ed93c815a/src/core/crypto_tc.c#L2025) (`Crypto_TC_ProcessSecurity_Cam`) |
@@ -112,7 +114,11 @@ With `*len_ingest == 5` and `*byte_idx == 5`, `ingest[*byte_idx]` reads `ingest[
   }
   ```
 
-#### Proposed Fix
+#### Upstream Fix
+
+[`d65a49a`](https://github.com/nasa/CryptoLib/commit/d65a49ab55e31ab68b38ad233fe0563f9a82b704) ("resolve reported vulnerabilities", on `dev`) only calls `Crypto_TC_Set_Segment_Header` when `*len_ingest >= 6` and otherwise returns `CRYPTO_LIB_ERR_TC_FRAME_TOO_SHORT` (-200). `byte_idx` is always 5 at that point, so the bound is exact and the reproducer frame is rejected before `ingest[5]` is read. The same commit adds a full minimum-length check after `Crypto_TC_Calc_Lengths` (primary header, segment header, SPI, IV, sequence number, pad length, MAC and FECF). Checked by reading the diff; the reproducer was not rerun against `dev`.
+
+#### Proposed Fix (as filed)
 
 Check that `*len_ingest` has room for the optional segment header (plus the mandatory 2-byte SPI) before calling `Crypto_TC_Set_Segment_Header`:
 
@@ -135,6 +141,75 @@ Check that `*len_ingest` has room for the optional segment header (plus the mand
  
      if (*len_ingest >= byte_idx + SPI_LEN)
 ```
+
+---
+
+### `CRYPTOLIB-02`: One-byte out-of-bounds read in `Crypto_TM_Process_Setup` on 6-byte TM frame with Secondary Header flag
+
+| Field | Value |
+| :--- | :--- |
+| **Status** | Reported; still present on `dev` (`329f895`, checked 2026-11-21) |
+| **Upstream Ticket** | [GHSA-mfqc-272c-5gwx](https://github.com/nasa/CryptoLib/security/advisories/GHSA-mfqc-272c-5gwx) (private security advisory, filed 2026-11-05, state `triage`) |
+| **Severity** | **Medium** (CVSS v3.1 5.3, `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L`; 1-byte heap out-of-bounds read before any MAC check) |
+| **Reachability** | `untrusted_surface` (`Crypto_TM_ProcessSecurity`) |
+| **Detection** | Not in the pipeline campaign record for revision `5b98c8b`; found and verified with `ASan + UBSan` against v1.5.2 (`0e4ef19`) for the advisory |
+| **Location** | [`src/core/crypto_tm.c:1372`](https://github.com/nasa/CryptoLib/blob/0e4ef191943b3c1700519f49f61aaf65849594ef/src/core/crypto_tm.c#L1372) at v1.5.2 (`Crypto_TM_Process_Setup`), called from `:2029` (`Crypto_TM_ProcessSecurity`); lines 1381-1397 on `dev` |
+| **Failing Property** | `mem_access`: read of `p_ingest[6]` when `len_ingest == 6` (CWE-125) |
+
+#### Description & Root Cause
+
+`Crypto_TM_ProcessSecurity` and `Crypto_TM_Process_Setup` only reject frames shorter than `TM_FRAME_PRIMARYHEADER_SIZE` (6 bytes). When byte 4 has the Secondary Header flag (`0x80`) set, `Crypto_TM_Process_Setup` sets `*byte_idx = 6` and reads `p_ingest[6]` to decode the secondary-header version number (`shvn`) and length. The only check that the secondary header fits (`len_ingest < TM_FRAME_PRIMARYHEADER_SIZE + *secondary_hdr_len + 1`) runs after those reads, so a 6-byte frame reads one byte past the caller's buffer. Introduced by `29cd1b4` (2024-04-02); affects v1.3.1 to v1.5.2.
+
+[`d65a49a`](https://github.com/nasa/CryptoLib/commit/d65a49ab55e31ab68b38ad233fe0563f9a82b704) does not touch `Crypto_TM_Process_Setup`: its `crypto_tm.c` changes only add unsupported-mode checks and free a leaked buffer in `Crypto_TM_Do_Decrypt`. On `dev` the read is at line 1384 (`shvn`) and 1397 (length), and the fit check is still at line 1419.
+
+#### Minimal Standalone Reproducer
+
+- **Triggering 6-byte TM frame (hex):** `00 3a 00 00 f7 00` (byte 4 `0xf7` has the Secondary Header flag set).
+- **Expected unpatched result (`clang -fsanitize=address,undefined`):** `heap-buffer-overflow ... READ of size 1` in `Crypto_TM_Process_Setup` (`crypto_tm.c:1372`), `0 bytes after 6-byte region`.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "crypto.h"
+
+int main(void) {
+    Crypto_SC_Init();
+    const uint8_t frame[6] = {0x00, 0x3a, 0x00, 0x00, 0xf7, 0x00};
+    uint8_t *buf = malloc(6);
+    memcpy(buf, frame, 6);
+    TM_t tm;
+    memset(&tm, 0, sizeof tm);
+    uint16_t declen = 0;
+    int32_t st = Crypto_TM_ProcessSecurity(buf, 6, &tm, &declen);
+    printf("Crypto_TM_ProcessSecurity status=%d\n", st);
+    free(buf);
+    return 0;
+}
+```
+
+#### Proposed Fix (as filed)
+
+```diff
+--- a/src/core/crypto_tm.c
++++ b/src/core/crypto_tm.c
+@@ -1368,6 +1368,14 @@
+             // Secondary header is present
+             *byte_idx = 6;
+ 
++            // A secondary header requires at least one byte at *byte_idx.
++            if (len_ingest <= *byte_idx)
++            {
++                status = CRYPTO_LIB_ERR_TM_SECONDARY_HDR_SIZE;
++                mc_if->mc_log(status);
++                return status;
++            }
++
+             // Determine Secondary Header Version Number, should always be 0b00
+             uint8_t shvn = (p_ingest[*byte_idx] & 0xC0) >> 6;
+```
+
+With the patch the reproducer returns `CRYPTO_LIB_ERR_TM_SECONDARY_HDR_SIZE` (-80).
 
 ---
 
