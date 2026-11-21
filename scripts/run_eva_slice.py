@@ -1168,7 +1168,9 @@ def run_eva_on_slice(
             if loaded is active
             else _command(loaded, allow_incomplete_recursion_specs, options, flamegraph)
         )
+        started = time.monotonic()
         res = _exec(cur_cmd, cur_reduced, timeout)
+        first_s = round(time.monotonic() - started, 1)
 
         # Auto-retry when Frama-C aborts on a recursive call or indirect callback cycle without an ACSL
         # assigns clause, and on nothing else under the same warning key.
@@ -1182,6 +1184,9 @@ def run_eva_on_slice(
             cur_cmd, cur_reduced = _command(loaded, True, options, flamegraph)
             res = _exec(cur_cmd, cur_reduced, _remaining(int(budget_s or 300)))
             res["auto_recursion_fallback"] = True
+            # elapsed_s stays the retry's; this is the wall time the aborted first attempt took of the
+            # budget (what _remaining() subtracted). Cached with the result like the marker above.
+            res[RECURSION_FIRST_ATTEMPT_FIELD] = first_s
 
         # Fast cvalue fallback when the default 5-domain base run times out. Preserve both eva.log
         # and any non-empty 5-domain flamegraph.txt so cost_profile and eva_shards.py plan from the
@@ -1196,7 +1201,9 @@ def run_eva_on_slice(
             tried: list[dict] = []
             for tier_name, fb_opts in _timeout_fallback_tiers(slevel, options):
                 fb_cmd, fb_reduced = _command(loaded, cur_allow_rec, fb_opts, fb_flamegraph)
+                fb_started = time.monotonic()
                 fb_res = _exec(fb_cmd, fb_reduced, fb_budget)
+                fb_first_s = round(time.monotonic() - fb_started, 1)
                 if (
                     fb_res["status"] == "analysis_error"
                     and not cur_allow_rec
@@ -1207,7 +1214,15 @@ def run_eva_on_slice(
                     fb_cmd, fb_reduced = _command(loaded, True, fb_opts, fb_flamegraph)
                     fb_res = _exec(fb_cmd, fb_reduced, fb_budget)
                     fb_res["auto_recursion_fallback"] = True
+                    fb_res[RECURSION_FIRST_ATTEMPT_FIELD] = fb_first_s
                 if fb_res["status"] == "ok":
+                    if timed_out.get("auto_recursion_fallback") and not fb_res.get("auto_recursion_fallback"):
+                        # The tiers started downgraded because the timed-out run had retried: the
+                        # result keeps that marker and the first attempt it lost, so a tuning plan
+                        # reading it propagates the downgrade (pipeline_make._plan_tuning).
+                        fb_res["auto_recursion_fallback"] = True
+                        if RECURSION_FIRST_ATTEMPT_FIELD in timed_out:
+                            fb_res[RECURSION_FIRST_ATTEMPT_FIELD] = timed_out[RECURSION_FIRST_ATTEMPT_FIELD]
                     fb_res["eva_options"] = fb_opts
                     fb_res["timeout_fallback"] = tier_name
                     own = cost_profile(out_dir / "flamegraph.txt") if kept_fg is None else None
@@ -1389,6 +1404,9 @@ _USING_SPEC_RE = re.compile(r"^\[eva\] using specification for function (?P<fn>[
 _DECL_NAME_RE = re.compile(r"\b(?P<fn>[A-Za-z_]\w*)\s*\(")
 _NOT_A_DECL_NAME = frozenset({"__attribute__", "__attribute", "__declspec", "__asm__", "__asm", "asm", "typeof"})
 RECURSION_REDUCED_CHECK = "-eva-warn-key assigns:missing=warning (recursive calls use kernel-inferred assigns)"
+# Report field: seconds the first attempt took before it aborted on the recursion and was retried with
+# the downgrade (set with `auto_recursion_fallback`; `elapsed_s` is the retry's alone).
+RECURSION_FIRST_ATTEMPT_FIELD = "auto_recursion_fallback_first_attempt_s"
 
 
 def _strip_attributes(text: str) -> str:

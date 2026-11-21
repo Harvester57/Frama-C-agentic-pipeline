@@ -200,6 +200,7 @@ eva_args = --module $(1) --sources $(SOURCES_$(1)) --main eva_main --slevel $(EV
 # per-obligation combination (eva_tuning.py finish). It writes the module's report, and copies the
 # flamegraph.txt of the run the report rests on (the base run's, when that is a rung) to workspace/eva/$(1)/.
 eva_finish_cmd = $(PY) $(S)/eva_tuning.py finish $(call eva_args,$(1)) \
+	$(if $(EVA_TUNE_RECURSION_FALLBACK_$(1)),--allow-incomplete-recursion-specs) \
 	$(if $(ENTRY_FN_$(1)),--entry-fn=$(ENTRY_FN_$(1))) \
 	--settings-digest $(EVA_TUNE_DIGEST_$(1)) --rungs $(EVA_TUNE_RUNGS_$(1)) --loop-unroll $(EVA_LOOP_UNROLL_$(1)) \
 	$(if $(EVA_TUNE_TIMEOUT_$(1)),--timeout $(EVA_TUNE_TIMEOUT_$(1))) \
@@ -257,6 +258,11 @@ eva_merge_cmd = $(PY) $(S)/eva_shards.py merge --module $(1) --shard-dir workspa
 # times out stays a timeout: the less precise fallback tiers are of no use against the base run. Rungs
 # write no flamegraph.txt either (+7% wall time, gigabytes on long runs): the base run's is published.
 # A sharded module has no single base run and no rungs: its base run is its shards, merged.
+# When the base run only finished on run_eva_slice.py's recursion retry (`auto_recursion_fallback`),
+# EVA_TUNE_RECURSION_FALLBACK_<mod> starts every rung and the loop trials of `finish` with that same
+# downgrade (--allow-incomplete-recursion-specs, the same reduced check): otherwise each one repeats a
+# first attempt bound to abort, under a limit derived from the base run's retry alone. The base run
+# keeps detecting the recursion, and the plain run keeps sharing the base run's cache entry.
 eva_base_run = --output workspace/reports/eva-tuning/$(1)/base.json -- $(PY) $(S)/run_eva_slice.py $(call eva_args,$(1)) \
 	--out-dir workspace/eva/$(1)/tune/base $(EVA_BASE_OPTIONS_$(1)) \
 	$(if $(EVA_TIMEOUT_$(1)),--timeout $(EVA_TIMEOUT_$(1))) \
@@ -275,6 +281,7 @@ evarung-$(1)--$(2):
 	@rm -f workspace/reports/eva-tuning/$(1)/$(2).json
 	-$$(RUN) --class eva --key $(1):$(2) --output workspace/reports/eva-tuning/$(1)/$(2).json -- \
 		$$(PY) $$(S)/run_eva_slice.py $$(call eva_args,$(1)) --out-dir workspace/eva/$(1)/tune/$(2) \
+		$$(if $$(EVA_TUNE_RECURSION_FALLBACK_$(1)),--allow-incomplete-recursion-specs) \
 		$$(EVA_RUNG_OPTIONS_$(1)__$(2)) --no-timeout-fallback --no-flamegraph \
 		$$(if $$(EVA_TUNE_TIMEOUT_$(1)),--timeout $$(EVA_TUNE_TIMEOUT_$(1))) \
 		--out-json workspace/reports/eva-tuning/$(1)/$(2).json

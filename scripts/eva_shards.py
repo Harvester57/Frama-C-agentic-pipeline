@@ -65,6 +65,8 @@ EVA_SHARD_MACRO = "FRAMAC_EVA_SHARD"  # generate_harness.EVA_SHARD_MACRO
 # running it with the downgrade changes nothing. Shards may therefore differ in it alone, and the merged
 # report carries it when any shard does.
 RECURSION_REDUCED_CHECK = "-eva-warn-key assigns:missing=warning (recursive calls use kernel-inferred assigns)"
+# run_eva_slice.RECURSION_FIRST_ATTEMPT_FIELD: a shard's aborted first attempt before its recursion retry.
+RECURSION_FIRST_ATTEMPT_FIELD = "auto_recursion_fallback_first_attempt_s"
 # How many shards a module may run as. Fixed: k decides what each run analyses, so it never follows
 # the machine (a machine with fewer slots runs the same shards one after another).
 MAX_SHARDS = 16
@@ -935,10 +937,20 @@ def merge(
     # result carries it when any shard needed it, so the ledger keeps the caveat.
     report["reduced_checks"] = _union(s.run.report.get("reduced_checks") for s in shards)
     report.pop("auto_recursion_fallback", None)
+    report.pop(RECURSION_FIRST_ATTEMPT_FIELD, None)
     retried = [s.index for s in shards if s.run.report.get("auto_recursion_fallback")]
     if retried:
         report["auto_recursion_fallback"] = True
         report["auto_recursion_fallback_shards"] = retried
+        # The time every retried shard lost to its aborted first attempt, not shard 0's alone.
+        lost = [
+            float(v)
+            for s in shards
+            if isinstance(v := s.run.report.get(RECURSION_FIRST_ATTEMPT_FIELD), (int, float))
+            and not isinstance(v, bool)
+        ]
+        if lost:
+            report[RECURSION_FIRST_ATTEMPT_FIELD] = round(sum(lost), 1)
     if flamegraph_out is not None and concat_flamegraphs(
         [Path(p) for s in shards if (p := s.run.report.get("flamegraph_file"))], flamegraph_out
     ):

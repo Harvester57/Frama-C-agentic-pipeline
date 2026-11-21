@@ -239,7 +239,9 @@ the design above:
   downgrade would change nothing: every shard is the analysis with the downgrade. The merged report's
   `reduced_checks` is the union over the shards (the first shard's order, then new entries in shard
   order), so the ledger keeps the recursion caveat, and `auto_recursion_fallback_shards` names the
-  shards that were retried. Any other difference in reduced checks is still refused.
+  shards that were retried; `auto_recursion_fallback_first_attempt_s` is the sum of the seconds their
+  aborted first attempts took (never the first shard's value alone). Any other difference in reduced
+  checks is still refused.
   `input_digest` differs by construction; the merged report's is a digest of the shards' digests.
   They must also carry the same `harness_digest`: shards of an older and of a repaired harness, or
   a stamped shard beside an unstamped one, are refused, and must be run again. A merged report built
