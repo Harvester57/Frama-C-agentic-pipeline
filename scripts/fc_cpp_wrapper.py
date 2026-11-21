@@ -53,11 +53,19 @@ accepts `__alignof__` under `-machdep gcc_x86_64`, but its ACSL parser rejects `
 `unexpected token ')'` when a target compiles explicitly with `-std=c99` and a macro expands to
 `__alignof__(T)` (mpack run-4).
 
+Fifth, before the preprocessor runs, `-include fc_cpp_no_c23_attributes.h` (next to this script) is put first
+on its command line: it defines `__has_c_attribute(x)` as 0. Frama-C 34 (34.0~beta) rejects C23 attribute specifiers
+(`[[__noreturn__]]`, `[[__fallthrough__]];`: "syntax error ... before or at token: ["), but GCC 14 answers
+`__has_c_attribute` with 202311 in every `-std` mode, so code that feature-tests it (sudo's config.h) handed
+Frama-C `[[...]]`; it now takes its own pre-C23 fallback. The header's `#undef`/`#define` lines are blanked
+out of the `-dD` output, so Frama-C's annotation preprocessor does not replay them. Source that writes
+`[[...]]` without asking `__has_c_attribute` is not covered.
+
 For the E-ACSL frontend only, fc_cpp_wrapper_eacsl.py runs this script with `iff=True`, which also writes
 every `<==>` in an ACSL annotation as two implications (E-ACSL 35 aborts on `<==>` over a labelled term;
 see `rewrite_iff_text`). Eva and WP read the annotations as written.
 
-FRAMAC_CPP_REWRITE=off runs the subcommand without any rewrite.
+FRAMAC_CPP_REWRITE=off runs the subcommand unchanged and without any rewrite.
 """
 
 from __future__ import annotations
@@ -774,12 +782,74 @@ def rewrite_alignof_text(text: str) -> tuple[str, list[dict]]:
     return "".join(out), notes
 
 
+# ---------------------------------------------------------------------------------------------------
+# C23 attributes: `__has_c_attribute(x)` answers 0 for Frama-C's preprocessing
+# ---------------------------------------------------------------------------------------------------
+#
+# Frama-C 34 (34.0~beta) rejects `[[...]]` attribute specifiers in declarations and statements alike (sudo 1.9.18:
+# `include/sudo_fatal.h:173: User Error: syntax error ... before or at token: [`, from config.h's
+# `#define sudo_noreturn [[__noreturn__]]` and `#define FALLTHROUGH [[__fallthrough__]]`), while GCC 14's
+# preprocessor answers `__has_c_attribute(...)` with 202311 in every `-std` mode. The header forced first on
+# the preprocessor's command line redefines it as 0, so feature-testing code takes its pre-C23 branch.
+# `-U__has_c_attribute` would turn `#if defined(__has_c_attribute) && __has_c_attribute(x)` into a cpp error,
+# and `-D__has_c_attribute(x)=0` warns ("redefined") and so fails under a target's `-Werror`; in a header with
+# `#pragma GCC system_header` neither happens.
+
+NO_C23_ATTRIBUTES_HEADER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fc_cpp_no_c23_attributes.h")
+# The header's directives as `-dD` writes them into the preprocessed file. Frama-C's annotation preprocessor
+# (-pp-annot) replays the file's `#define`/`#undef` lines in a main file, where redefining the built-in warns.
+_C23_DIRECTIVE_RE = re.compile(
+    r"^[ \t]*#[ \t]*(?:undef[ \t]+__has_c_attribute"
+    r"|define[ \t]+__has_c_attribute\(__fc_c23_attribute\)[ \t]+0"
+    r"|pragma[ \t]+GCC[ \t]+system_header)[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def with_c23_attributes_off(cmd: Sequence[str], header: str = NO_C23_ATTRIBUTES_HEADER) -> list[str]:
+    """
+    gcc's preprocessor subcommand `cmd` (`cc1 -E`) with `-include <header>` first, so the header's
+    `__has_c_attribute` precedes every target macro and forced include; any other subcommand, or a missing
+    header, unchanged.
+    """
+    if not cmd or os.path.basename(cmd[0]) not in ("cc1", "cc1.exe") or "-E" not in cmd[1:]:
+        return list(cmd)
+    if not os.path.isfile(header):
+        return list(cmd)
+    return [cmd[0], "-include", header, *cmd[1:]]
+
+
+def blank_c23_attribute_directives(text: str, header: str = NO_C23_ATTRIBUTES_HEADER) -> str:
+    """
+    The preprocessed text with the forced header's directive lines left blank (lines keep their numbers).
+    Only lines inside the header's own line-marker region are touched: a target's own directives stay.
+    """
+    hits = list(_C23_DIRECTIVE_RE.finditer(text)) if "__has_c_attribute" in text else []
+    if not hits:
+        return text
+    marks = [(m.start(), m.group(2)) for m in _MARKER_RE.finditer(text)]
+    starts = [start for start, _ in marks]
+    out: list[str] = []
+    last = 0
+    for hit in hits:
+        k = bisect.bisect_right(starts, hit.start()) - 1
+        if k < 0 or marks[k][1] != header:
+            continue
+        out.append(text[last : hit.start()])
+        last = hit.end()
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
 def rewrite_file(path: str, iff: bool = False) -> list[dict]:
     """Rewrite one preprocessed file in place; fail open (the file stays as the preprocessor wrote it)."""
     try:
         with open(path, "rb") as fh:
             text = fh.read().decode("latin-1")  # byte-preserving: the C text round-trips unchanged
-        new, notes = rewrite_text(text)
+        blanked = blank_c23_attribute_directives(text)
+        new, notes = rewrite_text(blanked)
         new, syscall_notes = rewrite_syscall_text(new)
         notes += syscall_notes
         new, alignof_notes = rewrite_alignof_text(new)
@@ -787,7 +857,7 @@ def rewrite_file(path: str, iff: bool = False) -> list[dict]:
         if iff:
             new, iff_notes = rewrite_iff_text(new)
             notes += iff_notes
-        if notes:
+        if notes or blanked is not text:
             tmp = f"{path}.fc-cpp"
             with open(tmp, "wb") as fh:
                 fh.write(new.encode("latin-1"))
@@ -822,14 +892,16 @@ def output_path(cmd: Sequence[str]) -> str | None:
 
 def run(cmd: Sequence[str], call: Callable[[list[str]], int] = subprocess.call, iff: bool = False) -> int:
     """
-    Run gcc's subcommand `cmd`; after a successful preprocessing into a file, rewrite that file. `iff`
+    Run gcc's subcommand `cmd` (the preprocessor with `__has_c_attribute` answering 0, see
+    `with_c23_attributes_off`); after a successful preprocessing into a file, rewrite that file. `iff`
     (the E-ACSL frontend, fc_cpp_wrapper_eacsl.py) also rewrites `<==>` in annotations.
     """
     if not cmd:
         print(f"usage: {os.path.basename(sys.argv[0])} <subcommand> [args...] (a gcc -wrapper)", file=sys.stderr)
         return 2
-    rc = call(list(cmd))
-    if rc != 0 or not is_preprocessing(cmd) or os.environ.get(DISABLE_ENV, "").lower() in ("0", "off", "false", "no"):
+    disabled = os.environ.get(DISABLE_ENV, "").lower() in ("0", "off", "false", "no")
+    rc = call(list(cmd) if disabled else with_c23_attributes_off(cmd))
+    if rc != 0 or not is_preprocessing(cmd) or disabled:
         return rc
     out = output_path(cmd)
     if out is not None and out != "-":
