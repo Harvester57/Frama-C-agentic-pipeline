@@ -1835,19 +1835,20 @@ def global_definition_text(name: str, type_text: str) -> tuple[str | None, str]:
     return f"{base}{'' if base.endswith('*') else ' '}{name}{dims};", ""
 
 
-def _declaring_header(name: str, run_dir: Path) -> tuple[Path, str] | None:
+def _declaring_headers(name: str, run_dir: Path) -> list[tuple[Path, str]]:
     """
-    The project header (workspace/work) with an `extern` declaration of global `name`, shortest path
-    first, and the definition to write after including it: the declaration itself without `extern`,
-    so with its qualifiers and typedef names (`extern volatile int G;` gives `volatile int G;`).
+    The project headers (workspace/work) with an `extern` declaration of global `name`, shortest path
+    first, each with the definition to write after including it: the declaration itself without
+    `extern`, so with its qualifiers and typedef names (`extern volatile int G;` gives `volatile int G;`).
     `__typeof__(G) G;` would not do: Frama-C 35 drops a top-level `volatile` there and then refuses
     the definition (`different qualifiers`). It is used only for a declaration of several variables,
     whose text would define the others too.
     """
     work = Path(run_dir) / "workspace/work"
     if not work.is_dir():
-        return None
+        return []
     decl = re.compile(rf"^[ \t]*extern\b([^;{{}}()]*\b{re.escape(name)}\b\s*(?:\[[^;]*\]\s*)*);", re.MULTILINE)
+    out: list[tuple[Path, str]] = []
     for header in sorted(work.rglob("*.h"), key=lambda p: (len(p.parts), p.as_posix())):
         try:
             text = header.read_text(encoding="utf-8", errors="replace")
@@ -1856,15 +1857,169 @@ def _declaring_header(name: str, run_dir: Path) -> tuple[Path, str] | None:
         m = decl.search(text) if name in text else None
         if m:
             own = " ".join(m.group(1).split())
-            return header, (f"__typeof__({name}) {name};" if "," in own else f"{own};")
+            out.append((header, f"__typeof__({name}) {name};" if "," in own else f"{own};"))
+    return out
+
+
+def _declaring_header(name: str, run_dir: Path) -> tuple[Path, str] | None:
+    """The first of `_declaring_headers`: the shortest path that declares global `name`, or None."""
+    found = _declaring_headers(name, run_dir)
+    return found[0] if found else None
+
+
+# The words a definition may use and still need no project header: C's own type keywords.
+_HEADER_FREE_WORDS = frozenset(
+    "void char short int long float double signed unsigned _Bool const volatile restrict __restrict".split()
+)
+
+
+_TAG_POINTER_RE = re.compile(r"\s*(?:(?:const|volatile|restrict|__restrict)\b\s*)*\*")
+
+
+def _header_free_definition(name: str, definition: str) -> str | None:
+    """
+    `definition` (a declaring header's own text) when it compiles without any project header: it
+    names only C's type keywords and pointers to struct or union tags, which need no definition of
+    the struct (`struct client_closure *client_closure;`). None when it names a typedef, a macro, an
+    enum, a struct held by value, or other variables (`__typeof__`). sudo's log_client.h, which
+    declares client_closure, does not parse without the sudo_queue.h its includers bring first.
+    """
+    if definition.startswith("__typeof__") or re.search(r"\benum\b", definition):
+        return None
+    text = definition
+    for m in reversed(list(_GLOBAL_TAG_RE.finditer(definition))):
+        if not _TAG_POINTER_RE.match(definition, m.end()):
+            return None
+        text = text[: m.start()] + " " + text[m.end() :]
+    words = set(re.findall(r"[A-Za-z_]\w*", text)) - {name}
+    return definition if words <= _HEADER_FREE_WORDS else None
+
+
+_INCLUDE_DIRECTIVE_RE = re.compile(r'^(\s*#\s*include\s*)([<"])([^>"]+)[>"]')
+_CONDITIONAL_OPEN_RE = re.compile(r"^\s*#\s*if(?:n?def)?\b")
+_CONDITIONAL_CLOSE_RE = re.compile(r"^\s*#\s*endif\b")
+_LINE_DIRECTIVE_RE = re.compile(r"^\s*#\s*(?:line\b|\d)")
+
+
+def _strip_c_comments(text: str) -> str:
+    """`text` without its C comments, keeping the line count (block comments keep their newlines)."""
+    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def _includer_prelude(header: Path, includer: Path, stub_dir: Path) -> list[str] | None:
+    """
+    The preprocessor lines of C file `includer` up to its own `#include` of `header`, or None when it
+    does not include it directly: its `#include`s (config.h first), `#define`s and conditionals, with
+    each conditional still open at the include closed after it. The header's include and the quoted
+    includes found next to `includer` are rewritten relative to `stub_dir`, where link_globals.c is;
+    `<...>` includes resolve through the module's -I flags, as for the includer itself.
+    """
+    try:
+        text = includer.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if header.name not in text:
+        return None
+    target = header.resolve()
+
+    def _rel(p: Path) -> str:
+        return Path(os.path.relpath(p.resolve(), stub_dir.resolve())).as_posix()
+
+    lines: list[str] = []
+    depth = 0
+    for raw in _strip_c_comments(text).replace("\\\n", " ").splitlines():
+        line = raw.rstrip()
+        if not line.lstrip().startswith("#") or _LINE_DIRECTIVE_RE.match(line):
+            continue
+        m = _INCLUDE_DIRECTIVE_RE.match(line)
+        if m:
+            inc = m.group(3).strip()
+            local = includer.parent / inc
+            if (m.group(2) == '"' and local.is_file() and local.resolve() == target) or (
+                header.as_posix().endswith("/" + inc.lstrip("./"))
+            ):
+                return [*lines, f'{m.group(1)}"{_rel(header)}"', *(["#endif"] * depth)]
+            if m.group(2) == '"' and local.is_file():
+                line = f'{m.group(1)}"{_rel(local)}"'
+        elif _CONDITIONAL_OPEN_RE.match(line):
+            depth += 1
+        elif _CONDITIONAL_CLOSE_RE.match(line):
+            depth = max(0, depth - 1)
+        lines.append(line)
     return None
 
 
+def _includer_candidates(build_sources: list[str], defining_files: list[str], run_dir: Path) -> list[Path]:
+    """
+    The C files whose includes link_globals.c may copy, best first: the build's own target sources
+    (compiled with the same flags), the files defining the global, then every C file of the project.
+    """
+    out: dict[Path, None] = {}
+    for src in build_sources:
+        if src.endswith(".c") and not _is_generated_build_source(src):
+            p = Path(src) if posixpath.isabs(src) else Path(run_dir) / src
+            out.setdefault(p, None)
+    for f in defining_files:
+        out.setdefault(Path(run_dir) / _normalize_dag_source(f, Path(run_dir)), None)
+    work = Path(run_dir) / "workspace/work"
+    if work.is_dir():
+        for p in sorted(work.rglob("*.c"), key=lambda q: (len(q.parts), q.as_posix())):
+            out.setdefault(p, None)
+    return [p for p in out if p.is_file()]
+
+
+def _global_stub_definition(
+    sym: str, rec: dict, records: list[dict], build_sources: list[str], run_dir: Path, stub_dir: Path
+) -> tuple[dict, str | None, str]:
+    """
+    How link_globals.c defines global `sym` (model record `rec`, of all `records` for the name), as
+    (stub fields, definition or None, reason). A declaring header's own text comes first, as it
+    keeps the qualifiers the model's type text drops; it is written without the header when it names
+    only C's type keywords and struct pointers (`_header_free_definition`). Otherwise the header is
+    included after the preprocessor lines of a C file that includes it (`_includer_prelude`): sudo's
+    sudoers.h does not parse without config.h first. Without such a file the header is included
+    alone. Without a declaring header, the model's type text (`global_definition_text`).
+    """
+    fields: dict = {}
+    headers = _declaring_headers(sym, run_dir)
+    for header, definition in headers:
+        free = _header_free_definition(sym, definition)
+        if free is not None:
+            fields["declared_in"] = header.relative_to(run_dir).as_posix()
+            return fields, free, ""
+    if not headers:
+        from_type, reason = global_definition_text(sym, rec["type"])
+        return fields, from_type, reason
+    candidates = _includer_candidates(build_sources, [str(r.get("file") or "") for r in records], run_dir)
+    for header, definition in headers:
+        for includer in candidates:
+            prelude = _includer_prelude(header, includer, stub_dir)
+            if prelude is not None:
+                fields["declared_in"] = header.relative_to(run_dir).as_posix()
+                fields["include"] = Path(os.path.relpath(header.resolve(), stub_dir.resolve())).as_posix()
+                fields["prelude"] = prelude
+                fields["prelude_from"] = Path(os.path.relpath(includer.resolve(), run_dir.resolve())).as_posix()
+                return fields, definition, ""
+    header, definition = headers[0]
+    fields["declared_in"] = header.relative_to(run_dir).as_posix()
+    fields["include"] = Path(os.path.relpath(header.resolve(), stub_dir.resolve())).as_posix()
+    return fields, definition, ""
+
+
 def link_globals_source(stubs: list[dict]) -> str:
-    """The generated definitions file for the globals link repair stands in for (`stubbed_globals`)."""
-    includes = dict.fromkeys(f'#include "{s["include"]}"' for s in stubs if s.get("include"))
+    """
+    The generated definitions file for the globals link repair stands in for (`stubbed_globals`): each
+    declaring header after the preprocessor lines of a file that includes it (`prelude`), or alone.
+    """
+    includes = dict.fromkeys(
+        "\n".join(s["prelude"]) if s.get("prelude") else f'#include "{s["include"]}"' for s in stubs if s.get("include")
+    )
     tags = dict.fromkeys(
-        f"{kw} {tag};" for s in stubs if not s.get("include") for kw, tag in _GLOBAL_TAG_RE.findall(s["type"])
+        f"{kw} {tag};"
+        for s in stubs
+        if not s.get("include")
+        for kw, tag in _GLOBAL_TAG_RE.findall(s.get("definition") or s["type"])
     )
     lines = [
         "/* Generated by run_eacsl_fuzz.py (link repair): global variables another link unit defines.",
@@ -2369,7 +2524,9 @@ def repair_sources_for_link(
     `build_only_functions` are never stubbed in `link_stubs.c` (their `.c` files are linked).
 
     For non-flow builds, a global defined in another link unit is defined zero-initialized in
-    `<stub_dir>/link_globals.c` via `_declaring_header` or `global_definition_text`.
+    `<stub_dir>/link_globals.c` (`_global_stub_definition`). No global is stubbed whose defining
+    file this round links in; an earlier round's stub of one is dropped (`info["unstubbed_globals"]`),
+    and link_globals.c leaves the sources when it has nothing left to define.
     """
     syms = parse_undefined_references(log)
     if not syms or not dag_path:
@@ -2434,16 +2591,13 @@ def repair_sources_for_link(
                 resolved.append(sym)
                 continue
             elif action == "stub" and stub_dir is not None:
-                stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION}
                 # The header that declares it comes first: it has the types and the qualifiers the
                 # model's type text drops. A plain `int G;` next to another stub's header declaring
                 # `extern volatile int G;` does not compile (checked with clang 19 and Frama-C 35).
-                declared = _declaring_header(sym, Path(run_dir))
-                header = declared[0] if declared else None
-                definition, reason = (declared[1], "") if declared else global_definition_text(sym, rec["type"])
-                if header is not None:
-                    stub["declared_in"] = header.relative_to(Path(run_dir)).as_posix()
-                    stub["include"] = Path(os.path.relpath(header.resolve(), stub_dir.resolve())).as_posix()
+                fields, definition, reason = _global_stub_definition(
+                    sym, rec, global_vars[sym], [*sources, *added], Path(run_dir), stub_dir
+                )
+                stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION, **fields}
                 if definition is None:
                     action, reason = "unresolved", f"{reason}, and no header of the project declares it"
                 else:
@@ -2470,18 +2624,44 @@ def repair_sources_for_link(
             have.add(norm)
             added.append(norm)
             resolved.append(sym)
-    if new_c_stubs and stub_dir is not None:
-        stub_dir.mkdir(parents=True, exist_ok=True)
+    # A global is defined once: a file this round links in for any symbol defines the globals the
+    # model records in it, so neither a stub of this round nor one of an earlier round stays for them
+    # (sudo liblogsrv_a: protobuf-c.c added for protobuf_c_message_pack, and protobuf_c_empty_string
+    # stubbed too; Frama-C: `global var ... has different initializer`). A global still undefined
+    # beside a file the failed build already compiled keeps its stub: that file does not define it
+    # under the build's flags. Only link_globals.c's stubs: an address-flow cluster's `.bss` stubs
+    # (link_stubs.c, also pre-seeded) are left as they were.
+    prior = list(stubbed or [])
+    dropped: list[dict] = []
+    if added and (new_c_stubs or prior):
+        if global_vars is None:
+            global_vars = _model_global_variables(dp)
+        added_tree = {_dag_tree_path(a) for a in added}
+
+        def _linked(name: str) -> bool:
+            return any(_dag_tree_path(r["file"]) in added_tree for r in (global_vars or {}).get(name) or [])
+
+        new_c_stubs = [s for s in new_c_stubs if not _linked(s["name"])]
+        dropped = [s for s in prior if not s.get("bss") and _linked(s["name"])]
+    prior_c = [s for s in prior if not s.get("bss") and s not in dropped]
+    prior_bss = [s for s in prior if s.get("bss")]
+    removed: set[str] = set()
+    if (new_c_stubs or dropped) and stub_dir is not None:
         stub_file = stub_dir / LINK_GLOBALS_FILE
-        prior_c = [s for s in (stubbed or []) if not s.get("bss")]
-        stub_file.write_text(link_globals_source([*prior_c, *new_c_stubs]), encoding="utf-8", newline="\n")
-        if stub_file.as_posix() not in have:
-            have.add(stub_file.as_posix())
-            added.append(stub_file.as_posix())
+        if prior_c or new_c_stubs:
+            stub_dir.mkdir(parents=True, exist_ok=True)
+            stub_file.write_text(link_globals_source([*prior_c, *new_c_stubs]), encoding="utf-8", newline="\n")
+            if stub_file.as_posix() not in have:
+                have.add(stub_file.as_posix())
+                added.append(stub_file.as_posix())
+        else:
+            # No global left to define: the file leaves the build.
+            removed.add(stub_file.as_posix())
+            with contextlib.suppress(OSError):
+                stub_file.unlink()
     if (new_fn_stubs or new_bss_stubs) and stub_dir is not None:
         stub_dir.mkdir(parents=True, exist_ok=True)
         fn_file = stub_dir / LINK_STUBS_FILE
-        prior_bss = [s for s in (stubbed or []) if s.get("bss")]
         fn_file.write_text(
             link_stubs_source([*(stubbed_functions or []), *new_fn_stubs], [*prior_bss, *new_bss_stubs], module),
             encoding="utf-8",
@@ -2491,12 +2671,15 @@ def repair_sources_for_link(
             have.add(fn_file.as_posix())
             added.append(fn_file.as_posix())
     new_stubs = [*new_c_stubs, *new_bss_stubs]
-    info: dict = {"symbols": resolved, "added_sources": added} if added or new_stubs or new_fn_stubs else {}
+    changed = added or new_stubs or new_fn_stubs or dropped
+    info: dict = {"symbols": resolved, "added_sources": added} if changed else {}
     if new_stubs:
         info["stubbed_globals"] = new_stubs
     if new_fn_stubs:
         info["stubbed_functions"] = new_fn_stubs
-    return [*sources, *added], info
+    if dropped:
+        info["unstubbed_globals"] = [s["name"] for s in dropped]
+    return [s for s in [*sources, *added] if s.replace("\\", "/") not in removed], info
 
 
 # Where a run keeps its call graph; run-relative, as the Make recipes run in the run directory.
@@ -2571,6 +2754,10 @@ def repair_link_rounds(
                 break
             new_g = info.get("stubbed_globals", [])
             new_f = info.get("stubbed_functions", [])
+            # A stub whose defining file a later round linked in is gone from the generated file.
+            gone = set(info.get("unstubbed_globals") or [])
+            stubbed = [s for s in stubbed if s["name"] not in gone]
+            round_stubbed = [s for s in round_stubbed if s["name"] not in gone]
             stubbed += new_g
             stubbed_fns += new_f
             round_stubbed += new_g
@@ -2584,7 +2771,8 @@ def repair_link_rounds(
         return comp, current, None
     record: dict = {
         "symbols": [sym for r in rounds for sym in r["symbols"]],
-        "added_sources": [src for r in rounds for src in r["added_sources"]],
+        # A file a later round took out again (an emptied link_globals.c) is no added source.
+        "added_sources": [src for r in rounds for src in r["added_sources"] if src in current],
         "rounds": rounds,
     }
     if round_stubbed:
