@@ -339,8 +339,17 @@ class UnsafePassthroughError(ValueError):
     """A flag value would be misinterpreted by e-acsl-gcc's whitespace re-parsing."""
 
 
-def normalize_passthrough(value: str) -> str:
-    """Make a flag string safe for e-acsl-gcc's whitespace splitting, or raise UnsafePassthroughError."""
+def normalize_passthrough(value: str, shell_words: bool = False) -> str:
+    """
+    Make a flag string safe for e-acsl-gcc's whitespace splitting, or raise UnsafePassthroughError.
+
+    `shell_words` quotes each token for a shell (shlex.quote), for the `-E` frontend flags: e-acsl-gcc
+    hands them to Frama-C as `-cpp-extra-args`, and Frama-C runs its preprocessor command through
+    /bin/sh, which removes one level of quotes. A bare `-DLOCALEDIR="/usr/share/locale"` reaches cpp as
+    `-DLOCALEDIR=/usr/share/locale` (a syntax error where the macro is used). Without it, tokens are
+    joined bare: the `-e` and `-l` values reach clang through an unquoted expansion, which splits on
+    whitespace but removes no quotes.
+    """
     try:
         tokens = shlex.split(value or "", posix=True)
     except ValueError as exc:
@@ -374,7 +383,7 @@ def normalize_passthrough(value: str) -> str:
             )
         out.append(tok)
         i += 1
-    return " ".join(out)
+    return shlex.join(out) if shell_words else " ".join(out)
 
 
 def split_preprocessor_flags(flags: str) -> tuple[list[str], list[str], list[str]]:
@@ -454,7 +463,7 @@ def build_eacsl_flag_sets(
     if not std_flags and EACSL_DEFAULT_STD not in backend:
         backend.append(EACSL_DEFAULT_STD)
     return {
-        "frontend": normalize_passthrough(shlex.join(front)),
+        "frontend": normalize_passthrough(shlex.join(front), shell_words=True),
         "backend": normalize_passthrough(shlex.join(backend)),
     }
 

@@ -183,6 +183,29 @@ def _append_cppflag(cppflags: str, flag: str) -> str:
     return cppflags.strip()
 
 
+def _restore_unquoted_macro(cppflags: str, dag_flag: str) -> str | None:
+    """
+    `cppflags` with the build's string-valued macro `dag_flag` (`-DLOCALEDIR="/usr/share/locale"`)
+    in place of the same macro without its quotes (`-DLOCALEDIR=/usr/share/locale`), else None.
+    The unquoted form is what a shell or shlex makes of the unit's DAG flags joined with spaces, as
+    a `--cppflags` value typed from the DAG list is (a target fuzz module's, SKILL.md): it compiles
+    `bindtextdomain("sudoers", /usr/share/locale)`. None when the caller gives no such token (its own
+    other value for the macro is not rewritten here) or the DAG flag has no quotes.
+    """
+    name, eq, value = dag_flag[2:].partition("=")
+    if not (dag_flag.startswith("-D") and eq and any(q in value for q in "\"'")):
+        return None
+    try:
+        unquoted = "".join(shlex.split(value))
+    except ValueError:
+        return None
+    tokens = _split_cppflags(cppflags)
+    stripped = f"-D{name}={unquoted}"
+    if stripped == dag_flag or stripped not in tokens:
+        return None
+    return " ".join(shlex.quote(dag_flag if t == stripped else t) for t in tokens)
+
+
 def _normalize_header_include(header_include: str | None, cppflags: str) -> tuple[str | None, str]:
     """
     If `header_include` is passed as a workspace/target file path (e.g.
@@ -1937,17 +1960,21 @@ def _merge_dag_module_cppflags(module_name: str, out_dir: Path, cppflags: str, u
             norm_flag = _normalize_dag_cppflag(raw_flag.strip())
             if not norm_flag.startswith(("-I", "-D", "-U", "-std=")):
                 continue
-            # Not carried into the harness: a macro value with quotes or spaces (later stages split
-            # and re-join flag strings, and `-DLOG="log.txt"` reaches the compiler as `log.txt`), and
-            # pre-C99 `-std=` flags (the harness code is ours, and needs C99 or later where a build
-            # may say -std=c89). C99+ `-std=` flags (e.g. `-std=c11`, `-std=gnu11`, `-std=c17`) are
-            # preserved on link units so WP, Eva and E-ACSL see the build's language standard unless
-            # the caller already supplied a C99+ `-std=`.
-            if norm_flag.startswith("-D") and any(c in norm_flag for c in "\"' \\"):
+            # Not carried into the harness: a macro value with whitespace (the build allowlist,
+            # pipeline_make.check_flags, and e-acsl-gcc's re-split of its flag values both refuse
+            # it), and pre-C99 `-std=` flags (the harness code is ours, and needs C99 or later where
+            # a build may say -std=c89). A string-valued macro (`-DLOCALEDIR="/usr/share/locale"`)
+            # is carried: every flag string keeps it shell-quoted (`_append_cppflag`), and the E-ACSL
+            # frontend quotes it again for the shell Frama-C runs its preprocessor through
+            # (eacsl_toolchain.build_eacsl_flag_sets). C99+ `-std=` flags (e.g. `-std=c11`,
+            # `-std=gnu11`, `-std=c17`) are preserved on link units so WP, Eva and E-ACSL see the
+            # build's language standard unless the caller already supplied a C99+ `-std=`.
+            if norm_flag.startswith("-D") and any(c.isspace() for c in norm_flag):
                 continue
             if norm_flag.startswith("-std=") and (is_pre_c99_std(norm_flag) or caller_has_std):
                 continue
-            cppflags = _append_cppflag(cppflags, norm_flag)
+            restored = _restore_unquoted_macro(cppflags, norm_flag)
+            cppflags = restored if restored is not None else _append_cppflag(cppflags, norm_flag)
         # The unit's force-included files (`-include config.h` in the build): without them the
         # harness compiles different code than the build does.
         tokens = _split_cppflags(cppflags)

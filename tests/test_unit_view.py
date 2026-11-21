@@ -245,13 +245,15 @@ def test_harness_flags_take_the_units_force_includes(tmp_path: Path) -> None:
         "tlv", tmp_path / "harnesses", "-include workspace/work/config.h"
     )
     assert again.count("config.h") == 1
-    # The spec's own quoted flag keeps its quoting; the build's quoted macro (CryptoLib's
-    # -DMC_LOG_PATH="log.txt", which later stages would unquote) and its -std= are not carried over.
+    # The spec's own quoted flag keeps its quoting; the build's string-valued macro (CryptoLib's
+    # -DMC_LOG_PATH="log.txt") is carried with its quotes; a macro with whitespace in its value and a
+    # pre-C99 -std= are not carried over.
     modules: dict = dag["modules"]  # type: ignore[assignment]
-    modules["libtlv_a"]["cppflags"] = ['-DLOG="log.txt"', "-std=c89", "-DN=4"]
+    modules["libtlv_a"]["cppflags"] = ['-DLOG="log.txt"', "-std=c89", "-DN=4", '-DSP="a b"']
     (tmp_path / "reports/callgraph_dag.json").write_bytes(json.dumps(dag).encode())
     merged = generate_harness._merge_dag_module_cppflags("tlv", tmp_path / "harnesses", "-DA='x y'")
-    assert generate_harness._split_cppflags(merged)[:2] == ["-DA=x y", "-DN=4"]
+    assert generate_harness._split_cppflags(merged)[:3] == ["-DA=x y", '-DLOG="log.txt"', "-DN=4"]
+    assert not any(t.startswith(("-DSP", "-std=")) for t in generate_harness._split_cppflags(merged))
 
 
 def test_cluster_and_freely_named_harnesses_take_their_units_flags(tmp_path: Path) -> None:

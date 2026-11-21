@@ -1639,11 +1639,19 @@ def parse_undefined_references(log: str) -> list[str]:
     return found
 
 
+_HEADER_SUFFIXES = frozenset({".h", ".hh", ".hpp", ".hxx", ".inc"})
+
+
 def _dag_symbol_tables(dag_path: Path) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
     """
     Return `(parsed_functions, build_only_functions)` from `callgraph_dag.json`:
     - `parsed_functions`: non-static function name -> `(defining_file, module)` (static functions
-      are skipped so they can never shadow an `extern` function or `extern` global, B8).
+      are skipped so they can never shadow an `extern` function or `extern` global, B8). A record
+      in a source file wins over one in a header (`header: true`, or a header suffix): the GCC call
+      graph also records a function at its header prototype (`include/sudo_debug.h#
+      sudo_debug_printf2_v1`, no body), and that header, linked as a source, defines nothing and
+      is parsed without the config.h its includer brings (sudo: `sudo_dso_public` at
+      sudo_fatal.h:170).
     - `build_only_functions`: build-only function name -> `defining_file` (code hidden from
       Frama-C by compiler macros, e.g. `#ifdef __SSE2__`; never stubbed in `link_stubs.c`).
     """
@@ -1653,13 +1661,22 @@ def _dag_symbol_tables(dag_path: Path) -> tuple[dict[str, tuple[str, str]], dict
         return {}, {}
     dag = dag if isinstance(dag, dict) else {}
     parsed: dict[str, tuple[str, str]] = {}
+    in_header: set[str] = set()
     for key, rec in (dag.get("functions") or {}).items():
         if not isinstance(rec, dict) or rec.get("is_static") is True:
             continue
         name = rec.get("name") or str(key).split("#")[-1]
         file = rec.get("file")
-        if name and file:
-            parsed.setdefault(str(name), (str(file), str(rec.get("module") or "")))
+        if not (name and file):
+            continue
+        header = bool(rec.get("header")) or posixpath.splitext(str(file))[1].lower() in _HEADER_SUFFIXES
+        name = str(name)
+        if name not in parsed or (name in in_header and not header):
+            parsed[name] = (str(file), str(rec.get("module") or ""))
+            if header:
+                in_header.add(name)
+            else:
+                in_header.discard(name)
     build_only_out: dict[str, str] = {}
     build_only = dag.get("build_only_functions")
     for file, names in (build_only if isinstance(build_only, dict) else {}).items():
