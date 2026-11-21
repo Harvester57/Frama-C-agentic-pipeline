@@ -146,6 +146,19 @@
     "harness_file": {"type": "string", "minLength": 1},
     "sources": {"$ref": "#/definitions/strings"},
     "flow_build_sources": {"$comment": "widened tree-relative address-flow build_sources when harness snippets name functions or globals outside the cluster's DAG reach (synchronized with fuzz_build._flow_cluster_files)", "$ref": "#/definitions/strings"},
+    "names_outside_link": {
+      "$comment": "System functions the harness's code (entry, call expressions, a target fuzzer's text without its comments and literals) calls that the target defines only outside what the harness's link unit can link (generate_harness._link_module_sets: the unit, what it links, and for a library the libraries a program links next to it), so no source was pulled in for them: sudo's getenv interposer in src/env_hooks.c for a library fuzzer calling libc's. A name is a system one when the target fuzzer's system headers declare it, or a program or shared library of the target (never an archive) calls it as an external function without linking any project definition of it. `definitions` are the DAG keys left out. Absent when there is none or the link unit is unknown.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "definitions": {"$ref": "#/definitions/strings"}
+        },
+        "required": ["name", "definitions"],
+        "additionalProperties": false
+      }
+    },
     "scope_files": {"$comment": "files whose functions a sub-module answers for at the reach gate (generate_harness.py --scope-file, kept on regeneration); empty means `sources`", "$ref": "#/definitions/strings"},
     "header": {"type": ["string", "null"]},
     "extra_includes": {"$ref": "#/definitions/strings"},

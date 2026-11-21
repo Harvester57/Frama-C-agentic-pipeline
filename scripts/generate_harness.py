@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -2570,6 +2570,67 @@ def _resolve_overlay_source(work_dir: Path, cand: str) -> str:
     return cand
 
 
+def _link_module_sets(dag: dict[str, Any]) -> dict[str, set[str]] | None:
+    """
+    Per DAG module (link unit), the modules whose definitions its link can hold: the unit, the project
+    modules it links (transitively), and, since a library is linked like the programs that use it, every
+    project library linked by a program (or library) whose link holds it. A static archive records no
+    links of its own (sudo's libsudo_iolog.a calls libsudo_util and libsudo_eventlog, which its programs
+    link next to it). A program nothing links (an executable, a plugin) is in no other module's set.
+    None when the DAG has no link units.
+    """
+    modules = dag.get("modules") or {}
+    if dag.get("module_kind") != "link_unit" or not isinstance(modules, dict):
+        return None
+    import unit_split
+
+    closures = {str(k): unit_split.unit_closure_modules(dag, str(k)) for k in modules}
+    sets = {k: set(c) for k, c in closures.items()}
+    for closure in closures.values():
+        for lib in closure[1:]:
+            sets[lib].update(closure[1:])
+    return sets
+
+
+def _dag_unit_key(dag: dict[str, Any], unit: str | None) -> str | None:
+    """The DAG module key of link unit `unit`, given as its key or as its path (`lib/util/.libs/libsudo_util.so.0.0.0`)."""
+    modules = dag.get("modules") or {}
+    if not unit or not isinstance(modules, dict):
+        return None
+    if isinstance(modules.get(unit), dict):
+        return unit
+    return next((str(k) for k, m in modules.items() if isinstance(m, dict) and m.get("unit") == unit), None)
+
+
+_LINE_MARKER_FLAGS_RE = re.compile(r'^#\s*\d+\s+"((?:[^"\\]|\\.)*)"((?:\s+\d+)*)\s*$')
+_DECLARATOR_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
+
+def _system_declared_names(preprocessed: str) -> set[str]:
+    """
+    The names `gcc -E` output `preprocessed` declares as functions in system headers (line-marker flag 3):
+    every identifier followed by `(` on a system header's lines, a superset of what they declare.
+    """
+    names: set[str] = set()
+    in_system = False
+    for line in preprocessed.splitlines():
+        marker = _LINE_MARKER_FLAGS_RE.match(line)
+        if marker:
+            in_system = "3" in marker.group(2).split()
+        elif in_system and "(" in line:
+            names.update(_DECLARATOR_RE.findall(line))
+    return names
+
+
+def _driver_system_names(driver: str, cppflags: str) -> set[str]:
+    """The function names target fuzzer `driver` gets from system headers (its `gcc -E`), none when that fails."""
+    path = Path(driver)
+    if not path.is_file():
+        path = Path("workspace/work") / driver
+    pre = _preprocess_driver(path.as_posix(), cppflags)
+    return _system_declared_names(pre) if pre else set()
+
+
 def _merge_dag_harness_sources(
     out_dir: Path,
     sources: list[str],
@@ -2577,14 +2638,31 @@ def _merge_dag_harness_sources(
     *invocation_snippets: str | None,
     module_name: str | None = None,
     flow_meta: dict[str, Any] | None = None,
+    unit: str | None = None,
+    system_names: Collection[str] = (),
 ) -> list[str]:
     """
     If `callgraph_dag.json` exists next to `out_dir` and `include_source` is False,
     inspect identifiers referenced in the harness invocation snippets (`entry_fn`,
-    `call_expr`, `eva_expr`, `fuzz_expr`), resolve any in-tree functions or header
-    `static inline` wrappers via the DAG, and append their module `required_sources`
-    (preserving `workspace/work/` prefix conventions from `sources` and respecting
-    explicit sub-module slices).
+    `call_expr`, `eva_expr`, `fuzz_expr`, a target fuzzer's whole text), resolve any in-tree
+    functions or header `static inline` wrappers via the DAG, and append their module
+    `required_sources` (preserving `workspace/work/` prefix conventions from `sources` and
+    respecting explicit sub-module slices).
+
+    Only code names something: comments and string or character literals are masked first (sudo's
+    fuzz_sudo_conf.c printed "Set disable_coredump %s" and pulled in sudo's front end).
+
+    A system function the target also defines (sudo's own program interposes libc's getenv and putenv
+    in src/env_hooks.c) is the system's for a harness whose link holds no such definition: with the
+    harness's link unit `unit` known (a link-unit DAG), a system name resolves only to a definition that
+    link can hold (`_link_module_sets`, or a file of `sources`). A name is a system one when
+    `system_names` holds it (what the target fuzzer's system headers declare, `_driver_system_names`)
+    or when a final link of the target (a program or shared library, never an archive) calls it as an
+    external function without linking any of its project
+    definitions. Any other name resolves as it always did, wherever it is defined: a fuzzer's own link
+    can add another program's objects (sudo's fuzz_sudoers links visudo's check_aliases.o). The names
+    left out are recorded in `flow_meta["names_outside_link"]` (name and the DAG keys of the definitions
+    it would have taken).
 
     For an address-flow cluster (`module_name` is a DAG submodule with `reach: address_flow`,
     scripts/unit_split.py), the files appended are instead those of the address-flow reach of the
@@ -2618,10 +2696,16 @@ def _merge_dag_harness_sources(
     if not isinstance(functions_map, dict) or not isinstance(modules_map, dict):
         return list(norm_sources)
 
+    from acsl_ast import mask_comments_and_literals
+
     referenced_idents: set[str] = set()
     for snippet in invocation_snippets:
         if snippet:
-            referenced_idents.update(_HARNESS_IDENT_RE.findall(snippet))
+            code = mask_comments_and_literals(snippet, acsl="blank", on_error="mask")
+            referenced_idents.update(_HARNESS_IDENT_RE.findall(code))
+
+    def _in_sources(file: object) -> bool:
+        return isinstance(file, str) and any(s == file or s.endswith("/" + file) for s in norm_sources)
 
     # A name defined in several files is keyed `file#name` in the DAG, never by the name alone.
     colliding: dict[str, list[str]] = {}
@@ -2629,34 +2713,94 @@ def _merge_dag_harness_sources(
         if "#" in str(key) and isinstance(rec, dict) and rec.get("name"):
             colliding.setdefault(str(rec["name"]), []).append(str(key))
 
+    # What each link unit's link can hold (None: no link units), the harness's (None: no filter), and
+    # the link units each definition is compiled into.
+    link_sets = _link_module_sets(dag)
+    unit_key = _dag_unit_key(dag, unit) if link_sets is not None else None
+    link_modules = link_sets.get(unit_key) if link_sets is not None and unit_key else None
+    module_of_unit = {
+        str(m.get("unit")): str(k) for k, m in modules_map.items() if isinstance(m, dict) and m.get("unit")
+    }
+    external_of: dict[str, list[str]] = {}
+    if link_modules is not None:
+        for mod_key, info in modules_map.items():
+            if not isinstance(info, dict) or info.get("kind") == "static_lib":
+                # An archive's link is not final: what it calls a program may define (sudo's fuzz stub
+                # library calls sudo_gettime_mono_v1, which libsudo_util defines).
+                continue
+            for callee in info.get("external_callees") or []:
+                if isinstance(callee, str):
+                    external_of.setdefault(callee, []).append(str(mod_key))
+
+    def _def_modules(key: str) -> set[str]:
+        rec = functions_map.get(key) or {}
+        mods = {module_of_unit.get(str(u)) for u in rec.get("units") or []} | {rec.get("module")}
+        return {m for m in mods if isinstance(m, str)}
+
+    def _system_name(ident: str) -> bool:
+        """Whether `ident` is a system function: declared by the system headers, or one a final link calls as such."""
+        if ident in system_names:
+            return True
+        keys = [ident] if ident in functions_map else colliding.get(ident) or []
+        defs = [k for k in keys if isinstance(functions_map.get(k), dict) and not functions_map[k].get("is_static")]
+        return any(
+            not any(_def_modules(k) & (link_sets or {}).get(mod, set()) for k in defs)
+            for mod in external_of.get(ident) or []
+        )
+
+    def _linkable(ident: str, key: str) -> bool:
+        """Whether the harness may mean definition `key` of `ident` (always, but for a system name its link lacks)."""
+        rec = functions_map.get(key)
+        if link_modules is None or not isinstance(rec, dict) or rec.get("header") or rec.get("model_only"):
+            return True
+        if _def_modules(key) & link_modules or _in_sources(rec.get("file")):
+            return True
+        return not _system_name(ident)
+
     def _colliding_keys(ident: str) -> list[str]:
-        """The definition the harness means: one in its sources, else the only external one."""
+        """The definition the harness means: one in its sources, else the only external one it may mean."""
         keys = sorted(colliding.get(ident) or [])
-        in_sources = [
-            k
-            for k in keys
-            if any(
-                s == functions_map[k].get("file") or s.endswith("/" + str(functions_map[k].get("file")))
-                for s in norm_sources
-            )
-        ]
+        in_sources = [k for k in keys if _in_sources(functions_map[k].get("file"))]
         if in_sources:
             return in_sources
-        external = [k for k in keys if not functions_map[k].get("is_static")]
+        external = [k for k in keys if not functions_map[k].get("is_static") and _linkable(ident, k)]
+        if len(external) > 1 and link_modules is not None:
+            # Several programs define it: the one the harness's link holds, when exactly one does.
+            external = [k for k in external if _def_modules(k) & link_modules]
         return external if len(external) == 1 else []
 
     aliases = dag.get("macro_aliases") or {}
     target_fns: set[str] = set()
+    outside_link: dict[str, set[str]] = {}
+
+    def _take(ident: str, keys: list[str]) -> None:
+        for key in keys:
+            if _linkable(ident, key):
+                target_fns.add(key)
+            else:
+                outside_link.setdefault(ident, set()).add(key)
+
     for ident in referenced_idents:
         if ident in functions_map:
-            target_fns.add(ident)
+            _take(ident, [ident])
         else:
-            target_fns.update(_colliding_keys(ident))
+            meant = _colliding_keys(ident)
+            target_fns.update(meant)
+            outs = [k for k in sorted(colliding.get(ident) or []) if not functions_map[k].get("is_static")]
+            if not meant and outs and not any(_linkable(ident, k) for k in outs):
+                # Every external definition lies outside the link (an ambiguous name stays silent).
+                outside_link.setdefault(ident, set()).update(outs)
         # A macro alias the build defines (the Phase 0 model's): alias -> DAG keys it expands to.
+        # Judged by the function's own name: `strlcpy` expanding to the project's `sudo_strlcpy` is no
+        # system function, whatever libc declares.
         alias_keys = aliases.get(ident) if isinstance(aliases, dict) else None
         for key in [alias_keys] if isinstance(alias_keys, str) else alias_keys or []:
-            if isinstance(key, str) and key in functions_map:
-                target_fns.add(key)
+            if isinstance(key, str) and isinstance(functions_map.get(key), dict):
+                _take(str(functions_map[key].get("name") or key.rpartition("#")[2]), [key])
+    if outside_link and flow_meta is not None:
+        flow_meta["names_outside_link"] = [
+            {"name": name, "definitions": sorted(keys)} for name, keys in sorted(outside_link.items())
+        ]
 
     global_vars_map = dag.get("global_variables") or {}
     target_globals: set[str] = set()
@@ -3230,7 +3374,18 @@ def _generate_module_harness(
         target_fuzzer_snippet,
         module_name=module_name,
         flow_meta=flow_meta,
+        unit=unit,
+        # The functions the fuzzer gets from system headers are the system's unless its link defines them.
+        system_names=(
+            _driver_system_names(target_fuzzer_record["source"], norm_cppflags) if target_fuzzer_record else ()
+        ),
     )
+    for left in flow_meta.get("names_outside_link") or []:
+        _feature_warn(
+            module_name,
+            f"`{left['name']}` is a system function here: the target defines it only outside what {unit} "
+            f"links ({', '.join(left['definitions'])}), so no source was pulled in for it (sidecar names_outside_link)",
+        )
     if target_fuzzer_record is not None:
         # The fuzzer overrides functions and globals of its unit: not linked with the files defining them.
         sources, tf_link = target_fuzzer_link_sources(out_dir, target_fuzzer_record["source"], sources, norm_cppflags)
@@ -3469,6 +3624,8 @@ def _generate_module_harness(
         sidecar["feature_macros"] = feature_macros
     if flow_meta.get("flow_build_sources"):
         sidecar["flow_build_sources"] = list(flow_meta["flow_build_sources"])
+    if flow_meta.get("names_outside_link"):
+        sidecar["names_outside_link"] = list(flow_meta["names_outside_link"])
     write_sidecar(harness_meta_file, sidecar)
 
     if (
