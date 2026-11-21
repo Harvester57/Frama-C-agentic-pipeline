@@ -2657,7 +2657,8 @@ def _merge_dag_harness_sources(
     harness's link unit `unit` known (a link-unit DAG), a system name resolves only to a definition that
     link can hold (`_link_module_sets`, or a file of `sources`). A name is a system one when
     `system_names` holds it (what the target fuzzer's system headers declare, `_driver_system_names`)
-    or when a unit of the target calls it as an external function without linking any of its project
+    or when a final link of the target (a program or shared library, never an archive) calls it as an
+    external function without linking any of its project
     definitions. Any other name resolves as it always did, wherever it is defined: a fuzzer's own link
     can add another program's objects (sudo's fuzz_sudoers links visudo's check_aliases.o). The names
     left out are recorded in `flow_meta["names_outside_link"]` (name and the DAG keys of the definitions
