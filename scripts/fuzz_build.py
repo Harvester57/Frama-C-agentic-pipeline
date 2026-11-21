@@ -24,6 +24,7 @@ from typing import Any
 
 import cache
 import fc_cpp_wrapper_eacsl
+import include_context
 import target_env
 from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code
 from eacsl_toolchain import (
@@ -67,6 +68,7 @@ from eacsl_toolchain import (
     rejected_meta_property,
     reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
+    rewrite_forward_array_sizes,
     rewrite_incomplete_alignof,
     rewrite_sound_verdict_resets,
     rewrite_sync_builtins,
@@ -195,6 +197,38 @@ def _resolve_eacsl_gcc() -> tuple[str, bool]:
 # (pipeline_make.KNOWN_EACSL_FAILURES, `eacsl_build_timeout`) reads the line from the compile log.
 BUILD_TIMEOUT_RC = 124
 BUILD_TIME_LIMIT_TEXT = "s build time limit"
+
+
+# Where a run keeps its build capture; run-relative, as the Make recipes run in the run directory.
+DEFAULT_CAPTURE_PATH = Path("workspace/reports/build_capture.json")
+
+
+@functools.lru_cache(maxsize=4)
+def _capture_context(path: str, mtime_ns: int) -> tuple[dict, str | None]:
+    """The build capture at `path` and the DAG's `target_dir` next to it (cached per file version)."""
+    capture = load_json_optional(Path(path), None)
+    dag = load_json_optional(Path(path).parent / "callgraph_dag.json", None)
+    target_dir = dag.get("target_dir") if isinstance(dag, dict) else None
+    return (capture if isinstance(capture, dict) else {}), (str(target_dir) if target_dir else None)
+
+
+def with_capture_include_dirs(
+    cppflags: str, sources: list[str], capture_path: Path | str | None = None
+) -> tuple[str, list[str]]:
+    """
+    `cppflags` with the `-I` / `-iquote` directories the build capture's compiles of `sources` search and
+    `cppflags` lacks (include_context.source_include_dirs), and the flags added. Unchanged without a capture
+    (`capture_path`, default the run's DEFAULT_CAPTURE_PATH).
+    """
+    path = Path(capture_path) if capture_path is not None else DEFAULT_CAPTURE_PATH
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        return cppflags, []
+    capture, target_dir = _capture_context(str(path.resolve()), mtime)
+    if not capture:
+        return cppflags, []
+    return include_context.source_include_dirs(cppflags, sources, capture, target_dir)
 
 
 def _run_tool(cmd: list[str], runner=subprocess.run, timeout: float | None = BUILD_TIMEOUT_S) -> tuple[int, str, str]:
@@ -778,6 +812,10 @@ def compile_eacsl_binary(
     the binary, `<out>.instrumented.c`, the variadic fallback object and the compile log (which
     then names the cache entry). The result carries `cache: {"hit": bool, "key": str | None}`.
 
+    The `-I` / `-iquote` directories of the build's own compiles of `sources` that `cppflags` lacks (a file
+    another link unit compiles, added by a link repair) are appended (`with_capture_include_dirs`) and listed
+    in `source_include_dirs`.
+
     `security_meta` (resolve_security_meta's result; None: no MetAcsl property, the build of every
     caller but build_module_binary) adds the run's MetAcsl properties to stage 1, so the binary stops
     on an input that violates one (`_build_with_security_meta`). The result then carries
@@ -810,9 +848,15 @@ def compile_eacsl_binary(
         concurrency=concurrency,
         libc_checks=libc_checks,
     )
+    cppflags, source_dirs = with_capture_include_dirs(cppflags, sources)
     cppflags = target_env.with_include_flags(cppflags)
     ldflags_extra = target_env.with_link_flags(ldflags_extra)
     target_fns = _discover_slice_functions(sources, functions, cppflags=cppflags, runner=runner)
+
+    def _noted(res: dict) -> dict:
+        if source_dirs:
+            res["source_include_dirs"] = list(source_dirs)
+        return res
 
     def _build(meta: dict | None = None) -> dict:
         return _compile_eacsl_binary_uncached(
@@ -892,7 +936,7 @@ def compile_eacsl_binary(
     if material is None:
         res = _meta_build() if plan else _build()
         res["cache"] = {"hit": False, "key": None}
-        return _with_properties(res) if plan else res
+        return _noted(_with_properties(res) if plan else res)
 
     instrumented_c = out_bin.with_suffix(".instrumented.c")
     compile_log = out_bin.with_suffix(".compile.log")
@@ -934,7 +978,7 @@ def compile_eacsl_binary(
         enable_l2=enable_l2,
         l2_target_functions=l2_functions,
     )
-    return _with_properties(cached) if plan else cached
+    return _noted(_with_properties(cached) if plan else cached)
 
 
 def _incomplete_alignof_note(info: dict) -> str:
@@ -990,7 +1034,7 @@ def _compile_eacsl_binary_uncached(
     an instrumented main() would. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
     (`-Dregister=`, recorded in `full_mtracking_defines`). Between the stages the instrumented file
     is patched for printer and E-ACSL gaps, each counted in the result (`alignas_rewrites`,
-    `wrapper_result_inits`, `formal_inits`, ...). A pointer-alignment check on a type the instrumented file
+    `wrapper_result_inits`, `formal_inits`, `forward_array_sizes`, ...). A pointer-alignment check on a type the instrumented file
     leaves incomplete (an opaque handle) cannot compile; it is made vacuous and listed, with the assumption it
     leaves, in `incomplete_alignof` (eacsl_toolchain.rewrite_incomplete_alignof). Uninitialized reads are
     checked (`-rte-initialized @all`) unless `rte_initialized` is False, which is recorded in
@@ -1267,6 +1311,18 @@ def _compile_eacsl_binary_uncached(
                     "(Frama-C's gcc_builtins.json overloads are not linker symbols).\n"
                 )
 
+            # Without this, clang rejects an array the kernel declares before the object its size reads.
+            c_text, forward_arrays = rewrite_forward_array_sizes(c_text)
+            if forward_arrays:
+                c_modified = True
+                result["forward_array_sizes"] = forward_arrays
+                names = ", ".join(f"{a['name']} (sized from {', '.join(a['operands'])})" for a in forward_arrays)
+                log_parts.append(
+                    f"Rewrote {len(forward_arrays)} global array(s) the Frama-C kernel declares before the object "
+                    f"their size reads: {names}. The earlier declarations became `extern T x[];` and the sized "
+                    "declaration follows that object's definition; the size and the checks are kept.\n"
+                )
+
             # Without this, clang rejects `_Alignof(T)` of an opaque handle T (pub/frama-c#2805): never silent.
             c_text, incomplete = rewrite_incomplete_alignof(c_text)
             if incomplete["rewrites"]:
@@ -1521,10 +1577,13 @@ def _compile_clang_binary(
     """
     Compile a slice directly with Clang, cached (binary and compile log) outside agents/*/scratch.
     Headers among `sources` are left out (`framac_common.compile_inputs`): clang cannot take one.
+    The include directories of the build's own compiles of `sources` that `cppflags` lacks are appended
+    and listed in `source_include_dirs` (`with_capture_include_dirs`), as for the E-ACSL build.
     """
     sources = compile_inputs(sources)
     out_bin = Path(out_bin)
     compile_log = out_bin.with_suffix(log_suffix)
+    cppflags, source_dirs = with_capture_include_dirs(cppflags, sources)
     cppflags = target_env.with_include_flags(cppflags)
     ldflags_extra = target_env.with_link_flags(ldflags_extra)
     cmd = [
@@ -1561,24 +1620,27 @@ def _compile_clang_binary(
     if not use_cache or _in_agent_scratch(out_bin):
         res = _build()
         res["cache"] = {"hit": False, "key": None}
-        return res
-    material = {
-        "kind": engine,
-        "command": cmd,
-        "sources": [str(s) for s in sources],
-        "out_bin": out_bin.as_posix(),
-    }
-    return cache.memoize(
-        "eacsl-build",
-        material,
-        sources=sources,
-        dep_flags=shlex.split(cppflags),
-        build=_build,
-        outputs=lambda res: {"binary": out_bin, "compile.log": compile_log},
-        ok=lambda res: res.get("returncode") == 0,
-        runner=runner,
-        on_restore=_note_cache_restore,
-    )
+    else:
+        material = {
+            "kind": engine,
+            "command": cmd,
+            "sources": [str(s) for s in sources],
+            "out_bin": out_bin.as_posix(),
+        }
+        res = cache.memoize(
+            "eacsl-build",
+            material,
+            sources=sources,
+            dep_flags=shlex.split(cppflags),
+            build=_build,
+            outputs=lambda res: {"binary": out_bin, "compile.log": compile_log},
+            ok=lambda res: res.get("returncode") == 0,
+            runner=runner,
+            on_restore=_note_cache_restore,
+        )
+    if source_dirs:
+        res["source_include_dirs"] = list(source_dirs)
+    return res
 
 
 def compile_sanitizer_binary(

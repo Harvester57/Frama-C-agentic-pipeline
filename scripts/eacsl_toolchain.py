@@ -1306,6 +1306,184 @@ def rewrite_incomplete_alignof(c_text: str) -> tuple[str, dict[str, Any]]:
     return "".join(pieces) + c_text[pos:], info
 
 
+# A file-scope array declaration as the Frama-C printer writes it, on one line from column 0, up to the
+# `[` of its size: `unsigned int ids[sizeof(names) / sizeof(names[0]) - (unsigned long)1];`.
+_FILE_SCOPE_ARRAY_LINE_RE = re.compile(r"^[A-Za-z_][^\n]*\][ \t]*;[ \t]*$", re.MULTILINE)
+_FILE_SCOPE_ARRAY_HEAD_RE = re.compile(r"(?P<head>[A-Za-z_][^\[\]=(){};]*?)\b(?P<name>[A-Za-z_]\w*)\s*\[")
+_INT_LITERAL_SIZE_RE = re.compile(r"\s*(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*\s*")
+_C_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+_C_SIZE_EXPRESSION_KEYWORDS = frozenset(
+    {
+        "sizeof",
+        "_Alignof",
+        "__alignof__",
+        "__alignof",
+        "unsigned",
+        "signed",
+        "long",
+        "short",
+        "int",
+        "char",
+        "float",
+        "double",
+        "_Bool",
+        "void",
+        "const",
+        "volatile",
+        "struct",
+        "union",
+        "enum",
+        "__int128",
+    }
+)
+
+
+def _matching_bracket(code: str, open_at: int, pair: str = "[]") -> int:
+    """The index of the bracket closing the one at `open_at` in `code` (comments and literals blanked), or -1."""
+    depth = 0
+    for i in range(open_at, len(code)):
+        ch = code[i]
+        if ch == pair[0]:
+            depth += 1
+        elif ch == pair[1]:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _declaration_end(code: str, start: int) -> int:
+    """The `;` that ends the file-scope declaration starting at `start` (outside any brace or parenthesis), or -1."""
+    depth = 0
+    for i in range(start, len(code)):
+        ch = code[i]
+        if ch in "{([":
+            depth += 1
+        elif ch in "})]":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return i
+    return -1
+
+
+def rewrite_forward_array_sizes(c_text: str) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Work around the Frama-C kernel printing a global array before the object its size reads (sudo run-1:
+    `testsudoers`, `tsdump`, `visudo`, `tf_fuzz_sudo_conf`; Frama-C 34 and 35). A header declares
+    `extern unsigned int ids[];`, and the source that defines the array sizes it from a static table:
+    `static const char *const names[] = {...}; unsigned int ids[nitems(names) - 1];`. The kernel completes
+    the type of every declaration with that size and prints the definition at the header's declaration,
+    before `names`, as `unsigned int ids[sizeof(names) / sizeof(names[0]) - (unsigned long)1];` (the size
+    is not folded: the E-ACSL frontend runs with `--no-constfold`). clang then stops on
+    "use of undeclared identifier 'names'". Plain `frama-c -print` does the same, so it is no E-ACSL issue.
+
+    Each file-scope declaration of an array whose size names an identifier first declared further down
+    (outside such declarations) becomes `extern T ids[];`, a declaration of the same object with an
+    incomplete type; the declaration with its size, unchanged, is put right after the `;` that ends the
+    definition of the last identifier it reads, on the same line (no line number moves). Without `extern`
+    in any rewritten declaration it is a definition, as the kernel printed it. The array's size and every
+    check on it are kept; code between the two only indexes the array, which an incomplete type allows.
+    A `static` or `typedef` declaration, and a size read from an identifier no file-scope declaration
+    defines, are left as they are.
+
+    Returns the new text and one entry per array rewritten: {name, size, operands, declarations, line}
+    (`declarations`: how many were made `extern T x[]`; `line`: the first one's line).
+    """
+    if "[" not in c_text:
+        return c_text, []
+    code = _C_COMMENT_OR_LITERAL_RE.sub(lambda m: " " * len(m.group(0)), c_text)
+    cands: list[dict[str, Any]] = []
+    for lm in _FILE_SCOPE_ARRAY_LINE_RE.finditer(code):
+        line = lm.group(0)
+        hm = _FILE_SCOPE_ARRAY_HEAD_RE.match(line)
+        if not hm:
+            continue
+        head_words = hm.group("head").split()
+        if "typedef" in head_words or "static" in head_words:
+            continue
+        open_at = hm.end() - 1
+        close_at = _matching_bracket(line, open_at)
+        if close_at < 0 or line[close_at + 1 :].strip() != ";":
+            continue
+        size = line[open_at + 1 : close_at]
+        if not size.strip() or _INT_LITERAL_SIZE_RE.fullmatch(size):
+            continue
+        ids = [i for i in dict.fromkeys(_C_IDENTIFIER_RE.findall(size)) if i not in _C_SIZE_EXPRESSION_KEYWORDS]
+        if ids:
+            cands.append({"start": lm.start(), "end": lm.end(), "line": line, "hm": hm, "size": size, "ids": ids})
+    if not cands:
+        return c_text, []
+    cand_starts = {c["start"] for c in cands}
+    first_decl: dict[str, int | None] = {}
+
+    def declared_at(ident: str) -> int | None:
+        """The start of the first line outside the candidates that names `ident`."""
+        if ident not in first_decl:
+            first_decl[ident] = None
+            for m in re.finditer(rf"(?<![\w$]){re.escape(ident)}(?![\w$])", code):
+                line_start = code.rfind("\n", 0, m.start()) + 1
+                if line_start not in cand_starts:
+                    first_decl[ident] = line_start
+                    break
+        return first_decl[ident]
+
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for c in cands:
+        forward = [i for i in c["ids"] if (at := declared_at(i)) is not None and at > c["start"]]
+        if not forward or any(declared_at(i) is None for i in c["ids"]):
+            continue
+        defs = [declared_at(i) for i in forward]
+        if any(d is None or code[d] in " \t\n" for d in defs):
+            continue  # first named inside a function: no file-scope definition to follow
+        end = max(_declaration_end(code, d) for d in defs if d is not None)
+        if end < 0:
+            continue
+        key = (c["hm"].group("name"), " ".join(c["size"].split()))
+        g = groups.setdefault(key, {"cands": [], "end": end, "operands": forward})
+        g["end"] = max(g["end"], end)
+        g["cands"].append(c)
+
+    edits: list[tuple[int, int, str]] = []
+    info: list[dict[str, Any]] = []
+    for (name, _size), g in groups.items():
+        before = [c for c in g["cands"] if c["start"] < g["end"]]
+        if not before:
+            continue
+        tentative = False
+        for c in before:
+            hm = c["hm"]
+            head = c_text[c["start"] : c["start"] + hm.start("name")]
+            words = head.split()
+            tentative = tentative or "extern" not in words
+            decl = head if "extern" in words else f"extern {head}"
+            edits.append((c["start"], c["end"], f"{decl}{name}[];"))
+        last = before[-1]
+        head = c_text[last["start"] : last["start"] + last["hm"].start("name")]
+        if tentative:
+            head = re.sub(r"\bextern\s+", "", head, count=1)
+        elif "extern" not in head.split():
+            head = f"extern {head}"
+        edits.append((g["end"] + 1, g["end"] + 1, f" {head}{name}[{last['size']}];"))
+        info.append(
+            {
+                "name": name,
+                "size": " ".join(last["size"].split()),
+                "operands": list(g["operands"]),
+                "declarations": len(before),
+                "line": c_text.count("\n", 0, before[0]["start"]) + 1,
+            }
+        )
+    if not edits:
+        return c_text, []
+    pieces: list[str] = []
+    pos = 0
+    for start, end, text in sorted(edits, key=lambda e: (e[0], e[1])):
+        pieces.extend([c_text[pos:start], text])
+        pos = end
+    pieces.append(c_text[pos:])
+    return "".join(pieces), info
+
+
 _STRTO_CALL_RE = re.compile(r"\b(?:strto\w*|wcsto\w*)\s*\(")
 _SOUND_VERDICT_RESET_RE = re.compile(r"\b__e_acsl_sound_verdict\s*=\s*0\s*;")
 _FUZZER_TEST_ONE_INPUT_DEF_RE = re.compile(
