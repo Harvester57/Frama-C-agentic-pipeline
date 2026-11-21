@@ -182,6 +182,8 @@ def test_a_later_round_that_adds_the_defining_file_drops_the_stub(tmp_path: Path
     assert record is not None
     assert "stubbed_globals" not in record and "globals_file" not in record
     assert record["rounds"][1]["unstubbed_globals"] == ["proto_empty"]
+    assert record["added_sources"] == ["workspace/work/proto/proto.c"]
+    assert not Path(stub_file).exists()
 
 
 def test_a_typedef_global_includes_its_header_after_an_includers_prefix(tmp_path: Path, monkeypatch) -> None:

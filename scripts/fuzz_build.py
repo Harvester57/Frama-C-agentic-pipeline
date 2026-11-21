@@ -2597,10 +2597,11 @@ def repair_sources_for_link(
     # (sudo liblogsrv_a: protobuf-c.c added for protobuf_c_message_pack, and protobuf_c_empty_string
     # stubbed too; Frama-C: `global var ... has different initializer`). A global still undefined
     # beside a file the failed build already compiled keeps its stub: that file does not define it
-    # under the build's flags.
+    # under the build's flags. Only link_globals.c's stubs: an address-flow cluster's `.bss` stubs
+    # (link_stubs.c, also pre-seeded) are left as they were.
     prior = list(stubbed or [])
     dropped: list[dict] = []
-    if added and (new_c_stubs or new_bss_stubs or prior):
+    if added and (new_c_stubs or prior):
         if global_vars is None:
             global_vars = _model_global_variables(dp)
         added_tree = {_dag_tree_path(a) for a in added}
@@ -2609,12 +2610,11 @@ def repair_sources_for_link(
             return any(_dag_tree_path(r["file"]) in added_tree for r in (global_vars or {}).get(name) or [])
 
         new_c_stubs = [s for s in new_c_stubs if not _linked(s["name"])]
-        new_bss_stubs = [s for s in new_bss_stubs if not _linked(s["name"])]
-        dropped = [s for s in prior if _linked(s["name"])]
+        dropped = [s for s in prior if not s.get("bss") and _linked(s["name"])]
     prior_c = [s for s in prior if not s.get("bss") and s not in dropped]
-    prior_bss = [s for s in prior if s.get("bss") and s not in dropped]
+    prior_bss = [s for s in prior if s.get("bss")]
     removed: set[str] = set()
-    if (new_c_stubs or any(not s.get("bss") for s in dropped)) and stub_dir is not None:
+    if (new_c_stubs or dropped) and stub_dir is not None:
         stub_file = stub_dir / LINK_GLOBALS_FILE
         if prior_c or new_c_stubs:
             stub_dir.mkdir(parents=True, exist_ok=True)
@@ -2627,7 +2627,7 @@ def repair_sources_for_link(
             removed.add(stub_file.as_posix())
             with contextlib.suppress(OSError):
                 stub_file.unlink()
-    if (new_fn_stubs or new_bss_stubs or any(s.get("bss") for s in dropped)) and stub_dir is not None:
+    if (new_fn_stubs or new_bss_stubs) and stub_dir is not None:
         stub_dir.mkdir(parents=True, exist_ok=True)
         fn_file = stub_dir / LINK_STUBS_FILE
         fn_file.write_text(
@@ -2739,7 +2739,8 @@ def repair_link_rounds(
         return comp, current, None
     record: dict = {
         "symbols": [sym for r in rounds for sym in r["symbols"]],
-        "added_sources": [src for r in rounds for src in r["added_sources"]],
+        # A file a later round took out again (an emptied link_globals.c) is no added source.
+        "added_sources": [src for r in rounds for src in r["added_sources"] if src in current],
         "rounds": rounds,
     }
     if round_stubbed:
