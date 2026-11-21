@@ -2454,9 +2454,11 @@ def sweep(
                 "off",
                 *wp_extra_flags,
                 "--sarif",
-                # One out-dir per file: run_wp_function names its artifacts after the function only.
+                # One out-dir per function: run_wp_function takes an exclusive lock on its out-dir
+                # (out_dir_locked), so two functions of one file must not share it in a parallel
+                # sweep. The file slug keeps same-named statics of different files apart.
                 "--out-dir",
-                f"{SWEEP_DIR}/work/{slugs[e['file']]}",
+                f"{SWEEP_DIR}/work/{slugs[e['file']]}/{e['function']}",
                 "--out-json",
                 out_json,
             ]

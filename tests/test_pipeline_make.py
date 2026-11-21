@@ -989,7 +989,7 @@ def test_sweep_runs_leased_wp_jobs_without_the_run_cache(tmp_path):
         "--no-warn-unsigned-downcast",
         "--sarif",
         "--out-dir",
-        "workspace/reports/wp-sweep/work/src_snmp_ber.c",
+        "workspace/reports/wp-sweep/work/src_snmp_ber.c/ber_decode",
         "--out-json",
         "workspace/reports/wp-sweep/src_snmp_ber.c__ber_decode.json",
     ]
