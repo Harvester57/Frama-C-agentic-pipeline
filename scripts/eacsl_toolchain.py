@@ -1169,6 +1169,143 @@ def rewrite_trailing_alignas(c_text: str) -> tuple[str, int]:
     return "\n".join(lines), count
 
 
+# What a build that rewrote `_Alignof(<incomplete type>)` assumes (rewrite_incomplete_alignof), recorded with
+# each such build in the result's `incomplete_alignof`.
+INCOMPLETE_ALIGNOF_ASSUMPTION = (
+    "a pointer to a type the instrumented translation unit leaves incomplete is aligned for that type: "
+    "its alignment is unknown there, so the pointer_alignment check on it was made vacuous (alignment 1)"
+)
+INCOMPLETE_ALIGNOF_VALUE = "1UL"
+# Comments and literals, blanked before the code is read, so that neither a definition nor an `_Alignof`
+# is found inside one.
+_C_COMMENT_OR_LITERAL_RE = re.compile(r"/\*.*?\*/|//[^\n]*|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
+_ALIGNOF_OP_RE = re.compile(r"(?<![\w$])(?:_Alignof|__alignof__|__alignof)\s*\(")
+_GNU_ATTRIBUTE = r"(?:__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)\s*)*"
+_RECORD_DEFINITION_RE = re.compile(rf"\b(struct|union)\s+{_GNU_ATTRIBUTE}([A-Za-z_]\w*)\s*{_GNU_ATTRIBUTE}\{{")
+_SIMPLE_TYPEDEF_RE = re.compile(r"\btypedef\s+([^;{}()\[\]*]+?)\s*;")
+_TYPE_QUALIFIERS = frozenset(
+    {"const", "volatile", "restrict", "__restrict", "__restrict__", "__const", "__volatile", "__volatile__"}
+)
+_ASSERT_DATA_VAR_RE = re.compile(r"\b__e_acsl_assert_register_\w+\s*\(\s*&\s*([A-Za-z_]\w*)")
+# How far past an `_Alignof` its assertion's data is looked for: E-ACSL writes it within a few lines.
+_ASSERT_DATA_WINDOW = 8000
+
+
+def _type_words(spelling: str) -> list[str] | None:
+    """The words of a type name without its qualifiers, or None for a pointer, array or function type."""
+    if any(ch in spelling for ch in "*[]()"):
+        return None
+    return [w for w in spelling.split() if w not in _TYPE_QUALIFIERS]
+
+
+def _c_string_value(literal: str) -> str:
+    """The text of a C string literal E-ACSL printed (only `\\\\` and `\\"` escapes matter here)."""
+    return re.sub(r"\\(.)", r"\1", literal[1:-1])
+
+
+def _assertion_of(c_text: str, at: int) -> dict[str, Any]:
+    """The source assertion whose E-ACSL check sits at `at`: its function, file, line and predicate, or Nones."""
+    found: dict[str, Any] = {"function": None, "file": None, "line": None, "predicate": None}
+    m = _ASSERT_DATA_VAR_RE.search(c_text, at, at + _ASSERT_DATA_WINDOW)
+    if not m:
+        return found
+    var = re.escape(m.group(1))
+    fields = re.compile(rf'\b{var}\.(fct|file|line|pred_txt)\s*=\s*("(?:\\.|[^"\\\n])*"|\d+)\s*;')
+    keys = {"fct": "function", "file": "file", "line": "line", "pred_txt": "predicate"}
+    for f in fields.finditer(c_text, m.end(), m.end() + _ASSERT_DATA_WINDOW):
+        key = keys[f.group(1)]
+        if found[key] is None:
+            value = f.group(2)
+            found[key] = int(value) if key == "line" else _c_string_value(value)
+        if all(v is not None for v in found.values()):
+            break
+    return found
+
+
+def rewrite_incomplete_alignof(c_text: str) -> tuple[str, dict[str, Any]]:
+    """
+    Work around Frama-C `-rte` / E-ACSL emitting the alignment of an incomplete type (sudo run-1, nginx
+    C7.2, libssh2 PB-5; upstream pub/frama-c#2805): for a pointer to an opaque handle that the instrumented
+    translation unit only declares (`typedef struct evp_md_st EVP_MD;`), RTE asserts
+    `\\aligned(p, alignof(EVP_MD const))` and E-ACSL prints `_Alignof(EVP_MD const)`, which clang refuses
+    ("invalid application of 'alignof' to an incomplete type"), so the module loses E-ACSL altogether.
+
+    Each `_Alignof(T)` (or `__alignof__(T)`) whose T names a struct or union tag that has no definition
+    anywhere in `c_text` becomes INCOMPLETE_ALIGNOF_VALUE (1): `\\aligned(p, 1)` holds for every pointer,
+    so that check is made vacuous. T may be the tag (`struct ssl_st`), a typedef name (`SSL`), a typedef of a
+    typedef, and carry `const` / `volatile`. A complete type, a pointer, an array, a scalar, and any name
+    this function cannot resolve to a tag keep their `_Alignof`: only a type shown to be incomplete is
+    rewritten. Comments and string literals are left alone, and so is the line count.
+
+    Why 1 and not another value: the translation unit cannot access an object through an incomplete type,
+    so the check guards no access it makes; and the true alignment is unknown there. Any value above 1 is a
+    guess: `_Alignof(max_align_t)` would raise false alarms on an object the library aligns less (a static
+    table of 8-aligned descriptors), and a smaller guess would only look like a check. The upstream fix
+    (pub/frama-c!36) likewise drops the annotation. The weakening is never silent: the result lists it.
+
+    Returns the new text and {rewrites, types, checks}: the number of `_Alignof` replaced (each E-ACSL
+    assertion holds two: the check and the value it reports), the incomplete tags (`struct evp_md_st`) in
+    order of first use, and one entry per distinct weakened source assertion {type, tag, function, file,
+    line, predicate, rewrites} read from the E-ACSL assertion data that follows it (`rewrites`: the
+    `_Alignof` replaced for it, 2 per E-ACSL check, more when the same assertion is checked again); an
+    occurrence without assertion data is listed with `function` None and its `instrumented_line`.
+    """
+    info: dict[str, Any] = {"rewrites": 0, "types": [], "checks": []}
+    if "_Alignof" not in c_text and "__alignof" not in c_text:
+        return c_text, info
+    code = _C_COMMENT_OR_LITERAL_RE.sub(lambda m: " " * len(m.group(0)), c_text)
+    defined = {(m.group(1), m.group(2)) for m in _RECORD_DEFINITION_RE.finditer(code)}
+    typedefs: dict[str, list[str]] = {}
+    for m in _SIMPLE_TYPEDEF_RE.finditer(code):
+        words = _type_words(m.group(1))
+        if words and len(words) >= 2:
+            typedefs[words[-1]] = words[:-1]
+
+    def incomplete_tag(spelling: str) -> str | None:
+        words = _type_words(spelling)
+        for _ in range(32):  # typedef chains are short; a cycle is no type
+            if not words:
+                return None
+            if len(words) == 2 and words[0] in ("struct", "union") and re.fullmatch(r"[A-Za-z_]\w*", words[1]):
+                return None if (words[0], words[1]) in defined else f"{words[0]} {words[1]}"
+            if len(words) != 1 or words[0] not in typedefs:
+                return None
+            words = typedefs[words[0]]
+        return None
+
+    pieces: list[str] = []
+    pos = 0
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for m in _ALIGNOF_OP_RE.finditer(code):
+        if m.start() < pos:
+            continue
+        close_at = _matching_paren(code, m.end() - 1)
+        if close_at < 0:
+            continue
+        spelling = " ".join(code[m.end() : close_at].split())
+        tag = incomplete_tag(spelling)
+        if tag is None:
+            continue
+        # Newlines inside the span stay after the value, so every later line keeps its number.
+        pieces.extend([c_text[pos : m.start()], INCOMPLETE_ALIGNOF_VALUE, "\n" * code.count("\n", m.start(), close_at)])
+        pos = close_at + 1
+        info["rewrites"] += 1
+        if tag not in info["types"]:
+            info["types"].append(tag)
+        where = _assertion_of(c_text, close_at)
+        check: dict[str, Any] = {"type": spelling, "tag": tag, **where}
+        if where["function"] is None:
+            check["instrumented_line"] = c_text.count("\n", 0, m.start()) + 1
+        key = tuple(check.values())
+        if key not in seen:
+            seen[key] = check
+            info["checks"].append(check)
+        seen[key]["rewrites"] = seen[key].get("rewrites", 0) + 1
+    if not pieces:
+        return c_text, info
+    return "".join(pieces) + c_text[pos:], info
+
+
 _STRTO_CALL_RE = re.compile(r"\b(?:strto\w*|wcsto\w*)\s*\(")
 _SOUND_VERDICT_RESET_RE = re.compile(r"\b__e_acsl_sound_verdict\s*=\s*0\s*;")
 _FUZZER_TEST_ONE_INPUT_DEF_RE = re.compile(

@@ -37,6 +37,7 @@ from eacsl_toolchain import (
     EACSL_NO_LIBC_CHECKS,
     EACSL_RTE_INITIALIZED_FLAG,
     ERRNO_SHIM_FUNCTIONS,
+    INCOMPLETE_ALIGNOF_ASSUMPTION,
     UnsafePassthroughError,
     attribute_ignored_annotations,
     build_eacsl_flag_sets,
@@ -66,6 +67,7 @@ from eacsl_toolchain import (
     rejected_meta_property,
     reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
+    rewrite_incomplete_alignof,
     rewrite_sound_verdict_resets,
     rewrite_sync_builtins,
     rewrite_trailing_alignas,
@@ -935,6 +937,26 @@ def compile_eacsl_binary(
     return _with_properties(cached) if plan else cached
 
 
+def _incomplete_alignof_note(info: dict) -> str:
+    """The compile-log paragraph for the checks rewrite_incomplete_alignof made vacuous, one line per check."""
+    checks = info["checks"]
+    lines = [
+        f"Made the pointer-alignment checks of {len(checks)} distinct source assertion(s) vacuous "
+        f"({info['rewrites']} `_Alignof` rewritten to "
+        f"1): the instrumented translation unit leaves {', '.join(info['types'])} incomplete, so clang rejects "
+        f"their `_Alignof` (Frama-C -rte / E-ACSL, pub/frama-c#2805). Assumed, not checked: "
+        f"{INCOMPLETE_ALIGNOF_ASSUMPTION}. Listed in the build result's `incomplete_alignof`."
+    ]
+    for c in checks:
+        where = (
+            f"{c['file']}:{c['line']} in {c['function']}"
+            if c.get("function")
+            else f"instrumented line {c.get('instrumented_line')}"
+        )
+        lines.append(f"  - {where}: {c.get('predicate') or 'alignof(' + str(c['type']) + ')'} ({c['tag']})")
+    return "\n".join(lines) + "\n"
+
+
 def _compile_eacsl_binary_uncached(
     sources: list[str],
     out_bin: Path,
@@ -968,9 +990,12 @@ def _compile_eacsl_binary_uncached(
     an instrumented main() would. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
     (`-Dregister=`, recorded in `full_mtracking_defines`). Between the stages the instrumented file
     is patched for printer and E-ACSL gaps, each counted in the result (`alignas_rewrites`,
-    `wrapper_result_inits`, `formal_inits`, ...). Uninitialized reads are checked (`-rte-initialized @all`)
-    unless `rte_initialized` is False, which is recorded in `reduced_checks`. Stage 1 is retried
-    once without functions Frama-C reports as unknown; stage 2 is retried once with a generated
+    `wrapper_result_inits`, `formal_inits`, ...). A pointer-alignment check on a type the instrumented file
+    leaves incomplete (an opaque handle) cannot compile; it is made vacuous and listed, with the assumption it
+    leaves, in `incomplete_alignof` (eacsl_toolchain.rewrite_incomplete_alignof). Uninitialized reads are
+    checked (`-rte-initialized @all`) unless `rte_initialized` is False, which is recorded in
+    `reduced_checks`. Stage 1 is retried once without functions Frama-C reports as unknown; stage 2 is
+    retried once with a generated
     link-only object when Variadic `<fn>_fallback_<N>` symbols are undefined.
     When the slice reads errno (the fc_stubs/errno.h global) and calls libc functions that set it,
     stage 2 also links the generated errno shim (`errno_shim`: wrapped functions, or `failed`).
@@ -1241,6 +1266,13 @@ def _compile_eacsl_binary_uncached(
                     f"Rewrote {n_sync} typed __sync_*_<intN>_t builtin call(s) back to polymorphic __sync_* "
                     "(Frama-C's gcc_builtins.json overloads are not linker symbols).\n"
                 )
+
+            # Without this, clang rejects `_Alignof(T)` of an opaque handle T (pub/frama-c#2805): never silent.
+            c_text, incomplete = rewrite_incomplete_alignof(c_text)
+            if incomplete["rewrites"]:
+                c_modified = True
+                result["incomplete_alignof"] = {**incomplete, "assumption": INCOMPLETE_ALIGNOF_ASSUMPTION}
+                log_parts.append(_incomplete_alignof_note(incomplete))
 
             if rte_initialized:
                 # Without this, any `ensures` reading \result fails \initialized(&__retres) on every input.

@@ -656,6 +656,40 @@ def const_union_rewrite_lines(run_dir: Path) -> list[str]:
     ]
 
 
+def incomplete_alignof_lines(run_dir: Path) -> list[str]:
+    """
+    The modules whose E-ACSL build made pointer-alignment checks on opaque handles vacuous
+    (`compile.incomplete_alignof` of workspace/build/<mod>.build.json, eacsl_toolchain.rewrite_incomplete_alignof).
+    One line, or nothing.
+    """
+    built: dict[str, tuple[int, list[str]]] = {}
+    for path in sorted((Path(run_dir) / "workspace/build").glob("*.build.json")):
+        try:
+            report = load_json_optional(path, None)
+        except (ArtifactError, OSError, ValueError):
+            continue
+        comp = report.get("compile") if isinstance(report, dict) else None
+        if not isinstance(comp, dict) or comp.get("returncode") != 0 or comp.get("engine") != "eacsl":
+            continue
+        rec = comp.get("incomplete_alignof")
+        if isinstance(rec, dict) and rec.get("rewrites"):
+            mod = str(report.get("module") or path.name.removesuffix(".build.json"))
+            built[mod] = (len(rec.get("checks") or []), [str(t) for t in rec.get("types") or []])
+    if not built:
+        return []
+    shown = ", ".join(
+        f"`{md_escape(m)}` ({n}: {md_escape(', '.join(types))})" for m, (n, types) in sorted(built.items())
+    )
+    return [
+        f"- **E-ACSL alignment checks on opaque handles made vacuous:** {len(built)} module(s) were built with "
+        "the pointer-alignment checks on types their instrumented file leaves incomplete rewritten to "
+        "alignment 1 (count of source assertions and the types in parentheses), because clang rejects "
+        "`_Alignof` of an incomplete type (pub/frama-c#2805). Those pointers are assumed aligned, not checked; "
+        f"each build result lists the assertions in `incomplete_alignof`. {shown}.",
+        "",
+    ]
+
+
 def load_fuzz_security_props(run_dir: Path) -> list[dict]:
     """
     What each fuzzed module's E-ACSL build did with the run's MetAcsl properties, one row per module
@@ -1860,6 +1894,7 @@ def render_report(data: dict) -> str:
     out += model_only_lines(ledger)
     if run_dir:
         out += const_union_rewrite_lines(Path(run_dir))
+        out += incomplete_alignof_lines(Path(run_dir))
     out += spec_quality_section(data)
 
     out += ["## 6. Coverage gaps", ""]
