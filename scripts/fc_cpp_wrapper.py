@@ -54,7 +54,7 @@ accepts `__alignof__` under `-machdep gcc_x86_64`, but its ACSL parser rejects `
 `__alignof__(T)` (mpack run-4).
 
 Fifth, before the preprocessor runs, `-include fc_cpp_no_c23_attributes.h` (next to this script) is put first
-on its command line: it defines `__has_c_attribute(x)` as 0. Frama-C 34/35 rejects C23 attribute specifiers
+on its command line: it defines `__has_c_attribute(x)` as 0. Frama-C 34 (34.0~beta) rejects C23 attribute specifiers
 (`[[__noreturn__]]`, `[[__fallthrough__]];`: "syntax error ... before or at token: ["), but GCC 14 answers
 `__has_c_attribute` with 202311 in every `-std` mode, so code that feature-tests it (sudo's config.h) handed
 Frama-C `[[...]]`; it now takes its own pre-C23 fallback. The header's `#undef`/`#define` lines are blanked
@@ -786,7 +786,7 @@ def rewrite_alignof_text(text: str) -> tuple[str, list[dict]]:
 # C23 attributes: `__has_c_attribute(x)` answers 0 for Frama-C's preprocessing
 # ---------------------------------------------------------------------------------------------------
 #
-# Frama-C 34/35 rejects `[[...]]` attribute specifiers in declarations and statements alike (sudo 1.9.18:
+# Frama-C 34 (34.0~beta) rejects `[[...]]` attribute specifiers in declarations and statements alike (sudo 1.9.18:
 # `include/sudo_fatal.h:173: User Error: syntax error ... before or at token: [`, from config.h's
 # `#define sudo_noreturn [[__noreturn__]]` and `#define FALLTHROUGH [[__fallthrough__]]`), while GCC 14's
 # preprocessor answers `__has_c_attribute(...)` with 202311 in every `-std` mode. The header forced first on

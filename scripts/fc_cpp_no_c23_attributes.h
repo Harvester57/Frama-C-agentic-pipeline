@@ -1,6 +1,6 @@
 /*
  * Forced first by scripts/fc_cpp_wrapper.py into every Frama-C preprocessing (Eva, WP, the Phase 0 model,
- * the kernel AST and the E-ACSL frontend). Frama-C 34/35 does not parse C23 attribute specifiers
+ * the kernel AST and the E-ACSL frontend). Frama-C 34 (34.0~beta) does not parse C23 attribute specifiers
  * (`[[__noreturn__]]`, `[[__fallthrough__]];`), but GCC 14's preprocessor answers `__has_c_attribute(...)`
  * with 202311 in every -std mode, so code that feature-tests it (sudo's config.h: sudo_noreturn,
  * FALLTHROUGH) hands Frama-C `[[...]]` and the parse stops with "syntax error ... before or at token: [".
