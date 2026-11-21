@@ -14,6 +14,9 @@
      docs/plans/unit-split-address-flow.md): per function body, the functions whose address it
      takes (`address_refs`) and the globals it names (`global_refs`); per defined global, the
      functions and globals its initializer names (`init_functions`, `init_globals`). Kernel names.
+   - per defined function and global, the file Frama-C parsed it from (schema 7, `root`): the
+     outermost file of its location's inclusion chain, so a location that a line directive moved
+     into a header can still be traced to its compiled source.
 
    Locations stay raw strings (Fclib.Fileloc.pretty), parsed by phase0_model.py; line spans are
    source lines (Fclib.Filepos.line), not lines of the preprocessed file. *)
@@ -63,6 +66,18 @@ let one_line pp x =
 
 let loc_s = one_line Fclib.Fileloc.pretty
 let exp_s = one_line Printer.pp_exp
+
+(* Schema 7: the file Frama-C parsed that a location comes from, absolute: the outermost position of
+   its inclusion chain, or the location's own file when it is in no included file. Line directives
+   can make the location name a file that does not hold the code (a `#line "toke.l"` Frama-C ignores
+   leaves the position in the last header entered); the root is still the compiled source, which
+   phase0_model.py uses to attribute such a definition. "" when unknown. *)
+let root_s (loc : location) =
+  try
+    let p = Fclib.Fileloc.start_pos loc in
+    let r = match List.rev (Fclib.Filepos.inclusions p) with [] -> p | outer :: _ -> outer in
+    Fclib.Filepath.to_string_abs (Fclib.Filepos.path r)
+  with _ -> ""
 
 (* First and last source line of a location; 0 for a generated or unknown one. *)
 let lines (loc : location) =
@@ -306,6 +321,7 @@ let function_json kf =
     [ ("kernel_name", S vi.vname);
       ("name", S vi.vorig_name);
       ("loc", S (loc_s def_loc));
+      ("root", S (root_s def_loc));
       ("first_line", I first);
       ("last_line", I (max first !last));
       ("static", B (vi.vstorage = Static));
@@ -351,14 +367,14 @@ let run () =
             let size_field = match bytes_of vi.vtype with Some n -> [ ("size", I n) ] | None -> [] in
             Some
               (O ([ ("name", S vi.vorig_name); ("kernel_name", S vi.vname); ("loc", S (loc_s loc));
-                    ("static", B (vi.vstorage = Static)); ("type", S (canon vi.vtype)) ]
+                    ("root", S (root_s loc)); ("static", B (vi.vstorage = Static)); ("type", S (canon vi.vtype)) ]
                   @ size_field
                   @ [ ("init_functions", names r.faddr); ("init_globals", names gvars) ]))
           | _ -> None)
         (Ast.get ()).globals
     in
     let doc =
-      O [ ("schema", I 6); ("functions", L (List.rev !functions)); ("declared", L !declared);
+      O [ ("schema", I 7); ("functions", L (List.rev !functions)); ("declared", L !declared);
           ("address_taken", L taken); ("globals", L globals) ]
     in
     let b = Buffer.create 65536 in
