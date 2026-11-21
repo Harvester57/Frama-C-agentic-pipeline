@@ -414,7 +414,7 @@ def test_the_preprocessor_output_is_rewritten_after_a_successful_run(tmp_path, c
     call, calls = _fake_cc1(_pp("r = __builtin_offsetof(struct d, args[x]);\n"))
     cmd = [CC1, "-E", "-quiet", "/t/src/arch.c", "-o", str(out)]
     assert W.run(cmd, call=call) == 0
-    assert calls == [cmd]
+    assert calls == [[CC1, "-include", W.NO_C23_ATTRIBUTES_HEADER, *cmd[1:]]]
     assert "__builtin_offsetof(struct d, args) + " in out.read_text(encoding="utf-8")
     assert "[fc-cpp] src/arch.c:50: offsetof with a non-constant index rewritten" in capsys.readouterr().err
     assert not list(tmp_path.glob("*.fc-cpp"))
@@ -459,6 +459,83 @@ def test_only_the_eacsl_wrapper_rewrites_equivalences(tmp_path, capsys):
     call, _ = _fake_cc1(text)
     assert fc_cpp_wrapper_eacsl.run_eacsl(cmd, call=call) == 0
     assert "<==>" not in out.read_text(encoding="utf-8")
+
+
+# sudo 1.9.18 run-1: config.h's `sudo_noreturn` / `FALLTHROUGH` became `[[__noreturn__]]` /
+# `[[__fallthrough__]]` because GCC 14 answers `__has_c_attribute`, and Frama-C stopped on the `[`.
+
+
+@pytest.mark.unit
+def test_the_preprocessor_runs_with_c23_attributes_answered_false():
+    header = W.NO_C23_ATTRIBUTES_HEADER
+    assert Path(header).name == "fc_cpp_no_c23_attributes.h" and Path(header).parent == ROOT / "scripts"
+    cmd = [CC1, "-E", "-quiet", "-include", "/opt/fc_compat_types.h", "src/a.c", "-o", "a.i"]
+    # First, so it precedes every target macro and the pipeline's own forced include.
+    assert W.with_c23_attributes_off(cmd) == [CC1, "-include", header, *cmd[1:]]
+    deps = [CC1, "-E", "-M", "a.c"]
+    assert W.with_c23_attributes_off(deps)[:3] == [CC1, "-include", header]
+    for other in (["/usr/bin/as", "a.s", "-o", "a.o"], [CC1, "-quiet", "a.c", "-o", "a.s"], []):
+        assert W.with_c23_attributes_off(other) == other
+    assert W.with_c23_attributes_off(cmd, header=str(ROOT / "scripts" / "missing.h")) == cmd
+
+
+@pytest.mark.unit
+def test_the_c23_attributes_header_redefines_the_builtin_inside_a_system_header():
+    raw = (ROOT / "scripts" / "fc_cpp_no_c23_attributes.h").read_bytes()
+    assert b"\r" not in raw
+    lines = [ln for ln in raw.decode("utf-8").splitlines() if ln.startswith("#")]
+    # A system header: redefining a built-in there neither warns nor fails a target's -Werror.
+    assert lines == [
+        "#pragma GCC system_header",
+        "#undef __has_c_attribute",
+        "#define __has_c_attribute(__fc_c23_attribute) 0",
+    ]
+    # The lines the wrapper blanks out of the `-dD` output are exactly the header's.
+    assert all(W._C23_DIRECTIVE_RE.fullmatch(ln) for ln in lines)
+
+
+@pytest.mark.unit
+def test_the_header_directives_are_blanked_from_the_preprocessed_output_and_nothing_else():
+    header = W.NO_C23_ATTRIBUTES_HEADER
+    text = (
+        '# 0 "src/a.c"\n'
+        f'# 1 "{header}" 1 3\n'
+        "#pragma GCC system_header\n"
+        "#undef __has_c_attribute\n"
+        "#define __has_c_attribute(__fc_c23_attribute) 0\n"
+        '# 1 "src/a.c" 2\n'
+        "#define __has_c_attribute(__fc_c23_attribute) 0\n"  # the target's own (same text): kept
+        "#pragma GCC system_header\n"
+        "int f(void) { int a[2], b[2] = {0}; return a[b[0]]; }\n"
+    )
+    new = W.blank_c23_attribute_directives(text)
+    assert new.count("\n") == text.count("\n")
+    assert new.splitlines()[2:5] == ["", "", ""]
+    assert new.splitlines()[5:] == text.splitlines()[5:]
+    assert W.blank_c23_attribute_directives(new) == new
+    assert W.blank_c23_attribute_directives("int x;\n") == "int x;\n"
+
+
+@pytest.mark.unit
+def test_the_wrapper_injects_the_header_and_blanks_its_lines_unless_switched_off(tmp_path, monkeypatch):
+    header = W.NO_C23_ATTRIBUTES_HEADER
+    text = f'# 1 "{header}" 1 3\n#undef __has_c_attribute\n# 1 "src/a.c" 2\nint x;\n'
+    out = tmp_path / "a.i"
+    cmd = [CC1, "-E", "src/a.c", "-o", str(out)]
+    call, calls = _fake_cc1(text)
+    assert W.run(cmd, call=call) == 0
+    assert calls[-1][:3] == [CC1, "-include", header]
+    assert out.read_text(encoding="utf-8") == f'# 1 "{header}" 1 3\n\n# 1 "src/a.c" 2\nint x;\n'
+    # The E-ACSL frontend's wrapper goes through the same `run`.
+    import fc_cpp_wrapper_eacsl
+
+    call, calls = _fake_cc1(text)
+    assert fc_cpp_wrapper_eacsl.run_eacsl(cmd, call=call) == 0
+    assert calls[-1][:3] == [CC1, "-include", header]
+    monkeypatch.setenv(W.DISABLE_ENV, "off")
+    call, calls = _fake_cc1(text)
+    assert W.run(cmd, call=call) == 0
+    assert calls == [cmd] and out.read_text(encoding="utf-8") == text
 
 
 @pytest.mark.unit
@@ -805,3 +882,111 @@ def test_wp_and_eacsl_guardrail_agree_on_alignof_macros_under_default_and_c99(tm
     assert wp_c99_off["status"] != "all_proven", wp_c99_off
     off_text = json.dumps(wp_c99_off) + (tmp_path / "wp_c99_off.err").read_text(encoding="utf-8", errors="replace")
     assert "unexpected token ')'" in off_text, off_text
+
+
+# sudo 1.9.18 config.h.in:1600-1650 (run-1: 19 of 25 link units fell back to GCC in the Phase 0 model):
+# a declaration attribute, a statement attribute with sudo's own pre-C23 fallback, and the one-line
+# `defined(X) && X(...)` test that `-U__has_c_attribute` would break. `a[b[k]]` must stay a subscript.
+SUDO_C23_LIKE = r"""#include <stdlib.h>
+#define HAVE_FALLTHROUGH_ATTRIBUTE 1
+#if defined(__has_c_attribute)
+# if __has_c_attribute(__noreturn__)
+#  define sudo_noreturn [[__noreturn__]]
+# endif
+#endif
+#ifndef sudo_noreturn
+# define sudo_noreturn __attribute__((__noreturn__))
+#endif
+#if defined(__has_c_attribute)
+# if __has_c_attribute(__fallthrough__)
+#  define FALLTHROUGH [[__fallthrough__]]
+# endif
+#endif
+#ifndef FALLTHROUGH
+# if defined(HAVE_FALLTHROUGH_ATTRIBUTE)
+#  define FALLTHROUGH __attribute__((__fallthrough__))
+# else
+#  define FALLTHROUGH do { } while (0)
+# endif
+#endif
+#if defined(__has_c_attribute) && __has_c_attribute(nodiscard)
+# define must_use [[nodiscard]]
+#else
+# define must_use
+#endif
+
+sudo_noreturn void die(const char *restrict fmt, ...) __attribute__((__format__(__printf__, 1, 2)));
+
+void die(const char *restrict fmt, ...)
+{
+    (void)fmt;
+    exit(1);
+}
+
+/*@ requires 0 <= k <= 1;
+    requires \valid_read(a + (0 .. 1)) && \valid_read(b + (0 .. 1));
+    requires \forall integer i; 0 <= i <= 1 ==> 0 <= b[i] <= 1;
+    assigns \nothing; */
+must_use int pick(int k, int *a, int *b)
+{
+    int x = 0;
+    switch (k) {
+    case 0:
+        x++;
+        FALLTHROUGH;
+    case 1:
+        x += a[b[k]];
+        break;
+    default:
+        die("bad %d", k);
+    }
+    return x;
+}
+
+int main(void)
+{
+    int a[2] = {1, 2}, b[2] = {0, 1};
+    return pick(0, a, b) == 2 ? 0 : 1;
+}
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_frama_c_and_eacsl_parse_code_that_feature_tests_c23_attributes(tmp_path):
+    require_docker_images(ANALYSIS_IMAGE)
+    (tmp_path / "c23.c").write_text(SUDO_C23_LIKE, encoding="utf-8", newline="\n")
+    py = 'import sys; sys.path.insert(0, "/opt/framac-pipeline/scripts"); '
+    script = (
+        "cd /w; "
+        f"A=$(python3 -c '{py}import framac_common; print(framac_common.augment_framac_cppflags(\"-I.\"))'); "
+        f'F=$(python3 -c \'{py}import eacsl_toolchain as T; print(T.build_eacsl_flag_sets("-I.", fuzzer=False)["frontend"])\'); '
+        # Without the wrapper's rewrites, Frama-C stops on `[[` (keeps this test honest about what it repairs).
+        'FRAMAC_CPP_REWRITE=off frama-c -no-unicode c23.c -cpp-extra-args="$A" -print > off.log 2>&1; echo "off_rc=$?"; '
+        'frama-c -no-unicode c23.c -cpp-extra-args="$A" -print > print.log 2>&1; echo "print_rc=$?"; '
+        'frama-c -no-unicode c23.c -cpp-extra-args="$A -Werror" -eva > eva.log 2>&1; echo "eva_rc=$?"; '
+        'e-acsl-gcc --full-mtracking -G clang -E "$F" -O bin c23.c > eacsl.log 2>&1; echo "eacsl_rc=$?"; '
+        './bin.e-acsl; echo "run_rc=$?"; cat print.log eva.log eacsl.log'
+    )
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", f"{tmp_path}:/w",
+            "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+            "-v", f"{ROOT / 'templates'}:/opt/framac-pipeline/templates:ro",
+            "--entrypoint", "bash", ANALYSIS_IMAGE, "-c", script,
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900, check=False,
+    )  # fmt: skip
+    log = proc.stdout + proc.stderr
+    off = (tmp_path / "off.log").read_text(encoding="utf-8", errors="replace")
+    assert "off_rc=0" not in log and "syntax error" in off and "[[__noreturn__]]" in off, off
+    for rc in ("print_rc=0", "eva_rc=0", "eacsl_rc=0", "run_rc=0"):
+        assert rc in log, log
+    assert "syntax error" not in log and "[[" not in log, log
+    assert "__attribute__((__noreturn__)) void" in log  # the declaration attribute's fallback
+    assert "__attribute__((__fallthrough__));" in log  # the statement attribute's fallback
+    assert "x += *(a + *(b + k));" in log  # a nested subscript is not an attribute
+    assert "0 alarms generated by the analysis." in log
+    # The redefined built-in is silent, even under -Werror and in the annotation preprocessor's replay.
+    assert "__has_c_attribute" not in log, log
