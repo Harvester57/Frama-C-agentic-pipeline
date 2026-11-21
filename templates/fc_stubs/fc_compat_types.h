@@ -1184,6 +1184,213 @@ struct tcp_info {
 #endif
 #endif /* FC_STUBS_NO_NETINET_LINUX_DECLS */
 
+/*
+ * glibc's internal type names (<bits/types.h>) that __fc_libc does not define, found on sudo (run-1,
+ * 2026-11-21). sudo's configure found <sys/procfs.h>, so plugins/sudoers/starttime.c includes it; __fc_libc
+ * has no such header, glibc's resolves through the `-idirafter` host directories, and its
+ * `__pid_t pr_pid;` stopped the parse with "sys/procfs.h:68: syntax error ... before or at token: __pid_t".
+ * Any glibc header reached that way may name these types, because glibc's own <sys/types.h> would have
+ * defined them and __fc_libc's does not.
+ *
+ * The types are glibc's on x86_64 (LP64, asserted above), not __fc_libc's public types: glibc's
+ * <bits/types.h> stays reachable through `-idirafter` and typedefs every one of these names again, which
+ * C11 accepts only for the identical type. Eight differ from the __fc_libc type with the same public name:
+ * __dev_t, __ino_t, __nlink_t, __suseconds_t, __clock_t, __blksize_t, __blkcnt_t and __key_t are glibc's,
+ * dev_t ... key_t stay __fc_libc's (checked against gcc with glibc by tests/test_fc_glibc_gaps.py).
+ * __int8_t ... __uint64_t are defined below. Not declared: __fsid_t (a structure, so a second definition
+ * would be another type) and __sigset_t (see the epoll entry in docs/troubleshooting/kernel-and-stubs.md).
+ * Define FC_STUBS_NO_GLIBC_INTERNAL_TYPES for a target that typedefs one of these names itself.
+ */
+#ifndef FC_STUBS_NO_GLIBC_INTERNAL_TYPES
+#ifndef __FC_COMPAT_GLIBC_TYPES_DEFINED
+#define __FC_COMPAT_GLIBC_TYPES_DEFINED 1
+typedef unsigned char __u_char;
+typedef unsigned short int __u_short;
+typedef unsigned int __u_int;
+typedef unsigned long int __u_long;
+typedef long int __quad_t;
+typedef unsigned long int __u_quad_t;
+typedef long int __intmax_t;
+typedef unsigned long int __uintmax_t;
+typedef unsigned long int __dev_t;
+typedef unsigned int __uid_t;
+typedef unsigned int __gid_t;
+typedef unsigned long int __ino_t;
+typedef unsigned long int __ino64_t;
+typedef unsigned int __mode_t;
+typedef unsigned long int __nlink_t;
+typedef long int __off_t;
+typedef long int __off64_t;
+typedef int __pid_t;
+typedef long int __clock_t;
+typedef unsigned long int __rlim_t;
+typedef unsigned long int __rlim64_t;
+typedef unsigned int __id_t;
+typedef long int __time_t;
+typedef unsigned int __useconds_t;
+typedef long int __suseconds_t;
+typedef long int __suseconds64_t;
+typedef int __daddr_t;
+typedef int __key_t;
+typedef int __clockid_t;
+typedef void *__timer_t;
+typedef long int __blksize_t;
+typedef long int __blkcnt_t;
+typedef long int __blkcnt64_t;
+typedef unsigned long int __fsblkcnt_t;
+typedef unsigned long int __fsblkcnt64_t;
+typedef unsigned long int __fsfilcnt_t;
+typedef unsigned long int __fsfilcnt64_t;
+typedef long int __fsword_t;
+typedef long int __ssize_t;
+typedef long int __syscall_slong_t;
+typedef unsigned long int __syscall_ulong_t;
+typedef long int __loff_t;
+typedef char *__caddr_t;
+typedef long int __intptr_t;
+typedef unsigned int __socklen_t;
+typedef int __sig_atomic_t;
+#endif /* __FC_COMPAT_GLIBC_TYPES_DEFINED */
+#endif /* FC_STUBS_NO_GLIBC_INTERNAL_TYPES */
+
+/*
+ * Linux resource limits __fc_libc's <sys/resource.h> lacks, found on sudo (run-1, 2026-11-21):
+ * src/limits.c:294 `getrlimit(RLIMIT_NPROC, &nproclimit)` stopped the parse with "Cannot resolve variable
+ * RLIMIT_NPROC". __fc_libc defines the seven POSIX names, RLIMIT_CORE to RLIMIT_AS, as 0 to 6, which are not
+ * Linux's numbers. The names below continue from 7 rather than take Linux's: Linux's RLIMIT_RSS (5) and
+ * RLIMIT_NPROC (6) are __fc_libc's RLIMIT_STACK and RLIMIT_AS, so `case RLIMIT_NPROC:` next to
+ * `case RLIMIT_AS:` would be a duplicate label and Eva would take `resource == RLIMIT_AS` for
+ * RLIMIT_NPROC. __fc_libc's getrlimit / setrlimit contracts do not depend on the number. RLIM_NLIMITS and
+ * RLIMIT_NLIMITS are one past the largest; RLIMIT_OFILE is the BSD name of RLIMIT_NOFILE. Each steps aside
+ * when <sys/resource.h> already defines it. Not changed: __fc_libc's RLIM_INFINITY is 0xFFFFFFFFul where
+ * glibc's on x86_64 is ~0ul. Define FC_STUBS_NO_RLIMIT_DECLS to keep <sys/resource.h> out of the
+ * force-include.
+ */
+#ifndef FC_STUBS_NO_RLIMIT_DECLS
+#include <sys/resource.h>
+#ifndef RLIMIT_RSS
+#define RLIMIT_RSS 7
+#endif
+#ifndef RLIMIT_NPROC
+#define RLIMIT_NPROC 8
+#endif
+#ifndef RLIMIT_MEMLOCK
+#define RLIMIT_MEMLOCK 9
+#endif
+#ifndef RLIMIT_LOCKS
+#define RLIMIT_LOCKS 10
+#endif
+#ifndef RLIMIT_SIGPENDING
+#define RLIMIT_SIGPENDING 11
+#endif
+#ifndef RLIMIT_MSGQUEUE
+#define RLIMIT_MSGQUEUE 12
+#endif
+#ifndef RLIMIT_NICE
+#define RLIMIT_NICE 13
+#endif
+#ifndef RLIMIT_RTPRIO
+#define RLIMIT_RTPRIO 14
+#endif
+#ifndef RLIMIT_RTTIME
+#define RLIMIT_RTTIME 15
+#endif
+#ifndef RLIMIT_NLIMITS
+#define RLIMIT_NLIMITS 16
+#endif
+#ifndef RLIM_NLIMITS
+#define RLIM_NLIMITS RLIMIT_NLIMITS
+#endif
+#ifndef RLIMIT_OFILE
+#define RLIMIT_OFILE RLIMIT_NOFILE
+#endif
+#endif /* FC_STUBS_NO_RLIMIT_DECLS */
+
+/*
+ * The pseudo-handles of dlsym(3) that __fc_libc's <dlfcn.h> lacks, found on sudo (run-1, 2026-11-21):
+ * src/sudo_intercept.c:243 `fn = dlsym(RTLD_NEXT, "execve");` stopped the parse with "Cannot resolve
+ * variable RTLD_NEXT". glibc's values and spelling; glibc declares them under _GNU_SOURCE, here they are
+ * defined whatever the target defines, because this header is read before the target's own
+ * `#define _GNU_SOURCE`. Macros only, no #include. __fc_libc's dlsym contract (`\result \from handle`)
+ * reads the handle as a value and never dereferences it. Not defined: glibc's RTLD_NOLOAD, RTLD_NODELETE
+ * and RTLD_DEEPBIND, which are mode bits, and __fc_libc's modes (RTLD_LAZY 1 to RTLD_LOCAL 4) are not
+ * glibc's bits (RTLD_NOLOAD would equal RTLD_LOCAL).
+ */
+#ifndef RTLD_NEXT
+#define RTLD_NEXT ((void *) -1l)
+#endif
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *) 0)
+#endif
+
+/*
+ * GNU fnmatch(3) flags __fc_libc's <fnmatch.h> lacks (it has POSIX's FNM_PATHNAME, FNM_NOESCAPE, FNM_PERIOD
+ * and FNM_NOMATCH), found on sudo (run-1, 2026-11-21): plugins/sudoers/match.c:540 stopped the parse with
+ * "Cannot resolve variable FNM_CASEFOLD". glibc's values, defined whatever the target's feature-test macros
+ * (glibc: _GNU_SOURCE); each steps aside when <fnmatch.h> defines it. __fc_libc's fnmatch contract does not
+ * depend on the flags. Define FC_STUBS_NO_FNMATCH_DECLS to keep <fnmatch.h> out of the force-include.
+ */
+#ifndef FC_STUBS_NO_FNMATCH_DECLS
+#include <fnmatch.h>
+#ifndef FNM_FILE_NAME
+#define FNM_FILE_NAME FNM_PATHNAME
+#endif
+#ifndef FNM_LEADING_DIR
+#define FNM_LEADING_DIR (1 << 3)
+#endif
+#ifndef FNM_CASEFOLD
+#define FNM_CASEFOLD (1 << 4)
+#endif
+#ifndef FNM_EXTMATCH
+#define FNM_EXTMATCH (1 << 5)
+#endif
+#ifndef FNM_NOSYS
+#define FNM_NOSYS (-1)
+#endif
+#endif /* FC_STUBS_NO_FNMATCH_DECLS */
+
+/*
+ * The lockf(3) commands, which __fc_libc's <unistd.h> does not define although it declares lockf (POSIX
+ * XSI puts both in <unistd.h>), found on sudo (run-1, 2026-11-21): lib/util/locking.c:62 stopped the parse
+ * with "Cannot resolve variable F_LOCK". glibc's values; each steps aside when <unistd.h> defines it.
+ */
+#include <unistd.h>
+#ifndef F_ULOCK
+#define F_ULOCK 0
+#endif
+#ifndef F_LOCK
+#define F_LOCK 1
+#endif
+#ifndef F_TLOCK
+#define F_TLOCK 2
+#endif
+#ifndef F_TEST
+#define F_TEST 3
+#endif
+
+/*
+ * mkdirat(2) (POSIX.1-2008, glibc <sys/stat.h>), which __fc_libc's <sys/stat.h> lacks although it declares
+ * fchmodat, fstatat and utimensat, found on sudo (run-1, 2026-11-21). Frama-C read each call as one to an
+ * undeclared `int mkdirat()` ("Calling undeclared function mkdirat. Old style K&R code?"), typed it from the
+ * first call it met, and stopped the unit at a second call whose mode argument has another type:
+ * "Incompatible declaration for mkdirat: different integer types: 'unsigned int' and 'int'"
+ * (lib/util/mkdir_parents.c:126, lib/util/mktemp.c:106). The contract is __fc_libc's mkdir contract with the
+ * directory descriptor added. Define FC_STUBS_NO_MKDIRAT_DECL for a target that declares its own.
+ * Not <sys/stat.h>: __fc_libc's includes <errno.h>, which this header never pulls in (test_fc_compat_contracts.py);
+ * mode_t and the string logic (valid_read_string, strlen) come from the two headers sys/stat.h reads them from.
+ */
+#ifndef FC_STUBS_NO_MKDIRAT_DECL
+#include <sys/types.h>
+#include <__fc_string_axiomatic.h>
+/*@
+  // missing: assigns \result \from 'filesystem'
+  requires valid_path: valid_read_string(path);
+  assigns \result \from indirect:fd, indirect:path, indirect:path[0..strlen(path)], indirect:mode;
+  ensures result_ok_or_error: \result == 0 || \result == -1;
+*/
+extern int mkdirat(int fd, const char *path, mode_t mode);
+#endif /* FC_STUBS_NO_MKDIRAT_DECL */
+
 /* Shared-header `assigns errno;` shim for __fc_libc (Eva, WP, Phase 0): declare `__fc_errno` and
  * `#define errno __fc_errno` without `#include <errno.h>` (so `E*` macros and `program_invocation_*`
  * stay out of units that did not include `<errno.h>`). Placed after the libc includes above and

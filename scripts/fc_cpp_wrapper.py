@@ -61,6 +61,18 @@ Frama-C `[[...]]`; it now takes its own pre-C23 fallback. The header's `#undef`/
 out of the `-dD` output, so Frama-C's annotation preprocessor does not replay them. Source that writes
 `[[...]]` without asking `__has_c_attribute` is not covered.
 
+Sixth, the line of a `#pragma` Frama-C does not interpret is left blank (`drop_unknown_pragmas`): Frama-C
+parses most pragmas with its attribute grammar and stops the unit on one outside it, such as sudo's
+`#pragma pvs(disable: 575, 618)`, which GCC ignores. `pack`, `GCC`, `STDC` and the other names in
+`PRAGMA_KEEP` stay.
+
+Seventh, when the preprocessor reads Frama-C's libc (`-I <share>/libc`, never in the E-ACSL frontend), the
+`fc_libc` directory of the `-I` directory holding fc_compat_types.h (templates/fc_stubs/fc_libc) is put on the
+include path right before it (`with_libc_overrides`). Its headers are __fc_libc's own with a structure
+completed to glibc's (`struct group` with gr_passwd, `struct utmpx` with ut_exit and ut_session, sudo): a
+structure cannot be completed from outside its header, and a stub directory searched after __fc_libc's is
+never read for a header __fc_libc has. A unit reads them only when it includes the header.
+
 For the E-ACSL frontend only, fc_cpp_wrapper_eacsl.py runs this script with `iff=True`, which also writes
 every `<==>` in an ACSL annotation as two implications (E-ACSL 35 aborts on `<==>` over a labelled term;
 see `rewrite_iff_text`). Eva and WP read the annotations as written.
@@ -819,6 +831,60 @@ def with_c23_attributes_off(cmd: Sequence[str], header: str = NO_C23_ATTRIBUTES_
     return [cmd[0], "-include", header, *cmd[1:]]
 
 
+# ---------------------------------------------------------------------------------------------------
+# __fc_libc headers with a structure completed to glibc's: searched before __fc_libc's
+# ---------------------------------------------------------------------------------------------------
+#
+# Frama-C puts `-I <share>/libc` before every `-cpp-extra-args` directory, so templates/fc_stubs is only
+# read for a header __fc_libc lacks. A structure __fc_libc declares with fewer members than glibc's (sudo:
+# `gr_passwd`, `ut_exit`) cannot be completed from fc_stubs, and pre-empting the header from the
+# force-included fc_compat_types.h would put its names (`EMPTY`, `ut_time`, `struct group`) and its
+# includes (<errno.h> through <stdio.h>) in every unit. The preprocessor is given the `fc_libc` directory
+# next to fc_compat_types.h right before __fc_libc's instead; its headers keep __fc_libc's guards, includes
+# and contracts. `__fc_libc.h`, which includes every libc header with quotes, still reads __fc_libc's.
+LIBC_OVERRIDE_SUBDIR = "fc_libc"
+FC_LIBC_MARKER = "__fc_libc.h"  # in Frama-C's libc directory only
+COMPAT_HEADER = "fc_compat_types.h"
+
+
+def _include_dirs(cmd: Sequence[str]) -> list[tuple[int, str]]:
+    """The `-I` directories of a cc1 command line, with the index of the argument that starts each."""
+    dirs: list[tuple[int, str]] = []
+    for i, arg in enumerate(cmd):
+        if i == 0:
+            continue
+        if arg == "-I" and i + 1 < len(cmd):
+            dirs.append((i, cmd[i + 1]))
+        elif arg.startswith("-I") and len(arg) > 2 and cmd[i - 1] != "-I":
+            dirs.append((i, arg[2:]))
+    return dirs
+
+
+def with_libc_overrides(cmd: Sequence[str]) -> list[str]:
+    """
+    gcc's preprocessor subcommand `cmd` (`cc1 -E`) with `-I <fc_stubs>/fc_libc` right before Frama-C's libc
+    directory; unchanged when it reads no __fc_libc (the E-ACSL frontend), has no -I directory holding
+    fc_compat_types.h and a `fc_libc` subdirectory, or already searches it.
+    """
+    if not cmd or os.path.basename(cmd[0]) not in ("cc1", "cc1.exe") or "-E" not in cmd[1:]:
+        return list(cmd)
+    dirs = _include_dirs(cmd)
+    libc = next((i for i, d in dirs if os.path.isfile(os.path.join(d, FC_LIBC_MARKER))), None)
+    if libc is None:
+        return list(cmd)
+    override = next(
+        (
+            os.path.join(d, LIBC_OVERRIDE_SUBDIR)
+            for _, d in dirs
+            if os.path.isfile(os.path.join(d, COMPAT_HEADER)) and os.path.isdir(os.path.join(d, LIBC_OVERRIDE_SUBDIR))
+        ),
+        None,
+    )
+    if override is None or any(os.path.normpath(d) == os.path.normpath(override) for _, d in dirs):
+        return list(cmd)
+    return [*cmd[:libc], "-I", override, *cmd[libc:]]
+
+
 def blank_c23_attribute_directives(text: str, header: str = NO_C23_ATTRIBUTES_HEADER) -> str:
     """
     The preprocessed text with the forced header's directive lines left blank (lines keep their numbers).
@@ -843,13 +909,91 @@ def blank_c23_attribute_directives(text: str, header: str = NO_C23_ATTRIBUTES_HE
     return "".join(out)
 
 
+# ---------------------------------------------------------------------------------------------------
+# Pragmas Frama-C does not interpret: dropped
+# ---------------------------------------------------------------------------------------------------
+#
+# Frama-C's lexer takes the rest of the line as text only for a few pragma names (clexer.mll,
+# `no_parse_pragma`: warning, GCC, omp and the Solaris and embedded ones); every other pragma is parsed with
+# the C attribute grammar, and one outside it is a syntax error that stops the whole unit. sudo 1.9.18's
+# bison grammar (plugins/sudoers/gram.y) has `#pragma pvs(disable: 575, 618)`, a PVS-Studio pragma, in
+# sudoerserror(), and Frama-C 34 stopped on its `:` (and reported it at a wrong file and line,
+# `plugins/sudoers/toke.h:2811`, with a nonsense include chain). `#pragma clang loop vectorize(enable)` fails
+# the same way. GCC ignores a pragma it does not know, as C11 6.10.6 asks, and so did sudo's build.
+# The line of every pragma whose first word is not in PRAGMA_KEEP is left blank (the line count is kept) and
+# reported as `[fc-cpp] <file>:<line>: unknown pragma rewritten: <pragma> -> (blank line)`. Kept: the names
+# Frama-C reads as a line, the ones it interprets (`pack`, `align`, `noalign`, `fc_stdlib`, cabs2cil.ml), the
+# ones that change a layout or a link for the compiler of E-ACSL's output (`scalar_storage_order`,
+# `ms_struct`, `weak`, `redefine_extname`), the C standard's `STDC`, `once`, and `push_macro` / `pop_macro`,
+# which Frama-C's annotation preprocessor (-pp-annot) may replay with the file's `#define` lines. A pragma
+# Frama-C parsed was only kept as a pragma: no kernel pass or plugin reads one outside that list.
+PRAGMA_KEEP = frozenset(
+    {
+        # Frama-C reads these as a line of text (clexer.mll `no_parse_pragma`).
+        "warning", "GCC", "omp", "ident", "section", "option", "asm", "use_section", "weak",
+        "redefine_extname", "TCS_align", "global_register", "location",
+        # Frama-C interprets these (cabs2cil.ml).
+        "pack", "align", "noalign", "fc_stdlib",
+        # Layout, standard pragmas, and the macro stack the annotation preprocessor may replay.
+        "scalar_storage_order", "ms_struct", "STDC", "once", "push_macro", "pop_macro",
+    }
+)  # fmt: skip
+# Comments and literals are matched whole (and so skipped); group 1 is the text of a pragma line, and every
+# other directive line is matched whole.
+_PRAGMA_SCAN_RE = re.compile(
+    r"//[^\n]*"
+    r"|/\*.*?\*/"
+    r'|"(?:\\.|[^"\\\n])*"'
+    r"|'(?:\\.|[^'\\\n])*'"
+    r"|^[ \t]*#[ \t]*pragma\b([^\n]*)"
+    r"|^[ \t]*#[^\n]*",
+    re.DOTALL | re.MULTILINE,
+)
+_PRAGMA_NAME_RE = re.compile(r"[ \t]*([A-Za-z_]\w*)")
+
+
+def drop_unknown_pragmas(text: str) -> tuple[str, list[dict]]:
+    """
+    The preprocessed text with the line of every pragma whose name is not in PRAGMA_KEEP left blank, and
+    one note per pragma dropped. Pragmas inside comments and string literals stay.
+    """
+    if "pragma" not in text:
+        return text, []
+    where: Callable[[int], tuple[str, int]] | None = None
+    out: list[str] = []
+    notes: list[dict] = []
+    last = 0
+    for m in _PRAGMA_SCAN_RE.finditer(text):
+        body = m.group(1)
+        if body is None:
+            continue
+        name = _PRAGMA_NAME_RE.match(body)
+        if name is None or name.group(1) in PRAGMA_KEEP:
+            continue
+        if where is None:
+            where = _locator(text)
+        file, line = where(m.start())
+        original = " ".join(m.group(0).split())
+        notes.append(
+            {"file": file, "line": line, "kind": "unknown pragma", "original": original, "rewritten": "(blank line)"}
+        )
+        out.append(text[last : m.start()])
+        last = m.end()
+    if not notes:
+        return text, []
+    out.append(text[last:])
+    return "".join(out), notes
+
+
 def rewrite_file(path: str, iff: bool = False) -> list[dict]:
     """Rewrite one preprocessed file in place; fail open (the file stays as the preprocessor wrote it)."""
     try:
         with open(path, "rb") as fh:
             text = fh.read().decode("latin-1")  # byte-preserving: the C text round-trips unchanged
         blanked = blank_c23_attribute_directives(text)
-        new, notes = rewrite_text(blanked)
+        blanked, notes = drop_unknown_pragmas(blanked)
+        new, offset_notes = rewrite_text(blanked)
+        notes += offset_notes
         new, syscall_notes = rewrite_syscall_text(new)
         notes += syscall_notes
         new, alignof_notes = rewrite_alignof_text(new)
@@ -893,14 +1037,15 @@ def output_path(cmd: Sequence[str]) -> str | None:
 def run(cmd: Sequence[str], call: Callable[[list[str]], int] = subprocess.call, iff: bool = False) -> int:
     """
     Run gcc's subcommand `cmd` (the preprocessor with `__has_c_attribute` answering 0, see
-    `with_c23_attributes_off`); after a successful preprocessing into a file, rewrite that file. `iff`
+    `with_c23_attributes_off`, and the completed __fc_libc headers first, see `with_libc_overrides`);
+    after a successful preprocessing into a file, rewrite that file. `iff`
     (the E-ACSL frontend, fc_cpp_wrapper_eacsl.py) also rewrites `<==>` in annotations.
     """
     if not cmd:
         print(f"usage: {os.path.basename(sys.argv[0])} <subcommand> [args...] (a gcc -wrapper)", file=sys.stderr)
         return 2
     disabled = os.environ.get(DISABLE_ENV, "").lower() in ("0", "off", "false", "no")
-    rc = call(list(cmd) if disabled else with_c23_attributes_off(cmd))
+    rc = call(list(cmd) if disabled else with_libc_overrides(with_c23_attributes_off(cmd)))
     if rc != 0 or not is_preprocessing(cmd) or disabled:
         return rc
     out = output_path(cmd)
