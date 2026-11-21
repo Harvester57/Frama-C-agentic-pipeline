@@ -1335,12 +1335,18 @@ def contract_declaration_spans(
 ) -> list[DeclSpan]:
     """
     The declarations of `function_name` whose contract the pipeline reads and merges: in a header,
-    every one (`function_declaration_spans`); in a source file, its first definition only.
+    every one (`function_declaration_spans`); in a source file, every definition, not its prototypes.
+
+    A source file may define the function once per arm of a preprocessor conditional (nanopb
+    `pb_decode.c`: `pb_release` under `#ifdef PB_ENABLE_MALLOC` and again under `#else`). This text
+    scanner does not know the build's macros, so it cannot tell which definition is compiled: the
+    prover annotates the compiled one, and every definition is taken so that its contract is the one
+    merged and read. WP and Eva run on the preprocessed source and see the compiled definition only.
     """
     spans = function_declaration_spans(source, function_name, path=path)
     if is_header:
         return spans
-    return [d for d in spans if d.kind == "definition"][:1]
+    return [d for d in spans if d.kind == "definition"]
 
 
 def _span_contract_part(decl: DeclSpan, path: str = "<input>") -> str:
@@ -1463,9 +1469,10 @@ def splice_prover_changes(
     """
     Validate that the prover only modified ACSL annotations inside `function_name`'s
     declarations (comparing `agent_work_text` against `base_work_text`), then splice the
-    updated declarations into `current_work_text`. In a source file that is the definition;
-    in a header it is every declaration (`contract_declaration_spans`: the prototype, the
-    `static inline` definition, or both). When `contract_only=True`, only the contract before
+    updated declarations into `current_work_text`. In a source file that is the definition (each
+    of them when the arms of a preprocessor conditional define it more than once); in a header it
+    is every declaration (`contract_declaration_spans`: the prototype, the `static inline`
+    definition, or both). When `contract_only=True`, only the contract before
     a definition's `{` is taken from `agent_work_text`; its body `{ ... }` is kept from
     `base_work_text`.
     """
