@@ -37,9 +37,10 @@ Modes:
    GUARDRAIL_MAX_EXCLUDED_INPUTS times; `excluded_inputs` lists each with its crash (and the E-ACSL
    `failure` and `fingerprint`). Such a failure is never a `code_fault` or `rejected_overconstrained`
    of the contract under check. When the input is a mutation of the burst, not a corpus file, the
-   corpus is replayed again without mutations and `mutations_skipped` holds the crash. When the
-   input still cannot be dropped, or past the limit, the status is `guardrail_error` and
-   `outside_checked_functions` holds the failure.
+   corpus is replayed again without mutations and `mutations_skipped` holds the crash (and, for an
+   E-ACSL failure, its `failure` and `fingerprint`), whether or not E-ACSL reported it. When the
+   input still cannot be dropped, or past the limit, the status is `guardrail_error`; for an E-ACSL
+   failure `outside_checked_functions` holds it, a sanitizer crash keeps the classifier's reason.
    A replayed input that hangs (libFuzzer's per-input `-timeout`) says nothing about the contract either: it is
    dropped the same way, its entry has `kind: timeout`, and a hanging mutation skips the burst. `timeout_s` bounds
    all the replays together. When the hang cannot be dropped, every input hung, the limit or the wall budget is
@@ -1865,7 +1866,9 @@ def run_guardrail_check(
     A pass only says that no replayed input broke a check. `reach` records how often each of
     `functions` ran: a contract on a function no input reached was not tested at all.
 
-    A failure outside `functions` is not held against the contract (failure_outside_checked_functions).
+    A failure outside `functions` is not held against the contract (failure_outside_checked_functions),
+    nor is a sanitizer crash there (crash_outside_checked_functions). On a corpus input either one drops
+    the input; on a mutation of the burst either one skips the burst (`mutations_skipped`).
     `contract_functions` are the functions whose annotations the build is limited to (`--functions`;
     default `functions`): a failed annotation is only excused outside them, so a module-wide build that
     only measures the reach of `functions` (`--reach-functions`, an empty list here) excuses RTE
@@ -2040,10 +2043,12 @@ def run_guardrail_check(
         still = set(replay_names)
         name = _replayed_input_of(crash_input, [e for e in replay_manifest if e[0] in still])
         if name is None:
-            if failure is None or crash_input is None or mutation_runs <= 0:
+            if crash_input is None or mutation_runs <= 0:
                 break
             # Not a corpus file: a mutation of the burst. The seed is fixed, so the burst would stop there
-            # every time; replay the corpus alone and say so (`mutations_skipped`).
+            # every time; replay the corpus alone and say so (`mutations_skipped`). This holds for a sanitizer
+            # crash as for an E-ACSL failure: either way no checked function is on the stack (nanopb run-1: a
+            # UBSan SEGV of `advance_iterator` on a mutation stopped the header guardrail after 64 inputs).
             mutations_skipped = {"crash_input": crash_input, **outside}
             mutation_runs = 0
             wall_left = math.ceil(deadline - time.monotonic())

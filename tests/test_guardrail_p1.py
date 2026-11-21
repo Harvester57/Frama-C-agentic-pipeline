@@ -783,11 +783,20 @@ def test_guardrail_never_blames_the_contract_past_the_exclusion_limit(tmp_path, 
     assert verdict["outside_checked_functions"]["failure"]["function"] == "minmea_scan"
 
 
-def _mutation_guardrail(tmp_path: Path, monkeypatch, functions: list[str], calls: list, always: bool = False) -> dict:
+def _mutation_guardrail(
+    tmp_path: Path,
+    monkeypatch,
+    functions: list[str],
+    calls: list,
+    always: bool = False,
+    report: str = EACSL_RTE_ELSEWHERE,
+    returncode: int = 77,
+) -> dict:
     """
-    A guardrail whose fake libFuzzer stops on an input no corpus file holds, with the minmea_scan overflow:
-    a mutation of the `--extra-runs` burst (only when `-runs` is not 0), or with `always` on every replay.
-    This is the minmea case: 64 of 223 corpus inputs replayed, and the fault came from a generated unit.
+    A guardrail whose fake libFuzzer stops on an input no corpus file holds, with `report` (by default the
+    minmea_scan overflow): a mutation of the `--extra-runs` burst (only when `-runs` is not 0), or with `always`
+    on every replay. This is the minmea case: 64 of 223 corpus inputs replayed, and the fault came from a
+    generated unit.
     """
     corpus = _corpus(tmp_path)
     monkeypatch.setattr(R, "is_eacsl_instrumented", lambda b: True)
@@ -799,8 +808,8 @@ def _mutation_guardrail(tmp_path: Path, monkeypatch, functions: list[str], calls
         if always or "-runs=0" not in cmd:
             prefix = Path(next(a for a in cmd if a.startswith("-artifact_prefix=")).split("=", 1)[1])
             (prefix / "crash-0123").write_bytes(MINMEA_CRASHER)
-            out = EACSL_RTE_ELSEWHERE + f"Test unit written to {prefix}/crash-0123\n"
-            return SandboxResult(77, "", out, False, "rlimits", list(cmd))
+            out = report + f"Test unit written to {prefix}/crash-0123\n"
+            return SandboxResult(returncode, "", out, False, "rlimits", list(cmd))
         return SandboxResult(0, "stat::number_of_executed_units: 6\n", "", False, "rlimits", list(cmd))
 
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
@@ -838,6 +847,44 @@ def test_guardrail_never_blames_the_contract_for_an_input_it_cannot_drop(tmp_pat
     outside = verdict["outside_checked_functions"]
     assert outside["failure"]["label"] == "rte/signed_overflow" and outside["fingerprint"]
     assert len(verdict["diagnostic_hints"]) == 1 and "NOT a code_fault" in verdict["diagnostic_hints"][0]
+
+
+# nanopb run-1 (2026-11-20): the header guardrail's burst stopped on a mutation (`MS: 1 CrossOver-`) with a
+# UBSan SEGV in `advance_iterator` <- `pb_field_iter_find_extension`, no E-ACSL report and no checked function
+# on the stack, and reported `guardrail_error` after 64 of 773 corpus inputs. SEGV_ELSEWHERE has the same shape.
+
+
+def test_guardrail_skips_the_mutation_burst_when_a_mutation_crashes_in_another_function(
+    tmp_path, monkeypatch, chdir_tmp
+):
+    calls: list = []
+    verdict = _mutation_guardrail(
+        tmp_path, monkeypatch, ["mnl_attr_get_len"], calls, report=SEGV_ELSEWHERE, returncode=1
+    )
+    assert verdict["status"] == "passed_dynamic_oracle" and verdict["excluded_inputs"] == []
+    assert ["-runs=100" in c for c in calls] == [True, False] and "-runs=0" in calls[1]
+    skipped = verdict["mutations_skipped"]
+    assert skipped["crash_input"] == "scratch/crash-0123" and "in mnl_attr_ok" in skipped["crash"]
+    assert "failure" not in skipped and "kind" not in skipped
+    assert any("mutation burst was skipped" in h for h in verdict["diagnostic_hints"])
+
+
+def test_guardrail_keeps_the_sanitizer_crash_of_a_mutation_in_a_checked_function(tmp_path, monkeypatch, chdir_tmp):
+    calls: list = []
+    verdict = _mutation_guardrail(tmp_path, monkeypatch, ["mnl_attr_parse"], calls, report=SEGV_ELSEWHERE, returncode=1)
+    assert verdict["status"] == "guardrail_error" and len(calls) == 1
+    assert "mutations_skipped" not in verdict and "outside_checked_functions" not in verdict
+    assert "SUMMARY: UndefinedBehaviorSanitizer: SEGV" in verdict["runtime_trace"]
+
+
+def test_guardrail_stops_when_a_sanitizer_crash_elsewhere_survives_the_skipped_burst(tmp_path, monkeypatch, chdir_tmp):
+    # Still crashing elsewhere without mutations, on an input that is no replayed corpus file: nothing to drop.
+    calls: list = []
+    verdict = _mutation_guardrail(
+        tmp_path, monkeypatch, ["mnl_attr_get_len"], calls, always=True, report=SEGV_ELSEWHERE, returncode=1
+    )
+    assert verdict["status"] == "guardrail_error" and verdict["failure"] is None and len(calls) == 2
+    assert verdict["excluded_inputs"] == [] and "in mnl_attr_ok" in verdict["mutations_skipped"]["crash"]
 
 
 # ---------------------------------------------------------------------------
