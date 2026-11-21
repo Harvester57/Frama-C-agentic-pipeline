@@ -316,3 +316,132 @@ def test_link_repair_rounds_stub_it_and_stop(tmp_path, monkeypatch):
     assert [s["name"] for s in record["stubbed_functions"]] == ["open_cfg"]
     assert record["functions_file"].endswith("fuzz_libparse_a_link_globals/link_stubs.c")
     assert not any("progs/" in s for s in current)
+
+
+# ---------------------------------------------------------------------------
+# C. A file the target fuzzer's link leaves out is never linked back
+# ---------------------------------------------------------------------------
+
+SLP_PLUGIN_UNIT = "plugin/.libs/plugin.so"
+
+SLP_TF_FILES = {
+    "plugin/audit.h": "extern char *audit_msg;\nextern int audit_count;\nint audit_success(void);\nint audit_failure(void);\n",
+    "plugin/audit.c": (
+        '#include "audit.h"\nchar *audit_msg = "real";\nint audit_count;\n'
+        "int audit_success(void) { return ++audit_count; }\nint audit_failure(void) { return 0; }\n"
+    ),
+    "plugin/policy.c": '#include "audit.h"\nint policy_check(void) { return audit_success() + audit_count; }\n',
+    # sudo's regress/fuzz/fuzz_policy.c: overrides audit_msg and audit_failure.
+    "plugin/fuzz/fuzz_pol.c": (
+        '#include "../audit.h"\nchar *audit_msg = "fuzz";\nint audit_failure(void) { return 1; }\n'
+        "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return policy_check(); }\n"
+    ),
+}
+
+
+def _slp_tf_run(tmp_path: Path) -> Path:
+    """A plugin unit and the target fuzzer generate_harness linked without plugin/audit.c."""
+    work = tmp_path / "workspace" / "work"
+    for rel, text in SLP_TF_FILES.items():
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text(text, encoding="utf-8", newline="\n")
+    reports = tmp_path / "workspace" / "reports"
+    reports.mkdir(parents=True)
+    harnesses = tmp_path / "workspace" / "harnesses"
+    harnesses.mkdir(parents=True)
+    functions = dict(
+        [
+            _slp_fn("audit_success", "plugin/audit.c", "plugin_so", SLP_PLUGIN_UNIT),
+            _slp_fn("audit_failure", "plugin/audit.c", "plugin_so", SLP_PLUGIN_UNIT),
+            _slp_fn("policy_check", "plugin/policy.c", "plugin_so", SLP_PLUGIN_UNIT),
+            _slp_fn("audit_failure", "plugin/fuzz/fuzz_pol.c", "fuzz_pol", "plugin/fuzz_pol"),
+        ]
+    )
+    files = ["plugin/audit.c", "plugin/policy.c"]
+    dag = {
+        "functions": functions,
+        "module_kind": "link_unit",
+        "modules": {"plugin_so": _slp_unit("plugin_so", SLP_PLUGIN_UNIT, files)},
+    }
+    (reports / "callgraph_dag.json").write_text(json.dumps(dag), encoding="utf-8")
+    globs = [
+        {"name": "audit_msg", "file": "plugin/audit.c", "type": "char *", "units": [SLP_PLUGIN_UNIT]},
+        {"name": "audit_count", "file": "plugin/audit.c", "type": "int", "units": [SLP_PLUGIN_UNIT]},
+        {"name": "audit_msg", "file": "plugin/fuzz/fuzz_pol.c", "type": "char *", "units": ["plugin/fuzz_pol"]},
+    ]
+    model = {"global_variables": {f"{g['file']}#{g['name']}": {**g, "static": False} for g in globs}}
+    (reports / "phase0_model.json").write_text(json.dumps(model), encoding="utf-8")
+    sidecar = {
+        "module": "tf_fuzz_pol",
+        "unit": "plugin_so",
+        "target_fuzzer": {
+            "id": "fuzz_pol",
+            "source": "workspace/work/plugin/fuzz/fuzz_pol.c",
+            "link": {
+                "from": "unit",
+                "excluded_sources": [{"source": "plugin/audit.c", "symbols": ["audit_failure", "audit_msg"]}],
+            },
+        },
+    }
+    (harnesses / "harness_tf_fuzz_pol.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    return reports / "callgraph_dag.json"
+
+
+SLP_TF_SOURCES = ["workspace/work/plugin/policy.c", "workspace/work/plugin/fuzz/fuzz_pol.c"]
+
+
+def test_an_excluded_source_is_not_linked_back_its_function_and_global_are_stubbed(tmp_path, monkeypatch):
+    """tf_fuzz_policy: policy.c calls into audit.c, which the fuzzer's link leaves out (audit_msg)."""
+    dag = _slp_tf_run(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    stub_dir = _slp_stub_dir("tf_fuzz_pol")
+    repaired, info = fuzz_build.repair_sources_for_link(
+        SLP_TF_SOURCES,
+        _slp_undef("audit_success", "audit_count"),
+        dag,
+        tmp_path,
+        module="tf_fuzz_pol",
+        stub_dir=stub_dir,
+    )
+    assert "workspace/work/plugin/audit.c" not in repaired
+    assert sorted(info["symbols"]) == ["audit_count", "audit_success"]
+    (fn,) = info["stubbed_functions"]
+    assert fn["name"] == "audit_success" and fn["file"] == "plugin/audit.c"
+    assert "the target fuzzer's link leaves plugin/audit.c out" in fn["reason"]
+    (glob,) = info["stubbed_globals"]
+    assert glob["name"] == "audit_count" and "target_fuzzer.link.excluded_sources" in glob["reason"]
+    assert (stub_dir / fuzz_build.LINK_STUBS_FILE).as_posix() in repaired
+    assert (stub_dir / fuzz_build.LINK_GLOBALS_FILE).as_posix() in repaired
+    assert "int audit_count;" in (stub_dir / fuzz_build.LINK_GLOBALS_FILE).read_text(encoding="utf-8")
+
+
+def test_an_excluded_source_is_recorded_unresolved_without_a_build_directory(tmp_path, monkeypatch):
+    dag = _slp_tf_run(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    fns: list[dict] = []
+    globs: list[dict] = []
+    repaired, info = fuzz_build.repair_sources_for_link(
+        SLP_TF_SOURCES,
+        _slp_undef("audit_success", "audit_count"),
+        dag,
+        tmp_path,
+        module="tf_fuzz_pol",
+        unresolved=globs,
+        unresolved_functions=fns,
+    )
+    assert repaired == SLP_TF_SOURCES and info == {}
+    assert [u["name"] for u in fns] == ["audit_success"]
+    assert [u["name"] for u in globs] == ["audit_count"]
+    assert "leaves plugin/audit.c out" in globs[0]["reason"]
+
+
+def test_the_unit_harness_still_links_the_file_the_target_fuzzer_leaves_out(tmp_path, monkeypatch):
+    """The exclusion is the target fuzz module's own: the unit's harness links audit.c as before."""
+    dag = _slp_tf_run(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    sources = ["workspace/work/plugin/policy.c"]
+    repaired, info = fuzz_build.repair_sources_for_link(
+        sources, _slp_undef("audit_success"), dag, tmp_path, module="plugin_so", stub_dir=_slp_stub_dir("plugin_so")
+    )
+    assert repaired == [*sources, "workspace/work/plugin/audit.c"]
+    assert "stubbed_functions" not in info

@@ -2367,6 +2367,26 @@ def _place_global(records: list[dict], ctx: dict) -> tuple[str, dict, str]:
     return "stub", records[0], ""
 
 
+def _excluded_link_sources(dag_path: Path, module: str | None) -> dict[str, list[str]]:
+    """
+    The files a target fuzz module's link leaves out (tree path -> the symbols its fuzzer defines
+    itself), from its sidecar `harness_<module>.json` `target_fuzzer.link.excluded_sources`
+    (generate_harness.target_fuzzer_link_sources). Linked back for another symbol they define, they
+    bring the conflict back (sudo run-1 tf_fuzz_policy: "global var audit_msg at .../fuzz_policy.c:50
+    has different initializer than .../audit.c:43"). Empty for any other module.
+    """
+    if not module:
+        return {}
+    sidecar = load_json_optional(Path(dag_path).parent.parent / "harnesses" / f"harness_{module}.json", None)
+    tf = sidecar.get("target_fuzzer") if isinstance(sidecar, dict) else None
+    link = tf.get("link") if isinstance(tf, dict) else None
+    out: dict[str, list[str]] = {}
+    for ex in (link.get("excluded_sources") or []) if isinstance(link, dict) else []:
+        if isinstance(ex, dict) and isinstance(ex.get("source"), str) and ex["source"].strip():
+            out[_dag_tree_path(ex["source"])] = [str(s) for s in ex.get("symbols") or [] if isinstance(s, str)]
+    return out
+
+
 def _place_function(records: list[dict], ctx: dict, linked: set[str]) -> tuple[str, dict, str]:
     """
     Which of several files defining an undefined function to link, as (action, record, reason). Each
@@ -2672,6 +2692,10 @@ def repair_sources_for_link(
     `definers` (`info["stubbed_functions"]`), or without `stub_dir` listed in `unresolved_functions`:
     linking one program's file into a library pulls that whole program in (sudo run-1 libparsesudoers_a).
 
+    A file a target fuzz module's link leaves out (sidecar `target_fuzzer.link.excluded_sources`,
+    `_excluded_link_sources`) is never added back: a function or global it defines is stubbed instead
+    (`link_stubs.c` / `link_globals.c`), or recorded unresolved without `stub_dir`.
+
     For an address-flow cluster (`module` is a DAG submodule with `build_sources`,
     scripts/unit_split.py), a parsed non-static function defined outside `flow_files` (of the same
     unit, or explicitly listed in `sub["link_stubs"]["functions"]`) is not linked from its file: it
@@ -2706,6 +2730,31 @@ def repair_sources_for_link(
     global_vars: dict[str, list[dict]] | None = None
     definers: dict[str, list[dict]] | None = None
     ctx: dict = {}
+    excluded = _excluded_link_sources(dp, module)
+
+    def _excluded_reason(file: str) -> str:
+        tree = _dag_tree_path(file)
+        return (
+            f"the target fuzzer's link leaves {tree} out: the fuzzer defines {', '.join(excluded.get(tree) or [])} "
+            "itself (sidecar target_fuzzer.link.excluded_sources)"
+        )
+
+    def _stub_function(sym: str, file: str, reason: str, recs: list[dict]) -> None:
+        """Define `sym` in link_stubs.c instead of linking `file`; without `stub_dir`, record it unresolved."""
+        stub = {
+            "name": sym,
+            "file": _dag_tree_path(file),
+            "reason": reason,
+            "definers": [_dag_tree_path(r["file"]) for r in recs],
+        }
+        if stub_dir is None:
+            if unresolved_functions is not None and all(u["name"] != sym for u in unresolved_functions):
+                unresolved_functions.append({**stub, "reason": f"{reason}; no build directory was given"})
+        elif sym not in known_fn_stubs:
+            known_fn_stubs.add(sym)
+            new_fn_stubs.append(stub)
+            resolved.append(sym)
+
     for sym in syms:
         parsed_hit = parsed_syms.get(sym)
         if parsed_hit is not None:
@@ -2722,31 +2771,29 @@ def repair_sources_for_link(
                 continue
             if definers is None:
                 definers = _dag_function_definers(dp)
-            recs = definers.get(sym) or []
-            if len(recs) > 1:
+            recs = definers.get(sym) or [{"file": f, "module": fn_mod, "units": []}]
+            kept = [r for r in recs if _dag_tree_path(r["file"]) not in excluded]
+            if len(kept) > 1:
                 # Several programs define it: link the one of this module's unit, never the first listed.
                 ctx = ctx or _link_unit_context(dp, module, sources=sources)
-                action, rec, reason = _place_function(recs, ctx, {_dag_tree_path(h) for h in have})
+                action, rec, reason = _place_function(kept, ctx, {_dag_tree_path(h) for h in have})
                 if action == "add":
                     f = rec["file"]
                 else:
-                    stub = {
-                        "name": sym,
-                        "file": _dag_tree_path(rec["file"]),
-                        "reason": reason,
-                        "definers": [_dag_tree_path(r["file"]) for r in recs],
-                    }
-                    if stub_dir is None:
-                        if unresolved_functions is not None and all(u["name"] != sym for u in unresolved_functions):
-                            unresolved_functions.append({**stub, "reason": f"{reason}; no build directory was given"})
-                    elif sym not in known_fn_stubs:
-                        known_fn_stubs.add(sym)
-                        new_fn_stubs.append(stub)
-                        resolved.append(sym)
+                    _stub_function(sym, rec["file"], reason, recs)
                     continue
+            elif kept:
+                f = kept[0]["file"]
+            else:
+                _stub_function(sym, recs[0]["file"], _excluded_reason(recs[0]["file"]), recs)
+                continue
         elif sym in build_only_syms:
-            # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed.
+            # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed,
+            # unless the target fuzzer's link leaves their file out.
             f = build_only_syms[sym]
+            if _dag_tree_path(f) in excluded:
+                _stub_function(sym, f, _excluded_reason(f), [{"file": f}])
+                continue
         else:
             f = ""
         if not f:
@@ -2755,9 +2802,17 @@ def repair_sources_for_link(
             if sym not in global_vars or sym in known_stubs:
                 continue
             ctx = ctx or _link_unit_context(dp, module, sources=sources)
-            action, rec, reason = _place_global(global_vars[sym], ctx)
+            # A file the target fuzzer's link leaves out is never linked back: its global is stubbed.
+            linkable = [r for r in global_vars[sym] if _dag_tree_path(r["file"]) not in excluded]
+            if linkable:
+                action, rec, reason = _place_global(linkable, ctx)
+            else:
+                action, rec, reason = "stub", global_vars[sym][0], ""
+            why = {} if linkable else {"reason": _excluded_reason(rec["file"])}
             if action == "stub" and stub_dir is None:
                 action, reason = "unresolved", "another link unit defines it and no build directory was given"
+                if not linkable:
+                    reason = f"{_excluded_reason(rec['file'])}, and no build directory was given"
             elif action == "stub" and stub_dir is not None and flow_files is not None:
                 raw_sz = rec.get("size")
                 size = int(raw_sz) if isinstance(raw_sz, int) and raw_sz > 0 else DEFAULT_BSS_GLOBAL_SIZE
@@ -2769,6 +2824,7 @@ def repair_sources_for_link(
                         "size": size,
                         "assumption": LINK_GLOBALS_ASSUMPTION,
                         "bss": True,
+                        **why,
                     }
                 )
                 resolved.append(sym)
@@ -2780,7 +2836,7 @@ def repair_sources_for_link(
                 fields, definition, reason = _global_stub_definition(
                     sym, rec, global_vars[sym], [*sources, *added], Path(run_dir), stub_dir
                 )
-                stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION, **fields}
+                stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION, **fields, **why}
                 if definition is None:
                     action, reason = "unresolved", f"{reason}, and no header of the project declares it"
                 else:
