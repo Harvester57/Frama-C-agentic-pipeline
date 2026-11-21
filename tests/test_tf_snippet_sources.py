@@ -10,9 +10,11 @@ identifier 'LOCALEDIR'"). Three names did it:
   `src/limits.c`; `output`, only in the comment `/* no output for fuzzers */`, to `plugins/sudoers`.
   Names in comments and literals are no reference.
 - `getenv`, a real call to libc's, resolved to the interposer sudo's own program defines in
-  `src/env_hooks.c`. A name resolves only to a definition the harness's link can hold: its unit, what the
-  unit links, and, for a library, the project libraries a program links alongside it (a static archive
-  records no links of its own: `libsudo_iolog_a`'s fuzzers call `libsudo_util` and `libsudo_eventlog`).
+  `src/env_hooks.c`. A system function (declared by the fuzzer's system headers, or called by a unit of
+  the target as an external function) resolves only to a definition the harness's link can hold: its
+  unit, what the unit links, and, for a library, the project libraries a program links alongside it.
+  Any other name still resolves wherever it is defined: sudo's fuzz_sudoers links visudo's
+  check_aliases.o, and fuzz_sudoers_ldif cvtsudoers' parse_ldif.o.
 """
 
 from __future__ import annotations
@@ -25,7 +27,8 @@ import generate_harness as G
 TFS_DRIVER = "lib/io/regress/fuzz/fuzz_json.c"
 
 # Two libraries a program links together (no links of their own, as static archives record), a program
-# that links the utility library and defines an interposer of libc's getenv, and a log daemon linking all.
+# that links the utility library and interposes libc's getenv and putenv, a log daemon linking the
+# libraries and calling libc's getenv, and a tool whose own file defines a project function.
 TFS_DAG: dict = {
     "module_kind": "link_unit",
     "target_dir": "/framac-run/workspace/work",
@@ -54,12 +57,13 @@ TFS_DAG: dict = {
         "prog": {
             "unit": "src/.libs/prog",
             "kind": "executable",
-            "files": ["src/main.c", "src/env_hooks.c", "src/limits.c", "src/fmt.c"],
+            "files": ["src/main.c", "src/env_hooks.c", "src/limits.c", "src/fmt.c", "lib/compat/strlcpy.c"],
             "required_sources": [
                 "src/main.c",
                 "src/env_hooks.c",
                 "src/limits.c",
                 "src/fmt.c",
+                "lib/compat/strlcpy.c",
                 "lib/util/progname.c",
                 "lib/util/fmt.c",
             ],
@@ -71,6 +75,14 @@ TFS_DAG: dict = {
             "files": ["logd/logd.c"],
             "required_sources": ["logd/logd.c", "lib/io/json.c", "lib/ev/free.c", "lib/ev/reset.c"],
             "linked_modules": ["libio_a", "libev_a", "libutil_so"],
+            "external_callees": ["getenv", "memcpy"],
+        },
+        "tool": {
+            "unit": "tools/.libs/tool",
+            "kind": "executable",
+            "files": ["tools/check.c"],
+            "required_sources": ["tools/check.c", "lib/util/progname.c", "lib/util/fmt.c"],
+            "linked_modules": ["libutil_so"],
         },
     },
     "functions": {
@@ -84,14 +96,24 @@ TFS_DAG: dict = {
             "lexer_module": "progname",
         },
         "getenv": {"name": "getenv", "file": "src/env_hooks.c", "module": "prog", "lexer_module": "src"},
+        "putenv": {"name": "putenv", "file": "src/env_hooks.c", "module": "prog", "lexer_module": "src"},
         "disable_coredump": {
             "name": "disable_coredump",
             "file": "src/limits.c",
             "module": "prog",
             "lexer_module": "src",
         },
+        # Compiled into the program and the I/O library (its `units`), owned by the program.
+        "strlcpy": {
+            "name": "strlcpy",
+            "file": "lib/compat/strlcpy.c",
+            "module": "prog",
+            "units": ["src/.libs/prog", "lib/io/.libs/libio.a"],
+            "lexer_module": "compat",
+        },
         "lib/util/fmt.c#fmt": {"name": "fmt", "file": "lib/util/fmt.c", "module": "libutil_so", "lexer_module": "fmt"},
         "src/fmt.c#fmt": {"name": "fmt", "file": "src/fmt.c", "module": "prog", "lexer_module": "src"},
+        "alias_check": {"name": "alias_check", "file": "tools/check.c", "module": "tool", "lexer_module": "tools"},
         "logd_main": {"name": "logd_main", "file": "logd/logd.c", "module": "logd", "lexer_module": "logd"},
     },
     "lexer_modules": {
@@ -100,13 +122,16 @@ TFS_DAG: dict = {
         "evreset": {"required_sources": ["lib/ev/reset.c"]},
         "progname": {"required_sources": ["lib/util/progname.c"]},
         "fmt": {"required_sources": ["lib/util/fmt.c"]},
+        "compat": {"required_sources": ["lib/compat/strlcpy.c"]},
         "src": {"required_sources": ["src/main.c", "src/env_hooks.c", "src/limits.c", "src/fmt.c"]},
+        "tools": {"required_sources": ["tools/check.c"]},
         "logd": {"required_sources": ["logd/logd.c"]},
     },
 }
 
 TFS_IO_SOURCES = ["lib/io/json.c"]
 TFS_PROG_SOURCES = ["src/main.c", "src/env_hooks.c", "src/limits.c", "src/fmt.c"]
+TFS_UTIL_SOURCES = ["lib/util/progname.c", "lib/util/fmt.c"]
 
 
 def _tfs_run(tmp_path: Path) -> Path:
@@ -123,50 +148,80 @@ def _tfs_merge(run: Path, snippet: str, **kw) -> list[str]:
 def test_names_in_comments_and_literals_pull_in_nothing(tmp_path):
     run = _tfs_run(tmp_path)
     driver = (
-        "/* ev_free is never called here */\n"
+        "/* disable_coredump is never called here */\n"
         "// nor ev_reset\n"
         "int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {\n"
-        "    log_line(\"Set ev_reset %s\", 'x');\n"
+        "    log_line(\"Set ev_free %s\", 'x');\n"
         "    return json_parse(data, size);\n"
         "}\n"
     )
     # Without a unit too: what the code does not name is no reference, whatever the link.
     assert _tfs_merge(run, driver, module_name="tf_fuzz_json") == TFS_IO_SOURCES
-    # The same names in code do pull their files in (both libraries are linked together by logd).
+    assert _tfs_merge(run, driver, module_name="tf_fuzz_json", unit="libio_a") == TFS_IO_SOURCES
+    # The same names in code do pull their files in.
     merged = _tfs_merge(run, "ev_free(e); ev_reset(e);", module_name="tf_fuzz_json")
     assert merged == [*TFS_IO_SOURCES, "lib/ev/free.c", "lib/ev/reset.c"]
 
 
-def test_a_name_defined_only_by_another_program_pulls_in_nothing(tmp_path):
+def test_a_system_function_another_program_interposes_pulls_in_nothing(tmp_path):
     run = _tfs_run(tmp_path)
-    driver = 'int f(void) { const char *h = getenv("HOME"); disable_coredump(); return h != 0; }\n'
+    driver = 'int f(void) { const char *h = getenv("HOME"); putenv("A=1"); return h != 0; }\n'
     meta: dict = {}
-    merged = _tfs_merge(run, driver, module_name="tf_fuzz_json", unit="libio_a", flow_meta=meta)
+    # getenv: the log daemon calls it as libc's (an external callee its link defines nowhere).
+    # putenv: the fuzzer's system headers declare it.
+    merged = _tfs_merge(
+        run, driver, module_name="tf_fuzz_json", unit="libio_a", flow_meta=meta, system_names={"putenv", "memcpy"}
+    )
     assert merged == TFS_IO_SOURCES
     assert meta["names_outside_link"] == [
-        {"name": "disable_coredump", "definitions": ["disable_coredump"]},
         {"name": "getenv", "definitions": ["getenv"]},
+        {"name": "putenv", "definitions": ["putenv"]},
     ]
+    # The unit given by its path, not its key, is the same link.
+    assert _tfs_merge(run, driver, module_name="h", unit="lib/io/.libs/libio.a", system_names={"putenv"}) == (
+        TFS_IO_SOURCES
+    )
+
+
+def test_a_project_function_of_another_program_still_resolves(tmp_path):
+    # sudo's fuzz_sudoers links visudo's check_aliases.o: a project name is meant wherever it is defined.
+    run = _tfs_run(tmp_path)
+    meta: dict = {}
+    merged = _tfs_merge(run, "alias_check(t); disable_coredump();", module_name="h", unit="libio_a", flow_meta=meta)
+    assert merged == [*TFS_IO_SOURCES, "tools/check.c", *TFS_UTIL_SOURCES, *TFS_PROG_SOURCES]
+    assert "names_outside_link" not in meta
 
 
 def test_a_library_harness_keeps_the_libraries_a_program_links_with_it(tmp_path):
     run = _tfs_run(tmp_path)
-    merged = _tfs_merge(run, 'progname_init(); ev_free(e); getenv("X");', module_name="tf_fuzz_json", unit="libio_a")
+    merged = _tfs_merge(
+        run,
+        'progname_init(); ev_free(e); getenv("X");',
+        module_name="tf_fuzz_json",
+        unit="libio_a",
+        system_names={"progname_init", "ev_free"},
+    )
     assert merged == [*TFS_IO_SOURCES, "lib/ev/free.c", "lib/util/progname.c"]
+
+
+def test_a_definition_compiled_into_the_unit_is_its_own(tmp_path):
+    # strlcpy's file is the program's, but the I/O library compiles it too (`units`).
+    run = _tfs_run(tmp_path)
+    merged = _tfs_merge(run, "strlcpy(d, s, n)", module_name="h", unit="libio_a", system_names={"strlcpy"})
+    assert merged == [*TFS_IO_SOURCES, "lib/compat/strlcpy.c", *TFS_UTIL_SOURCES]
 
 
 def test_the_unit_itself_and_what_it_links_still_resolve(tmp_path):
     run = _tfs_run(tmp_path)
     out = run / "workspace/harnesses"
     # The program's own interposer is its getenv (with the library the program links, as before).
-    merged = G._merge_dag_harness_sources(out, ["src/main.c"], False, "getenv", module_name="h", unit="prog")
-    assert merged == [*TFS_PROG_SOURCES, "lib/util/progname.c", "lib/util/fmt.c"]
-    # The program does not link the event library, nor does anything link it with the program.
-    merged = G._merge_dag_harness_sources(out, ["src/main.c"], False, "ev_free", module_name="h", unit="prog")
-    assert merged == ["src/main.c"]
+    merged = G._merge_dag_harness_sources(
+        out, ["src/main.c"], False, "getenv", module_name="h", unit="prog", system_names={"getenv"}
+    )
+    assert merged == [*TFS_PROG_SOURCES, *TFS_UTIL_SOURCES]
 
 
-def test_a_name_defined_in_several_units_resolves_to_the_one_the_link_holds(tmp_path):
+def test_a_name_defined_in_several_programs_resolves_to_the_one_the_link_holds(tmp_path):
     run = _tfs_run(tmp_path)
     # Two external `fmt`: ambiguous without a unit, the library's for a harness of a library.
     assert _tfs_merge(run, "fmt(b)", module_name="tf_fuzz_json") == TFS_IO_SOURCES
@@ -178,8 +233,24 @@ def test_a_name_defined_in_several_units_resolves_to_the_one_the_link_holds(tmp_
 
 def test_without_a_unit_a_name_resolves_as_before(tmp_path):
     run = _tfs_run(tmp_path)
-    merged = _tfs_merge(run, "getenv", module_name="tf_fuzz_json")
-    assert merged == [*TFS_IO_SOURCES, *TFS_PROG_SOURCES, "lib/util/progname.c", "lib/util/fmt.c"]
+    merged = _tfs_merge(run, "getenv", module_name="tf_fuzz_json", system_names={"getenv"})
+    assert merged == [*TFS_IO_SOURCES, *TFS_PROG_SOURCES, *TFS_UTIL_SOURCES]
+
+
+def test_system_names_are_what_system_headers_declare():
+    pre = (
+        '# 1 "fuzz.c"\n'
+        '# 1 "/usr/include/stdlib.h" 1 3 4\n'
+        "extern char *getenv (const char *__name) __attribute__ ((__nothrow__));\n"
+        '# 3 "fuzz.c" 2\n'
+        '# 1 "include/util.h" 1\n'
+        "void progname_init(const char *n);\n"
+        '# 5 "fuzz.c" 2\n'
+        "int f(void) { return helper(1); }\n"
+    )
+    names = G._system_declared_names(pre)
+    assert "getenv" in names
+    assert not names & {"progname_init", "helper", "f"}
 
 
 def test_the_target_fuzzer_sidecar_holds_no_other_program_and_says_what_it_left(tmp_path, monkeypatch):
@@ -187,17 +258,28 @@ def test_the_target_fuzzer_sidecar_holds_no_other_program_and_says_what_it_left(
 
     run = _tfs_run(tmp_path)
     monkeypatch.chdir(run)
-    monkeypatch.setattr(G, "_preprocess_driver", lambda driver, cppflags: None)
+    driver = f"workspace/work/{TFS_DRIVER}"
+    # What `gcc -E` of the driver gives: putenv from a system header, the driver's own lines after.
+    preprocessed = (
+        f'# 1 "{driver}"\n'
+        '# 1 "/usr/include/stdlib.h" 1 3 4\n'
+        "extern int putenv (char *__string);\n"
+        f'# 2 "{driver}" 2\n'
+        "int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) { return 0; }\n"
+    )
+    monkeypatch.setattr(G, "_preprocess_driver", lambda path, cppflags: preprocessed)
     files = {
         "lib/io/json.c": "int json_parse(const unsigned char *b, unsigned long n) { return n ? b[0] : 0; }\n",
         "lib/ev/free.c": "void ev_free(void *e) { (void)e; }\n",
         "lib/ev/reset.c": "void ev_reset(void *e) { (void)e; }\n",
         "lib/util/progname.c": "void progname_init(const char *n) { (void)n; }\n",
         "lib/util/fmt.c": "int fmt(int b) { return b; }\n",
+        "lib/compat/strlcpy.c": "unsigned long strlcpy(char *d, const char *s, unsigned long n) { return 0; }\n",
         "src/main.c": "int main(void) { return 0; }\n",
-        "src/env_hooks.c": "char *getenv(const char *n) { (void)n; return 0; }\n",
+        "src/env_hooks.c": "char *getenv(const char *n) { (void)n; return 0; }\nint putenv(char *s) { return 0; }\n",
         "src/limits.c": "void disable_coredump(void) { }\n",
         "src/fmt.c": "int fmt(int b) { return -b; }\n",
+        "tools/check.c": "int alias_check(void *t) { return t != 0; }\n",
         "logd/logd.c": "int logd_main(void) { return 0; }\n",
         TFS_DRIVER: (
             "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <stdio.h>\n"
@@ -205,6 +287,7 @@ def test_the_target_fuzzer_sidecar_holds_no_other_program_and_says_what_it_left(
             "/* no output, ev_reset is not called */\n"
             "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
             '    if (getenv("FUZZ_VERBOSE")) printf("Set disable_coredump %d\\n", 1);\n'
+            '    putenv("FUZZ=1");\n'
             '    progname_init("fuzz");\n'
             "    return json_parse(data, size);\n"
             "}\n"
@@ -214,16 +297,15 @@ def test_the_target_fuzzer_sidecar_holds_no_other_program_and_says_what_it_left(
         p = run / "workspace/work" / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
-    argv = ["--module", "tf_fuzz_json", "--unit", "libio_a", "--target-fuzzer", f"workspace/work/{TFS_DRIVER}"]
+    argv = ["--module", "tf_fuzz_json", "--unit", "libio_a", "--target-fuzzer", driver]
     argv += ["--no-auto-prelude", "--sources", "workspace/work/lib/io/json.c", "--cppflags", "-Iworkspace/work/lib/io"]
     assert G.main(argv) == 0
     side = json.loads((run / "workspace/harnesses/harness_tf_fuzz_json.json").read_text(encoding="utf-8"))
     assert sorted(side["sources"]) == sorted(
-        [
-            "workspace/work/lib/io/json.c",
-            f"workspace/work/{TFS_DRIVER}",
-            "workspace/work/lib/util/progname.c",
-        ]
+        ["workspace/work/lib/io/json.c", driver, "workspace/work/lib/util/progname.c"]
     )
-    assert side["names_outside_link"] == [{"name": "getenv", "definitions": ["getenv"]}]
+    assert side["names_outside_link"] == [
+        {"name": "getenv", "definitions": ["getenv"]},
+        {"name": "putenv", "definitions": ["putenv"]},
+    ]
     assert schema_warning("harness_sidecar", side) is None
