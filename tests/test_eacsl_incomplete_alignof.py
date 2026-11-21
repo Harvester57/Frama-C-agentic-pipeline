@@ -174,8 +174,19 @@ def test_each_weakened_check_is_attributed_to_its_source_assertion():
             "file": "workspace/work/lib/util/digest_openssl.c",
             "line": 9,
             "predicate": "\\aligned(p,alignof(EVP_MD const))",
+            "rewrites": 2,
         }
     ]
+
+
+def test_the_same_assertion_checked_twice_is_one_entry_with_its_count():
+    # A macro checks the same predicate twice on one source line (sudo_sendlog: 60 rewrites, 28 entries).
+    body = INCALIGN_ASSERT_BLOCK.split("EVP_MD const *md_from", 1)[1]
+    text = INCALIGN_ASSERT_BLOCK + "EVP_MD const *md_from_again" + body
+    _new, info = T.rewrite_incomplete_alignof(text)
+    assert info["rewrites"] == 4
+    (check,) = info["checks"]
+    assert check["function"] == "md_from" and check["rewrites"] == 4
 
 
 def test_an_occurrence_without_assert_data_is_still_listed():
@@ -183,7 +194,7 @@ def test_an_occurrence_without_assert_data_is_still_listed():
     _new, info = T.rewrite_incomplete_alignof(text)
     (check,) = info["checks"]
     assert check["type"] == "SSL" and check["tag"] == "struct ssl_st"
-    assert check["function"] is None and check["instrumented_line"] == 3
+    assert check["function"] is None and check["instrumented_line"] == 3 and check["rewrites"] == 1
 
 
 @pytest.mark.usefixtures("modern_cli")
@@ -198,7 +209,8 @@ def test_the_build_records_the_weakened_checks_as_an_assumption(tmp_path):
     instrumented = Path(res["instrumented_source"]).read_text(encoding="utf-8")
     assert "_Alignof(EVP_MD const)" not in instrumented
     log = Path(res["compile_log"]).read_text(encoding="utf-8")
-    assert "1 pointer-alignment check(s)" in log and "struct evp_md_st" in log and "md_from" in log
+    assert "pointer-alignment checks of 1 distinct source assertion(s) vacuous" in log
+    assert "struct evp_md_st" in log and "digest_openssl.c:9 in md_from" in log
     plain = R.compile_eacsl_binary([str(_src(tmp_path))], tmp_path / "plain", runner=FakeEacslGcc(), use_cache=False)
     assert "incomplete_alignof" not in plain
 

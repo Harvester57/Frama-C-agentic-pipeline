@@ -941,7 +941,8 @@ def _incomplete_alignof_note(info: dict) -> str:
     """The compile-log paragraph for the checks rewrite_incomplete_alignof made vacuous, one line per check."""
     checks = info["checks"]
     lines = [
-        f"Made {len(checks)} pointer-alignment check(s) vacuous ({info['rewrites']} `_Alignof` rewritten to "
+        f"Made the pointer-alignment checks of {len(checks)} distinct source assertion(s) vacuous "
+        f"({info['rewrites']} `_Alignof` rewritten to "
         f"1): the instrumented translation unit leaves {', '.join(info['types'])} incomplete, so clang rejects "
         f"their `_Alignof` (Frama-C -rte / E-ACSL, pub/frama-c#2805). Assumed, not checked: "
         f"{INCOMPLETE_ALIGNOF_ASSUMPTION}. Listed in the build result's `incomplete_alignof`."

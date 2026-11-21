@@ -1245,9 +1245,10 @@ def rewrite_incomplete_alignof(c_text: str) -> tuple[str, dict[str, Any]]:
 
     Returns the new text and {rewrites, types, checks}: the number of `_Alignof` replaced (each E-ACSL
     assertion holds two: the check and the value it reports), the incomplete tags (`struct evp_md_st`) in
-    order of first use, and one entry per weakened source assertion {type, tag, function, file, line,
-    predicate} read from the E-ACSL assertion data that follows it; an occurrence without assertion data
-    is listed with `function` None and its `instrumented_line`.
+    order of first use, and one entry per distinct weakened source assertion {type, tag, function, file,
+    line, predicate, rewrites} read from the E-ACSL assertion data that follows it (`rewrites`: the
+    `_Alignof` replaced for it, 2 per E-ACSL check, more when the same assertion is checked again); an
+    occurrence without assertion data is listed with `function` None and its `instrumented_line`.
     """
     info: dict[str, Any] = {"rewrites": 0, "types": [], "checks": []}
     if "_Alignof" not in c_text and "__alignof" not in c_text:
@@ -1274,7 +1275,7 @@ def rewrite_incomplete_alignof(c_text: str) -> tuple[str, dict[str, Any]]:
 
     pieces: list[str] = []
     pos = 0
-    seen: set[tuple[Any, ...]] = set()
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
     for m in _ALIGNOF_OP_RE.finditer(code):
         if m.start() < pos:
             continue
@@ -1297,8 +1298,9 @@ def rewrite_incomplete_alignof(c_text: str) -> tuple[str, dict[str, Any]]:
             check["instrumented_line"] = c_text.count("\n", 0, m.start()) + 1
         key = tuple(check.values())
         if key not in seen:
-            seen.add(key)
+            seen[key] = check
             info["checks"].append(check)
+        seen[key]["rewrites"] = seen[key].get("rewrites", 0) + 1
     if not pieces:
         return c_text, info
     return "".join(pieces) + c_text[pos:], info
