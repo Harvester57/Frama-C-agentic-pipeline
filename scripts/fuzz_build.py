@@ -70,6 +70,7 @@ from eacsl_toolchain import (
     resolve_fuzz_init_source,
     rewrite_forward_array_sizes,
     rewrite_incomplete_alignof,
+    rewrite_misplaced_fallthrough,
     rewrite_sound_verdict_resets,
     rewrite_sync_builtins,
     rewrite_trailing_alignas,
@@ -1034,7 +1035,7 @@ def _compile_eacsl_binary_uncached(
     an instrumented main() would. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
     (`-Dregister=`, recorded in `full_mtracking_defines`). Between the stages the instrumented file
     is patched for printer and E-ACSL gaps, each counted in the result (`alignas_rewrites`,
-    `wrapper_result_inits`, `formal_inits`, `forward_array_sizes`, ...). A pointer-alignment check on a type the instrumented file
+    `wrapper_result_inits`, `formal_inits`, `forward_array_sizes`, `misplaced_fallthrough`, ...). A pointer-alignment check on a type the instrumented file
     leaves incomplete (an opaque handle) cannot compile; it is made vacuous and listed, with the assumption it
     leaves, in `incomplete_alignof` (eacsl_toolchain.rewrite_incomplete_alignof). Uninitialized reads are
     checked (`-rte-initialized @all`) unless `rte_initialized` is False, which is recorded in
@@ -1398,6 +1399,20 @@ def _compile_eacsl_binary_uncached(
                     log_parts.append(
                         f"Injected {n_resets} __e_acsl_sound_verdict = 1 reset(s) at LLVMFuzzerTestOneInput entry.\n"
                     )
+
+            # Without this, clang rejects a fallthrough attribute the kernel printed before `label: default:`.
+            # Last, so the lines it records are those of the file stage 2 compiles.
+            c_text, fallthrough = rewrite_misplaced_fallthrough(c_text)
+            if fallthrough["rewrites"]:
+                c_modified = True
+                result["misplaced_fallthrough"] = fallthrough
+                log_parts.append(
+                    f"Removed {fallthrough['rewrites']} __attribute__((__fallthrough__)) not directly followed by "
+                    f"a case or default label (instrumented lines {', '.join(map(str, fallthrough['lines'][:20]))}"
+                    f"{', ...' if len(fallthrough['lines']) > 20 else ''}): the Frama-C printer puts a goto label "
+                    "before `default:`, which clang rejects. Its `;` stays; the attribute only silences "
+                    "-Wimplicit-fallthrough, so control flow and checks are unchanged.\n"
+                )
 
             if c_modified:
                 instrumented_c.write_text(c_text, encoding="utf-8", newline="\n")
@@ -1780,6 +1795,34 @@ def _dag_symbol_tables(dag_path: Path) -> tuple[dict[str, tuple[str, str]], dict
     return parsed, build_only_out
 
 
+def _dag_function_definers(dag_path: Path) -> dict[str, list[dict]]:
+    """
+    Non-static function name -> every source file defining it in `callgraph_dag.json`, one record each
+    ({file, module, units}, in DAG order; header records left out). A name several programs define for
+    themselves (sudo's `open_sudoers`: cvtsudoers.c, sudoers.c, testsudoers.c, visudo.c) has several.
+    """
+    dag = load_json_optional(Path(dag_path), None)
+    out: dict[str, list[dict]] = {}
+    for key, rec in ((dag.get("functions") or {}) if isinstance(dag, dict) else {}).items():
+        if not isinstance(rec, dict) or rec.get("is_static") is True:
+            continue
+        name = str(rec.get("name") or str(key).split("#")[-1])
+        file = str(rec.get("file") or "")
+        if not (name and file) or rec.get("header") or posixpath.splitext(file)[1].lower() in _HEADER_SUFFIXES:
+            continue
+        recs = out.setdefault(name, [])
+        if all(r["file"] != file for r in recs):
+            units = rec.get("units")
+            recs.append(
+                {
+                    "file": file,
+                    "module": str(rec.get("module") or ""),
+                    "units": [str(u) for u in units] if isinstance(units, list) else [],
+                }
+            )
+    return out
+
+
 def _dag_symbol_files(dag_path: Path) -> dict[str, str]:
     """
     Map non-static function name -> defining source file from callgraph_dag.json: its parsed
@@ -2107,7 +2150,8 @@ def link_stubs_source(
     """
     The generated file defining the functions and globals an address-flow cluster's sources name
     and its harness cannot reach (`stubbed_functions`, `.bss` `global_stubs`; scripts/unit_split.py,
-    docs/plans/unit-split-address-flow.md).
+    docs/plans/unit-split-address-flow.md), and for any module the functions link repair does not
+    link from a file (`reason`: several programs define it, or its file is left out of the link).
     Each function is a symbol in file-scope assembly (no C type, so no project prototype can
     conflict) that jumps to `__framac_link_stub_called(name)`, writing LINK_STUB_MARKER via
     unbuffered `write(2, ...)` (E-ACSL-safe: no `fprintf` / `strlen` on unregistered `.rodata`) and
@@ -2142,8 +2186,10 @@ def link_stubs_source(
     ]
     for i, s in enumerate(stubs):
         name = s["name"]
+        # A stub link repair chose over linking a file (several definers, an excluded source) says why.
+        why = str(s.get("reason") or "").replace("*/", "* /").replace("\\", "/").replace('"', "'")
         lines += [
-            f'  "/* {name}: defined in {s.get("file") or "unknown"} */\\n"',
+            f'  "/* {name}: defined in {s.get("file") or "unknown"}{f"; {why}" if why else ""} */\\n"',
             '  ".text\\n"',
             f'  ".globl {name}\\n"',
             f'  ".type {name}, @function\\n"',
@@ -2257,7 +2303,9 @@ def _link_unit_context(dag_path: Path, module: str | None, sources: list[str] | 
     What placing a global needs from the DAG: the link unit record of harness module `module`
     (`unit`: None without link units, without a module, or for a module the DAG and the sidecars
     do not place, as `ModuleMap.unit_of` answers), that unit's sources (`unit_files`: its own and
-    those of the project libraries it links) and the files defining a `main` (`main_files`).
+    those of the project libraries it links), the units of the modules it links (`linked_units`, from
+    the record's `linked_modules`, whose files are in `unit_files` too) and the files defining a
+    `main` (`main_files`).
     """
     from module_map import ModuleMap, load_sidecars
 
@@ -2268,9 +2316,16 @@ def _link_unit_context(dag_path: Path, module: str | None, sources: list[str] | 
         rec = mm.modules.get(mm.unit_of(module))
         unit = rec if isinstance(rec, dict) else None
     files = [*((unit or {}).get("files") or []), *((unit or {}).get("required_sources") or [])]
+    linked_units: set[str] = set()
+    for name in (unit or {}).get("linked_modules") or []:
+        linked = mm.modules.get(str(name)) if isinstance(name, str) else None
+        if isinstance(linked, dict):
+            linked_units.add(str(linked.get("unit") or name))
+            files += [f for f in linked.get("files") or [] if isinstance(f, str)]
     return {
         "flow_files": _flow_cluster_files(Path(dag_path), module, sources=sources),
         "unit": unit,
+        "linked_units": linked_units,
         "unit_files": {_dag_tree_path(f) for f in files if isinstance(f, str)},
         "main_files": {
             _dag_tree_path(str(r.get("file") or ""))
@@ -2310,6 +2365,60 @@ def _place_global(records: list[dict], ctx: dict) -> tuple[str, dict, str]:
         if unit.get("unit") in rec["units"] or _dag_tree_path(rec["file"]) in ctx["unit_files"]:
             return "add", rec, ""
     return "stub", records[0], ""
+
+
+def _excluded_link_sources(dag_path: Path, module: str | None) -> dict[str, list[str]]:
+    """
+    The files a target fuzz module's link leaves out (tree path -> the symbols its fuzzer defines
+    itself), from its sidecar `harness_<module>.json` `target_fuzzer.link.excluded_sources`
+    (generate_harness.target_fuzzer_link_sources). Linked back for another symbol they define, they
+    bring the conflict back (sudo run-1 tf_fuzz_policy: "global var audit_msg at .../fuzz_policy.c:50
+    has different initializer than .../audit.c:43"). Empty for any other module.
+    """
+    if not module:
+        return {}
+    sidecar = load_json_optional(Path(dag_path).parent.parent / "harnesses" / f"harness_{module}.json", None)
+    tf = sidecar.get("target_fuzzer") if isinstance(sidecar, dict) else None
+    link = tf.get("link") if isinstance(tf, dict) else None
+    out: dict[str, list[str]] = {}
+    for ex in (link.get("excluded_sources") or []) if isinstance(link, dict) else []:
+        if isinstance(ex, dict) and isinstance(ex.get("source"), str) and ex["source"].strip():
+            out[_dag_tree_path(ex["source"])] = [str(s) for s in ex.get("symbols") or [] if isinstance(s, str)]
+    return out
+
+
+def _place_function(records: list[dict], ctx: dict, linked: set[str]) -> tuple[str, dict, str]:
+    """
+    Which of several files defining an undefined function to link, as (action, record, reason). Each
+    program of a target may define a function its libraries call (sudo: `open_sudoers` in cvtsudoers.c,
+    sudoers.c, testsudoers.c and visudo.c, called from the parser libparsesudoers.a); linking the first
+    one the DAG lists pulled the whole cvtsudoers program into libparsesudoers_a (sudo run-1).
+
+    - `add`: a definer the build already links (`linked`, tree paths), else one of the module's link
+      unit or of a unit it links (`units`, `unit_files`, `linked_units`); with the unit not known, the
+      only definer that defines no `main`.
+    - `stub`: none of them; the caller stubs it (`link_stubs.c`) or records it unresolved.
+    """
+    for rec in records:
+        if _dag_tree_path(rec["file"]) in linked:
+            return "add", rec, ""
+    unit = ctx.get("unit")
+    files = ", ".join(_dag_tree_path(r["file"]) for r in records)
+    if unit is not None:
+        own_units = {str(unit.get("unit") or ""), *ctx.get("linked_units", ())} - {""}
+        for rec in records:
+            if own_units & set(rec.get("units") or ()) or _dag_tree_path(rec["file"]) in ctx["unit_files"]:
+                return "add", rec, ""
+        return (
+            "stub",
+            records[0],
+            f"{len(records)} files define it ({files}), none of them in the module's link unit "
+            f"{unit.get('unit') or unit.get('module')} or a unit it links",
+        )
+    candidates = [r for r in records if _dag_tree_path(r["file"]) not in ctx["main_files"]]
+    if len(candidates) == 1:
+        return "add", candidates[0], ""
+    return "stub", records[0], f"{len(records)} files define it ({files}) and the module's link unit is not known"
 
 
 def _record_in_flow_files(rec: dict | None, flow_files: set[str]) -> bool:
@@ -2571,10 +2680,21 @@ def repair_sources_for_link(
     unresolved: list[dict] | None = None,
     missing: list[dict] | None = None,
     stubbed_functions: list[dict] | None = None,
+    unresolved_functions: list[dict] | None = None,
 ) -> tuple[list[str], dict]:
     """
     One link-repair round: map `undefined reference to 'X'` symbols to their
     defining sources via the DAG and append the missing files. Returns (sources, info).
+
+    A function several files define (each program its own: sudo's `open_sudoers`) is linked from the
+    one the build already links, else the one of the module's link unit or of a unit it links
+    (`_place_function`). When none is, it is stubbed in `<stub_dir>/link_stubs.c` with its `reason` and
+    `definers` (`info["stubbed_functions"]`), or without `stub_dir` listed in `unresolved_functions`:
+    linking one program's file into a library pulls that whole program in (sudo run-1 libparsesudoers_a).
+
+    A file a target fuzz module's link leaves out (sidecar `target_fuzzer.link.excluded_sources`,
+    `_excluded_link_sources`) is never added back: a function or global it defines is stubbed instead
+    (`link_stubs.c` / `link_globals.c`), or recorded unresolved without `stub_dir`.
 
     For an address-flow cluster (`module` is a DAG submodule with `build_sources`,
     scripts/unit_split.py), a parsed non-static function defined outside `flow_files` (of the same
@@ -2608,7 +2728,33 @@ def repair_sources_for_link(
         _flow_sub_stub_info(dp, module, flow_files=flow_files) if flow_files is not None else ("", set())
     )
     global_vars: dict[str, list[dict]] | None = None
+    definers: dict[str, list[dict]] | None = None
     ctx: dict = {}
+    excluded = _excluded_link_sources(dp, module)
+
+    def _excluded_reason(file: str) -> str:
+        tree = _dag_tree_path(file)
+        return (
+            f"the target fuzzer's link leaves {tree} out: the fuzzer defines {', '.join(excluded.get(tree) or [])} "
+            "itself (sidecar target_fuzzer.link.excluded_sources)"
+        )
+
+    def _stub_function(sym: str, file: str, reason: str, recs: list[dict]) -> None:
+        """Define `sym` in link_stubs.c instead of linking `file`; without `stub_dir`, record it unresolved."""
+        stub = {
+            "name": sym,
+            "file": _dag_tree_path(file),
+            "reason": reason,
+            "definers": [_dag_tree_path(r["file"]) for r in recs],
+        }
+        if stub_dir is None:
+            if unresolved_functions is not None and all(u["name"] != sym for u in unresolved_functions):
+                unresolved_functions.append({**stub, "reason": f"{reason}; no build directory was given"})
+        elif sym not in known_fn_stubs:
+            known_fn_stubs.add(sym)
+            new_fn_stubs.append(stub)
+            resolved.append(sym)
+
     for sym in syms:
         parsed_hit = parsed_syms.get(sym)
         if parsed_hit is not None:
@@ -2623,9 +2769,32 @@ def repair_sources_for_link(
                     new_fn_stubs.append({"name": sym, "file": _dag_tree_path(f)})
                     resolved.append(sym)
                 continue
+            if definers is None:
+                definers = _dag_function_definers(dp)
+            recs = definers.get(sym) or [{"file": f, "module": fn_mod, "units": []}]
+            kept = [r for r in recs if _dag_tree_path(r["file"]) not in excluded]
+            if not kept:
+                _stub_function(sym, recs[0]["file"], _excluded_reason(recs[0]["file"]), recs)
+                continue
+            if len(recs) > 1:
+                # Several programs define it: link the one of this module's unit, never the first listed
+                # (nor the one an excluded file leaves: sudo's stubs.c beside an excluded interfaces.c).
+                ctx = ctx or _link_unit_context(dp, module, sources=sources)
+                action, rec, reason = _place_function(kept, ctx, {_dag_tree_path(h) for h in have})
+                if action == "add":
+                    f = rec["file"]
+                else:
+                    _stub_function(sym, rec["file"], reason, recs)
+                    continue
+            else:
+                f = kept[0]["file"]
         elif sym in build_only_syms:
-            # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed.
+            # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed,
+            # unless the target fuzzer's link leaves their file out.
             f = build_only_syms[sym]
+            if _dag_tree_path(f) in excluded:
+                _stub_function(sym, f, _excluded_reason(f), [{"file": f}])
+                continue
         else:
             f = ""
         if not f:
@@ -2634,9 +2803,17 @@ def repair_sources_for_link(
             if sym not in global_vars or sym in known_stubs:
                 continue
             ctx = ctx or _link_unit_context(dp, module, sources=sources)
-            action, rec, reason = _place_global(global_vars[sym], ctx)
+            # A file the target fuzzer's link leaves out is never linked back: its global is stubbed.
+            linkable = [r for r in global_vars[sym] if _dag_tree_path(r["file"]) not in excluded]
+            if linkable:
+                action, rec, reason = _place_global(linkable, ctx)
+            else:
+                action, rec, reason = "stub", global_vars[sym][0], ""
+            why = {} if linkable else {"reason": _excluded_reason(rec["file"])}
             if action == "stub" and stub_dir is None:
                 action, reason = "unresolved", "another link unit defines it and no build directory was given"
+                if not linkable:
+                    reason = f"{_excluded_reason(rec['file'])}, and no build directory was given"
             elif action == "stub" and stub_dir is not None and flow_files is not None:
                 raw_sz = rec.get("size")
                 size = int(raw_sz) if isinstance(raw_sz, int) and raw_sz > 0 else DEFAULT_BSS_GLOBAL_SIZE
@@ -2648,6 +2825,7 @@ def repair_sources_for_link(
                         "size": size,
                         "assumption": LINK_GLOBALS_ASSUMPTION,
                         "bss": True,
+                        **why,
                     }
                 )
                 resolved.append(sym)
@@ -2659,7 +2837,7 @@ def repair_sources_for_link(
                 fields, definition, reason = _global_stub_definition(
                     sym, rec, global_vars[sym], [*sources, *added], Path(run_dir), stub_dir
                 )
-                stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION, **fields}
+                stub = {**rec, "assumption": LINK_GLOBALS_ASSUMPTION, **fields, **why}
                 if definition is None:
                     action, reason = "unresolved", f"{reason}, and no header of the project declares it"
                 else:
@@ -2721,19 +2899,39 @@ def repair_sources_for_link(
             removed.add(stub_file.as_posix())
             with contextlib.suppress(OSError):
                 stub_file.unlink()
-    if (new_fn_stubs or new_bss_stubs) and stub_dir is not None:
-        stub_dir.mkdir(parents=True, exist_ok=True)
+    # A function is defined once too: a stub placed because no definer could be linked (`definers`:
+    # several programs define it, or its file is excluded) goes when a file this round links in is
+    # one of its definers, in either order. An address-flow cluster's stubs (no `definers`) stay.
+    prior_fns = list(stubbed_functions or [])
+    fn_dropped: list[dict] = []
+    if added:
+        added_tree = {_dag_tree_path(a) for a in added}
+
+        def _fn_linked(stub: dict) -> bool:
+            return any(d in added_tree for d in stub.get("definers") or [])
+
+        new_fn_stubs = [s for s in new_fn_stubs if not _fn_linked(s)]
+        fn_dropped = [s for s in prior_fns if _fn_linked(s)]
+    kept_fns = [s for s in prior_fns if s not in fn_dropped]
+    if (new_fn_stubs or new_bss_stubs or fn_dropped) and stub_dir is not None:
         fn_file = stub_dir / LINK_STUBS_FILE
-        fn_file.write_text(
-            link_stubs_source([*(stubbed_functions or []), *new_fn_stubs], [*prior_bss, *new_bss_stubs], module),
-            encoding="utf-8",
-            newline="\n",
-        )
-        if fn_file.as_posix() not in have:
-            have.add(fn_file.as_posix())
-            added.append(fn_file.as_posix())
+        if kept_fns or new_fn_stubs or prior_bss or new_bss_stubs:
+            stub_dir.mkdir(parents=True, exist_ok=True)
+            fn_file.write_text(
+                link_stubs_source([*kept_fns, *new_fn_stubs], [*prior_bss, *new_bss_stubs], module),
+                encoding="utf-8",
+                newline="\n",
+            )
+            if fn_file.as_posix() not in have:
+                have.add(fn_file.as_posix())
+                added.append(fn_file.as_posix())
+        else:
+            # No function or global left to define: the file leaves the build.
+            removed.add(fn_file.as_posix())
+            with contextlib.suppress(OSError):
+                fn_file.unlink()
     new_stubs = [*new_c_stubs, *new_bss_stubs]
-    changed = added or new_stubs or new_fn_stubs or dropped
+    changed = added or new_stubs or new_fn_stubs or dropped or fn_dropped
     info: dict = {"symbols": resolved, "added_sources": added} if changed else {}
     if new_stubs:
         info["stubbed_globals"] = new_stubs
@@ -2741,6 +2939,8 @@ def repair_sources_for_link(
         info["stubbed_functions"] = new_fn_stubs
     if dropped:
         info["unstubbed_globals"] = [s["name"] for s in dropped]
+    if fn_dropped:
+        info["unstubbed_functions"] = [s["name"] for s in fn_dropped]
     return [s for s in [*sources, *added] if s.replace("\\", "/") not in removed], info
 
 
@@ -2820,6 +3020,9 @@ def repair_link_rounds(
             gone = set(info.get("unstubbed_globals") or [])
             stubbed = [s for s in stubbed if s["name"] not in gone]
             round_stubbed = [s for s in round_stubbed if s["name"] not in gone]
+            gone_fns = set(info.get("unstubbed_functions") or [])
+            stubbed_fns = [s for s in stubbed_fns if s["name"] not in gone_fns]
+            round_stubbed_fns = [s for s in round_stubbed_fns if s["name"] not in gone_fns]
             stubbed += new_g
             stubbed_fns += new_f
             round_stubbed += new_g

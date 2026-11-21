@@ -1484,6 +1484,56 @@ def rewrite_forward_array_sizes(c_text: str) -> tuple[str, list[dict[str, Any]]]
     return "".join(pieces), info
 
 
+# A fallthrough statement attribute as the kernel prints it (`__attribute__((__fallthrough__));`), on one line.
+_FALLTHROUGH_ATTR_RE = re.compile(r"__attribute__[ \t]*\(\([ \t]*(?:__)?fallthrough(?:__)?[ \t]*\)\)(?=[ \t]*;)")
+# What may come between it and the label it announces: blanks and comments (ACSL annotations included).
+_BLANKS_AND_COMMENTS_RE = re.compile(r"(?:\s+|/\*.*?\*/|//[^\n]*)*", re.S)
+_SWITCH_LABEL_RE = re.compile(r"(?:case(?![\w$])|default[ \t\r\n]*:)")
+
+
+def rewrite_misplaced_fallthrough(c_text: str) -> tuple[str, dict[str, Any]]:
+    """
+    Work around the Frama-C printer putting a statement's goto label before its `default:` label (sudo
+    run-1 `libparsesudoers_a`, plugins/sudoers/fmtsudoers.c:113; seen with Frama-C 34.0~beta). The source has
+    `FALLTHROUGH; default: print_word:` (sudo's FALLTHROUGH is `__attribute__((__fallthrough__))`), the
+    kernel prints `__attribute__((__fallthrough__)); print_word: default:`, and clang stops on
+    "fallthrough annotation does not directly precede switch label". Plain `frama-c -print` does the same,
+    so it is no E-ACSL issue.
+
+    The attribute only tells the compiler the fall through is intended (a warning, -Wimplicit-fallthrough):
+    each one the next statement does not start with `case` or `default:` (blanks and comments aside) is
+    removed, its `;` stays as an empty statement, so control flow, labels and line numbers do not change.
+    One that directly precedes a switch label is left as it is.
+
+    Returns the new text and {rewrites, lines} (`lines`: where each removed attribute was, 1-based).
+    Linear in the text: the instrumented file of a unit runs to millions of lines.
+    """
+    info: dict[str, Any] = {"rewrites": 0, "lines": []}
+    if "fallthrough" not in c_text:
+        return c_text, info
+    pieces: list[str] = []
+    pos = 0
+    line = 1
+    for m in _FALLTHROUGH_ATTR_RE.finditer(c_text):
+        # A statement: what comes before it ends a statement, a block or a label (or a comment).
+        before = c_text[max(0, m.start() - 256) : m.start()].rstrip()
+        if before and before[-1] not in ";{}:/":
+            continue
+        semi = c_text.index(";", m.end())
+        after = _BLANKS_AND_COMMENTS_RE.match(c_text, semi + 1)
+        if _SWITCH_LABEL_RE.match(c_text, after.end() if after else semi + 1):
+            continue
+        line += c_text.count("\n", pos, m.start())
+        pieces.append(c_text[pos : m.start()])
+        pos = m.end()
+        info["rewrites"] += 1
+        info["lines"].append(line)
+    if not info["rewrites"]:
+        return c_text, info
+    pieces.append(c_text[pos:])
+    return "".join(pieces), info
+
+
 _STRTO_CALL_RE = re.compile(r"\b(?:strto\w*|wcsto\w*)\s*\(")
 _SOUND_VERDICT_RESET_RE = re.compile(r"\b__e_acsl_sound_verdict\s*=\s*0\s*;")
 _FUZZER_TEST_ONE_INPUT_DEF_RE = re.compile(
