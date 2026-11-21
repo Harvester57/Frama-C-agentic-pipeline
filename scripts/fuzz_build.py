@@ -1795,6 +1795,34 @@ def _dag_symbol_tables(dag_path: Path) -> tuple[dict[str, tuple[str, str]], dict
     return parsed, build_only_out
 
 
+def _dag_function_definers(dag_path: Path) -> dict[str, list[dict]]:
+    """
+    Non-static function name -> every source file defining it in `callgraph_dag.json`, one record each
+    ({file, module, units}, in DAG order; header records left out). A name several programs define for
+    themselves (sudo's `open_sudoers`: cvtsudoers.c, sudoers.c, testsudoers.c, visudo.c) has several.
+    """
+    dag = load_json_optional(Path(dag_path), None)
+    out: dict[str, list[dict]] = {}
+    for key, rec in ((dag.get("functions") or {}) if isinstance(dag, dict) else {}).items():
+        if not isinstance(rec, dict) or rec.get("is_static") is True:
+            continue
+        name = str(rec.get("name") or str(key).split("#")[-1])
+        file = str(rec.get("file") or "")
+        if not (name and file) or rec.get("header") or posixpath.splitext(file)[1].lower() in _HEADER_SUFFIXES:
+            continue
+        recs = out.setdefault(name, [])
+        if all(r["file"] != file for r in recs):
+            units = rec.get("units")
+            recs.append(
+                {
+                    "file": file,
+                    "module": str(rec.get("module") or ""),
+                    "units": [str(u) for u in units] if isinstance(units, list) else [],
+                }
+            )
+    return out
+
+
 def _dag_symbol_files(dag_path: Path) -> dict[str, str]:
     """
     Map non-static function name -> defining source file from callgraph_dag.json: its parsed
@@ -2122,7 +2150,8 @@ def link_stubs_source(
     """
     The generated file defining the functions and globals an address-flow cluster's sources name
     and its harness cannot reach (`stubbed_functions`, `.bss` `global_stubs`; scripts/unit_split.py,
-    docs/plans/unit-split-address-flow.md).
+    docs/plans/unit-split-address-flow.md), and for any module the functions link repair does not
+    link from a file (`reason`: several programs define it, or its file is left out of the link).
     Each function is a symbol in file-scope assembly (no C type, so no project prototype can
     conflict) that jumps to `__framac_link_stub_called(name)`, writing LINK_STUB_MARKER via
     unbuffered `write(2, ...)` (E-ACSL-safe: no `fprintf` / `strlen` on unregistered `.rodata`) and
@@ -2157,8 +2186,10 @@ def link_stubs_source(
     ]
     for i, s in enumerate(stubs):
         name = s["name"]
+        # A stub link repair chose over linking a file (several definers, an excluded source) says why.
+        why = str(s.get("reason") or "").replace("*/", "* /").replace("\\", "/").replace('"', "'")
         lines += [
-            f'  "/* {name}: defined in {s.get("file") or "unknown"} */\\n"',
+            f'  "/* {name}: defined in {s.get("file") or "unknown"}{f"; {why}" if why else ""} */\\n"',
             '  ".text\\n"',
             f'  ".globl {name}\\n"',
             f'  ".type {name}, @function\\n"',
@@ -2272,7 +2303,9 @@ def _link_unit_context(dag_path: Path, module: str | None, sources: list[str] | 
     What placing a global needs from the DAG: the link unit record of harness module `module`
     (`unit`: None without link units, without a module, or for a module the DAG and the sidecars
     do not place, as `ModuleMap.unit_of` answers), that unit's sources (`unit_files`: its own and
-    those of the project libraries it links) and the files defining a `main` (`main_files`).
+    those of the project libraries it links), the units of the modules it links (`linked_units`, from
+    the record's `linked_modules`, whose files are in `unit_files` too) and the files defining a
+    `main` (`main_files`).
     """
     from module_map import ModuleMap, load_sidecars
 
@@ -2283,9 +2316,16 @@ def _link_unit_context(dag_path: Path, module: str | None, sources: list[str] | 
         rec = mm.modules.get(mm.unit_of(module))
         unit = rec if isinstance(rec, dict) else None
     files = [*((unit or {}).get("files") or []), *((unit or {}).get("required_sources") or [])]
+    linked_units: set[str] = set()
+    for name in (unit or {}).get("linked_modules") or []:
+        linked = mm.modules.get(str(name)) if isinstance(name, str) else None
+        if isinstance(linked, dict):
+            linked_units.add(str(linked.get("unit") or name))
+            files += [f for f in linked.get("files") or [] if isinstance(f, str)]
     return {
         "flow_files": _flow_cluster_files(Path(dag_path), module, sources=sources),
         "unit": unit,
+        "linked_units": linked_units,
         "unit_files": {_dag_tree_path(f) for f in files if isinstance(f, str)},
         "main_files": {
             _dag_tree_path(str(r.get("file") or ""))
@@ -2325,6 +2365,40 @@ def _place_global(records: list[dict], ctx: dict) -> tuple[str, dict, str]:
         if unit.get("unit") in rec["units"] or _dag_tree_path(rec["file"]) in ctx["unit_files"]:
             return "add", rec, ""
     return "stub", records[0], ""
+
+
+def _place_function(records: list[dict], ctx: dict, linked: set[str]) -> tuple[str, dict, str]:
+    """
+    Which of several files defining an undefined function to link, as (action, record, reason). Each
+    program of a target may define a function its libraries call (sudo: `open_sudoers` in cvtsudoers.c,
+    sudoers.c, testsudoers.c and visudo.c, called from the parser libparsesudoers.a); linking the first
+    one the DAG lists pulled the whole cvtsudoers program into libparsesudoers_a (sudo run-1).
+
+    - `add`: a definer the build already links (`linked`, tree paths), else one of the module's link
+      unit or of a unit it links (`units`, `unit_files`, `linked_units`); with the unit not known, the
+      only definer that defines no `main`.
+    - `stub`: none of them; the caller stubs it (`link_stubs.c`) or records it unresolved.
+    """
+    for rec in records:
+        if _dag_tree_path(rec["file"]) in linked:
+            return "add", rec, ""
+    unit = ctx.get("unit")
+    files = ", ".join(_dag_tree_path(r["file"]) for r in records)
+    if unit is not None:
+        own_units = {str(unit.get("unit") or ""), *ctx.get("linked_units", ())} - {""}
+        for rec in records:
+            if own_units & set(rec.get("units") or ()) or _dag_tree_path(rec["file"]) in ctx["unit_files"]:
+                return "add", rec, ""
+        return (
+            "stub",
+            records[0],
+            f"{len(records)} files define it ({files}), none of them in the module's link unit "
+            f"{unit.get('unit') or unit.get('module')} or a unit it links",
+        )
+    candidates = [r for r in records if _dag_tree_path(r["file"]) not in ctx["main_files"]]
+    if len(candidates) == 1:
+        return "add", candidates[0], ""
+    return "stub", records[0], f"{len(records)} files define it ({files}) and the module's link unit is not known"
 
 
 def _record_in_flow_files(rec: dict | None, flow_files: set[str]) -> bool:
@@ -2586,10 +2660,17 @@ def repair_sources_for_link(
     unresolved: list[dict] | None = None,
     missing: list[dict] | None = None,
     stubbed_functions: list[dict] | None = None,
+    unresolved_functions: list[dict] | None = None,
 ) -> tuple[list[str], dict]:
     """
     One link-repair round: map `undefined reference to 'X'` symbols to their
     defining sources via the DAG and append the missing files. Returns (sources, info).
+
+    A function several files define (each program its own: sudo's `open_sudoers`) is linked from the
+    one the build already links, else the one of the module's link unit or of a unit it links
+    (`_place_function`). When none is, it is stubbed in `<stub_dir>/link_stubs.c` with its `reason` and
+    `definers` (`info["stubbed_functions"]`), or without `stub_dir` listed in `unresolved_functions`:
+    linking one program's file into a library pulls that whole program in (sudo run-1 libparsesudoers_a).
 
     For an address-flow cluster (`module` is a DAG submodule with `build_sources`,
     scripts/unit_split.py), a parsed non-static function defined outside `flow_files` (of the same
@@ -2623,6 +2704,7 @@ def repair_sources_for_link(
         _flow_sub_stub_info(dp, module, flow_files=flow_files) if flow_files is not None else ("", set())
     )
     global_vars: dict[str, list[dict]] | None = None
+    definers: dict[str, list[dict]] | None = None
     ctx: dict = {}
     for sym in syms:
         parsed_hit = parsed_syms.get(sym)
@@ -2638,6 +2720,30 @@ def repair_sources_for_link(
                     new_fn_stubs.append({"name": sym, "file": _dag_tree_path(f)})
                     resolved.append(sym)
                 continue
+            if definers is None:
+                definers = _dag_function_definers(dp)
+            recs = definers.get(sym) or []
+            if len(recs) > 1:
+                # Several programs define it: link the one of this module's unit, never the first listed.
+                ctx = ctx or _link_unit_context(dp, module, sources=sources)
+                action, rec, reason = _place_function(recs, ctx, {_dag_tree_path(h) for h in have})
+                if action == "add":
+                    f = rec["file"]
+                else:
+                    stub = {
+                        "name": sym,
+                        "file": _dag_tree_path(rec["file"]),
+                        "reason": reason,
+                        "definers": [_dag_tree_path(r["file"]) for r in recs],
+                    }
+                    if stub_dir is None:
+                        if unresolved_functions is not None and all(u["name"] != sym for u in unresolved_functions):
+                            unresolved_functions.append({**stub, "reason": f"{reason}; no build directory was given"})
+                    elif sym not in known_fn_stubs:
+                        known_fn_stubs.add(sym)
+                        new_fn_stubs.append(stub)
+                        resolved.append(sym)
+                    continue
         elif sym in build_only_syms:
             # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed.
             f = build_only_syms[sym]
