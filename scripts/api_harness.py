@@ -343,6 +343,7 @@ _OFF_VALUES = frozenset({"off", "0", "false", "no"})
 MAX_SCHEMA_INSTANCES = 4
 NO_ATTACKER_DATA_REASON = "no attacker data per the threat model"
 TRUSTED_PARAM_NO_INSTANCE_FMT = "trusted parameter {name} has no instance"
+CALLER_STORAGE_NOTE = "trusted caller-storage buffer: backed by fixed harness array"
 REFCOUNT_EXEMPT_REASON = "refcount helper requires producer-allocated object"
 STATIC_NOT_CALLABLE_REASON = "static: not callable from the harness"
 _NULLABLE_ALLOCATOR_NAMES = frozenset({"allocator", "alloc", "mem_alloc"})
@@ -991,6 +992,75 @@ def _is_nullable_allocator_param(param_name: str | None, p: dict[str, Any]) -> b
     return False
 
 
+def _is_writable_byte_ptr_field(f: dict[str, Any]) -> bool:
+    """Whether a struct field is a non-const byte/void pointer (`void *`, `unsigned char *`, `uint8_t *`, `char *`)."""
+    if f.get("kind") != "ptr" or f.get("const"):
+        return False
+    if f.get("bytes") is True:
+        return True
+    if f.get("bytes") is False:
+        return False
+    pointee = str(f.get("pointee") or "").strip()
+    if pointee:
+        norm = _norm_type(pointee)
+        return norm in _BYTE_POINTEES or norm == "uint8_t"
+    return False
+
+
+def _is_caller_storage_len_field(f: dict[str, Any]) -> bool:
+    """Whether a struct field is a size/length integer field of a caller-storage buffer struct."""
+    if not _len_field(f):
+        return False
+    fname = str(f.get("name") or "")
+    return bool(_LEN_NAME_RE.search(fname) or (set(_words(fname)) & _TRIPLE_SIZE_WORDS))
+
+
+def _writable_buffer_struct_fields(lay: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """
+    S2 caller-storage shape (a): a struct whose fields are exactly one writable byte/void pointer
+    (`void *`, `unsigned char *`, `uint8_t *`, `char *`, non-`const` pointee) and one size/length
+    integer field, in either `{ptr, len}` or `{len, ptr}` field order, with no function-pointer or
+    other pointer fields (e.g. QCBOR's `UsefulBuf { void *ptr; size_t len; }`).
+    Returns `(ptr_field, len_field)` or None.
+    """
+    if not isinstance(lay, dict) or lay.get("what") != "struct":
+        return None
+    fields = list(lay.get("fields") or [])
+    if len(fields) != 2 or not all(isinstance(f, dict) for f in fields):
+        return None
+    f0, f1 = fields[0], fields[1]
+    if _is_writable_byte_ptr_field(f0) and _is_caller_storage_len_field(f1):
+        return f0, f1
+    if _is_caller_storage_len_field(f0) and _is_writable_byte_ptr_field(f1):
+        return f1, f0
+    return None
+
+
+def _is_caller_storage_pair(
+    params: list[dict[str, Any]],
+    i: int,
+    formals: list[dict[str, Any]],
+    rec: dict[str, Any],
+    api: ApiInfo,
+) -> bool:
+    """
+    S2 caller-storage shape (b): a trusted writable `(void */byte *, size_t)` scratch pair whose
+    pointer is non-`const` (`formals[i]["kind"] == "pointer"`), not an opaque handle, followed by
+    a length integer whose name says length/size/capacity (or an unnamed `size_t`/`unsigned long`).
+    """
+    if i + 1 >= len(params) or not _is_pair(params, i, formals):
+        return False
+    if _is_input(formals, i):
+        return False
+    fn_name = str(rec.get("name") or "")
+    if i in (api.handles.get(fn_name) or {}):
+        return False
+    lname = _name(formals, i + 1)
+    if lname:
+        return bool(_LEN_NAME_RE.search(lname) or (set(_words(lname)) & _TRIPLE_SIZE_WORDS))
+    return str(params[i + 1].get("ctype") or "") in ("unsigned long", "unsigned long long")
+
+
 def _is_trusted_cstring(params: list[dict], formals: list[dict], rec: dict, i: int, roles: list[str] | None) -> bool:
     """
     Under `FRAMAC_API_TRUST_SCHEMA`, whether trusted parameter `i` is a NUL-terminated string the
@@ -1220,7 +1290,7 @@ def _target_claims_rest(
         p = params[i]
         nxt = params[i + 1] if i + 1 < n else None
         role = roles[i] if roles is not None else None
-        if i in schema_bindings or role == "trusted_scalar":
+        if i in schema_bindings or role in ("trusted_scalar", "caller_storage_len"):
             i += 1
             continue
         if (
@@ -1253,7 +1323,7 @@ def _target_claims_rest(
             continue
         if p["kind"] == "ptr":
             pointee = str(p.get("pointee") or "void")
-            is_input = False if role == "output" else _is_input(formals, i)
+            is_input = False if role in ("output", "caller_storage") else _is_input(formals, i)
             size = None if varlen and _lone_output(params, formals, i) else param_size(rec, i)
             own_init = (i == 0 and name in api.candidates.get(pointee, set())) or (
                 api.trust_schema and name in api.candidates.get(pointee, set())
@@ -1263,6 +1333,12 @@ def _target_claims_rest(
                 continue
             if _table_type(api, p) is not None or role == "trusted":
                 i += 1
+                continue
+            if role == "caller_storage":
+                if _is_pair(params, i, formals) and nxt is not None and (i + 1) not in shared:
+                    i += 2
+                else:
+                    i += 1
                 continue
             j = _array_count(params, i, formals)
             if j is not None and not any(
@@ -1295,7 +1371,7 @@ def _target_claims_rest(
             if api.trust_schema and ctype in api.inits and name not in api.candidates.get(ctype, set()):
                 i += 1
                 continue
-            if role == "trusted":
+            if role in ("trusted", "caller_storage"):
                 i += 1
                 continue
             if _struct_claims_rest(api, api.structs.get(ctype)):
@@ -2258,8 +2334,13 @@ def _param_roles(
     entry_trust: _EntryTrust,
 ) -> list[str]:
     """
-    S1 per-parameter roles when a threat model is active:
+    S1/S2 per-parameter roles when a threat model is active:
       - `attacker`: fuzzed as today (or built via an S2 byte-taking builder);
+      - `caller_storage`: trusted caller-owned writable buffer struct (`{ptr, len}` / `{len, ptr}`
+        with a single writable byte/void pointer and length) or writable `(void */byte *, size_t)`
+        scratch pair -> backed by a fixed `_Alignas(16)` harness array;
+      - `caller_storage_len`: trusted length integer paired with a `caller_storage` pointer -> set
+        to `sizeof(<var>_buf)` (zeroed if standalone);
       - `trusted`: pointer/struct not in `attacker_params` -> ONLY S3 schema instance or S2 builder
         (a read-only NUL-terminated string: a fixed literal, `_is_trusted_cstring`), else skipped
         with `"trusted parameter <name> has no instance"`;
@@ -2281,12 +2362,24 @@ def _param_roles(
                 roles.append("attacker")
             elif i + 1 < n and _len_ptr_params(params, i, formals, rec) and _name(formals, i + 1) in att:
                 roles.append("attacker")
+            elif (
+                i > 0
+                and roles[i - 1] == "caller_storage"
+                and _is_caller_storage_pair(params, i - 1, formals, rec, api)
+            ):
+                roles.append("caller_storage_len")
             elif p["kind"] == "struct":
-                roles.append("trusted")
+                ctype = str(p.get("ctype") or "")
+                if _writable_buffer_struct_fields(api.structs.get(ctype)) is not None:
+                    roles.append("caller_storage")
+                else:
+                    roles.append("trusted")
             elif p["kind"] == "ptr":
                 pointee = str(p.get("pointee") or "")
                 if (_is_record(pointee) and "*" not in pointee) or is_in:
                     roles.append("trusted")
+                elif _is_caller_storage_pair(params, i, formals, rec, api):
+                    roles.append("caller_storage")
                 else:
                     roles.append("output")
             elif p["kind"] == "fnptr":
@@ -2306,8 +2399,16 @@ def _param_roles(
                 roles.append("attacker")
             elif p["kind"] == "struct" and str(p.get("ctype") or "") in api.inits:
                 roles.append("attacker")
+            elif (
+                p["kind"] == "struct"
+                and _writable_buffer_struct_fields(api.structs.get(str(p.get("ctype") or ""))) is not None
+            ):
+                roles.append("caller_storage")
             elif p["kind"] == "ptr" and not is_in:
-                roles.append("output")
+                if _is_caller_storage_pair(params, i, formals, rec, api):
+                    roles.append("caller_storage")
+                else:
+                    roles.append("output")
             elif p["kind"] == "ptr" and _is_record(str(p.get("pointee") or "")) and is_in:
                 roles.append("trusted")
             else:
@@ -2385,7 +2486,7 @@ def _bind_call(
             args.append(f"&{gname}" if by_ref else gname)
             i += 1
             continue
-        if role == "trusted_scalar":
+        if role in ("trusted_scalar", "caller_storage_len"):
             case.decls.append(f"{p['ctype']} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
             recorded = (
                 (api.trusted_scalars.get(name) or {}).get(i)
@@ -2538,7 +2639,7 @@ def _bind_call(
             continue
         if p["kind"] == "ptr":
             pointee = p.get("pointee") or "void"
-            is_input = False if role == "output" else _is_input(formals, i)
+            is_input = False if role in ("output", "caller_storage") else _is_input(formals, i)
             size = None if varlen and _lone_output(params, formals, i) else param_size(rec, i)
             charlike = _charlike(p)
             pair = _is_pair(params, i, formals)
@@ -2638,6 +2739,37 @@ def _bind_call(
             ):
                 args += _array_args(case, call, params, formals, rec, i, j)
                 i = j + 1
+                continue
+            if (
+                api.trust_schema
+                and role == "caller_storage"
+                and pair
+                and nxt is not None
+                and (i + 1) not in shared
+            ):
+                # S2 caller-storage shape (b): trusted writable `(void */byte *, size_t)` scratch pair.
+                buf_var = case.declare(f"{v}_buf")
+                case.decls.append(_byte_buffer("static ", buf_var, case.spare))
+                ln = f"c{call}a{i + 1}"
+                attacker_sized = roles is not None and roles[i + 1] == "attacker"
+                if attacker_sized:
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+                    case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
+                    case.decls.append(
+                        f"if ((unsigned long long){ln} > sizeof({buf_var})) {{ {ln} = ({nxt['ctype']})sizeof({buf_var}); }}"
+                    )
+                    case.note(
+                        call,
+                        i,
+                        f"{CALLER_STORAGE_NOTE} (attacker-sized length clamped to 0..sizeof({buf_var}))",
+                    )
+                else:
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)} = ({nxt['ctype']})sizeof({buf_var});")
+                    case.note(call, i, CALLER_STORAGE_NOTE)
+                args.append(f"({p['type']}){buf_var}")
+                args.append(ln)
+                pairs.append((i, ln, False))
+                i += 2
                 continue
             if (
                 pair
@@ -2843,6 +2975,23 @@ def _bind_call(
                 args.append(v)
                 i += 1
                 continue
+            if api.trust_schema and role == "caller_storage":
+                # S2 caller-storage shape (a): trusted by-value writable buffer struct (`{ptr, len}` / `{len, ptr}`).
+                buf_fields = _writable_buffer_struct_fields(api.structs.get(ctype))
+                if buf_fields is not None:
+                    pf, lf = buf_fields
+                    buf_var = case.declare(f"{v}_buf")
+                    case.decls.append(_byte_buffer("static ", buf_var, case.spare))
+                    case.decls.append(f"{ctype} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                    case.decls.append(
+                        f"{v}.{pf['name']} = (void *){buf_var}; {v}.{lf['name']} = ({lf['ctype']})sizeof({buf_var});"
+                    )
+                    case.note(call, i, CALLER_STORAGE_NOTE)
+                    args.append(v)
+                    i += 1
+                    continue
+                pname = _name(formals, i) or f"param{i}"
+                raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
             if role == "trusted":
                 pname = _name(formals, i) or f"param{i}"
                 raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
@@ -3221,6 +3370,7 @@ def _single_cases_for_entry(
                 builder_schema_opts[i] = (s_pointee, insts)
                 continue
             if role == "trusted" and not has_builder:
+                # Caller-storage buffer structs have role == "caller_storage" (backed by fixed harness array).
                 insts = _lookup_schema_instances(api, ctype, None)
                 if not insts:
                     return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
