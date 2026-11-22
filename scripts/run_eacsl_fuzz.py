@@ -4808,7 +4808,7 @@ def run_judge(
         return report
 
     try:
-        eacsl_binary = resolve_prebuilt_binary(build_json, "eacsl")
+        eacsl_binary = fuzz_build.resolve_prebuilt_binary(build_json, "eacsl")
     except (PrebuiltBinaryError, ValueError, TypeError) as exc:
         return _base_report(
             status="skipped",
@@ -5197,7 +5197,7 @@ def _run_eacsl_fuzz_mode(args) -> dict:
         }
 
     try:
-        eacsl_binary = resolve_prebuilt_binary(args.build_json, "eacsl")
+        eacsl_binary = fuzz_build.resolve_prebuilt_binary(args.build_json, "eacsl")
     except (PrebuiltBinaryError, ValueError, TypeError) as exc:
         return {
             "mode": "eacsl-fuzz",
@@ -5599,12 +5599,12 @@ def _run_explore_campaign_mode(
     if build_json_path is not None:
         build_doc = _load_json_dict_optional(build_json_path)
         try:
-            binary_path = resolve_prebuilt_binary(build_json_path, "sanitizers")
+            binary_path = fuzz_build.resolve_prebuilt_binary(build_json_path, "sanitizers")
             engine_used = "sanitizers"
         except PrebuiltBinaryError as san_exc:
             if args.engine == "auto":
                 try:
-                    binary_path = resolve_prebuilt_binary(build_json_path, "eacsl")
+                    binary_path = fuzz_build.resolve_prebuilt_binary(build_json_path, "eacsl")
                     engine_used = "eacsl"
                     dual_skipped_note = f"sanitizer prebuilt binary unavailable ({san_exc})"
                 except PrebuiltBinaryError as eacsl_exc:
