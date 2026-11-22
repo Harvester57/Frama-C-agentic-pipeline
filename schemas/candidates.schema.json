@@ -79,6 +79,16 @@
         "type": ["string", "null"],
         "description": "SHA-256 digest of the harness that produced this candidate (used by P5 verifier circuit breaker supersession)."
       },
+      "module_harness_digests": {
+        "type": "object",
+        "additionalProperties": {"type": "string", "minLength": 1},
+        "description": "Per-module active SHA-256 harness digests for every module that observed this candidate (prevents secondary modules from clobbering top-level harness_digest)."
+      },
+      "superseded_module_digests": {
+        "type": "object",
+        "additionalProperties": {"type": "string", "minLength": 1},
+        "description": "Per-module SHA-256 harness digests that have been superseded by harness repair for this candidate."
+      },
       "discovering_step": {
         "type": ["string", "null"],
         "enum": ["explore", "judge", "eacsl_fuzz", null],
