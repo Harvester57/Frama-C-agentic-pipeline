@@ -1404,12 +1404,16 @@ def _cstring_fixture(
     label_kind: str = "const_pointer",
     attacker: tuple[str, ...] = ("c", "out"),
     label_sizes: dict[str, int] | None = None,
+    after_label: tuple[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
     """
     A QCBOR-shaped map lookup `int lookup(struct ctx *c, const char *szLabel, int *out)` whose
     threat-model `input_sources` entry lists only the context and the output (`params`): the label is
-    chosen by the application, so it is a trusted parameter, not attacker data.
+    chosen by the application, so it is a trusted parameter, not attacker data. `after_label` adds a
+    scalar `(ctype, name)` between the label and `out` (QCBOR's `uint32_t uConvertTypes`).
     """
+    extra_types = f"{after_label[0]}," if after_label else ""
+    extra_formals = [{"name": after_label[1], "kind": "value"}] if after_label else []
     key = "lookup.c#lookup"
     tm_block: dict[str, Any] = {
         "status": "ok",
@@ -1420,10 +1424,11 @@ def _cstring_fixture(
     rec: dict[str, Any] = {
         "name": "lookup",
         "file": "lookup.c",
-        "signature": f"int(struct ctx *,{label_type},int *)",
+        "signature": f"int(struct ctx *,{label_type},{extra_types}int *)",
         "formals": [
             {"name": "c", "kind": "pointer"},
             {"name": "szLabel", "kind": label_kind},
+            *extra_formals,
             {"name": "out", "kind": "pointer"},
         ],
     }
@@ -1565,6 +1570,40 @@ def test_trusted_non_string_pointer_stays_exempt(monkeypatch: pytest.MonkeyPatch
         return
     assert planned["auto_exempt"]["lookup.c#lookup"] == "trusted parameter szLabel has no instance"
     assert _lookup_cases(planned) == []
+
+
+@pytest.mark.parametrize(
+    "after_label",
+    [("unsigned int", "uConvertTypes"), ("unsigned char", "uTagRequirement"), ("unsigned long", "uOptions")],
+)
+def test_trusted_cstring_beside_a_trusted_scalar_gets_the_literal(
+    monkeypatch: pytest.MonkeyPatch, after_label: tuple[str, str]
+):
+    """
+    QCBOR's `QCBORDecode_GetInt64ConvertAllInMapSZ(pCtx, szLabel, uint32_t uConvertTypes, pnValue)`:
+    the unsigned scalar after the label looks like a length, but the threat model leaves it trusted,
+    so it is zeroed and the label still gets its literal.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture(after_label=after_label)
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    assert "lookup.c#lookup" not in planned["auto_exempt"], planned["auto_exempt"]
+    (stmt, lay), *_ = _lookup_cases(planned)
+    assert f'(char const *)"{ah.TRUSTED_STRING_DEFAULT}", c0a2,' in stmt
+    assert f"{after_label[0]} c0a2; memset(&c0a2, 0, sizeof(c0a2));" in stmt
+    assert all(s.get("param") not in (1, 2) for s in lay["slots"])
+
+
+def test_trusted_cstring_beside_an_attacker_length_stays_exempt(monkeypatch: pytest.MonkeyPatch):
+    """A length the attacker controls beside a literal would read past it: no case, as before."""
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture(after_label=("unsigned long", "uLen"), attacker=("c", "uLen", "out"))
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    assert planned["auto_exempt"]["lookup.c#lookup"] == "trusted parameter szLabel has no instance"
 
 
 def test_trusted_cstring_flag_off_is_unchanged(monkeypatch: pytest.MonkeyPatch):

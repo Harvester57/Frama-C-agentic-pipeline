@@ -983,25 +983,29 @@ def _is_nullable_allocator_param(param_name: str | None, p: dict[str, Any]) -> b
     return False
 
 
-def _is_trusted_cstring(params: list[dict], formals: list[dict], rec: dict, i: int, role: str | None) -> bool:
+def _is_trusted_cstring(params: list[dict], formals: list[dict], rec: dict, i: int, roles: list[str] | None) -> bool:
     """
     Under `FRAMAC_API_TRUST_SCHEMA`, whether trusted parameter `i` is a NUL-terminated string the
     application chooses (QCBOR's `const char *szLabel`), bound to a literal (`_trusted_string_arg`)
     instead of exempting the entry point. Only a `char`/`signed char` pointee the model positively
-    marks read-only (`const_pointer`), with no size its call sites give and no length beside it:
-    a byte buffer (`void`, `unsigned char`), a fixed-size object, a (pointer, length) pair or a
-    pointer the callee may write keeps the `TRUSTED_PARAM_NO_INSTANCE_FMT` exemption.
+    marks read-only (`const_pointer`), with no size its call sites give: a byte buffer (`void`,
+    `unsigned char`), a fixed-size object or a pointer the callee may write keeps the
+    `TRUSTED_PARAM_NO_INSTANCE_FMT` exemption. An unsigned scalar beside it that the threat model
+    leaves trusted (`trusted_scalar`: QCBOR's `szLabel, uint32_t uConvertTypes`) is no length of
+    the string, only zeroed; one it gives the attacker would be a length beside a literal: exempt.
     """
-    if role != "trusted" or i >= len(params) or i >= len(formals):
+    if roles is None or i >= len(params) or i >= len(formals) or i >= len(roles) or roles[i] != "trusted":
         return False
     p = params[i]
     if p.get("kind") != "ptr" or str(p.get("pointee") or "") not in ("char", "signed char"):
         return False
     if not isinstance(formals[i], dict) or formals[i].get("kind") != "const_pointer":
         return False
-    if param_size(rec, i) is not None or _is_pair(params, i, formals):
+    if param_size(rec, i) is not None:
         return False
-    return not (i > 0 and _len_ptr_params(params, i - 1, formals, rec))
+    if _is_pair(params, i, formals) and (i + 1 >= len(roles) or roles[i + 1] != "trusted_scalar"):
+        return False
+    return not (i > 0 and _len_ptr_params(params, i - 1, formals, rec) and roles[i - 1] != "trusted_scalar")
 
 
 def recorded_strings(traces: list[list[dict]] | None) -> dict[str, dict[int, str]]:
@@ -2184,8 +2188,9 @@ def _param_roles(
     """
     S1 per-parameter roles when a threat model is active:
       - `attacker`: fuzzed as today (or built via an S2 byte-taking builder);
-      - `trusted`: pointer/struct not in `attacker_params` -> ONLY S3 schema instance or S2 builder,
-        else skipped with `"trusted parameter <name> has no instance"`;
+      - `trusted`: pointer/struct not in `attacker_params` -> ONLY S3 schema instance or S2 builder
+        (a read-only NUL-terminated string: a fixed literal, `_is_trusted_cstring`), else skipped
+        with `"trusted parameter <name> has no instance"`;
       - `output`: non-const writable buffer or scalar out-parameter -> clean zeroed buffer;
       - `trusted_scalar`: scalar not in `attacker_params` -> zeroed without fuzz slot.
     """
@@ -2325,7 +2330,7 @@ def _bind_call(
             args.append("NULL")
             i += 1
             continue
-        if api.trust_schema and i not in shared and _is_trusted_cstring(params, formals, rec, i, role):
+        if api.trust_schema and i not in shared and _is_trusted_cstring(params, formals, rec, i, roles):
             # QCBOR run-1: a label the application chooses (`const char *szLabel`) is a literal it
             # could pass, never fuzz bytes; without it the entry point was exempted unreached.
             args.append(_trusted_string_arg(case, call, i, p, name))
@@ -3116,7 +3121,7 @@ def _single_cases_for_entry(
                 and not has_builder
                 and _table_type(api, p) is None
                 and not _is_nullable_allocator_param(pname, p)
-                and not _is_trusted_cstring(params, formals, model_rec, i, role)
+                and not _is_trusted_cstring(params, formals, model_rec, i, roles)
             ):
                 insts = _lookup_schema_instances(api, pointee, decl)
                 if not insts:
