@@ -92,12 +92,14 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter, deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -364,6 +366,336 @@ JUDGE_CORPUS_CAP_BY_PROFILE: dict[str, int] = {
 }
 JUDGE_BATCH_SIZE = 64
 JUDGE_DEFAULT_MAX_TIME_S = 1800
+# W1-D two-tier coverage-frontier E-ACSL judge selection (docs/plans/phase1-qcbor-lessons-plan.md).
+JUDGE_FRONTIER_ENV = "FRAMAC_JUDGE_FRONTIER"
+JUDGE_FRONTIER_CAP_BY_PROFILE: dict[str, int] = {
+    "quick": 2048,
+    "standard": 8192,
+    "deep": 16384,
+}
+JUDGE_TARGET_REPLAY_S_BY_PROFILE: dict[str, int] = {
+    "quick": 30,
+    "standard": 120,
+    "deep": 300,
+}
+JUDGE_TIER2_HARD_CAP = 16384
+JUDGE_MERGE_TIMEOUT_S = 30
+
+# W1-D execution-count plateau stop (strictly execution-counted to preserve P3 hardware independence).
+FUZZ_PLATEAU_STOP_ENV = "FRAMAC_FUZZ_PLATEAU_STOP"
+PLATEAU_POLL_INTERVAL_S = 15.0
+PLATEAU_MAX_FT_REL_GROWTH = 0.005  # < 0.5% relative ft growth
+PLATEAU_SIGTERM_GRACE_S = 15.0
+PLATEAU_CONFIG_BY_PROFILE: dict[str, tuple[int, int]] = {
+    # profile -> (min_execs_per_worker, window_execs)
+    "quick": (1_000_000, 1_500_000),
+    "standard": (3_000_000, 4_000_000),
+    "deep": (10_000_000, 8_000_000),
+}
+
+_ORIG_RUN_SANDBOXED = sandbox_exec.run_sandboxed
+
+
+def judge_frontier_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """True unless FRAMAC_JUDGE_FRONTIER is explicitly off/0/false/no (default on)."""
+    src = os.environ if env is None else env
+    raw = (src.get(JUDGE_FRONTIER_ENV) or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def fuzz_plateau_stop_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """True unless FRAMAC_FUZZ_PLATEAU_STOP is explicitly off/0/false/no (default on)."""
+    src = os.environ if env is None else env
+    raw = (src.get(FUZZ_PLATEAU_STOP_ENV) or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def plateau_config_for_profile(profile: str = "standard") -> tuple[int, int]:
+    """Return `(min_execs_per_worker, window_execs)` for `profile`."""
+    prof = (profile or "standard").strip().lower()
+    return PLATEAU_CONFIG_BY_PROFILE.get(prof, PLATEAU_CONFIG_BY_PROFILE["standard"])
+
+
+class ExecutionPlateauDetector:
+    """
+    Execution-counted stagnation detector for multi-worker shared-pass fuzzing (W1-D).
+
+    Preserves P3 hardware independence by tracking stagnation strictly in execution counts
+    (`unit`), never wall seconds:
+      - Requires every active worker to reach `min_execs_per_worker` (`3M` standard / `1M` quick
+        / `10M` deep).
+      - Stops only when EVERY active worker has observed at least `window_execs` (`W`: `4M`
+        standard / `1.5M` quick / `8M` deep) executions with `0` new `cov` edges AND strictly
+        `< max_ft_rel_growth` (`0.5%`) relative `ft` growth over the last `W` executions.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_execs_per_worker: int = 3_000_000,
+        window_execs: int = 4_000_000,
+        max_ft_rel_growth: float = PLATEAU_MAX_FT_REL_GROWTH,
+        expected_workers: int = 1,
+    ) -> None:
+        self.min_execs_per_worker = max(1, int(min_execs_per_worker))
+        self.window_execs = max(1, int(window_execs))
+        self.max_ft_rel_growth = max(0.0, float(max_ft_rel_growth))
+        self.expected_workers = max(1, int(expected_workers))
+        self._history: dict[str, list[tuple[int, int, int]]] = {}
+
+    @classmethod
+    def from_profile(
+        cls,
+        profile: str = "standard",
+        *,
+        expected_workers: int = 1,
+        max_ft_rel_growth: float = PLATEAU_MAX_FT_REL_GROWTH,
+    ) -> ExecutionPlateauDetector:
+        min_execs, window_execs = plateau_config_for_profile(profile)
+        return cls(
+            min_execs_per_worker=min_execs,
+            window_execs=window_execs,
+            max_ft_rel_growth=max_ft_rel_growth,
+            expected_workers=expected_workers,
+        )
+
+    def observe(self, worker_id: str, unit: int, cov: int, ft: int) -> None:
+        """Record a `(unit, cov, ft)` observation for `worker_id`."""
+        u, c, f = int(unit), int(cov), int(ft)
+        if u < 0 or c < 0 or f < 0:
+            return
+        hist = self._history.setdefault(worker_id, [])
+        if not hist:
+            hist.append((u, c, f))
+            return
+        last_u, last_c, last_f = hist[-1]
+        if u < last_u:
+            return
+        if u == last_u:
+            hist[-1] = (u, max(last_c, c), max(last_f, f))
+        else:
+            hist.append((u, max(last_c, c), max(last_f, f)))
+
+    def observe_log_text(self, worker_id: str, text: str) -> int:
+        """Parse libFuzzer worker status lines from `text` and record them for `worker_id`."""
+        count = 0
+        for m in _LF_WORKER_STATUS_RE.finditer(text or ""):
+            self.observe(worker_id, int(m.group("unit")), int(m.group("cov")), int(m.group("ft")))
+            count += 1
+        return count
+
+    def is_worker_plateaued(self, worker_id: str) -> bool:
+        """True when `worker_id` passed the execution floor and stagnated over the last `W` executions."""
+        hist = self._history.get(worker_id)
+        if not hist:
+            return False
+        u_now, cov_now, ft_now = hist[-1]
+        if u_now < self.min_execs_per_worker:
+            return False
+        target_u = u_now - self.window_execs
+        if target_u < 0:
+            return False
+        ref: tuple[int, int, int] | None = None
+        for pt in hist:
+            if pt[0] <= target_u:
+                ref = pt
+            else:
+                break
+        if ref is None:
+            return False
+        _u_ref, cov_ref, ft_ref = ref
+        if cov_now - cov_ref > 0:
+            return False
+        if ft_ref <= 0:
+            ft_rel = 0.0 if ft_now <= 0 else 1.0
+        else:
+            ft_rel = max(0, ft_now - ft_ref) / float(ft_ref)
+        return ft_rel < self.max_ft_rel_growth
+
+    def is_plateaued(self) -> bool:
+        """True when all active workers (at least `expected_workers`) are simultaneously plateaued."""
+        if len(self._history) < self.expected_workers:
+            return False
+        return all(self.is_worker_plateaued(wid) for wid in self._history)
+
+    def summary(self) -> dict[str, Any]:
+        """Diagnostic snapshot of per-worker progress and plateau status."""
+        per_worker: dict[str, dict[str, Any]] = {}
+        for wid, hist in sorted(self._history.items()):
+            u_now, cov_now, ft_now = hist[-1]
+            per_worker[wid] = {
+                "unit": u_now,
+                "cov": cov_now,
+                "ft": ft_now,
+                "samples": len(hist),
+                "plateaued": self.is_worker_plateaued(wid),
+            }
+        return {
+            "workers_observed": len(self._history),
+            "expected_workers": self.expected_workers,
+            "min_execs_per_worker": self.min_execs_per_worker,
+            "window_execs": self.window_execs,
+            "max_ft_rel_growth": self.max_ft_rel_growth,
+            "plateaued": self.is_plateaued(),
+            "per_worker": per_worker,
+        }
+
+
+def _poll_worker_logs(
+    scratch: Path,
+    detector: ExecutionPlateauDetector,
+    offsets: dict[Path, int],
+    remainders: dict[Path, str],
+) -> None:
+    """Incrementally read newly appended bytes from `fuzz-*.log` files into `detector`."""
+    for log_path in sorted(scratch.glob("fuzz-*.log")):
+        if not log_path.is_file():
+            continue
+        try:
+            sz = log_path.stat().st_size
+        except OSError:
+            continue
+        pos = offsets.get(log_path, 0)
+        if sz <= pos:
+            continue
+        try:
+            with log_path.open("rb") as f:
+                f.seek(pos)
+                chunk = f.read(sz - pos)
+        except OSError:
+            continue
+        offsets[log_path] = pos + len(chunk)
+        text = remainders.get(log_path, "") + chunk.decode("utf-8", errors="replace")
+        if "\n" in text:
+            complete, tail = text.rsplit("\n", 1)
+            remainders[log_path] = tail
+            detector.observe_log_text(log_path.name, complete)
+        else:
+            remainders[log_path] = text
+
+
+def _signal_process_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Deliver `sig` to `proc`'s process group when POSIX `os.killpg` is available."""
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        try:
+            killpg(proc.pid, sig)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        if sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _run_sandboxed_with_plateau_monitor(
+    argv: Sequence[str],
+    writable: Sequence[Path],
+    timeout_s: int,
+    *,
+    scratch: Path,
+    detector: ExecutionPlateauDetector,
+    poll_interval_s: float = PLATEAU_POLL_INTERVAL_S,
+    sigterm_grace_s: float = PLATEAU_SIGTERM_GRACE_S,
+    cwd: Path | None = None,
+    limits: Limits | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[sandbox_exec.SandboxResult, bool]:
+    """
+    Execute `argv` with `sandbox_exec`'s rlimits/env/stream-draining model while polling
+    `scratch/fuzz-*.log` every `poll_interval_s` seconds. When `detector.is_plateaued()`
+    holds, sends `SIGTERM` to the process group so libFuzzer flushes final stats and corpus.
+    """
+    mode = sandbox_exec.sandbox_mode()
+    eff_limits = limits or Limits()
+    resolved_writable = [Path(w).resolve() for w in writable]
+    for w in resolved_writable:
+        w.mkdir(parents=True, exist_ok=True)
+    eff_cwd = Path(cwd).resolve() if cwd else resolved_writable[0]
+    env = sandbox_exec.build_env(home=resolved_writable[0], extra=extra_env)
+
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(eff_cwd),
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+        popen_kwargs["preexec_fn"] = sandbox_exec._make_preexec(eff_limits)
+
+    proc = subprocess.Popen(list(argv), **popen_kwargs)
+    drainer_out = sandbox_exec.BoundedStreamDrainer(proc.stdout)
+    drainer_err = sandbox_exec.BoundedStreamDrainer(proc.stderr)
+    t_out = threading.Thread(target=drainer_out.run, daemon=True)
+    t_err = threading.Thread(target=drainer_err.run, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    timed_out = False
+    plateau_stopped = False
+    offsets: dict[Path, int] = {}
+    remainders: dict[Path, str] = {}
+    poll_step = max(0.05, float(poll_interval_s))
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            timed_out = True
+            sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            _signal_process_group(proc, sigkill)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            break
+        try:
+            proc.wait(timeout=min(poll_step, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            _poll_worker_logs(scratch, detector, offsets, remainders)
+            if detector.is_plateaued():
+                plateau_stopped = True
+                _signal_process_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=max(0.5, float(sigterm_grace_s)))
+                except subprocess.TimeoutExpired:
+                    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                    _signal_process_group(proc, sigkill)
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                break
+
+    t_out.join(timeout=5.0)
+    t_err.join(timeout=5.0)
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+
+    out_bytes = drainer_out.get_bytes()
+    err_bytes = drainer_err.get_bytes()
+    result = sandbox_exec.SandboxResult(
+        returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout=out_bytes.decode("utf-8", errors="replace"),
+        stderr=err_bytes.decode("utf-8", errors="replace"),
+        timed_out=timed_out,
+        sandbox=mode,
+        command=list(argv),
+    )
+    return result, plateau_stopped
+
+
 FLOOR_PASS_BY_PROFILE: dict[str, tuple[int, int]] = {
     "quick": (5000, 15),
     "standard": (25000, 120),
@@ -1435,7 +1767,7 @@ def run_campaign_rounds(
             rnd["stopped"] = "insufficient_memory"
             break
         if not fresh:
-            rnd["stopped"] = "no_new_case"
+            rnd["stopped"] = "plateau" if last.get("stopped_reason") == "plateau" else "no_new_case"
             break
         # The next round needs the CPU floor and at least one whole second of wall time left.
         if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S or int(max_time - spent) < 1:
@@ -1507,7 +1839,24 @@ def run_campaign_rounds(
     out.pop("_case_passes", None)
     out["artifacts"] = merged
     if last.get("status") != "insufficient_memory":
-        out["status"] = classify_campaign(last.get("returncode") or 0, bool(last.get("timed_out")), merged)
+        eff_rc = (
+            0
+            if (last.get("stopped_reason") == "plateau" and not merged and not last.get("timed_out"))
+            else (last.get("returncode") or 0)
+        )
+        out["status"] = classify_campaign(eff_rc, bool(last.get("timed_out")), merged)
+    if last.get("stopped_reason") == "plateau":
+        out["stopped_reason"] = "plateau"
+        out["cpu_saved_s"] = round(max(0.0, float(max_time) - spent) * max(1, workers), 3)
+    elif last.get("stopped_reason") in ("crash", "budget"):
+        out["stopped_reason"] = str(last["stopped_reason"])
+        out["cpu_saved_s"] = 0.0
+    elif rounds and rounds[-1].get("stopped") in ("crash_in_skipped_case", "every_case_skipped"):
+        out["stopped_reason"] = "crash"
+        out["cpu_saved_s"] = 0.0
+    else:
+        out["stopped_reason"] = "budget"
+        out["cpu_saved_s"] = 0.0
     if dropped:
         omitted = dict(out.get("artifacts_omitted") or {})
         omitted["duplicates"] = omitted.get("duplicates", 0) + dropped
@@ -1600,6 +1949,15 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
         "engines": engines,
         "log_tail": "\n".join(f"--- {e}\n{(r.get('log_tail') or '')[-2000:]}" for e, r in runs.items()),
     }
+    if any(r.get("stopped_reason") == "plateau" for r in runs.values()):
+        merged["stopped_reason"] = "plateau"
+        merged["cpu_saved_s"] = round(sum(float(r.get("cpu_saved_s") or 0.0) for r in runs.values()), 3)
+    elif any(r.get("stopped_reason") == "crash" for r in runs.values()):
+        merged["stopped_reason"] = "crash"
+        merged["cpu_saved_s"] = 0.0
+    elif any("stopped_reason" in r for r in runs.values()):
+        merged["stopped_reason"] = "budget"
+        merged["cpu_saved_s"] = 0.0
     tels = [r.get("telemetry") for r in runs.values() if isinstance(r.get("telemetry"), dict)]
     if tels:
         merged["telemetry"] = merge_telemetry(tels)
@@ -1652,6 +2010,7 @@ def run_fuzz_campaign(
     single_process_reason: str | None = None,
     runs: int | None = None,
     seed: int | None = None,
+    profile: str = "standard",
 ) -> dict:
     """
     `corpus_dir` receives new units (writable); `extra_corpus` directories are read-only
@@ -1689,6 +2048,7 @@ def run_fuzz_campaign(
         "extra_env": extra_env,
         "runs": runs,
         "seed": seed,
+        "profile": profile,
     }
     multi = fork or max(1, int(workers or 1)) > 1 or max(1, int(jobs or 1)) > 1
     reason = single_process_reason if multi else None
@@ -1753,6 +2113,9 @@ def _run_fuzz_campaign_once(
     print_funcs: bool = True,
     runs: int | None = None,
     seed: int | None = None,
+    profile: str = "standard",
+    plateau_poll_interval_s: float = PLATEAU_POLL_INTERVAL_S,
+    plateau_enabled: bool | None = None,
 ) -> dict:
     """One libFuzzer campaign as run_fuzz_campaign describes; `_executed_inputs` says whether any input ran."""
     req_mem = fuzz_required_memory_mb(workers)
@@ -1830,14 +2193,36 @@ def _run_fuzz_campaign_once(
         wall_timeout = max_time * waves + 180
         cpu_mult = max(2, eff_workers + 1)
         oom_before = resources.read_cgroup_oom_kills() if resources.fuzz_explore_judge_enabled() else None
-        fuzz_started = time.monotonic()
-        res = sandbox_exec.run_sandboxed(
-            cmd,
-            writable=[scratch, corpus_dir, artifacts_dir],
-            timeout_s=wall_timeout,
-            limits=Limits(cpu_seconds=wall_timeout * cpu_mult, ignore_sigpipe=True),
-            extra_env=run_env,
+        eff_plateau = fuzz_plateau_stop_enabled() if plateau_enabled is None else bool(plateau_enabled)
+        use_plateau_monitor = (
+            eff_plateau
+            and not fork
+            and runs is None
+            and eff_workers > 1
+            and sandbox_exec.run_sandboxed is _ORIG_RUN_SANDBOXED
         )
+        plateau_stopped = False
+        fuzz_started = time.monotonic()
+        if use_plateau_monitor:
+            plateau_detector = ExecutionPlateauDetector.from_profile(profile, expected_workers=eff_workers)
+            res, plateau_stopped = _run_sandboxed_with_plateau_monitor(
+                cmd,
+                writable=[scratch, corpus_dir, artifacts_dir],
+                timeout_s=wall_timeout,
+                scratch=scratch,
+                detector=plateau_detector,
+                poll_interval_s=plateau_poll_interval_s,
+                limits=Limits(cpu_seconds=wall_timeout * cpu_mult, ignore_sigpipe=True),
+                extra_env=run_env,
+            )
+        else:
+            res = sandbox_exec.run_sandboxed(
+                cmd,
+                writable=[scratch, corpus_dir, artifacts_dir],
+                timeout_s=wall_timeout,
+                limits=Limits(cpu_seconds=wall_timeout * cpu_mult, ignore_sigpipe=True),
+                extra_env=run_env,
+            )
         fuzz_s = max(0.0, time.monotonic() - fuzz_started)
         oom_after = resources.read_cgroup_oom_kills() if oom_before is not None else None
         oom_delta = max(0, oom_after - oom_before) if (oom_before is not None and oom_after is not None) else None
@@ -2014,9 +2399,20 @@ def _run_fuzz_campaign_once(
             artifacts = kept_after_oom
 
         artifacts, omitted = _collapse_duplicate_artifacts(artifacts)
-        status = classify_campaign(res.returncode, res.timed_out, artifacts)
+        eff_rc = 0 if (plateau_stopped and not artifacts and not res.timed_out) else res.returncode
+        status = classify_campaign(eff_rc, res.timed_out, artifacts)
         if oom_delta and oom_delta > 0 and container_oom_dropped > 0 and status in ("fuzzer_error", "clean"):
             status = "container_oom"
+
+        if plateau_stopped and not artifacts:
+            stopped_reason = "plateau"
+            cpu_saved_s = round(max(0.0, float(max_time) - fuzz_s) * eff_workers, 3)
+        elif artifacts or status in ("crash_found", "timeout_found", "oom_found"):
+            stopped_reason = "crash"
+            cpu_saved_s = 0.0
+        else:
+            stopped_reason = "budget"
+            cpu_saved_s = 0.0
 
         telemetry_streams = [f"{res.stdout}\n{res.stderr}", *worker_logs]
         telemetry = parse_libfuzzer_telemetry(
@@ -2034,6 +2430,8 @@ def _run_fuzz_campaign_once(
             "artifacts": artifacts,
             "fuzz_s": round(fuzz_s, 3),
             "replay_s": round(replay_s, 3),
+            "stopped_reason": stopped_reason,
+            "cpu_saved_s": cpu_saved_s,
             "telemetry": telemetry,
             "log_tail": combined_out[-4000:],
             "_executed_inputs": libfuzzer_executed_inputs(combined_out),
@@ -4476,6 +4874,182 @@ def _judge_input_running_at_exit(output: str, batch: Sequence[Path]) -> int | No
     return matches[0] if len(matches) == 1 else None
 
 
+def _count_grown_corpus_files(corpus_dir: Path) -> int:
+    """Count non-hidden, non-targeted grown corpus files in `corpus_dir` without reading contents."""
+    cdir = Path(corpus_dir)
+    if not cdir.is_dir():
+        return 0
+    count = 0
+    with os.scandir(cdir) as it:
+        for entry in it:
+            name = entry.name
+            if name.startswith(".") or name.startswith(TARGETED_CORPUS_PREFIXES):
+                continue
+            if not entry.is_symlink() and entry.is_file(follow_symlinks=False):
+                count += 1
+    return count
+
+
+def discover_judge_frontier(
+    san_binary: Path,
+    corpus_dir: Path,
+    *,
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    merge_timeout_s: int = JUDGE_MERGE_TIMEOUT_S,
+    smoke_skipped: Sequence[int] = (),
+    scratch_dir: Path | None = None,
+) -> set[str] | None:
+    """
+    Run a fast read-only `libFuzzer -merge=1` pass using the `.san` binary into a temporary
+    scratch directory to identify the filenames in `corpus_dir` forming the minimized coverage
+    frontier. `corpus_dir` is never modified (all grown corpus files stay on disk).
+
+    Returns the set of matched filenames in `corpus_dir`, or `None` if the merge fails, times
+    out, cannot run, or produces no frontier files.
+    """
+    cdir = Path(corpus_dir)
+    if not cdir.is_dir():
+        return None
+    own_scratch = scratch_dir is None
+    merge_scratch = (
+        Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp(prefix="judge_frontier_merge_"))
+    )
+    merge_dst = merge_scratch / "merged"
+    merge_dst.mkdir(parents=True, exist_ok=True)
+    try:
+        merge_env = dict(SANITIZER_RUNTIME_ENV)
+        merge_env["TMPDIR"] = str(merge_scratch.resolve())
+        if smoke_skipped:
+            merge_env[DISPATCH_SKIP_MACRO] = format_skip_cases_env(smoke_skipped)
+        cmd = [
+            str(Path(san_binary).resolve()),
+            "-merge=1",
+            f"-timeout={per_input_timeout}",
+            f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+            str(merge_dst.resolve()),
+            str(cdir.resolve()),
+        ]
+        wall = max(1, int(merge_timeout_s))
+        try:
+            res = sandbox_exec.run_sandboxed(
+                cmd,
+                writable=[merge_scratch],
+                timeout_s=wall,
+                limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
+                extra_env=merge_env,
+            )
+        except SandboxUnavailable:
+            return None
+        if res.returncode != 0 or res.timed_out:
+            return None
+
+        merged_files = [p for p in sorted(merge_dst.iterdir()) if p.is_file() and not p.is_symlink()]
+        if not merged_files:
+            return None
+
+        corpus_by_name = {
+            p.name: p for p in cdir.iterdir() if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
+        }
+        frontier_names: set[str] = set()
+        unmatched_by_size: dict[int, set[str]] = {}
+        for mf in merged_files:
+            if mf.name in corpus_by_name:
+                frontier_names.add(mf.name)
+            else:
+                try:
+                    sz = mf.stat().st_size
+                    digest = sha256_file(mf)
+                except OSError:
+                    continue
+                unmatched_by_size.setdefault(sz, set()).add(digest)
+
+        # Resolve non-SHA1-named corpus files (e.g. `floor_c<k>_...`) by size + content SHA-256.
+        if unmatched_by_size:
+            for name in sorted(corpus_by_name):
+                if name in frontier_names:
+                    continue
+                cf = corpus_by_name[name]
+                try:
+                    sz = cf.stat().st_size
+                except OSError:
+                    continue
+                wanted = unmatched_by_size.get(sz)
+                if not wanted:
+                    continue
+                try:
+                    digest = sha256_file(cf)
+                except OSError:
+                    continue
+                if digest in wanted:
+                    frontier_names.add(name)
+                    wanted.discard(digest)
+                    if not wanted:
+                        unmatched_by_size.pop(sz, None)
+                        if not unmatched_by_size:
+                            break
+        return frontier_names if frontier_names else None
+    finally:
+        if own_scratch:
+            shutil.rmtree(merge_scratch, ignore_errors=True)
+
+
+def compute_tier2_expansion(
+    *,
+    already_selected_total: int,
+    already_selected_grown: int,
+    mandatory_count: int,
+    available_overflow: int,
+    inputs_per_s: float,
+    target_replay_s: float,
+    hard_cap: int = JUDGE_TIER2_HARD_CAP,
+) -> int:
+    """
+    Compute how many additional Tier 2 value-diverse overflow inputs to pull after measuring
+    replay throughput (`inputs_per_s`) on the first batch, up to `target_replay_s` wall seconds
+    and hard-capped at `hard_cap` grown inputs (so fast modules like QCBOR do not stop early).
+    """
+    if available_overflow <= 0 or inputs_per_s <= 0.0 or target_replay_s <= 0.0:
+        return 0
+    target_total = int(inputs_per_s * target_replay_s)
+    if target_total <= already_selected_total:
+        return 0
+    desired_grown = max(already_selected_grown, target_total - max(0, mandatory_count))
+    capped_grown = min(max(already_selected_grown, int(hard_cap)), desired_grown)
+    extra = max(0, capped_grown - already_selected_grown)
+    return min(int(available_overflow), extra)
+
+
+def _interleave_by_case(items: Sequence[tuple[Path, int | None]], n_cases: int | None) -> list[Path]:
+    """Interleave `(path, case)` pairs round-robin across dispatch cases."""
+    if not (n_cases and n_cases > 0 and items):
+        return [p for p, _ in items]
+    inter_buckets: dict[int, deque[Path]] = {}
+    for p, c in items:
+        bk = c if c is not None else -1
+        inter_buckets.setdefault(bk, deque()).append(p)
+    ordered: list[Path] = []
+    active = sorted(inter_buckets.keys())
+    while active:
+        nxt: list[int] = []
+        for bk in active:
+            iq = inter_buckets[bk]
+            if iq:
+                ordered.append(iq.popleft())
+            if iq:
+                nxt.append(bk)
+        active = nxt
+    return ordered
+
+
+def _format_not_judged_by_case(counts: Mapping[str, int]) -> dict[str, int]:
+    """Return a deterministically ordered dict of positive per-case unjudged counts."""
+    return {
+        k: int(v)
+        for k, v in sorted(counts.items(), key=lambda kv: (int(kv[0]) if kv[0].isdigit() else 10**9, kv[0]))
+        if int(v) > 0
+    }
+
+
 def select_judge_inputs(
     corpus_dir: Path,
     extra_corpus: Sequence[Path] = (),
@@ -4485,16 +5059,24 @@ def select_judge_inputs(
     n_cases: int | None = None,
     selector: str = DISPATCH_SELECTOR_MODULO,
     smoke_skipped: Sequence[int] = (),
+    frontier_names: Iterable[str] | None = None,
+    frontier_cap: int | None = None,
 ) -> dict[str, Any]:
     """
-    P2d deterministic case-stratified SHA-256 input selection for E-ACSL judging:
+    P2d + W1-D deterministic two-tier case-stratified SHA-256 input selection for E-ACSL judging:
     - Mandatory inputs (always kept): all files from `extra_corpus` (seeds + imported inputs),
       all targeted files in `corpus_dir` (`TARGETED_CORPUS_PREFIXES`), and all explorer crash
       artifacts listed in `explore_report`.
-    - Grown corpus inputs (up to `cap`): grouped by dispatch case when `n_cases` is known,
-      deterministically ordered by SHA-256 of filename within each case, and selected round-robin
-      across cases so no high-volume case starves low-volume cases.
-    - Selected inputs are interleaved across dispatch cases for prompt per-case blinding.
+    - When `frontier_names` is provided (`FRAMAC_JUDGE_FRONTIER=on`):
+      - Tier 1 (frontier): select all frontier grown files up to `frontier_cap` ahead of
+        unmerged intermediate mutations.
+      - Tier 2 (value-diverse overflow): fill remaining capacity up to `cap` with case-stratified
+        SHA-256 samples from non-frontier grown files, preserving remaining non-frontier files in
+        case-stratified order (`tier2_pool`) for speed-aware expansion in `run_judge`.
+    - When `frontier_names` is `None` (`FRAMAC_JUDGE_FRONTIER=off` or fallback):
+      - Single-tier case-stratified SHA-256 selection across all grown files up to `cap`.
+    - Selected inputs are interleaved across dispatch cases (Tier 1 before Tier 2 when tiered)
+      for prompt per-case blinding and frontier priority.
     """
     smoke_set = {int(c) for c in smoke_skipped if int(c) >= 0}
     seen_paths: set[str] = set()
@@ -4528,19 +5110,32 @@ def select_judge_inputs(
     # 3. Corpus directory: targeted files are mandatory, rest are grown corpus
     cdir = Path(corpus_dir)
     if cdir.is_dir():
-        for f in sorted(cdir.iterdir()):
-            if f.name.startswith(TARGETED_CORPUS_PREFIXES):
-                _add_unique(f, mandatory_raw)
+        cdir_resolved = cdir.resolve()
+        with os.scandir(cdir) as it:
+            dir_entries = sorted(it, key=lambda e: e.name)
+        for entry in dir_entries:
+            name = entry.name
+            if name.startswith(".") or entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+            key = str(cdir_resolved / name)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            fp = cdir / name
+            if name.startswith(TARGETED_CORPUS_PREFIXES):
+                mandatory_raw.append(fp)
             else:
-                _add_unique(f, grown_raw)
+                grown_raw.append(fp)
 
     # Filter out inputs belonging to smoke-quarantined dispatch cases before cap selection
     smoke_skipped_count = 0
+    nj_by_case: Counter[str] = Counter()
     mandatory: list[tuple[Path, int | None]] = []
     for p in mandatory_raw:
         c = _file_dispatch_case(p, n_cases, selector)
         if c is not None and c in smoke_set:
             smoke_skipped_count += 1
+            nj_by_case[str(c)] += 1
             continue
         mandatory.append((p, c))
 
@@ -4549,6 +5144,7 @@ def select_judge_inputs(
         c = _file_dispatch_case(p, n_cases, selector)
         if c is not None and c in smoke_set:
             smoke_skipped_count += 1
+            nj_by_case[str(c)] += 1
             continue
         grown.append((p, c))
 
@@ -4557,56 +5153,74 @@ def select_judge_inputs(
         digest = hashlib.sha256(p.name.encode("utf-8", errors="surrogateescape")).hexdigest()
         return (digest, p.as_posix())
 
-    eff_cap = max(0, int(cap))
-    grown_selected: list[tuple[Path, int | None]] = []
-    if len(grown) <= eff_cap:
-        grown_selected = sorted(grown, key=_sha_key)
-    elif n_cases and n_cases > 0:
-        # Case-stratified round-robin SHA-256 selection
+    def _case_stratified_order(items: list[tuple[Path, int | None]]) -> list[tuple[Path, int | None]]:
+        if not items:
+            return []
+        if not (n_cases and n_cases > 0):
+            return sorted(items, key=_sha_key)
         buckets: dict[int, deque[tuple[Path, int | None]]] = {}
-        for item in grown:
+        for item in items:
             bucket_key = item[1] if item[1] is not None else -1
             buckets.setdefault(bucket_key, deque()).append(item)
         for bk in buckets:
             buckets[bk] = deque(sorted(buckets[bk], key=_sha_key))
+        ordered_items: list[tuple[Path, int | None]] = []
         active_keys = sorted(buckets.keys())
-        while len(grown_selected) < eff_cap and active_keys:
+        while active_keys:
             next_keys: list[int] = []
             for bk in active_keys:
-                if len(grown_selected) >= eff_cap:
-                    break
                 q = buckets[bk]
                 if q:
-                    grown_selected.append(q.popleft())
+                    ordered_items.append(q.popleft())
                 if q:
                     next_keys.append(bk)
             active_keys = next_keys
+        return ordered_items
+
+    def _case_stratified_sample(
+        items: list[tuple[Path, int | None]], limit: int
+    ) -> tuple[list[tuple[Path, int | None]], list[tuple[Path, int | None]]]:
+        lim = max(0, int(limit))
+        if len(items) <= lim:
+            return sorted(items, key=_sha_key), []
+        rr = _case_stratified_order(items)
+        return rr[:lim], rr[lim:]
+
+    eff_cap = max(0, int(cap))
+    frontier_total = 0
+    frontier_selected_items: list[tuple[Path, int | None]] = []
+    tier2_pool: list[tuple[Path, int | None]] = []
+    unchosen: list[tuple[Path, int | None]] = []
+
+    if frontier_names is not None:
+        frontier_set = {str(n) for n in frontier_names}
+        frontier_grown = [item for item in grown if item[0].name in frontier_set]
+        overflow_grown = [item for item in grown if item[0].name not in frontier_set]
+        frontier_total = len(frontier_grown)
+        eff_frontier_cap = (
+            max(0, int(frontier_cap))
+            if frontier_cap is not None
+            else max(eff_cap, JUDGE_FRONTIER_CAP_BY_PROFILE["standard"])
+        )
+        frontier_selected_items, tier1_unchosen = _case_stratified_sample(frontier_grown, eff_frontier_cap)
+        tier2_initial_cap = max(0, eff_cap - len(frontier_selected_items))
+        tier2_selected, tier2_pool = _case_stratified_sample(overflow_grown, tier2_initial_cap)
+        grown_selected = [*frontier_selected_items, *tier2_selected]
+        unchosen = [*tier1_unchosen, *tier2_pool]
+        ordered = [
+            *_interleave_by_case([*mandatory, *frontier_selected_items], n_cases),
+            *_interleave_by_case(tier2_selected, n_cases),
+        ]
     else:
-        grown_selected = sorted(grown, key=_sha_key)[:eff_cap]
+        grown_selected, unchosen = _case_stratified_sample(grown, eff_cap)
+        ordered = _interleave_by_case([*mandatory, *grown_selected], n_cases)
+
+    for _p, c in unchosen:
+        if c is not None:
+            nj_by_case[str(c)] += 1
 
     not_judged_cap = max(0, len(grown) - len(grown_selected))
-
-    # Interleave selected inputs across dispatch cases so broken cases blind early without starving healthy cases.
-    combined = [*mandatory, *grown_selected]
-    if n_cases and n_cases > 0 and combined:
-        inter_buckets: dict[int, deque[Path]] = {}
-        for p, c in combined:
-            bk = c if c is not None else -1
-            inter_buckets.setdefault(bk, deque()).append(p)
-        ordered: list[Path] = []
-        active = sorted(inter_buckets.keys())
-        while active:
-            nxt: list[int] = []
-            for bk in active:
-                iq = inter_buckets[bk]
-                if iq:
-                    ordered.append(iq.popleft())
-                if iq:
-                    nxt.append(bk)
-            active = nxt
-    else:
-        ordered = [p for p, _ in combined]
-
+    frontier_paths = {str(p.resolve()) for p, _ in frontier_selected_items}
     total_inputs = len(mandatory_raw) + len(grown_raw)
     return {
         "selected": ordered,
@@ -4616,6 +5230,11 @@ def select_judge_inputs(
         "grown_selected": len(grown_selected),
         "not_judged_cap": not_judged_cap,
         "not_judged_smoke": smoke_skipped_count,
+        "frontier_total": frontier_total,
+        "frontier_selected": len(frontier_selected_items),
+        "frontier_paths": frontier_paths,
+        "tier2_pool": tier2_pool,
+        "not_judged_by_case": _format_not_judged_by_case(nj_by_case),
     }
 
 
@@ -4778,21 +5397,43 @@ def run_judge(
     scratch_dir: Path | None = None,
     sources: Sequence[str] | None = None,
     blinding_threshold: int = BLINDING_CASE_THRESHOLD,
+    frontier_enabled: bool | None = None,
+    frontier_names: Iterable[str] | None = None,
+    frontier_cap: int | None = None,
+    target_replay_s: int | None = None,
+    tier2_hard_cap: int = JUDGE_TIER2_HARD_CAP,
+    merge_timeout_s: int = JUDGE_MERGE_TIMEOUT_S,
 ) -> dict[str, Any]:
     """
-    P2d standalone E-ACSL judge:
+    P2d + W1-D standalone E-ACSL judge:
     - Resolves the pre-built `.e-acsl` binary from `build_json` via `resolve_prebuilt_binary`.
-    - Selects all mandatory inputs (seeds, imported inputs, explorer crashes) + up to `N`
-      case-stratified SHA-256 grown corpus inputs (`512` quick / `2048` standard / `4096` deep).
+    - When `FRAMAC_JUDGE_FRONTIER` is enabled (default `on`) and grown corpus exceeds `cap`,
+      runs a fast read-only `libFuzzer -merge=1` pass on the `.san` binary into a temporary
+      scratch directory to discover the minimized coverage frontier (`frontier_names`) while
+      keeping all grown corpus files on disk.
+    - Selects all mandatory inputs + Tier 1 coverage frontier (up to `frontier_cap`) + Tier 2
+      case-stratified SHA-256 overflow, expanding Tier 2 after the first batch measures
+      `inputs_per_s` up to `target_replay_s` (hard-capped at `tier2_hard_cap`).
     - Runs inputs in `O(N)` batches, advancing strictly with `batch[culprit + 1 :]` on failure
       (handling `culprit == last` cleanly with zero infinite loops) and treating `returncode == 0`
       mid-batch exits (`P8a`) as passes before continuing with `batch[idx + 1 :]`.
     - Confirms every new fingerprint in a fresh standalone process (`crash_replay.replay_artifact`),
       separating `batch_state_only` failures from confirmed standalone candidate witnesses.
-    - Tracks per-case blinding (`K_case = 16`), D1b cross-engine linking, and `not_judged` accounting.
+    - Tracks per-case blinding (`K_case = 16`), D1b cross-engine linking, `frontier_total` /
+      `frontier_judged`, and per-case `not_judged_by_case` accounting.
     """
     prof = (profile or "standard").strip().lower()
     cap = int(max_corpus_inputs) if max_corpus_inputs is not None else JUDGE_CORPUS_CAP_BY_PROFILE.get(prof, 2048)
+    eff_frontier_enabled = judge_frontier_enabled() if frontier_enabled is None else bool(frontier_enabled)
+    eff_frontier_cap = (
+        max(0, int(frontier_cap)) if frontier_cap is not None else JUDGE_FRONTIER_CAP_BY_PROFILE.get(prof, 8192)
+    )
+    eff_target_replay_s = (
+        max(0, int(target_replay_s)) if target_replay_s is not None else JUDGE_TARGET_REPLAY_S_BY_PROFILE.get(prof, 120)
+    )
+    can_expand_tier2 = (
+        eff_frontier_enabled and eff_target_replay_s > 0 and (max_corpus_inputs is None or target_replay_s is not None)
+    )
 
     build_doc: dict[str, Any] | None = (
         build_json if isinstance(build_json, dict) else _load_json_dict_optional(Path(build_json))
@@ -4820,6 +5461,31 @@ def run_judge(
         else (campaign_harness_identity(module, eff_sources).get("harness_digest") if eff_sources else None)
     )
 
+    eacsl_binary: Path | None = None
+    eacsl_missing_reason: str | None = None
+    try:
+        eacsl_binary = fuzz_build.resolve_prebuilt_binary(build_json, "eacsl")
+    except (PrebuiltBinaryError, ValueError, TypeError) as exc:
+        eacsl_missing_reason = str(exc)
+
+    resolved_frontier: set[str] | None = None
+    if eacsl_binary is not None and eff_frontier_enabled:
+        if frontier_names is not None:
+            resolved_frontier = {str(n) for n in frontier_names}
+        elif _count_grown_corpus_files(corpus_dir) > cap:
+            try:
+                san_binary = fuzz_build.resolve_prebuilt_binary(build_json, "sanitizers")
+            except (PrebuiltBinaryError, ValueError, TypeError):
+                san_binary = None
+            if san_binary is not None:
+                resolved_frontier = discover_judge_frontier(
+                    san_binary,
+                    corpus_dir,
+                    per_input_timeout=per_input_timeout,
+                    merge_timeout_s=merge_timeout_s,
+                    smoke_skipped=smoke_skipped,
+                )
+
     selection = select_judge_inputs(
         corpus_dir,
         extra_corpus,
@@ -4828,8 +5494,17 @@ def run_judge(
         n_cases=n_cases,
         selector=selector,
         smoke_skipped=smoke_skipped,
+        frontier_names=resolved_frontier,
+        frontier_cap=eff_frontier_cap,
     )
     selected: list[Path] = list(selection["selected"])
+    grown_selected_count = int(selection["grown_selected"])
+    selected_count = len(selected)
+    not_judged_cap = int(selection["not_judged_cap"])
+    frontier_total = int(selection["frontier_total"])
+    frontier_paths: set[str] = set(selection["frontier_paths"])
+    tier2_pool: deque[tuple[Path, int | None]] = deque(selection["tier2_pool"])
+    not_judged_by_case: Counter[str] = Counter(selection["not_judged_by_case"])
 
     def _base_report(
         *,
@@ -4840,6 +5515,7 @@ def run_judge(
         not_judged_timeout: int = 0,
         not_judged_blinded: int = 0,
         not_judged_error: int = 0,
+        frontier_judged_count: int = 0,
         artifacts: list[dict[str, Any]] | None = None,
         batch_state_only: list[dict[str, Any]] | None = None,
         cross_links: list[dict[str, Any]] | None = None,
@@ -4856,9 +5532,10 @@ def run_judge(
         omitted_dups: int = 0,
     ) -> dict[str, Any]:
         judged = passed + failed
-        nj_cap = int(selection["not_judged_cap"])
+        nj_cap = int(not_judged_cap)
         nj_smoke = int(selection["not_judged_smoke"])
         nj_total = nj_cap + nj_smoke + not_judged_timeout + not_judged_blinded + not_judged_error
+        nj_by_case = _format_not_judged_by_case(not_judged_by_case)
         ips = round(judged / judge_s, 2) if judge_s > 0.0 and judged > 0 else 0.0
         report: dict[str, Any] = {
             "schema_version": JUDGE_SCHEMA_VERSION,
@@ -4875,8 +5552,8 @@ def run_judge(
                 "total": int(selection["total"]),
                 "mandatory": int(selection["mandatory"]),
                 "grown_total": int(selection["grown_total"]),
-                "grown_selected": int(selection["grown_selected"]),
-                "selected": len(selected),
+                "grown_selected": grown_selected_count,
+                "selected": selected_count,
                 "judged": judged,
                 "passed": passed,
                 "failed": failed,
@@ -4888,8 +5565,14 @@ def run_judge(
                     "smoke_skipped": nj_smoke,
                     "error": not_judged_error,
                 },
+                "frontier_total": frontier_total,
+                "frontier_judged": int(frontier_judged_count),
+                "not_judged_by_case": nj_by_case,
             },
             "not_judged": nj_total,
+            "frontier_total": frontier_total,
+            "frontier_judged": int(frontier_judged_count),
+            "not_judged_by_case": nj_by_case,
             "artifacts": list(artifacts or []),
             "batch_state_only": list(batch_state_only or []),
             "cross_engine_links": list(cross_links or []),
@@ -4920,16 +5603,24 @@ def run_judge(
             report["startup_error"] = startup_error
         return report
 
-    try:
-        eacsl_binary = fuzz_build.resolve_prebuilt_binary(build_json, "eacsl")
-    except (PrebuiltBinaryError, ValueError, TypeError) as exc:
+    def _case_of(p: Path) -> int | None:
+        return _file_dispatch_case(p, n_cases, selector)
+
+    def _note_not_judged(items: Sequence[Path]) -> None:
+        for item in items:
+            c = _case_of(item)
+            if c is not None:
+                not_judged_by_case[str(c)] += 1
+
+    if eacsl_binary is None:
+        _note_not_judged(selected)
         return _base_report(
             status="skipped",
             binary_str=None,
             passed=0,
             failed=0,
             not_judged_error=len(selected),
-            reason=str(exc),
+            reason=eacsl_missing_reason or "eacsl binary unavailable",
         )
 
     seed = derive_seed(eacsl_binary, module)
@@ -4945,6 +5636,7 @@ def run_judge(
 
     passed = 0
     failed = 0
+    frontier_judged = 0
     not_judged_timeout = 0
     not_judged_blinded = 0
     not_judged_error = 0
@@ -4956,6 +5648,7 @@ def run_judge(
     sandbox_err: str | None = None
     module_blinded_non_dispatch = False
     non_dispatch_blind_fp: str | None = None
+    tier2_expanded = False
 
     own_scratch = scratch_dir is None
     scratch = Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp(prefix=f"judge_{module}_"))
@@ -4964,13 +5657,16 @@ def run_judge(
     deadline = judge_started + max(1, int(max_time))
     min_wall = 2 * int(per_input_timeout) + 10
 
-    def _case_of(p: Path) -> int | None:
-        return _file_dispatch_case(p, n_cases, selector)
+    def _note_judged_path(item: Path) -> None:
+        nonlocal frontier_judged
+        if frontier_paths and str(item.resolve()) in frontier_paths:
+            frontier_judged += 1
 
     def _record_passes(items: Sequence[Path]) -> None:
         nonlocal passed
         for item in items:
             passed += 1
+            _note_judged_path(item)
             if n_cases and n_cases > 0:
                 c = _case_of(item)
                 if c is not None:
@@ -4978,9 +5674,46 @@ def run_judge(
             else:
                 tracker.record_pass(0)
 
+    def _maybe_expand_tier2() -> None:
+        nonlocal tier2_expanded, grown_selected_count, selected_count, not_judged_cap
+        if tier2_expanded or not can_expand_tier2 or not tier2_pool:
+            return
+        judged_now = passed + failed
+        if judged_now <= 0 or batch_s <= 0.0:
+            return
+        tier2_expanded = True
+        measured_ips = judged_now / batch_s
+        extra_n = compute_tier2_expansion(
+            already_selected_total=selected_count,
+            already_selected_grown=grown_selected_count,
+            mandatory_count=int(selection["mandatory"]),
+            available_overflow=len(tier2_pool),
+            inputs_per_s=measured_ips,
+            target_replay_s=eff_target_replay_s,
+            hard_cap=tier2_hard_cap,
+        )
+        if extra_n <= 0:
+            return
+        pulled: list[Path] = []
+        for _ in range(extra_n):
+            p_extra, c_extra = tier2_pool.popleft()
+            pulled.append(p_extra)
+            if c_extra is not None:
+                ck = str(c_extra)
+                if not_judged_by_case[ck] > 1:
+                    not_judged_by_case[ck] -= 1
+                else:
+                    not_judged_by_case.pop(ck, None)
+        grown_selected_count += len(pulled)
+        selected_count += len(pulled)
+        not_judged_cap = max(0, not_judged_cap - len(pulled))
+        for i in range(0, len(pulled), eff_batch):
+            pending.append(pulled[i : i + eff_batch])
+
     def _handle_failure(culprit_path: Path, batch_output: str, batch_rc: int | None, batch_to: bool) -> None:
         nonlocal failed, confirm_s, fresh_confirmations, module_blinded_non_dispatch, non_dispatch_blind_fp
         failed += 1
+        _note_judged_path(culprit_path)
         c_idx = _case_of(culprit_path)
         sha = sha256_file(culprit_path)
         size = culprit_path.stat().st_size if culprit_path.is_file() else 0
@@ -5097,15 +5830,20 @@ def run_judge(
                 module_blinded_non_dispatch = True
                 non_dispatch_blind_fp = eff_fp
 
+    current_batch: list[Path] = []
     try:
         while pending:
             if module_blinded_non_dispatch:
-                not_judged_blinded += sum(len(b) for b in pending)
+                for rem_b in pending:
+                    not_judged_blinded += len(rem_b)
+                    _note_not_judged(rem_b)
                 pending.clear()
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                not_judged_timeout += sum(len(b) for b in pending)
+                for rem_b in pending:
+                    not_judged_timeout += len(rem_b)
+                    _note_not_judged(rem_b)
                 pending.clear()
                 break
 
@@ -5116,6 +5854,7 @@ def run_judge(
                     c = _case_of(item)
                     if c is not None and c in skipped_cases:
                         not_judged_blinded += 1
+                        not_judged_by_case[str(c)] += 1
                     else:
                         batch.append(item)
                 if not batch:
@@ -5128,6 +5867,7 @@ def run_judge(
             run_env = dict(SANITIZER_RUNTIME_ENV)
             if skipped_cases:
                 run_env[DISPATCH_SKIP_MACRO] = format_skip_cases_env(skipped_cases)
+            current_batch = batch
             bt0 = time.monotonic()
             res = sandbox_exec.run_sandboxed(
                 [
@@ -5143,6 +5883,7 @@ def run_judge(
                 limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
                 extra_env=run_env,
             )
+            current_batch = []
             batch_s += max(0.0, time.monotonic() - bt0)
             out_text = f"{res.stdout}\n{res.stderr}"
 
@@ -5156,6 +5897,7 @@ def run_judge(
                         pending.appendleft(rest)
                 else:
                     _record_passes(batch)
+                _maybe_expand_tier2()
                 continue
 
             # Non-zero exit or timeout: check for startup failure before LLVMFuzzerTestOneInput.
@@ -5164,11 +5906,15 @@ def run_judge(
             if is_start and _judge_input_running_at_exit(out_text, batch) is None:
                 startup_err = start_reason or "startup failure before LLVMFuzzerTestOneInput"
                 not_judged_error += len(batch) + sum(len(b) for b in pending)
+                _note_not_judged(batch)
+                for rem_b in pending:
+                    _note_not_judged(rem_b)
                 pending.clear()
                 break
 
             if len(batch) == 1:
                 _handle_failure(batch[0], out_text, res.returncode, res.timed_out)
+                _maybe_expand_tier2()
                 continue
 
             culprit = _judge_input_running_at_exit(out_text, batch)
@@ -5181,6 +5927,7 @@ def run_judge(
                 rest = batch[culprit + 1 :]
                 if rest:
                     pending.appendleft(rest)
+                _maybe_expand_tier2()
                 continue
 
             # Output did not identify the running input: bisect deterministically.
@@ -5190,7 +5937,11 @@ def run_judge(
     except SandboxUnavailable as exc:
         sandbox_err = f"sandbox_unavailable: {exc}"
         accounted = passed + failed + not_judged_timeout + not_judged_blinded + not_judged_error
-        not_judged_error += max(0, len(selected) - accounted)
+        not_judged_error += max(0, selected_count - accounted)
+        if current_batch:
+            _note_not_judged(current_batch)
+        for rem_b in pending:
+            _note_not_judged(rem_b)
         pending.clear()
     finally:
         if own_scratch:
@@ -5228,6 +5979,7 @@ def run_judge(
         not_judged_timeout=not_judged_timeout,
         not_judged_blinded=not_judged_blinded,
         not_judged_error=not_judged_error,
+        frontier_judged_count=frontier_judged,
         artifacts=collapsed_arts,
         batch_state_only=batch_state_only,
         cross_links=cross_links,
@@ -5405,6 +6157,7 @@ def _run_eacsl_fuzz_mode(args) -> dict:
             fork=fork,
             extra_env=extra_env,
             single_process_reason=single_process.get("reason"),
+            profile=prof,
         )
         if run.get("single_process_reason") and "reason" not in single_process:
             single_process["reason"] = str(run["single_process_reason"])
@@ -5588,6 +6341,7 @@ def _run_campaign_mode(args) -> dict:
                     fork=fork,
                     extra_env=extra_env,
                     single_process_reason=single_process.get("reason"),
+                    profile=profile,
                 )
                 if run.get("single_process_reason") and "reason" not in single_process:
                     single_process["reason"] = str(run["single_process_reason"])
@@ -5902,6 +6656,7 @@ def _run_explore_campaign_mode(
             fork=fork,
             extra_env=extra_env,
             single_process_reason=single_process.get("reason"),
+            profile=profile,
         )
         if run.get("single_process_reason") and "reason" not in single_process:
             single_process["reason"] = str(run["single_process_reason"])

@@ -126,7 +126,13 @@
         "passed": {"type": "integer", "minimum": 0},
         "failed": {"type": "integer", "minimum": 0},
         "not_judged": {"type": "integer", "minimum": 0},
-        "not_judged_breakdown": {"$ref": "#/definitions/not_judged_breakdown"}
+        "not_judged_breakdown": {"$ref": "#/definitions/not_judged_breakdown"},
+        "frontier_total": {"type": "integer", "minimum": 0},
+        "frontier_judged": {"type": "integer", "minimum": 0},
+        "not_judged_by_case": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        }
       },
       "required": [
         "total",
@@ -188,6 +194,12 @@
     "corpus_cap": {"type": "integer", "minimum": 0},
     "inputs": {"$ref": "#/definitions/inputs_summary"},
     "not_judged": {"type": "integer", "minimum": 0},
+    "frontier_total": {"type": "integer", "minimum": 0},
+    "frontier_judged": {"type": "integer", "minimum": 0},
+    "not_judged_by_case": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
     "artifacts": {
       "type": "array",
       "items": {"$ref": "#/definitions/judge_artifact"}
