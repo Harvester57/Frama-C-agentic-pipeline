@@ -1915,6 +1915,46 @@ def test_a_by_value_builder_of_a_shared_buffer_assigns_through_its_type(monkeypa
     assert "*(struct bufc *)s1 = buf_from_sz(" in stmt
 
 
+def test_stateful_cases_go_first_over_the_case_limit(monkeypatch: pytest.MonkeyPatch):
+    """
+    The stateful cases come after every single case, a public header function's included: over the
+    case limit they are cut first, so no entry point loses its only case to an extra stateful one.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _stateful_fixture()
+    hdr = "inc/lib.h#h_peek"
+    dag["functions"][hdr] = {"name": "h_peek", "file": "inc/lib.h", "is_static": True, "header": True, "module": "lib"}
+    dag["modules"]["lib"]["candidate_entry_points"].append(hdr)
+    dag["modules"]["lib"]["functions"].append(hdr)
+    model["functions"][hdr] = {
+        "name": "h_peek",
+        "file": "inc/lib.h",
+        "static": True,
+        "header": True,
+        "signature": "int(int)",
+        "formals": [{"name": "p0", "kind": "value"}],
+    }
+    entry = {"function": "h_peek", "role": "entry", "params": ["p0"], "description": "h_peek"}
+    dag["trust"]["threat_model"]["input_sources"].append(entry)
+    visible = ah.Declared({str(rec["name"]) for rec in dag["functions"].values()})
+
+    full = ah.plan(dag, model, "lib", "lib", 256, struct_layouts=layouts, visible=visible)
+    kinds = [bool(lay.get("state")) for lay in full["layouts"]]
+    assert any(kinds), "the fixture has stateful cases"
+    # Every stateful case is after every other case, the header function's single case included.
+    assert kinds == sorted(kinds)
+    assert any(lay.get("entry") == hdr for lay in full["layouts"])
+    n_other = kinds.count(False)
+
+    monkeypatch.setattr(ah, "MAX_CASES", n_other + 1)
+    capped = ah.plan(dag, model, "lib", "lib", 256, struct_layouts=layouts, visible=visible)
+    assert [lay for lay in capped["layouts"] if not lay.get("state")] == [
+        lay for lay in full["layouts"] if not lay.get("state")
+    ]
+    assert sum(1 for lay in capped["layouts"] if lay.get("state")) == 1
+    assert not any("more than" in why for why in capped["skipped"].values()), capped["skipped"]
+
+
 def test_generate_reports_a_dropped_sequence_case_and_keeps_both_copies_equal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

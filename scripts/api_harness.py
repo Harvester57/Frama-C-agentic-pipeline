@@ -4646,9 +4646,11 @@ def plan(
     (`variadic_calls.load_cases`): its cases come after the single ones, and it is skipped only when
     it has none. `variadic_dropped` lists the call sites that made no case, with the reason.
     An entry point defined in a public header (`static`, `header`: the model's `header_api`) gets a
-    single case when `visible` has it, after every other generated case (so the cases of the global
-    entry points keep their selectors, and these go first over the case limit); without the probe it
-    is skipped as `HEADER_NOT_VISIBLE`.
+    single case when `visible` has it, after every other generated case but the stateful ones (so the
+    cases of the global entry points keep their selectors, and these go over the case limit before
+    them); without the probe it is skipped as `HEADER_NOT_VISIBLE`. The stateful cases
+    (`stateful_prefixes`) come last and go over the case limit first: every entry point keeps its
+    single case.
     """
     effective_trust_schema = api_trust_schema_enabled() if trust_schema is None else bool(trust_schema)
     max_cases = max(0, MAX_CASES - reserve)
@@ -4907,31 +4909,10 @@ def plan(
         n_seq += 1
         cases.append(lc_stmt)
         layouts.append(lc_layout)
-    # Stateful cases: an entry point that fails on a fresh context, after the calls that set up the
-    # state it needs (`stateful_prefixes`), within their own cap. Its single case stays.
-    key_of = {str((functions.get(k) or {}).get("name") or k.split("#")[-1]): k for k in names}
-    n_state = 0
-    for plan_st in stateful_prefixes(records, singles, api, model.get("functions") or {}, traces):
-        sig = tuple(plan_st["calls"])
-        if n_state >= STATE_MAX_CASES or sig in seq_seen:
-            continue
-        ctx_trace = [{"fn": fn, "args": {}, "addrs": {"0": "fc_ctx"}} for fn in plan_st["calls"]]
-        st_stmt, st_layout, _why = sequence_case(
-            ctx_trace, list(range(len(ctx_trace))), records, spare, api, trust_by_name
-        )
-        if st_stmt is None or st_layout is None:
-            continue
-        seq_seen.add(sig)
-        n_state += 1
-        st_layout["notes"] = [
-            *(st_layout.get("notes") or []),
-            f"stateful case ({plan_st['state']}): {plan_st['entry']} {plan_st['why']}",
-        ]
-        cases.append(st_stmt)
-        layouts.append({**st_layout, "entry": key_of[plan_st["entry"]], "state": plan_st["state"]})
-    # The functions defined in a public header, last: the cases above keep their selectors, and these
-    # are the first to go over the case limit. They stay out of `records`, which builds the sequence
-    # and lifecycle cases above, so those are the same with or without them.
+    # The functions defined in a public header, after the cases above: those keep their selectors,
+    # and these go over the case limit before them (only the stateful cases below go first). They
+    # stay out of `records`, which builds the sequence and lifecycle cases above, so those are the
+    # same with or without them.
     for key, name in header_entries:
         mrec = _model_record(model, functions.get(key) or {}, key)
         if not mrec:
@@ -4952,6 +4933,30 @@ def plan(
         for stmt, layout in made_cases:
             cases.append(stmt)
             layouts.append({**layout, "entry": key})
+    # Stateful cases, last: an entry point that fails on a fresh context, after the calls that set up
+    # the state it needs (`stateful_prefixes`), within their own cap. Its single case stays, and over
+    # the case limit these go first, so no entry point loses its single case to them.
+    header_keys = {k for k, _ in header_entries}
+    key_of = {str((functions.get(k) or {}).get("name") or k.split("#")[-1]): k for k in names if k not in header_keys}
+    n_state = 0
+    for plan_st in stateful_prefixes(records, singles, api, model.get("functions") or {}, traces):
+        sig = tuple(plan_st["calls"])
+        if n_state >= STATE_MAX_CASES or sig in seq_seen:
+            continue
+        ctx_trace = [{"fn": fn, "args": {}, "addrs": {"0": "fc_ctx"}} for fn in plan_st["calls"]]
+        st_stmt, st_layout, _why = sequence_case(
+            ctx_trace, list(range(len(ctx_trace))), records, spare, api, trust_by_name
+        )
+        if st_stmt is None or st_layout is None:
+            continue
+        seq_seen.add(sig)
+        n_state += 1
+        st_layout["notes"] = [
+            *(st_layout.get("notes") or []),
+            f"stateful case ({plan_st['state']}): {plan_st['entry']} {plan_st['why']}",
+        ]
+        cases.append(st_stmt)
+        layouts.append({**st_layout, "entry": key_of[plan_st["entry"]], "state": plan_st["state"]})
     if len(cases) > max_cases:
         for lay in layouts[max_cases:]:
             if lay.get("entry"):
