@@ -32,22 +32,33 @@ import argparse
 import hashlib
 import json
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from framac_common import ArtifactError, atomic_write_json, load_json_optional, run_lock, utc_now  # noqa: E402
+from framac_common import (  # noqa: E402
+    ArtifactError,
+    atomic_write_json,
+    load_json_optional,
+    load_json_strict,
+    run_lock,
+    utc_now,
+)
 
 GATES_JSON = "workspace/reports/phase0_gates.json"
 HARNESS_DIR = "workspace/harnesses"
 DAG_JSON = "workspace/reports/callgraph_dag.json"
 SECTIONS = ("reach", "build_check")
+ALL_SECTIONS = ("reach", "build_check", "smoke")
+SMOKE_PASS_STATUSES = frozenset({"ok", "degraded"})
+SMOKE_FAIL_STATUSES = frozenset({"startup_error", "failed"})
 DYNAMIC_GAP_ERROR = "dynamic: entry points never executed by the corpus"
 HOW_TO_RUN = {
     "reach": "python3 $S/harness_reach.py check",
     "build_check": "python3 $S/pipeline_make.py build-check",
+    "smoke": "python3 $S/harness_smoke.py run",
 }
 
 
@@ -226,6 +237,96 @@ def record_build_check(run_dir: Path, out: dict[str, Any]) -> dict[str, Any]:
     return _store(Path(run_dir), "build_check", entry)
 
 
+def record_smoke(run_dir: Path, module: str, report: dict[str, Any]) -> dict[str, Any]:
+    """
+    Store a per-module harness_smoke.py report under the `smoke` gate section.
+
+    Reads and merges prior module rows under `run_lock("phase0_gates")` so parallel `smoke-<mod>`
+    targets never clobber one another.
+    """
+    run_dir = Path(run_dir)
+    mod = str(module)
+    status = str(report.get("status") or "failed")
+    startup = report.get("startup")
+    if isinstance(startup, dict) and "ok" in startup:
+        startup_ok = bool(startup.get("ok"))
+        reason = startup.get("reason") or report.get("reason")
+    else:
+        startup_ok = bool(report.get("startup_ok", False))
+        reason = report.get("reason")
+
+    raw_quarantined = report.get("quarantined_cases")
+    quarantined: list[int] = sorted(
+        {int(c) for c in raw_quarantined if isinstance(c, int) and not isinstance(c, bool)}
+        if isinstance(raw_quarantined, list)
+        else set()
+    )
+    skip_cases_env = report.get("skip_cases_env")
+    if not isinstance(skip_cases_env, str):
+        skip_cases_env = ",".join(str(c) for c in quarantined)
+
+    recorded_digest = report.get("harness_digest")
+    if not isinstance(recorded_digest, str) or not recorded_digest:
+        recorded_digest = harness_digest(run_dir, mod, ignore_exempt=True)
+
+    now = utc_now()
+    row_ok = status in SMOKE_PASS_STATUSES and startup_ok
+    row: dict[str, Any] = {
+        "ok": row_ok,
+        "status": status,
+        "startup_ok": startup_ok,
+        "harness_digest": recorded_digest,
+        "quarantined_cases": quarantined,
+        "skip_cases_env": skip_cases_env,
+        "timestamp": now,
+    }
+    if reason:
+        row["reason"] = str(reason)
+
+    with run_lock("phase0_gates", run_dir):
+        gates = load_gates(run_dir)
+        prior = gates.get("smoke")
+        modules: dict[str, Any] = (
+            dict(prior["modules"]) if isinstance(prior, dict) and isinstance(prior.get("modules"), dict) else {}
+        )
+        modules[mod] = row
+        gates["smoke"] = {
+            "ok": all(bool(m.get("ok")) for m in modules.values() if isinstance(m, dict)),
+            "generated_at": now,
+            "modules": dict(sorted(modules.items())),
+        }
+        atomic_write_json(run_dir / GATES_JSON, gates)
+    return gates
+
+
+def _check_smoke_row(
+    run_dir: Path,
+    module: str,
+    row: Any,
+    emit_warning: Callable[[str], None],
+) -> list[str]:
+    """Validate one module's smoke gate row. Returns failure reasons; emits a warning when degraded."""
+    if not isinstance(row, dict):
+        return [f"smoke gate failed for {module}: malformed record"]
+    status = str(row.get("status") or "")
+    startup_ok = bool(row.get("startup_ok"))
+    detail = f" ({row['reason']})" if row.get("reason") else ""
+    if not startup_ok or status == "startup_error":
+        return [f"smoke gate failed for {module}: startup_error{detail}"]
+    if status in SMOKE_FAIL_STATUSES or status not in SMOKE_PASS_STATUSES:
+        return [f"smoke gate failed for {module}: {status or 'unknown'}{detail}"]
+    expected_digest = harness_digest(run_dir, module, ignore_exempt=True)
+    if row.get("harness_digest") != expected_digest:
+        return [
+            f"the harness of {module} changed after the smoke gate ran (stale harness_digest); "
+            f"run `{HOW_TO_RUN['smoke']}` again"
+        ]
+    if status == "degraded":
+        quarantined = [int(c) for c in (row.get("quarantined_cases") or []) if isinstance(c, int)]
+        emit_warning(f"smoke gate degraded for {module}: quarantined_cases={quarantined}")
+    return []
+
+
 def _section_ok(section: str, entry: dict[str, Any]) -> bool:
     return bool(entry.get("passed") if section == "reach" else entry.get("ok"))
 
@@ -286,9 +387,11 @@ def current_build_status(run_dir: Path, module: str, row: dict[str, Any]) -> tup
 def check(
     run_dir: Path,
     module: str | None = None,
-    need: tuple[str, ...] = SECTIONS,
+    need: Sequence[str] = SECTIONS,
     modules_expected: list[str] | None = None,
     fuzzed_expected: list[str] | None = None,
+    *,
+    warnings_out: list[str] | None = None,
 ) -> list[str]:
     """
     Reasons the gate fails for `module` (or for the whole run when None); empty when it passes.
@@ -304,6 +407,13 @@ def check(
     gates = load_gates(run_dir)
     current_dag = dag_digest(run_dir)
     reasons: list[str] = []
+
+    def _emit_warning(msg: str) -> None:
+        if warnings_out is not None:
+            warnings_out.append(msg)
+        else:
+            print(f"phase0 gate warning: {msg}", file=sys.stderr)
+
     for section in need:
         entry = gates.get(section)
         if not isinstance(entry, dict):
@@ -316,6 +426,12 @@ def check(
                 failed = sorted(m for m, r in modules.items() if not _build_ok(run_dir, m, r)[0])
                 if failed or (not modules and not entry.get("ok")):
                     reasons.append(f"{section} failed for {', '.join(failed) or 'the run'}")
+                expected = fuzzed_expected
+            elif section == "smoke":
+                for m, r in sorted(modules.items()):
+                    reasons.extend(_check_smoke_row(run_dir, m, r, _emit_warning))
+                if not modules and not entry.get("ok"):
+                    reasons.append("smoke failed for the run")
                 expected = fuzzed_expected
             else:
                 failed = sorted(m for m, r in modules.items() if not _row_reach_ok(r))
@@ -356,6 +472,8 @@ def check(
                 reasons.append(f"the harness of {module} changed after the reach gate ran; run it again")
             elif row.get("dag_digest") != current_dag:
                 reasons.append(_dag_changed(module))
+        elif section == "smoke":
+            reasons.extend(_check_smoke_row(run_dir, module, row, _emit_warning))
         else:
             ok, status = _build_ok(run_dir, module, row)
             if not ok:
@@ -396,27 +514,52 @@ def _build_ok(run_dir: Path, module: str, row: dict[str, Any]) -> tuple[bool, st
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Check the Phase 0 gate stamp")
+    p = argparse.ArgumentParser(description="Check or update the Phase 0 gate stamp")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("check")
     c.add_argument("--run-dir", type=Path, default=Path("."))
     c.add_argument("--module", default=None)
-    c.add_argument("--need", default=",".join(SECTIONS), help="Comma-separated sections: reach, build_check")
+    c.add_argument(
+        "--need",
+        default=",".join(SECTIONS),
+        help="Comma-separated sections: reach, build_check, smoke",
+    )
     c.add_argument(
         "--modules", default=None, help="Whole run: the plan's modules (space-separated), each needing a reach row"
     )
     c.add_argument(
         "--fuzzed",
         default=None,
-        help="Whole run: the plan's fuzzed modules (space-separated), each needing a build row",
+        help="Whole run: the plan's fuzzed modules (space-separated), each needing a build/smoke row",
     )
+    rs = sub.add_parser("record-smoke", help="Record a harness_smoke.py report into phase0_gates.json")
+    rs.add_argument("--run-dir", type=Path, default=Path("."))
+    rs.add_argument("--module", required=True)
+    rs.add_argument("--report", type=Path, required=True)
+
     a = p.parse_args(argv)
+    if a.cmd == "record-smoke":
+        try:
+            report = load_json_strict(a.report)
+            if not isinstance(report, dict):
+                raise ArtifactError(f"smoke report is not a JSON object: {a.report}")
+            gates = record_smoke(a.run_dir, a.module, report)
+        except (ArtifactError, OSError, ValueError) as exc:
+            err = f"cannot record smoke report {a.report}: {exc}"
+            print(json.dumps({"ok": False, "module": a.module, "error": err}))
+            print(f"phase0 gate: {err}", file=sys.stderr)
+            return 1
+        row = gates["smoke"]["modules"][str(a.module)]
+        print(json.dumps({"ok": bool(row.get("ok")), "module": a.module, "smoke": row}))
+        return 0
+
     need = tuple(s.strip() for s in a.need.split(",") if s.strip())
-    unknown = [s for s in need if s not in SECTIONS]
+    unknown = [s for s in need if s not in ALL_SECTIONS]
     if unknown:
         p.error(f"unknown gate section(s): {', '.join(unknown)}")
     if a.module and (a.modules is not None or a.fuzzed is not None):
         p.error("--modules and --fuzzed apply to the whole run, not with --module")
+    warn_list: list[str] = []
     try:
         reasons = check(
             a.run_dir,
@@ -424,10 +567,16 @@ def main(argv: list[str] | None = None) -> int:
             need,
             None if a.modules is None else a.modules.split(),
             None if a.fuzzed is None else a.fuzzed.split(),
+            warnings_out=warn_list,
         )
     except (ArtifactError, OSError, ValueError) as exc:
         reasons = [f"cannot read {GATES_JSON}: {exc}"]
-    print(json.dumps({"ok": not reasons, "module": a.module, "need": list(need), "reasons": reasons}))
+    payload: dict[str, Any] = {"ok": not reasons, "module": a.module, "need": list(need), "reasons": reasons}
+    if warn_list:
+        payload["warnings"] = warn_list
+    print(json.dumps(payload))
+    for warning in warn_list:
+        print(f"phase0 gate warning: {warning}", file=sys.stderr)
     for reason in reasons:
         print(f"phase0 gate: {reason}", file=sys.stderr)
     return 1 if reasons else 0

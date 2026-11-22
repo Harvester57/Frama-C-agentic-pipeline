@@ -56,7 +56,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import acsl_ast  # noqa: E402
 import checkpoint  # noqa: E402
 import contract_negotiator  # noqa: E402
+import crash_triage  # noqa: E402
 import function_facts  # noqa: E402
+import harness_smoke  # noqa: E402
 import ledger  # noqa: E402
 import loop_seeds  # noqa: E402
 import phase0_gates  # noqa: E402
@@ -165,6 +167,48 @@ _STARTS_WITH_ACSL_CLAUSE_RE = re.compile(
     r"(?:loop\s+(?:invariant|assigns|variant|allocates|frees)|"
     r"requires|ensures|assumes|assigns|allocates|frees|terminates|exits|breaks|continues|returns|decreases|invariant|variant)\b"
 )
+FUZZ_EXPLORE_JUDGE_ENV = "FRAMAC_FUZZ_EXPLORE_JUDGE"
+_FLAG_ON_VALUES = frozenset({"on", "1", "true"})
+_EXCLUDED_CANDIDATE_STATUSES = frozenset({"quarantined_by_smoke", "superseded_by_repair"})
+_EXCLUDED_CANDIDATE_KINDS = frozenset({"toolchain_startup_error"})
+_VERIFIER_DECISIONS = frozenset({"confirmed", "needs_validation", "rejected"})
+
+
+def _fuzz_explore_judge_enabled() -> bool:
+    """Whether fuzz explore/judge loop is enabled (`FRAMAC_FUZZ_EXPLORE_JUDGE=on|1|true`, default off)."""
+    return (os.environ.get(FUZZ_EXPLORE_JUDGE_ENV) or "").strip().lower() in _FLAG_ON_VALUES
+
+
+def _fast_fuzz_repair_enabled() -> bool:
+    """Whether fast fuzz-only repair actions apply when no Eva report exists yet."""
+    return (
+        crash_triage.verifier_breaker_enabled()
+        or harness_smoke.harness_smoke_enabled()
+        or _fuzz_explore_judge_enabled()
+    )
+
+
+def _candidate_excluded_reason(cand: dict) -> str | None:
+    """
+    Return the exclusion reason when a candidate must never receive a `verify:*` task:
+    startup errors (`toolchain_startup_error`, flat or nested under `property`/`failure`/`observations`),
+    smoke-quarantined candidates (`quarantined_by_smoke`), or repair-superseded candidates (`superseded_by_repair`).
+    """
+    status = str(cand.get("status") or "").strip()
+    if status in _EXCLUDED_CANDIDATE_STATUSES:
+        return status
+    if str(cand.get("kind") or "").strip() in _EXCLUDED_CANDIDATE_KINDS:
+        return "toolchain_startup_error"
+    prop = cand.get("property")
+    if isinstance(prop, dict) and str(prop.get("kind") or "").strip() in _EXCLUDED_CANDIDATE_KINDS:
+        return "toolchain_startup_error"
+    failure = cand.get("failure")
+    if isinstance(failure, dict) and str(failure.get("kind") or "").strip() in _EXCLUDED_CANDIDATE_KINDS:
+        return "toolchain_startup_error"
+    for obs in cand.get("observations") or []:
+        if isinstance(obs, dict) and str(obs.get("kind") or "").strip() in _EXCLUDED_CANDIDATE_KINDS:
+            return "toolchain_startup_error"
+    return None
 
 
 def _agent_wall_budget_s() -> int:
@@ -1275,25 +1319,37 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
     for fp, cand in sorted(ctx.candidates.items()):
         tid = f"verify:{fp}"
         task = tasks.get(tid)
+        excluded = _candidate_excluded_reason(cand)
+        if excluded is not None:
+            if task is not None and task["state"] in ("pending", "paused_by_breaker"):
+                _finish(state, task, "done", excluded, reason=f"candidate excluded ({excluded})")
+                changes["closed"].append(tid)
+            continue
         if cand.get("status") == "unverified":
             if task is None:
                 loc = cand.get("location") or {}
                 loc_file = norm_path(loc.get("file") or "")
                 fn = str(loc.get("function") or fp.split("#", 1)[-1].split("::", 1)[0])
+                task_mod = cand.get("module") or ctx.file_module.get(loc_file) or "unknown"
+                h_mod = workspace_overlay.harness_module_for_function(ctx.mm, task_mod, loc_file, fn) or task_mod
+                cand_digest = cand.get("harness_digest") or phase0_gates.harness_digest(
+                    Path("."), h_mod, ignore_exempt=True
+                )
                 _new_task(
                     state,
                     tid,
                     "verify",
                     f"{fn[:28]}_{fp.rsplit('::', 1)[-1]}",
-                    module=cand.get("module") or ctx.file_module.get(loc_file) or "unknown",
+                    module=task_mod,
                     fingerprint=fp,
                     location_file=loc_file,
                     location_function=fn,
+                    harness_digest=cand_digest,
                     ingest_errors=0,
                     invalid_results=0,
                 )
                 changes["created"].append(tid)
-            elif task["state"] in TERMINAL:
+            elif task["state"] in TERMINAL and task.get("outcome") != "superseded_by_repair":
                 # The ledger reopened a rejected candidate on new tool evidence (`reopened` entries on
                 # the candidate): it needs a second verdict. One task reopening per ledger reopening,
                 # so a verify task that ended blocked for another reason is not dispatched again.
@@ -1302,7 +1358,7 @@ def _sync(state: dict, ctx: Ctx, persist: bool = True) -> dict:
                     task["candidate_reopens"] = ledger_reopens
                     _reopen(state, task, "candidate reopened by tool evidence after a rejection")
                     changes["reopened"].append(tid)
-        elif task is not None and task["state"] == "pending":
+        elif task is not None and task["state"] in ("pending", "paused_by_breaker"):
             _finish(state, task, "done", "verified_elsewhere")
             changes["closed"].append(tid)
     open_verify = {t["fingerprint"] for t in tasks.values() if t["kind"] == "verify" and t["state"] not in TERMINAL}
@@ -1830,7 +1886,7 @@ def _compute_deps(state: dict, ctx: Ctx) -> None:
         elif task["kind"] == "arch":
             task["deps"] = [f"gate:{task['module']}"]
         elif task["kind"] == "repair":
-            task["deps"] = _repair_verify_deps(tasks, task["module"], ctx)
+            task["deps"] = _repair_verify_deps(tasks, task["module"], ctx, state=state)
         elif task["kind"] in ("breaker", "negotiate"):
             task["eva_unknowns"] = ctx.eva_unknown_count(task.get("file"), task.get("function") or "")
     _refresh_negotiate_deps(state, ctx, arch_of)
@@ -2193,7 +2249,9 @@ class _View:
             for dep in _deps(self.tasks[member])
         )
         if ok and task["kind"] == "repair":
-            ok = all(self.terminal(vtid) for vtid in _repair_verify_deps(self.tasks, task["module"], self.ctx))
+            ok = all(
+                self.terminal(vtid) for vtid in _repair_verify_deps(self.tasks, task["module"], self.ctx, state=self.state)
+            )
         if scc:
             self._group_ready[scc] = ok
         return ok
@@ -2235,10 +2293,127 @@ def _waves_filter(state: dict) -> Callable[[dict], bool]:
     return allowed
 
 
+def _verify_task_belongs_to_module(task: dict, module: str, ctx: Ctx | None) -> bool:
+    return task.get("kind") == "verify" and (
+        task.get("module") == module or _verify_harness_module(task, ctx) == module
+    )
+
+
+def _module_verify_verdicts(
+    state: dict,
+    module: str,
+    ctx: Ctx | None,
+    *,
+    include_active: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Collect current-harness-generation active and completed verifier verdicts for `module`
+    in the shape consumed by `crash_triage.evaluate_circuit_breaker` / `select_probe_batch`.
+    """
+    current_digest = phase0_gates.harness_digest(Path("."), module, ignore_exempt=True)
+    cands = ctx.candidates if ctx is not None else {}
+    verdicts: list[dict[str, Any]] = []
+    for _tid, t in sorted(state["tasks"].items()):
+        if not _verify_task_belongs_to_module(t, module, ctx):
+            continue
+        fp = str(t.get("fingerprint") or "")
+        st = str(t.get("state") or "")
+        if include_active and st in LIVE:
+            raw_cand = cands.get(fp) or {}
+            entry: dict[str, Any] = dict(raw_cand) if isinstance(raw_cand, dict) else {}
+            entry.update({"fingerprint": fp, "state": "running"})
+            verdicts.append(entry)
+        elif st == "done" and str(t.get("outcome") or "") in _VERIFIER_DECISIONS:
+            task_digest = t.get("harness_digest")
+            if current_digest is not None and task_digest is not None and task_digest != current_digest:
+                continue
+            verdicts.append(
+                {
+                    "fingerprint": fp,
+                    "state": "done",
+                    "outcome": t.get("outcome"),
+                    "rejection_class": t.get("rejection_class"),
+                    "harness_induced": bool(t.get("harness_induced")),
+                }
+            )
+    return verdicts
+
+
+def _probe_allowed_verify_ids(
+    state: dict,
+    ready_tasks: list[dict],
+    ctx: Ctx | None,
+) -> tuple[set[str] | None, dict[str, int]]:
+    """
+    When `FRAMAC_VERIFIER_BREAKER` is enabled, restrict ready `verify:*` tasks per module:
+      - If `state["breaker_tripped"][mod]` is set, suppress all pending `verify:*` tasks of `mod`.
+      - Otherwise delegate to `crash_triage.select_probe_batch(...)` so modules with `> 3` candidates
+        dispatch only up to 2 clustered probes until the probe batch resolves, while modules with
+        `<= 3` candidates release immediately.
+    """
+    if not crash_triage.verifier_breaker_enabled():
+        return None, {}
+    ready_verify_mods: dict[str, list[dict]] = defaultdict(list)
+    for t in ready_tasks:
+        if t.get("kind") == "verify":
+            hmod = _verify_harness_module(t, ctx)
+            ready_verify_mods[hmod].append(t)
+    if not ready_verify_mods:
+        return set(), {}
+
+    tripped = state.get("breaker_tripped") or {}
+    cands = ctx.candidates if ctx is not None else {}
+    allowed_ids: set[str] = set()
+    probe_rank: dict[str, int] = {}
+
+    for mod in sorted(ready_verify_mods):
+        if tripped.get(mod):
+            continue
+        open_mod_cands: list[dict[str, Any]] = []
+        for _tid, t in sorted(state["tasks"].items()):
+            if not _verify_task_belongs_to_module(t, mod, ctx):
+                continue
+            if t.get("state") != "pending" and t.get("state") not in LIVE:
+                continue
+            fp = str(t.get("fingerprint") or "")
+            raw_cand = cands.get(fp) or {}
+            cand_entry: dict[str, Any] = dict(raw_cand) if isinstance(raw_cand, dict) else {}
+            cand_entry["fingerprint"] = fp
+            cand_entry["status"] = "unverified"
+            if "location" not in cand_entry:
+                cand_entry["location"] = {
+                    "file": t.get("location_file") or "",
+                    "function": t.get("location_function") or "",
+                }
+            open_mod_cands.append(cand_entry)
+
+        verdicts = _module_verify_verdicts(state, mod, ctx, include_active=True)
+        selected_fps = crash_triage.select_probe_batch(open_mod_cands, verdicts)
+        for rank, fp in enumerate(selected_fps):
+            vtid = f"verify:{fp}"
+            allowed_ids.add(vtid)
+            probe_rank[vtid] = rank
+
+    return allowed_ids, probe_rank
+
+
 def _ready(state: dict, mode: str, ctx: Ctx | None = None) -> list[dict]:
     view = _View(state, ctx=ctx)
     allowed = _waves_filter(state) if mode == "waves" else (lambda _task: True)
-    return sorted((t for t in state["tasks"].values() if view.ready(t) and allowed(t)), key=_priority_key)
+    ready_tasks = [t for t in state["tasks"].values() if view.ready(t) and allowed(t)]
+    allowed_verify, probe_rank = _probe_allowed_verify_ids(state, ready_tasks, view.ctx)
+    if allowed_verify is not None:
+        ready_tasks = [t for t in ready_tasks if t["kind"] != "verify" or t["id"] in allowed_verify]
+    if not probe_rank:
+        return sorted(ready_tasks, key=_priority_key)
+
+    def _sort_key(task: dict) -> tuple:
+        base = _priority_key(task)
+        if task["kind"] == "verify" and task["id"] in probe_rank:
+            return (*base[:-1], probe_rank[task["id"]], base[-1])
+        return (*base[:-1], 0, base[-1])
+
+    return sorted(ready_tasks, key=_sort_key)
 
 
 # ---------------------------------------------------------------------------
@@ -2719,13 +2894,31 @@ def _verify_harness_module(task: dict, ctx: Ctx | None = None) -> str:
     )
 
 
-def _repair_verify_deps(tasks: dict[str, dict], module: str, ctx: Ctx | None = None) -> list[str]:
+def _repair_verify_deps(
+    tasks: dict[str, dict],
+    module: str,
+    ctx: Ctx | None = None,
+    state: dict | None = None,
+) -> list[str]:
     """
-    Every `verify:*` task answering to `module`'s harness: `repair:<module>` stays pending and
-    accumulates `harness_induced` reasons until all open verifiers of `module` reach a terminal state.
+    `verify:*` tasks that `repair:<module>` waits on before dispatching.
+
+    Normally `repair:<module>` waits until all verifiers of `module` reach a terminal state.
+    When the verifier circuit breaker has tripped for `module` (`state["breaker_tripped"][module]`),
+    it waits ONLY on currently `running` verifiers (never `paused_by_breaker` or `pending` ones),
+    so `repair:<module>` dispatches immediately once in-flight probes finish.
     """
     if not module or module == "unknown":
         return []
+    tripped = bool(state is not None and (state.get("breaker_tripped") or {}).get(module))
+    if tripped:
+        return sorted(
+            tid
+            for tid, t in tasks.items()
+            if t["kind"] == "verify"
+            and t.get("state") == "running"
+            and (t.get("module") == module or _verify_harness_module(t, ctx) == module)
+        )
     return sorted(
         tid
         for tid, t in tasks.items()
@@ -2736,7 +2929,7 @@ def _repair_verify_deps(tasks: dict[str, dict], module: str, ctx: Ctx | None = N
 def _describe_repair(task: dict) -> dict:
     mod = task["module"]
     actions = []
-    if any(str(r).startswith("harness_induced") for r in task.get("reasons") or []):
+    if any(str(r).startswith(("harness_induced", "circuit_breaker")) for r in task.get("reasons") or []):
         actions.append(
             f'python3 {SCRIPTS}/generate_harness.py --record-repair workspace/harnesses/harness_{mod}.json --reason "<reason>"'
         )
@@ -2746,14 +2939,29 @@ def _describe_repair(task: dict) -> dict:
     # A repaired harness has a new digest, so `build-`/`fuzz-<mod>` refuse it until the reach gate
     # records it again; build-check needs no re-run (the gate reads the current build report).
     actions.append(f"python3 {SCRIPTS}/pipeline_make.py run reach-gate")
-    # module-<mod> re-runs fuzz, Eva and facts on the repaired harness. Skipping Eva leaves the alarms, the
-    # facts and the WP queue resting on the old harness, so `refresh` refuses to close the repair until the
-    # fuzz and Eva reports carry the repaired harness's digest (and names the targets still to run).
-    actions.append(f"python3 {SCRIPTS}/pipeline_make.py run module-{mod}")
-    actions.append(
-        f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}"
-        "  # refuses to close (repair: stale_evidence) until Eva and fuzz were re-run on the repaired harness"
-    )
+    eva_report = EVA_DIR / f"{mod}.json"
+    if _fast_fuzz_repair_enabled() and not eva_report.is_file():
+        # Fast fuzz-only repair before Phase 2 Eva: avoid multi-hour module-<mod> (Fuzz + Eva)
+        # when no Eva report exists on disk yet.
+        actions.append(f"python3 {SCRIPTS}/pipeline_make.py run build-{mod}")
+        if harness_smoke.harness_smoke_enabled():
+            actions.append(f"python3 {SCRIPTS}/pipeline_make.py run smoke-{mod}")
+        actions.append(f"python3 {SCRIPTS}/pipeline_make.py run fuzz-{mod}")
+        if _fuzz_explore_judge_enabled():
+            actions.append(f"python3 {SCRIPTS}/pipeline_make.py run judge-{mod}")
+        actions.append(
+            f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}"
+            "  # refuses to close (repair: stale_evidence) until fuzz was re-run on the repaired harness"
+        )
+    else:
+        # module-<mod> re-runs fuzz, Eva and facts on the repaired harness. Skipping Eva leaves the alarms, the
+        # facts and the WP queue resting on the old harness, so `refresh` refuses to close the repair until the
+        # fuzz and Eva reports carry the repaired harness's digest (and names the targets still to run).
+        actions.append(f"python3 {SCRIPTS}/pipeline_make.py run module-{mod}")
+        actions.append(
+            f"python3 {SCRIPTS}/wp_scheduler.py refresh --module {mod}"
+            "  # refuses to close (repair: stale_evidence) until Eva and fuzz were re-run on the repaired harness"
+        )
     return {
         "task": task["id"],
         "kind": "repair",
@@ -3890,8 +4098,10 @@ def _ensure_repair(state: dict, module: str, reason: str, out: dict, ctx: Ctx | 
         task.setdefault("followup_reasons", []).append(reason)
     elif reason not in task.setdefault("reasons", []):
         task["reasons"].append(reason)
-    task["deps"] = _repair_verify_deps(state["tasks"], module, ctx)
-    out.setdefault("new_tasks", []).append(tid)
+    task["deps"] = _repair_verify_deps(state["tasks"], module, ctx, state=state)
+    new_tasks = out.setdefault("new_tasks", [])
+    if tid not in new_tasks:
+        new_tasks.append(tid)
 
 
 def _on_invalid_result(state: dict, task: dict, agent_id: str, errors: list[str], out: dict) -> None:
@@ -4333,6 +4543,66 @@ def _parent_replay_verifier_inputs(fp: str, res: dict, out: dict) -> list[str]:
     return [report.as_posix()] if report.is_file() else []
 
 
+def _maybe_trip_verifier_breaker(state: dict, harness_mod: str, ctx: Ctx, out: dict) -> None:
+    """
+    Evaluate the per-module verifier circuit breaker after any verifier verdict for `harness_mod`.
+    When tripped, records `state["breaker_tripped"][harness_mod]`, pauses all remaining `pending`
+    `verify:*` tasks of `harness_mod` to `state = "paused_by_breaker"`, and opens/updates
+    `repair:<harness_mod>` immediately so it waits only on currently `running` verifiers.
+    """
+    verdicts = _module_verify_verdicts(state, harness_mod, ctx, include_active=False)
+    breaker = crash_triage.evaluate_circuit_breaker(verdicts)
+    if not breaker["tripped"]:
+        return
+    probe_fps = sorted(str(v["fingerprint"]) for v in verdicts if v.get("fingerprint"))
+    current_digest = phase0_gates.harness_digest(Path("."), harness_mod, ignore_exempt=True)
+    tripped_map = state.setdefault("breaker_tripped", {})
+    prior = tripped_map.get(harness_mod)
+    tripped_rec: dict[str, Any] = {
+        "module": harness_mod,
+        "tripped_at": (prior.get("tripped_at") if isinstance(prior, dict) else None) or utc_now(),
+        "harness_digest": current_digest,
+        "harness_induced": int(breaker["harness_induced"]),
+        "verified": int(breaker["verified"]),
+        "ratio": float(breaker["ratio"]),
+        "probe_fingerprints": probe_fps,
+        "reason": str(breaker["reason"]),
+    }
+    tripped_map[harness_mod] = tripped_rec
+
+    ratio_str = f"{breaker['harness_induced']}/{breaker['verified']} ({breaker['ratio']:.1%})"
+    pause_reason = f"paused_by_breaker: {ratio_str} harness_induced; probes=[{', '.join(probe_fps)}]"
+    paused_ids: list[str] = []
+    for tid, t in sorted(state["tasks"].items()):
+        if t.get("state") == "pending" and _verify_task_belongs_to_module(t, harness_mod, ctx):
+            t["state"] = "paused_by_breaker"
+            t["last_reason"] = pause_reason[:500]
+            t["paused_by_breaker"] = {
+                "at": utc_now(),
+                "module": harness_mod,
+                "harness_digest": t.get("harness_digest") or current_digest,
+                "ratio": float(breaker["ratio"]),
+                "harness_induced": int(breaker["harness_induced"]),
+                "verified": int(breaker["verified"]),
+                "probe_fingerprints": probe_fps,
+                "reason": pause_reason,
+            }
+            paused_ids.append(tid)
+            _event(state, "paused_by_breaker", tid, module=harness_mod, ratio=breaker["ratio"])
+
+    _ensure_repair(state, harness_mod, f"circuit_breaker: {breaker['reason']}", out, ctx=ctx)
+    out["circuit_breaker"] = {**tripped_rec, "paused_tasks": paused_ids}
+    if prior is None or paused_ids:
+        _event(
+            state,
+            "circuit_breaker_tripped",
+            f"repair:{harness_mod}",
+            module=harness_mod,
+            ratio=breaker["ratio"],
+            paused=len(paused_ids),
+        )
+
+
 def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path: Path, out: dict) -> None:
     fp = task["fingerprint"]
     replays = _parent_replay(fp, ctx.candidates.get(fp) or {}, out)
@@ -4357,10 +4627,21 @@ def _complete_verifier(state: dict, ctx: Ctx, task: dict, res: dict, result_path
     harness_induced = any(
         r.get("verdict") == "rejected" and r.get("rejection_class") == "harness_induced" for r in records
     )
+    raw_primary = res.get("record")
+    primary_rec: dict[str, Any] = raw_primary if isinstance(raw_primary, dict) else {}
+    task["harness_induced"] = bool(harness_induced)
+    if primary_rec.get("rejection_class"):
+        task["rejection_class"] = str(primary_rec["rejection_class"])
+    elif harness_induced:
+        task["rejection_class"] = "harness_induced"
+    if not task.get("harness_digest"):
+        task["harness_digest"] = phase0_gates.harness_digest(Path("."), harness_mod, ignore_exempt=True)
+    _finish(state, task, "done", str(ing.get("decision")))
     if harness_induced and not ing.get("harness_exhausted"):
         # The harness to repair (`pipeline_make.py run module-<harness>`), never a bare link unit.
         _ensure_repair(state, harness_mod, f"harness_induced: {fp}", out, ctx=ctx)
-    _finish(state, task, "done", str(ing.get("decision")))
+    if crash_triage.verifier_breaker_enabled() and not ing.get("harness_exhausted"):
+        _maybe_trip_verifier_breaker(state, harness_mod, ctx, out)
     out.update(action="ingested", decision=ing.get("decision"), harness_exhausted=ing.get("harness_exhausted"))
     if ing.get("sink_conflicts"):
         # Opposite verdicts at one sink (ledger.py): shown to the parent now, not only in the final report.
@@ -5105,6 +5386,9 @@ def _stale_repair_evidence(ctx: Ctx, module: str) -> tuple[list[dict], list[str]
             path = Path(f"workspace/reports/{kind}/{harness}.json")
             reason = None
             if not path.is_file():
+                if kind == "eva" and _fast_fuzz_repair_enabled():
+                    # Pre-Phase-2 fast fuzz-only repair: no Eva report exists on disk yet.
+                    continue
                 reason = "missing"
             else:
                 try:
@@ -5131,6 +5415,139 @@ def _stale_repair_evidence(ctx: Ctx, module: str) -> tuple[list[dict], list[str]
             ):
                 targets.append(f"facts-{harness}")
     return stale, targets
+
+
+def _supersede_ledger_candidates(
+    run_dir: Path,
+    module: str,
+    old_harness_digest: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    """
+    Notify `ledger.py` to supersede stale unverified candidates of `module` from `old_harness_digest`.
+    Invokes `ledger.cmd_supersede_candidates` or `ledger.main(["supersede-candidates", ...])` in-process
+    so the re-entrant `run_lock("ledger")` never deadlocks, and fails soft when Wave 3's subcommand is not
+    wired yet. Never touches confirmed findings.
+    """
+    cmd_fn = getattr(ledger, "cmd_supersede_candidates", None)
+    if callable(cmd_fn):
+        try:
+            sig = inspect.signature(cmd_fn)
+            kwargs: dict[str, Any] = {}
+            if "run_dir" in sig.parameters:
+                kwargs["run_dir"] = Path(run_dir)
+            if "module" in sig.parameters:
+                kwargs["module"] = str(module)
+            if "old_harness_digest" in sig.parameters:
+                kwargs["old_harness_digest"] = old_harness_digest
+            elif "harness_digest" in sig.parameters:
+                kwargs["harness_digest"] = old_harness_digest
+            if "reason" in sig.parameters:
+                kwargs["reason"] = str(reason)
+            res = cmd_fn(**kwargs)
+            return {"ok": True, "supported": True, "result": res}
+        except Exception as exc:
+            return {"ok": False, "supported": True, "error": str(exc)}
+
+    argv = ["supersede-candidates", "--module", str(module), "--reason", str(reason)]
+    if old_harness_digest:
+        argv.extend(["--old-harness-digest", str(old_harness_digest)])
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = ledger.main(argv)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        err_text = buf_err.getvalue().strip()
+        if code == 2 and "invalid choice" in err_text:
+            return {"ok": True, "supported": False, "reason": "ledger.py supersede-candidates not yet available"}
+        return {"ok": False, "supported": False, "error": err_text or f"ledger.py exited with code {code}"}
+    except Exception as exc:
+        return {"ok": False, "supported": False, "error": str(exc)}
+    raw = buf_out.getvalue().strip()
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except ValueError:
+        parsed = {"raw": raw}
+    return {"ok": rc == 0, "supported": True, "returncode": rc, "result": parsed}
+
+
+def _supersede_after_repair(state: dict, ctx: Ctx, module: str, out: dict[str, Any]) -> bool:
+    """
+    After `repair:<module>` closes on a fresh repaired `harness_digest`:
+      - Transition `paused_by_breaker` `verify:*` tasks from the old `harness_digest` to
+        `state = "done"`, `outcome = "superseded_by_repair"`.
+      - Invoke `_supersede_ledger_candidates(...)` (failing soft if not yet wired).
+      - Clear `state["breaker_tripped"][mod]`.
+      - Never touch any previously `confirmed` task or finding.
+    Returns True when ledger supersession was attempted (so caller should reload `Ctx()`).
+    """
+    run_dir = Path(".")
+    tripped_map = state.get("breaker_tripped")
+    if not isinstance(tripped_map, dict):
+        tripped_map = {}
+
+    superseded_all: list[str] = []
+    cleared_mods: list[str] = []
+    ledger_results: dict[str, Any] = {}
+    reloaded_needed = False
+
+    mod_candidates = list(dict.fromkeys([str(module), *(ctx.harness_modules(str(module)) or [])]))
+    for mod_name in mod_candidates:
+        new_digest = phase0_gates.harness_digest(run_dir, mod_name, ignore_exempt=True)
+        if new_digest is None:
+            continue
+        tripped_rec = tripped_map.get(mod_name)
+        tripped_old_digest = tripped_rec.get("harness_digest") if isinstance(tripped_rec, dict) else None
+
+        mod_superseded: list[str] = []
+        old_digests: list[str] = []
+        for tid, t in sorted(state["tasks"].items()):
+            if t.get("state") != "paused_by_breaker":
+                continue
+            if not _verify_task_belongs_to_module(t, mod_name, ctx):
+                continue
+            pause_meta = t.get("paused_by_breaker")
+            old_dig = (
+                (pause_meta.get("harness_digest") if isinstance(pause_meta, dict) else None)
+                or t.get("harness_digest")
+                or tripped_old_digest
+            )
+            if old_dig == new_digest:
+                continue
+            sup_reason = f"superseded_by_repair: harness {mod_name} repaired ({old_dig or 'unknown'} -> {new_digest})"
+            _finish(state, t, "done", "superseded_by_repair", reason=sup_reason)
+            mod_superseded.append(tid)
+            if isinstance(old_dig, str) and old_dig and old_dig not in old_digests:
+                old_digests.append(old_dig)
+
+        should_clear = bool(mod_superseded) or (
+            isinstance(tripped_rec, dict) and tripped_old_digest != new_digest
+        )
+        if not should_clear:
+            continue
+
+        primary_old = (
+            str(tripped_old_digest)
+            if isinstance(tripped_old_digest, str) and tripped_old_digest
+            else (old_digests[0] if old_digests else None)
+        )
+        reason = f"harness {mod_name} repaired ({primary_old or 'unknown'} -> {new_digest})"
+        ledger_results[mod_name] = _supersede_ledger_candidates(run_dir, mod_name, primary_old, reason)
+        reloaded_needed = True
+        if mod_name in tripped_map:
+            del tripped_map[mod_name]
+            cleared_mods.append(mod_name)
+            _event(state, "circuit_breaker_cleared", f"repair:{mod_name}", module=mod_name, harness_digest=new_digest)
+        superseded_all.extend(mod_superseded)
+
+    if superseded_all:
+        out["superseded_tasks"] = superseded_all
+    if cleared_mods:
+        out["breaker_cleared"] = cleared_mods
+    if ledger_results:
+        out["ledger_supersede"] = ledger_results
+    return reloaded_needed
 
 
 def cmd_refresh(module: str | None = None) -> dict:
@@ -5161,10 +5578,16 @@ def cmd_refresh(module: str | None = None) -> dict:
             else:
                 _finish(state, task, "done", "refreshed")
                 out["repair"] = "done"
+                if _supersede_after_repair(state, ctx, str(module), out):
+                    ctx = Ctx()
                 if targets:
                     # Only the facts lag behind the Eva report. `facts-<mod>` tolerates a failure (Make `-`), so a
                     # missing facts file must not hold the repair: it is named, not enforced.
                     out["targets"] = targets
+        elif module and (state.get("breaker_tripped") or {}).get(str(module)):
+            stale, _targets = _stale_repair_evidence(ctx, str(module))
+            if not stale and _supersede_after_repair(state, ctx, str(module), out):
+                ctx = Ctx()
         out["sync"] = _sync(state, ctx)
         save_schedule(state)
     return out
