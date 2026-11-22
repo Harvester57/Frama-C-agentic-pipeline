@@ -140,6 +140,11 @@
       "uniqueItems": true
     },
     "unspent_budget_s": {"type": ["number", "null"], "minimum": 0},
+    "stopped_reason": {
+      "type": "string",
+      "enum": ["budget", "plateau", "crash"]
+    },
+    "cpu_saved_s": {"type": "number", "minimum": 0},
     "telemetry": {"$ref": "#/definitions/telemetry"},
     "artifacts": {
       "type": "array",
