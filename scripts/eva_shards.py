@@ -811,6 +811,16 @@ def concat_flamegraphs(sources: list[Path], dest: Path) -> bool:
     return True
 
 
+def _shards_cache(shards: list[Shard]) -> dict:
+    """The merged report's cache record: a hit when every shard hit, with the reasons shards went uncached."""
+    records = [s.run.report.get("cache") or {} for s in shards]
+    out: dict = {"hit": all(r.get("hit") for r in records), "key": None}
+    reasons = [f"shard {s.index}: {r['reason']}" for s, r in zip(shards, records, strict=True) if r.get("reason")]
+    if reasons:
+        out["reason"] = "; ".join(reasons[:3]) + (f"; and {len(reasons) - 3} more shard(s)" if len(reasons) > 3 else "")
+    return out
+
+
 def _shard_row(s: Shard) -> dict:
     r = s.run.report
     return {
@@ -909,7 +919,7 @@ def merge(
             or phase0_gates.derived_harness_digest(
                 Path("."), module, [Path(p) for s in shards if (p := s.run.report.get("_path"))]
             ),
-            "cache": {"hit": all((s.run.report.get("cache") or {}).get("hit") for s in shards), "key": None},
+            "cache": _shards_cache(shards),
             "flows": merge_flows([s.run.report.get("flows") for s in shards]),
             "nonterm": _union(s.run.report.get("nonterm") for s in shards),
             "repair_hints": _union(s.run.report.get("repair_hints") for s in shards),

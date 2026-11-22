@@ -12,10 +12,16 @@ from __future__ import annotations
 import subprocess
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import cache
+import eacsl_toolchain as T
+import eva_shards
+import fuzz_build
+import run_eacsl_fuzz as R
+from test_cache import FakeToolchain, _module
 
 CDS_N_SOURCES = 150
 CDS_SINGLE_CALL_LIMIT = 40
@@ -122,7 +128,10 @@ def test_large_module_manifest_survives_a_per_call_timeout(cds_run):
 
 
 def test_chunked_manifest_and_key_equal_the_single_call_ones(cds_run):
-    """Same files, same digests, same order: the cache keys of existing entries do not change."""
+    """
+    Same files, same digests, same order: chunking leaves the manifest, so the key under given
+    scripts, unchanged. (Any edit under scripts/ still changes every key through scripts_digest.)
+    """
     _, srcs = cds_run
     chunked = cache.dependency_manifest(srcs, ["-Iinc"], runner=CdsRunner(limit=None))
     expected = _cds_expected(srcs)
@@ -185,7 +194,40 @@ def test_a_replaced_manifest_function_without_reason_still_reports_one(cds_run, 
     assert res["cache"]["key"] is None and res["cache"]["reason"]
 
 
-@pytest.mark.parametrize(("env", "expected"), [("1.5", 1), ("0.4", 1), ("3", 3), ("junk", None)])
+class CdsSlowScanToolchain(FakeToolchain):
+    """test_cache's E-ACSL toolchain, whose `-M` scans time out like sudoers_so's on a loaded machine."""
+
+    def __call__(self, cmd, **kwargs):
+        if "-M" in cmd:
+            self.calls.append(list(cmd))
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        return super().__call__(cmd, **kwargs)
+
+
+def test_an_eacsl_build_record_carries_the_reason(cds_run, monkeypatch):
+    run, _ = cds_run
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(T.shutil, "which", lambda name: None)
+    _module(run)
+    res = R.compile_eacsl_binary(["mod.c"], Path("bin/fuzz_mod"), cppflags="-Iinc", runner=CdsSlowScanToolchain())
+    assert res["returncode"] == 0
+    rec = res["cache"]
+    assert rec["hit"] is False and rec["key"] is None
+    assert "gcc -M -MG timed out" in rec["reason"] and "mod.c" in rec["reason"]
+
+
+def test_sharded_eva_report_keeps_the_shards_reasons():
+    def shard(i, rec):
+        return eva_shards.Shard(index=i, cases=[i], run=SimpleNamespace(report={"cache": rec}))
+
+    merged = eva_shards._shards_cache(
+        [shard(0, {"hit": False, "key": None, "reason": "clang -M -MG exit 1"}), shard(1, {"hit": True, "key": "k"})]
+    )
+    assert merged == {"hit": False, "key": None, "reason": "shard 0: clang -M -MG exit 1"}
+    assert eva_shards._shards_cache([shard(0, {"hit": True, "key": "k"})]) == {"hit": True, "key": None}
+
+
+@pytest.mark.parametrize(("env", "expected"), [("1.5", 1), ("0.4", 1), ("3", 3), ("junk", None), ("inf", None)])
 def test_scan_workers_follow_the_job_cpu_grant(monkeypatch, env, expected):
     monkeypatch.setenv("FRAMAC_JOB_CPUS", env)
     workers = cache.deps_scan_workers(100)

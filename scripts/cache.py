@@ -1118,7 +1118,7 @@ def deps_scan_workers(n_chunks: int) -> int:
     try:
         if raw:
             cpus = max(1, int(float(raw)))
-    except ValueError:
+    except (ValueError, OverflowError):
         cpus = None
     if cpus is None:
         try:
