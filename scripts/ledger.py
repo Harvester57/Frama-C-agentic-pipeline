@@ -529,7 +529,16 @@ def upsert_candidate(
             # The E-ACSL or Eva reading of a site a sanitizer saw first names the bug better.
             cand["property"] = prop
     if isinstance(harness_digest, str) and harness_digest:
-        cand["harness_digest"] = harness_digest
+        mod_digests = cand.setdefault("module_harness_digests", {})
+        primary_mod = str(cand.get("module") or "").strip()
+        primary_digest = cand.get("harness_digest")
+        if primary_mod and isinstance(primary_digest, str) and primary_digest and primary_mod not in mod_digests:
+            mod_digests[primary_mod] = primary_digest
+        obs_mod = str(module or "").strip()
+        if obs_mod:
+            mod_digests[obs_mod] = harness_digest
+        if not primary_mod or primary_mod == obs_mod or not primary_digest:
+            cand["harness_digest"] = harness_digest
     if discovering_step in ("explore", "judge", "eacsl_fuzz") and not cand.get("discovering_step"):
         cand["discovering_step"] = discovering_step
     if proposed == "confirmed":
@@ -3106,6 +3115,24 @@ def _maybe_chdir(target: Path | None):
         os.chdir(prev)
 
 
+def _tool_output_module(tool_output: Any) -> str | None:
+    if not isinstance(tool_output, str) or not tool_output:
+        return None
+    p = Path(tool_output)
+    if p.suffix == ".json" and p.stem:
+        return p.stem
+    return None
+
+
+def _candidate_observed_by_module(cand: dict, module: str) -> bool:
+    for obs in cand.get("observations") or []:
+        if not isinstance(obs, dict):
+            continue
+        if obs.get("module") == module or _tool_output_module(obs.get("tool_output")) == module:
+            return True
+    return False
+
+
 def cmd_supersede_candidates(
     module: str,
     old_harness_digest: str | None = None,
@@ -3116,6 +3143,11 @@ def cmd_supersede_candidates(
     """
     Mark unverified candidates of `module` from `old_harness_digest` as `superseded_by_repair`
     (P5 verifier circuit breaker).
+
+    When a candidate was observed by multiple modules (`module_harness_digests`), repairing one
+    module removes only that module's active digest (recording it under `superseded_module_digests`
+    and deterministically re-homing `module`/`harness_digest` when needed) so the candidate remains
+    `unverified` until every observing module is repaired.
 
     CRITICAL INVARIANT: Never modifies `findings.json`, never touches any candidate whose status
     is not `"unverified"`, and never touches any candidate whose fingerprint (or resolved
@@ -3130,12 +3162,36 @@ def cmd_supersede_candidates(
         current_digest = phase0_gates.harness_digest(Path("."), module, ignore_exempt=True)
 
         superseded_fps: list[str] = []
+        partially_superseded_fps: list[str] = []
         untouched_confirmed = 0
         for fp, cand in sorted(candidates.items()):
             cand_mod = str(cand.get("module") or "")
             cand_harness = _candidate_harness_module(mm, cand)
-            if module not in (cand_mod, cand_harness):
-                continue
+            raw_mod_digests = cand.get("module_harness_digests")
+            mod_digests: dict[str, str] = (
+                {
+                    str(k): str(v)
+                    for k, v in raw_mod_digests.items()
+                    if isinstance(k, str) and k and isinstance(v, str) and v
+                }
+                if isinstance(raw_mod_digests, dict)
+                else {}
+            )
+            has_mod_digests = bool(mod_digests)
+
+            matched_mod_key: str | None = None
+            direct_module_match = module in (cand_mod, cand_harness)
+            if has_mod_digests:
+                if module in mod_digests:
+                    matched_mod_key = module
+                elif cand_harness == module and cand_mod in mod_digests:
+                    matched_mod_key = cand_mod
+                else:
+                    continue
+            else:
+                observed_match = _candidate_observed_by_module(cand, module)
+                if not (direct_module_match or observed_match):
+                    continue
 
             resolved_fps = list(cand.get("resolved_fingerprints") or [fp])
             is_confirmed = (
@@ -3148,18 +3204,42 @@ def cmd_supersede_candidates(
             if cand.get("status") != "unverified":
                 continue
 
-            cand_digest = cand.get("harness_digest") if isinstance(cand.get("harness_digest"), str) else None
-            if old_harness_digest is not None:
-                if cand_digest is not None:
-                    if cand_digest != old_harness_digest:
+            if has_mod_digests and matched_mod_key is not None:
+                active_digest = mod_digests[matched_mod_key]
+                if old_harness_digest is not None and active_digest != old_harness_digest:
+                    continue
+                remaining = {m: d for m, d in mod_digests.items() if m != matched_mod_key}
+                sup_map = cand.setdefault("superseded_module_digests", {})
+                sup_map[matched_mod_key] = active_digest
+                if remaining:
+                    cand["module_harness_digests"] = dict(sorted(remaining.items()))
+                    if cand_mod == matched_mod_key or cand_mod not in remaining:
+                        next_mod, next_digest = sorted(remaining.items())[0]
+                        cand["module"] = next_mod
+                        cand["harness_digest"] = next_digest
+                    else:
+                        cand["harness_digest"] = remaining[cand_mod]
+                    partially_superseded_fps.append(fp)
+                    continue
+                cand["module_harness_digests"] = {}
+            else:
+                cand_digest = cand.get("harness_digest") if isinstance(cand.get("harness_digest"), str) else None
+                if not direct_module_match:
+                    # Legacy multi-module candidate without `module_harness_digests` where `module`
+                    # appears in observations: match only on an explicit digest match.
+                    if old_harness_digest is None or cand_digest != old_harness_digest:
                         continue
-                else:
-                    # Legacy candidate without an embedded harness_digest: supersede only when
-                    # the harness was repaired away from old_harness_digest and origin is harness-based.
-                    if cand.get("origin") not in ("fuzz", "eva"):
-                        continue
-                    if current_digest is not None and current_digest == old_harness_digest:
-                        continue
+                elif old_harness_digest is not None:
+                    if cand_digest is not None:
+                        if cand_digest != old_harness_digest:
+                            continue
+                    else:
+                        # Legacy candidate without an embedded harness_digest: supersede only when
+                        # the harness was repaired away from old_harness_digest and origin is harness-based.
+                        if cand.get("origin") not in ("fuzz", "eva"):
+                            continue
+                        if current_digest is not None and current_digest == old_harness_digest:
+                            continue
 
             cand["status"] = "superseded_by_repair"
             cand["superseded_reason"] = reason_text
@@ -3198,7 +3278,7 @@ def cmd_supersede_candidates(
                         u["agent_id"] = None
                         u["unresolved"] = []
 
-        if superseded_fps:
+        if superseded_fps or partially_superseded_fps:
             commit(units, candidates)
 
         return {
@@ -3207,6 +3287,8 @@ def cmd_supersede_candidates(
             "reason": reason_text,
             "superseded": len(superseded_fps),
             "superseded_fingerprints": superseded_fps,
+            "partially_superseded": len(partially_superseded_fps),
+            "partially_superseded_fingerprints": partially_superseded_fps,
             "untouched_confirmed": untouched_confirmed,
         }
 

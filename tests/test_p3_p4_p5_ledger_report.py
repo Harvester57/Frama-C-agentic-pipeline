@@ -746,6 +746,381 @@ def test_supersede_candidates_preserves_confirmed_and_fresh_digest_and_interops_
     assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
 
 
+def _seed_iolog_multimod(run_dir: Path) -> None:
+    dag = {
+        "callgraph_source": "frama_c",
+        "modules": {
+            "libsudo_iolog_a": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"},
+            "sudo_logsrvd": {"tier": "Tier 1A (Untrusted Binary / Network Parser)"},
+        },
+        "functions": {
+            "iolog_gets": {
+                "name": "iolog_gets",
+                "file": "lib/iolog/iolog_fileio.c",
+                "module": "libsudo_iolog_a",
+                "wave": 0,
+                "has_loops": False,
+                "security_properties": [],
+            },
+            "iolog_write": {
+                "name": "iolog_write",
+                "file": "lib/iolog/iolog_fileio.c",
+                "module": "libsudo_iolog_a",
+                "wave": 0,
+                "has_loops": False,
+                "security_properties": [],
+            },
+            "logsrvd_main": {
+                "name": "logsrvd_main",
+                "file": "logsrvd/logsrvd.c",
+                "module": "sudo_logsrvd",
+                "wave": 1,
+                "has_loops": False,
+                "security_properties": [],
+            },
+        },
+    }
+    write_json(run_dir / "workspace/reports/callgraph_dag.json", dag)
+    L.cmd_seed(run_dir / "workspace/reports/callgraph_dag.json", [], "frama_c")
+
+
+def test_multimodule_shared_candidate_digest_tracking_partial_and_full_supersede(run_dir: Path) -> None:
+    _seed_iolog_multimod(run_dir)
+    digest_iolog = "1" * 64
+    digest_logsrvd = "2" * 64
+    digest_wrong = "9" * 64
+
+    fp_gets = make_fingerprint("lib/iolog/iolog_fileio.c", "iolog_gets", "mem_access", PRED_MEM)
+    fp_write = make_fingerprint("lib/iolog/iolog_fileio.c", "iolog_write", "signed_overflow", PRED_OVF)
+
+    c_iolog = run_dir / "workspace/crashes/libsudo_iolog_a"
+    c_logsrvd = run_dir / "workspace/crashes/sudo_logsrvd"
+    c_iolog.mkdir(parents=True, exist_ok=True)
+    c_logsrvd.mkdir(parents=True, exist_ok=True)
+    for p in (c_iolog / "crash-gets", c_iolog / "crash-write", c_logsrvd / "crash-gets", c_logsrvd / "crash-write"):
+        p.write_bytes(p.name.encode("utf-8"))
+
+    # 1) libsudo_iolog_a observes both iolog_gets (fuzz) and iolog_write (fuzz).
+    fuzz_iolog = run_dir / "workspace/reports/fuzz/libsudo_iolog_a.json"
+    write_json(
+        fuzz_iolog,
+        {
+            **_valid_explore_report("libsudo_iolog_a", status="crash_found"),
+            "harness_digest": digest_iolog,
+            "artifacts": [
+                {
+                    "artifact": str(c_iolog / "crash-gets"),
+                    "kind": "crash",
+                    "sha256": "a" * 64,
+                    "size_bytes": 10,
+                    "reproducible": True,
+                    "engine": "sanitizers",
+                    "fingerprint": fp_gets,
+                    "failure": {
+                        "file": "lib/iolog/iolog_fileio.c",
+                        "line": 120,
+                        "function": "iolog_gets",
+                        "kind": "asan_heap_buffer_overflow",
+                        "alarm_kind": "mem_access",
+                        "predicate": PRED_MEM,
+                    },
+                },
+                {
+                    "artifact": str(c_iolog / "crash-write"),
+                    "kind": "crash",
+                    "sha256": "b" * 64,
+                    "size_bytes": 11,
+                    "reproducible": True,
+                    "engine": "sanitizers",
+                    "fingerprint": fp_write,
+                    "failure": {
+                        "file": "lib/iolog/iolog_fileio.c",
+                        "line": 210,
+                        "function": "iolog_write",
+                        "kind": "ubsan_signed_overflow",
+                        "alarm_kind": "signed_overflow",
+                        "predicate": PRED_OVF,
+                    },
+                },
+            ],
+        },
+    )
+
+    # 2) sudo_logsrvd observes iolog_gets via fuzz and iolog_write via judge with its OWN digest.
+    fuzz_logsrvd = run_dir / "workspace/reports/fuzz/sudo_logsrvd.json"
+    write_json(
+        fuzz_logsrvd,
+        {
+            **_valid_explore_report("sudo_logsrvd", status="crash_found"),
+            "harness_digest": digest_logsrvd,
+            "artifacts": [
+                {
+                    "artifact": str(c_logsrvd / "crash-gets"),
+                    "kind": "crash",
+                    "sha256": "c" * 64,
+                    "size_bytes": 10,
+                    "reproducible": True,
+                    "engine": "sanitizers",
+                    "fingerprint": fp_gets,
+                    "failure": {
+                        "file": "lib/iolog/iolog_fileio.c",
+                        "line": 120,
+                        "function": "iolog_gets",
+                        "kind": "asan_heap_buffer_overflow",
+                        "alarm_kind": "mem_access",
+                        "predicate": PRED_MEM,
+                    },
+                }
+            ],
+        },
+    )
+    judge_logsrvd = run_dir / "workspace/reports/judge/sudo_logsrvd.json"
+    write_json(
+        judge_logsrvd,
+        _valid_judge_report(
+            "sudo_logsrvd",
+            status="crash_found",
+            passed=4,
+            failed=1,
+            harness_digest=digest_logsrvd,
+            artifacts=[
+                {
+                    "artifact": str(c_logsrvd / "crash-write"),
+                    "kind": "crash",
+                    "sha256": "d" * 64,
+                    "size_bytes": 11,
+                    "case": 0,
+                    "engine": "eacsl",
+                    "discovering_step": "judge",
+                    "reproducible": True,
+                    "standalone_confirmed": True,
+                    "returncode": 134,
+                    "timed_out": False,
+                    "fingerprint": fp_write,
+                    "failure": {
+                        "file": "lib/iolog/iolog_fileio.c",
+                        "line": 210,
+                        "function": "iolog_write",
+                        "kind": "assertion",
+                        "alarm_kind": "signed_overflow",
+                        "predicate": PRED_OVF,
+                    },
+                }
+            ],
+        ),
+    )
+
+    L.cmd_ingest_fuzz([fuzz_iolog, fuzz_logsrvd])
+
+    # Both digests are recorded in module_harness_digests and top-level harness_digest is NOT clobbered!
+    cands = {c["fingerprint"]: c for c in load(run_dir / "candidates.json")}
+    for fp in (fp_gets, fp_write):
+        assert cands[fp]["module"] == "libsudo_iolog_a"
+        assert cands[fp]["harness_digest"] == digest_iolog
+        assert cands[fp]["module_harness_digests"] == {
+            "libsudo_iolog_a": digest_iolog,
+            "sudo_logsrvd": digest_logsrvd,
+        }
+    assert list(V.validate_candidates(list(cands.values()))) == []
+    assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+    # 3) Partial supersede: only libsudo_iolog_a is repaired -> candidates stay unverified and re-home to sudo_logsrvd.
+    res_part = L.cmd_supersede_candidates(
+        module="libsudo_iolog_a",
+        old_harness_digest=digest_iolog,
+        reason="libsudo_iolog_a repaired",
+        run_dir=run_dir,
+    )
+    assert res_part["superseded"] == 0
+    assert res_part["partially_superseded"] == 2
+    assert set(res_part["partially_superseded_fingerprints"]) == {fp_gets, fp_write}
+
+    after_part = {c["fingerprint"]: c for c in load(run_dir / "candidates.json")}
+    units_part = units_by_id(run_dir)
+    for fp, cid in (
+        (fp_gets, "lib/iolog/iolog_fileio.c#iolog_gets::rte"),
+        (fp_write, "lib/iolog/iolog_fileio.c#iolog_write::rte"),
+    ):
+        assert after_part[fp]["status"] == "unverified"
+        assert after_part[fp]["module"] == "sudo_logsrvd"
+        assert after_part[fp]["harness_digest"] == digest_logsrvd
+        assert after_part[fp]["module_harness_digests"] == {"sudo_logsrvd": digest_logsrvd}
+        assert after_part[fp]["superseded_module_digests"] == {"libsudo_iolog_a": digest_iolog}
+        assert units_part[cid]["status"] == "candidate"
+    assert list(V.validate_candidates(list(after_part.values()))) == []
+    assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+    # Re-running libsudo_iolog_a supersede is idempotent; wrong digest for sudo_logsrvd does nothing.
+    res_dup = L.cmd_supersede_candidates("libsudo_iolog_a", digest_iolog, "repeat", run_dir=run_dir)
+    assert res_dup["superseded"] == 0
+    assert res_dup["partially_superseded"] == 0
+    res_wrong = L.cmd_supersede_candidates("sudo_logsrvd", digest_wrong, "wrong digest", run_dir=run_dir)
+    assert res_wrong["superseded"] == 0
+    assert res_wrong["partially_superseded"] == 0
+
+    # 4) Full supersede: sudo_logsrvd is now repaired too -> candidates transition to superseded_by_repair and units reset to planned!
+    res_full = L.cmd_supersede_candidates(
+        module="sudo_logsrvd",
+        old_harness_digest=digest_logsrvd,
+        reason="sudo_logsrvd repaired",
+        run_dir=run_dir,
+    )
+    assert res_full["superseded"] == 2
+    assert res_full["partially_superseded"] == 0
+    assert set(res_full["superseded_fingerprints"]) == {fp_gets, fp_write}
+
+    after_full = {c["fingerprint"]: c for c in load(run_dir / "candidates.json")}
+    units_full = units_by_id(run_dir)
+    for fp, cid in (
+        (fp_gets, "lib/iolog/iolog_fileio.c#iolog_gets::rte"),
+        (fp_write, "lib/iolog/iolog_fileio.c#iolog_write::rte"),
+    ):
+        assert after_full[fp]["status"] == "superseded_by_repair"
+        assert after_full[fp]["superseded_reason"] == "sudo_logsrvd repaired"
+        assert after_full[fp]["superseded_at"]
+        assert after_full[fp]["superseded_from_harness_digest"] == digest_logsrvd
+        assert after_full[fp]["module_harness_digests"] == {}
+        assert after_full[fp]["superseded_module_digests"] == {
+            "libsudo_iolog_a": digest_iolog,
+            "sudo_logsrvd": digest_logsrvd,
+        }
+        assert units_full[cid]["status"] == "planned"
+        assert units_full[cid]["result_fingerprints"] == []
+    assert list(V.validate_candidates(list(after_full.values()))) == []
+    assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_multimodule_shared_confirmed_candidate_never_touched_and_legacy_fallback(run_dir: Path) -> None:
+    _seed_iolog_multimod(run_dir)
+    digest_iolog = "3" * 64
+    digest_logsrvd = "4" * 64
+
+    fp_confirmed = make_fingerprint("lib/iolog/iolog_fileio.c", "iolog_gets", "mem_access", PRED_MEM)
+    fp_legacy = make_fingerprint("lib/iolog/iolog_fileio.c", "iolog_write", "signed_overflow", PRED_OVF)
+
+    crash = run_dir / "workspace/crashes/libsudo_iolog_a/crash-1"
+    crash.parent.mkdir(parents=True, exist_ok=True)
+    crash.write_bytes(b"xyz")
+    write_json(
+        run_dir / "workspace/reports/fuzz/libsudo_iolog_a.json",
+        {**_valid_explore_report("libsudo_iolog_a", status="crash_found"), "harness_digest": digest_iolog},
+    )
+    write_json(
+        run_dir / "workspace/reports/fuzz/sudo_logsrvd.json",
+        {**_valid_explore_report("sudo_logsrvd", status="crash_found"), "harness_digest": digest_logsrvd},
+    )
+
+    confirmed = confirmed_record(fp_confirmed)
+    confirmed["location"] = {"file": "lib/iolog/iolog_fileio.c", "line": 120, "function": "iolog_gets"}
+    confirmed["linked_units"] = ["lib/iolog/iolog_fileio.c#iolog_gets::rte"]
+    confirmed["reproducers"][0]["sha256"] = hashlib.sha256(b"xyz").hexdigest()
+    write_json(run_dir / "findings.json", [confirmed])
+    findings_bytes_before = (run_dir / "findings.json").read_bytes()
+
+    # Candidate 1: verified + confirmed shared by both modules.
+    # Candidate 2: legacy pre-fix candidate without module_harness_digests whose top-level harness_digest
+    #              was overwritten by sudo_logsrvd while module stayed libsudo_iolog_a.
+    cands = [
+        {
+            "fingerprint": fp_confirmed,
+            "status": "verified",
+            "origin": "fuzz",
+            "proposed_verdict": "confirmed",
+            "module": "libsudo_iolog_a",
+            "location": {"file": "lib/iolog/iolog_fileio.c", "line": 120, "function": "iolog_gets"},
+            "property": {"kind": "mem_access", "predicate": PRED_MEM},
+            "reproducers": ["workspace/crashes/libsudo_iolog_a/crash-1"],
+            "tool_outputs": [
+                "workspace/reports/fuzz/libsudo_iolog_a.json",
+                "workspace/reports/fuzz/sudo_logsrvd.json",
+            ],
+            "linked_units": ["lib/iolog/iolog_fileio.c#iolog_gets::rte"],
+            "first_seen": "2026-11-22T12:00:00Z",
+            "harness_digest": digest_iolog,
+            "module_harness_digests": {
+                "libsudo_iolog_a": digest_iolog,
+                "sudo_logsrvd": digest_logsrvd,
+            },
+        },
+        {
+            "fingerprint": fp_legacy,
+            "status": "unverified",
+            "origin": "fuzz",
+            "proposed_verdict": "confirmed",
+            "module": "libsudo_iolog_a",
+            "location": {"file": "lib/iolog/iolog_fileio.c", "line": 210, "function": "iolog_write"},
+            "property": {"kind": "signed_overflow", "predicate": PRED_OVF},
+            "reproducers": ["workspace/crashes/libsudo_iolog_a/crash-1"],
+            "tool_outputs": [
+                "workspace/reports/fuzz/libsudo_iolog_a.json",
+                "workspace/reports/fuzz/sudo_logsrvd.json",
+            ],
+            "linked_units": ["lib/iolog/iolog_fileio.c#iolog_write::rte"],
+            "first_seen": "2026-11-22T12:00:00Z",
+            "harness_digest": digest_logsrvd,
+            "observations": [
+                {
+                    "fingerprint": fp_legacy,
+                    "origin": "fuzz",
+                    "engine": "sanitizers",
+                    "kind": "signed_overflow",
+                    "message": PRED_OVF,
+                    "tool_output": "workspace/reports/fuzz/sudo_logsrvd.json",
+                    "reproducer": "workspace/crashes/libsudo_iolog_a/crash-1",
+                }
+            ],
+        },
+    ]
+    write_json(run_dir / "candidates.json", sorted(cands, key=lambda c: c["fingerprint"]))
+
+    ledger_rows = load(run_dir / "coverage-ledger.json")
+    for u in ledger_rows:
+        if u["coverage_id"] == "lib/iolog/iolog_fileio.c#iolog_gets::rte":
+            u["status"] = "candidate"
+            u["result_fingerprints"] = [fp_confirmed]
+            u["evidence"] = [
+                evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/libsudo_iolog_a.json")
+            ]
+        elif u["coverage_id"] == "lib/iolog/iolog_fileio.c#iolog_write::rte":
+            u["status"] = "candidate"
+            u["result_fingerprints"] = [fp_legacy]
+            u["evidence"] = [
+                evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/sudo_logsrvd.json")
+            ]
+    write_json(run_dir / "coverage-ledger.json", ledger_rows)
+
+    # Superseding libsudo_iolog_a touches neither confirmed nor legacy (digest mismatch on legacy).
+    r1 = L.cmd_supersede_candidates("libsudo_iolog_a", digest_iolog, "iolog repaired", run_dir=run_dir)
+    assert r1["superseded"] == 0
+    assert r1["partially_superseded"] == 0
+    assert r1["untouched_confirmed"] == 1
+
+    # Superseding sudo_logsrvd supersedes the legacy observation-matched candidate, NEVER the confirmed one!
+    r2 = L.cmd_supersede_candidates("sudo_logsrvd", digest_logsrvd, "logsrvd repaired", run_dir=run_dir)
+    assert r2["superseded"] == 1
+    assert r2["superseded_fingerprints"] == [fp_legacy]
+    assert r2["untouched_confirmed"] == 1
+
+    # CRITICAL INVARIANT: findings.json is byte-identical, confirmed candidate is completely untouched.
+    assert (run_dir / "findings.json").read_bytes() == findings_bytes_before
+    after = {c["fingerprint"]: c for c in load(run_dir / "candidates.json")}
+    assert after[fp_confirmed]["status"] == "verified"
+    assert after[fp_confirmed]["module"] == "libsudo_iolog_a"
+    assert after[fp_confirmed]["harness_digest"] == digest_iolog
+    assert after[fp_confirmed]["module_harness_digests"] == {
+        "libsudo_iolog_a": digest_iolog,
+        "sudo_logsrvd": digest_logsrvd,
+    }
+    assert "superseded_module_digests" not in after[fp_confirmed]
+    assert after[fp_legacy]["status"] == "superseded_by_repair"
+
+    units = units_by_id(run_dir)
+    assert units["lib/iolog/iolog_fileio.c#iolog_gets::rte"]["status"] == "candidate"
+    assert units["lib/iolog/iolog_fileio.c#iolog_write::rte"]["status"] == "planned"
+    assert list(V.validate_candidates(list(after.values()))) == []
+    assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
 # ---------------------------------------------------------------------------
 # 4. validate_artifacts.py run-dir with smoke, judge, fuzz & Phase 0 artifacts
 # ---------------------------------------------------------------------------
