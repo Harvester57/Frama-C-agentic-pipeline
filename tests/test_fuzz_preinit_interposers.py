@@ -250,7 +250,7 @@ def test_the_sandbox_preexec_ignores_sigpipe_only_when_asked(monkeypatch):
     S._make_preexec(S.Limits())()
     assert calls == []
     S._make_preexec(S.Limits(ignore_sigpipe=True))()
-    assert calls == [(signal.SIGPIPE, signal.SIG_IGN)]
+    assert calls == [(getattr(signal, "SIGPIPE"), signal.SIG_IGN)]  # noqa: B009 (POSIX-only name; mypy on Windows)
 
 
 # --- Bug A: what the keep-going report says ------------------------------------------------------
