@@ -164,6 +164,7 @@ from failure_identity import (  # noqa: E402, F401
     _resolve_source_candidates,
     failure_fingerprint,
     is_harness_fuzz_function,
+    is_pure_harness_crash,
     is_runtime_function,
     is_startup_failure,
     needs_attribution,
@@ -1978,6 +1979,16 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
     return merged
 
 
+def _is_harness_self_fault(
+    failure: dict[str, Any] | None,
+    frames: Sequence[dict[str, Any] | re.Match[str]] | None,
+) -> bool:
+    """True when `failure` + `frames` indicate a pure-harness fault with zero target stack frames."""
+    if not isinstance(failure, dict):
+        return False
+    return bool(failure.get("harness_self_fault") is True or is_pure_harness_crash(failure, frames))
+
+
 def classify_campaign(returncode: int, timed_out: bool, artifacts: list[dict]) -> str:
     kinds = {a["kind"] for a in artifacts}
     if "crash" in kinds or "leak" in kinds:
@@ -2326,7 +2337,8 @@ def _run_fuzz_campaign_once(
                 )
                 entry["reproducible"] = replay["reproduced"]
                 entry["replay_log_tail"] = replay["log_tail"]
-                entry["frames"] = replay.get("frames") or []
+                eff_frames: list[dict[str, Any]] = list(replay.get("frames") or [])
+                entry["frames"] = eff_frames
                 entry["failure_source"] = "primary" if failure else None
                 if not stub_abort and needs_attribution(failure):
                     san_bin = _attribution_binary()
@@ -2347,6 +2359,7 @@ def _run_fuzz_campaign_once(
                         elif san_replay["failure"] and not needs_attribution(san_replay["failure"]):
                             failure = san_replay["failure"]
                             entry["failure_source"] = "sanitizer_replay"
+                            eff_frames = list(san_replay.get("frames") or eff_frames)
                 entry["failure"] = failure
                 if stub_abort is not None:
                     entry["link_stub_abort"] = stub_abort
@@ -2374,6 +2387,8 @@ def _run_fuzz_campaign_once(
                         failure["alarm_kind"] or failure["kind"],
                         failure["predicate"],
                     )
+                    if _is_harness_self_fault(failure, eff_frames):
+                        entry["harness_self_fault"] = True
             artifacts.append(entry)
         replay_s = max(0.0, time.monotonic() - replay_started)
 
@@ -5789,6 +5804,7 @@ def run_judge(
                 cross_link_keys.add(lkey)
                 cross_links.append(lk)
 
+        art_frames = (standalone_rep.get("frames") if standalone_rep else None) or stack_frames(batch_output)
         art_entry: dict[str, Any] = {
             "artifact": culprit_path.as_posix(),
             "kind": _artifact_kind(culprit_path.name) or ("timeout" if batch_to else "crash"),
@@ -5804,13 +5820,15 @@ def run_judge(
             "failure": eff_failure,
             "failure_source": "primary" if eff_failure else None,
             "fingerprint": eff_fp,
-            "frames": (standalone_rep.get("frames") if standalone_rep else None) or stack_frames(batch_output),
+            "frames": art_frames,
             "replay_log_tail": (standalone_rep.get("log_tail") if standalone_rep else batch_output[-3000:]),
             "cross_engine_links": links,
             "harness_digest": harness_digest,
             "dispatch_case_count": n_cases,
             "dispatch_selector": selector if n_cases is not None else None,
         }
+        if _is_harness_self_fault(eff_failure, art_frames):
+            art_entry["harness_self_fault"] = True
         if eff_stub is not None:
             art_entry["link_stub_abort"] = eff_stub
         elif not eff_failure:
