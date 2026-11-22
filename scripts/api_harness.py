@@ -212,6 +212,13 @@ ARRAY_STRING_BYTES = 16  # the storage of each element of an array of `const` st
 # input bytes, its last byte 0. Small, since the slot is read whole or not at all; room for a dotted
 # IPv4 address or `/dev/ttyUSB0` and its NUL.
 STRING_SLOT_BYTES = 16
+# Under FRAMAC_API_TRUST_SCHEMA, a trusted NUL-terminated string (`const char *szLabel` the threat
+# model does not list as attacker data; QCBOR run-1's map labels) is bound to a fixed literal, a value
+# the application could pass: the one the target's tests pass most often (recorded seed traces), else
+# this one. Recorded strings longer than TRUSTED_STRING_MAX_BYTES, empty or not printable ASCII are
+# never taken.
+TRUSTED_STRING_DEFAULT = "a"
+TRUSTED_STRING_MAX_BYTES = 64
 # The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`,
 # and `nb` as a word (libmodbus's `nb`, `nb_bits`, `write_nb`, `read_nb`).
 _ARRAY_COUNT_RE = re.compile(
@@ -568,6 +575,9 @@ class ApiInfo:
     schema_inits: dict[str, tuple[int, str]] = field(default_factory=dict)
     schema_globals: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     schema_externs: dict[str, str] = field(default_factory=dict)
+    # Per function, per argument index: the string the recorded traces pass most often there
+    # (`recorded_strings`), the literal of a trusted string parameter (`_trusted_string_arg`).
+    trusted_strings: dict[str, dict[int, str]] = field(default_factory=dict)
 
 
 class _Case:
@@ -971,6 +981,80 @@ def _is_nullable_allocator_param(param_name: str | None, p: dict[str, Any]) -> b
         if isinstance(spelling, str) and "allocator" in spelling.lower():
             return True
     return False
+
+
+def _is_trusted_cstring(params: list[dict], formals: list[dict], rec: dict, i: int, role: str | None) -> bool:
+    """
+    Under `FRAMAC_API_TRUST_SCHEMA`, whether trusted parameter `i` is a NUL-terminated string the
+    application chooses (QCBOR's `const char *szLabel`), bound to a literal (`_trusted_string_arg`)
+    instead of exempting the entry point. Only a `char`/`signed char` pointee the model positively
+    marks read-only (`const_pointer`), with no size its call sites give and no length beside it:
+    a byte buffer (`void`, `unsigned char`), a fixed-size object, a (pointer, length) pair or a
+    pointer the callee may write keeps the `TRUSTED_PARAM_NO_INSTANCE_FMT` exemption.
+    """
+    if role != "trusted" or i >= len(params) or i >= len(formals):
+        return False
+    p = params[i]
+    if p.get("kind") != "ptr" or str(p.get("pointee") or "") not in ("char", "signed char"):
+        return False
+    if not isinstance(formals[i], dict) or formals[i].get("kind") != "const_pointer":
+        return False
+    if param_size(rec, i) is not None or _is_pair(params, i, formals):
+        return False
+    return not (i > 0 and _len_ptr_params(params, i - 1, formals, rec))
+
+
+def recorded_strings(traces: list[list[dict]] | None) -> dict[str, dict[int, str]]:
+    """
+    Per function and argument index, the NUL-terminated string (`s` records of seed_harvest.py
+    traces) the target's tests pass most often there; ties go to the shorter, then the smaller text.
+    Only printable ASCII of 1 to `TRUSTED_STRING_MAX_BYTES` bytes counts, so the literal is stable.
+    """
+    counts: dict[tuple[str, int], dict[str, int]] = {}
+    for trace in traces or []:
+        for call in trace:
+            fn = call.get("fn")
+            args = call.get("args")
+            if not isinstance(fn, str) or not isinstance(args, dict):
+                continue
+            for idx, vals in args.items():
+                if not str(idx).isdigit() or not isinstance(vals, list):
+                    continue
+                for val in vals:
+                    if not (isinstance(val, list) and len(val) == 3 and val[0] == "s" and isinstance(val[2], str)):
+                        continue
+                    try:
+                        data = bytes.fromhex(val[2])
+                    except ValueError:
+                        continue
+                    if not 0 < len(data) <= TRUSTED_STRING_MAX_BYTES or not all(0x20 <= b < 0x7F for b in data):
+                        continue
+                    seen = counts.setdefault((fn, int(idx)), {})
+                    text = data.decode("ascii")
+                    seen[text] = seen.get(text, 0) + 1
+    out: dict[str, dict[int, str]] = {}
+    for (fn, idx), seen in sorted(counts.items()):
+        out.setdefault(fn, {})[idx] = min(seen, key=lambda t: (-seen[t], len(t), t))
+    return out
+
+
+def _trusted_string_arg(case: _Case, call: int, i: int, p: dict, name: str) -> str:
+    """The argument of a trusted string parameter (`_is_trusted_cstring`): a string literal, no slot."""
+    recorded = (case.api.trusted_strings.get(name) or {}).get(i)
+    text = recorded if recorded is not None else TRUSTED_STRING_DEFAULT
+    literal = c_string_literal(text.encode("ascii"))
+    why = (
+        "the value the target's tests pass most often (recorded seed traces)"
+        if recorded is not None
+        else "a fixed literal (no value recorded from the target's tests)"
+    )
+    case.note(
+        call,
+        i,
+        f"trusted string parameter per threat model: the literal {literal}, {why}, a value the application "
+        "could pass; not read from the input",
+    )
+    return f"({p['type']}){literal}"
 
 
 def _strip_builder_pair_sizes(params: list[dict], formals: list[dict], rec: dict) -> dict:
@@ -2241,6 +2325,12 @@ def _bind_call(
             args.append("NULL")
             i += 1
             continue
+        if api.trust_schema and i not in shared and _is_trusted_cstring(params, formals, rec, i, role):
+            # QCBOR run-1: a label the application chooses (`const char *szLabel`) is a literal it
+            # could pass, never fuzz bytes; without it the entry point was exempted unreached.
+            args.append(_trusted_string_arg(case, call, i, p, name))
+            i += 1
+            continue
         htype = handles.get(i) if i not in shared and p["kind"] == "ptr" else None
         # A pointer to a struct the headers only declare is a handle or nothing: never a stack object.
         if htype is not None and (allow_init or _opaque(htype)):
@@ -3026,6 +3116,7 @@ def _single_cases_for_entry(
                 and not has_builder
                 and _table_type(api, p) is None
                 and not _is_nullable_allocator_param(pname, p)
+                and not _is_trusted_cstring(params, formals, model_rec, i, role)
             ):
                 insts = _lookup_schema_instances(api, pointee, decl)
                 if not insts:
@@ -4350,6 +4441,7 @@ def plan(
         byval_inits=byval_inits,
         schema_inits=schema_inits,
         schema_globals=schema_globals,
+        trusted_strings=recorded_strings(traces) if effective_trust_schema else {},
     )
     header_entries: list[tuple[str, str]] = []
     for key in entries:
