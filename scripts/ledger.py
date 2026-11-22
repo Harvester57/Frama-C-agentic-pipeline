@@ -1794,6 +1794,7 @@ _PHASE1_STATUS_RESULTS = frozenset(
         "fuzz_keep_going_error",
         "fuzz_meta_not_checked",
         "harness_smoke_quarantined",
+        "harness_self_fault_rejected",
         "judge_clean",
         "judge_blinded",
         "judge_partial_blinded",
@@ -1854,6 +1855,166 @@ def _is_smoke_quarantined_artifact(art: dict, smoke_skipped: set[int]) -> tuple[
     if isinstance(case_idx, int) and not isinstance(case_idx, bool) and case_idx in smoke_skipped:
         return True, f"dispatch case {case_idx} quarantined by smoke gate"
     return False, None
+
+
+def _is_pure_harness_self_fault(art: dict) -> bool:
+    """True when a fuzz/judge artifact represents a pure-harness fault with zero target stack frames."""
+    if art.get("harness_self_fault") is True:
+        return True
+    if art.get("harness_self_fault") is False:
+        return False
+    failure = art.get("failure")
+    if not isinstance(failure, dict):
+        return False
+    if failure.get("harness_self_fault") is True:
+        return True
+    frames = art.get("frames")
+    if isinstance(frames, list):
+        return failure_identity.is_pure_harness_crash(failure, frames)
+    log_tail = str(art.get("replay_log_tail") or "")
+    if log_tail:
+        return failure_identity.is_pure_harness_crash(failure, failure_identity.stack_frames(log_tail))
+    return False
+
+
+def _auto_reject_pure_harness_fault(
+    candidates: dict[str, dict],
+    findings: dict[str, dict],
+    *,
+    art: dict,
+    artifact_rel: str,
+    module: str,
+    tool_output: str,
+    engine_note: str,
+    report: dict,
+    art_digest: str | None,
+    art_step: str | None,
+    reopen: bool,
+    stats: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Classify a pure-harness fault (`harness_self_fault: True`) directly as `rejected`
+    (`rejection_class="harness_induced"`, `evidence_basis="pure_harness_stack_frame"`) and emit
+    a repair hint without queuing an LLM Crash Verifier subagent (0 pending verifier tasks).
+    """
+    raw_failure = art.get("failure")
+    failure: dict[str, Any] = raw_failure if isinstance(raw_failure, dict) else {}
+    function = str(failure.get("function") or "LLVMFuzzerTestOneInput").strip() or "LLVMFuzzerTestOneInput"
+    raw_file = normalize_file(str(failure.get("file") or ""))
+    loc_file = raw_file if (raw_file and is_safe_relative_path(raw_file)) else f"harness_{module}.c"
+    raw_line = int(failure.get("line") or 0)
+    loc_line = max(1, raw_line)
+    prop_kind = str(failure.get("alarm_kind") or failure.get("kind") or "mem_access").strip() or "mem_access"
+    prop_pred = (
+        str(failure.get("predicate") or failure.get("message") or f"pure harness fault in {function}").strip()
+        or f"pure harness fault in {function}"
+    )
+    raw_fp = art.get("fingerprint")
+    if isinstance(raw_fp, str) and is_valid_fingerprint(raw_fp) and f"#{function}::" in raw_fp:
+        fp = raw_fp
+    else:
+        fp = make_fingerprint(loc_file, function, prop_kind, prop_pred)
+
+    art_case = art.get("case")
+    case_idx = art_case if isinstance(art_case, int) and not isinstance(art_case, bool) and art_case >= 0 else None
+    case_desc = f" (dispatch case {case_idx})" if case_idx is not None else ""
+    harness_path = f"workspace/harnesses/harness_{module}.c"
+    repair_hint = (
+        f"Fix harness setup in {harness_path}{case_desc}: {function} aborted with zero target frames "
+        f"({prop_pred}). Guard input slicing, zero-length copies, and buffer setup before calling target APIs."
+    )
+    note = (
+        "auto-rejected pure-harness fault "
+        f"(rejection_class=harness_induced, evidence_basis=pure_harness_stack_frame); {repair_hint}"
+    )
+    cand = upsert_candidate(
+        candidates,
+        fp,
+        "fuzz",
+        "confirmed" if art.get("reproducible") else "needs_validation",
+        module,
+        {"file": loc_file, "line": raw_line, "function": function},
+        {"kind": prop_kind, "predicate": prop_pred},
+        [artifact_rel],
+        tool_output,
+        [],
+        note,
+        engine=_detection_engine(art, report),
+        harness_digest=art_digest,
+        discovering_step=art_step,
+    )
+    fp = cand["fingerprint"]
+    cand["status"] = "verified"
+    cand["resolved_fingerprints"] = [fp]
+    if reopen:
+        harness = _harness_state(module)
+        cand["last_rejection"] = {
+            "at": utc_now(),
+            "rejection_class": "harness_induced",
+            "refutation_basis": "checked",
+            "refutation_basis_source": "pure_harness_stack_frame",
+            "harness_sha256": harness["sha256"],
+            "repair_attempts": harness["repair_attempts"],
+        }
+
+    ev_entry = {
+        "phase": "fuzz",
+        "tool_output": tool_output,
+        "description": (
+            f"{engine_note} pure-harness fault on {artifact_rel} "
+            f"({function}{case_desc}, zero target frames): {prop_pred}"
+        ),
+    }
+    existing = findings.get(fp)
+    if existing is not None and existing.get("verdict") == "rejected":
+        if all(e.get("tool_output") != tool_output for e in existing.get("evidence") or []):
+            existing.setdefault("evidence", []).append(ev_entry)
+        existing.setdefault("evidence_basis", "pure_harness_stack_frame")
+        existing.setdefault("repair_hint", repair_hint)
+    else:
+        findings[fp] = {
+            "verdict": "rejected",
+            "fingerprint": fp,
+            "title": f"Auto-rejected pure-harness fault in {function}{case_desc}",
+            "description": (
+                f"{engine_note} aborted directly inside harness function {function}{case_desc} "
+                f"with zero target stack frames ({prop_pred})."
+            ),
+            "location": {"file": loc_file, "line": loc_line, "function": function},
+            "property": {"kind": prop_kind, "predicate": prop_pred},
+            "claimed_root_cause": f"Pure-harness {prop_kind} fault in {function}{case_desc}: {prop_pred}",
+            "evidence": [ev_entry],
+            "rejection_class": "harness_induced",
+            "reason": (
+                f"Pure-harness fault in {function}{case_desc} with zero target frames on the crash stack "
+                "(evidence_basis=pure_harness_stack_frame); auto-rejected without Crash Verifier dispatch."
+            ),
+            "refutation_basis": "checked",
+            "evidence_basis": "pure_harness_stack_frame",
+            "repair_hint": repair_hint,
+            "linked_units": [],
+            "verifier": {
+                "agent_id": "pre_triage",
+                "method": "reproduced",
+                "notes": (
+                    f"Deterministic pre-triage auto-rejected pure-harness fault ({fp}): "
+                    f"zero target frames between runtime abort and {function}. Repair hint: {repair_hint}"
+                ),
+            },
+        }
+
+    hint_entry: dict[str, Any] = {
+        "module": module,
+        "case": case_idx,
+        "fingerprint": fp,
+        "artifact": artifact_rel,
+        "rejection_class": "harness_induced",
+        "evidence_basis": "pure_harness_stack_frame",
+        "hint": repair_hint,
+    }
+    stats["auto_rejected_harness_faults"] = stats.get("auto_rejected_harness_faults", 0) + 1
+    stats.setdefault("repair_hints", []).append(hint_entry)
+    return hint_entry
 
 
 def _supersede_phase1_status_evidence(
@@ -2038,6 +2199,7 @@ def _ingest_fuzz_artifacts(
     link_stub_aborts: list[tuple[str, dict]] = []
     startup_aborts: list[tuple[str, str]] = []
     smoke_quarantined: list[tuple[str, str]] = []
+    auto_rejected_harness: list[dict[str, Any]] = []
     failed_unit_ids: set[str] = set()
     failed_cases: set[int] = set()
 
@@ -2063,6 +2225,24 @@ def _ingest_fuzz_artifacts(
             failed_cases.add(art_case)
         art_digest = art.get("harness_digest") if isinstance(art.get("harness_digest"), str) else report_digest
         art_step = art.get("discovering_step") if isinstance(art.get("discovering_step"), str) else report_step
+
+        if _is_pure_harness_self_fault(art):
+            hint_entry = _auto_reject_pure_harness_fault(
+                candidates,
+                findings,
+                art=art,
+                artifact_rel=artifact_rel,
+                module=module,
+                tool_output=tool_output,
+                engine_note=engine_note,
+                report=report,
+                art_digest=art_digest,
+                art_step=art_step,
+                reopen=reopen,
+                stats=stats,
+            )
+            auto_rejected_harness.append(hint_entry)
+            continue
 
         failure = art.get("failure")
         if failure and art.get("fingerprint"):
@@ -2318,11 +2498,48 @@ def _ingest_fuzz_artifacts(
                 "inputs; replay them on the sanitizer build to cover them.",
                 {"artifacts": shown + ([more.strip()] if more else [])},
             )
+    if auto_rejected_harness:
+        fault_cases = {int(h["case"]) for h in auto_rejected_harness if isinstance(h.get("case"), int)}
+        reaching_for_faults = _dispatch_reaching_cases(module, mm.dag) if fault_cases else {}
+        target_units: list[dict] = []
+        if fault_cases and reaching_for_faults:
+            for u in mod_units:
+                fn_key = (normalize_file(u["file"]), u["function"])
+                fn_cases = reaching_for_faults.get(fn_key) or reaching_for_faults.get(("", u["function"])) or set()
+                if fn_cases & fault_cases:
+                    target_units.append(u)
+        if not target_units:
+            target_units = mod_units
+        shown_h = [str(h["artifact"]) for h in auto_rejected_harness[:5]]
+        hints_h = [str(h["hint"]) for h in auto_rejected_harness[:5]]
+        fps_h = [str(h["fingerprint"]) for h in auto_rejected_harness[:5]]
+        for u in target_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "harness_self_fault_rejected",
+                False,
+                tool_output,
+                f"{len(auto_rejected_harness)} pure-harness fault(s) auto-rejected as harness_induced "
+                f"(evidence_basis=pure_harness_stack_frame, 0 verifier tasks queued): {hints_h[0]}",
+                {
+                    "module": module,
+                    "step": report_step or "campaign",
+                    "rejection_class": "harness_induced",
+                    "evidence_basis": "pure_harness_stack_frame",
+                    "artifacts": shown_h,
+                    "fingerprints": fps_h,
+                    "repair_hints": hints_h,
+                    **({"cases": sorted(fault_cases)} if fault_cases else {}),
+                },
+            )
     return {
         "failed_unit_ids": failed_unit_ids,
         "failed_cases": failed_cases,
         "startup_aborts": len(startup_aborts),
         "smoke_quarantined": len(smoke_quarantined),
+        "auto_rejected_harness": len(auto_rejected_harness),
     }
 
 
@@ -2429,8 +2646,29 @@ def _ingest_judge_report_into_state(
     nj_bd: dict[str, Any] = raw_nj_bd if isinstance(raw_nj_bd, dict) else {}
     nj_cap = int(nj_bd.get("cap", 0) or 0)
     nj_timeout = int(nj_bd.get("timeout", 0) or 0)
+    nj_blinded = int(nj_bd.get("blinded", 0) or 0)
+    nj_smoke = int(nj_bd.get("smoke_skipped", 0) or 0)
     nj_error = int(nj_bd.get("error", 0) or 0)
-    nj_module_gap = nj_cap + nj_timeout + nj_error
+
+    raw_frontier_total = report.get("frontier_total")
+    if raw_frontier_total is None:
+        raw_frontier_total = inputs.get("frontier_total", 0)
+    frontier_total = int(raw_frontier_total or 0)
+
+    raw_frontier_judged = report.get("frontier_judged")
+    if raw_frontier_judged is None:
+        raw_frontier_judged = inputs.get("frontier_judged", 0)
+    frontier_judged = int(raw_frontier_judged or 0)
+
+    raw_nj_by_case = report.get("not_judged_by_case")
+    if not isinstance(raw_nj_by_case, dict):
+        raw_nj_by_case = inputs.get("not_judged_by_case")
+    not_judged_by_case: dict[str, int] = (
+        {str(k): int(v or 0) for k, v in raw_nj_by_case.items()} if isinstance(raw_nj_by_case, dict) else {}
+    )
+
+    frontier_complete = frontier_total > 0 and frontier_judged == frontier_total
+    can_check_per_case_cap = nj_cap > 0 and bool(not_judged_by_case) and sum(not_judged_by_case.values()) > 0
 
     raw_blinded = report.get("blinded_cases")
     blinded_cases_raw: list[Any] = raw_blinded if isinstance(raw_blinded, list) else []
@@ -2466,7 +2704,10 @@ def _ingest_judge_report_into_state(
             )
         return module
 
-    if nj_module_gap > 0 or judged_count <= 0 or status == "partial":
+    hard_module_gap = nj_timeout > 0 or nj_error > 0 or judged_count <= 0 or status == "partial"
+    unscoped_cap_gap = nj_cap > 0 and not frontier_complete and not can_check_per_case_cap
+
+    if hard_module_gap or unscoped_cap_gap:
         reason_parts = []
         if judged_count <= 0:
             reason_parts.append("0 inputs judged")
@@ -2482,6 +2723,20 @@ def _ingest_judge_report_into_state(
         for u in mod_units:
             if u["coverage_id"] in failed_unit_ids:
                 continue
+            gap_details: dict[str, Any] = {
+                "module": module,
+                "step": "judge",
+                "engine": "eacsl",
+                "judged": judged_count,
+                "not_judged": not_judged,
+                "not_judged_breakdown": dict(nj_bd),
+            }
+            if nj_cap > 0:
+                gap_details["overflow_not_judged"] = nj_cap
+            if frontier_total > 0:
+                gap_details["frontier_total"] = frontier_total
+                gap_details["frontier_judged"] = frontier_judged
+                gap_details["judge_frontier_complete"] = frontier_complete
             add_evidence(
                 u,
                 "fuzz",
@@ -2490,27 +2745,24 @@ def _ingest_judge_report_into_state(
                 False,
                 tool_output,
                 f"E-ACSL judge left inputs unjudged ({gap_desc}); E-ACSL fuzz_clean not granted.",
-                {
-                    "module": module,
-                    "step": "judge",
-                    "engine": "eacsl",
-                    "judged": judged_count,
-                    "not_judged": not_judged,
-                    "not_judged_breakdown": dict(nj_bd),
-                },
+                gap_details,
             )
         return module
 
     # At this point: status is clean, crash_found, or partial_blinded, judged_count > 0,
-    # and no module-wide cap/timeout/error gap exists. Check dynamic execution (F7) and
-    # per-case blinding/quarantine/failure on each function's reaching cases (P2c).
+    # and no timeout/error gap exists. Any cap overflow is either covered by a complete
+    # coverage frontier (frontier_judged == frontier_total > 0) or checked per reaching case
+    # against not_judged_by_case. Check dynamic execution (F7) and per-case cleanliness (P2c).
     executions, unmeasured = _fuzz_coverage_executions(module)
-    reaching_cases = (
-        _dispatch_reaching_cases(module, mm.dag)
-        if (blinded_case_ids or smoke_skipped_ids or failed_case_ids or status != "clean")
-        else {}
+    needs_per_case_cap_check = nj_cap > 0 and not frontier_complete
+    needs_case_isolation = bool(
+        blinded_case_ids or smoke_skipped_ids or failed_case_ids or status != "clean" or needs_per_case_cap_check
     )
-    has_unattributed_not_judged = not_judged > 0 and not (blinded_case_ids or smoke_skipped_ids)
+    reaching_cases = _dispatch_reaching_cases(module, mm.dag) if needs_case_isolation else {}
+    bd_total = nj_cap + nj_timeout + nj_blinded + nj_smoke + nj_error
+    has_unattributed_not_judged = (
+        (nj_blinded > 0 and not blinded_case_ids) or (nj_smoke > 0 and not smoke_skipped_ids) or (not_judged > bd_total)
+    )
 
     for u in mod_units:
         if u["coverage_id"] in failed_unit_ids:
@@ -2556,9 +2808,14 @@ def _ingest_judge_report_into_state(
             )
             continue
 
+        fn_cases = (
+            reaching_cases.get(fn_key) or reaching_cases.get(("", u["function"])) or set()
+            if needs_case_isolation
+            else set()
+        )
+
         # Check reaching-case cleanliness when any case was blinded, smoke-skipped, or failed.
         if blinded_case_ids or smoke_skipped_ids or failed_case_ids or status != "clean":
-            fn_cases = reaching_cases.get(fn_key) or reaching_cases.get(("", u["function"])) or set()
             if not fn_cases:
                 # Fail closed: cannot prove this function's reaching cases were unaffected.
                 if blinded_case_ids:
@@ -2626,6 +2883,88 @@ def _ingest_judge_report_into_state(
                 # A reaching case had an E-ACSL failure; do not grant fuzz_clean.
                 continue
 
+        # When frontier is incomplete and nj_cap > 0, grant fuzz_clean only if every reaching
+        # case k satisfies not_judged_by_case.get(str(k), 0) == 0 (fail closed if unmapped).
+        if needs_per_case_cap_check:
+            if not fn_cases:
+                cap_unmapped_details: dict[str, Any] = {
+                    "module": module,
+                    "step": "judge",
+                    "engine": "eacsl",
+                    "judged": judged_count,
+                    "not_judged": not_judged,
+                    "overflow_not_judged": nj_cap,
+                }
+                if frontier_total > 0:
+                    cap_unmapped_details["frontier_total"] = frontier_total
+                    cap_unmapped_details["frontier_judged"] = frontier_judged
+                    cap_unmapped_details["judge_frontier_complete"] = False
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_not_judged",
+                    False,
+                    tool_output,
+                    f"E-ACSL judge had capped overflow (cap={nj_cap}) with incomplete frontier and reaching "
+                    f"cases for {u['function']} could not be isolated; E-ACSL fuzz_clean not granted.",
+                    cap_unmapped_details,
+                )
+                continue
+            capped_cases = sorted(k for k in fn_cases if not_judged_by_case.get(str(k), 0) > 0)
+            if capped_cases:
+                capped_details: dict[str, Any] = {
+                    "module": module,
+                    "step": "judge",
+                    "engine": "eacsl",
+                    "judged": judged_count,
+                    "not_judged": not_judged,
+                    "overflow_not_judged": nj_cap,
+                    "capped_cases": capped_cases,
+                    "not_judged_by_case": {str(k): not_judged_by_case[str(k)] for k in capped_cases},
+                }
+                if frontier_total > 0:
+                    capped_details["frontier_total"] = frontier_total
+                    capped_details["frontier_judged"] = frontier_judged
+                    capped_details["judge_frontier_complete"] = False
+                frontier_desc = f", frontier={frontier_judged}/{frontier_total}" if frontier_total > 0 else ""
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_not_judged",
+                    False,
+                    tool_output,
+                    f"E-ACSL judge left inputs unjudged on reaching case(s) {capped_cases} "
+                    f"(cap={nj_cap}{frontier_desc}); E-ACSL fuzz_clean not granted.",
+                    capped_details,
+                )
+                continue
+
+        clean_details: dict[str, Any] = {
+            "module": module,
+            "step": "judge",
+            "engine": "eacsl",
+            "judged": judged_count,
+        }
+        if frontier_complete:
+            clean_details["judge_frontier_complete"] = True
+            clean_details["frontier_total"] = frontier_total
+            clean_details["frontier_judged"] = frontier_judged
+        if nj_cap > 0 or frontier_complete:
+            clean_details["overflow_not_judged"] = nj_cap
+        if nj_cap > 0 and frontier_complete:
+            clean_summary = (
+                f"E-ACSL judge found no failure across the complete coverage frontier "
+                f"({frontier_judged}/{frontier_total}; {nj_cap} overflow input(s) not judged; not a proof)."
+            )
+        elif nj_cap > 0:
+            clean_summary = (
+                f"E-ACSL judge found no failure on all inputs for this function's reaching case(s) "
+                f"({nj_cap} overflow input(s) unjudged in other cases; not a proof)."
+            )
+        else:
+            clean_summary = "E-ACSL judge found no failure (not a proof)."
         add_evidence(
             u,
             "fuzz",
@@ -2633,8 +2972,8 @@ def _ingest_judge_report_into_state(
             "fuzz_clean",
             False,
             tool_output,
-            "E-ACSL judge found no failure (not a proof).",
-            {"module": module, "step": "judge", "engine": "eacsl", "judged": judged_count},
+            clean_summary,
+            clean_details,
         )
     return module
 
@@ -2643,7 +2982,7 @@ def _ingest_judge_report_into_state(
 def cmd_ingest_fuzz(paths: list[Path], judge_reports: list[Path] | None = None) -> dict:
     units, candidates = load_state()
     reopen = rejection_reopen_enabled()
-    findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])} if reopen else {}
+    findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])}
     mm = ModuleMap.load(".")
     # A failure lands on the function its line lies in, as Eva rows do (a renamed static, `f_0`,
     # still credits `f`); the reported name, through the model's kernel_names, only without a line.
@@ -3076,7 +3415,7 @@ def cmd_ingest_fuzz(paths: list[Path], judge_reports: list[Path] | None = None) 
         )
         judged_modules.add(jmod)
 
-    commit(units, candidates)
+    commit(units, candidates, findings if stats.get("auto_rejected_harness_faults") else None)
     if cache.shared_mode() == "rw" and ingested_modules:
         published_corpora: dict[str, int] = {}
         for mod_name in sorted(set(ingested_modules)):
@@ -3100,7 +3439,7 @@ def cmd_ingest_judge(paths: list[Path]) -> dict:
     """Ingest one or more P2d E-ACSL judge reports (`workspace/reports/judge/<mod>.json`)."""
     units, candidates = load_state()
     reopen = rejection_reopen_enabled()
-    findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])} if reopen else {}
+    findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])}
     mm = ModuleMap.load(".")
     index = _dag_line_index(dag=mm.dag)
     kernel = _model_kernel_names()
@@ -3120,7 +3459,7 @@ def cmd_ingest_judge(paths: list[Path]) -> dict:
             reopen=reopen,
             stats=stats,
         )
-    commit(units, candidates)
+    commit(units, candidates, findings if stats.get("auto_rejected_harness_faults") else None)
     return stats
 
 

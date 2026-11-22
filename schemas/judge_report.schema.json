@@ -57,6 +57,7 @@
         "replay_log_tail": {"type": "string"},
         "link_stub_abort": {"type": ["object", "null"]},
         "eacsl_resource_abort": {"type": ["object", "null"]},
+        "harness_self_fault": {"type": "boolean"},
         "cross_engine_links": {
           "type": "array",
           "items": {"$ref": "#/definitions/cross_engine_link"}

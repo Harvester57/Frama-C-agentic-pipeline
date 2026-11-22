@@ -260,6 +260,8 @@
         "rejection_class": {"type": "string", "enum": ["harness_induced", "dead_code", "toolchain_artifact", "contract_overconstraint", "disproved_by_source", "duplicate", "other"]},
         "reason": {"$ref": "#/definitions/text"},
         "refutation_basis": {"$ref": "#/definitions/refutation_basis"},
+        "evidence_basis": {"type": "string", "minLength": 1},
+        "repair_hint": {"type": "string", "minLength": 1},
         "prior_verdicts": {"$ref": "#/definitions/prior_verdicts"},
         "conflicts_with": {"$ref": "#/definitions/conflicts_with"},
         "linked_units": {"$ref": "#/definitions/linked_units"},
