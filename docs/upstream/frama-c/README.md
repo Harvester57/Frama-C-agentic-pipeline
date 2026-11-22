@@ -48,9 +48,11 @@ This section is newer than the ones below and wins where they differ.
     `dev`.
   - **Duplicates:** live read-only API search of `pub/frama-c` issues and MRs (all states) on
     2026-11-22 found none.
-  - **Overview text updated locally:** [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md)
-    adds a 22 November edit note and annex row `50` under E-ACSL (sync to live `#2832` awaits the
-    owner's go-ahead; filing remains paused).
+  - **Overview issue [#2832](https://git.frama-c.com/pub/frama-c/-/work_items/2832) updated** (on
+    the owner's go-ahead, synced from
+    [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md) and read back
+    identical): minimal edit adding a 22 November edit note and annex row `50` under E-ACSL. No
+    separate issue or merge request was opened; filing remains paused.
 
 ---
 
