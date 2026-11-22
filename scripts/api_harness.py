@@ -161,11 +161,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -328,6 +329,35 @@ _NULL_WORD_RE = re.compile(r"\bNULL\b")
 _NOT_NULL_RE = re.compile(r"\b(?:not|never|cannot|can't|mustn't|non)\b[\s-]+(?:be\s+)?(?:a\s+)?NULL\b", re.IGNORECASE)
 _DEFAULT_WORD_RE = re.compile(r"\b(?:default|system|standard|built-?in)\b", re.IGNORECASE)
 
+# --- P2A schema/trust-driven API harness (FRAMAC_API_TRUST_SCHEMA, default off) ----------------------
+API_TRUST_SCHEMA_ENV = "FRAMAC_API_TRUST_SCHEMA"
+_TRUTHY_ENV = frozenset({"on", "1", "true", "yes"})
+MAX_SCHEMA_INSTANCES = 4
+NO_ATTACKER_DATA_REASON = "no attacker data per the threat model"
+TRUSTED_PARAM_NO_INSTANCE_FMT = "trusted parameter {name} has no instance"
+REFCOUNT_EXEMPT_REASON = "refcount helper requires producer-allocated object"
+# S2 widened builder names (by-value builders like `pb_istream_from_buffer`, schema-taking builders like
+# `pb_field_iter_begin`, `mbedtls_cipher_setup`, `foo_make_*`).
+_BY_VAL_BUILDER_NAME_RE = re.compile(
+    rf"{_INIT_NAME_RE.pattern}|(?:^|_)(?:from|make|begin)(?:$|_)|(?:^|(?<=[a-z0-9_]))(?:From|Make|Begin)(?=[A-Z0-9_]|$)"
+)
+_SCHEMA_INIT_NAME_RE = re.compile(
+    rf"{_INIT_NAME_RE.pattern}|(?:^|_)(?:begin|setup|make|from)(?:$|_)|"
+    r"(?:^|(?<=[a-z0-9_]))(?:Begin|Setup|Make|From)(?=[A-Z0-9_]|$)"
+)
+# Refcount helpers (`sudo_rcstr_addref`, `sudo_rcstr_delref`, `foo_unref`, `bar_decref`): their parameter
+# carries a producer-allocated header (often via `container_of`), never a stack object or plain byte buffer.
+_REFCOUNT_NAME_RE = re.compile(
+    r"(?:^|_)(?:addref|delref|unref|decref)(?:$|_)|(?:^|(?<=[a-z0-9_]))(?:AddRef|DelRef|Unref|DecRef)(?=[A-Z0-9_]|$)"
+)
+_CTOR_BOILERPLATE_WORDS = frozenset({"new", "init", "create", "alloc", "make", "open", "from"})
+
+
+def api_trust_schema_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Whether P2A schema/trust-driven `--api` upgrades are enabled (`FRAMAC_API_TRUST_SCHEMA`, default off)."""
+    src = os.environ if env is None else env
+    return (src.get(API_TRUST_SCHEMA_ENV) or "").strip().lower() in _TRUTHY_ENV
+
 
 def _words(name: str | None) -> list[str]:
     """The lowercase words of an identifier (`max_message_nodes`, `maxNodes`, `mpack_expect_cstr`)."""
@@ -370,6 +400,13 @@ class _Unbuildable(_CaseError):
     """
     A case needs an object the generator cannot make: an opaque handle (a pointer to a struct the headers
     only declare) with no constructor or destructor known. A stack object of that struct would not compile.
+    """
+
+
+class _AutoExempt(_CaseError):
+    """
+    A case skipped under `FRAMAC_API_TRUST_SCHEMA` with an automatic reach-gate exemption reason
+    (trusted parameter without a schema instance, or refcount helper without a producer).
     """
 
 
@@ -522,6 +559,13 @@ class ApiInfo:
     owner_names: dict[str, set[str]] = field(default_factory=dict)
     owner_tables: dict[str, set[str]] = field(default_factory=dict)
     producers: dict[str, list[str]] = field(default_factory=dict)
+    # P2A (FRAMAC_API_TRUST_SCHEMA): gated schema/trust/builder/hygiene metadata.
+    trust_schema: bool = False
+    ctor_cands: dict[str, list[str]] = field(default_factory=dict)
+    byval_inits: set[str] = field(default_factory=set)
+    schema_inits: dict[str, tuple[int, str]] = field(default_factory=dict)
+    schema_globals: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    schema_externs: dict[str, str] = field(default_factory=dict)
 
 
 class _Case:
@@ -541,6 +585,8 @@ class _Case:
         # Frees of heap outputs of an initializer or constructor call (rule F), placed after the
         # releases of the call they were built for.
         self.owned_frees: list[str] = []
+        self.schema_instance: str | None = None
+        self.builder: str | None = None
 
     def declare(self, name: str) -> str:
         """
@@ -582,6 +628,10 @@ class _Case:
             out["inits"] = self.inits
         if self.notes:
             out["notes"] = self.notes
+        if self.schema_instance:
+            out["schema_instance"] = self.schema_instance
+        if self.builder:
+            out["builder"] = self.builder
         return out
 
     def statements(self, calls: list[str]) -> str:
@@ -784,6 +834,46 @@ def _len_ptr_pair(fields: list[dict], i: int) -> bool:
     return _len_before_ptr(fields, i) and bool(fields[i + 1].get("bytes"))
 
 
+def _bsd_queue_head_fields(lay: dict | None) -> tuple[str, str] | None:
+    """
+    BSD `TAILQ_HEAD` / `STAILQ_HEAD` layout: a 2-pointer struct whose fields match
+    `(tqh_first, tqh_last)` or `(stqh_first, stqh_last)`. Leaving `tqh_last == NULL` crashes
+    `TAILQ_INSERT_TAIL` (`*head->tqh_last = elm`) immediately.
+    """
+    if not isinstance(lay, dict) or lay.get("what") != "struct":
+        return None
+    fields = list(lay.get("fields") or [])
+    if len(fields) != 2 or not all(isinstance(f, dict) and f.get("kind") == "ptr" for f in fields):
+        return None
+    pair = (str(fields[0].get("name") or ""), str(fields[1].get("name") or ""))
+    if pair in (("tqh_first", "tqh_last"), ("stqh_first", "stqh_last")):
+        return pair
+    return None
+
+
+def _init_bsd_queues(case: _Case, expr: str, lay: dict | None, seen: frozenset[str] = frozenset()) -> bool:
+    """
+    Emit valid empty-list initialization for BSD `TAILQ_HEAD` / `STAILQ_HEAD` (`obj.tqh_first = NULL;
+    obj.tqh_last = &obj.tqh_first;`), recursively for nested structs. Returns True when any queue
+    head was initialized.
+    """
+    pair = _bsd_queue_head_fields(lay)
+    if pair is not None:
+        case.decls.append(f"{expr}.{pair[0]} = NULL; {expr}.{pair[1]} = &{expr}.{pair[0]};")
+        return True
+    if not isinstance(lay, dict) or lay.get("what") != "struct":
+        return False
+    did = False
+    for f in lay.get("fields") or []:
+        if isinstance(f, dict) and f.get("kind") == "record" and f.get("what") == "struct":
+            sub_ctype = str(f.get("ctype") or "")
+            sub_lay = case.api.structs.get(sub_ctype)
+            if sub_lay is not None and sub_ctype not in seen:
+                if _init_bsd_queues(case, f"{expr}.{f['name']}", sub_lay, seen | {sub_ctype}):
+                    did = True
+    return did
+
+
 def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base: int) -> None:
     """
     Fill the fields of a struct with pointers (`expr`, already zeroed) without putting an input byte
@@ -792,6 +882,9 @@ def _fill_fields(case: _Case, call: int, param: int, expr: str, lay: dict, base:
     function pointers stay NULL, scalars and pointer-free members come from the input, except the
     length of a pointer to wider elements before it (`_len_before_ptr`), which stays 0.
     """
+    if case.api.trust_schema and (qpair := _bsd_queue_head_fields(lay)) is not None:
+        case.decls.append(f"{expr}.{qpair[0]} = NULL; {expr}.{qpair[1]} = &{expr}.{qpair[0]};")
+        return
     fields = list(lay.get("fields") or [])
     i = 0
     while i < len(fields):
@@ -860,19 +953,99 @@ def _struct_value(case: _Case, call: int, param: int, v: str, ctype: str) -> Non
         case.note(call, param, f"{ctype}: a union with pointers or _Bool: zeroed, not read from the input")
 
 
-def _init_call(case: _Case, pointee: str, target: str, call: int, param: int) -> str:
-    """The initializer call of a struct object `target` (an address expression) before call `call`."""
+def _init_call(
+    case: _Case,
+    pointee: str,
+    target: str,
+    call: int,
+    param: int,
+    *,
+    var: str | None = None,
+    schema_inst: dict[str, Any] | None = None,
+) -> str:
+    """
+    The initializer or S2 builder call of a struct object before call `call`.
+    For a pointer initializer, `target` is its address expression (`&var` or a shared buffer);
+    for a by-value builder (S2, `fn in api.byval_inits`), `var` is assigned the returned struct.
+    """
     fn = case.api.inits[pointee]
     rec = case.api.records.get(fn) or {}
     params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
     k = case.ncalls + len(case.inits)
     case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
-    return _bind_call(case, k, fn, params or [], list(rec.get("formals") or []), rec, {0: target}, allow_init=False)
+    if case.api.trust_schema and case.builder is None:
+        case.builder = fn
+    schema_bindings: dict[int, tuple[str, bool]] | None = None
+    if case.api.trust_schema and fn in case.api.schema_inits:
+        s_idx, s_pointee = case.api.schema_inits[fn]
+        inst = schema_inst
+        if inst is None:
+            insts = _lookup_schema_instances(case.api, s_pointee)
+            if not insts:
+                raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=f"param{param}"))
+            inst = insts[0]
+        gname = str(inst["name"])
+        _record_schema_extern(case.api, inst, s_pointee)
+        schema_bindings = {s_idx: (gname, True)}
+    if case.api.trust_schema and fn in case.api.byval_inits:
+        stmt = _bind_call(
+            case,
+            k,
+            fn,
+            params or [],
+            list(rec.get("formals") or []),
+            rec,
+            shared={},
+            allow_init=False,
+            schema_bindings=schema_bindings,
+        )
+        lhs = var or target.lstrip("&")
+        return stmt.replace(f"(void){fn}(", f"{lhs} = {fn}(", 1)
+    return _bind_call(
+        case,
+        k,
+        fn,
+        params or [],
+        list(rec.get("formals") or []),
+        rec,
+        {0: target},
+        allow_init=False,
+        schema_bindings=schema_bindings,
+    )
 
 
-def _handle_call(case: _Case, htype: str, var: str, call: int, param: int) -> str:
+def _choose_handle_ctor(api: ApiInfo, htype: str, caller_name: str | None) -> str:
+    """
+    Pick the handle constructor for `htype` when calling `caller_name`. Under `FRAMAC_API_TRUST_SCHEMA`,
+    score candidate constructors by shared distinctive identifier words with `caller_name`
+    (`modbus_tcp_pi_listen` -> `modbus_new_tcp_pi`, `modbus_rtu_*` -> `modbus_new_rtu`) before
+    falling back to fewest parameters and name.
+    """
+    default = api.ctors[htype]
+    cands = api.ctor_cands.get(htype) or []
+    if not api.trust_schema or not caller_name or len(cands) <= 1:
+        return default
+    cand_word_sets = {c: set(_words(c)) for c in cands}
+    common = set.intersection(*cand_word_sets.values()) if cand_word_sets else set()
+    caller_words = set(_words(caller_name))
+    distinctive = {c: ws - common - _CTOR_BOILERPLATE_WORDS for c, ws in cand_word_sets.items()}
+    matched_any = any(bool(distinctive[c] & caller_words) for c in cands)
+    if not matched_any:
+        return default
+
+    def score(c: str) -> tuple[int, int, int, str]:
+        d = distinctive[c]
+        rec = api.records.get(c) or {}
+        parts = split_signature(str(rec.get("signature") or ""))
+        nparams = len(parts[1]) if parts else 99
+        return (-len(d & caller_words), len(d - caller_words), nparams, c)
+
+    return min(cands, key=score)
+
+
+def _handle_call(case: _Case, htype: str, var: str, call: int, param: int, caller_name: str | None = None) -> str:
     """`<handle type> var = <constructor>(...);` before call `call`, the constructor's arguments by the usual rules."""
-    fn = case.api.ctors[htype]
+    fn = _choose_handle_ctor(case.api, htype, caller_name)
     rec = case.api.records.get(fn) or {}
     params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
     k = case.ncalls + len(case.inits)
@@ -904,7 +1077,13 @@ _RESERVED_REST: dict[str, Any] = {"reserved": True}
 
 
 def _construct(
-    case: _Case, htype: str, var: str, call: int, param: int, depth: int = 0
+    case: _Case,
+    htype: str,
+    var: str,
+    call: int,
+    param: int,
+    depth: int = 0,
+    caller_name: str | None = None,
 ) -> tuple[list[str], str | None, list[str], str | None]:
     """
     Build a handle of `htype` in `var` before call `call`: (the statements that declare and build it,
@@ -918,7 +1097,12 @@ def _construct(
     """
     api = case.api
     if htype in api.ctors:
-        return [_handle_call(case, htype, var, call, param)], _handle_release(api, htype, var), [], None
+        return (
+            [_handle_call(case, htype, var, call, param, caller_name=caller_name)],
+            _handle_release(api, htype, var),
+            [],
+            None,
+        )
     fn, out = api.out_ctors[htype]
     rec = api.records.get(fn) or {}
     params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
@@ -1422,6 +1606,345 @@ def _index_rules(
         case.note(call, k, "count or index into a buffer of no length: within half of its elements")
 
 
+@dataclass
+class _EntryTrust:
+    """Resolved per-function threat-model metadata (S1, FRAMAC_API_TRUST_SCHEMA)."""
+
+    input_role: str | None = None
+    attacker_params: list[str] | None = None
+    trusted_caller: bool = False
+
+
+def _match_tm_ref(ref: str, key: str, name: str) -> bool:
+    if not ref:
+        return False
+    if "#" in ref:
+        return ref == key or ref.endswith(f"#{name}") and key.endswith(f"#{name}") and ref == key
+    return ref == name or ref == key
+
+
+def _resolve_threat_model(
+    dag: dict,
+    model: dict,
+    trust: dict[str, Any] | None = None,
+    unit: str | None = None,
+) -> tuple[bool, dict[str, _EntryTrust]]:
+    """
+    Resolve active threat-model status and per-entry trust roles (S1, FRAMAC_API_TRUST_SCHEMA).
+    Reads per-function `trust.input_role` / `trust.attacker_params` / `trust.value` from DAG or
+    model records first, and falls back to `trust["threat_model"]["input_sources"]` or the recorded
+    `THREAT_MODEL.md` file when a pre-existing DAG does not carry per-function `input_role` yet.
+    """
+    explicit: dict[str, Any] = trust if isinstance(trust, dict) else {}
+    raw_dag_trust = dag.get("trust")
+    dag_trust: dict[str, Any] = raw_dag_trust if isinstance(raw_dag_trust, dict) else {}
+    raw_model_trust = model.get("trust")
+    model_trust: dict[str, Any] = raw_model_trust if isinstance(raw_model_trust, dict) else {}
+    tm_info: dict[str, Any] = {}
+    for src in (explicit, dag_trust, model_trust):
+        cand = src.get("threat_model")
+        if isinstance(cand, dict) and cand.get("status"):
+            tm_info = cand
+            break
+    if tm_info.get("status") != "ok":
+        return False, {}
+
+    fallback_sources: list[dict[str, Any]] = []
+    fallback_trusted: list[dict[str, Any]] = []
+    if isinstance(tm_info.get("input_sources"), list):
+        fallback_sources = [x for x in tm_info["input_sources"] if isinstance(x, dict)]
+    elif isinstance(explicit.get("input_sources"), list):
+        fallback_sources = [x for x in explicit["input_sources"] if isinstance(x, dict)]
+    if isinstance(tm_info.get("trusted_callers"), list):
+        fallback_trusted = [x for x in tm_info["trusted_callers"] if isinstance(x, dict)]
+    elif isinstance(explicit.get("trusted_callers"), list):
+        fallback_trusted = [x for x in explicit["trusted_callers"] if isinstance(x, dict)]
+
+    if not fallback_sources and isinstance(tm_info.get("path"), str) and tm_info["path"]:
+        tm_path = Path(tm_info["path"])
+        if tm_path.is_file():
+            try:
+                import trust as trust_mod
+
+                loaded = trust_mod.load_threat_model(tm_path)
+                want_sha = tm_info.get("sha256")
+                if loaded.get("status") == "ok" and (not want_sha or loaded.get("sha256") == want_sha):
+                    block = loaded.get("block") or {}
+                    if isinstance(block.get("input_sources"), list):
+                        fallback_sources = [x for x in block["input_sources"] if isinstance(x, dict)]
+                    if isinstance(block.get("trusted_callers"), list):
+                        fallback_trusted = [x for x in block["trusted_callers"] if isinstance(x, dict)]
+            except Exception:  # noqa: BLE001 - fall back to per-function trust records
+                pass
+
+    dag_fns = dag.get("functions") or {}
+    raw_explicit_fns = explicit.get("functions")
+    explicit_fns: dict[str, Any] = raw_explicit_fns if isinstance(raw_explicit_fns, dict) else {}
+
+    def _is_in_fallback_trusted(key: str, name: str) -> bool:
+        for item in fallback_trusted:
+            if "functions" in item:
+                if any(_match_tm_ref(str(r), key, name) for r in item.get("functions") or []):
+                    return True
+            elif "unit" in item and unit:
+                u_ref = str(item.get("unit") or "")
+                if u_ref == unit or Path(unit).name == u_ref:
+                    exc = item.get("except") or []
+                    if not any(_match_tm_ref(str(r), key, name) for r in exc):
+                        return True
+        return False
+
+    def _fallback_source(key: str, name: str) -> dict[str, Any] | None:
+        for item in fallback_sources:
+            if _match_tm_ref(str(item.get("function") or ""), key, name):
+                return item
+        return None
+
+    roles: dict[str, _EntryTrust] = {}
+    for key, drec in dag_fns.items():
+        if not isinstance(drec, dict):
+            continue
+        name = str(drec.get("name") or str(key).split("#")[-1])
+        mrec = _model_record(model, drec, key)
+        ftrust: dict[str, Any] = {}
+        for cand_t in (
+            drec.get("trust"),
+            mrec.get("trust") if isinstance(mrec, dict) else None,
+            explicit_fns.get(key),
+            explicit_fns.get(name),
+        ):
+            if isinstance(cand_t, dict):
+                ftrust = {**cand_t, **ftrust}
+        trusted_caller = (
+            ftrust.get("value") == "trusted" and ftrust.get("source") == "threat_model"
+        ) or _is_in_fallback_trusted(key, name)
+        input_role: str | None = str(ftrust["input_role"]) if ftrust.get("input_role") in ("entry", "reader") else None
+        attacker_params: list[str] | None = (
+            [str(p) for p in ftrust["attacker_params"]] if isinstance(ftrust.get("attacker_params"), list) else None
+        )
+        if input_role is None:
+            fb = _fallback_source(key, name)
+            if fb is not None and fb.get("role") in ("entry", "reader"):
+                input_role = str(fb["role"])
+                if attacker_params is None and isinstance(fb.get("params"), list):
+                    attacker_params = [str(p) for p in fb["params"]]
+        elif attacker_params is None:
+            fb = _fallback_source(key, name)
+            if fb is not None and isinstance(fb.get("params"), list):
+                attacker_params = [str(p) for p in fb["params"]]
+        roles[key] = _EntryTrust(
+            input_role=input_role,
+            attacker_params=attacker_params,
+            trusted_caller=trusted_caller,
+        )
+    return True, roles
+
+
+def _merge_global_variables(
+    model: dict,
+    dag: dict,
+    explicit: dict[str, dict] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Merge global_variables from model, DAG, and explicit override, keeping richest fields."""
+    merged: dict[str, dict[str, Any]] = {}
+    for source in (dag.get("global_variables"), model.get("global_variables"), explicit):
+        if not isinstance(source, dict):
+            continue
+        for gid, g in source.items():
+            if not isinstance(g, dict):
+                continue
+            prev = merged.get(gid) or {}
+            merged[gid] = {**prev, **{k: v for k, v in g.items() if v is not None}}
+    return merged
+
+
+def _schema_rank_key(g: dict[str, Any]) -> tuple[int, int, str]:
+    size = int(g.get("size") or 0) if isinstance(g.get("size"), int) else 0
+    raw_fields = g.get("field_count")
+    if isinstance(raw_fields, int):
+        richness = raw_fields
+    else:
+        richness = len(g.get("init_globals") or []) + len(g.get("init_functions") or [])
+    return (-size, -richness, str(g.get("name") or ""))
+
+
+def _schema_instances_index(
+    global_variables: dict[str, dict[str, Any]],
+    unit: str | None = None,
+    unit_links: Collection[str] | None = None,
+    anon_tags: dict[str, str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    S3: index eligible const, initialized, non-static global schema instances by canonical and raw
+    type name (`pb_msgdesc_t`, `struct pb_msgdesc_s`, `ProtobufCMessageDescriptor`, ...).
+    Ranked by largest `size`, then most init/field references, then deterministically by name, and
+    capped at `MAX_SCHEMA_INSTANCES`.
+    """
+    allowed_units = ({unit, *(unit_links or ())} - {None, ""}) if unit else set()
+    typedef_to_tags: dict[str, list[str]] = {}
+    for tag, tdef in (anon_tags or {}).items():
+        typedef_to_tags.setdefault(_spelled(tdef), []).append(_spelled(tag))
+
+    buckets: dict[str, dict[str, dict[str, Any]]] = {}
+    for gid, g in sorted(global_variables.items()):
+        if not isinstance(g, dict):
+            continue
+        if g.get("const") is not True or g.get("has_init") is not True or g.get("static"):
+            continue
+        name = str(g.get("name") or gid.split("#")[-1])
+        if not _IDENT_RE.fullmatch(name):
+            continue
+        g_units = [str(u) for u in g.get("units") or [] if u]
+        if allowed_units and g_units and not (set(g_units) & allowed_units):
+            continue
+        raw_t = str(g.get("raw_type") or "").strip()
+        canon_t = str(g.get("type") or "").strip()
+        if any("[" in t or "*" in t or "(" in t for t in (raw_t, canon_t) if t):
+            continue
+        keys: set[str] = set()
+        for t in (canon_t, raw_t):
+            norm = _spelled(t)
+            if norm:
+                keys.add(norm)
+                for tag in typedef_to_tags.get(norm, []):
+                    keys.add(tag)
+        if not keys:
+            continue
+        rec = {**g, "name": name}
+        for k in keys:
+            buckets.setdefault(k, {})[name] = rec
+    return {k: sorted(items.values(), key=_schema_rank_key)[:MAX_SCHEMA_INSTANCES] for k, items in buckets.items()}
+
+
+def _lookup_schema_instances_raw(
+    schema_globals: dict[str, list[dict[str, Any]]],
+    pointee: str,
+    decl: str | None = None,
+    anon_tags: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    keys: list[str] = []
+    for cand in (pointee, decl or "", (anon_tags or {}).get(pointee, "")):
+        norm = _spelled(cand)
+        if norm and norm not in keys:
+            keys.append(norm)
+    found: dict[str, dict[str, Any]] = {}
+    for k in keys:
+        for inst in schema_globals.get(k) or []:
+            found.setdefault(str(inst["name"]), inst)
+    return sorted(found.values(), key=_schema_rank_key)[:MAX_SCHEMA_INSTANCES]
+
+
+def _lookup_schema_instances(api: ApiInfo, pointee: str, decl: str | None = None) -> list[dict[str, Any]]:
+    return _lookup_schema_instances_raw(api.schema_globals, pointee, decl, api.anon_tags)
+
+
+def _record_schema_extern(api: ApiInfo, inst: dict[str, Any], pointee: str, decl: str | None = None) -> None:
+    """Record a file-scope `extern const <T> <name>;` declaration for a bound S3 schema global."""
+    name = str(inst.get("name") or "")
+    if not name or not _IDENT_RE.fullmatch(name) or name in api.schema_externs:
+        return
+    raw_t = " ".join(str(inst.get("raw_type") or "").split())
+    if raw_t and "__anon" not in raw_t and not any(c in raw_t for c in "[]()*"):
+        if re.search(r"\bconst\b", raw_t):
+            api.schema_externs[name] = f"extern {raw_t} {name};"
+        else:
+            api.schema_externs[name] = f"extern const {raw_t} {name};"
+        return
+    t = " ".join(str(decl or api.anon_tags.get(pointee) or pointee).split())
+    if t and "__anon" not in t and not any(c in t for c in "[]()*"):
+        api.schema_externs[name] = f"extern const {t} {name};"
+
+
+def _is_refcount_without_producer(name: str, params: list[dict], api: ApiInfo) -> bool:
+    """
+    Skip standalone single cases for refcount helpers (`*_addref`, `*_delref`, `*_unref`, `*_decref`)
+    whose pointer parameter has no producer/initializer (`container_of` / refcounted string or struct).
+    """
+    if not api.trust_schema or not _REFCOUNT_NAME_RE.search(name):
+        return False
+    handles = api.handles.get(name) or {}
+    for i, p in enumerate(params):
+        if p["kind"] != "ptr":
+            continue
+        htype = handles.get(i)
+        if htype is not None and _constructible(api, htype) and _releasable(api, htype):
+            return False
+        if _charlike(p):
+            return True
+        pointee = str(p.get("pointee") or "")
+        if _is_record(pointee) and "*" not in pointee:
+            if pointee in api.inits or bool(api.producers.get(pointee)):
+                return False
+            return True
+        return False
+    return False
+
+
+def _param_roles(
+    params: list[dict],
+    formals: list[dict],
+    rec: dict,
+    api: ApiInfo,
+    entry_trust: _EntryTrust,
+) -> list[str]:
+    """
+    S1 per-parameter roles when a threat model is active:
+      - `attacker`: fuzzed as today (or built via an S2 byte-taking builder);
+      - `trusted`: pointer/struct not in `attacker_params` -> ONLY S3 schema instance or S2 builder,
+        else skipped with `"trusted parameter <name> has no instance"`;
+      - `output`: non-const writable buffer or scalar out-parameter -> clean zeroed buffer;
+      - `trusted_scalar`: scalar not in `attacker_params` -> zeroed without fuzz slot.
+    """
+    n = len(params)
+    if entry_trust.input_role == "entry":
+        if entry_trust.attacker_params is None:
+            return ["attacker"] * n
+        att = set(entry_trust.attacker_params)
+        roles: list[str] = []
+        for i, p in enumerate(params):
+            fname = _name(formals, i)
+            is_in = _is_input(formals, i)
+            if fname in att:
+                roles.append("attacker")
+            elif i > 0 and _is_pair(params, i - 1, formals) and _name(formals, i - 1) in att:
+                roles.append("attacker")
+            elif i + 1 < n and _len_ptr_params(params, i, formals, rec) and _name(formals, i + 1) in att:
+                roles.append("attacker")
+            elif p["kind"] == "struct":
+                roles.append("trusted")
+            elif p["kind"] == "ptr":
+                pointee = str(p.get("pointee") or "")
+                if (_is_record(pointee) and "*" not in pointee) or is_in:
+                    roles.append("trusted")
+                else:
+                    roles.append("output")
+            elif p["kind"] == "fnptr":
+                roles.append("trusted")
+            else:
+                roles.append("trusted_scalar")
+        return roles
+    if entry_trust.input_role == "reader":
+        att = set(entry_trust.attacker_params) if entry_trust.attacker_params is not None else set()
+        roles = []
+        for i, p in enumerate(params):
+            fname = _name(formals, i)
+            is_in = _is_input(formals, i)
+            if fname in att:
+                roles.append("attacker")
+            elif p["kind"] == "ptr" and str(p.get("pointee") or "") in api.inits:
+                roles.append("attacker")
+            elif p["kind"] == "struct" and str(p.get("ctype") or "") in api.inits:
+                roles.append("attacker")
+            elif p["kind"] == "ptr" and not is_in:
+                roles.append("output")
+            elif p["kind"] == "ptr" and _is_record(str(p.get("pointee") or "")) and is_in:
+                roles.append("trusted")
+            else:
+                roles.append("attacker")
+        return roles
+    return ["attacker"] * n
+
+
 def _bind_call(
     case: _Case,
     call: int,
@@ -1432,6 +1955,9 @@ def _bind_call(
     shared: dict[int, str] | None = None,
     allow_init: bool = True,
     extra_args: list[str] | None = None,
+    entry_trust: _EntryTrust | None = None,
+    schema_bindings: dict[int, tuple[str, bool]] | None = None,
+    builder_schema: dict[int, dict[str, Any]] | None = None,
 ) -> str:
     """
     The declarations and slots of one call's arguments (added to `case`); returns the call statement,
@@ -1439,15 +1965,22 @@ def _bind_call(
     from `params` as they are (the objects behind a variadic call, `variadic_case`).
     """
     shared = shared or {}
+    schema_bindings = schema_bindings or {}
+    builder_schema = builder_schema or {}
     params = _respell_anon_records(case.api, _respell_enum_pointers(case.api, name, params))
     params = _respell_qualified_pointers(case.api, name, params)
+    api = case.api
+    if allow_init and _is_refcount_without_producer(name, params, api):
+        raise _AutoExempt(REFCOUNT_EXEMPT_REASON)
+    roles = (
+        _param_roles(params, formals, rec, api, entry_trust) if (api.trust_schema and entry_trust is not None) else None
+    )
     varlen = _variable_length(params, formals, rec, shared)
     args: list[str] = []
     before: list[str] = []
     after: list[str] = []
     guards: list[str] = []
     bound_handles: set[int] = set()  # parameters a handle constructor built (released as handles)
-    api = case.api
     handles = api.handles.get(name) or {}
     outs = api.outs.get(name) or {}
     # Argument domains (`_domain_rules`): the variables of the scalars and byte pairs read for this call.
@@ -1466,6 +1999,21 @@ def _bind_call(
         p = params[i]
         v = f"c{call}a{i}"
         nxt = params[i + 1] if i + 1 < n else None
+        role = roles[i] if roles is not None else None
+        if i in schema_bindings:
+            gname, by_ref = schema_bindings[i]
+            if case.schema_instance is None:
+                case.schema_instance = gname
+            case.note(call, i, f"trusted parameter: const schema instance {gname}")
+            args.append(f"&{gname}" if by_ref else gname)
+            i += 1
+            continue
+        if role == "trusted_scalar":
+            case.decls.append(f"{p['ctype']} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+            case.note(call, i, "trusted scalar parameter per threat model: zeroed, not read from the input")
+            args.append(v)
+            i += 1
+            continue
         htype = handles.get(i) if i not in shared and p["kind"] == "ptr" else None
         # A pointer to a struct the headers only declare is a handle or nothing: never a stack object.
         if htype is not None and (allow_init or _opaque(htype)):
@@ -1484,7 +2032,7 @@ def _bind_call(
                 case.note(call, i, f"{why}: zeroed buffers, not constructed handles")
             else:
                 # A handle: the constructor's result, released afterwards unless this call is the release.
-                made_here, release, parents_release, guard = _construct(case, htype, v, call, i)
+                made_here, release, parents_release, guard = _construct(case, htype, v, call, i, caller_name=name)
                 bound_handles.add(i)
                 before += made_here
                 if guard:
@@ -1581,11 +2129,13 @@ def _bind_call(
             continue
         if p["kind"] == "ptr":
             pointee = p.get("pointee") or "void"
-            is_input = _is_input(formals, i)
+            is_input = False if role == "output" else _is_input(formals, i)
             size = None if varlen and _lone_output(params, formals, i) else param_size(rec, i)
             charlike = _charlike(p)
             pair = _is_pair(params, i, formals)
-            own_init = i == 0 and name in case.api.candidates.get(pointee, set())
+            own_init = (i == 0 and name in case.api.candidates.get(pointee, set())) or (
+                api.trust_schema and name in case.api.candidates.get(pointee, set())
+            )
             if i == 0 and name in api.owner_names.get(pointee, set()):
                 # Rule G (sudo run-1: `change_window_size__free_unpacked(&c0a0, &c0a1)` on a stack
                 # message): a destructor that also takes tables frees what its producer returned. The
@@ -1619,8 +2169,16 @@ def _bind_call(
                 )
             if allow_init and pointee in case.api.inits and not own_init:
                 # A context object: its initializer runs first, never a zeroed or input-filled object.
+                if (
+                    api.trust_schema
+                    and api.inits[pointee] in api.schema_inits
+                    and i not in builder_schema
+                    and not _lookup_schema_instances(api, api.schema_inits[api.inits[pointee]][1])
+                ):
+                    pname = _name(formals, i) or f"param{i}"
+                    raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
                 case.decls.append(f"{p.get('decl') or pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
-                before.append(_init_call(case, pointee, f"&{v}", call, i))
+                before.append(_init_call(case, pointee, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)))
                 args.append(f"&{v}")
                 release = _struct_release(api, pointee, name, f"&{v}")
                 if release:
@@ -1632,6 +2190,10 @@ def _bind_call(
                 args.append(_table_arg(case, call, i, p, v))
                 i += 1
                 continue
+            if role == "trusted":
+                # SD2(c): a trusted pointer with no schema instance and no builder is never fuzzed or zeroed.
+                pname = _name(formals, i) or f"param{i}"
+                raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
             if allow_init and not own_init and pointee in case.api.init_skip_notes:
                 for note_msg in case.api.init_skip_notes[pointee]:
                     case.note(call, i, note_msg)
@@ -1645,7 +2207,12 @@ def _bind_call(
                 args += _array_args(case, call, params, formals, rec, i, j)
                 i = j + 1
                 continue
-            if pair and nxt is not None and (i + 1) not in shared:
+            if (
+                pair
+                and nxt is not None
+                and (i + 1) not in shared
+                and (roles is None or roles[i + 1] != "trusted_scalar")
+            ):
                 if is_input and case.rest is None and size is None:
                     case.rest = {"call": call, "param": i, "kind": "bytes"}
                     args.append(f"({p['type']})(fuzz_buf + fuzz_off)")
@@ -1742,6 +2309,8 @@ def _bind_call(
                         )
                 elif is_input and lay is not None and lay.get("what") == "struct":
                     _fill_fields(case, call, i, f"{v}[0]", lay, 0)
+                elif api.trust_schema and not is_input and lay is not None and lay.get("what") == "struct":
+                    _init_bsd_queues(case, f"{v}[0]", lay)
                 if not _is_record(pointee):
                     bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
@@ -1781,6 +2350,8 @@ def _bind_call(
                     case.slot(v, SCALAR_BYTES.get(pointee) or (lay or {}).get("size"), call, i, "pointee")
                 elif is_input and lay is not None and lay.get("what") == "struct":
                     _fill_fields(case, call, i, v, lay, 0)
+                elif api.trust_schema and not is_input and lay is not None and lay.get("what") == "struct":
+                    _init_bsd_queues(case, v, lay)
                 elif (
                     not is_input
                     and pointee in ("char *", "void *", "unsigned char *")
@@ -1795,7 +2366,24 @@ def _bind_call(
             i += 1
             continue
         if p["kind"] == "struct":
-            _struct_value(case, call, i, v, p["ctype"])
+            ctype = p["ctype"]
+            if api.trust_schema and allow_init and ctype in api.inits and name not in api.candidates.get(ctype, set()):
+                if (
+                    api.inits[ctype] in api.schema_inits
+                    and i not in builder_schema
+                    and not _lookup_schema_instances(api, api.schema_inits[api.inits[ctype]][1])
+                ):
+                    pname = _name(formals, i) or f"param{i}"
+                    raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
+                case.decls.append(f"{ctype} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                before.append(_init_call(case, ctype, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)))
+                args.append(v)
+                i += 1
+                continue
+            if role == "trusted":
+                pname = _name(formals, i) or f"param{i}"
+                raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
+            _struct_value(case, call, i, v, ctype)
             args.append(v)
             i += 1
             continue
@@ -2061,7 +2649,14 @@ def _model_record(model: dict, dag_rec: dict, key: str) -> dict:
 
 
 def single_case(
-    name: str, model_rec: dict, spare: int, api: ApiInfo | None = None
+    name: str,
+    model_rec: dict,
+    spare: int,
+    api: ApiInfo | None = None,
+    *,
+    entry_trust: _EntryTrust | None = None,
+    schema_bindings: dict[int, tuple[str, bool]] | None = None,
+    builder_schema: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """(statements, layout, why not) of the case that calls one API function."""
     params, why = plan_params(str(model_rec.get("signature") or ""), model_rec.get("formals"))
@@ -2069,10 +2664,174 @@ def single_case(
         return None, None, why
     case = _Case(spare, api, calls=1)
     try:
-        call = _bind_call(case, 0, name, params, list(model_rec.get("formals") or []), model_rec)
+        call = _bind_call(
+            case,
+            0,
+            name,
+            params,
+            list(model_rec.get("formals") or []),
+            model_rec,
+            entry_trust=entry_trust,
+            schema_bindings=schema_bindings,
+            builder_schema=builder_schema,
+        )
     except _CaseError as e:
         return None, None, str(e)
     return case.statements([call]), case.layout("single", [name]), None
+
+
+def _single_cases_for_entry(
+    name: str,
+    model_rec: dict,
+    spare: int,
+    api: ApiInfo,
+    entry_trust: _EntryTrust | None = None,
+) -> tuple[list[tuple[str, dict[str, Any]]], str | None, bool, set[str]]:
+    """
+    Build one or more single cases for an entry point under `FRAMAC_API_TRUST_SCHEMA`:
+    returns `(made_cases, skip_reason, is_auto_exempt, used_schema_sources)`.
+    When `api.trust_schema` is False, emits at most one case identically to `single_case`.
+    When `api.trust_schema` is True, expands up to `MAX_SCHEMA_INSTANCES` cases per `(entry, instance)`
+    for trusted schema parameters (S3) and schema-taking builders (S2/SD1b).
+    """
+    if not api.trust_schema:
+        stmt, lay, why = single_case(name, model_rec, spare, api)
+        return ([(stmt, lay)] if stmt is not None and lay is not None else []), why, False, set()
+
+    params_raw, why = plan_params(str(model_rec.get("signature") or ""), model_rec.get("formals"))
+    if params_raw is None:
+        return [], why, False, set()
+    formals = list(model_rec.get("formals") or [])
+    try:
+        params = _respell_anon_records(api, _respell_enum_pointers(api, name, params_raw))
+        params = _respell_qualified_pointers(api, name, params)
+    except _CaseError as exc:
+        return [], str(exc), isinstance(exc, _AutoExempt), set()
+
+    if _is_refcount_without_producer(name, params, api):
+        return [], REFCOUNT_EXEMPT_REASON, True, set()
+
+    roles = _param_roles(params, formals, model_rec, api, entry_trust) if entry_trust is not None else None
+    handles = api.handles.get(name) or {}
+
+    direct_schema_opts: dict[int, tuple[bool, str, str | None, list[dict[str, Any]]]] = {}
+    builder_schema_opts: dict[int, tuple[str, list[dict[str, Any]]]] = {}
+
+    for i, p in enumerate(params):
+        role = roles[i] if roles is not None else None
+        pname = _name(formals, i) or f"param{i}"
+        if p["kind"] == "ptr":
+            pointee = str(p.get("pointee") or "")
+            decl = p.get("decl")
+            htype = handles.get(i)
+            is_handle = htype is not None and _constructible(api, htype) and _releasable(api, htype)
+            own_init = name in api.candidates.get(pointee, set())
+            has_builder = pointee in api.inits and not own_init
+            if has_builder and api.inits[pointee] in api.schema_inits:
+                _, s_pointee = api.schema_inits[api.inits[pointee]]
+                insts = _lookup_schema_instances(api, s_pointee)
+                if not insts:
+                    return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
+                builder_schema_opts[i] = (s_pointee, insts)
+                continue
+            if role == "trusted" and not is_handle and not has_builder and _table_type(api, p) is None:
+                insts = _lookup_schema_instances(api, pointee, decl)
+                if not insts:
+                    return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
+                direct_schema_opts[i] = (True, pointee, decl, insts)
+        elif p["kind"] == "struct":
+            ctype = str(p.get("ctype") or "")
+            own_init = name in api.candidates.get(ctype, set())
+            has_builder = ctype in api.inits and not own_init
+            if has_builder and api.inits[ctype] in api.schema_inits:
+                _, s_pointee = api.schema_inits[api.inits[ctype]]
+                insts = _lookup_schema_instances(api, s_pointee)
+                if not insts:
+                    return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
+                builder_schema_opts[i] = (s_pointee, insts)
+                continue
+            if role == "trusted" and not has_builder:
+                insts = _lookup_schema_instances(api, ctype, None)
+                if not insts:
+                    return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
+                direct_schema_opts[i] = (False, ctype, None, insts)
+
+    if not direct_schema_opts and not builder_schema_opts:
+        case = _Case(spare, api, calls=1)
+        try:
+            call_stmt = _bind_call(case, 0, name, params_raw, formals, model_rec, entry_trust=entry_trust)
+        except _AutoExempt as exc:
+            return [], str(exc), True, set()
+        except _CaseError as exc:
+            return [], str(exc), False, set()
+        return [(case.statements([call_stmt]), case.layout("single", [name]))], None, False, set()
+
+    # Expand up to MAX_SCHEMA_INSTANCES along the primary schema parameter (direct trusted schema first).
+    primary_direct = min(direct_schema_opts) if direct_schema_opts else None
+    primary_builder = min(builder_schema_opts) if primary_direct is None and builder_schema_opts else None
+    combos: list[
+        tuple[dict[int, tuple[str, bool]], dict[int, dict[str, Any]], list[tuple[dict[str, Any], str, str | None]]]
+    ] = []
+
+    if primary_direct is not None:
+        by_ref, p_pointee, p_decl, p_insts = direct_schema_opts[primary_direct]
+        for inst in p_insts[:MAX_SCHEMA_INSTANCES]:
+            sb: dict[int, tuple[str, bool]] = {primary_direct: (str(inst["name"]), by_ref)}
+            used_meta: list[tuple[dict[str, Any], str, str | None]] = [(inst, p_pointee, p_decl)]
+            for j, (j_ref, j_pointee, j_decl, j_insts) in direct_schema_opts.items():
+                if j == primary_direct:
+                    continue
+                sb[j] = (str(j_insts[0]["name"]), j_ref)
+                used_meta.append((j_insts[0], j_pointee, j_decl))
+            bs = {j: j_insts[0] for j, (_, j_insts) in builder_schema_opts.items()}
+            for _j, (j_sp, j_insts) in builder_schema_opts.items():
+                used_meta.append((j_insts[0], j_sp, None))
+            combos.append((sb, bs, used_meta))
+    elif primary_builder is not None:
+        p_sp, p_insts = builder_schema_opts[primary_builder]
+        for inst in p_insts[:MAX_SCHEMA_INSTANCES]:
+            bs = {primary_builder: inst}
+            used_meta = [(inst, p_sp, None)]
+            for j, (j_sp, j_insts) in builder_schema_opts.items():
+                if j == primary_builder:
+                    continue
+                bs[j] = j_insts[0]
+                used_meta.append((j_insts[0], j_sp, None))
+            combos.append(({}, bs, used_meta))
+
+    made: list[tuple[str, dict[str, Any]]] = []
+    schema_sources: set[str] = set()
+    last_err: str | None = None
+    last_exempt = False
+    for sb, bs, used_meta in combos:
+        case = _Case(spare, api, calls=1)
+        try:
+            call_stmt = _bind_call(
+                case,
+                0,
+                name,
+                params_raw,
+                formals,
+                model_rec,
+                entry_trust=entry_trust,
+                schema_bindings=sb,
+                builder_schema=bs,
+            )
+        except _AutoExempt as exc:
+            last_err, last_exempt = str(exc), True
+            continue
+        except _CaseError as exc:
+            last_err, last_exempt = str(exc), False
+            continue
+        for inst, pointee, decl in used_meta:
+            _record_schema_extern(api, inst, pointee, decl)
+            gfile = str(inst.get("file") or "")
+            if gfile.endswith(".c"):
+                schema_sources.add(gfile)
+        made.append((case.statements([call_stmt]), case.layout("single", [name])))
+    if not made:
+        return [], last_err, last_exempt, set()
+    return made, None, False, schema_sources
 
 
 # --- variadic functions: one case per call site of the target's own programs -------------------------
@@ -2348,6 +3107,67 @@ def struct_destructors(
     return chosen, names
 
 
+def _byval_builder_target(rec: dict) -> str | None:
+    """The struct type a by-value builder returns (`struct pb_istream_s`), or None."""
+    ret = _norm_type(_return_type(rec))
+    if not _is_record(ret) or "*" in ret or "(" in ret or "[" in ret:
+        return None
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    if params is None:
+        return None
+    # A function taking the same struct (by value or pointer) is a transformer/copy, not a builder from scratch.
+    for p in params:
+        if p["kind"] == "struct" and str(p.get("ctype") or "") == ret:
+            return None
+        if p["kind"] == "ptr" and str(p.get("pointee") or "") == ret:
+            return None
+    return ret
+
+
+def _schema_builder_param(rec: dict, target_struct: str, is_byval: bool) -> tuple[int, str] | None:
+    """
+    For a schema-taking builder (`pb_field_iter_begin(iter, desc, msg)`, `mbedtls_cipher_setup(ctx, info)`),
+    return `(param_index, schema_pointee)` of its `const` struct-pointer parameter, or None.
+    """
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    if not params:
+        return None
+    formals = list(rec.get("formals") or [])
+    start = 0 if is_byval else 1
+    for i in range(start, len(params)):
+        p = params[i]
+        if p["kind"] != "ptr" or not _is_input(formals, i):
+            continue
+        pointee = str(p.get("pointee") or "")
+        if _is_record(pointee) and "*" not in pointee and pointee != target_struct:
+            return i, pointee
+    return None
+
+
+def builder_metadata(
+    chosen: dict[str, str],
+    records: dict[str, dict],
+) -> tuple[set[str], dict[str, tuple[int, str]]]:
+    """
+    Inspect `initializers(..., trust_schema=True)` outputs to identify:
+      - `byval_inits`: builders returning their struct by value (`pb_istream_from_buffer`);
+      - `schema_inits`: builders taking a trusted `const` struct schema pointer (`pb_field_iter_begin`).
+    """
+    byval: set[str] = set()
+    schema_inits: dict[str, tuple[int, str]] = {}
+    for target, fn in chosen.items():
+        rec = records.get(fn)
+        if not isinstance(rec, dict):
+            continue
+        is_byval = _byval_builder_target(rec) == target
+        if is_byval:
+            byval.add(fn)
+        sp = _schema_builder_param(rec, target, is_byval)
+        if sp is not None:
+            schema_inits[fn] = sp
+    return byval, schema_inits
+
+
 def initializers(
     functions: dict[str, dict],
     traces: list[list[dict]] | None = None,
@@ -2355,10 +3175,16 @@ def initializers(
     *,
     cluster_budget: _ClusterInitBudget | None = None,
     skipped_notes: dict[str, list[str]] | None = None,
+    trust_schema: bool = False,
+    schema_globals: dict[str, list[dict[str, Any]]] | None = None,
+    anon_tags: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], dict[str, set[str]], dict[str, dict]]:
     """
     Per struct type, the initializer the harness calls on a pointer to it, and every candidate: a
     function named like an initializer whose first parameter is a non-const pointer to that struct.
+    When `trust_schema=True` (`FRAMAC_API_TRUST_SCHEMA`, S2), also recognizes by-value struct
+    builders (`*_from_*`, `*_init*`, `*_new*`, `*_create*`, `*_make*`, e.g. `pb_istream_from_buffer`)
+    and schema-taking builders (`*_begin*`, `*_setup*`, e.g. `pb_field_iter_begin`).
     `functions` are the model's records (key -> record): `plan` passes the whole unit's, an
     initializer often lies in another cluster than the API it serves (mpack). A header `static`
     function counts only when the layout probe saw it declared in the harness (`visible`), every
@@ -2381,25 +3207,40 @@ def initializers(
         if not isinstance(rec, dict):
             continue
         name = str(rec.get("name") or key.split("#")[-1])
-        if not _INIT_NAME_RE.search(name):
-            continue
         if rec.get("static") and not rec.get("header"):
             continue
         if (rec.get("static") and visible is None) or (visible is not None and name not in visible):
             continue
-        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
-        formals = list(rec.get("formals") or [])
-        if not params or params[0]["kind"] != "ptr" or _is_input(formals, 0):
-            continue
         if path_parameter(rec):
             continue  # it would open a file the input names (path_parameter)
-        pointee = str(params[0].get("pointee") or "")
-        # A `struct tag **` first parameter is an out-parameter constructor (`outparam_constructors`),
-        # not an initializer of a struct object.
-        if not _is_record(pointee) or "*" in pointee:
-            continue
-        cands.setdefault(pointee, set()).add(name)
-        records[name] = rec
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        formals = list(rec.get("formals") or [])
+        matched_ptr = False
+        if (
+            (_SCHEMA_INIT_NAME_RE.search(name) if trust_schema else _INIT_NAME_RE.search(name))
+            and not (trust_schema and _DTOR_NAME_RE.search(name))
+            and params
+            and params[0]["kind"] == "ptr"
+            and not _is_input(formals, 0)
+        ):
+            pointee = str(params[0].get("pointee") or "")
+            # A `struct tag **` first parameter is an out-parameter constructor (`outparam_constructors`),
+            # not an initializer of a struct object.
+            if _is_record(pointee) and "*" not in pointee:
+                cands.setdefault(pointee, set()).add(name)
+                records[name] = rec
+                matched_ptr = True
+        if (
+            trust_schema
+            and not matched_ptr
+            and _BY_VAL_BUILDER_NAME_RE.search(name)
+            and not _DTOR_NAME_RE.search(name)
+            and params is not None
+        ):
+            target = _byval_builder_target(rec)
+            if target is not None:
+                cands.setdefault(target, set()).add(name)
+                records[name] = rec
     traced: dict[str, int] = {}  # each function the traces call, by the order of its first call
     for trace in traces or []:
         for c in trace:
@@ -2407,18 +3248,38 @@ def initializers(
             if isinstance(fn, str):
                 traced.setdefault(fn, len(traced))
 
-    def rank(n: str) -> tuple[bool, bool, bool, int, bool, int, str]:
+    def rank(target: str, n: str) -> tuple[Any, ...]:
         rec = records[n]
         params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         formals = list(rec.get("formals") or [])
-        pairs = [i for i in range(1, len(params or [])) if _is_pair(params or [], i, formals)]
+        is_byval = trust_schema and _byval_builder_target(rec) == target
+        start = 0 if is_byval else 1
+        pairs = [i for i in range(start, len(params or [])) if _is_pair(params or [], i, formals)]
         parts = split_signature(str(rec.get("signature") or ""))
+        if not trust_schema:
+            return (
+                not cluster_budget.in_cluster(n) if cluster_budget is not None else False,
+                not any(_is_input(formals, i) for i in pairs),
+                not pairs,
+                traced.get(n, len(traced)),
+                not re.search(r"_[Ii]nit$", n),
+                len(parts[1]) if parts else 99,
+                n,
+            )
+        len_ptrs = [i for i in range(start, len(params or [])) if _len_ptr_params(params or [], i, formals, rec)]
+        has_input_pair = any(_is_input(formals, i) for i in pairs) or bool(len_ptrs)
+        has_any_pair = bool(pairs) or bool(len_ptrs)
+        sp = _schema_builder_param(rec, target, is_byval)
+        has_schema_inst = sp is not None and bool(
+            _lookup_schema_instances_raw(schema_globals or {}, sp[1], None, anon_tags)
+        )
         return (
             not cluster_budget.in_cluster(n) if cluster_budget is not None else False,
-            not any(_is_input(formals, i) for i in pairs),
-            not pairs,
+            not has_input_pair,
+            not has_any_pair,
+            not has_schema_inst,
             traced.get(n, len(traced)),
-            not re.search(r"_[Ii]nit$", n),
+            not re.search(r"_(?:[Ii]nit|from_buffer|begin)$", n),
             len(parts[1]) if parts else 99,
             n,
         )
@@ -2437,7 +3298,7 @@ def initializers(
                     )
             usable = fitting
         if usable:
-            chosen[t] = min(usable, key=rank)
+            chosen[t] = min(usable, key=lambda n: rank(t, n))  # noqa: B023
     return chosen, cands, records
 
 
@@ -2508,6 +3369,34 @@ def handle_functions(
     ctors = {t: min(names, key=lambda n: (len(protos[n]["params"]), n)) for t, names in ctor_cands.items()}
     dtors = {t: min(names, key=_dtor_rank) for t, names in dtor_cands.items()}
     return handles, ctors, dtors, dtor_cands, {n: by_name[n] for n in ctors.values()}, returns
+
+
+def handle_constructor_candidates(
+    functions: dict[str, dict], visible: set[str] | None
+) -> tuple[dict[str, list[str]], dict[str, dict]]:
+    """
+    All candidate handle constructors per handle type and their model records (for backend-matched
+    constructor selection under `FRAMAC_API_TRUST_SCHEMA`, without altering `handle_functions`'s
+    return tuple).
+    """
+    protos = getattr(visible, "prototypes", None) or {}
+    by_name: dict[str, dict] = {}
+    for key, rec in functions.items():
+        if isinstance(rec, dict) and not (rec.get("static") and not rec.get("header")):
+            by_name.setdefault(str(rec.get("name") or key.split("#")[-1]), rec)
+    ctor_cands: dict[str, list[str]] = {}
+    ctor_recs: dict[str, dict] = {}
+    for name, rec in by_name.items():
+        proto = protos.get(name)
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        if not isinstance(proto, dict) or params is None or len(proto.get("params") or []) > len(params):
+            continue
+        mine = {i: t for i, t in enumerate(proto["params"]) if t and params[i]["kind"] == "ptr"}
+        ret = proto.get("ret")
+        if ret and not mine and _INIT_NAME_RE.search(name) and not path_parameter(rec):
+            ctor_cands.setdefault(ret, []).append(name)
+            ctor_recs[name] = rec
+    return {t: sorted(ns) for t, ns in ctor_cands.items()}, ctor_recs
 
 
 def _dtor_rank(name: str) -> tuple[bool, str]:
@@ -2992,6 +3881,10 @@ def plan(
     reserve: int = 0,
     callback_stubs: bool = True,
     variadic: dict[str, list[dict]] | None = None,
+    *,
+    global_variables: dict[str, dict] | None = None,
+    trust: dict[str, Any] | None = None,
+    trust_schema: bool | None = None,
 ) -> dict[str, Any]:
     """
     The cases of a module's API harness: {entries, cases, layouts, skipped, stubs, variadic_dropped}.
@@ -3007,6 +3900,7 @@ def plan(
     entry points keep their selectors, and these go first over the case limit); without the probe it
     is skipped as `HEADER_NOT_VISIBLE`.
     """
+    effective_trust_schema = api_trust_schema_enabled() if trust_schema is None else bool(trust_schema)
     max_cases = max(0, MAX_CASES - reserve)
     from module_map import ModuleMap
 
@@ -3024,6 +3918,8 @@ def plan(
     cases: list[str] = []
     layouts: list[dict] = []
     skipped: dict[str, str] = {}
+    auto_exempt: dict[str, str] = {}
+    schema_sources: set[str] = set()
     records: dict[str, dict] = {}
     names: list[str] = []
     variadic_made: list[tuple[str, dict]] = []
@@ -3041,15 +3937,19 @@ def plan(
         and not _unspelled_anon_record(rec, anon_tags)
     }
     handles, ctors, dtors, dtor_names, ctor_records, returns = handle_functions(init_pool, visible)
+    ctor_cands: dict[str, list[str]] = {}
+    all_ctor_records: dict[str, dict] = {}
+    if effective_trust_schema:
+        ctor_cands, all_ctor_records = handle_constructor_candidates(init_pool, visible)
     outp = outparam_constructors(init_pool, visible, handles, traces)
     # Initializers and destructors of struct objects may lie outside the scope: mpack's
     # mpack_writer_init and mpack_writer_destroy are in other clusters than most of the writer API
     # (mpack run-3: every mpack_writer_2 case passed an all-zero writer). Any function of the unit
     # counts; the harness's sources take in the unit of every function a case names
     # (generate_harness._merge_dag_harness_sources).
+    unit_rec = mm.unit_record(module)
     unit_names = {
-        str((functions.get(k) or {}).get("name") or str(k).split("#")[-1])
-        for k in mm.unit_record(module).get("functions") or []
+        str((functions.get(k) or {}).get("name") or str(k).split("#")[-1]) for k in unit_rec.get("functions") or []
     } | entry_names
     unit_pool = {
         k: rec
@@ -3058,11 +3958,37 @@ def plan(
         and (str(rec.get("name") or k.split("#")[-1]) in unit_names or (rec.get("static") and rec.get("header")))
         and not _unspelled_anon_record(rec, anon_tags)
     }
+    resolved_unit = unit or (unit_rec.get("unit") if isinstance(unit_rec.get("unit"), str) else None)
+    unit_links: list[str] = []
+    if resolved_unit:
+        u_model = (model.get("units") or {}).get(resolved_unit) or {}
+        if isinstance(u_model, dict):
+            unit_links = [str(x) for x in u_model.get("links") or [] if x]
+    tm_active = False
+    entry_trust_map: dict[str, _EntryTrust] = {}
+    schema_globals: dict[str, list[dict[str, Any]]] = {}
+    if effective_trust_schema:
+        tm_active, entry_trust_map = _resolve_threat_model(dag, model, trust=trust, unit=resolved_unit)
+        merged_globals = _merge_global_variables(model, dag, global_variables)
+        schema_globals = _schema_instances_index(
+            merged_globals, unit=resolved_unit, unit_links=unit_links, anon_tags=anon_tags
+        )
     cluster_budget = _flow_cluster_budget(dag, module)
     init_skip_notes: dict[str, list[str]] = {}
     inits, candidates, init_records = initializers(
-        unit_pool, traces, visible, cluster_budget=cluster_budget, skipped_notes=init_skip_notes
+        unit_pool,
+        traces,
+        visible,
+        cluster_budget=cluster_budget,
+        skipped_notes=init_skip_notes,
+        trust_schema=effective_trust_schema,
+        schema_globals=schema_globals if effective_trust_schema else None,
+        anon_tags=anon_tags if effective_trust_schema else None,
     )
+    byval_inits: set[str] = set()
+    schema_inits: dict[str, tuple[int, str]] = {}
+    if effective_trust_schema:
+        byval_inits, schema_inits = builder_metadata(inits, init_records)
     struct_dtors, struct_dtor_names = struct_destructors(unit_pool, visible, cluster_budget=cluster_budget)
     freers = struct_freers(struct_dtor_names)
     if cluster_budget is not None:
@@ -3094,6 +4020,7 @@ def plan(
         records={
             **{n: callable_recs[n] for n in g_names},
             **init_records,
+            **all_ctor_records,
             **ctor_records,
             **{c[0]: outp.records[c[0]] for c in out_ctors.values()},
         },
@@ -3126,6 +4053,11 @@ def plan(
         owner_names=owner_names,
         owner_tables=owner_tables,
         producers=producers,
+        trust_schema=effective_trust_schema,
+        ctor_cands=ctor_cands,
+        byval_inits=byval_inits,
+        schema_inits=schema_inits,
+        schema_globals=schema_globals,
     )
     header_entries: list[tuple[str, str]] = []
     for key in entries:
@@ -3133,6 +4065,14 @@ def plan(
         name = str(drec.get("name") or key.split("#")[-1])
         if name == "main":
             continue
+        if effective_trust_schema and tm_active:
+            et = entry_trust_map.get(key) or _EntryTrust()
+            if et.trusted_caller or et.input_role is None:
+                skipped[key] = NO_ATTACKER_DATA_REASON
+                auto_exempt[key] = NO_ATTACKER_DATA_REASON
+                continue
+        else:
+            et = None
         if drec.get("is_static") and drec.get("header"):
             # Defined in a public header (`header_api`): callable once the layout probe saw the
             # harness declare it. Its case comes after every other generated one (HD4).
@@ -3162,17 +4102,21 @@ def plan(
             else:
                 skipped[key] = f"{NO_VARIADIC_SITE} ({left_out[0]['why']})" if left_out else NO_VARIADIC_SITE
             continue
-        stmt, layout, why = single_case(name, mrec, spare, api)
-        if stmt is None or layout is None:
+        made_cases, why, is_exempt, used_srcs = _single_cases_for_entry(name, mrec, spare, api, et)
+        if not made_cases:
             skipped[key] = str(why)
+            if is_exempt:
+                auto_exempt[key] = str(why)
             continue
+        schema_sources.update(used_srcs)
         records[name] = mrec
         names.append(key)
-        cases.append(stmt)
-        layouts.append({**layout, "entry": key})
-    for stmt, layout in variadic_made:
-        cases.append(stmt)
-        layouts.append(layout)
+        for c_stmt, c_layout in made_cases:
+            cases.append(c_stmt)
+            layouts.append({**c_layout, "entry": key})
+    for v_stmt, v_layout in variadic_made:
+        cases.append(v_stmt)
+        layouts.append(v_layout)
     seq_seen: set[tuple[str, ...]] = set()
     for full in traces or []:
         # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
@@ -3182,12 +4126,12 @@ def plan(
             sig = tuple(trace[k]["fn"] for k in chain)
             if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
                 continue
-            stmt, layout, why = sequence_case(trace, chain, records, spare, api)
-            if stmt is None or layout is None:
+            seq_stmt, seq_layout, _why = sequence_case(trace, chain, records, spare, api)
+            if seq_stmt is None or seq_layout is None:
                 continue
             seq_seen.add(sig)
-            cases.append(stmt)
-            layouts.append(layout)
+            cases.append(seq_stmt)
+            layouts.append(seq_layout)
     # Every handle type with a constructor and a destructor gets one synthesized lifecycle case, within
     # the same cap as the recorded sequences (which come first). A recorded chain does not cover the
     # type: sequence_case passes a shared handle as a zeroed buffer (an incomplete struct does not
@@ -3197,12 +4141,12 @@ def plan(
         if n_seq >= MAX_SEQUENCE_CASES:
             break
         methods = lifecycle_methods(htype, records, api)
-        stmt, layout, why = lifecycle_case(htype, methods, records, spare, api)
-        if stmt is None or layout is None:
+        lc_stmt, lc_layout, _why = lifecycle_case(htype, methods, records, spare, api)
+        if lc_stmt is None or lc_layout is None:
             continue
         n_seq += 1
-        cases.append(stmt)
-        layouts.append(layout)
+        cases.append(lc_stmt)
+        layouts.append(lc_layout)
     # The functions defined in a public header, last: the cases above keep their selectors, and these
     # are the first to go over the case limit. They stay out of `records`, which builds the sequence
     # and lifecycle cases above, so those are the same with or without them.
@@ -3214,13 +4158,18 @@ def plan(
         if is_variadic(str(mrec.get("signature") or ""), mrec.get("formals")):
             skipped[key] = HEADER_VARIADIC
             continue
-        stmt, layout, why = single_case(name, mrec, spare, api)
-        if stmt is None or layout is None:
+        et = entry_trust_map.get(key) if (effective_trust_schema and tm_active) else None
+        made_cases, why, is_exempt, used_srcs = _single_cases_for_entry(name, mrec, spare, api, et)
+        if not made_cases:
             skipped[key] = str(why)
+            if is_exempt:
+                auto_exempt[key] = str(why)
             continue
+        schema_sources.update(used_srcs)
         names.append(key)
-        cases.append(stmt)
-        layouts.append({**layout, "entry": key})
+        for stmt, layout in made_cases:
+            cases.append(stmt)
+            layouts.append({**layout, "entry": key})
     if len(cases) > max_cases:
         for lay in layouts[max_cases:]:
             if lay.get("entry"):
@@ -3229,6 +4178,7 @@ def plan(
                 dropped.append(_dropped_variadic(lay, f"more than {MAX_CASES} cases"))
         cases, layouts = cases[:max_cases], layouts[:max_cases]
         skipped = still_skipped(layouts, skipped)
+    auto_exempt = still_skipped(layouts, auto_exempt)
     for sel, lay in enumerate(layouts):
         lay["selector"] = sel
     return {
@@ -3236,7 +4186,10 @@ def plan(
         "cases": cases,
         "layouts": layouts,
         "skipped": skipped,
+        "auto_exempt": auto_exempt,
         "stubs": dict(api.stubs),
+        "schema_externs": dict(api.schema_externs),
+        "schema_sources": sorted(schema_sources),
         "variadic_dropped": dropped,
         "helpers": case_helpers(cases, layouts, helper_pool),
         "helper_pool": sorted(helper_pool),
@@ -3263,6 +4216,13 @@ def stubs_used(cases: list[str], stubs: dict[str, str]) -> list[str]:
     """The definitions of the callback stubs `cases` call, in name order (an unused one is left out)."""
     used = {m.group(0) for c in cases for m in _STUB_NAME_RE.finditer(c)}
     return [stubs[s] for s in sorted(used) if s in stubs]
+
+
+def schema_externs_used(cases: list[str], externs: dict[str, str]) -> list[str]:
+    """The `extern` declarations of S3 const schema globals `cases` reference, in name order."""
+    if not externs:
+        return []
+    return [externs[g] for g in sorted(externs) if any(re.search(rf"\b{re.escape(g)}\b", c) for c in cases)]
 
 
 def _dropped_variadic(layout: dict, why: str) -> dict[str, Any]:
@@ -4444,6 +5404,10 @@ def generate(
     visible: set[str] | None = None,
     dispatch_cases: list[str] | None = None,
     variadic: dict[str, list[dict]] | None = None,
+    *,
+    global_variables: dict[str, dict] | None = None,
+    trust: dict[str, Any] | None = None,
+    trust_schema: bool | None = None,
 ) -> dict[str, Any]:
     """
     Write harness_<module>.{c,json} for the module's whole API; the generate_harness result plus counts.
@@ -4517,6 +5481,7 @@ def generate(
 
         reports = dag_file.parent
         variadic = ensure(reports / "variadic_calls.json", model_path, reports / "build_capture.json")
+    effective_trust_schema = api_trust_schema_enabled() if trust_schema is None else bool(trust_schema)
     p = plan(
         dag,
         model,
@@ -4529,6 +5494,9 @@ def generate(
         visible,
         reserve=len(custom),
         variadic=variadic,
+        global_variables=global_variables,
+        trust=trust,
+        trust_schema=effective_trust_schema,
     )
     if not p["cases"]:
         raise ApiHarnessError(f"module {module!r}: no API entry point the generator can call: {p['skipped']}")
@@ -4548,6 +5516,7 @@ def generate(
             and not ((functions.get(k) or {}).get("header") and (functions.get(k) or {}).get("is_static"))
         }
         | {str(s) for s in req_sources if s}
+        | {str(s) for s in (p.get("schema_sources") or []) if s}
     )
     first = str((functions.get(p["entries"][0]) or {}).get("name") or p["entries"][0].split("#")[-1])
     planned = copy.deepcopy(p)  # header-free: every attempt at the headers starts from it
@@ -4574,9 +5543,14 @@ def generate(
         while True:
             # While the probe drops cases, a compile error is the probe's to judge; without the
             # probe, generate_module_harness fails on it itself.
+            cur_sources = sorted(set(sources) | {str(s) for s in (p.get("schema_sources") or []) if s})
+            file_scope_decls = [
+                *schema_externs_used(cases, p.get("schema_externs") or {}),
+                *stubs_used(cases, p.get("stubs") or {}),
+            ]
             result = generate_module_harness(
                 module_name=module,
-                sources=sources,
+                sources=cur_sources,
                 header_include=header,
                 entry_fn=first,
                 max_input_size=max_input_size,
@@ -4591,7 +5565,7 @@ def generate(
                 auto_prelude=auto_prelude,
                 scope_files=scope,
                 fail_on_compile_error=not probe,
-                file_scope=stubs_used(cases, p.get("stubs") or {}),
+                file_scope=file_scope_decls,
             )
             if not probe:
                 break
@@ -4610,6 +5584,9 @@ def generate(
                         *layouts_probed,
                         reserve=len(custom),
                         variadic=variadic,
+                        global_variables=global_variables,
+                        trust=trust,
+                        trust_schema=effective_trust_schema,
                     )
                     if p["cases"]:
                         cases, layouts, skipped = with_custom(p)
@@ -4634,6 +5611,9 @@ def generate(
                     reserve=len(custom),
                     variadic=variadic,
                     callback_stubs=False,
+                    global_variables=global_variables,
+                    trust=trust,
+                    trust_schema=effective_trust_schema,
                 )
                 layouts_probed = None
                 if p["cases"]:
@@ -4702,8 +5682,12 @@ def generate(
         sidecar["dispatch_case_count"] = len(layouts)
         # A variadic function has one case per call site: it is skipped only when none is left.
         skipped = still_skipped(layouts, skipped)
+        auto_exempt = still_skipped(layouts, dict(p.get("auto_exempt") or {}))
         sidecar["api_cases"] = layouts
         sidecar["api_skipped"] = skipped
+        sidecar.pop("api_auto_exempt", None)
+        if effective_trust_schema and auto_exempt:
+            sidecar["api_auto_exempt"] = dict(sorted(auto_exempt.items()))
         sidecar["api_helpers"] = case_helpers(cases, layouts, p.get("helper_pool") or [])
         sidecar["api_headers"] = api_headers
         sidecar.pop("api_variadic_dropped", None)
@@ -4720,6 +5704,8 @@ def generate(
         api_custom=sum(1 for lay in layouts if lay["kind"] == CUSTOM_KIND),
         api_skipped=skipped,
     )
+    if effective_trust_schema and auto_exempt:
+        result["api_auto_exempt"] = dict(sorted(auto_exempt.items()))
     if warnings:
         result["api_warnings"] = warnings
     return result
