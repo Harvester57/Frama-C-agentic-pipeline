@@ -107,3 +107,16 @@ line removed because 34.0~beta lacks it; that removal is not in the patches. Lin
 check and the `meta-deduce` Prolog proofs (SWI-Prolog absent) were not run. The oracles of 45, 47
 and 49 contain trailing spaces or blank lines at EOF as Frama-C prints them; `git am` warns about
 them.
+
+**`50-*` (2026-11-22, not filed)** is one commit (`53ebd5fc4a`) on upstream `master` `189053d4a2`,
+authored with the GitLab noreply address. It updates `Functions.Libc.get_printf_argument_str` in
+`plugins/e-acsl/src/libraries/functions.ml` (4 lines added, 2 changed: maps `TEnum { ekind }` via
+`get_ikind_str ekind` and recurses in `get_pkind_str` on `Cil_const.mk_tint ekind`) and adds
+`plugins/e-acsl/tests/format/printf_enum.c` (14 sub-tests) with its three oracles
+(`oracle/gen_printf_enum.0.c`, `oracle/printf_enum.0.res.oracle`,
+`oracle_dev/printf_enum.0.e-acsl.err.log`). No existing oracle changes. Validated in fresh
+containers of `framac-master-audit:189053d` with `revalidate.sh package 50` (fail-before /
+pass-after in default and `dev`, full `plugins/e-acsl` default suite, `./dev/check-files.sh -p
+HEAD~1`, and installed 12-case reproducer), plus the full `plugins/e-acsl/tests/format` `dev` suite
+and `revalidate.sh combined 30 50` / `combined 50 30` (auto-merges `functions.ml` cleanly with `!48`
+in either order and passes both `printf_promoted.c` and `printf_enum.c` in `dev`).

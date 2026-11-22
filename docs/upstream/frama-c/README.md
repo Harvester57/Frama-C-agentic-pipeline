@@ -16,6 +16,44 @@ on 2026-11-09. It predates Issues 15 to 40, so do not rely on it alone for dedup
 
 ---
 
+## Status update (2026-11-22)
+
+This section is newer than the ones below and wins where they differ.
+
+- **Drafted and validated, not filed: 50** (2026-11-22). With `--validate-format-strings`,
+  `Functions.Libc.get_printf_argument_str` (`plugins/e-acsl/src/libraries/functions.ml:156`) falls
+  into `assert false` for any `TEnum _` argument to `printf`, `fprintf`, `sprintf`, `snprintf`,
+  `dprintf`, or `syslog` (`default_argument_promotion` in `cabs2cil.ml:3847` preserves `TEnum ei`),
+  and `get_pkind_str` falls into `Options.fatal` (`unexpected argument type in printf`) for
+  `enum E *` pointers (such as `%n` on a signed `enum *`, or mismatched `%p`/`%s`).
+  - **Package:** analysis draft
+    ([`./frama-c-eacsl-format-enum-argument.md`](./frama-c-eacsl-format-enum-argument.md)), issue
+    text ([`./filing/50-eacsl-format-enum-argument-issue.md`](./filing/50-eacsl-format-enum-argument-issue.md)),
+    MR text ([`./filing/50-eacsl-format-enum-argument-mr.md`](./filing/50-eacsl-format-enum-argument-mr.md),
+    holding `#<issue>`), reproducer
+    ([`./repro/50-eacsl-format-enum-argument.sh`](./repro/50-eacsl-format-enum-argument.sh) +
+    [`./repro/50-eacsl-format-enum-argument.c`](./repro/50-eacsl-format-enum-argument.c)), and patch
+    ([`./patches/50-eacsl-format-enum-argument.patch`](./patches/50-eacsl-format-enum-argument.patch),
+    one commit `53ebd5fc4a` on `master` `189053d4a2`, 4 lines added and 2 changed in `functions.ml`
+    plus `plugins/e-acsl/tests/format/printf_enum.c` with 14 sub-tests and 3 oracles).
+  - **Validated** on upstream `master` `189053d4a2` in `framac-master-audit:189053d` via
+    `revalidate.sh package 50`: `git am --keep-non-patch` clean (no mode changes), `printf_enum.c`
+    fails on unpatched `master` (default and `dev`) and passes patched (default and `dev`), the
+    entire `plugins/e-acsl` default suite and the entire `plugins/e-acsl/tests/format` `dev` suite
+    pass with zero diffs on existing oracles, `./dev/check-files.sh -p HEAD~1` passes (`Lint 5
+    file(s)`), and the 12-case reproducer goes from `RESULT: bug present (12 of 12 cases fail)` on
+    both `master` `189053d4a2` and `34.0~beta` (`framac-analysis:latest`) to `RESULT: fixed`
+    (12/12 pass). Stacks cleanly with Issue 30 (`!48`) via `git am --3way --keep-non-patch` in
+    either order (`30+50` and `50+30`), passing both `printf_promoted.c` and `printf_enum.c` in
+    `dev`.
+  - **Duplicates:** live read-only API search of `pub/frama-c` issues and MRs (all states) on
+    2026-11-22 found none.
+  - **Overview text updated locally:** [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md)
+    adds a 22 November edit note and annex row `50` under E-ACSL (sync to live `#2832` awaits the
+    owner's go-ahead; filing remains paused).
+
+---
+
 ## Status update (2026-11-20)
 
 This section is newer than the ones below and wins where they differ.
@@ -571,7 +609,8 @@ All paths below are relative to this folder.
 - **Draft:** the long analysis.
 - **Repro:** `repro/<NN>-<slug>.sh` plus its `.c` files.
 - **Patch:** `patches/<NN>-<slug>.patch`. "Validated" means built, and the reproducer run before and
-  after on `master` `3dff90fc70` (01 to 27), `95408044f7` (28 to 40) or `b80fcac74f` (41 to 44).
+  after on `master` `3dff90fc70` (01 to 27), `95408044f7` (28 to 40), `b80fcac74f` (41 to 44), or
+  `189053d4a2` (50).
 
 | # | Component | Bug | Draft | Issue | MR | Repro | Patch |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -621,8 +660,9 @@ All paths below are relative to this folder.
 | 47 | MetAcsl | Callee `Old`/`Pre`/`Here` labels copied into `\written`/`\read` instances at a call: `Old` aborts E-ACSL and WP, `Pre` and `Here` (under `After`) let WP prove false properties (**soundness**) | [draft](./frama-c-metacsl-callee-old-label-in-written.md) | [issue](./filing/47-metacsl-callee-old-label-in-written-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/47-metacsl-callee-old-label-in-written-mr.md), **not opened** | [sh](./repro/47-metacsl-callee-old-label-in-written.sh) | [built](./patches/47-metacsl-callee-old-label-in-written.patch) on pub/meta `4f43801390` (one visitor and a test) |
 | 48 | MetAcsl | `-meta-fold`: folded instances have no location (`<unknown>:0` under E-ACSL) | [draft](./frama-c-metacsl-fold-annotation-location.md) | [issue](./filing/48-metacsl-fold-annotation-location-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/48-metacsl-fold-annotation-location-mr.md), **not opened** | [sh](./repro/48-metacsl-fold-annotation-location.sh) | [built](./patches/48-metacsl-fold-annotation-location.patch) on pub/meta `4f43801390` (locations passed, new test + one oracle) |
 | 49 | MetAcsl | Feature: a call to a function without specification gets no `\writing`/`\reading` instance and no warning (libc under `e-acsl-gcc`); `\written`/`\read` terms lack locations (`<unknown>:0` E-ACSL guards) | [draft](./frama-c-metacsl-eacsl-libc-instances.md) | [issue](./filing/49-metacsl-eacsl-libc-instances-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/49-metacsl-eacsl-libc-instances-mr.md), **not opened** | [sh](./repro/49-metacsl-eacsl-libc-instances.sh) | [built](./patches/49-metacsl-eacsl-libc-instances.patch) on pub/meta `4f43801390` (warning only) |
+| 50 | E-ACSL | `--validate-format-strings`: `Assertion failed` in `functions.ml:156` on `enum` arguments and `Options.fatal` on `enum *` pointers | [draft](./frama-c-eacsl-format-enum-argument.md) | [issue](./filing/50-eacsl-format-enum-argument-issue.md), **not filed** (staged for #2832) | [MR](./filing/50-eacsl-format-enum-argument-mr.md), **not opened** | [sh](./repro/50-eacsl-format-enum-argument.sh) | [validated](./patches/50-eacsl-format-enum-argument.patch) on `189053d4a2` (`functions.ml` + `printf_enum.c`, 5 files; stacks with !48) |
 
-Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11. 43 to 49 wait for the owner's
+Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11. 43 to 50 wait for the owner's
 go-ahead.
 
 ## How to file
@@ -719,6 +759,7 @@ points the maintainers may raise, and are no longer blocking. 41 and 42 were fil
 | 44 | File it? Decided on 2026-11-18: the patch also strengthens the `separation` precondition to `src+(0..strlen(src))` (measured: no oracle of `tests/libc` or of the E-ACSL suite changes with it; both texts say it can be dropped). Rename the check `imprecise` of `tests/libc/string_h.c`, which becomes valid? |
 | 45 | File it on `pub/meta` (issue and validated MR are ready, still paused)? Stacks cleanly with 47 to 49 (only `CHANGELOG.md` conflicts). `file_upstream.py` knows project 780 only, so it is filed by hand. |
 | 47 to 49 | File them on `pub/meta` (issues and MRs)? 49 cites 47 and 48, so file those first and replace `#ISSUE-47` and `#ISSUE-48`. Listed in #2832 since 2026-11-20. `file_upstream.py` knows project 780 only, so they are filed by hand. |
+| 50 | File it on `pub/frama-c` once the filing pause lifts, or fold it into a combined format-validation MR with `!48`, `!49` and `!50` if the maintainers answer question 3 of `#2832` in favour of combining them? Stacks cleanly with `!48` in either order. |
 | hunt | Which of the candidates of [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md) to turn into packages, and in which order? That document ranks them ("Order of criticity"); N1 (enumeration constants), L2 (`pclose`) and L1 (`void` objects under WP) come first. N1 reverts a deliberate upstream change, so it needs the argument from C11 and gcc. |
 
 ## Identified, not filed

@@ -90,6 +90,10 @@ annex). It would go to `pub/meta`, and it is not filed either.*
 (Libc, reference 46), and three MetAcsl reports for `pub/meta` (references 47 to 49, including a
 wrong proof in 47; patches ready, and 45's patch is now built too).*
 
+*Edit, 22 November: added `--validate-format-strings` crashing on `enum` arguments and `enum *`
+pointers in `printf`-family calls (E-ACSL, reference 50 in the annex; validated on `master`
+`189053d4a2` and `34.0~beta`, patch ready).*
+
 One of them is a question before it is a report, because the behaviour is deliberate.
 
 **Enumeration constants.** Since the change "Fix enumeration typing by making sure all items are
@@ -160,9 +164,9 @@ Thank you for the triage so far, and for opening the fork settings.
 
 One line each, so that you can say which ones you want. The references are my own labels (the
 gaps are findings I dropped). Each has a reproducer of a few lines, run on `master`
-(`b80fcac74f`) and on `34.0~beta`, except the two marked "`master` only" and the four MetAcsl
-reports (45, 47 to 49), which were run on Frama-C `34.0~beta` (MetAcsl `0.12~beta` and `pub/meta`
-`4f43801390`).
+(`b80fcac74f`, or `189053d4a2` for reference 50) and on `34.0~beta`, except the two marked
+"`master` only" and the four MetAcsl reports (45, 47 to 49), which were run on Frama-C `34.0~beta`
+(MetAcsl `0.12~beta` and `pub/meta` `4f43801390`).
 
 **Kernel, C front end**
 
@@ -227,6 +231,7 @@ reports (45, 47 to 49), which were run on Frama-C `34.0~beta` (MetAcsl `0.12~bet
 | Ref | What happens | Kind |
 | :-- | :-- | :-- |
 | 43 | A real constant with an exponent (`1e-9`) stops Frama-C with `Not_a_decimal`, and `0.1L` is 0 at run time. Patch ready. | unexpected error, wrong run-time check |
+| 50 | `--validate-format-strings`: any `enum` argument to a `printf`-family function crashes Frama-C with `Assertion failed` in `plugins/e-acsl/src/libraries/functions.ml:156` (`get_printf_argument_str`), and a pointer to an `enum` (such as `&s` for `%n`) aborts with `unexpected argument type in printf`. Patch ready (stacks cleanly with !48). | internal error |
 | H11 | `(double)` of a real is truncated (`mpq_get_d`), not rounded: with `double e = 0.1;`, `e == (double)0.1` fails, and it passes for the `double` just below 0.1. | wrong run-time check, both ways |
 | H15 | `x < 1e40f` in an annotation gives `x < inf` in the generated code. | the generated code does not compile |
 | old-guard | An `\old` or `\at` term is evaluated at its label even when a guard (`\old(p) == \null ==> ...`, disjunction, or `assumes`) makes it unneeded (`Translate_ats.for_stmt`): valid calls abort at run time with default options, including Frama-C's libc `recvfrom(..., NULL, NULL)` under `e-acsl-gcc -L`. | false alarm on valid code |
