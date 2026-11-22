@@ -2712,8 +2712,9 @@ def _bind_call(
                 elif size is None and is_input and pointee in ("char", "signed char") and case.rest is None:
                     case.rest = {"call": call, "param": i, "kind": "string"}
                     case.post.append(
-                        f"{{ size_t rest_n = fuzz_len - fuzz_off; if (rest_n > sizeof({v}) - 1) "
-                        f"{{ rest_n = sizeof({v}) - 1; }} memcpy({v}, {FUZZ_COPY}, rest_n); {v}[rest_n] = 0; }}"
+                        f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                        f"if (rest_n > sizeof({v}) - 1) {{ rest_n = sizeof({v}) - 1; }} "
+                        f"if (rest_n > 0) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} {v}[rest_n] = 0; }}"
                     )
                 bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
