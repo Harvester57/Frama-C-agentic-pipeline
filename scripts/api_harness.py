@@ -15,12 +15,14 @@ byte selects it), with arguments built from the model's signature of each functi
     generator-owned storage: an input pair (`const` pointee) takes the rest of the input when it is
     still free, else a `PAIR_BYTES` buffer read from the input; an output pair a zeroed spare buffer;
     the length is read from the input and clamped to that storage. Another pointer field points to a
-    zeroed spare buffer, a function pointer stays NULL, every other field is read from the input. A
-    struct whose layout is unknown is zeroed, and the case's `notes` say why;
+    zeroed spare buffer, a function pointer stays NULL (a table of function pointers is rule G's,
+    below), every other field is read from the input. A struct whose layout is unknown is zeroed, and
+    the case's `notes` say why;
   - a byte pointer followed by a length (a `(buf, len)` pair: an unsigned integer, or a signed one
     whose formal name says length, never an enum): the first input pair gets the rest of the input
     itself, so a read past it is caught; an output pair gets a spare buffer and a length read from
-    the input, clamped to the buffer;
+    the input, clamped to the buffer. A length-named integer before a `const` byte pointer it counts
+    (`X__unpack(allocator, size_t len, const uint8_t *data)`, `_len_ptr_params`) is bound the same way;
   - pointers to non-byte elements followed by their count (`const char *strings[], size_t count`;
     `const char *keys[], bool found[], size_t count`; `mpack_node_data_t *node_pool, size_t
     node_pool_count`; `_array_count`: the count's formal name says count, or length or size when no
@@ -98,7 +100,17 @@ byte selects it), with arguments built from the model's signature of each functi
   - a function pointer: a callback stub of its prototype (`callback_stub`, defined after the headers:
     it writes nothing and returns the zero value of its type), when the layout probe spelled the
     prototype from the headers' own typedefs (`callback_prototypes`); else NULL. Either way the case's
-    `notes` say which. A function pointer inside a struct stays NULL;
+    `notes` say which. A function pointer inside a struct stays NULL, except in a table of them;
+  - a pointer to a table of function pointers (rule G, `_vtable_layout`: function pointers make at
+    least half of its fields, as protobuf-c's `ProtobufCAllocator` and `ProtobufCBuffer`): NULL when a
+    doc comment of the headers says NULL selects a default for that type (`null_default_records`),
+    else an object of harness functions (`_table_stub`: malloc/calloc/realloc/free wrappers in an
+    allocator, no-op stubs otherwise), else the function is skipped with the reason. Never zeroed:
+    the callee calls through it. A destructor named for freeing that also takes such tables
+    (`struct_owners`: `X__free_unpacked(X *, ProtobufCAllocator *)`) gets only what its producer
+    returned in the same case (`struct_producers`: `X *m = X__unpack(...)`, the call under test run
+    when `m` is not NULL), and is skipped when no function of the unit produces one; the producer's
+    own case frees its result with it;
   - argument domains (mpack run-4, `_domain_rules`, `_realloc_like`, `_owned_result`): a value read
     from the input that breaks a documented precondition is normalized after the read, and only
     then, so slots and seeds do not move: (min, max) bounds ordered, and a lone bound an inline
@@ -106,7 +118,8 @@ byte selects it), with arguments built from the model's signature of each functi
     capacity and a limit setter's `max_*` at least 1 (B); an initializer's (buffer, size, count)
     count at most the size (C); an enum by value one of its declared constants (D, from the probe);
     a realloc-like call given a harness malloc (E); a heap result or `char **` output the caller
-    owns freed (F). Each restriction is in the case's `notes`.
+    owns freed (F); tables of function pointers and the objects their destructors free (G, above).
+    Each restriction is in the case's `notes`.
 
 Recorded call sequences (seed_harvest.py traces) add sequence cases: the calls of one traced chain in
 order, the buffers they share passed between them, so a later call sees what an earlier one produced
@@ -293,6 +306,27 @@ REALLOC_OLD_BYTES = 64
 _OWNED_RESULT_WORDS = frozenset({"alloc", "dup", "strdup", "strndup"})
 _OWNED_OUT_WORDS = _OWNED_RESULT_WORDS | {"growable"}
 ALLOCATORS = frozenset({"malloc", "calloc", "realloc", "reallocarray", "strdup", "strndup", "aligned_alloc"})
+# G (sudo run-1, protobuf-c's `liblogsrv_a`). A table of function pointers (`_vtable_layout`: an
+#    allocator `{alloc, free, allocator_data}`, an ops table, a sink `{append}`) is never passed zeroed:
+#    the callee calls through it (`do_alloc` called a NULL `alloc`). NULL when a doc comment of the
+#    headers says a NULL pointer of that type selects a default (`null_default_records`: protobuf-c's
+#    "May be NULL to specify the default allocator"), else an object whose function pointers are
+#    harness functions (`_table_stub`: malloc/calloc/realloc/free wrappers in an allocator, no-op
+#    stubs otherwise), else the case is skipped. A destructor named for freeing that also takes such
+#    tables (`X__free_unpacked(X *, ProtobufCAllocator *)`, `struct_owners`) frees what its producer
+#    returned (`struct_producers`: `X__unpack`), never a stack object: its case calls the producer
+#    first and frees the result only when it is not NULL; the producer's own case frees its result.
+_PRODUCER_NAME_RE = re.compile(
+    rf"{_OUT_CTOR_NAME_RE.pattern}|(?:^|_)(?:unpack|decode|deserialize|dup|clone|copy|load|from)(?:$|_)"
+)
+_TABLE_ALLOC_WORDS = frozenset({"alloc", "malloc", "allocate"})
+_TABLE_CALLOC_WORDS = frozenset({"calloc"})
+_TABLE_REALLOC_WORDS = frozenset({"realloc", "reallocate"})
+_TABLE_FREE_WORDS = frozenset({"free", "dealloc", "deallocate"})
+_NULL_WORD_RE = re.compile(r"\bNULL\b")
+# "must not be NULL", "cannot be NULL", "never NULL", "non-NULL": the opposite of a NULL default.
+_NOT_NULL_RE = re.compile(r"\b(?:not|never|cannot|can't|mustn't|non)\b[\s-]+(?:be\s+)?(?:a\s+)?NULL\b", re.IGNORECASE)
+_DEFAULT_WORD_RE = re.compile(r"\b(?:default|system|standard|built-?in)\b", re.IGNORECASE)
 
 
 def _words(name: str | None) -> list[str]:
@@ -477,6 +511,17 @@ class ApiInfo:
     init_skip_notes: dict[str, list[str]] = field(default_factory=dict)
     # Per function, parameter index -> (">=" or "<=", constant) of a lone range bound (`bound_forwards`).
     bounds: dict[str, dict[int, tuple[str, str]]] = field(default_factory=dict)
+    # Rule G: the struct types a doc comment documents as NULL for a default (`null_default_records`);
+    # whether a table of function pointers may get harness functions (False after a stub failed to
+    # compile, as for callback parameters); per struct type, its destructor that also takes tables
+    # (`struct_owners`: the chosen one, every one, and the table types they take) and its producers,
+    # best first (`struct_producers`).
+    null_defaults: set[str] = field(default_factory=set)
+    table_stubs: bool = True
+    owners: dict[str, str] = field(default_factory=dict)
+    owner_names: dict[str, set[str]] = field(default_factory=dict)
+    owner_tables: dict[str, set[str]] = field(default_factory=dict)
+    producers: dict[str, list[str]] = field(default_factory=dict)
 
 
 class _Case:
@@ -995,6 +1040,187 @@ def _owned_result(name: str, rec: dict, api: ApiInfo) -> bool:
     )
 
 
+def _vtable_layout(lay: dict | None) -> bool:
+    """
+    Whether a struct layout is a table of function pointers (rule G): at least one function pointer,
+    and function pointers make at least half of its fields (protobuf-c's `ProtobufCAllocator {alloc,
+    free, allocator_data}`, `ProtobufCBuffer {append}`). A struct with one callback among its data
+    (`{flags, name, cb, data}`) is not one.
+    """
+    if not lay or lay.get("what") != "struct":
+        return False
+    fields = list(lay.get("fields") or [])
+    fns = sum(1 for f in fields if f.get("kind") == "fnptr")
+    return fns >= 1 and 2 * fns >= len(fields)
+
+
+def _table_type(api: ApiInfo, p: dict) -> str | None:
+    """The table-of-function-pointers struct parameter `p` points to (`_vtable_layout`), or None."""
+    pointee = str(p.get("pointee") or "")
+    if p["kind"] != "ptr" or not _is_record(pointee) or "*" in pointee:
+        return None
+    return pointee if _vtable_layout(api.structs.get(pointee)) else None
+
+
+_SCALAR_SPELLING_RE = re.compile(r"^[A-Za-z_][\w ]*$")
+
+
+def _table_stub(stub: str, proto: dict[str, Any], field_name: str, allocator: bool) -> str:
+    """
+    The harness function for a function-pointer field `field_name` of a table (rule G), defined at
+    file scope on one line: in an allocator (a table with an allocating field), a field named for
+    allocating returns `malloc` of its last integer parameter (`calloc` of two, `realloc` of its last
+    pointer and integer), and one named for freeing `free`s its last pointer parameter, so what the
+    callee allocates through the table is real heap memory it can free through it. Any other field is
+    a `callback_stub`: it writes nothing and returns zero.
+    """
+    params = list(proto["params"])
+    ret = str(proto["ret"])
+    ints = [k for k, t in enumerate(params) if "*" not in t and _SCALAR_SPELLING_RE.match(t) and not _is_record(t)]
+    ptrs = [k for k, t in enumerate(params) if "*" in t]
+    words = set(_words(field_name))
+    body: str | None = None
+    if ret.rstrip().endswith("*"):
+        if words & _TABLE_CALLOC_WORDS and len(ints) >= 2:
+            body = f"return ({ret})calloc((size_t)fc_p{ints[-2]}, (size_t)fc_p{ints[-1]});"
+        elif words & _TABLE_REALLOC_WORDS and ints and ptrs:
+            body = f"return ({ret})realloc((void *)fc_p{ptrs[-1]}, (size_t)fc_p{ints[-1]});"
+        elif words & _TABLE_ALLOC_WORDS and ints:
+            body = f"return ({ret})malloc((size_t)fc_p{ints[-1]});"
+    elif allocator and _spelled(ret) == "void" and words & _TABLE_FREE_WORDS and ptrs:
+        body = f"free((void *)fc_p{ptrs[-1]});"
+    if body is None:
+        return callback_stub(stub, proto)
+    decl = ", ".join(f"{t} fc_p{k}" for k, t in enumerate(params)) or "void"
+    uses = " ".join(f"(void)fc_p{k};" for k in range(len(params)))
+    return f"static {ret} {stub}({decl}) {{ {uses} {body} }} /* {CALLBACK_STUB_MARKER} */"
+
+
+def _allocating_field(f: dict) -> bool:
+    return f.get("kind") == "fnptr" and bool(
+        set(_words(f.get("name"))) & (_TABLE_ALLOC_WORDS | _TABLE_CALLOC_WORDS | _TABLE_REALLOC_WORDS)
+    )
+
+
+def _table_arg(case: _Case, call: int, i: int, p: dict, var: str, noted: bool = True) -> str:
+    """
+    The argument of a pointer to a table of function pointers (rule G, `_table_type`): NULL when the
+    headers document NULL as the default for its type (`api.null_defaults`); else an object whose
+    function pointers are harness functions (`_table_stub`), its data pointers spare buffers and its
+    other fields zero (no input is read: the layout does not move); else the case is refused. A zeroed
+    table is never passed: the callee would call a NULL function pointer, a crash only the harness made.
+    `noted` False leaves the case's notes alone (a release's table, which the release's note covers).
+    """
+    api = case.api
+    pointee = str(p.get("pointee") or "")
+    if pointee in api.null_defaults:
+        if noted:
+            case.note(
+                call, i, f"{pointee}: a table of function pointers the headers document as NULL for the default: NULL"
+            )
+        return f"({p['type']})0"
+    fields = list((api.structs.get(pointee) or {}).get("fields") or [])
+    fns = [f for f in fields if f.get("kind") == "fnptr"]
+    unspelled = [str(f.get("name")) for f in fns if not f.get("proto")]
+    if not api.table_stubs or unspelled:
+        why = (
+            "no harness function compiles for them (a stub failed)"
+            if not api.table_stubs
+            else f"the layout probe could not spell {', '.join(unspelled)}"
+        )
+        raise _CaseError(
+            f"{pointee} is a table of function pointers the callee calls through: a zeroed one would be a NULL call "
+            f"only the harness makes, no doc comment of the headers says NULL selects a default, and {why}"
+        )
+    allocator = any(_allocating_field(f) for f in fns)
+    elem = p.get("decl") or _anon_record_spelling(api, pointee)
+    case.decls.append(f"{elem} {case.declare(var)}; memset(&{var}, 0, sizeof({var}));")
+    tag = re.sub(r"\W+", "_", pointee).strip("_")
+    for k, f in enumerate(fields):
+        if f.get("kind") == "fnptr":
+            stub = f"framac_cb_vt_{tag}_{f['name']}"
+            api.stubs.setdefault(stub, _table_stub(stub, f["proto"], str(f["name"]), allocator))
+            case.decls.append(f"{var}.{f['name']} = {stub};")
+        elif f.get("kind") == "ptr":
+            buf = case.declare(f"{var}f{k}")
+            case.decls.append(f"{_byte_buffer('static ', buf, case.spare)} {var}.{f['name']} = (void *){buf};")
+    what = "malloc/free wrappers and no-op stubs" if allocator else "no-op stubs"
+    if noted:
+        case.note(call, i, f"{pointee}: a table of function pointers, filled with harness functions ({what})")
+    return f"&{var}"
+
+
+def _len_ptr_params(params: list[dict], i: int, formals: list[dict], rec: dict) -> bool:
+    """
+    Whether parameters `i`, `i + 1` are a length and the byte pointer it counts, in that order
+    (protobuf-c's `X__unpack(allocator, size_t len, const uint8_t *data)`): an integer `is_length`
+    accepts whose formal name says length (`_LEN_NAME_RE`), then a byte pointer the call only reads,
+    with no length after it and no size its call sites give. Bound as a (pointer, length) pair is: a
+    length read from the input on its own let the callee read past the harness's buffer.
+    """
+    if i + 1 >= len(params) or i + 1 >= len(formals):
+        return False
+    name = _name(formals, i)
+    if not name or not _LEN_NAME_RE.search(name) or not is_length(params[i], name):
+        return False
+    q = params[i + 1]
+    if q["kind"] != "ptr" or not _charlike(q) or not isinstance(formals[i + 1], dict):
+        return False
+    if formals[i + 1].get("kind") != "const_pointer":
+        return False
+    return param_size(rec, i + 1) is None and not _is_pair(params, i + 1, formals)
+
+
+def _produced_struct(name: str, rec: dict, params: list[dict], api: ApiInfo) -> str | None:
+    """The struct type `name` makes for a destructor that takes tables (`api.producers`), or None."""
+    ret = _return_type(rec)
+    if not ret.endswith("*"):
+        return None
+    made = ret[:-1].strip()
+    if name not in api.producers.get(made, []) or made not in api.owners:
+        return None
+    if any(p["kind"] == "ptr" and str(p.get("pointee") or "") == made for p in params):
+        return None
+    return made
+
+
+def _produced_object(case: _Case, made: str, var: str, call: int, param: int) -> str:
+    """
+    `S *var = <producer>(...)` before call `call` (rule G): the object its destructor may free, made
+    by the struct's best producer with its arguments by the usual rules (a byte input is the rest of
+    the input). The call under test runs only when it is not NULL (the caller's guard).
+    """
+    fn = case.api.producers[made][0]
+    rec = case.api.records.get(fn) or {}
+    params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    if params is None:
+        raise _CaseError(f"{fn}, the producer of {made}: {why}")
+    k = case.ncalls + len(case.inits)
+    case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
+    stmt = _bind_call(case, k, fn, params, list(rec.get("formals") or []), rec, allow_init=False)
+    target = f"(void){fn}("
+    if stmt.count(target) != 1:
+        raise _CaseError(f"{fn}, the producer of {made}: its call cannot be kept for the call under test")
+    spelled = _anon_record_spelling(case.api, made)
+    return f"{spelled} *{case.declare(var)} = 0; " + stmt.replace(target, f"{var} = ({spelled} *){fn}(", 1)
+
+
+def _owner_release(case: _Case, call: int, made: str, expr: str) -> str:
+    """The release of object `expr` of `made` by its destructor that takes tables (`api.owners`), each table by `_table_arg`."""
+    api = case.api
+    fn = api.owners[made]
+    rec = api.records.get(fn) or {}
+    params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    if not params:
+        raise _CaseError(f"{fn}, the destructor of {made}: {why}")
+    args = [f"({params[0]['type']}){expr}"]
+    for j in range(1, len(params)):
+        if _table_type(api, params[j]) is None:
+            raise _CaseError(f"{fn}, the destructor of {made}: argument {j} is not a table of function pointers")
+        args.append(_table_arg(case, call, j, params[j], f"c{call}d{j}", noted=False))
+    return f"(void){fn}({', '.join(args)});"
+
+
 def _range_partner(a: str | None, b: str | None) -> bool:
     """Whether formals `a` and `b` are the bounds of one range, `a` the lower (rule A)."""
     wa, wb = _words(a), _words(b)
@@ -1286,6 +1512,11 @@ def _bind_call(
             i += 1
             continue
         if i in shared:
+            if i == 0 and p["kind"] == "ptr" and name in api.owner_names.get(str(p.get("pointee") or ""), set()):
+                # Rule G: a buffer a recorded chain shares is no object the destructor's producer made.
+                raise _CaseError(
+                    f"{name} frees its argument: a buffer the harness shares is no object its producer made"
+                )
             args.append(f"({p['type']}){shared[i]}")
             if nxt is not None and (i + 1) not in shared and _is_pair(params, i, formals):
                 # The length of a shared buffer: from the input, clamped to that buffer.
@@ -1300,6 +1531,27 @@ def _bind_call(
                 i += 2
                 continue
             i += 1
+            continue
+        if p["kind"] == "int" and (i + 1) not in shared and _len_ptr_params(params, i, formals, rec):
+            # A length before the byte pointer it counts (`X__unpack(allocator, len, data)`): the rest of
+            # the input, as a (pointer, length) pair; else a spare buffer and a length clamped to it.
+            q = params[i + 1]
+            if case.rest is None:
+                case.rest = {"call": call, "param": i + 1, "kind": "bytes"}
+                args.append(f"({p['type']})(fuzz_len - fuzz_off)")
+                args.append(f"({q['type']})(fuzz_buf + fuzz_off)")
+                case.note(call, i, "length before the byte pointer it counts: the rest of the input")
+            else:
+                dv = f"c{call}a{i + 1}"
+                case.decls.append(f"{p['ctype']} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                case.slot(v, SCALAR_BYTES.get(p["ctype"]), call, i, "int")
+                case.decls.append(_byte_buffer(_storage(None), case.declare(dv), case.spare))
+                case.decls.append(
+                    f"if ((unsigned long long){v} > {case.spare}ULL) {{ {v} = ({p['ctype']}){case.spare}; }}"
+                )
+                args += [v, f"({q['type']}){dv}"]
+                case.note(call, i, "length before the byte pointer it counts: clamped to a zeroed spare buffer")
+            i += 2
             continue
         if p["kind"] == "fnptr":
             proto = (case.api.callbacks.get(name) or {}).get(i)
@@ -1334,6 +1586,23 @@ def _bind_call(
             charlike = _charlike(p)
             pair = _is_pair(params, i, formals)
             own_init = i == 0 and name in case.api.candidates.get(pointee, set())
+            if i == 0 and name in api.owner_names.get(pointee, set()):
+                # Rule G (sudo run-1: `change_window_size__free_unpacked(&c0a0, &c0a1)` on a stack
+                # message): a destructor that also takes tables frees what its producer returned. The
+                # producer runs first, and the call under test only on a non-NULL result.
+                if not api.producers.get(pointee):
+                    raise _CaseError(
+                        f"frees an object only its producer makes: no function of the unit returns the {pointee} * "
+                        f"{name} frees; a stack or zeroed object would be an invalid free only the harness makes"
+                    )
+                before.append(_produced_object(case, pointee, v, call, i))
+                guards.append(f"{v} != 0")
+                case.note(
+                    call, i, f"the {pointee} {api.producers[pointee][0]} returned, freed by this call when not NULL"
+                )
+                args.append(f"({p['type']}){v}")
+                i += 1
+                continue
             if (
                 allow_init
                 and i not in shared
@@ -1356,6 +1625,11 @@ def _bind_call(
                 release = _struct_release(api, pointee, name, f"&{v}")
                 if release:
                     after.append(release)
+                i += 1
+                continue
+            if _table_type(api, p) is not None:
+                # Rule G: a table of function pointers is NULL (a documented default) or harness functions.
+                args.append(_table_arg(case, call, i, p, v))
                 i += 1
                 continue
             if allow_init and not own_init and pointee in case.api.init_skip_notes:
@@ -1549,6 +1823,7 @@ def _bind_call(
                 after.append(release)
     made = case.api.returns.get(name) if allow_init else None
     made_struct = _made_struct(name, rec, params, api) if allow_init else None
+    produced = _produced_struct(name, rec, params, api) if allow_init and made_struct is None else None
     if made is not None and made in case.api.dtors:
         # The call under test makes a handle: release it, or every run of the case leaks one.
         r = f"c{call}r"
@@ -1560,6 +1835,14 @@ def _bind_call(
         made_c = _anon_record_spelling(api, made_struct)
         own = f"{{ {made_c} * {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){freer}({r}); }} }}"
         case.notes.append(f"call {call} result: a {made_struct} the caller owns, released with {freer}")
+    elif produced is not None:
+        # Rule G: the object a producer returns is freed by the destructor that takes its tables
+        # (`X__unpack` -> `X__free_unpacked(r, allocator)`), or every run of the case leaks one.
+        r = f"c{call}r"
+        made_c = _anon_record_spelling(api, produced)
+        release = _owner_release(case, call, produced, r)
+        own = f"{{ {made_c} * {r} = {name}({', '.join(args)}); if ({r} != 0) {{ {release} }} }}"
+        case.notes.append(f"call {call} result: a {produced} the caller owns, released with {api.owners[produced]}")
     elif realloc_old is not None:
         # Rule E: the result is freed; on failure (a new size of at least 1) the old pointer still is the caller's.
         r = f"c{call}r"
@@ -2265,6 +2548,103 @@ def struct_freers(struct_dtor_names: dict[str, set[str]]) -> dict[str, str]:
     return out
 
 
+def _callable_records(functions: dict[str, dict], visible: set[str] | None) -> dict[str, dict]:
+    """The records a case may call, by name: no file-local `static`, a header one only when the probe saw it declared."""
+    out: dict[str, dict] = {}
+    for key, rec in functions.items():
+        if not isinstance(rec, dict):
+            continue
+        name = str(rec.get("name") or key.split("#")[-1])
+        if rec.get("static") and not rec.get("header"):
+            continue
+        if (rec.get("static") and visible is None) or (visible is not None and name not in visible):
+            continue
+        out.setdefault(name, rec)
+    return out
+
+
+def struct_owners(
+    functions: dict[str, dict], visible: set[str] | None, structs: dict[str, dict]
+) -> tuple[dict[str, str], dict[str, set[str]], dict[str, set[str]]]:
+    """
+    Rule G: per struct type `S`, the destructors that free an object of it and also take tables of
+    function pointers (`_vtable_layout`): named for freeing (`_FREEING_DTOR_RE`), a non-const `S *`
+    first, then only pointers to such tables (protobuf-c's `void X__free_unpacked(X *message,
+    ProtobufCAllocator *allocator)`). Returns (the chosen one per type, the first name; every one;
+    the table types they take). A one-parameter destructor is `struct_destructors`' and
+    `struct_freers`', as before.
+    """
+    names: dict[str, set[str]] = {}
+    tables: dict[str, set[str]] = {}
+    for name, rec in _callable_records(functions, visible).items():
+        if not _FREEING_DTOR_RE.search(name):
+            continue
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        if not params or len(params) < 2 or params[0]["kind"] != "ptr":
+            continue
+        if _is_input(list(rec.get("formals") or []), 0):
+            continue
+        made = str(params[0].get("pointee") or "")
+        if not _is_record(made) or "*" in made:
+            continue
+        kinds = [str(p.get("pointee") or "") for p in params[1:]]
+        if not all(
+            p["kind"] == "ptr" and _vtable_layout(structs.get(t)) for p, t in zip(params[1:], kinds, strict=True)
+        ):
+            continue
+        names.setdefault(made, set()).add(name)
+        tables.setdefault(made, set()).update(kinds)
+    return {t: min(ns) for t, ns in names.items()}, names, tables
+
+
+def struct_producers(
+    functions: dict[str, dict],
+    visible: set[str] | None,
+    owners: dict[str, str],
+    owner_tables: dict[str, set[str]],
+    structs: dict[str, dict],
+    allocating: set[str],
+    const_returns: set[str],
+) -> dict[str, list[str]]:
+    """
+    Rule G: per struct type with a destructor that takes tables (`struct_owners`), the functions that
+    make an object it may free, best first: returning `S *` (no `const` pointee in the header), taking
+    no `S *`, no file-system path, named like a constructor, a parser or an unpacker
+    (`_PRODUCER_NAME_RE`: `X__unpack`), and either reaching an allocator through the model's call
+    sites or taking a table of a type the destructor takes (the allocation goes through it, an
+    indirect call the model does not follow). The name that shares most words with the destructor's
+    comes first (`alert_message__unpack` for `alert_message__free_unpacked`), then the fewest
+    parameters, then the name.
+    """
+    out: dict[str, list[str]] = {}
+    callable_recs = _callable_records(functions, visible)
+    for name, rec in callable_recs.items():
+        ret = _return_type(rec)
+        if not ret.endswith("*"):
+            continue
+        made = ret[:-1].strip()
+        if made not in owners or not _PRODUCER_NAME_RE.search(name) or name in const_returns or path_parameter(rec):
+            continue
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        if params is None or any(p["kind"] == "ptr" and str(p.get("pointee") or "") == made for p in params):
+            continue
+        takes = {str(p.get("pointee") or "") for p in params if p["kind"] == "ptr"}
+        if name not in allocating and not (takes & owner_tables.get(made, set())):
+            continue
+        out.setdefault(made, []).append(name)
+
+    def rank(made: str, n: str) -> tuple[int, int, str]:
+        common = 0
+        for a, b in zip(_words(owners[made]), _words(n), strict=False):
+            if a != b:
+                break
+            common += 1
+        parts = split_signature(str(callable_recs[n].get("signature") or ""))
+        return (-common, len(parts[1]) if parts else 99, n)
+
+    return {made: sorted(ns, key=lambda n: rank(made, n)) for made, ns in out.items()}  # noqa: B023
+
+
 @dataclass
 class OutParamConstructors:
     """`outparam_constructors`: what `ApiInfo` takes (`outs`, `out_ctors`, `out_ctor_names`, `parents`) and the records."""
@@ -2452,6 +2832,10 @@ def _sequence_case(
                 continue
             idx = int(idx_s)
             if idx >= len(params) or params[idx]["kind"] != "ptr":
+                continue
+            if _table_type(case.api, params[idx]) is not None:
+                # Rule G: a shared buffer would be a zeroed table; each call gets its own (NULL or harness
+                # functions), the same for every call of the chain.
                 continue
             if addr not in buffers:
                 var = f"s{len(buffers)}"
@@ -2689,12 +3073,30 @@ def plan(
     structs = dict(struct_layouts or {})
     # The typedef's layout under the model's tag too: a case looks an object up by the model's type.
     structs.update({tag: structs[n] for tag, n in anon_tags.items() if n in structs})
+    # Rule G: destructors that take tables of function pointers, and the producers of what they free.
+    allocating = allocating_functions(model.get("functions") or {})
+    const_rets = set(getattr(visible, "const_returns", None) or ())
+    owners, owner_names, owner_tables = struct_owners(unit_pool, visible, structs)
+    producers = struct_producers(unit_pool, visible, owners, owner_tables, structs, allocating, const_rets)
+    if cluster_budget is not None:
+        # As the freers above: a helper from another cluster only within the cluster's limits. A
+        # destructor whose producers all fall out is skipped; a producer whose destructor does is not freed.
+        owners = {t: fn for t, fn in owners.items() if cluster_budget.fits(fn)}
+        producers = {t: kept for t, ns in producers.items() if (kept := [n for n in ns if cluster_budget.fits(n)])}
+    callable_recs = _callable_records(unit_pool, visible)
+    g_names = set(owners.values()) | {ns[0] for ns in producers.values()}
+    helper_pool |= g_names - entry_names
     api = ApiInfo(
         structs=structs,
         probed=struct_layouts is not None,
         inits=inits,
         candidates=candidates,
-        records={**init_records, **ctor_records, **{c[0]: outp.records[c[0]] for c in out_ctors.values()}},
+        records={
+            **{n: callable_recs[n] for n in g_names},
+            **init_records,
+            **ctor_records,
+            **{c[0]: outp.records[c[0]] for c in out_ctors.values()},
+        },
         handles=handles,
         ctors=ctors,
         dtors=dtors,
@@ -2713,11 +3115,17 @@ def plan(
         struct_dtor_names=struct_dtor_names,
         struct_freers=freers,
         enum_params=dict(getattr(visible, "enum_params", None) or {}),
-        const_returns=set(getattr(visible, "const_returns", None) or ()),
-        allocating=allocating_functions(model.get("functions") or {}),
+        const_returns=const_rets,
+        allocating=allocating,
         limits=limit_parameters(model.get("functions") or {}),
         init_skip_notes=init_skip_notes,
         bounds=dict(getattr(visible, "bound_forwards", None) or {}),
+        null_defaults=set(getattr(visible, "null_defaults", None) or ()),
+        table_stubs=callback_stubs,
+        owners=owners,
+        owner_names=owner_names,
+        owner_tables=owner_tables,
+        producers=producers,
     )
     header_entries: list[tuple[str, str]] = []
     for key in entries:
@@ -2984,6 +3392,7 @@ class Declared(set):  # type: ignore[type-arg]
     bound_forwards: dict[str, dict[int, tuple[str, str]]]
     anon_records: dict[str, dict[str, str]]
     anon_record_pointers: dict[str, dict[int, str]]
+    null_defaults: set[str]
 
     def __init__(
         self,
@@ -2997,6 +3406,7 @@ class Declared(set):  # type: ignore[type-arg]
         bound_forwards: dict[str, dict[int, tuple[str, str]]] | None = None,
         anon_records: dict[str, dict[str, str]] | None = None,
         anon_record_pointers: dict[str, dict[int, str]] | None = None,
+        null_defaults: set[str] | None = None,
     ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
@@ -3018,6 +3428,8 @@ class Declared(set):  # type: ignore[type-arg]
         # `anon_record_pointers`: per function, parameter index (-1: the return) -> the typedef name
         # through which it points to an anonymous struct or union.
         self.anon_record_pointers = anon_record_pointers or {}
+        # `null_default_records`: the struct types a doc comment documents as NULL for a default.
+        self.null_defaults = set(null_defaults or ())
 
 
 def _spelled(t: str) -> str:
@@ -3603,6 +4015,7 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
     that name, so a named struct holding an `ngx_str_t` has a layout too.
     """
     raw, functions = _walk_records(tree)
+    typedefs = _typedef_spellings(tree)
     anon_nodes = _anon_record_nodes(tree)
     for tname, (_, _, node) in anon_nodes.items():
         raw.setdefault(tname, node)
@@ -3695,6 +4108,12 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
             info = type_info(qual if anon_name(qual) else str(ftype.get("desugaredQualType") or qual))
             if info is None:
                 return None
+            if info["kind"] == "fnptr":
+                # Rule G: a table's function pointers get harness functions of this prototype, spelled
+                # as the header writes it (`_callback_prototype`); without it the field cannot be filled.
+                proto = _callback_prototype(qual, typedefs)
+                if proto is not None:
+                    info["proto"] = proto
             a = int(info.pop("align"))
             align = max(align, a)
             here = 0 if what == "union" else (off + a - 1) // a * a
@@ -3725,7 +4144,100 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         bound_forwards(tree),
         {name: {"what": what, "id": rid} for name, (what, rid, _) in anon_nodes.items()},
         anon_record_pointers(tree, set(anon_nodes)),
+        null_default_records(tree),
     )
+
+
+def _typedef_spellings(tree: dict) -> dict[str, str]:
+    """Every typedef name of a clang JSON AST -> its type as written (function bodies left out)."""
+    typedefs: dict[str, str] = {}
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        kind = node.get("kind")
+        if kind == "FunctionDecl":
+            continue
+        if kind == "TypedefDecl" and isinstance(node.get("name"), str):
+            typedefs.setdefault(node["name"], str((node.get("type") or {}).get("qualType") or ""))
+        stack.extend(n for n in reversed(node.get("inner") or []) if isinstance(n, dict))
+    return typedefs
+
+
+def _comment_text(node: dict) -> str:
+    """The text of a doc-comment node (clang's `FullComment` and its parts), joined."""
+    parts: list[str] = []
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.get("kind") == "TextComment" and isinstance(n.get("text"), str):
+            parts.append(n["text"])
+        stack.extend(c for c in reversed(n.get("inner") or []) if isinstance(c, dict))
+    return " ".join(" ".join(parts).split())
+
+
+def _says_null_default(text: str) -> bool:
+    """
+    Whether a doc comment says NULL selects a default (`May be NULL to specify the default allocator`).
+    One that forbids NULL anywhere (`Must not be NULL; use the default ops`) never does.
+    """
+    if _NOT_NULL_RE.search(text):
+        return False
+    return bool(_NULL_WORD_RE.search(text) and _DEFAULT_WORD_RE.search(text))
+
+
+def _pointed_record(decl: dict, typedefs: dict[str, str]) -> str | None:
+    """
+    The struct or union a declaration of type `T *` points to (`struct ProtobufCAllocator`), or None.
+    clang writes `ProtobufCAllocator *` without a desugared form: the typedef name is followed.
+    """
+    t = str((decl.get("type") or {}).get("desugaredQualType") or (decl.get("type") or {}).get("qualType") or "")
+    t = _TRAILING_QUALIFIER_RE.sub("", " ".join(t.split()))
+    if not t.endswith("*") or t.count("*") != 1 or "(" in t:
+        return None
+    base = _spelled(t[:-1])
+    seen: set[str] = set()
+    while base in typedefs and base not in seen:
+        seen.add(base)
+        base = _spelled(typedefs[base])
+    return base if _RECORD_TYPE_RE.match(base) and not base.startswith("enum ") else None
+
+
+def null_default_records(tree: dict) -> set[str]:
+    """
+    Rule G: the struct types a doc comment of the headers documents as NULL for a default, from clang's
+    JSON AST (doc comments, `/** ... */`, come as `FullComment` nodes): a function's `\\param` text,
+    or a field's comment, that says NULL and a default (`_says_null_default`) on a declaration of type
+    `T *`. protobuf-c.h: "`ProtobufCAllocator` to use for memory allocation. May be NULL to specify
+    the default allocator." on `protobuf_c_message_unpack`'s `allocator`, and "Allocator to use. May
+    be NULL to indicate the system allocator." on `ProtobufCBufferSimple`'s. The type is what the
+    rule applies to, for every function that takes it: the generated `X__unpack` wrappers have no
+    comment of their own.
+    """
+    out: set[str] = set()
+    typedefs = _typedef_spellings(tree)
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        kind = node.get("kind")
+        inner = [n for n in node.get("inner") or [] if isinstance(n, dict)]
+        comments = [n for n in inner if n.get("kind") == "FullComment"]
+        if kind == "FunctionDecl":
+            parms = {n.get("name"): n for n in inner if n.get("kind") == "ParmVarDecl"}
+            for full in comments:
+                for pc in full.get("inner") or []:
+                    if not isinstance(pc, dict) or pc.get("kind") != "ParamCommandComment":
+                        continue
+                    parm = parms.get(pc.get("param"))
+                    t = _pointed_record(parm, typedefs) if parm is not None else None
+                    if t is not None and _says_null_default(_comment_text(pc)):
+                        out.add(t)
+            continue  # a body holds no declaration the API documents
+        if kind == "FieldDecl" and comments:
+            t = _pointed_record(node, typedefs)
+            if t is not None and any(_says_null_default(_comment_text(c)) for c in comments):
+                out.add(t)
+        stack.extend(reversed(inner))
+    return out
 
 
 def probe_layouts(
