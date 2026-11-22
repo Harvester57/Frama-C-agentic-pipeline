@@ -177,11 +177,12 @@ Direct leak of 64 byte(s) in 1 object(s) allocated from:
 @pytest.mark.parametrize(
     "val,expected",
     [
-        (None, False),
-        ("", False),
+        (None, True),
+        ("", True),
         ("off", False),
         ("0", False),
         ("false", False),
+        ("no", False),
         ("on", True),
         ("1", True),
         ("true", True),

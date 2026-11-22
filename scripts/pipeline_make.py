@@ -153,12 +153,12 @@ FUNCTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def harness_smoke_enabled() -> bool:
-    """True when FRAMAC_HARNESS_SMOKE enables the standalone harness smoke gate (default off)."""
+    """True when FRAMAC_HARNESS_SMOKE enables the standalone harness smoke gate (default on; `=off` disables)."""
     return harness_smoke.harness_smoke_enabled()
 
 
 def fuzz_explore_judge_enabled() -> bool:
-    """True when FRAMAC_FUZZ_EXPLORE_JUDGE enables P2/P3/P7f explore/judge and sublinear budgets (default off)."""
+    """True when FRAMAC_FUZZ_EXPLORE_JUDGE enables P2/P3/P7f explore/judge and sublinear budgets (default on; `=off` disables)."""
     return resources.fuzz_explore_judge_enabled()
 
 

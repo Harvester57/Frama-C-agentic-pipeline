@@ -539,5 +539,5 @@ def test_projects_and_specs_come_from_the_corpus():
     # s09 has no test suite: its seeds can only come from the corpus it ships.
     assert bs.project_spec(by_name["s09_shipped_corpus"], _truth("s09_shipped_corpus"))["build"]["test_command"] is None
     plan = bs.stage_plan(s04, 45)
-    assert [s[0] for s in plan] == ["phase0", "build", "fuzz", "eva", "coverage", "ingest"]
+    assert [s[0] for s in plan] == ["phase0", "build", "smoke", "fuzz", "judge", "eva", "coverage", "ingest"]
     assert plan[0][1].endswith("benchmark_seeded.py inner --repo s04-force-include --fuzz-budget 45")

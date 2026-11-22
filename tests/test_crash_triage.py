@@ -59,18 +59,20 @@ def _cand(
 # ---------------------------------------------------------------------------
 
 
-def test_verifier_breaker_enabled_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verifier_breaker_enabled_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(crash_triage.VERIFIER_BREAKER_ENV, raising=False)
-    assert crash_triage.verifier_breaker_enabled() is False
+    assert crash_triage.verifier_breaker_enabled() is True
 
 
-@pytest.mark.parametrize("value", ["on", "ON", "On", "1", "true", "TRUE", "  true  ", " 1 ", "yes", "YES", " yes "])
+@pytest.mark.parametrize(
+    "value", ["", "   ", "on", "ON", "On", "1", "true", "TRUE", "  true  ", " 1 ", "yes", "YES", " yes ", "enabled"]
+)
 def test_verifier_breaker_enabled_truthy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv(crash_triage.VERIFIER_BREAKER_ENV, value)
     assert crash_triage.verifier_breaker_enabled() is True
 
 
-@pytest.mark.parametrize("value", ["", "   ", "off", "OFF", "0", "false", "FALSE", "no", "enabled"])
+@pytest.mark.parametrize("value", ["off", "OFF", "0", "false", "FALSE", "no", "NO", "  off  "])
 def test_verifier_breaker_enabled_falsy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv(crash_triage.VERIFIER_BREAKER_ENV, value)
     assert crash_triage.verifier_breaker_enabled() is False
@@ -79,8 +81,8 @@ def test_verifier_breaker_enabled_falsy_values(monkeypatch: pytest.MonkeyPatch, 
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, False),
-        ("", False),
+        (None, True),
+        ("", True),
         ("off", False),
         ("0", False),
         ("false", False),

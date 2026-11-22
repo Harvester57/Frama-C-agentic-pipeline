@@ -168,14 +168,13 @@ _STARTS_WITH_ACSL_CLAUSE_RE = re.compile(
     r"requires|ensures|assumes|assigns|allocates|frees|terminates|exits|breaks|continues|returns|decreases|invariant|variant)\b"
 )
 FUZZ_EXPLORE_JUDGE_ENV = "FRAMAC_FUZZ_EXPLORE_JUDGE"
-_FLAG_ON_VALUES = frozenset({"on", "1", "true", "yes"})
 _EXCLUDED_CANDIDATE_STATUSES = frozenset({"quarantined_by_smoke", "superseded_by_repair"})
 _EXCLUDED_CANDIDATE_KINDS = frozenset({"toolchain_startup_error"})
 _VERIFIER_DECISIONS = frozenset({"confirmed", "needs_validation", "rejected"})
 
 
 def _fuzz_explore_judge_enabled() -> bool:
-    """Whether fuzz explore/judge loop is enabled (`FRAMAC_FUZZ_EXPLORE_JUDGE=on|1|true|yes`, default off)."""
+    """Whether fuzz explore/judge loop is enabled (`FRAMAC_FUZZ_EXPLORE_JUDGE`, default on; `=off` disables)."""
     return resources.fuzz_explore_judge_enabled()
 
 

@@ -1493,11 +1493,14 @@ def fuzz_workers_from_rss(
     return max(1, min(b.cpus, by_mem))
 
 
+_OFF_VALUES = frozenset({"off", "0", "false", "no"})
+
+
 def fuzz_explore_judge_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """True when FRAMAC_FUZZ_EXPLORE_JUDGE enables the P2/P7f explore/judge split (default off)."""
+    """True unless FRAMAC_FUZZ_EXPLORE_JUDGE is explicitly off/0/false/no (default on)."""
     src = os.environ if env is None else env
     raw = (src.get("FRAMAC_FUZZ_EXPLORE_JUDGE") or "").strip().lower()
-    return raw in ("on", "1", "true", "yes")
+    return raw not in _OFF_VALUES
 
 
 def pool_budget() -> Budget:

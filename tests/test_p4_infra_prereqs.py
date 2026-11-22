@@ -118,11 +118,12 @@ def test_p7bc_fuzz_workers_from_rss_with_2048_cushion():
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        (None, False),
-        ("", False),
+        (None, True),
+        ("", True),
         ("off", False),
         ("0", False),
         ("false", False),
+        ("no", False),
         ("on", True),
         ("ON", True),
         ("1", True),

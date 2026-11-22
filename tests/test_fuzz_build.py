@@ -169,7 +169,8 @@ def test_campaign_still_applies_the_selftest(monkeypatch, tmp_path):
 
 
 def test_a_campaign_after_build_compiles_nothing(tmp_path, monkeypatch):
-    # The real cache, with the cache tests' fake toolchain: the campaign's builds restore what `build` compiled.
+    # Legacy build-then-campaign cache reuse (FRAMAC_FUZZ_EXPLORE_JUDGE=off); P7f dual prebuild is in test_p4_infra_prereqs.py.
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run = tmp_path / "run-1"
     run.mkdir()
     (run / "run-metadata.json").write_text("{}\n", encoding="utf-8")

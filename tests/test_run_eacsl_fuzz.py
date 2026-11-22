@@ -204,7 +204,7 @@ def test_a_harness_that_is_not_a_dispatch_harness_runs_in_fork_mode(tmp_path: Pa
         return {"status": "ok", "artifacts": [{"artifact": str(crash), "kind": "crash"}]}
 
     res = R.run_campaign_rounds(Path("bin"), 60, campaign=campaign, rebuild=None, n_cases=0)
-    assert res["keep_going"] == {"mode": "fork"} and calls == [True]
+    assert res["keep_going"] == {"mode": "fork"} and calls == [True, True]
 
 
 def test_derive_eacsl_diagnostic_hints_for_stage_killed_and_with_preprocessing():
