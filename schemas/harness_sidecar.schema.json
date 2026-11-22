@@ -61,7 +61,9 @@
         "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]},
         "entry": {"$comment": "the DAG key of the API entry point the case calls", "type": "string", "minLength": 1},
         "inits": {"type": "array", "items": {"$ref": "#/definitions/init"}},
-        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"}
+        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"},
+        "schema_instance": {"$comment": "S3 const global schema instance bound to a trusted parameter in this case (FRAMAC_API_TRUST_SCHEMA)", "type": "string", "minLength": 1},
+        "builder": {"$comment": "S2 builder function used to construct a stream or schema-backed object for this case (FRAMAC_API_TRUST_SCHEMA)", "type": "string", "minLength": 1}
       },
       "required": ["selector", "kind", "calls", "slots", "rest", "entry"],
       "additionalProperties": false
@@ -75,7 +77,9 @@
         "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
         "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]},
         "inits": {"type": "array", "items": {"$ref": "#/definitions/init"}},
-        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"}
+        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"},
+        "schema_instance": {"$comment": "S3 const global schema instance bound to a trusted parameter in this case (FRAMAC_API_TRUST_SCHEMA)", "type": "string", "minLength": 1},
+        "builder": {"$comment": "S2 builder function used to construct a stream or schema-backed object for this case (FRAMAC_API_TRUST_SCHEMA)", "type": "string", "minLength": 1}
       },
       "required": ["selector", "kind", "calls", "slots", "rest"],
       "additionalProperties": false
@@ -134,7 +138,9 @@
         "format_param": {"type": "integer", "minimum": 0},
         "varargs": {"type": "array", "items": {"$ref": "#/definitions/vararg"}},
         "inits": {"type": "array", "items": {"$ref": "#/definitions/init"}},
-        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"}
+        "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"},
+        "schema_instance": {"$comment": "S3 const global schema instance bound to a trusted parameter in this case (FRAMAC_API_TRUST_SCHEMA)", "type": "string", "minLength": 1},
+        "builder": {"$comment": "S2 builder function used to construct a stream or schema-backed object for this case (FRAMAC_API_TRUST_SCHEMA)", "type": "string", "minLength": 1}
       },
       "required": ["selector", "kind", "calls", "slots", "rest", "entry", "format", "format_param", "varargs"],
       "additionalProperties": false
@@ -199,6 +205,7 @@
       "items": {"oneOf": [{"$ref": "#/definitions/single_case"}, {"$ref": "#/definitions/sequence_case"}, {"$ref": "#/definitions/lifecycle_case"}, {"$ref": "#/definitions/custom_case"}, {"$ref": "#/definitions/variadic_case"}]}
     },
     "api_skipped": {"$comment": "API entry points (DAG keys) the generator could not call, with the reason. A variadic function is here only when none of its call sites made a case", "type": "object", "additionalProperties": {"type": "string"}},
+    "api_auto_exempt": {"$comment": "API entry points automatically exempted under FRAMAC_API_TRUST_SCHEMA (no attacker data per the threat model, trusted parameter without instance, or refcount helper without producer), mapping DAG key or function name to the exact reason. Absent when empty or when FRAMAC_API_TRUST_SCHEMA is off.", "type": "object", "additionalProperties": {"type": "string"}},
     "api_helpers": {"$comment": "Functions from outside the module's scope (another cluster of the unit) the cases call only to set up or release a struct object: its initializer and destructor (api_harness.case_helpers). harness_reach.check_module counts none of them as a root of the module. Absent on an older sidecar.", "$ref": "#/definitions/strings"},
     "api_headers": {
       "$comment": "Where the headers of an --api harness came from (api_harness.capture_headers): `given` (--header), `none` (--header none), `capture` (no --header: the build capture's public headers the module's link unit includes, plus the internal headers declaring an entry point no public header declares, with the names), `not_found` (no --header and the capture gave none; `why` says why), or `capture_failed` (none of the capture's headers compiled in the harness: it includes none, as without a capture). An automatic choice degrades in steps (all chosen headers, then the public ones alone, then none) and never fails the module for its own headers; `fallbacks` lists each abandoned step, the headers it dropped and the first compile errors. `public` and `internal` list what the final harness includes. Paths are tree-relative. Absent on an older sidecar.",

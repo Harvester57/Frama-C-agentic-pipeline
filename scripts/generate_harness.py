@@ -4075,7 +4075,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.api:
         if not args.module:
             parser.error("--api requires --module")
+        from api_harness import MODEL_JSON as API_MODEL_JSON
         from api_harness import generate
+
+        dag_meta = load_json_optional(args.out_dir.parent / "reports" / "callgraph_dag.json", {})
+        model_candidate = args.out_dir.parent / "reports" / "phase0_model.json"
+        if not model_candidate.is_file():
+            model_candidate = API_MODEL_JSON
+        model_meta = load_json_optional(model_candidate, {})
+        api_globals: dict[str, dict[str, Any]] = {}
+        for src_meta in (dag_meta, model_meta):
+            if isinstance(src_meta, dict) and isinstance(src_meta.get("global_variables"), dict):
+                for gid, g in src_meta["global_variables"].items():
+                    if isinstance(g, dict):
+                        api_globals[gid] = {**(api_globals.get(gid) or {}), **g}
+        api_trust: dict[str, Any] | None = None
+        for src_meta in (dag_meta, model_meta):
+            if isinstance(src_meta, dict) and isinstance(src_meta.get("trust"), dict):
+                api_trust = src_meta["trust"]
+                break
 
         try:
             with _rolled_back_on_failure(_repair_paths()):
@@ -4098,6 +4116,8 @@ def main(argv: list[str] | None = None) -> int:
                     scope_files=args.scope_file,
                     # Hand-written cases after the generated ones; without the flag, the previous sidecar's.
                     dispatch_cases=args.dispatch_case or None,
+                    global_variables=api_globals or None,
+                    trust=api_trust,
                 )
                 out = _with_repair_result(result, repair_res)
         except Exception as exc:  # a repair's files are already rolled back
