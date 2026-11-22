@@ -82,7 +82,8 @@ def _plan(module: str = "lib__api", traces: list[list[dict]] | None = None) -> d
 
 
 def _case_and_layout(p: dict, entry: str) -> tuple[str, dict]:
-    (i,) = [k for k, lay in enumerate(p["layouts"]) if lay.get("entry") == entry]
+    # The single case: a stateful sequence case (`ctx_size` after `ctx_write`s) names the entry point too.
+    (i,) = [k for k, lay in enumerate(p["layouts"]) if lay.get("entry") == entry and lay["kind"] == "single"]
     return p["cases"][i], p["layouts"][i]
 
 

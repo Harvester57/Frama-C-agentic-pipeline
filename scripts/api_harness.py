@@ -219,6 +219,7 @@ STRING_SLOT_BYTES = 16
 # never taken.
 TRUSTED_STRING_DEFAULT = "a"
 TRUSTED_STRING_MAX_BYTES = 64
+MAX_RECORDED_SCALARS = 8  # values a trusted scalar of a sequence case keeps, of those the tests passed
 # The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`,
 # and `nb` as a word (libmodbus's `nb`, `nb_bits`, `write_nb`, `read_nb`).
 _ARRAY_COUNT_RE = re.compile(
@@ -578,6 +579,10 @@ class ApiInfo:
     # Per function, per argument index: the string the recorded traces pass most often there
     # (`recorded_strings`), the literal of a trusted string parameter (`_trusted_string_arg`).
     trusted_strings: dict[str, dict[int, str]] = field(default_factory=dict)
+    # Per function, per argument index: the integers the recorded traces pass there, (byte width,
+    # unsigned value), most frequent first (`recorded_scalars`): what a trusted scalar takes in a
+    # sequence case.
+    trusted_scalars: dict[str, dict[int, list[tuple[int, int]]]] = field(default_factory=dict)
 
 
 class _Case:
@@ -599,6 +604,9 @@ class _Case:
         self.owned_frees: list[str] = []
         self.schema_instance: str | None = None
         self.builder: str | None = None
+        # A sequence case replays calls the target's tests made: a trusted scalar takes one of the
+        # values they passed there (`ApiInfo.trusted_scalars`) instead of 0.
+        self.recorded_scalars = False
 
     def declare(self, name: str) -> str:
         """
@@ -1040,6 +1048,70 @@ def recorded_strings(traces: list[list[dict]] | None) -> dict[str, dict[int, str
     for (fn, idx), seen in sorted(counts.items()):
         out.setdefault(fn, {})[idx] = min(seen, key=lambda t: (-seen[t], len(t), t))
     return out
+
+
+def recorded_scalars(traces: list[list[dict]] | None) -> dict[str, dict[int, list[tuple[int, int]]]]:
+    """
+    Per function and argument index, the integers (`i` records of seed_harvest.py traces, little
+    endian, at most 8 bytes) the target's tests pass there, as (byte width, unsigned value): at most
+    `MAX_RECORDED_SCALARS` distinct ones, the most frequent first, ties by value.
+    `_recorded_scalar_arg` reads them with the parameter's signedness.
+    """
+    counts: dict[tuple[str, int], dict[tuple[int, int], int]] = {}
+    for trace in traces or []:
+        for call in trace:
+            fn = call.get("fn")
+            args = call.get("args")
+            if not isinstance(fn, str) or not isinstance(args, dict):
+                continue
+            for idx, vals in args.items():
+                if not str(idx).isdigit() or not isinstance(vals, list):
+                    continue
+                for val in vals:
+                    if not (isinstance(val, list) and len(val) == 3 and val[0] == "i" and val[1] == 0):
+                        continue
+                    try:
+                        data = bytes.fromhex(str(val[2]))
+                    except ValueError:
+                        continue
+                    if not 0 < len(data) <= 8:
+                        continue
+                    seen = counts.setdefault((fn, int(idx)), {})
+                    key = (len(data), int.from_bytes(data, "little"))
+                    seen[key] = seen.get(key, 0) + 1
+    out: dict[str, dict[int, list[tuple[int, int]]]] = {}
+    for (fn, idx), seen in sorted(counts.items()):
+        out.setdefault(fn, {})[idx] = sorted(seen, key=lambda k: (-seen[k], k[1], k[0]))[:MAX_RECORDED_SCALARS]
+    return out
+
+
+def _recorded_scalar_arg(case: _Case, call: int, i: int, p: dict, v: str, recorded: list[tuple[int, int]]) -> None:
+    """
+    A trusted scalar of a sequence case (`_Case.recorded_scalars`) the traces recorded: read from the
+    input, then kept to the values the target's tests passed there (the application's own choices,
+    as `_trusted_string_arg`'s literal), never zero unless they passed zero.
+    """
+    ctype = str(p["ctype"])
+    signed = not (ctype.startswith(("unsigned", "enum", "_Bool")) or ctype in ("char", "size_t", "uint8_t"))
+    values: list[int] = []
+    for width, value in recorded:
+        if signed and value >= 1 << (8 * width - 1):
+            value -= 1 << (8 * width)
+        if value not in values:
+            values.append(value)
+    lits = [f"{x}LL" if x < 0 else f"{x}ULL" for x in values]
+    case.slot(v, SCALAR_BYTES.get(ctype), call, i, "int")
+    member = " || ".join(f"(long long){v} == (long long){lit}" for lit in lits)
+    case.decls.append(
+        f"if (!({member})) {{ static const long long fc_r[{len(lits)}] = {{ {', '.join(f'(long long){lit}' for lit in lits)} }}; "
+        f"{v} = ({ctype})fc_r[(unsigned long long){v} % {len(lits)}U]; }}"
+    )
+    case.note(
+        call,
+        i,
+        f"trusted scalar parameter per threat model: one of the {len(lits)} values the target's tests pass "
+        "there (recorded seed traces), picked by the input",
+    )
 
 
 def _trusted_string_arg(case: _Case, call: int, i: int, p: dict, name: str) -> str:
@@ -2315,7 +2387,16 @@ def _bind_call(
             continue
         if role == "trusted_scalar":
             case.decls.append(f"{p['ctype']} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
-            case.note(call, i, "trusted scalar parameter per threat model: zeroed, not read from the input")
+            recorded = (
+                (api.trusted_scalars.get(name) or {}).get(i)
+                if case.recorded_scalars and p["kind"] == "int" and p.get("ctype") != "_Bool"
+                else None
+            )
+            if recorded:
+                # QCBOR run-1: a zeroed `uType` made `EnterBoundedMapOrArray` enter nothing in a chain.
+                _recorded_scalar_arg(case, call, i, p, v, recorded)
+            else:
+                case.note(call, i, "trusted scalar parameter per threat model: zeroed, not read from the input")
             args.append(v)
             i += 1
             continue
@@ -4066,24 +4147,38 @@ def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], 
 
 
 def sequence_case(
-    trace: list[dict], chain: list[int], records: dict[str, dict], spare: int, api: ApiInfo | None = None
+    trace: list[dict],
+    chain: list[int],
+    records: dict[str, dict],
+    spare: int,
+    api: ApiInfo | None = None,
+    trust: Mapping[str, _EntryTrust] | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """
     The case that replays one chain of a trace: one buffer per shared address (the largest size the
     model or the trace gives it), passed to every call that used that address; every other argument
     as in a single case. The layout's slots name the trace call (`call`, its position in the chain).
     A shared struct object whose first use is not one of its initializers gets the initializer first.
+    `trust` gives each function's threat-model roles (by name), bound as in its single case: a trusted
+    string is its literal, and a trusted scalar takes one of the values the traces recorded there
+    (`_recorded_scalar_arg`), zero when none was.
     """
     try:
-        return _sequence_case(trace, chain, records, spare, api)
+        return _sequence_case(trace, chain, records, spare, api, trust)
     except _CaseError as e:
         return None, None, str(e)
 
 
 def _sequence_case(
-    trace: list[dict], chain: list[int], records: dict[str, dict], spare: int, api: ApiInfo | None
+    trace: list[dict],
+    chain: list[int],
+    records: dict[str, dict],
+    spare: int,
+    api: ApiInfo | None,
+    trust: Mapping[str, _EntryTrust] | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     case = _Case(spare, api, calls=len(chain))
+    case.recorded_scalars = True
     buffers: dict[str, str] = {}
     calls: list[str] = []
     names: list[str] = []
@@ -4134,14 +4229,20 @@ def _sequence_case(
                 buffers[addr] = var
                 own_init = idx == 0 and name in case.api.candidates.get(pointee, set())
                 if pointee in case.api.inits and not own_init:
-                    before.append(_init_call(case, pointee, var, pos, idx))
+                    if case.api.trust_schema and case.api.inits[pointee] in case.api.byval_inits:
+                        # QCBOR run-1: `s1 = UsefulBuf_FromSZ(...)` assigned a struct to the byte array, and
+                        # the compile probe dropped the recorded encoder chain. Assign through the type.
+                        obj = _anon_record_spelling(case.api, pointee)
+                        before.append(_init_call(case, pointee, var, pos, idx, var=f"*({obj} *){var}"))
+                    else:
+                        before.append(_init_call(case, pointee, var, pos, idx))
                 elif not own_init and pointee in case.api.init_skip_notes:
                     for note_msg in case.api.init_skip_notes[pointee]:
                         case.note(pos, idx, note_msg)
             shared[idx] = buffers[addr]
-        calls.append(
-            " ".join([*before, _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared)])
-        )
+        et = (trust or {}).get(name)
+        bound = _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared, entry_trust=et)
+        calls.append(" ".join([*before, bound]))
         names.append(name)
     return case.statements(calls), case.layout("sequence", names), None
 
@@ -4250,6 +4351,267 @@ def _lifecycle_case(
     return case.statements([make, loop, *frees]), layout, None
 
 
+# --- stateful cases: the state an entry point needs before it does more than fail ------------------------
+#
+# QCBOR run-1 (2026-11-22): every single case calls its entry point once, right after the context's
+# initializer. `QCBOREncode_CloseAndSortMap` then closes a map nobody opened, and the `*InMapSZ`
+# accessors search a map nobody entered: both return an error on every input. A stateful case is a
+# `sequence` case that leads up to such an entry point: the context's initializer, the calls that set
+# up the state it needs, then the entry point.
+
+STATE_MAX_CASES = 96  # stateful cases per harness, after the recorded sequences and lifecycle cases
+STATE_MAX_PREFIX = 6  # calls before the entry point in a stateful case (its initializer not counted)
+STATE_FEED_CALLS = 4  # data calls a model-built case makes on a context whose initializer reads no data
+STATE_REACH_DEPTH = 8  # call-graph depth of `_reach`
+_OPENER_WORDS = frozenset({"open", "enter", "begin", "start", "push"})
+_CLOSER_WORDS = {"close": "open", "exit": "enter", "leave": "enter", "end": "begin", "stop": "start", "pop": "push"}
+_CANCEL_WORDS = frozenset({"cancel", "abort"})  # undo an opener: a closer without a paired name
+_SCOPE_WORDS = frozenset({"in", "from", "inside", "within"})
+
+
+def _scope_noun(words: list[str]) -> str | None:
+    """The noun of a scope an accessor works in (`get_int_in_map` -> `map`), or None."""
+    for k, w in enumerate(words[:-1]):
+        if w in _SCOPE_WORDS:
+            return words[k + 1]
+    return None
+
+
+def _closer_word(words: list[str]) -> str | None:
+    return next((w for w in words if w in _CLOSER_WORDS or w in _CANCEL_WORDS), None)
+
+
+def _is_opener(words: list[str]) -> bool:
+    return any(w in _OPENER_WORDS for w in words) and _closer_word(words) is None and _scope_noun(words) is None
+
+
+def _reach(callees: Mapping[str, set[str]], name: str, depth: int = STATE_REACH_DEPTH) -> set[str]:
+    """The functions `name` reaches through the model's direct call sites, within `depth` calls."""
+    seen: set[str] = set()
+    frontier = set(callees.get(name, ()))
+    for _ in range(depth):
+        frontier -= seen
+        if not frontier:
+            break
+        seen |= frontier
+        frontier = set().union(*(callees.get(f, set()) for f in frontier))
+    return seen
+
+
+def _context_type(rec: dict, api: ApiInfo) -> str | None:
+    """The struct a function works on through its first parameter, when an initializer sets it up."""
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    if not params or params[0]["kind"] != "ptr":
+        return None
+    pointee = str(params[0].get("pointee") or "")
+    return pointee if _is_record(pointee) and "*" not in pointee and pointee in api.inits else None
+
+
+def _input_of(layout: dict) -> tuple[bool, bool]:
+    """
+    Of a single case: (whether the entry point's own call reads the input, whether the initializer of
+    its context reads data, not only a size). An initializer or builder made for another argument of
+    the call (`inits[].for.param` other than 0) feeds the call's own input.
+    """
+    ctx_inits = {
+        int(i["call"])
+        for i in layout.get("inits") or []
+        if isinstance(i, dict) and (i.get("for") or {}).get("call") == 0 and (i.get("for") or {}).get("param") == 0
+    }
+    used = [*(layout.get("slots") or []), *([layout["rest"]] if layout.get("rest") else [])]
+    own = any(int(s.get("call", 0)) not in ctx_inits for s in used)
+    data = any(int(s.get("call", 0)) in ctx_inits and s.get("kind") not in ("int", "field_len") for s in used)
+    return own, data
+
+
+def _context_segments(traces: list[list[dict]] | None, init_names: set[str]) -> list[tuple[str, list[dict]]]:
+    """
+    The calls of the traces on one context object, with the initializer that set it up: from a call of
+    an initializer on an address (its first argument) to the next one on that address, the initializer
+    left out. Calls on an address no recorded initializer set up are in no segment.
+    """
+    out: list[tuple[str, list[dict]]] = []
+    for trace in traces or []:
+        open_seg: dict[str, list[dict]] = {}
+        for call in trace:
+            addr = (call.get("addrs") or {}).get("0")
+            if not isinstance(addr, str) or addr in ("0", "-"):
+                continue
+            if call.get("fn") in init_names:
+                open_seg[addr] = []
+                out.append((str(call["fn"]), open_seg[addr]))
+            elif addr in open_seg:
+                open_seg[addr].append(call)
+    return [(fn, s) for fn, s in out if s]
+
+
+def _compress_prefix(pre: list[dict]) -> list[dict]:
+    """
+    At most `STATE_MAX_PREFIX` of a recorded prefix: the openers still open when the entry point ran,
+    then the calls just before it, back to the last closer or the innermost of those openers.
+    """
+    if len(pre) <= STATE_MAX_PREFIX:
+        return pre
+    stack: list[int] = []
+    for k, c in enumerate(pre):
+        words = _words(str(c.get("fn")))
+        if _closer_word(words) is not None:
+            if stack:
+                stack.pop()
+        elif _is_opener(words):
+            stack.append(k)
+    keep = stack[-STATE_MAX_PREFIX:]
+    lo = keep[-1] if keep else -1
+    k = len(pre) - 1
+    while len(keep) < STATE_MAX_PREFIX and k > lo:
+        if _closer_word(_words(str(pre[k].get("fn")))) is not None:
+            break
+        keep.append(k)
+        k -= 1
+    return [pre[k] for k in sorted(set(keep))]
+
+
+def _best_opener(
+    cands: list[str], against: set[str], words: dict[str, list[str]], rank: dict[str, tuple[Any, ...]]
+) -> str:
+    """The opener sharing most words with `against` (open/close words aside), then the most recorded."""
+    plain = against - _OPENER_WORDS - set(_CLOSER_WORDS) - _CANCEL_WORDS
+    return min(cands, key=lambda o: (-len(plain & set(words[o])), *rank[o]))
+
+
+def stateful_prefixes(
+    records: dict[str, dict],
+    singles: dict[str, dict],
+    api: ApiInfo,
+    model_functions: dict,
+    traces: list[list[dict]] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    The entry points whose single case can only reach an error path on a fresh context, each with the
+    calls that set up the state it needs: [{entry, state, calls, why}], `calls` ending with the entry
+    point. `records` are the entry points with a single case (`singles`: name -> its layout); the
+    context of a function is the struct its first parameter points to, when an initializer sets it up.
+
+    Which entry points (each rule names the opener it needs, if any):
+      - a closer (`close`, `exit`, `end`, `leave`, `pop`, `cancel`, ...): the opener of the same name
+        with the opening word (`close_nesting` -> `open_nesting`), its own or a direct callee's, else
+        the opener sharing most words with it;
+      - an accessor of a scope (`get_int_in_map`, `enter_array_from_map`): an opener whose name has the
+        scope's noun (`enter_bounded_map`); and any other function of the context that reaches the
+        functions all of those accessors reach and neither the opener nor the initializer does (QCBOR's
+        `SeekToLabelN` reaches `MapSearch` as the `*InMap*` accessors do);
+      - a function whose case reads no input of its own, on a context whose initializer reads no data
+        (QCBOR's encoder: its only input was the storage size).
+    The calls before it (at most `STATE_MAX_PREFIX`): (a) `recorded`, the calls the target's tests made
+    on the same object before calling it (`_compress_prefix`), when a trace holds one with an opener
+    (or any call, for the third rule); else (b) `model`, the opener, then `STATE_FEED_CALLS` calls of
+    the context's most recorded data call when its initializer reads no data. Deterministic.
+    """
+    callees = _callee_names(model_functions)
+    counts: dict[str, int] = {}
+    for trace in traces or []:
+        for call in trace:
+            if isinstance(call.get("fn"), str):
+                counts[call["fn"]] = counts.get(call["fn"], 0) + 1
+    by_ctx: dict[str, list[str]] = {}
+    for name in sorted(records):
+        ctx = _context_type(records[name], api)
+        if ctx is None or name == api.inits.get(ctx) or _INIT_NAME_RE.search(name) or name not in singles:
+            continue
+        by_ctx.setdefault(ctx, []).append(name)
+    init_names = set(api.inits.values()) | {
+        n for names in api.candidates.values() for n in names if _INIT_NAME_RE.search(n)
+    }
+    segments = _context_segments(traces, init_names)
+
+    def nparams(n: str) -> int:
+        parts = split_signature(str(records[n].get("signature") or ""))
+        return len(parts[1]) if parts else 99
+
+    out: list[dict[str, Any]] = []
+    for ctx, methods in sorted(by_ctx.items()):
+        words = {m: _words(m) for m in methods}
+        common = set.intersection(*(set(w) for w in words.values()))
+        openers = [m for m in methods if _is_opener(words[m])]
+        inputs = {m: _input_of(singles[m]) for m in methods}
+        init_data = any(data for _own, data in inputs.values())
+        rank = {o: (-counts.get(o, 0), nparams(o), o) for o in openers}
+        needs: dict[str, tuple[str | None, str]] = {}
+        groups: dict[str, list[str]] = {}  # per opener, the accessors of its scope
+        for m in methods:
+            if m in openers:
+                pass
+            elif (cw := _closer_word(words[m])) is not None:
+                paired = None
+                for callee in [m, *sorted(callees.get(m, ()))]:
+                    c_words = _words(callee)
+                    c_cw = _closer_word(c_words)
+                    if c_cw in _CLOSER_WORDS:
+                        want = [_CLOSER_WORDS[c_cw] if w == c_cw else w for w in c_words]
+                        paired = next((o for o in openers if words[o] == want), None)
+                        if paired is not None:
+                            break
+                if paired is None and openers:
+                    paired = _best_opener(openers, set(words[m]) - common, words, rank)
+                if paired is not None:
+                    needs[m] = (paired, f"is a closer ({cw}): {paired} opens first")
+                    continue
+            elif (noun := _scope_noun(words[m])) is not None:
+                scoped = [o for o in openers if noun in words[o]]
+                if scoped:
+                    entered = _best_opener(scoped, set(words[m]) - common, words, rank)
+                    needs[m] = (entered, f"works in a {noun}: {entered} enters one first")
+                    groups.setdefault(entered, []).append(m)
+                    continue
+            own, _data = inputs[m]
+            # A destructor releases the object whatever it holds: no state to set up first.
+            if not own and not init_data and m not in api.struct_dtor_names.get(ctx, set()):
+                needs[m] = (None, "reads no input of its own, and the context's initializer reads no data")
+        # The scope closure: what every accessor of one opener's scope reaches and the setup does not.
+        init_reach = _reach(callees, api.inits[ctx]) | {api.inits[ctx]}
+        for o, members in sorted(groups.items()):
+            if len(members) < 2:
+                continue
+            guarded = set.intersection(*(_reach(callees, m) for m in members)) - _reach(callees, o) - init_reach
+            guarded -= set(methods) | {o}
+            # The entry points of that part of the call graph: functions of it no other one calls.
+            tops = {g for g in guarded if not any(g in callees.get(h, set()) for h in guarded)}
+            for m in methods:
+                if m in needs or m in openers or not tops:
+                    continue
+                hit = sorted(_reach(callees, m) & tops)
+                if hit:
+                    needs[m] = (o, f"reaches {hit[0]} as the accessors of that scope do: {o} enters one first")
+        feeders = [m for m in methods if m not in needs and m not in openers and inputs[m][0]]
+        feeder = min(feeders, key=lambda f: (-counts.get(f, 0), nparams(f), f)) if feeders else None
+        for m in sorted(needs):
+            opener, why = needs[m]
+            prefix: list[str] | None = None
+            state = "model"
+            for seg_init, seg in segments:
+                if seg_init != api.inits[ctx] and seg_init not in api.candidates.get(ctx, set()):
+                    continue  # another object at a reused address
+                for j, c in enumerate(seg):
+                    if c.get("fn") != m:
+                        continue
+                    pre = [x for x in seg[:j] if x.get("fn") in records]
+                    if not pre or (opener is not None and not any(_is_opener(_words(str(x["fn"]))) for x in pre)):
+                        continue
+                    prefix = [str(x["fn"]) for x in _compress_prefix(pre)]
+                    state = "recorded"
+                    break
+                if prefix is not None:
+                    break
+            if prefix is None:
+                prefix = [opener] if opener is not None else []
+                if not init_data and feeder is not None:
+                    prefix += [feeder] * STATE_FEED_CALLS
+            prefix = prefix[:STATE_MAX_PREFIX]
+            if prefix:
+                out.append({"entry": m, "state": state, "calls": [*prefix, m], "why": why})
+    return out
+
+
 # A function defined in a public header (static) has no symbol to link: a case calls the copy the
 # harness compiles from the header, which the layout probe must have seen declared.
 HEADER_NOT_VISIBLE = "static header function: the layout probe did not see the harness declare it"
@@ -4284,9 +4646,11 @@ def plan(
     (`variadic_calls.load_cases`): its cases come after the single ones, and it is skipped only when
     it has none. `variadic_dropped` lists the call sites that made no case, with the reason.
     An entry point defined in a public header (`static`, `header`: the model's `header_api`) gets a
-    single case when `visible` has it, after every other generated case (so the cases of the global
-    entry points keep their selectors, and these go first over the case limit); without the probe it
-    is skipped as `HEADER_NOT_VISIBLE`.
+    single case when `visible` has it, after every other generated case but the stateful ones (so the
+    cases of the global entry points keep their selectors, and these go over the case limit before
+    them); without the probe it is skipped as `HEADER_NOT_VISIBLE`. The stateful cases
+    (`stateful_prefixes`) come last and go over the case limit first: every entry point keeps its
+    single case.
     """
     effective_trust_schema = api_trust_schema_enabled() if trust_schema is None else bool(trust_schema)
     max_cases = max(0, MAX_CASES - reserve)
@@ -4447,7 +4811,11 @@ def plan(
         schema_inits=schema_inits,
         schema_globals=schema_globals,
         trusted_strings=recorded_strings(traces) if effective_trust_schema else {},
+        trusted_scalars=recorded_scalars(traces) if effective_trust_schema else {},
     )
+    # Each function's threat-model roles by name, for the sequence cases (bound as in its single case).
+    trust_by_name: dict[str, _EntryTrust] = {}
+    singles: dict[str, dict] = {}
     header_entries: list[tuple[str, str]] = []
     for key in entries:
         drec = functions.get(key) or {}
@@ -4502,6 +4870,9 @@ def plan(
         schema_sources.update(used_srcs)
         records[name] = mrec
         names.append(key)
+        if et is not None:
+            trust_by_name[name] = et
+        singles[name] = made_cases[0][1]
         for c_stmt, c_layout in made_cases:
             cases.append(c_stmt)
             layouts.append({**c_layout, "entry": key})
@@ -4517,7 +4888,7 @@ def plan(
             sig = tuple(trace[k]["fn"] for k in chain)
             if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
                 continue
-            seq_stmt, seq_layout, _why = sequence_case(trace, chain, records, spare, api)
+            seq_stmt, seq_layout, _why = sequence_case(trace, chain, records, spare, api, trust_by_name)
             if seq_stmt is None or seq_layout is None:
                 continue
             seq_seen.add(sig)
@@ -4538,9 +4909,10 @@ def plan(
         n_seq += 1
         cases.append(lc_stmt)
         layouts.append(lc_layout)
-    # The functions defined in a public header, last: the cases above keep their selectors, and these
-    # are the first to go over the case limit. They stay out of `records`, which builds the sequence
-    # and lifecycle cases above, so those are the same with or without them.
+    # The functions defined in a public header, after the cases above: those keep their selectors,
+    # and these go over the case limit before them (only the stateful cases below go first). They
+    # stay out of `records`, which builds the sequence and lifecycle cases above, so those are the
+    # same with or without them.
     for key, name in header_entries:
         mrec = _model_record(model, functions.get(key) or {}, key)
         if not mrec:
@@ -4561,6 +4933,30 @@ def plan(
         for stmt, layout in made_cases:
             cases.append(stmt)
             layouts.append({**layout, "entry": key})
+    # Stateful cases, last: an entry point that fails on a fresh context, after the calls that set up
+    # the state it needs (`stateful_prefixes`), within their own cap. Its single case stays, and over
+    # the case limit these go first, so no entry point loses its single case to them.
+    header_keys = {k for k, _ in header_entries}
+    key_of = {str((functions.get(k) or {}).get("name") or k.split("#")[-1]): k for k in names if k not in header_keys}
+    n_state = 0
+    for plan_st in stateful_prefixes(records, singles, api, model.get("functions") or {}, traces):
+        sig = tuple(plan_st["calls"])
+        if n_state >= STATE_MAX_CASES or sig in seq_seen:
+            continue
+        ctx_trace = [{"fn": fn, "args": {}, "addrs": {"0": "fc_ctx"}} for fn in plan_st["calls"]]
+        st_stmt, st_layout, _why = sequence_case(
+            ctx_trace, list(range(len(ctx_trace))), records, spare, api, trust_by_name
+        )
+        if st_stmt is None or st_layout is None:
+            continue
+        seq_seen.add(sig)
+        n_state += 1
+        st_layout["notes"] = [
+            *(st_layout.get("notes") or []),
+            f"stateful case ({plan_st['state']}): {plan_st['entry']} {plan_st['why']}",
+        ]
+        cases.append(st_stmt)
+        layouts.append({**st_layout, "entry": key_of[plan_st["entry"]], "state": plan_st["state"]})
     if len(cases) > max_cases:
         for lay in layouts[max_cases:]:
             if lay.get("entry"):
@@ -5921,6 +6317,9 @@ def generate(
         p = copy.deepcopy(planned)
         cases, layouts, skipped = with_custom(p)
         dropped: list[dict] = list(p["variadic_dropped"])
+        # The sequence and lifecycle cases the compile probe refused: a stateful case's entry point keeps
+        # its single case, and a recorded chain names none, so `api_skipped` would never show them.
+        refused: list[dict[str, Any]] = []
         result: dict[str, Any] = {}
         # Struct layouts come from the first harness written (its headers and prelude): the cases are
         # planned again with them before the compile probe. Each later round drops at least one case, so
@@ -6032,6 +6431,16 @@ def generate(
                 if layouts[i]["kind"] == VARIADIC_KIND:
                     why = f"the case does not compile with the target's headers: {diag}"
                     dropped.append(_dropped_variadic(layouts[i], why))
+                if layouts[i]["kind"] in ("sequence", "lifecycle"):
+                    gone = {"kind": layouts[i]["kind"], "calls": list(layouts[i].get("calls") or [])}
+                    if layouts[i].get("entry"):
+                        gone["entry"] = layouts[i]["entry"]
+                    refused.append({**gone, "why": f"the case does not compile with the target's headers: {diag}"})
+                    print(
+                        f"api_harness: warning: dropped a {gone['kind']} case ({' -> '.join(gone['calls'][:4])}"
+                        f"{' ...' if len(gone['calls']) > 4 else ''}): {diag}",
+                        file=sys.stderr,
+                    )
             if not keep and more:
                 raise _HeadersBroken([bad[i] for i in sorted(bad)][:3])
             if not keep:
@@ -6040,7 +6449,7 @@ def generate(
             layouts = [layouts[i] for i in keep]
             for sel, lay in enumerate(layouts):
                 lay["selector"] = sel
-        return p, cases, layouts, skipped, dropped, result
+        return p, cases, layouts, skipped, dropped, result, refused
 
     # An automatic header choice degrades in steps and never fails the module for its own headers:
     # each abandoned attempt leaves the harness files as they were before it, and is recorded.
@@ -6054,7 +6463,7 @@ def generate(
                 print(f"api_harness: warning: {warnings[-1]}", file=sys.stderr)
             try:
                 with harness_files_kept_on_failure(out_dir, module):
-                    p, cases, layouts, skipped, dropped, result = attempt(hdr, extra, n + 1 < len(attempts))
+                    p, cases, layouts, skipped, dropped, result, refused = attempt(hdr, extra, n + 1 < len(attempts))
                 api_headers = attempts[n][2]
                 break
             except _HeadersBroken as exc:
@@ -6093,6 +6502,8 @@ def generate(
         api_sequences=sum(1 for lay in layouts if lay["kind"] == "sequence"),
         api_lifecycles=sum(1 for lay in layouts if lay["kind"] == "lifecycle"),
         api_custom=sum(1 for lay in layouts if lay["kind"] == CUSTOM_KIND),
+        api_stateful=sum(1 for lay in layouts if lay.get("state")),
+        api_dropped_cases=refused,
         api_skipped=skipped,
     )
     if effective_trust_schema and auto_exempt:

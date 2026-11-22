@@ -1660,3 +1660,371 @@ def test_trusted_cstring_generate_sidecar_valid_and_both_copies_bind_it(
     assert "int eva_main(void)" in eva_part
     assert eva_part.count(call) == 1
     assert fuzz_part.count(call) == 1
+
+
+# ---------------------------------------------------------------------------
+# Stateful entry points (QCBOR run-1: closers and in-map accessors called on a fresh context)
+# ---------------------------------------------------------------------------
+
+
+def _int_field(name: str, off: int) -> dict[str, Any]:
+    return {"name": name, "kind": "int", "off": off, "size": 4, "pointers": False, "ctype": "int"}
+
+
+def _stateful_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    """
+    A QCBOR-shaped encoder and decoder, each on a caller-allocated context its initializer sets up.
+
+    Encoder: `enc_init(e, cap)` reads no data (only the storage size), `enc_open_map(e)`,
+    `enc_add_int(e, v)`, `enc_close_and_sort_map(e)` (an error when no map is open) and
+    `enc_finish(e, struct bufc *out)`; `buf_from_sz(s)` builds a `struct bufc` by value.
+    Decoder: `dec_init(d, buf, len)` takes the document (an entry point, as `QCBORDecode_Init`; the
+    encoder's initializer is not one, as `QCBOREncode_Init`), `dec_enter_map(d, uType)` whose type the
+    application chooses, the in-map accessors `dec_get_int_in_map_sz(d, szLabel, out)` and
+    `dec_get_bool_in_map_n(d, nLabel, out)` (both through `dec_map_search`, which fails unless a map
+    is entered), `dec_seek_to_label_n(d, nLabel)` (the same search, no scope word in its name),
+    `dec_exit_map(d)` and `dec_get_next(d, out)`, which works on a fresh context.
+    """
+    fns: dict[str, tuple[str, list[tuple[str, str]], list[str], tuple[str, ...] | None]] = {
+        # name: (signature, formals, callees, attacker params; None: not an entry point)
+        "enc_init": ("void(struct enc *,unsigned long)", [("e", "pointer"), ("cap", "value")], [], None),
+        "enc_open_map": ("void(struct enc *)", [("e", "pointer")], ["enc_open_nesting"], ("e",)),
+        "enc_add_int": ("void(struct enc *,long)", [("e", "pointer"), ("v", "value")], [], ("e", "v")),
+        "enc_close_and_sort_map": ("int(struct enc *)", [("e", "pointer")], ["enc_close_nesting"], ("e",)),
+        "enc_finish": ("int(struct enc *,struct bufc *)", [("e", "pointer"), ("out", "pointer")], [], ("e", "out")),
+        "enc_open_nesting": ("void(struct enc *)", [("e", "pointer")], [], None),
+        "enc_close_nesting": ("int(struct enc *)", [("e", "pointer")], [], None),
+        "buf_from_sz": ("struct bufc(char const *)", [("s", "const_pointer")], [], None),
+        "dec_init": (
+            "void(struct dec *,unsigned char const *,unsigned long)",
+            [("d", "pointer"), ("buf", "const_pointer"), ("len", "value")],
+            [],
+            ("d", "buf", "len"),
+        ),
+        "dec_enter_map": ("void(struct dec *,unsigned char)", [("d", "pointer"), ("uType", "value")], [], ("d",)),
+        "dec_exit_map": ("void(struct dec *)", [("d", "pointer")], [], ("d",)),
+        "dec_get_next": ("int(struct dec *,long *)", [("d", "pointer"), ("out", "pointer")], [], ("d", "out")),
+        "dec_get_int_in_map_sz": (
+            "void(struct dec *,char const *,long *)",
+            [("d", "pointer"), ("szLabel", "const_pointer"), ("out", "pointer")],
+            ["dec_map_search"],
+            ("d", "out"),
+        ),
+        "dec_get_bool_in_map_n": (
+            "void(struct dec *,long,_Bool *)",
+            [("d", "pointer"), ("nLabel", "value"), ("out", "pointer")],
+            ["dec_map_search"],
+            ("d", "out"),
+        ),
+        "dec_seek_to_label_n": (
+            "void(struct dec *,long)",
+            [("d", "pointer"), ("nLabel", "value")],
+            ["dec_map_search"],
+            ("d",),
+        ),
+        "dec_map_search": ("int(struct dec *,long)", [("d", "pointer"), ("n", "value")], ["dec_match_label"], None),
+        "dec_match_label": ("int(long)", [("n", "value")], [], None),
+    }
+    tm_block: dict[str, Any] = {
+        "status": "ok",
+        "input_sources": [
+            {"function": n, "role": "entry", "params": list(att), "description": n}
+            for n, (_s, _f, _c, att) in fns.items()
+            if att is not None
+        ],
+    }
+    keys = {n: f"{n.split('_', 1)[0]}.c#{n}" for n in fns}
+    model_fns: dict[str, Any] = {}
+    dag_fns: dict[str, Any] = {}
+    for n, (sig, formals, callees, _att) in fns.items():
+        f = keys[n].split("#", 1)[0]
+        model_fns[keys[n]] = {
+            "name": n,
+            "file": f,
+            "signature": sig,
+            "formals": [{"name": a, "kind": k} for a, k in formals],
+            "call_sites": [{"callee": c, "line": 1, "literals": {}, "initializer": False} for c in callees],
+        }
+        dag_fns[keys[n]] = {"name": n, "file": f, "is_static": False, "module": "lib"}
+    entries = [keys[n] for n, (_s, _f, _c, att) in fns.items() if att is not None]
+    files = sorted({k.split("#", 1)[0] for k in keys.values()})
+    dag: dict[str, Any] = {
+        "module_kind": "link_unit",
+        "trust": {"threat_model": tm_block},
+        "modules": {"lib": {"candidate_entry_points": entries, "functions": list(keys.values()), "files": files}},
+        "functions": dag_fns,
+        "global_variables": {},
+    }
+    model: dict[str, Any] = {
+        "status": "ok",
+        "trust": {"threat_model": tm_block},
+        "units": {"lib": {"kind": "static_lib", "test": False, "files": files, "links": []}},
+        "functions": model_fns,
+        "global_variables": {},
+    }
+
+    def _struct(*names: str) -> dict[str, Any]:
+        fields = [_int_field(name, 4 * k) for k, name in enumerate(names)]
+        return {"what": "struct", "size": 4 * len(names), "align": 4, "pointers": False, "fields": fields}
+
+    layouts = {
+        "struct enc": _struct("depth", "count", "used"),
+        "struct dec": _struct("depth", "pos", "len"),
+        "struct bufc": _struct("off", "len"),
+    }
+    return dag, model, layouts
+
+
+def _stateful(planned: dict[str, Any], entry: str) -> list[tuple[str, dict[str, Any]]]:
+    """The stateful cases (`sequence` cases led up to `entry`) of a plan."""
+    return [
+        (stmt, lay)
+        for stmt, lay in zip(planned["cases"], planned["layouts"], strict=True)
+        if lay["kind"] == "sequence" and lay.get("entry") == entry
+    ]
+
+
+def test_a_closer_on_a_fresh_context_gets_its_opener_and_data_first(monkeypatch: pytest.MonkeyPatch):
+    """
+    QCBOR run-1 (2026-11-22): case 35 was `QCBOREncode_Init(&c0a0, c1a1); QCBOREncode_CloseAndSortMap(&c0a0);`,
+    whose only input is the storage size: closing a map nobody opened returns an error, so the map sort
+    never ran. A closer gets a case that opens first (its paired opener) and adds data from the input,
+    since the encoder's initializer reads none.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _stateful_fixture()
+
+    planned = ah.plan(dag, model, "lib", "lib", 256, struct_layouts=layouts)
+
+    # The single case stays.
+    assert any(lay["calls"] == ["enc_close_and_sort_map"] and lay["kind"] == "single" for lay in planned["layouts"])
+    cases = _stateful(planned, "enc.c#enc_close_and_sort_map")
+    assert len(cases) == 1, [lay["calls"] for lay in planned["layouts"]]
+    stmt, lay = cases[0]
+    assert lay["calls"] == ["enc_open_map", *["enc_add_int"] * ah.STATE_FEED_CALLS, "enc_close_and_sort_map"]
+    assert lay["state"] == "model"
+    assert [i["fn"] for i in lay.get("inits") or []] == ["enc_init"]
+    # One context through every call, set up once, in that order.
+    assert stmt.index("enc_init(") < stmt.index("enc_open_map(") < stmt.index("enc_add_int(")
+    assert stmt.index("enc_add_int(") < stmt.index("enc_close_and_sort_map(")
+    assert stmt.count("enc_init(") == 1
+    # The data of each add comes from the input.
+    adds = [k + 1 for k in range(ah.STATE_FEED_CALLS)]
+    assert sorted({s["call"] for s in lay["slots"] if s["param"] == 1 and s["call"] in adds}) == adds
+    assert any("stateful case" in n for n in lay.get("notes") or [])
+
+
+def test_an_in_map_accessor_gets_the_enter_call_first_and_keeps_its_trusted_label(monkeypatch: pytest.MonkeyPatch):
+    """
+    QCBOR run-1: the `*InMapSZ` accessors ran right after `QCBORDecode_Init`, so the map search returned
+    `QCBOR_ERR_MAP_NOT_ENTERED` before any label match. The accessor gets a case that enters a map first;
+    the decoder's initializer reads the document, so no data call is added, and the trusted label stays
+    a literal, as in the single case.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _stateful_fixture()
+
+    planned = ah.plan(dag, model, "lib", "lib", 256, struct_layouts=layouts)
+
+    (stmt, lay), *more = _stateful(planned, "dec.c#dec_get_int_in_map_sz")
+    assert not more
+    assert lay["calls"] == ["dec_enter_map", "dec_get_int_in_map_sz"]
+    assert [i["fn"] for i in lay.get("inits") or []] == ["dec_init"]
+    assert stmt.index("dec_init(") < stmt.index("dec_enter_map(") < stmt.index("dec_get_int_in_map_sz(")
+    assert f'(char const *)"{ah.TRUSTED_STRING_DEFAULT}"' in stmt
+    assert all(not (s["call"] == 1 and s["param"] == 1) for s in lay["slots"])
+    assert lay["rest"] is None or (lay["rest"]["call"], lay["rest"]["param"]) != (1, 1)
+    # The closer of the decoder gets its opener too; an accessor without the scope word reaches the same
+    # guarded search as the in-map accessors; a function that works on a fresh context gets nothing.
+    assert [lay["calls"] for _s, lay in _stateful(planned, "dec.c#dec_exit_map")] == [["dec_enter_map", "dec_exit_map"]]
+    seek = _stateful(planned, "dec.c#dec_seek_to_label_n")
+    assert [lay["calls"] for _s, lay in seek] == [["dec_enter_map", "dec_seek_to_label_n"]]
+    assert _stateful(planned, "dec.c#dec_get_next") == []
+    assert _stateful(planned, "enc.c#enc_add_int") == []
+    # Bounded: no stateful case is longer than the cap.
+    for lay in planned["layouts"]:
+        if lay.get("state"):
+            assert len(lay["calls"]) <= ah.STATE_MAX_PREFIX + 1
+
+
+def test_a_recorded_chain_binds_trusted_parameters_as_the_single_cases_do(monkeypatch: pytest.MonkeyPatch):
+    """
+    QCBOR run-1 (F1 note): `sequence_case` called `_bind_call` without the threat model's roles, so the
+    recorded `Init -> EnterBoundedMapOrArray -> GetItemInMapSZ` chain fuzzed the trusted label. The chain
+    now binds it as the single case does (the recorded literal), and a trusted scalar the application
+    chose (the type of map to enter) takes one of the values the target's tests passed, not zero.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _stateful_fixture()
+    trace = [
+        {"fn": "dec_init", "args": {"2": [["i", 0, "0400000000000000"]]}, "addrs": {"0": "d0"}},
+        {"fn": "dec_enter_map", "args": {"1": [["i", 0, "05"]]}, "addrs": {"0": "d0"}},
+        {"fn": "dec_get_int_in_map_sz", "args": {"1": [["s", 0, b"lbl".hex()]]}, "addrs": {"0": "d0", "2": "o1"}},
+    ]
+
+    planned = ah.plan(dag, model, "lib", "lib", 256, traces=[trace], struct_layouts=layouts)
+
+    chain = [
+        (stmt, lay)
+        for stmt, lay in zip(planned["cases"], planned["layouts"], strict=True)
+        if lay["kind"] == "sequence" and not lay.get("entry")
+    ]
+    assert [lay["calls"] for _s, lay in chain] == [["dec_init", "dec_enter_map", "dec_get_int_in_map_sz"]]
+    stmt, lay = chain[0]
+    assert '(char const *)"lbl"' in stmt
+    assert all(not (s["call"] == 2 and s["param"] == 1) for s in lay["slots"])
+    assert lay["rest"] is None or (lay["rest"]["call"], lay["rest"]["param"]) != (2, 1)
+    # The map type: read from the input, kept to what the tests passed.
+    assert any(s["call"] == 1 and s["param"] == 1 for s in lay["slots"])
+    assert "5ULL" in stmt
+    assert any("argument 1: trusted scalar" in n and "recorded" in n for n in lay.get("notes") or [])
+    # The stateful case of the accessor replays the recorded prefix, with the same bindings.
+    (st_stmt, st_lay), *_ = _stateful(planned, "dec.c#dec_get_int_in_map_sz")
+    assert st_lay["state"] == "recorded"
+    assert st_lay["calls"] == ["dec_enter_map", "dec_get_int_in_map_sz"]
+    assert '(char const *)"lbl"' in st_stmt and "5ULL" in st_stmt
+
+
+def test_a_by_value_builder_of_a_shared_buffer_assigns_through_its_type(monkeypatch: pytest.MonkeyPatch):
+    """
+    QCBOR run-1: the recorded encoder chain (48 calls) was built, then the compile probe dropped it on
+    `s1 = UsefulBuf_FromSZ(...)`: the shared `UsefulBufC *` of two `QCBOREncode_Finish` calls is a byte
+    array, and the by-value builder of its struct was assigned to the array. The drop was silent: a
+    sequence case names no entry point, so nothing went to `api_skipped`.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _stateful_fixture()
+    trace = [
+        {"fn": "enc_init", "args": {}, "addrs": {"0": "e0"}},
+        {"fn": "enc_open_map", "args": {}, "addrs": {"0": "e0"}},
+        {"fn": "enc_finish", "args": {}, "addrs": {"0": "e0", "1": "b0"}},
+        {"fn": "enc_init", "args": {}, "addrs": {"0": "e0"}},
+        {"fn": "enc_finish", "args": {}, "addrs": {"0": "e0", "1": "b0"}},
+    ]
+
+    planned = ah.plan(dag, model, "lib", "lib", 256, traces=[trace], struct_layouts=layouts)
+
+    chain = [
+        stmt
+        for stmt, lay in zip(planned["cases"], planned["layouts"], strict=True)
+        if lay["kind"] == "sequence" and "enc_finish" in lay["calls"] and not lay.get("entry")
+    ]
+    assert chain, [lay["calls"] for lay in planned["layouts"]]
+    stmt = chain[0]
+    assert " s1 = buf_from_sz(" not in stmt
+    assert "*(struct bufc *)s1 = buf_from_sz(" in stmt
+
+
+def test_stateful_cases_go_first_over_the_case_limit(monkeypatch: pytest.MonkeyPatch):
+    """
+    The stateful cases come after every single case, a public header function's included: over the
+    case limit they are cut first, so no entry point loses its only case to an extra stateful one.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _stateful_fixture()
+    hdr = "inc/lib.h#h_peek"
+    dag["functions"][hdr] = {"name": "h_peek", "file": "inc/lib.h", "is_static": True, "header": True, "module": "lib"}
+    dag["modules"]["lib"]["candidate_entry_points"].append(hdr)
+    dag["modules"]["lib"]["functions"].append(hdr)
+    model["functions"][hdr] = {
+        "name": "h_peek",
+        "file": "inc/lib.h",
+        "static": True,
+        "header": True,
+        "signature": "int(int)",
+        "formals": [{"name": "p0", "kind": "value"}],
+    }
+    entry = {"function": "h_peek", "role": "entry", "params": ["p0"], "description": "h_peek"}
+    dag["trust"]["threat_model"]["input_sources"].append(entry)
+    visible = ah.Declared({str(rec["name"]) for rec in dag["functions"].values()})
+
+    full = ah.plan(dag, model, "lib", "lib", 256, struct_layouts=layouts, visible=visible)
+    kinds = [bool(lay.get("state")) for lay in full["layouts"]]
+    assert any(kinds), "the fixture has stateful cases"
+    # Every stateful case is after every other case, the header function's single case included.
+    assert kinds == sorted(kinds)
+    assert any(lay.get("entry") == hdr for lay in full["layouts"])
+    n_other = kinds.count(False)
+
+    monkeypatch.setattr(ah, "MAX_CASES", n_other + 1)
+    capped = ah.plan(dag, model, "lib", "lib", 256, struct_layouts=layouts, visible=visible)
+    assert [lay for lay in capped["layouts"] if not lay.get("state")] == [
+        lay for lay in full["layouts"] if not lay.get("state")
+    ]
+    assert sum(1 for lay in capped["layouts"] if lay.get("state")) == 1
+    assert not any("more than" in why for why in capped["skipped"].values()), capped["skipped"]
+
+
+def test_generate_reports_a_dropped_sequence_case_and_keeps_both_copies_equal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    The stateful cases are `sequence` cases with an `entry` and a `state`: the sidecar stays valid and
+    the Eva and LibFuzzer copies dispatch the same bodies. A case the compile probe refuses that names
+    no entry point is reported instead of vanishing.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _stateful_fixture()
+    reports = tmp_path / "workspace" / "reports"
+    harnesses = tmp_path / "workspace" / "harnesses"
+    reports.mkdir(parents=True)
+    harnesses.mkdir(parents=True)
+    dag_path = reports / "callgraph_dag.json"
+    model_path = reports / "phase0_model.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+    traces_path = tmp_path / "traces.jsonl"
+    trace = [
+        {"fn": "dec_init", "args": {}, "addrs": {"0": "d0"}},
+        {"fn": "dec_enter_map", "args": {"1": [["i", 0, "05"]]}, "addrs": {"0": "d0"}},
+        {"fn": "dec_get_next", "args": {}, "addrs": {"0": "d0"}},
+    ]
+    traces_path.write_text(json.dumps({"pid": "1", "calls": trace}) + "\n", encoding="utf-8")
+    refused: list[int] = []
+
+    def fake_probe(harness_c: Path, cppflags: str, clang: str | None = None):
+        text = harness_c.read_text(encoding="utf-8")
+        bad = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("case ") and "dec_get_next(" in stripped and "dec_enter_map(" in stripped:
+                sel = int(stripped.split()[1].rstrip("U:"))
+                if "dec_init(" in stripped and "dec_exit_map(" not in stripped:
+                    bad[sel] = "harness_lib.c:1: error: refused for the test"
+        refused.extend(sorted(bad))
+        return bad, []
+
+    monkeypatch.setattr(ah, "probe_cases", fake_probe)
+    res = ah.generate(
+        module="lib",
+        header="none",
+        max_input_size=256,
+        cppflags="",
+        out_dir=harnesses,
+        unit="lib",
+        auto_prelude=False,
+        probe=True,
+        dag_path=dag_path,
+        model_path=model_path,
+        traces_path=traces_path,
+        struct_layouts=layouts,
+        visible=ah.Declared({f["name"] for f in model["functions"].values()}),
+        variadic={},
+    )
+    sidecar = json.loads(Path(res["harness_meta"]).read_text(encoding="utf-8"))
+    harness_c = Path(res["harness_file"]).read_text(encoding="utf-8")
+
+    assert not validate_sidecar(sidecar, module="lib")
+    stateful = [c for c in sidecar["api_cases"] if c.get("state")]
+    assert {c["entry"] for c in stateful} >= {"enc.c#enc_close_and_sort_map", "dec.c#dec_get_int_in_map_sz"}
+    assert all(c["kind"] == "sequence" for c in stateful)
+    # The recorded chain (no entry) was refused: reported with the probe's message.
+    assert refused
+    dropped = res["api_dropped_cases"]
+    assert [d["calls"] for d in dropped] == [["dec_init", "dec_enter_map", "dec_get_next"]]
+    assert "refused for the test" in dropped[0]["why"]
+    eva_part, fuzz_part = harness_c.split("LLVMFuzzerTestOneInput", 1)
+    for case in stateful:
+        body = sidecar["dispatch_cases"][case["selector"]]
+        assert eva_part.count(body) == 1 and fuzz_part.count(body) == 1
