@@ -16,7 +16,10 @@ Modes:
    fork mode with `-ignore_crashes=1`. When a round's new crashes cannot be skipped (a harness
    generated before every case was skippable, or a failed rebuild), the round records why and the
    time left goes to fork mode. `keep_going` in the report records the rounds, and duplicates of
-   one fingerprint are listed at most 3 times.
+   one fingerprint are listed at most 3 times. A binary that defines the libc functions libFuzzer
+   starts its worker processes with (system, exec*, posix_spawn*, ...: an LD_PRELOAD interposer
+   such as sudo_noexec.c), or whose multi-process campaign ends before any input ran, is fuzzed in
+   one process (`single_process_reason`).
 2. `guardrail`: the dynamic anti-hallucination oracle used inside `/framac-wp`.
    Replays the module corpus (plus a short mutation burst) against a binary compiled with
    the proposed ACSL contract. Outcomes:
@@ -319,6 +322,79 @@ _DISPATCH_SWITCH_RE = DISPATCH_SWITCH_RE
 
 _TEST_UNIT_WRITTEN_RE = re.compile(r"Test unit written to\s+(?P<path>\S+)")
 
+# The libc functions libFuzzer starts its -jobs/-workers and -fork processes with (ExecuteCommand: system(),
+# popen()). A binary that defines one replaces libc's in the whole process, libFuzzer included: an LD_PRELOAD
+# interposer such as sudo_noexec.c returns EACCES, sudo_intercept.c routes it through a port. Such a binary
+# is fuzzed in one process (sudo run-1: both engines ended `fuzzer_error` in 0.1 s). exec*/posix_spawn* the
+# target replaces do not reach libFuzzer (glibc's system() spawns internally); whatever else keeps the
+# workers from starting (a seccomp filter denying execve) is caught by the no-input rerun of run_fuzz_campaign.
+PROCESS_LAUNCH_FUNCTIONS = frozenset({"system", "popen"})
+# `nm` types of a global function definition: text, weak, indirect (GNU ifunc). A local (`t`) definition
+# replaces nothing. A sanitizer runtime defines `popen` as a weak alias of `__interceptor_popen` (LLVM 17+
+# also `___interceptor_popen`): that is libc's popen behind the interceptor, not a replacement.
+_NM_GLOBAL_FUNCTION_TYPES = frozenset("TWi")
+_NM_LINE_RE = re.compile(r"^\s*(?:[0-9a-fA-F]+\s+)?(?P<type>[A-Za-z])\s+(?P<name>\S+)\s*$")
+_INTERCEPTOR_PREFIXES = ("___interceptor_", "__interceptor_")
+NM_TIMEOUT_S = 120
+# libFuzzer output that shows an input ran: a progress line (`#N\tINITED`, `#N\tNEW`, `#N\tpulse`, ...; fork
+# mode's `#N: cov: ...`), `Done N runs` or the final stats.
+_LIBFUZZER_PROGRESS_RE = re.compile(r"^#\d+(?:\t|:\s)", re.MULTILINE)
+_LIBFUZZER_RUNS_RE = re.compile(
+    r"^(?:Done (?P<done>\d+) runs|stat::number_of_executed_units:\s*(?P<units>\d+))", re.MULTILINE
+)
+
+
+def parse_defined_process_launchers(nm_output: str) -> list[str]:
+    """
+    The PROCESS_LAUNCH_FUNCTIONS that `nm --defined-only` output defines as global functions, sorted. A
+    weak definition with a sanitizer interceptor of the same name is the interceptor, not the target's.
+    """
+    types: dict[str, str] = {}
+    intercepted: set[str] = set()
+    for line in (nm_output or "").splitlines():
+        m = _NM_LINE_RE.match(line)
+        if not m or m.group("type") not in _NM_GLOBAL_FUNCTION_TYPES:
+            continue
+        name = m.group("name").split("@", 1)[0]
+        for prefix in _INTERCEPTOR_PREFIXES:
+            if name.startswith(prefix):
+                intercepted.add(name[len(prefix) :])
+                break
+        else:
+            if name in PROCESS_LAUNCH_FUNCTIONS:
+                types[name] = m.group("type")
+    return sorted(name for name, typ in types.items() if typ != "W" or name not in intercepted)
+
+
+def defined_process_launchers(binary: Path, runner=subprocess.run) -> list[str] | None:
+    """
+    The process-launch functions (PROCESS_LAUNCH_FUNCTIONS) `binary` defines itself, from `nm
+    --defined-only`; None when nm cannot read it (no nm, not an ELF file): unknown, not "none".
+    """
+    try:
+        proc = runner(
+            ["nm", "--defined-only", str(binary)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=NM_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_defined_process_launchers(proc.stdout or "")
+
+
+def libfuzzer_executed_inputs(output: str) -> bool:
+    """Whether libFuzzer's output (the campaign's and its workers' logs) shows at least one input ran."""
+    text = output or ""
+    for m in _LIBFUZZER_RUNS_RE.finditer(text):
+        if int(m.group("done") or m.group("units") or 0) > 0:
+            return True
+    return bool(_LIBFUZZER_PROGRESS_RE.search(text))
+
 
 def _collapse_duplicate_artifacts(artifacts: list[dict]) -> tuple[list[dict], int]:
     """At most MAX_ARTIFACTS_PER_FINGERPRINT entries per fingerprint, in order; and how many were dropped."""
@@ -576,12 +652,19 @@ def run_campaign_rounds(
       crashes ignored on the last binary built (`fork_fallback`).
     - Any other harness runs once in fork mode with crashes ignored.
     - Without `keep_going`, one campaign that stops at the first crash, as before.
+
+    A campaign that ran in one process (`single_process_reason` in its result, run_fuzz_campaign) used
+    one CPU: `keep_going.workers` and `cpu_seconds_spent` count that, and `keep_going` carries the
+    reason. Without fork mode a single process stops at its first crash (`stops_at_first_crash`).
     """
     if not keep_going:
         return campaign(binary, max_time, False)
     if not n_cases:
         res = campaign(binary, max_time, True)
         res["keep_going"] = {"mode": "fork"}
+        if res.get("single_process_reason"):
+            res["keep_going"]["single_process_reason"] = res["single_process_reason"]
+            res["keep_going"]["stops_at_first_crash"] = True
         return res
     skippable = n_cases if skippable is None else min(skippable, n_cases)
     if runtime_skip:
@@ -594,6 +677,7 @@ def run_campaign_rounds(
     last: dict = {}
     fallback_reason: str | None = None
     skip_error: str | None = None
+    single_process_reason: str | None = None
     while True:
         # A round never runs longer than the wall time the campaign has left. The first round always runs.
         budget = max(1, int(max_time - spent)) if not rounds else int(max_time - spent)
@@ -604,6 +688,9 @@ def run_campaign_rounds(
         else:
             last = campaign(binary, budget, False)
         spent += time.monotonic() - started
+        single_process_reason = single_process_reason or last.get("single_process_reason")
+        if single_process_reason:
+            workers = 1
         arts = last.get("artifacts") or []
         collected.extend(arts)
         crashed = sorted(
@@ -679,6 +766,9 @@ def run_campaign_rounds(
         else:
             last = campaign(binary, left, True)
         spent += time.monotonic() - started
+        single_process_reason = single_process_reason or last.get("single_process_reason")
+        if single_process_reason:
+            workers = 1
         arts = last.get("artifacts") or []
         collected.extend(arts)
         fallback = {
@@ -688,6 +778,8 @@ def run_campaign_rounds(
             "returncode": last.get("returncode"),
             "artifacts": len(arts),
         }
+        if last.get("single_process_reason"):
+            fallback["stops_at_first_crash"] = True
 
     seen: set[str] = set()
     unique = []
@@ -719,6 +811,8 @@ def run_campaign_rounds(
     }
     if runtime_skip:
         out["keep_going"]["runtime_skip"] = True
+    if single_process_reason:
+        out["keep_going"]["single_process_reason"] = single_process_reason
     if skip_error:
         # Not ok: the campaign did not fuzz the cases it meant to. The crashes found stay listed (and
         # `status` keeps them for ingest); `error_summary` carries the reason to the reader.
@@ -740,7 +834,16 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
         artifacts.extend(run.get("artifacts") or [])
         engines[engine] = {
             key: run[key]
-            for key in ("status", "returncode", "timed_out", "keep_going", "artifacts_omitted", "fork")
+            for key in (
+                "status",
+                "returncode",
+                "timed_out",
+                "keep_going",
+                "artifacts_omitted",
+                "fork",
+                "single_process_reason",
+                "multi_process_attempt",
+            )
             if key in run
         }
         engines[engine]["artifacts"] = len(run.get("artifacts") or [])
@@ -807,6 +910,7 @@ def run_fuzz_campaign(
     workers: int = 1,
     fork: bool = False,
     extra_env: dict[str, str] | None = None,
+    single_process_reason: str | None = None,
 ) -> dict:
     """
     `corpus_dir` receives new units (writable); `extra_corpus` directories are read-only
@@ -821,7 +925,91 @@ def run_fuzz_campaign(
     Clang ASan+UBSan build of the same slice (or None). It is called at most once, only when
     an E-ACSL crash has no usable location (failure missing, line 0, or a runtime-internal
     function), and the crash input is replayed on that build to attribute file:line.
+
+    A multi-process campaign (`fork`, or more than one job or worker) runs in one process instead,
+    with `-print_funcs=0`, when:
+      - `single_process_reason` is given (an earlier round of the same engine ran in one process);
+      - the binary defines a process-launch function (PROCESS_LAUNCH_FUNCTIONS, `nm`): libFuzzer
+        starts its processes through system(), which the target replaced;
+      - it ends `fuzzer_error` with no artifact and no input run (the workers never started: a
+        replaced launcher nm did not see, or a seccomp filter denying execve as sudo_noexec.c's
+        constructor installs). It is then rerun once in one process; `multi_process_attempt` keeps
+        the first attempt's returncode and log tail.
+    The result then says why (`single_process_reason`) and `workers_used: 1`. NEW_FUNC lines are
+    turned off because libFuzzer symbolizes them through a child process, which such a target can
+    deny (sudo_noexec_so died of SIGPIPE at its first NEW_FUNC line).
     """
+    common = {
+        "dict_file": dict_file,
+        "per_input_timeout": per_input_timeout,
+        "rss_limit_mb": rss_limit_mb,
+        "extra_corpus": extra_corpus,
+        "attribution_builder": attribution_builder,
+        "extra_env": extra_env,
+    }
+    multi = fork or max(1, int(workers or 1)) > 1 or max(1, int(jobs or 1)) > 1
+    reason = single_process_reason if multi else None
+    if multi and reason is None:
+        launchers = defined_process_launchers(binary)
+        if launchers:
+            reason = (
+                f"the binary defines {', '.join(launchers)}, replacing libc's in the whole process: libFuzzer "
+                "starts its -jobs/-workers/-fork processes through system(), so the campaign runs in one process"
+            )
+    if reason is not None:
+        out = _run_fuzz_campaign_once(binary, corpus_dir, artifacts_dir, max_time, **common, print_funcs=False)
+        return _single_process_result(out, reason)
+    out = _run_fuzz_campaign_once(
+        binary, corpus_dir, artifacts_dir, max_time, **common, jobs=jobs, workers=workers, fork=fork
+    )
+    executed = out.pop("_executed_inputs", True)
+    if not multi or out.get("status") != "fuzzer_error" or out.get("artifacts") or out.get("timed_out") or executed:
+        return out
+    eff_workers = max(1, int(workers or 1), int(jobs or 1))
+    mode = f"-fork={eff_workers}" if fork else f"-jobs/-workers={eff_workers}"
+    reason = (
+        f"the multi-process campaign ({mode}) ended with returncode {out.get('returncode')} before any input ran: "
+        "its worker processes did not start (a target that replaces system()/exec*, or a seccomp filter "
+        "denying execve), so it was rerun in one process"
+    )
+    attempt = {"returncode": out.get("returncode"), "log_tail": str(out.get("log_tail") or "")[-1500:]}
+    retry = _single_process_result(
+        _run_fuzz_campaign_once(binary, corpus_dir, artifacts_dir, max_time, **common, print_funcs=False), reason
+    )
+    retry["multi_process_attempt"] = attempt
+    if retry.get("status") == "fuzzer_error":
+        retry["error_summary"] = [
+            *(retry.get("error_summary") or []),
+            "no input ran in the multi-process campaign nor in its single-process rerun: the binary fails "
+            "before fuzzing, not only its worker processes",
+        ]
+    return retry
+
+
+def _single_process_result(out: dict, reason: str) -> dict:
+    out.pop("_executed_inputs", None)
+    out["single_process_reason"] = reason
+    out["workers_used"] = 1
+    return out
+
+
+def _run_fuzz_campaign_once(
+    binary: Path,
+    corpus_dir: Path,
+    artifacts_dir: Path,
+    max_time: int,
+    dict_file: Path | None,
+    per_input_timeout: int,
+    rss_limit_mb: int,
+    extra_corpus: list[Path] | None,
+    attribution_builder,
+    extra_env: dict[str, str] | None,
+    jobs: int = 1,
+    workers: int = 1,
+    fork: bool = False,
+    print_funcs: bool = True,
+) -> dict:
+    """One libFuzzer campaign as run_fuzz_campaign describes; `_executed_inputs` says whether any input ran."""
     req_mem = fuzz_required_memory_mb(workers)
     mem_limit = enforced_memory_mb()
     if mem_limit is not None and mem_limit < req_mem:
@@ -862,6 +1050,8 @@ def run_fuzz_campaign(
             "-print_final_stats=1",
             str(corpus_dir.resolve()),
         ]
+        if not print_funcs:
+            cmd.insert(-1, "-print_funcs=0")
         cmd += [str(Path(d).resolve()) for d in (extra_corpus or []) if Path(d).is_dir()]
         eff_jobs = max(1, int(jobs or 1))
         eff_workers = max(1, int(workers or 1))
@@ -894,7 +1084,7 @@ def run_fuzz_campaign(
             cmd,
             writable=[scratch, corpus_dir, artifacts_dir],
             timeout_s=wall_timeout,
-            limits=Limits(cpu_seconds=wall_timeout * cpu_mult),
+            limits=Limits(cpu_seconds=wall_timeout * cpu_mult, ignore_sigpipe=True),
             extra_env=run_env,
         )
         MAX_WORKER_LOG_BYTES = 1024 * 1024
@@ -1055,6 +1245,7 @@ def run_fuzz_campaign(
             "sandbox": res.sandbox,
             "artifacts": artifacts,
             "log_tail": combined_out[-4000:],
+            "_executed_inputs": libfuzzer_executed_inputs(combined_out),
         }
         if fork:
             out["fork"] = eff_workers
@@ -1976,7 +2167,10 @@ def run_guardrail_check(
         ]
         artifacts_before = _prefix_artifacts(scratch_dir)
         res = sandbox_exec.run_sandboxed(
-            cmd, writable=[scratch_dir], timeout_s=wall_left, limits=Limits(cpu_seconds=wall_left * 2)
+            cmd,
+            writable=[scratch_dir],
+            timeout_s=wall_left,
+            limits=Limits(cpu_seconds=wall_left * 2, ignore_sigpipe=True),
         )
         reach, combined_out = parse_guardrail_reach(res.stdout + "\n" + res.stderr, functions)
         verdict = classify_guardrail(res.returncode, res.timed_out, combined_out)
@@ -3172,8 +3366,11 @@ def _run_campaign_mode(args) -> dict:
             shim = (comp.get("environ_keep") or {}).get("status") if engine == "eacsl" else None
             runtime_skip = harness_runtime_skip and (engine != "eacsl" or shim == "built")
 
+            # Once a round ran in one process (run_fuzz_campaign), every later round of this engine does too.
+            single_process: dict[str, str] = {}
+
             def _campaign(binary: Path, seconds: int, fork: bool, *, extra_env: dict[str, str] | None = None) -> dict:
-                return run_fuzz_campaign(
+                run = run_fuzz_campaign(
                     binary,
                     args.corpus_dir,
                     args.artifacts_dir,
@@ -3186,7 +3383,11 @@ def _run_campaign_mode(args) -> dict:
                     workers=workers,
                     fork=fork,
                     extra_env=extra_env,
+                    single_process_reason=single_process.get("reason"),
                 )
+                if run.get("single_process_reason") and "reason" not in single_process:
+                    single_process["reason"] = str(run["single_process_reason"])
+                return run
 
             def _rebuild(mask: int) -> tuple[Path | None, dict]:
                 opts = _build_options(args)

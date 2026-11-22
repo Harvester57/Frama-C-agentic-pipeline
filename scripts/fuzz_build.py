@@ -36,6 +36,8 @@ from eacsl_toolchain import (
     EACSL_META_LIBC_UNCHECKED,
     EACSL_META_LIBC_WRITERS,
     EACSL_NO_LIBC_CHECKS,
+    EACSL_NON_PIE_COMPILE,
+    EACSL_NON_PIE_LINK,
     EACSL_RTE_INITIALIZED_FLAG,
     ERRNO_SHIM_FUNCTIONS,
     INCOMPLETE_ALIGNOF_ASSUMPTION,
@@ -376,6 +378,42 @@ def _runtime_patches(check_options: list[str]) -> list[str]:
 
 # A compiler error in the patched copy's e_acsl_stdio.c (`<share>/libc_replacements/e_acsl_stdio.c:998:10: error: ...`).
 _PATCHED_STDIO_ERROR_RE = re.compile(r"libc_replacements/e_acsl_stdio\.c:\d+:\d+: error:")
+# A link that cannot produce a position-dependent executable (EACSL_NON_PIE_LINK): an object or flag that
+# needs a PIE, or a copy relocation against a protected data symbol of a shared library.
+_NON_PIE_LINK_ERROR_RE = re.compile(
+    r"[^\n]*(?:copy relocation against non-copyable protected symbol|"
+    r"can not be used when making a PIE object|recompile with -fPIE|"
+    r"-no-pie[^\n]*(?:incompatible|not allowed)|cannot be used with -pie|"
+    r"relocation R_X86_64_\w+ against [^\n]* can not be used)[^\n]*"
+)
+# `readelf -rW` line of a copy relocation: `<offset> <info> R_X86_64_COPY <value> <name>@<version> + 0`.
+_COPY_RELOCATION_RE = re.compile(r"^\s*[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+R_\w+_COPY\s+[0-9a-fA-F]+\s+(\S+)", re.MULTILINE)
+READELF_TIMEOUT_S = 120
+
+
+def parse_copy_relocations(readelf_output: str) -> list[str]:
+    """Sorted names (version suffix dropped) of the copy relocations in `readelf -rW` output."""
+    return sorted({m.group(1).split("@", 1)[0] for m in _COPY_RELOCATION_RE.finditer(readelf_output)})
+
+
+def copied_library_globals(binary: Path) -> list[str] | None:
+    """
+    Library-owned data the linker copied into `binary`'s own globals (its R_*_COPY relocations): in a
+    position-dependent E-ACSL binary these are the `environ`, `__progname`, `stdout`, ... the runtime
+    tracks as the executable's. None when readelf is missing or fails.
+    """
+    readelf = shutil.which("readelf")
+    if readelf is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [readelf, "-rW", str(binary)], capture_output=True, text=True, timeout=READELF_TIMEOUT_S, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_copy_relocations(proc.stdout)
 
 
 def _format_runtime_share(eacsl_bin: str, dest_root: Path) -> dict:
@@ -1032,8 +1070,9 @@ def _compile_eacsl_binary_uncached(
     result) unless `libc_checks` is False, which is recorded in `reduced_checks`.
     `-n` matters: without it `e-acsl-gcc` also links the original sources, which fails on a
     main-less fuzz harness. Fuzz builds use full memory tracking and link
-    templates/eacsl_runtime/fuzz_init.c, whose LLVMFuzzerInitialize initializes the runtime that
-    an instrumented main() would. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
+    templates/eacsl_runtime/fuzz_init.c, which initializes the runtime that an instrumented main()
+    would, from the executable's .preinit_array so target constructors and libc functions the target
+    replaces run tracked (`runtime_init`), with LLVMFuzzerInitialize as the fallback. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
     (`-Dregister=`, recorded in `full_mtracking_defines`). Between the stages the instrumented file
     is patched for printer and E-ACSL gaps, each counted in the result (`alignas_rewrites`,
     `wrapper_result_inits`, `formal_inits`, `forward_array_sizes`, `misplaced_fallthrough`, ...). A pointer-alignment check on a type the instrumented file
@@ -1445,6 +1484,14 @@ def _compile_eacsl_binary_uncached(
                 return _finish(1, "eacsl_init_hook_conflict")
             init_hook = [resolve_fuzz_init_source().as_posix()]
             result["init_hook"] = init_hook[0]
+            # The hook sets the runtime up from the executable's .preinit_array, before any target
+            # constructor or shared-library constructor can run instrumented code; LLVMFuzzerInitialize
+            # does it when that entry did not run.
+            result["runtime_init"] = {
+                "hook": "preinit_array",
+                "source": init_hook[0],
+                "fallback": "LLVMFuzzerInitialize",
+            }
             env_keep = _build_environ_keep_object(
                 instrumented_text,
                 out_bin.parent / f"{out_bin.name}_env_keep",
@@ -1522,7 +1569,17 @@ def _compile_eacsl_binary_uncached(
         zone_args = _zone_size_options(is_modern)
         result["eacsl_zone_sizes"] = {"heap_mb": int(zone_args[1].split(":", 1)[1])}
 
+        # Position-dependent binary (eacsl_toolchain.EACSL_NON_PIE_COMPILE/LINK): data a shared library owns
+        # (`environ`, `__progname`, `stdin`, `optarg`, ...) gets a copy relocation into the executable's own
+        # globals, which the runtime tracks; in a PIE its address is in libc and __e_acsl_globals_init
+        # segfaulted registering it (sudo run-1). The linker decides which symbols, for every library.
+        position: dict[str, object] = {"pie": False}
+
         def _stage2(link: str) -> tuple[list[str], int, str, str]:
+            backend = flags["backend"]
+            if not position["pie"]:
+                backend = f"{backend} {EACSL_NON_PIE_COMPILE}"
+                link = f"{link} {EACSL_NON_PIE_LINK}".strip()
             cmd2 = [
                 eacsl_bin,
                 "-C",
@@ -1532,7 +1589,7 @@ def _compile_eacsl_binary_uncached(
                 "-G",
                 "clang",
                 "-e",
-                flags["backend"],
+                backend,
                 "-O",
                 str(out_bin),
             ]
@@ -1545,6 +1602,24 @@ def _compile_eacsl_binary_uncached(
         link_used = ldflags
         cmd2, rc, out, err = _stage2(link_used)
         _record(cmd2, rc, out, err)
+        non_pie_error = _NON_PIE_LINK_ERROR_RE.search(out + "\n" + err) if rc != 0 else None
+        if non_pie_error:
+            # A library or flag that cannot go into a position-dependent executable: link a PIE as before.
+            # Imported library data the slice registers then still crashes __e_acsl_globals_init.
+            position["pie"] = True
+            position["fallback_reason"] = non_pie_error.group(0)
+            log_parts.append(
+                f"Position-dependent link failed ({position['fallback_reason']}); linking a PIE: library-owned "
+                "globals the slice registers (environ, __progname, ...) will crash __e_acsl_globals_init.\n"
+            )
+            cmd2, rc, out, err = _stage2(link_used)
+            _record(cmd2, rc, out, err)
+        result["position_dependent"] = {
+            "pie": position["pie"],
+            "compile": None if position["pie"] else EACSL_NON_PIE_COMPILE,
+            "link": None if position["pie"] else EACSL_NON_PIE_LINK,
+            **({"fallback_reason": position["fallback_reason"]} if position.get("fallback_reason") else {}),
+        }
         if rc != 0 and parse_undefined_fallbacks(out + "\n" + err):
             fb = build_fallback_object(
                 instrumented_c,
@@ -1585,6 +1660,8 @@ def _compile_eacsl_binary_uncached(
 
     binary = select_eacsl_binary(out_bin)
     result["binary"] = str(binary)
+    if isinstance(result.get("position_dependent"), dict) and not result["position_dependent"]["pie"]:
+        result["position_dependent"]["copied_library_globals"] = copied_library_globals(binary)
     if not is_eacsl_instrumented(binary):
         log_parts.append(
             f"Binary {binary} does not contain E-ACSL instrumentation; refusing to label it engine=eacsl.\n"

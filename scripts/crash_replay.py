@@ -86,7 +86,7 @@ def replay_artifact(
         ],
         writable=[scratch],
         timeout_s=wall,
-        limits=Limits(cpu_seconds=wall * 2),
+        limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
         extra_env=SANITIZER_RUNTIME_ENV,
     )
     out = res.stdout + "\n" + res.stderr
