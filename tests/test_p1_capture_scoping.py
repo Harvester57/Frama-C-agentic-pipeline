@@ -272,7 +272,7 @@ def test_static_lib_visibility_internal_vs_standalone_vs_installed(tmp_path: Pat
     assert no_install["units"]["build/mod.so"]["unit_visibility"] == "public_lib"
     assert "unit_visibility" not in no_install["units"]["build/standalone_test"]
 
-    # With install: public["method"] == "install" -> all non-test static_libs are public_lib.
+    # With install: public["method"] == "install" and lib.h declares all three libraries' APIs -> public_lib.
     staged = tmp_path / "inst" / "staged" / "include" / "lib.h"
     staged.parent.mkdir(parents=True, exist_ok=True)
     staged.write_text(headers["include/lib.h"], encoding="utf-8")
@@ -291,6 +291,121 @@ def test_static_lib_visibility_internal_vs_standalone_vs_installed(tmp_path: Pat
     assert with_install["units"]["build/libconv.a"]["unit_visibility"] == "public_lib"
     assert with_install["units"]["build/libsoconv.a"]["unit_visibility"] == "public_lib"
     assert with_install["units"]["build/libstandalone.a"]["unit_visibility"] == "public_lib"
+
+
+@pytest.mark.unit
+def test_static_lib_visibility_unrelated_installed_header_vs_installed_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    When `make install` stages only an unrelated header (like sudo's `sudo_plugin.h`), linked internal `.a`
+    archives whose symbols are NOT declared in installed headers stay `internal_convenience`, while:
+      - standalone `.a` archives not linked by any non-test exe/so stay `public_lib`,
+      - linked `.a` archives whose own API IS declared in installed headers stay `public_lib`, and
+      - linked `.a` archives whose `.a` file itself is staged under `scratch/install` stay `public_lib`.
+    """
+    execs = [
+        _exec(["cc", "-c", "lib/logsrv/log.c", "-o", "build/log.o"]),
+        _exec(["ar", "rcs", "build/liblogsrv.a", "build/log.o"]),
+        _exec(["cc", "-c", "lib/pub/pub.c", "-o", "build/pub.o"]),
+        _exec(["ar", "rcs", "build/libpub.a", "build/pub.o"]),
+        _exec(["cc", "-c", "lib/staged/staged.c", "-o", "build/staged.o"]),
+        _exec(["ar", "rcs", "build/libstaged.a", "build/staged.o"]),
+        _exec(["cc", "-c", "lib/standalone/alone.c", "-o", "build/alone.o"]),
+        _exec(["ar", "rcs", "build/libstandalone.a", "build/alone.o"]),
+        _exec(["cc", "-c", "src/daemon.c", "-o", "build/daemon.o"]),
+        _exec(
+            [
+                "cc",
+                "-o",
+                "build/daemon",
+                "build/daemon.o",
+                "build/liblogsrv.a",
+                "build/libpub.a",
+                "build/libstaged.a",
+            ]
+        ),
+        _exec(["cc", "-c", "plugins/sudoers/policy.c", "-o", "build/policy.o"]),
+        _exec(["cc", "-shared", "-o", "build/sudoers.so", "build/policy.o", "build/liblogsrv.a"]),
+    ]
+    headers = {
+        "include/sudo_plugin.h": "struct sudo_plugin_api { int version; };\n",
+        "include/log_server.h": "int logsrv_unpack(const unsigned char *buf, int len);\n",
+        "include/pub.h": "int pub_parse(const char *s);\n",
+        "include/staged_priv.h": "int staged_only_fn(int x);\n",
+        "include/alone.h": "int alone_decode(const unsigned char *b);\n",
+    }
+    dep_map = {
+        "lib/logsrv/log.c": ["include/sudo_plugin.h", "include/log_server.h"],
+        "lib/pub/pub.c": ["include/pub.h"],
+        "lib/staged/staged.c": ["include/staged_priv.h"],
+        "lib/standalone/alone.c": ["include/alone.h"],
+        "src/daemon.c": ["include/log_server.h", "include/pub.h", "include/staged_priv.h"],
+        "plugins/sudoers/policy.c": ["include/sudo_plugin.h", "include/log_server.h"],
+    }
+    sym_map = {
+        "lib/logsrv/log.c": {"logsrv_unpack": ("T", None)},
+        "lib/pub/pub.c": {"pub_parse": ("T", None)},
+        "lib/staged/staged.c": {"staged_only_fn": ("T", None)},
+        "lib/standalone/alone.c": {"alone_decode": ("T", None)},
+        "src/daemon.c": {"main": ("T", None)},
+        "plugins/sudoers/policy.c": {"sudoers_policy": ("D", None)},
+    }
+    nm_dynamic = {"build/sudoers.so": "0000000000004000 D sudoers_policy\n"}
+
+    # Stage sudo_plugin.h + pub.h (NOT log_server.h or staged_priv.h), plus libstaged.a itself.
+    run_root = tmp_path / "sudo_like"
+    inst_inc = run_root / "scratch" / "install" / "usr" / "local" / "include"
+    inst_inc.mkdir(parents=True, exist_ok=True)
+    staged_plugin_h = inst_inc / "sudo_plugin.h"
+    staged_plugin_h.write_text(headers["include/sudo_plugin.h"], encoding="utf-8")
+    staged_pub_h = inst_inc / "pub.h"
+    staged_pub_h.write_text(headers["include/pub.h"], encoding="utf-8")
+    inst_lib = run_root / "scratch" / "install" / "usr" / "local" / "lib"
+    inst_lib.mkdir(parents=True, exist_ok=True)
+    (inst_lib / "libstaged.a").write_bytes(b"!<arch>\n")
+
+    report = _run_analyse(
+        run_root,
+        monkeypatch,
+        execs,
+        headers,
+        dep_map,
+        sym_map,
+        nm_dynamic_map=nm_dynamic,
+        installed_headers=[staged_plugin_h, staged_pub_h],
+    )
+    assert bc.validate_report(report) == []
+    assert report["public_headers"]["method"] == "install"
+    assert report["units"]["build/liblogsrv.a"]["unit_visibility"] == "internal_convenience"
+    assert report["units"]["build/libpub.a"]["unit_visibility"] == "public_lib"
+    assert report["units"]["build/libstaged.a"]["unit_visibility"] == "public_lib"
+    assert report["units"]["build/libstandalone.a"]["unit_visibility"] == "public_lib"
+    assert report["units"]["build/sudoers.so"]["unit_visibility"] == "plugin_so"
+    assert report["units"]["build/daemon"]["unit_visibility"] == "executable"
+
+    # Re-evaluating offline from the saved report (with warnings) reproduces the same classification
+    # for declared-in-installed vs unrelated-header internal convenience archives.
+    units = report["units"]
+    pub = report["public_headers"]
+    warns = report["warnings"]
+    assert bc.classify_unit_visibility("build/liblogsrv.a", units["build/liblogsrv.a"], units, pub, warnings=warns) == (
+        "internal_convenience"
+    )
+    assert bc.classify_unit_visibility("build/libpub.a", units["build/libpub.a"], units, pub, warnings=warns) == (
+        "public_lib"
+    )
+    assert bc.classify_unit_visibility(
+        "build/libstandalone.a", units["build/libstandalone.a"], units, pub, warnings=warns
+    ) == "public_lib"
+    # Even a 4-arg call without `warnings` keeps liblogsrv.a as internal_convenience (consumer fallback
+    # mixed relative paths into public_headers["files"]) and keeps standalone nanopb-style .a as public_lib.
+    assert bc.classify_unit_visibility("build/liblogsrv.a", units["build/liblogsrv.a"], units, pub) == (
+        "internal_convenience"
+    )
+    assert bc.classify_unit_visibility("build/libstandalone.a", units["build/libstandalone.a"], units, pub) == (
+        "public_lib"
+    )
 
 
 @pytest.mark.unit
