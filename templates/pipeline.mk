@@ -28,9 +28,12 @@ GATE := $(PY) $(S)/phase0_gates.py check
 SELFTEST_JSON := workspace/reports/eacsl_selftest.json
 
 BUILD_TARGETS  := $(addprefix build-,$(FUZZ_MODULES))
+SMOKE_TARGETS  := $(addprefix smoke-,$(FUZZ_MODULES))
 FUZZ_TARGETS   := $(addprefix fuzz-,$(FUZZ_MODULES))
+JUDGE_TARGETS  := $(addprefix judge-,$(FUZZ_MODULES))
 COVERAGE_TARGETS := $(addprefix coverage-,$(FUZZ_MODULES))
 REACH_DYNAMIC_TARGETS := $(addprefix reach-dynamic-,$(FUZZ_MODULES))
+EACSL_FUZZ_TARGETS := $(addprefix eacsl-fuzz-,$(FUZZ_MODULES))
 EVA_TARGETS    := $(addprefix eva-,$(EVA_MODULES))
 EVA_BASE_TARGETS := $(addprefix evabase-,$(EVA_MODULES))
 EVA_RUNG_TARGETS := $(foreach m,$(EVA_MODULES),$(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)))
@@ -43,12 +46,12 @@ MODULE_TARGETS := $(addprefix module-,$(MODULES))
 MAKEFLAGS += --no-builtin-rules
 .SUFFIXES:
 .DEFAULT_GOAL := help
-.PHONY: help slice-init dag stubs stub-check security-props reach-gate reach-dynamic seeds seed build selftest fuzz coverage eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report \
-        $(BUILD_TARGETS) $(FUZZ_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) $(EVA_SHARD_TARGETS) \
+.PHONY: help slice-init dag stubs stub-check security-props reach-gate reach-dynamic seeds seed build selftest smoke fuzz judge coverage eacsl-fuzz eva eva-tune eva-tune-base flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report \
+        $(BUILD_TARGETS) $(SMOKE_TARGETS) $(FUZZ_TARGETS) $(JUDGE_TARGETS) $(COVERAGE_TARGETS) $(REACH_DYNAMIC_TARGETS) $(EACSL_FUZZ_TARGETS) $(EVA_TARGETS) $(EVA_BASE_TARGETS) $(EVA_RUNG_TARGETS) $(EVA_TUNE_TARGETS) $(EVA_SHARD_TARGETS) \
         $(FLAMEGRAPH_TARGETS) $(FACTS_TARGETS) $(MODULE_TARGETS)
 
 help:
-	@echo 'Targets: slice-init dag stubs stub-check security-props reach-gate seed seeds build selftest fuzz coverage reach-dynamic eva eva-tune-base eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
+	@echo 'Targets: slice-init dag stubs stub-check security-props reach-gate seed seeds build selftest smoke fuzz judge coverage reach-dynamic eacsl-fuzz eva eva-tune-base eva-tune flamegraph facts ingest replay minimize wp-replay wp-queue wp-baseline wp-sweep report module-<mod>'
 	@echo 'Fuzz modules: $(FUZZ_MODULES)'
 	@echo 'Eva modules: $(EVA_MODULES)'
 
@@ -139,26 +142,71 @@ seeds:
 	-$(RUN) --class light --key seeds -- $(PY) $(S)/seed_harvest.py write
 	-for m in $(FUZZ_MODULES); do $(RUN) --class light --key seeds -- $(PY) $(S)/fuzz_assets.py write --module $$m || true; done
 
+# Standalone harness smoke gate (P3): validates compiled fuzz binaries before fuzzing and Eva,
+# quarantining unambiguous harness setup faults and recording the gate stamp (even on startup_error
+# or failed exit, so a failing smoke run overwrites any prior passing stamp before Make fails).
+smoke: $(SMOKE_TARGETS)
+$(SMOKE_TARGETS): smoke-%:
+	$(GATE) --module $* --need reach
+	rm -f workspace/reports/smoke/$*.json; rc=0; \
+		$(RUN) --class replay --key $*:smoke -- \
+			$(PY) $(S)/harness_smoke.py run --module $* \
+			--build-json workspace/build/$*.build.json \
+			--sidecar workspace/harnesses/harness_$*.json \
+			--seeds-dir workspace/seeds/$* \
+			--out-json workspace/reports/smoke/$*.json || rc=$$?; \
+		if [ -f workspace/reports/smoke/$*.json ]; then \
+			$(RUN) --class light --key $*:smoke -- $(PY) $(S)/phase0_gates.py record-smoke \
+				--module $* --report workspace/reports/smoke/$*.json || { r2=$$?; [ $$rc -eq 0 ] && rc=$$r2; }; \
+		fi; \
+		exit $$rc
+
 # One campaign per module. Its effort is a CPU-second budget spread over the workers the lease
 # allows (pipeline_make.py: per harness case, capped per unit and profile); FUZZ_MAX_TIME_<mod>
 # overrides the wall time. The module's seeds and its imported corpus (the target's shipped corpora,
 # fuzz_assets.py write) are read-only extra corpora; a missing one is skipped. A failed write does not
 # stop the campaign (`-`): its recorded status is the report's `seeds` field.
+# Under FUZZ_EXPLORE_JUDGE (P7f), fuzz-% consumes the pre-built workspace/build/<mod>.build.json
+# without re-triggering phony build-% inside the fuzz lease.
 fuzz: $(FUZZ_TARGETS)
-$(FUZZ_TARGETS): fuzz-%: selftest build-%
+$(FUZZ_TARGETS): fuzz-%: selftest
 	$(GATE) --module $* --need reach,build_check
+ifdef HARNESS_SMOKE
+	$(GATE) --module $* --need smoke
+endif
 	-$(RUN) --class light --key $* -- $(PY) $(S)/seed_harvest.py write --module $*
 	-$(RUN) --class light --key $* -- $(PY) $(S)/fuzz_assets.py write --module $*
 	$(RUN) --class fuzz --key $* --output workspace/reports/fuzz/$*.json -- \
 		$(PY) $(S)/run_eacsl_fuzz.py campaign --module $* --sources $(SOURCES_$*) \
 		--out-bin workspace/harnesses/fuzz_$* --corpus-dir workspace/corpus/$* --artifacts-dir workspace/crashes/$* \
 		--extra-corpus workspace/seeds/$* workspace/imported_corpus/$* \
+		$(if $(FUZZ_EXPLORE_JUDGE),--build-json workspace/build/$*.build.json --profile $(PROFILE)) \
+		$(if $(HARNESS_SMOKE),--smoke-report workspace/reports/smoke/$*.json) \
 		--workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
 		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) $(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
 		$(if $(FUZZ_NO_RTE_INIT_$*),--no-rte-initialized) $(if $(FUZZ_NO_LIBC_CHECKS_$*),--no-libc-checks) \
 		--engine=$(FUZZ_ENGINE_$*)$(if $(FUZZ_SECURITY_PROPS_$*), --security-props=$(FUZZ_SECURITY_PROPS_$*)) \
 		--cppflags=$(CPPFLAGS_$*) --ldflags=$(LDFLAGS_$*) \
 		--selftest-json $(SELFTEST_JSON) --out-json workspace/reports/fuzz/$*.json
+
+ifndef FUZZ_EXPLORE_JUDGE
+$(FUZZ_TARGETS): fuzz-%: build-%
+endif
+
+# P2d E-ACSL judge: replays seeds, explorer crashes, and a case-stratified sample of the grown
+# corpus on the pre-built E-ACSL binary, parallel with coverage (no phony dependency on fuzz-%).
+judge: $(JUDGE_TARGETS)
+$(JUDGE_TARGETS): judge-%:
+	$(GATE) --module $* --need reach
+	$(RUN) --class replay --key $*:judge --output workspace/reports/judge/$*.json -- \
+		$(PY) $(S)/run_eacsl_fuzz.py judge --module $* \
+		--build-json workspace/build/$*.build.json \
+		--corpus-dir workspace/corpus/$* \
+		--extra-corpus workspace/seeds/$* workspace/imported_corpus/$* \
+		--explore-report workspace/reports/fuzz/$*.json \
+		$(if $(HARNESS_SMOKE),--smoke-report workspace/reports/smoke/$*.json) \
+		--profile $(PROFILE) --sources $(SOURCES_$*) \
+		--out-json workspace/reports/judge/$*.json
 
 # Which functions each module's corpus executes (with its seeds and imported corpus). It replays the
 # corpus as it stands: a dependency on fuzz-% would start a new campaign, because every target is phony.
@@ -181,6 +229,33 @@ $(COVERAGE_TARGETS): coverage-%:
 reach-dynamic: $(REACH_DYNAMIC_TARGETS)
 $(REACH_DYNAMIC_TARGETS): reach-dynamic-%: coverage-%
 	$(RUN) --class light --key reach-dynamic -- $(PY) $(S)/harness_reach.py dynamic --module $*
+
+# P2e opt-in 1/5 E-ACSL fuzzing share after judge (deep profile only).
+eacsl-fuzz: $(if $(filter deep,$(PROFILE)),$(EACSL_FUZZ_TARGETS))
+ifneq ($(PROFILE),deep)
+	@echo 'eacsl-fuzz: skipped (profile=$(PROFILE); deep profile only)'
+endif
+$(EACSL_FUZZ_TARGETS): eacsl-fuzz-%:
+ifneq ($(PROFILE),deep)
+	@echo 'eacsl-fuzz-$*: skipped (profile=$(PROFILE); deep profile only)'
+else
+	$(GATE) --module $* --need reach,build_check
+ifdef HARNESS_SMOKE
+	$(GATE) --module $* --need smoke
+endif
+	$(RUN) --class fuzz --key $*:eacsl-fuzz --output workspace/reports/eacsl-fuzz/$*.json -- \
+		$(PY) $(S)/run_eacsl_fuzz.py eacsl-fuzz --module $* \
+		--build-json workspace/build/$*.build.json \
+		--corpus-dir workspace/corpus/$* --artifacts-dir workspace/crashes/$* \
+		--extra-corpus workspace/seeds/$* workspace/imported_corpus/$* \
+		--judge-report workspace/reports/judge/$*.json \
+		$(if $(HARNESS_SMOKE),--smoke-report workspace/reports/smoke/$*.json) \
+		--profile $(PROFILE) --workers auto --fuzz-budget $(FUZZ_BUDGET_$*) \
+		$(if $(FUZZ_MAX_TIME_$*),--max-time $(FUZZ_MAX_TIME_$*)) \
+		$(if $(FUZZ_DICT_$*),--dict=$(FUZZ_DICT_$*)) \
+		--cppflags=$(CPPFLAGS_$*) --sources $(SOURCES_$*) \
+		--out-json workspace/reports/eacsl-fuzz/$*.json
+endif
 
 # What every Eva run of module $(1) has in common: the rest is tuning, and tuning never changes what
 # is checked, so runs differing only in that can be compared and combined (eva_tuning.py). $(2), when
@@ -222,6 +297,9 @@ $(foreach m,$(EVA_MODULES),$(if $(EVA_REPLAY_$(m)),$(eval eva-$(m): evabase-$(m)
 $(foreach m,$(EVA_MODULES),$(if $(EVA_SHARDS_$(m)),$(eval eva-$(m): $(foreach i,$(EVA_SHARDS_$(m)),evashard-$(m)--$(i)))))
 $(EVA_TARGETS): eva-%:
 	$(GATE) --module $* --need reach
+ifdef HARNESS_SMOKE
+	$(if $(filter $*,$(FUZZ_MODULES)),$(GATE) --module $* --need smoke)
+endif
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
 		$(if $(EVA_SHARDS_$*),$(call eva_merge_cmd,$*),$(if $(EVA_REPLAY_$*),$(call eva_finish_cmd,$*) --replay-only,$(call eva_plain_cmd,$*)))
 
@@ -271,6 +349,9 @@ eva-tune-base: $(EVA_BASE_TARGETS)
 $(foreach m,$(EVA_MODULES),$(if $(EVA_SHARDS_$(m)),$(eval evabase-$(m): $(foreach i,$(EVA_SHARDS_$(m)),evashard-$(m)--$(i)))))
 $(EVA_BASE_TARGETS): evabase-%:
 	$(GATE) --module $* --need reach
+ifdef HARNESS_SMOKE
+	$(if $(filter $*,$(FUZZ_MODULES)),$(GATE) --module $* --need smoke)
+endif
 	$(if $(EVA_SHARDS_$*),,@rm -f workspace/reports/eva-tuning/$*/base.json)
 	$(RUN) --class eva --key $* \
 		$(if $(EVA_SHARDS_$*),--output workspace/reports/eva/$*.json -- $(call eva_merge_cmd,$*),$(call eva_base_run,$*))
@@ -292,6 +373,9 @@ eva-tune: $(EVA_TUNE_TARGETS)
 $(foreach m,$(EVA_MODULES),$(eval evatune-$(m): $(foreach r,$(EVA_TUNE_RUNGS_$(m)),evarung-$(m)--$(r)) $(foreach i,$(EVA_SHARDS_$(m)),evashard-$(m)--$(i))))
 $(EVA_TUNE_TARGETS): evatune-%:
 	$(GATE) --module $* --need reach
+ifdef HARNESS_SMOKE
+	$(if $(filter $*,$(FUZZ_MODULES)),$(GATE) --module $* --need smoke)
+endif
 	$(RUN) --class eva --key $* --output workspace/reports/eva/$*.json -- \
 		$(if $(EVA_SHARDS_$*),$(call eva_merge_cmd,$*),$(call eva_finish_cmd,$*))
 
@@ -381,8 +465,26 @@ report:
 # --- Harness-repair loop ---------------------------------------------------------------------
 
 # module-<mod>: the module's own fuzz (with its build) and Eva targets, then ingestion of its
-# reports only, then its facts from the new Eva report.
+# reports only, then its facts from the new Eva report. Under FUZZ_EXPLORE_JUDGE / HARNESS_SMOKE,
+# pipeline_make.py run module-<mod> executes each per-module stage in strict pipeline order
+# (passing MODULE_STAGES_DONE=1 for the final ingest+facts step), while direct `make module-<mod>`
+# runs the same per-module stages sequentially via recursive $(MAKE) so build/smoke/fuzz/judge/
+# eacsl-fuzz/eva never run out of order or concurrently.
+ifndef MODULE_STAGES_DONE
+ifeq ($(or $(HARNESS_SMOKE),$(FUZZ_EXPLORE_JUDGE)),)
 $(foreach m,$(MODULES),$(eval module-$(m): $(filter fuzz-$(m) eva-$(m),$(FUZZ_TARGETS) $(EVA_TARGETS))))
+endif
+endif
 $(MODULE_TARGETS): module-%:
+ifneq ($(or $(HARNESS_SMOKE),$(FUZZ_EXPLORE_JUDGE)),)
+ifndef MODULE_STAGES_DONE
+	$(if $(filter $*,$(FUZZ_MODULES)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" build-$*)
+	$(if $(filter $*,$(FUZZ_MODULES)),$(if $(HARNESS_SMOKE),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" smoke-$*))
+	$(if $(filter $*,$(FUZZ_MODULES)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" fuzz-$*)
+	$(if $(filter $*,$(FUZZ_MODULES)),$(if $(FUZZ_EXPLORE_JUDGE),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" judge-$*))
+	$(if $(filter $*,$(FUZZ_MODULES)),$(if $(FUZZ_EXPLORE_JUDGE),$(if $(filter deep,$(PROFILE)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" eacsl-fuzz-$*)))
+	$(if $(filter $*,$(EVA_MODULES)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" eva-$*)
+endif
+endif
 	$(RUN) --class light --key ingest -- $(PM) ingest --module $*
 	$(call FACTS_RECIPE,$*)

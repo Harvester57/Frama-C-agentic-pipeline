@@ -60,6 +60,14 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   an `e-acsl-gcc` binary; 49 compares the Frama-C libc with the system headers and runs nine
   `e-acsl-gcc` binaries (including a plain `*p = 1` out-of-bounds write; needs gcc). Their "after"
   outputs were taken with a patched MetAcsl built in a throwaway container of the same image.
+  50 builds one C file twelve times with `e-acsl-gcc -q -c -M -G gcc --validate-format-strings`
+  (`-DCASE_unsigned_enum`, `signed_enum`, `long_enum`, `typedef_const_bf`, `packed_enum`,
+  `enum_ptr_n`, `snprintf_enum`, `enums_int`, `mismatch_str`, `mismatch_width`, `mismatch_sign`,
+  `mismatch_ptr_n`) and runs each binary. It prints one line per case, exits 1 while the bug is
+  present (12 of 12 cases fail on both `master` `189053d4a2` and `34.0~beta`), and exits 0
+  (`RESULT: fixed`) once fixed (8 valid calls exit 0 and 4 mismatched calls abort cleanly at run
+  time with exit 134). Its outputs were taken on `framac-master-audit:189053d` and
+  `framac-analysis:latest`.
 - Patched images `framac-master-audit:3dff90f-p28` to `-p31` held `master` with one patch each
   (the "after" runs of 28 to 31). In the master image, install a rebuilt tree with
   `dune install --release --prefix /home/opam/.opam/5.5` (plain `dune install` fails with

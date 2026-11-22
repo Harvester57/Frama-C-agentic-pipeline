@@ -35,6 +35,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -53,8 +54,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
+import harness_smoke  # noqa: E402
 import phase0_gates  # noqa: E402
 import proof_carry  # noqa: E402
+import resources  # noqa: E402
 from eva_loops import loop_ref_from_json, mirror_id  # noqa: E402
 from eva_options import (  # noqa: E402
     EVA_OPTIONS,
@@ -117,6 +120,9 @@ SECURITY_PROPS_JSON = "workspace/reports/security_props.json"
 HARNESS_DIR = "workspace/harnesses"
 WORK_DIR = "workspace/work"
 REPORT_DIRS = {"fuzz": "workspace/reports/fuzz", "eva": "workspace/reports/eva"}
+SMOKE_REPORT_DIR = "workspace/reports/smoke"
+JUDGE_REPORT_DIR = "workspace/reports/judge"
+EACSL_FUZZ_REPORT_DIR = "workspace/reports/eacsl-fuzz"
 COVERAGE_REPORT_DIR = "workspace/reports/coverage"  # not in REPORT_DIRS: nothing ingests these reports
 FACTS_DIR = "workspace/reports/facts"
 SELFTEST_JSON = "workspace/reports/eacsl_selftest.json"
@@ -134,10 +140,55 @@ DEFAULT_PROFILE = "standard"
 # params.json's fuzz_budget for a module replaces all of this for that module.
 FUZZ_BUDGET_BY_PROFILE = {"quick": 60, "standard": 120, "deep": 900}
 FUZZ_UNIT_CAP_BY_PROFILE = {"quick": 480, "standard": 1200, "deep": 7200}
+# P3 sublinear budget constants (active under FRAMAC_FUZZ_EXPLORE_JUDGE).
+P3_FUZZ_PER_CASE_BY_PROFILE = {"quick": 60, "standard": 600, "deep": 3600}
+P3_FUZZ_BASE_CAP_BY_PROFILE = {"quick": 480, "standard": 7200, "deep": 43200}
+P3_FUZZ_BASE_CASES = 12
+P3_FUZZ_MAX_CAP_MULTIPLIER = 3
 MIN_FUZZ_BUDGET_S = 30
+MIN_FUZZ_WALL_S = 30
 DEFAULT_EVA_SLEVEL = 100
 MODULE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,127}$")
 FUNCTION_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def harness_smoke_enabled() -> bool:
+    """True when FRAMAC_HARNESS_SMOKE enables the standalone harness smoke gate (default on; `=off` disables)."""
+    return harness_smoke.harness_smoke_enabled()
+
+
+def fuzz_explore_judge_enabled() -> bool:
+    """True when FRAMAC_FUZZ_EXPLORE_JUDGE enables P2/P3/P7f explore/judge and sublinear budgets (default on; `=off` disables)."""
+    return resources.fuzz_explore_judge_enabled()
+
+
+def sublinear_unit_cap(profile: str, cases: int) -> int:
+    """
+    P3 sublinear link-unit fuzz cap (CPU-s):
+    `min(3 * base_cap, round(base_cap * math.sqrt(max(1, cases / 12))))`.
+    """
+    base_cap = P3_FUZZ_BASE_CAP_BY_PROFILE.get(profile, P3_FUZZ_BASE_CAP_BY_PROFILE[DEFAULT_PROFILE])
+    n_cases = max(1, int(cases))
+    scaled = round(base_cap * math.sqrt(max(1.0, n_cases / P3_FUZZ_BASE_CASES)))
+    return min(P3_FUZZ_MAX_CAP_MULTIPLIER * base_cap, scaled)
+
+
+def sublinear_fuzz_budget(profile: str, cases: int) -> int:
+    """P3 module fuzz budget (CPU-s) for `cases` dispatch cases under `profile`."""
+    per_case = P3_FUZZ_PER_CASE_BY_PROFILE.get(profile, P3_FUZZ_PER_CASE_BY_PROFILE[DEFAULT_PROFILE])
+    n_cases = max(1, int(cases))
+    return max(MIN_FUZZ_BUDGET_S, min(per_case * n_cases, sublinear_unit_cap(profile, n_cases)))
+
+
+def clamp_fuzz_workers(lease_workers: int, budget_cpu_s: int, *, min_wall_s: int = MIN_FUZZ_WALL_S) -> int:
+    """
+    Clamp effective fuzz workers so the wall-time floor (`MIN_FUZZ_WALL_S`) never inflates CPU spent (P3):
+    `max(1, min(lease_workers, budget_cpu_s // min_wall_s))`.
+    """
+    workers = max(1, int(lease_workers))
+    wall_floor = max(1, int(min_wall_s))
+    budget = max(0, int(budget_cpu_s))
+    return max(1, min(workers, budget // wall_floor))
 
 
 class PipelineMakeError(RuntimeError):
@@ -314,6 +365,7 @@ PARAM_TYPES: dict[str, type] = {
 
 
 def default_params(profile: str) -> dict:
+    budget_table = P3_FUZZ_PER_CASE_BY_PROFILE if fuzz_explore_judge_enabled() else FUZZ_BUDGET_BY_PROFILE
     return {
         "eva_slevel": DEFAULT_EVA_SLEVEL,
         "eva_mlevel": 0,
@@ -324,7 +376,7 @@ def default_params(profile: str) -> dict:
         "eva_tuned": None,
         # None: shard when the last single run was too slow to tune (eva_shards.py); 1: never; k: k shards.
         "eva_shards": None,
-        "fuzz_budget": FUZZ_BUDGET_BY_PROFILE.get(profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE]),
+        "fuzz_budget": budget_table.get(profile, budget_table[DEFAULT_PROFILE]),
         "fuzz_max_time": None,
         "fuzz_dict": None,
         "fuzz_rte_initialized": True,
@@ -1235,20 +1287,27 @@ def allocate_fuzz_budgets(plan: Plan) -> None:
     """
     The fuzz budget of each fuzzed module without a params.json override: FUZZ_BUDGET_BY_PROFILE per
     harness case, with the campaigns of one link unit together capped at FUZZ_UNIT_CAP_BY_PROFILE
-    (scaled down in proportion, at least MIN_FUZZ_BUDGET_S each). The plan records how each budget was
-    set in the module's params (`fuzz_budget_source`: params, cases or unit_cap; `fuzz_cases`).
-    A params.json budget above the unit cap is kept, with a tuning warning; so is a unit that the
-    MIN_FUZZ_BUDGET_S floor keeps above its cap. Both warnings reach `gen` and `run` output.
+    (scaled down in proportion, at least MIN_FUZZ_BUDGET_S each). Under FRAMAC_FUZZ_EXPLORE_JUDGE,
+    P3 sublinear scaling (`sublinear_unit_cap`) and raised per-case budgets apply instead, and
+    `fuzz_workers_cap` records the wall-floor worker clamp (`clamp_fuzz_workers`).
+    The plan records how each budget was set in the module's params (`fuzz_budget_source`: params,
+    cases or unit_cap; `fuzz_cases`). A params.json budget above the unit cap is kept, with a tuning
+    warning; so is a unit that the MIN_FUZZ_BUDGET_S floor keeps above its cap. Both warnings reach
+    `gen` and `run` output.
     """
-    per_case = FUZZ_BUDGET_BY_PROFILE.get(plan.profile, FUZZ_BUDGET_BY_PROFILE[DEFAULT_PROFILE])
-    cap = FUZZ_UNIT_CAP_BY_PROFILE.get(plan.profile, FUZZ_UNIT_CAP_BY_PROFILE[DEFAULT_PROFILE])
+    explore_judge = fuzz_explore_judge_enabled()
+    per_case_table = P3_FUZZ_PER_CASE_BY_PROFILE if explore_judge else FUZZ_BUDGET_BY_PROFILE
+    per_case = per_case_table.get(plan.profile, per_case_table[DEFAULT_PROFILE])
+    legacy_cap = FUZZ_UNIT_CAP_BY_PROFILE.get(plan.profile, FUZZ_UNIT_CAP_BY_PROFILE[DEFAULT_PROFILE])
     by_unit: dict[str, list[ModulePlan]] = {}
     for name, mod in plan.modules.items():
         if not mod.fuzz:
             continue
+        cases = harness_case_count(plan.mm.sidecars.get(name))
         if "fuzz_budget" in (plan.params_doc.get("modules", {}).get(name) or {}):
             mod.params["fuzz_budget_source"] = "params"
             budget = mod.params.get("fuzz_budget")
+            cap = sublinear_unit_cap(plan.profile, cases) if explore_judge else legacy_cap
             if isinstance(budget, int) and budget > cap:
                 warning = (
                     f"fuzz budget: params.json sets {budget} CPU-seconds, above the {cap} the {plan.profile} "
@@ -1257,25 +1316,32 @@ def allocate_fuzz_budgets(plan: Plan) -> None:
                 )
                 mod.warnings.append(warning)
                 plan.warnings.append(f"{name}: {warning}")
+            if explore_judge and isinstance(budget, int):
+                mod.params["fuzz_workers_cap"] = clamp_fuzz_workers(max(1, budget), budget)
             continue
-        mod.params["fuzz_cases"] = harness_case_count(plan.mm.sidecars.get(name))
-        mod.params["fuzz_budget"] = per_case * mod.params["fuzz_cases"]
+        mod.params["fuzz_cases"] = cases
+        mod.params["fuzz_budget"] = per_case * cases
         mod.params["fuzz_budget_source"] = "cases"
         by_unit.setdefault(plan.mm.unit_of(name), []).append(mod)
     for unit, mods in by_unit.items():
+        unit_cases = sum(m.params["fuzz_cases"] for m in mods)
+        cap = sublinear_unit_cap(plan.profile, unit_cases) if explore_judge else legacy_cap
         total = sum(m.params["fuzz_budget"] for m in mods)
-        if total <= cap:
-            continue
-        for m in mods:
-            m.params["fuzz_budget"] = max(MIN_FUZZ_BUDGET_S, m.params["fuzz_budget"] * cap // total)
-            m.params["fuzz_budget_source"] = "unit_cap"
-        scaled = sum(m.params["fuzz_budget"] for m in mods)
-        if scaled > cap:
-            plan.warnings.append(
-                f"fuzz budget: link unit {unit} gets {scaled} CPU-seconds over {len(mods)} campaigns, above its "
-                f"{cap} cap under the {plan.profile} profile, because each campaign keeps at least "
-                f"{MIN_FUZZ_BUDGET_S}; set `fuzz_budget` per module with `params set` to stay within the cap"
-            )
+        if total > cap:
+            for m in mods:
+                m.params["fuzz_budget"] = max(MIN_FUZZ_BUDGET_S, m.params["fuzz_budget"] * cap // total)
+                m.params["fuzz_budget_source"] = "unit_cap"
+            scaled = sum(m.params["fuzz_budget"] for m in mods)
+            if scaled > cap:
+                plan.warnings.append(
+                    f"fuzz budget: link unit {unit} gets {scaled} CPU-seconds over {len(mods)} campaigns, above its "
+                    f"{cap} cap under the {plan.profile} profile, because each campaign keeps at least "
+                    f"{MIN_FUZZ_BUDGET_S}; set `fuzz_budget` per module with `params set` to stay within the cap"
+                )
+        if explore_judge:
+            for m in mods:
+                b = int(m.params["fuzz_budget"])
+                m.params["fuzz_workers_cap"] = clamp_fuzz_workers(max(1, b), b)
 
 
 def _unit_note(plan: Plan, unit: str) -> str:
@@ -1429,6 +1495,9 @@ def render_modules_mk(plan: Plan) -> str:
         # PROFILE is for the reader of modules.mk: recipes take the profile through the values it set
         # (FUZZ_BUDGET_<mod>, ...), never directly.
         _assign("PROFILE", plan.profile),
+        # Only emitted when enabled so default (flags=off) runs keep the exact modules.mk they always got.
+        *([_assign("HARNESS_SMOKE", "1")] if harness_smoke_enabled() else []),
+        *([_assign("FUZZ_EXPLORE_JUDGE", "1")] if fuzz_explore_judge_enabled() else []),
         _assign("MODULES", " ".join(plan.modules)),
         _assign("FUZZ_MODULES", " ".join(plan.fuzz_modules)),
         _assign("EVA_MODULES", " ".join(plan.eva_modules)),
@@ -1567,6 +1636,11 @@ def params_set(
         and not Path(entry["fuzz_dict"]).is_file()
     ):
         warnings.append(f"fuzz dictionary {entry['fuzz_dict']!r} does not exist (yet)")
+    if updates.get("fuzz_engine") == "eacsl":
+        warnings.append(
+            "fuzz_engine='eacsl' disables the fast sanitizer explorer (ASan+UBSan) and runs E-ACSL alone; "
+            "use `--fuzz-engine auto` to restore dual-engine mode (and override a DAG 'sanitizers' choice)"
+        )
     return {
         "ok": True,
         "module": module,
@@ -1626,7 +1700,9 @@ def params_show(run_dir: Path | str = ".", module: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 # Targets run in pipeline order: each stage is one make invocation (parallel inside), so that,
-# for example, `run fuzz eva ingest` ingests only after every campaign and Eva run has finished.
+# for example, `run build smoke fuzz judge coverage eva ingest` runs each phase strictly in order:
+# P7f keeps compilation out of fuzz leases, P3 runs smoke before fuzz and Eva, and P4 never overlaps
+# Phase 1 fuzzing with Phase 2 Eva.
 STAGE_OF_TARGET = {
     # The overlay; the build capture and the Phase 0 model run outside Make between it and the DAG.
     "slice-init": 0,
@@ -1638,35 +1714,86 @@ STAGE_OF_TARGET = {
     "security-props": 3,
     "reach-gate": 3,
     "seed": 3,
+    # P7f: compile in its own stage before smoke and fuzz.
     "build": 4,
     "selftest": 4,
+    "seeds": 4,
+    # P3 harness smoke gate: strictly after build and strictly before both fuzz and Eva.
+    "smoke": 5,
+    # Phase 1 fuzzing (P4: strictly before Eva, never overlapping).
+    "fuzz": 6,
+    # P2d E-ACSL judge runs in parallel with coverage after fuzz.
+    "judge": 7,
+    "coverage": 7,
+    # Reads coverage reports (reach-dynamic) / judge reports (P2e deep-only eacsl-fuzz).
+    "reach-dynamic": 8,
+    "eacsl-fuzz": 8,
+    # Phase 2 Eva (P4: strictly after Phase 1 fuzz/judge/eacsl-fuzz).
+    "eva": 9,
+    "eva-tune-base": 9,
+    # Its own stage: modules.mk is regenerated first, so the rungs come from the base runs' results.
+    "eva-tune": 10,
+    # Renders the flamegraph.txt an earlier Eva run left (it never runs Eva), so after eva and eva-tune.
+    "flamegraph": 11,
+    # After eva-tune, which rewrites the Eva report the facts read.
+    "facts": 11,
+    "ingest": 11,
+    "replay": 11,
+    "minimize": 11,
+    # Before wp-queue (a prerequisite in pipeline.mk): the units it credits never become prove tasks.
+    "wp-replay": 11,
+    "wp-queue": 11,
+    "wp-baseline": 11,
+    "wp-sweep": 12,
+    "report": 13,
+}
+# Legacy stage grouping preserved in `run_targets` when both FRAMAC_HARNESS_SMOKE and
+# FRAMAC_FUZZ_EXPLORE_JUDGE are off and no new P3/P4 target is requested.
+_LEGACY_STAGE_OF_TARGET = {
+    "slice-init": 0,
+    "dag": 1,
+    "stubs": 1,
+    "stub-check": 2,
+    "security-props": 3,
+    "reach-gate": 3,
+    "seed": 3,
+    "build": 4,
+    "selftest": 4,
+    "seeds": 4,
     "fuzz": 4,
     "eva": 4,
     "eva-tune-base": 4,
-    # Its own stage: modules.mk is regenerated first, so the rungs come from the base runs' results.
     "eva-tune": 5,
-    # Renders the flamegraph.txt an earlier Eva run left (it never runs Eva), so after eva and eva-tune.
+    "coverage": 5,
     "flamegraph": 6,
-    "coverage": 5,  # after fuzz, so that it measures the campaign's corpus
-    "seeds": 4,
-    # Reads the coverage reports, so after coverage (its per-module targets depend on coverage-<mod>).
     "reach-dynamic": 6,
-    # After eva-tune, which rewrites the Eva report the facts read.
     "facts": 6,
     "ingest": 6,
     "replay": 6,
     "minimize": 6,
-    # Before wp-queue (a prerequisite in pipeline.mk): the units it credits never become prove tasks.
     "wp-replay": 6,
     "wp-queue": 6,
     "wp-baseline": 6,
     "wp-sweep": 7,
     "report": 8,
 }
+_NEW_STAGE_TARGETS = frozenset({"smoke", "judge", "eacsl-fuzz"})
 # Phase 0 targets that write what the plan reads: they run even when the current DAG is unusable.
 PHASE0_INPUT_TARGETS = frozenset({"slice-init", "dag", "stubs", "security-props"})
-MODULE_TARGET_PREFIXES = ("build-", "fuzz-", "coverage-", "eva-", "flamegraph-", "module-", "facts-")
+MODULE_TARGET_PREFIXES = (
+    "build-",
+    "smoke-",
+    "fuzz-",
+    "judge-",
+    "coverage-",
+    "eacsl-fuzz-",
+    "eva-",
+    "flamegraph-",
+    "module-",
+    "facts-",
+)
 REACH_DYNAMIC_PREFIX = "reach-dynamic-"
+EACSL_FUZZ_PREFIX = "eacsl-fuzz-"
 _TARGET_OUTPUTS = {
     "slice-init": "workspace/overlay_meta.json",
     "dag": DAG_JSON,
@@ -1691,18 +1818,31 @@ _MAKE_NOT_REMADE_RE = re.compile(r"Target '(?P<target>[^']+)' not remade because
 MakeRunner = Callable[[list[str], Path, Callable[[str], None]], int]
 
 
-def _stage(target: str) -> int | None:
-    if target in STAGE_OF_TARGET:
-        return STAGE_OF_TARGET[target]
-    if target.startswith("facts-") and target.partition("-")[2]:
-        return STAGE_OF_TARGET["facts"]  # it reads the Eva report, so it follows the Eva stages of the invocation
-    if target.startswith("flamegraph-") and target.partition("-")[2]:
-        return STAGE_OF_TARGET["flamegraph"]
-    if target.startswith(REACH_DYNAMIC_PREFIX) and target[len(REACH_DYNAMIC_PREFIX) :]:
-        return STAGE_OF_TARGET["reach-dynamic"]
-    if target.startswith(MODULE_TARGET_PREFIXES) and target.partition("-")[2]:
-        return STAGE_OF_TARGET["coverage"] if target.startswith("coverage-") else STAGE_OF_TARGET["build"]
+def _split_module_target(target: str) -> tuple[str, str] | None:
+    """Split a per-module target (`build-m`, `smoke-m`, `reach-dynamic-m`, `eacsl-fuzz-m`, ...) into (kind, mod)."""
+    if target.startswith(REACH_DYNAMIC_PREFIX):
+        mod = target[len(REACH_DYNAMIC_PREFIX) :]
+        return ("reach-dynamic", mod) if mod else None
+    if target.startswith(EACSL_FUZZ_PREFIX):
+        mod = target[len(EACSL_FUZZ_PREFIX) :]
+        return ("eacsl-fuzz", mod) if mod else None
+    kind, sep, mod = target.partition("-")
+    if sep and mod and f"{kind}-" in MODULE_TARGET_PREFIXES:
+        return kind, mod
     return None
+
+
+def _stage(target: str, *, legacy: bool = False) -> int | None:
+    table = _LEGACY_STAGE_OF_TARGET if legacy else STAGE_OF_TARGET
+    if target in table:
+        return table[target]
+    split = _split_module_target(target)
+    if split is None:
+        return None
+    kind, _ = split
+    if kind == "module":
+        return table["build"] if legacy else table["ingest"]
+    return table.get(kind)
 
 
 def _target_problem(target: str, plan: Plan) -> str | None:
@@ -1710,13 +1850,18 @@ def _target_problem(target: str, plan: Plan) -> str | None:
         return "; ".join(plan.errors)
     if target in STAGE_OF_TARGET:
         return None
-    kind, _, mod = target.partition("-")
-    if target.startswith(REACH_DYNAMIC_PREFIX):
-        kind, mod = "coverage", target[len(REACH_DYNAMIC_PREFIX) :]
+    split = _split_module_target(target)
+    if split is None:
+        return f"unknown target {target!r}"
+    kind, mod = split
     allowed = {
         "build": plan.fuzz_modules,
+        "smoke": plan.fuzz_modules,
         "fuzz": plan.fuzz_modules,
+        "judge": plan.fuzz_modules,
         "coverage": plan.fuzz_modules,
+        "reach-dynamic": plan.fuzz_modules,
+        "eacsl-fuzz": plan.fuzz_modules,
         "eva": plan.eva_modules,
         "flamegraph": plan.eva_modules,
         "module": list(plan.modules),
@@ -1736,12 +1881,18 @@ def _target_problem(target: str, plan: Plan) -> str | None:
 def _target_nodes(target: str, plan: Plan) -> list[str]:
     if target == "build":
         return [f"build-{m}" for m in plan.fuzz_modules]
+    if target == "smoke":
+        return [f"smoke-{m}" for m in plan.fuzz_modules]
     if target == "fuzz":
         return [f"fuzz-{m}" for m in plan.fuzz_modules]
+    if target == "judge":
+        return [f"judge-{m}" for m in plan.fuzz_modules]
     if target == "coverage":
         return [f"coverage-{m}" for m in plan.fuzz_modules]
     if target == "reach-dynamic":
         return [f"{REACH_DYNAMIC_PREFIX}{m}" for m in plan.fuzz_modules]
+    if target == "eacsl-fuzz":
+        return [f"{EACSL_FUZZ_PREFIX}{m}" for m in plan.fuzz_modules] if plan.profile == "deep" else []
     if target == "eva":
         return [f"eva-{m}" for m in plan.eva_modules]
     if target == "flamegraph":
@@ -1759,12 +1910,26 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
     """Prerequisites as declared in templates/pipeline.mk (to tell skipped from failed)."""
     if node.startswith(REACH_DYNAMIC_PREFIX):
         return [f"coverage-{node[len(REACH_DYNAMIC_PREFIX) :]}"]
+    if node.startswith(EACSL_FUZZ_PREFIX):
+        return []
     kind, _, mod = node.partition("-")
     if kind == "fuzz" and mod:
-        return ["selftest", f"build-{mod}"]
+        return ["selftest"] if fuzz_explore_judge_enabled() else ["selftest", f"build-{mod}"]
     if kind == "module":
-        deps = [f"fuzz-{mod}"] if mod in plan.fuzz_modules else []
-        return deps + ([f"eva-{mod}"] if mod in plan.eva_modules else [])
+        deps: list[str] = []
+        if mod in plan.fuzz_modules:
+            if fuzz_explore_judge_enabled() or harness_smoke_enabled():
+                deps.append(f"build-{mod}")
+            if harness_smoke_enabled():
+                deps.append(f"smoke-{mod}")
+            deps.append(f"fuzz-{mod}")
+            if fuzz_explore_judge_enabled():
+                deps.append(f"judge-{mod}")
+                if plan.profile == "deep":
+                    deps.append(f"{EACSL_FUZZ_PREFIX}{mod}")
+        if mod in plan.eva_modules:
+            deps.append(f"eva-{mod}")
+        return deps
     if kind == "eva" and mod in plan.modules and plan.modules[mod].eva_replay:
         return [f"evabase-{mod}"]  # the recorded rungs are optional, as in eva-tune
     if node == "seed":
@@ -1785,12 +1950,19 @@ def _node_output(node: str, plan: Plan | None = None) -> str | None:
         return _TARGET_OUTPUTS[node]
     if node.startswith(REACH_DYNAMIC_PREFIX):
         return "workspace/reports/harness_reach_dynamic.json"
+    if node.startswith(EACSL_FUZZ_PREFIX):
+        mod = node[len(EACSL_FUZZ_PREFIX) :]
+        if plan is not None and plan.profile != "deep":
+            return None
+        return f"{EACSL_FUZZ_REPORT_DIR}/{mod}.json"
     kind, _, mod = node.partition("-")
     if kind == "evabase" and plan is not None and mod in plan.modules and plan.modules[mod].shards:
         return f"{REPORT_DIRS['eva']}/{mod}.json"  # a sharded module's base run is its merged shards
     return {
         "build": f"{BUILD_DIR}/{mod}.build.json",
+        "smoke": f"{SMOKE_REPORT_DIR}/{mod}.json",
         "fuzz": f"{REPORT_DIRS['fuzz']}/{mod}.json",
+        "judge": f"{JUDGE_REPORT_DIR}/{mod}.json",
         "coverage": f"{COVERAGE_REPORT_DIR}/{mod}.json",
         "eva": f"{REPORT_DIRS['eva']}/{mod}.json",
         "flamegraph": f"workspace/eva/{mod}/flamegraph.svg",
@@ -2008,11 +2180,33 @@ def run_targets(
         make_bin, make_runner = found, _subprocess_make_runner
     jobs = max(1, int(jobs or _make_jobs()))
 
+    use_legacy_stages = (
+        not fuzz_explore_judge_enabled()
+        and not harness_smoke_enabled()
+        and not any(
+            t in _NEW_STAGE_TARGETS or ((sp := _split_module_target(t)) is not None and sp[0] in _NEW_STAGE_TARGETS)
+            for t in targets
+        )
+    )
+    expanded_module_targets: set[str] = set()
+    if not use_legacy_stages and any((sp := _split_module_target(t)) is not None and sp[0] == "module" for t in targets):
+        expand_plan = build_plan(run_dir, templates_dir)
+        expanded: list[str] = []
+        for t in targets:
+            sp = _split_module_target(t)
+            if sp is not None and sp[0] == "module" and _target_problem(t, expand_plan) is None:
+                expanded.extend(_node_deps(t, expand_plan))
+                expanded.append(t)
+                expanded_module_targets.add(t)
+            else:
+                expanded.append(t)
+        targets = list(dict.fromkeys(expanded))
     stamp = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}"
     log_rel = f"{LOG_DIR}/run-{stamp}.log"
     (run_dir / LOG_DIR).mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     summary: dict = {"ok": True, "targets": {}, "stages": [], "jobs": jobs, "log": log_rel}
+    prior_failed: set[str] = set()
     with contextlib.ExitStack() as stack:
         priv_dir: Path | None = None
         priv_makefile: Path | None = None
@@ -2021,9 +2215,9 @@ def run_targets(
             priv_makefile = priv_dir / "Makefile"
             make_runner = _private_make_runner(priv_makefile, make_runner)
         log = stack.enter_context(open(run_dir / log_rel, "w", encoding="utf-8", newline="\n"))
-        stages = sorted({s for t in targets if (s := _stage(t)) is not None})
+        stages = sorted({s for t in targets if (s := _stage(t, legacy=use_legacy_stages)) is not None})
         for stage in stages:
-            stage_targets = [t for t in targets if _stage(t) == stage]
+            stage_targets = [t for t in targets if _stage(t, legacy=use_legacy_stages) == stage]
             plan, _ = _generate(run_dir, templates_dir, private_dir=priv_dir)
             summary.update(excluded=plan.excluded, warnings=plan.warnings)
             runnable = []
@@ -2040,6 +2234,9 @@ def run_targets(
             outputs = {n: _node_output(n, plan) for n in nodes}
             before = {out: _output_state(run_dir, out) for out in outputs.values() if out}
             eff_makefile = str(priv_makefile) if priv_makefile is not None else MAKEFILE
+            make_vars = [f"S={SCRIPTS_DIR.as_posix()}"]
+            if any(t in expanded_module_targets for t in runnable):
+                make_vars.append("MODULE_STAGES_DONE=1")
             cmd = [
                 make_bin,
                 "-f",
@@ -2047,7 +2244,7 @@ def run_targets(
                 f"-j{jobs}",
                 "-k",
                 "--output-sync=target",
-                f"S={SCRIPTS_DIR.as_posix()}",
+                *make_vars,
                 *runnable,
             ]
             rc, failed, tail = _run_stage(make_runner, cmd, run_dir, log)
@@ -2058,11 +2255,12 @@ def run_targets(
                 stage_info["log_tail"] = tail
                 summary["ok"] = False
             summary["stages"].append(stage_info)
+            all_failed = prior_failed | failed
             cache: dict[str, str] = {}
             for target in runnable:
                 entries = {}
                 for node in _target_nodes(target, plan):
-                    info: dict = {"status": _node_status(node, plan, run_dir, failed, cache)}
+                    info: dict = {"status": _node_status(node, plan, run_dir, all_failed, cache)}
                     out = outputs.get(node) or _node_output(node, plan)
                     if out:
                         after = _output_state(run_dir, out)
@@ -2072,10 +2270,11 @@ def run_targets(
                         info.update(_report_brief(run_dir / out))
                     entries[node] = info
                 bad = sorted(n for n, e in entries.items() if e["status"] in ("failed", "skipped"))
-                result: dict = {"status": "failed" if bad or target in failed else "ok", "nodes": entries}
+                result: dict = {"status": "failed" if bad or target in all_failed else "ok", "nodes": entries}
                 if not entries:
                     result["note"] = "no runnable module"
                 summary["targets"][target] = result
+            prior_failed.update(failed)
     summary["elapsed_s"] = round(time.monotonic() - started, 1)
     summary["ok"] = summary["ok"] and all(t.get("status") == "ok" for t in summary["targets"].values())
     try:
@@ -2141,10 +2340,10 @@ def _load_ingested(run_dir: Path) -> dict:
     return state
 
 
-def _pending_reports(
-    run_dir: Path, kind: str, module: str | None, seen: dict
+def _pending_dir_reports(
+    run_dir: Path, report_dir_rel: str, module: str | None, seen: dict
 ) -> tuple[list[tuple[str, str]], int, list[dict]]:
-    report_dir = run_dir / REPORT_DIRS[kind]
+    report_dir = run_dir / report_dir_rel
     if module is not None:
         paths = [report_dir / f"{module}.json"]
     else:
@@ -2155,7 +2354,7 @@ def _pending_reports(
     for path in paths:
         if not path.is_file():
             continue
-        rel = f"{REPORT_DIRS[kind]}/{path.name}"
+        rel = f"{report_dir_rel}/{path.name}"
         size = path.stat().st_size
         if size > EVA_REPORT_MAX_BYTES:
             # The ledger reads reports with the Eva cap (ledger.cmd_ingest_eva): say so here, unread.
@@ -2172,6 +2371,12 @@ def _pending_reports(
         else:
             pending.append((rel, digest))
     return pending, known, bad
+
+
+def _pending_reports(
+    run_dir: Path, kind: str, module: str | None, seen: dict
+) -> tuple[list[tuple[str, str]], int, list[dict]]:
+    return _pending_dir_reports(run_dir, REPORT_DIRS[kind], module, seen)
 
 
 def ingest(
@@ -2220,21 +2425,36 @@ def ingest(
                 atomic_write_json(path, _stub(kind, mod, reason))
                 result["stubs"].append(f"{REPORT_DIRS[kind]}/{mod}.json")
 
-        for kind in ("fuzz", "eva"):
-            pending, known, bad = _pending_reports(run_dir, kind, module, state[kind])
-            result["already_ingested"][kind] = known
+        # Phase 1 reports first (fuzz, then optional judge and deep eacsl-fuzz), then Phase 2 Eva.
+        # Stop before Eva if any Phase 1 ingestion fails.
+        ingest_steps: list[tuple[str, str, str, bool]] = [
+            ("fuzz", REPORT_DIRS["fuzz"], "ingest-fuzz", True),
+            ("judge", JUDGE_REPORT_DIR, "ingest-judge", False),
+            ("eacsl-fuzz", EACSL_FUZZ_REPORT_DIR, "ingest-fuzz", False),
+            ("eva", REPORT_DIRS["eva"], "ingest-eva", True),
+        ]
+        for kind, dir_rel, ledger_cmd, always_present in ingest_steps:
+            if not always_present and not (run_dir / dir_rel).is_dir() and not state.get(kind):
+                continue
+            seen = state.setdefault(kind, {})
+            if not isinstance(seen, dict):
+                raise ArtifactError(f"{INGESTED_JSON} is malformed; repair or remove it deliberately")
+            pending, known, bad = _pending_dir_reports(run_dir, dir_rel, module, seen)
             result["malformed"] += bad
+            if always_present or pending or known:
+                result["already_ingested"][kind] = known
+                result["ingested"].setdefault(kind, [])
             if not pending:
                 continue
-            rc, out = runner("ledger.py", [f"ingest-{kind}", *(rel for rel, _ in pending)])
+            rc, out = runner("ledger.py", [ledger_cmd, *(rel for rel, _ in pending)])
             result["ledger"][kind] = _json_or_tail(out)
             if rc != 0:
                 result["ok"] = False
-                result["errors"].append(f"ledger.py ingest-{kind} failed (rc={rc}); nothing recorded for these reports")
-                break  # never ingest Eva after a failed fuzz ingestion
+                result["errors"].append(f"ledger.py {ledger_cmd} failed (rc={rc}); nothing recorded for these reports")
+                break  # never ingest Eva after a failed Phase 1 ingestion
             stamp = utc_now()
             for rel, digest in pending:
-                state[kind][digest] = {"report": rel, "ingested_at": stamp}
+                seen[digest] = {"report": rel, "ingested_at": stamp}
             atomic_write_json(run_dir / INGESTED_JSON, state)
             result["ingested"][kind] = [rel for rel, _ in pending]
 
@@ -3131,6 +3351,10 @@ def main(argv: list[str] | None = None) -> int:
                 wp_exclude_files=args.wp_exclude_files,
                 wp_extra_sources=args.wp_extra_sources,
             )
+            if args.fuzz_engine == "eacsl":
+                for warning in out.get("warnings") or []:
+                    if "--fuzz-engine auto" in str(warning):
+                        print(f"warning: {warning}", file=sys.stderr)
         elif args.cmd == "params":
             out = params_show(run_dir, args.module)
             rc = 0 if out["ok"] else 1

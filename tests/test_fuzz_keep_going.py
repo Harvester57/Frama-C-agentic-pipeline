@@ -280,7 +280,11 @@ def test_non_dispatch_harness_uses_fork_mode_and_stop_on_first_crash_runs_once()
         calls.append(fork)
         return {"status": "clean", "returncode": 0, "artifacts": []}
 
+    # Under default explore_judge=True, non-dispatch fork mode runs a blinding probe then the remainder.
     res = R.run_campaign_rounds(Path("b"), 60, campaign=campaign, rebuild=None, n_cases=None)
+    assert calls == [True, True] and res["keep_going"] == {"mode": "fork"}
+    calls.clear()
+    res = R.run_campaign_rounds(Path("b"), 60, campaign=campaign, rebuild=None, n_cases=None, explore_judge=False)
     assert calls == [True] and res["keep_going"] == {"mode": "fork"}
     res = R.run_campaign_rounds(Path("b"), 60, campaign=campaign, rebuild=None, n_cases=3, keep_going=False)
     assert calls == [True, False] and "keep_going" not in res
@@ -374,6 +378,7 @@ def _dual_campaign(tmp_path, monkeypatch, engine: str, san_rc: int = 0) -> tuple
 
 
 def test_auto_fuzzes_with_sanitizers_then_eacsl_half_the_time_each(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     report, calls = _dual_campaign(tmp_path, monkeypatch, "auto")
     assert calls == [("bin.sanitizers", 50), ("bin.eacsl", 50)]
     assert report["engine_used"] == R.DUAL_ENGINE and set(report["engines"]) == {"sanitizers", "eacsl"}
@@ -381,6 +386,7 @@ def test_auto_fuzzes_with_sanitizers_then_eacsl_half_the_time_each(tmp_path, mon
 
 
 def test_explicit_engine_or_failed_sanitizer_build_fuzzes_with_one_engine(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     report, calls = _dual_campaign(tmp_path, monkeypatch, "eacsl")
     assert calls == [("bin.eacsl", 100)] and report["engine_used"] == "eacsl"
     report, calls = _dual_campaign(tmp_path, monkeypatch, "auto", san_rc=1)
@@ -633,6 +639,7 @@ def test_runtime_skip_without_the_environ_shim_falls_back_to_skip_rebuilds(tmp_p
     from generate_harness import generate_module_harness
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
     src = tmp_path / "src.c"
     src.write_text("int f(int x) { return x; }\n", encoding="utf-8")

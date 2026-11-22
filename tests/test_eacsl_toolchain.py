@@ -1384,6 +1384,7 @@ def test_main_records_engine_fallback_reason(tmp_path, monkeypatch):
         "run_fuzz_campaign",
         lambda binary, *a, **k: {"status": "clean", "artifacts": [], "builder": k.get("attribution_builder")},
     )
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     monkeypatch.setattr(sys, "argv", _campaign_argv(tmp_path))
     R.main()
     out = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
@@ -1393,6 +1394,7 @@ def test_main_records_engine_fallback_reason(tmp_path, monkeypatch):
 
 
 def test_failed_selftest_skips_eacsl_for_same_version(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     st = tmp_path / "selftest.json"
     st.write_text(
         json.dumps(

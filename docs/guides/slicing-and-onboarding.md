@@ -67,6 +67,35 @@ Frama-C needs exactly the files, include paths and macros each compilation unit 
 
 ---
 
+## 2a. Unit-Visibility Scoping, Reach Credit & Deterministic `--api` Upgrades (P1 / P2A)
+
+Two default-on A/B switches (set `=off` for A/B rollback; see [`./resources-and-caching.md`](./resources-and-caching.md#4-knobs)) tighten Phase 0 entry-point scoping and deterministic `--api` harness synthesis for multi-binary, plugin, and schema-driven targets:
+
+### P1 Unit-Visibility Scoping & Reachability (`FRAMAC_HARNESS_SCOPE_V2`)
+
+- **Visibility classification ([`../../scripts/build_capture.py`](../../scripts/build_capture.py), `classify_unit_visibility`):** every non-test link unit in `build_capture.json` and `phase0_model.json` carries `unit_visibility` (alongside `exported_data_symbols` on `shared_lib` units from `nm -D --defined-only`, and `embedded_api_source: "header_declared_internal"` when executables populate `embedded_api`):
+  - `executable`: program binaries (`main` / `argv` / `stdin` entry surface).
+  - `plugin_so`: shared libraries with 0 exported function entry points and `>= 1` `exported_data_symbols` (such as plugin dispatch tables in `sudo`).
+  - `public_lib`: shared libraries exporting function entry points, installed static libraries (`public.method == "install"`), or standalone static libraries not linked by any non-test in-tree executable or shared library.
+  - `internal_convenience`: non-installed static libraries linked by at least one non-test in-tree executable or shared library (or unlinked object groups).
+- **`THREAT_MODEL.md` alignment ([`../../scripts/trust.py`](../../scripts/trust.py), [`../../scripts/build_callgraph_dag.py`](../../scripts/build_callgraph_dag.py)):** `trust.py` always propagates per-function `input_role` and `attacker_params` from `THREAT_MODEL.md` `input_sources`. Under `FRAMAC_HARNESS_SCOPE_V2=on`, Rule 1 limits default boundary marks to `public_lib` exports and `plugin_so` vtable callbacks (`plugin_vtable_callbacks`) and warns when `public_lib` exports or input-reader roots are absent from `THREAT_MODEL.md`. `build_callgraph_dag.py` scopes `candidate_entry_points` by `unit_visibility`, recording `threat_model_entries`, `deferred_non_attacker_entries`, and `harness_scope_note` in `callgraph_dag.json`.
+- **First-class `tf_*` reach credit ([`../../scripts/harness_reach.py`](../../scripts/harness_reach.py)):** under `FRAMAC_HARNESS_SCOPE_V2=on`, both `check_unit()` (static reach gate) and `run_dynamic()` (dynamic reach gate) credit passing target-fuzzer (`tf_*`) modules to their link unit (`covered_by_target_fuzzers`) and accept P2A `api_auto_exempt` reasons, so shipped fuzzers satisfy reachability without forcing redundant synthetic `--api` cases.
+- **Batch `harness_reach.py exempt --function ...`:** `--function` is repeatable in a single invocation (`python3 $S/harness_reach.py exempt --module <mod> --function f1 --function f2 --reason '<why>'`), recording all exemptions under one reason and running a single regate (`regate_after_exempt`) instead of re-checking the gate once per function.
+
+### P2A Deterministic `--api` Harness Upgrades (`FRAMAC_API_TRUST_SCHEMA`)
+
+When `FRAMAC_API_TRUST_SCHEMA=on`, [`../../scripts/api_harness.py`](../../scripts/api_harness.py), [`../../scripts/generate_harness.py`](../../scripts/generate_harness.py), and [`../../scripts/fuzz_assets.py`](../../scripts/fuzz_assets.py) apply deterministic threat-model, schema, and C-hygiene rules while keeping legacy behavior unchanged when `off`:
+
+- **S1 — Threat-model parameter roles:** reads per-function `input_role`, `attacker_params`, and `trusted_callers` (falling back to `trust.threat_model` `input_sources`). Non-attacker functions and `trusted_callers` are recorded under `api_auto_exempt` (`"no attacker data per the threat model"`). Trusted pointer/struct parameters are bound only from S3 const schema instances or S2 builders, else auto-exempted with `"trusted parameter <name> has no instance"`; output parameters remain clean and zeroed, and Eva full-range modeling stays intact.
+- **S2 — Widened builders and schema-taking constructors:** `initializers()` recognizes by-value builders (`*_from_*`, `*_init*`, `*_new*`, `*_create*`, `*_make*`, preferring read-only `(buf, len)` pairs such as `pb_istream_from_buffer`) and schema-taking builders (`*_begin*`, `*_setup*`, such as `pb_field_iter_begin`) bound to real S3 schema instances. `fuzz_assets.py` maps whole-input corpora onto S3 cases whose rest bytes flow through an S2 builder.
+- **S3 — Const schema instances from model globals:** indexes `const`, initialized, non-static `global_variables` emitted by `phase0_dump.ml` (dump schema 8: `const`, `has_init`, `raw_type`) matching trusted parameter pointee types, emits up to `MAX_SCHEMA_INSTANCES` (4) cases ranked by largest size / field richness / name, emits file-scope `extern` declarations and links their defining sources, and records `schema_instance` and `builder` on `api_cases` in `harness_<mod>.json`.
+- **Deterministic API hygiene:**
+  - *Backend-matched handle constructors:* scores constructors by shared backend words with the method (for example, `modbus_new_tcp_pi` for `modbus_tcp_pi_listen`, `modbus_new_rtu` for `modbus_rtu_*`) instead of always picking the fewest-parameter constructor.
+  - *Refcount helper skips:* skips `*_addref`, `*_delref`, `*_unref`, and `*_decref` functions without a matched producer (`"refcount helper requires producer-allocated object"`).
+  - *BSD `TAILQ_HEAD` / `STAILQ_HEAD` initialization:* initializes BSD queue head structs as valid empty lists (`tqh_first = NULL; tqh_last = &head.tqh_first;` / `stqh_first = NULL; stqh_last = &head.stqh_first;`) instead of all-zero `memset`, preventing immediate NULL dereferences on queue insertions.
+
+---
+
 ## 3. Stubbing External Boundaries Once
 
 Frama-C substitutes the host's `/usr/include` standard C library with its own ACSL-annotated standard library (`__fc_libc`), which already includes complete formal contracts for `<string.h>`, `<stdlib.h>`, `<stdio.h>`, `<stdint.h>`, and `<sys/socket.h>`.

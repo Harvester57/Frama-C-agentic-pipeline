@@ -70,6 +70,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cache  # noqa: E402
 import decision_point_check  # noqa: E402
+import failure_identity  # noqa: E402
 import phase0_gates  # noqa: E402
 from contract_negotiator import cmd_ingest_prover  # noqa: E402
 from failure_identity import (  # noqa: E402
@@ -78,7 +79,7 @@ from failure_identity import (  # noqa: E402
     parse_link_stub_abort,
     site_key,
 )
-from fingerprint import make_fingerprint, normalize_file, normalize_kind  # noqa: E402
+from fingerprint import is_valid_fingerprint, make_fingerprint, normalize_file, normalize_kind  # noqa: E402
 from framac_common import (  # noqa: E402
     DEFAULT_JSON_MAX_BYTES,
     EVA_REPORT_MAX_BYTES,
@@ -495,6 +496,8 @@ def upsert_candidate(
     *,
     site: str | None = None,
     engine: str | None = None,
+    harness_digest: str | None = None,
+    discovering_step: str | None = None,
 ) -> dict:
     """
     Record one detection and return the candidate it landed on. Its key is `cand["fingerprint"]`, which
@@ -525,6 +528,19 @@ def upsert_candidate(
         if (origin == "eva" or engine == "eacsl") and first_engine == "sanitizers":
             # The E-ACSL or Eva reading of a site a sanitizer saw first names the bug better.
             cand["property"] = prop
+    if isinstance(harness_digest, str) and harness_digest:
+        mod_digests = cand.setdefault("module_harness_digests", {})
+        primary_mod = str(cand.get("module") or "").strip()
+        primary_digest = cand.get("harness_digest")
+        if primary_mod and isinstance(primary_digest, str) and primary_digest and primary_mod not in mod_digests:
+            mod_digests[primary_mod] = primary_digest
+        obs_mod = str(module or "").strip()
+        if obs_mod:
+            mod_digests[obs_mod] = harness_digest
+        if not primary_mod or primary_mod == obs_mod or not primary_digest:
+            cand["harness_digest"] = harness_digest
+    if discovering_step in ("explore", "judge", "eacsl_fuzz") and not cand.get("discovering_step"):
+        cand["discovering_step"] = discovering_step
     if proposed == "confirmed":
         cand["proposed_verdict"] = "confirmed"
     for r in reproducers:
@@ -1755,8 +1771,862 @@ def _fuzz_security_props_lost(report: dict) -> str | None:
     return None
 
 
+JUDGE_REPORT_DIR = Path("workspace/reports/judge")
+SMOKE_REPORT_DIR = Path("workspace/reports/smoke")
+
+_PHASE1_STATUS_RESULTS = frozenset(
+    {
+        "fuzz_clean",
+        "fuzz_not_executed",
+        "fuzz_not_judged",
+        "fuzz_blinded",
+        "fuzz_partial_blinded",
+        "fuzz_unspent_blinded",
+        "fuzz_skipped",
+        "fuzz_startup_error",
+        "fuzz_compile_error",
+        "fuzz_fuzzer_error",
+        "fuzz_sandbox_unavailable",
+        "fuzz_not_run",
+        "fuzz_insufficient_memory",
+        "fuzz_container_oom",
+        "fuzz_gate_failed",
+        "fuzz_keep_going_error",
+        "fuzz_meta_not_checked",
+        "harness_smoke_quarantined",
+        "judge_clean",
+        "judge_blinded",
+        "judge_partial_blinded",
+        "judge_partial",
+        "judge_skipped",
+        "judge_error",
+        "judge_not_judged",
+        "judge_batch_state_only",
+    }
+)
+
+
+def _is_startup_error_artifact(art: dict) -> tuple[bool, str | None]:
+    """True with reason when a fuzz/judge artifact represents a binary/toolchain startup failure (P3)."""
+    if art.get("kind") == "toolchain_startup_error":
+        return True, "toolchain_startup_error"
+    if art.get("classification") == "startup_error":
+        return True, str(art.get("reason") or "startup_error")
+    failure = art.get("failure")
+    if isinstance(failure, dict) and failure.get("kind") == "toolchain_startup_error":
+        return True, "toolchain_startup_error"
+    log_tail = str(art.get("replay_log_tail") or "")
+    is_startup, reason = failure_identity.is_startup_failure(
+        failure if isinstance(failure, dict) else None,
+        log_tail,
+    )
+    if is_startup:
+        return True, reason or "startup_error"
+    return False, None
+
+
+def _smoke_quarantined_cases(module: str, report: dict) -> set[int]:
+    """Dispatch case indices quarantined by the standalone smoke gate for `module`."""
+    cases: set[int] = set()
+    for raw in report.get("smoke_skipped_cases") or []:
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            cases.add(raw)
+    smoke_path = SMOKE_REPORT_DIR / f"{module}.json"
+    if smoke_path.is_file():
+        try:
+            smoke_doc = load_json_optional(smoke_path, None)
+        except (ArtifactError, OSError, ValueError):
+            smoke_doc = None
+        if isinstance(smoke_doc, dict):
+            for raw in smoke_doc.get("quarantined_cases") or []:
+                if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+                    cases.add(raw)
+    return cases
+
+
+def _is_smoke_quarantined_artifact(art: dict, smoke_skipped: set[int]) -> tuple[bool, str | None]:
+    """True with reason when an artifact was quarantined by the standalone harness smoke gate (P3)."""
+    if art.get("status") == "quarantined_by_smoke":
+        return True, str(art.get("reason") or "quarantined_by_smoke")
+    if art.get("status") == "quarantined" and art.get("classification") == "harness_setup_fault":
+        return True, str(art.get("reason") or "harness_setup_fault")
+    case_idx = art.get("case")
+    if isinstance(case_idx, int) and not isinstance(case_idx, bool) and case_idx in smoke_skipped:
+        return True, f"dispatch case {case_idx} quarantined by smoke gate"
+    return False, None
+
+
+def _supersede_phase1_status_evidence(
+    mod_units: list[dict],
+    module: str,
+    tool_output: str,
+    *,
+    step: str,
+    ensure_nonempty_if_active: bool = False,
+) -> int:
+    """
+    Supersede prior Phase 1 status evidence for `module` on rerun (F7), so rerunning `fuzz` or
+    `judge` after a fix does not leave contradictory append-only rows. Never removes concrete
+    `fuzz_failure`, `rejection_contradicted`, or non-`fuzz` phase evidence.
+    """
+    judge_rel = f"workspace/reports/judge/{module}.json"
+    fuzz_rel = f"workspace/reports/fuzz/{module}.json"
+    removed = 0
+    for u in mod_units:
+        kept: list[dict] = []
+        dropped: list[dict] = []
+        for ev in u["evidence"]:
+            if ev.get("phase") != "fuzz" or ev.get("discharging") or ev.get("result") not in _PHASE1_STATUS_RESULTS:
+                kept.append(ev)
+                continue
+            ev_out = str(ev.get("tool_output") or "")
+            det = ev.get("details") if isinstance(ev.get("details"), dict) else {}
+            ev_mod = det.get("module")
+            ev_step = det.get("step")
+            if step == "judge":
+                match = (
+                    ev_out == tool_output
+                    or ev_out == judge_rel
+                    or (ev_mod == module and ev_step in (None, "judge", "campaign"))
+                    or (ev_out == fuzz_rel and ev_step != "explore")
+                )
+            else:
+                match = (
+                    ev_out == tool_output
+                    or (ev_mod == module and ev_step in (None, step))
+                    or (ev_out == fuzz_rel and ev_step in (None, step))
+                )
+            if match:
+                dropped.append(ev)
+            else:
+                kept.append(ev)
+        if ensure_nonempty_if_active and not kept and dropped and u.get("status") in ("blocked", "candidate"):
+            kept.append(dropped.pop())
+        if dropped:
+            u["evidence"] = kept
+            removed += len(dropped)
+    return removed
+
+
+def _dispatch_reaching_cases(module: str, dag: dict | None) -> dict[tuple[str, str], set[int]]:
+    """
+    Map `(normalized_file, function_name)` -> set of dispatch case indices reaching it via the
+    harness sidecar (`api_cases` / `dispatch_cases`) and the call-graph DAG (`internal_callees`).
+    Returns `{}` when the harness is not a dispatch harness or has no readable sidecar.
+    """
+    sidecar_path = HARNESS_DIR / f"harness_{module}.json"
+    if not sidecar_path.is_file():
+        return {}
+    try:
+        sidecar = load_json_optional(sidecar_path, None)
+    except (ArtifactError, OSError, ValueError):
+        return {}
+    if not isinstance(sidecar, dict) or sidecar.get("entry_style") != "dispatch":
+        return {}
+
+    raw_dag_fns = dag.get("functions") if isinstance(dag, dict) else None
+    dag_fns: dict[str, Any] = raw_dag_fns if isinstance(raw_dag_fns, dict) else {}
+    by_name: dict[str, list[str]] = {}
+    for key, rec in dag_fns.items():
+        if isinstance(rec, dict) and isinstance(rec.get("name"), str):
+            by_name.setdefault(rec["name"], []).append(key)
+
+    case_roots: dict[int, set[str]] = {}
+    api_cases = sidecar.get("api_cases")
+    if isinstance(api_cases, list) and api_cases:
+        for idx, item in enumerate(api_cases):
+            if not isinstance(item, dict):
+                continue
+            sel = item.get("selector", idx)
+            if not isinstance(sel, int) or isinstance(sel, bool):
+                continue
+            roots = case_roots.setdefault(sel, set())
+            entry = item.get("entry")
+            if isinstance(entry, str) and entry:
+                roots.add(entry)
+            for field in ("calls", "methods"):
+                for name in item.get(field) or []:
+                    if isinstance(name, str) and name:
+                        roots.add(name)
+            for init_rec in item.get("inits") or []:
+                if isinstance(init_rec, dict) and isinstance(init_rec.get("fn"), str) and init_rec["fn"]:
+                    roots.add(init_rec["fn"])
+    else:
+        dispatch_cases = sidecar.get("dispatch_cases")
+        if isinstance(dispatch_cases, list) and dispatch_cases:
+            for idx, stmt in enumerate(dispatch_cases):
+                if not isinstance(stmt, str):
+                    continue
+                roots = case_roots.setdefault(idx, set())
+                for tok in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", stmt):
+                    if tok in dag_fns or tok in by_name:
+                        roots.add(tok)
+
+    if not case_roots:
+        return {}
+
+    reaching: dict[tuple[str, str], set[int]] = {}
+    for sel, raw_roots in case_roots.items():
+        queue: list[str] = []
+        visited: set[str] = set()
+        for r in raw_roots:
+            if r in dag_fns:
+                queue.append(r)
+            elif r in by_name:
+                queue.extend(by_name[r])
+            else:
+                reaching.setdefault(("", r), set()).add(sel)
+        while queue:
+            cur = queue.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            cur_rec = dag_fns.get(cur)
+            if not isinstance(cur_rec, dict):
+                continue
+            fn_name = str(cur_rec.get("name") or "")
+            fn_file = normalize_file(str(cur_rec.get("file") or ""))
+            if fn_name:
+                reaching.setdefault((fn_file, fn_name), set()).add(sel)
+            for callee in cur_rec.get("internal_callees") or []:
+                if isinstance(callee, str) and callee not in visited and callee in dag_fns:
+                    queue.append(callee)
+    return reaching
+
+
+def _record_related_link(candidates: dict[str, dict], fp_a: str, fp_b: str, reason: str) -> None:
+    """Record a bidirectional D1b `related` link between two existing candidates."""
+    if not fp_a or not fp_b or fp_a == fp_b:
+        return
+    if not (is_valid_fingerprint(fp_a) and is_valid_fingerprint(fp_b)):
+        return
+    if fp_a not in candidates or fp_b not in candidates:
+        return
+    for src, dst in ((fp_a, fp_b), (fp_b, fp_a)):
+        rel_list = candidates[src].setdefault("related", [])
+        if not any(isinstance(r, dict) and r.get("fingerprint") == dst for r in rel_list):
+            rel_list.append({"fingerprint": dst, "reason": reason})
+
+
+def _ingest_fuzz_artifacts(
+    units: dict[str, dict],
+    candidates: dict[str, dict],
+    findings: dict[str, dict],
+    mm: ModuleMap,
+    index: dict[str, list[tuple[int, int, str]]],
+    kernel: dict[tuple[str, str], dict[str, str]],
+    *,
+    report: dict,
+    module: str,
+    mod_units: list[dict],
+    tool_output: str,
+    engine_note: str,
+    reopen: bool,
+    stats: dict[str, Any],
+    default_step: str | None = None,
+) -> dict[str, Any]:
+    """
+    Ingest crash/timeout/OOM artifacts from a fuzz or judge report into `units` and `candidates`.
+    Skips startup failures (`toolchain_startup_error` / `failure_identity.is_startup_failure`) and
+    smoke-quarantined artifacts (`quarantined_by_smoke` or case in `smoke_skipped_cases`), recording
+    unit evidence (`fuzz_startup_error` / `harness_smoke_quarantined`) instead of creating candidates.
+    """
+    smoke_skipped = _smoke_quarantined_cases(module, report)
+    report_digest = report.get("harness_digest") if isinstance(report.get("harness_digest"), str) else None
+    report_step = report.get("discovering_step") if isinstance(report.get("discovering_step"), str) else default_step
+    resource_aborts: list[tuple[str, dict]] = []
+    link_stub_aborts: list[tuple[str, dict]] = []
+    startup_aborts: list[tuple[str, str]] = []
+    smoke_quarantined: list[tuple[str, str]] = []
+    failed_unit_ids: set[str] = set()
+    failed_cases: set[int] = set()
+
+    for art in report.get("artifacts", []):
+        if not isinstance(art, dict) or not art.get("artifact"):
+            continue
+        artifact_rel = rel(str(art["artifact"]))
+        is_startup, startup_reason = _is_startup_error_artifact(art)
+        if is_startup:
+            startup_aborts.append((artifact_rel, startup_reason or "toolchain_startup_error"))
+            continue
+        is_quarantined, quarantine_reason = _is_smoke_quarantined_artifact(art, smoke_skipped)
+        if is_quarantined:
+            smoke_quarantined.append((artifact_rel, quarantine_reason or "quarantined_by_smoke"))
+            continue
+        if (stub_abort := _link_stub_abort(art)) is not None:
+            # Address-flow link-stub hit: pipeline reach defect, never a target vulnerability candidate.
+            link_stub_aborts.append((artifact_rel, stub_abort))
+            continue
+
+        art_case = art.get("case")
+        if isinstance(art_case, int) and not isinstance(art_case, bool):
+            failed_cases.add(art_case)
+        art_digest = art.get("harness_digest") if isinstance(art.get("harness_digest"), str) else report_digest
+        art_step = art.get("discovering_step") if isinstance(art.get("discovering_step"), str) else report_step
+
+        failure = art.get("failure")
+        if failure and art.get("fingerprint"):
+            fp = art["fingerprint"]
+            file = normalize_file(failure["file"])
+            # The fingerprint and the location keep the reported name: replay and minimization
+            # match the failures they reproduce against it.
+            function = failure["function"]
+            link_unit = str((mm.modules.get(mm.unit_of(module)) or {}).get("unit") or mm.unit_of(module))
+            source_fn = _located_function(file, failure.get("line"), function, index, kernel, link_unit)
+            # A failed run-time check of a MetAcsl property goes by its own rules (_fuzz_meta_route).
+            meta = _fuzz_meta_route(units, failure, file, source_fn, report)
+            if meta is not None and meta.get("harness_induced"):
+                # The harness called a protected function itself: listed, never a candidate, no unit.
+                stats.setdefault("meta_harness_induced", []).append(
+                    {
+                        "module": module,
+                        "property": failure.get("meta_property"),
+                        "function": function,
+                        "caller": failure.get("caller"),
+                        "artifact": artifact_rel,
+                        "fingerprint": fp,
+                    }
+                )
+                continue
+            cls = (
+                meta["cls"]
+                if meta is not None
+                else goal_obligation_class(
+                    {"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")}
+                )
+            )
+            # A leak has no obligation class (D5): it links no unit, whatever the units of its function are.
+            leak = failure.get("alarm_kind") == "memory_leak"
+            if meta is not None:
+                linked = list(meta["linked"])
+            else:
+                linked = (
+                    []
+                    if leak
+                    else [
+                        u["coverage_id"]
+                        for u in units_for_function(units, file, source_fn)
+                        if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
+                    ]
+                )
+            proposed = "confirmed" if art.get("reproducible") else "needs_validation"
+            notes = [] if art.get("reproducible") else ["crash did not reproduce on replay"]
+            if source_fn != function:
+                notes.append(f"reported in {function}, which is {source_fn} in the source")
+            if meta is not None:
+                notes.extend(meta["notes"])
+            elif leak:
+                notes.append("a memory leak has no obligation class: no unit is linked (D5)")
+            elif not linked:
+                notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")
+            note = "; ".join(notes) or None
+            # The state read is of the candidate this detection lands on (its key, or the site's unverified one).
+            site = _candidate_site(file, failure.get("line"), source_fn, index)
+            prior = landing_candidate(candidates, fp, site)
+            already_listed = prior is not None and artifact_rel in prior["reproducers"]
+            rejected_before = reopen and prior is not None and _rejected_resolution(prior, findings) is not None
+            cand = upsert_candidate(
+                candidates,
+                fp,
+                "fuzz",
+                proposed,
+                module,
+                {"file": file, "line": failure.get("line", 0), "function": function},
+                {
+                    "kind": failure.get("alarm_kind") or failure.get("kind") or "assertion",
+                    "predicate": failure.get("predicate", ""),
+                },
+                [artifact_rel],
+                tool_output,
+                linked,
+                note,
+                site=site,
+                engine=_detection_engine(art, report),
+                harness_digest=art_digest,
+                discovering_step=art_step,
+            )
+            # A detection at a known site lands on that site's candidate: its key, not `fp`, from here on.
+            fp = cand["fingerprint"]
+            for link in art.get("cross_engine_links") or []:
+                if isinstance(link, dict):
+                    other_fp = str(link.get("explore_fingerprint") or "")
+                    match_kind = str(link.get("match") or "same_artifact")
+                    _record_related_link(candidates, fp, other_fp, f"judge cross-engine link ({match_kind})")
+            for cid in linked:
+                failed_unit_ids.add(cid)
+                add_evidence(
+                    units[cid],
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_failure",
+                    False,
+                    tool_output,
+                    f"{engine_note} failure {failure.get('alarm_kind') or failure.get('kind')} at line {failure.get('line')}.",
+                    {"artifact": artifact_rel, "reproducible": art.get("reproducible")},
+                )
+                if not rejected_before:
+                    mark_candidate(units[cid], fp)
+            if rejected_before and art.get("reproducible"):
+                # A reproducer replayed by the campaign on a rejected candidate: reopen it or
+                # record the contradiction. Its units stay as the rejection left them otherwise.
+                outcome = tool_evidence_on_verified_candidate(
+                    units,
+                    findings,
+                    candidates[fp],
+                    source="fuzz_reproducer",
+                    phase="fuzz",
+                    producer="run_eacsl_fuzz.py",
+                    artifact=artifact_rel,
+                    tool_output=tool_output,
+                    linked=linked,
+                    already_listed=already_listed,
+                )
+                if outcome in ("reopened", "contradicted"):
+                    stats[outcome] = stats.get(outcome, 0) + 1
+        elif (resource_abort := _eacsl_resource_abort(art)) is not None:
+            # The E-ACSL runtime stopped on its own limit (its tracked heap zone): no target check
+            # failed and no sanitizer replay located a failure. Not a candidate; the units say so.
+            resource_aborts.append((artifact_rel, resource_abort))
+            continue
+        else:
+            kind = art.get("kind", "crash")
+            # An OOM is keyed by its input too: `module:oom:` alone merged every OOM of a module (mpack run-4).
+            digest = hashlib.sha256(
+                f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak', 'oom') else ''}".encode()
+            ).hexdigest()[:10]
+            fp = f"harness_{re.sub(r'[^A-Za-z0-9_.-]', '_', module)}.c#unknown_function::{'unparsed_' + kind if kind in ('crash', 'leak') else kind}::{digest}"
+            cand = upsert_candidate(
+                candidates,
+                fp,
+                "fuzz",
+                "needs_validation",
+                module,
+                {"file": f"harness_{module}.c", "line": 0, "function": "unknown_function"},
+                {"kind": kind, "predicate": ""},
+                [artifact_rel],
+                tool_output,
+                [],
+                "no E-ACSL failure report could be parsed; verifier must triage and link units"
+                + ("; did not reproduce on replay" if art.get("reproducible") is False else ""),
+                engine=_detection_engine(art, report),
+                harness_digest=art_digest,
+                discovering_step=art_step,
+            )
+            fp = cand["fingerprint"]
+        stats["candidates"] += 1
+
+    if startup_aborts:
+        stats["startup_errors"] = stats.get("startup_errors", 0) + len(startup_aborts)
+        reasons = sorted({r for _, r in startup_aborts})
+        shown_s = [a for a, _ in startup_aborts[:5]]
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_startup_error",
+                False,
+                tool_output,
+                f"{len(startup_aborts)} artifact(s) failed during binary/runtime startup "
+                f"({'; '.join(reasons[:3])}): toolchain/harness startup error, no target candidate created.",
+                {"module": module, "step": report_step or "campaign", "artifacts": shown_s, "reasons": reasons[:5]},
+            )
+    if smoke_quarantined:
+        stats["smoke_quarantined"] = stats.get("smoke_quarantined", 0) + len(smoke_quarantined)
+        reasons = sorted({r for _, r in smoke_quarantined})
+        shown_q = [a for a, _ in smoke_quarantined[:5]]
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "harness_smoke_quarantined",
+                False,
+                tool_output,
+                f"{len(smoke_quarantined)} artifact(s) were quarantined by the harness smoke gate "
+                f"({'; '.join(reasons[:3])}): no target candidate created.",
+                {
+                    "module": module,
+                    "step": report_step or "campaign",
+                    "artifacts": shown_q,
+                    "quarantined_cases": sorted(smoke_skipped),
+                },
+            )
+    elif report.get("smoke_skipped_cases"):
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "harness_smoke_quarantined",
+                False,
+                tool_output,
+                f"Dispatch case(s) {sorted(smoke_skipped)} were quarantined by the harness smoke gate and skipped.",
+                {"module": module, "step": report_step or "campaign", "quarantined_cases": sorted(smoke_skipped)},
+            )
+    if link_stub_aborts:
+        stats["link_stub_aborts"] = stats.get("link_stub_aborts", 0) + len(link_stub_aborts)
+        details = [
+            {
+                "module": module,
+                "symbol": a.get("symbol"),
+                "caller": a.get("caller"),
+                "artifact": art_rel,
+                "message": a.get("message"),
+            }
+            for art_rel, a in link_stub_aborts
+        ]
+        stats.setdefault("link_stub_abort_details", []).extend(details)
+        rendered = [f"{d['module']}: {d['symbol']} (caller: {d['caller'] or 'unknown'})" for d in details]
+        stats.setdefault("warnings", []).append(f"link_stub_aborts: [{', '.join(rendered)}]")
+        shown_stubs = [r for r, _ in link_stub_aborts[:5]]
+        more_stubs = f" and {len(link_stub_aborts) - 5} more" if len(link_stub_aborts) > 5 else ""
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_link_stub_abort",
+                False,
+                tool_output,
+                f"{len(link_stub_aborts)} input(s) called an address-flow link stub "
+                f"({', '.join(rendered[:5])}): pipeline reach defect, no target candidate created.",
+                {"artifacts": shown_stubs + ([more_stubs.strip()] if more_stubs else []), "stubs": details[:5]},
+            )
+    if resource_aborts:
+        stats["eacsl_resource_aborts"] = stats.get("eacsl_resource_aborts", 0) + len(resource_aborts)
+        limits = sorted(
+            {
+                f"{a.get('resource')} limit"
+                + (f" of {a['limit_mb']} MiB" if a.get("limit_mb") else "")
+                + f" (sanitizer replay: {a.get('sanitizer_replay', 'unavailable')})"
+                for _, a in resource_aborts
+            }
+        )
+        shown = [r for r, _ in resource_aborts[:5]]
+        more = f" and {len(resource_aborts) - 5} more" if len(resource_aborts) > 5 else ""
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_eacsl_resource_limit",
+                False,
+                tool_output,
+                f"{len(resource_aborts)} input(s) stopped the E-ACSL runtime on its own {'; '.join(limits)}, "
+                "not on a target check: no candidate. E-ACSL checked nothing past that allocation for these "
+                "inputs; replay them on the sanitizer build to cover them.",
+                {"artifacts": shown + ([more.strip()] if more else [])},
+            )
+    return {
+        "failed_unit_ids": failed_unit_ids,
+        "failed_cases": failed_cases,
+        "startup_aborts": len(startup_aborts),
+        "smoke_quarantined": len(smoke_quarantined),
+    }
+
+
+def _ingest_judge_report_into_state(
+    units: dict[str, dict],
+    candidates: dict[str, dict],
+    findings: dict[str, dict],
+    mm: ModuleMap,
+    index: dict[str, list[tuple[int, int, str]]],
+    kernel: dict[tuple[str, str], dict[str, str]],
+    *,
+    path: Path,
+    report: dict,
+    reopen: bool,
+    stats: dict[str, Any],
+) -> str:
+    """
+    Ingest one P2d E-ACSL judge report (`workspace/reports/judge/<mod>.json`):
+      - Supersedes prior Phase 1 status evidence of `module` on rerun (F7).
+      - Never creates candidates for startup errors, smoke-quarantined artifacts, or `batch_state_only`.
+      - Grants E-ACSL `fuzz_clean` ONLY for dynamically executed functions (`coverage` executions > 0)
+        whose reaching cases were judged without blinding or `not_judged` gaps (P2c).
+    """
+    tool_output = rel(str(path))
+    module = str(report.get("module") or path.stem)
+    status = str(report.get("status") or "unknown")
+    mod_units = _module_units(units, *_report_scope(mm, module))
+    stats["judge_reports"] = stats.get("judge_reports", 0) + 1
+
+    superseded = _supersede_phase1_status_evidence(
+        mod_units,
+        module,
+        tool_output,
+        step="judge",
+        ensure_nonempty_if_active=False,
+    )
+    if superseded:
+        stats["superseded_phase1_evidence"] = stats.get("superseded_phase1_evidence", 0) + superseded
+
+    if status == "startup_error":
+        reason = str(report.get("startup_error") or report.get("reason") or "startup_error")
+        stats["startup_errors"] = stats.get("startup_errors", 0) + 1
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_startup_error",
+                False,
+                tool_output,
+                f"E-ACSL judge failed during binary/runtime startup ({reason}); no candidates created.",
+                {"module": module, "step": "judge", "engine": "eacsl", "reason": reason},
+            )
+        return module
+
+    if status in ("skipped", "judge_error"):
+        reason = str(report.get("reason") or status)
+        ev_res = "judge_skipped" if status == "skipped" else "judge_error"
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                ev_res,
+                False,
+                tool_output,
+                f"E-ACSL judge did not complete ({status}: {reason}); E-ACSL fuzz_clean not granted.",
+                {"module": module, "step": "judge", "engine": "eacsl", "reason": reason},
+            )
+        return module
+
+    art_info = _ingest_fuzz_artifacts(
+        units,
+        candidates,
+        findings,
+        mm,
+        index,
+        kernel,
+        report=report,
+        module=module,
+        mod_units=mod_units,
+        tool_output=tool_output,
+        engine_note="E-ACSL judge",
+        reopen=reopen,
+        stats=stats,
+        default_step="judge",
+    )
+
+    # Link top-level cross-engine links as well (when both fingerprints exist in candidates).
+    for link in report.get("cross_engine_links") or []:
+        if isinstance(link, dict):
+            _record_related_link(
+                candidates,
+                str(link.get("judge_fingerprint") or ""),
+                str(link.get("explore_fingerprint") or ""),
+                f"judge cross-engine link ({link.get('match') or 'same_artifact'})",
+            )
+
+    raw_inputs = report.get("inputs")
+    inputs: dict[str, Any] = raw_inputs if isinstance(raw_inputs, dict) else {}
+    judged_count = int(inputs.get("judged", 0) or 0)
+    not_judged = int(report.get("not_judged", inputs.get("not_judged", 0)) or 0)
+    raw_nj_bd = inputs.get("not_judged_breakdown")
+    nj_bd: dict[str, Any] = raw_nj_bd if isinstance(raw_nj_bd, dict) else {}
+    nj_cap = int(nj_bd.get("cap", 0) or 0)
+    nj_timeout = int(nj_bd.get("timeout", 0) or 0)
+    nj_error = int(nj_bd.get("error", 0) or 0)
+    nj_module_gap = nj_cap + nj_timeout + nj_error
+
+    raw_blinded = report.get("blinded_cases")
+    blinded_cases_raw: list[Any] = raw_blinded if isinstance(raw_blinded, list) else []
+    blinded_case_ids = {
+        int(b["case"])
+        for b in blinded_cases_raw
+        if isinstance(b, dict) and isinstance(b.get("case"), int) and not isinstance(b.get("case"), bool)
+    }
+    smoke_skipped_ids = _smoke_quarantined_cases(module, report)
+    failed_case_ids: set[int] = set(art_info["failed_cases"])
+    failed_unit_ids: set[str] = set(art_info["failed_unit_ids"])
+
+    if status == "blinded":
+        blind_fp = report.get("blinded_fingerprint")
+        for u in mod_units:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_blinded",
+                False,
+                tool_output,
+                "E-ACSL judge was blinded across the module"
+                + (f" ({blind_fp})" if blind_fp else "")
+                + "; E-ACSL fuzz_clean not granted.",
+                {
+                    "module": module,
+                    "step": "judge",
+                    "engine": "eacsl",
+                    "blinded_cases": sorted(blinded_case_ids),
+                    "not_judged": not_judged,
+                },
+            )
+        return module
+
+    if nj_module_gap > 0 or judged_count <= 0 or status == "partial":
+        reason_parts = []
+        if judged_count <= 0:
+            reason_parts.append("0 inputs judged")
+        if nj_cap:
+            reason_parts.append(f"cap={nj_cap}")
+        if nj_timeout:
+            reason_parts.append(f"timeout={nj_timeout}")
+        if nj_error:
+            reason_parts.append(f"error={nj_error}")
+        if not reason_parts and not_judged > 0:
+            reason_parts.append(f"not_judged={not_judged}")
+        gap_desc = ", ".join(reason_parts) or status
+        for u in mod_units:
+            if u["coverage_id"] in failed_unit_ids:
+                continue
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_not_judged",
+                False,
+                tool_output,
+                f"E-ACSL judge left inputs unjudged ({gap_desc}); E-ACSL fuzz_clean not granted.",
+                {
+                    "module": module,
+                    "step": "judge",
+                    "engine": "eacsl",
+                    "judged": judged_count,
+                    "not_judged": not_judged,
+                    "not_judged_breakdown": dict(nj_bd),
+                },
+            )
+        return module
+
+    # At this point: status is clean, crash_found, or partial_blinded, judged_count > 0,
+    # and no module-wide cap/timeout/error gap exists. Check dynamic execution (F7) and
+    # per-case blinding/quarantine/failure on each function's reaching cases (P2c).
+    executions, unmeasured = _fuzz_coverage_executions(module)
+    reaching_cases = _dispatch_reaching_cases(module, mm.dag) if (blinded_case_ids or smoke_skipped_ids or failed_case_ids or status != "clean") else {}
+    has_unattributed_not_judged = not_judged > 0 and not (blinded_case_ids or smoke_skipped_ids)
+
+    for u in mod_units:
+        if u["coverage_id"] in failed_unit_ids:
+            continue
+        if has_unattributed_not_judged:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_not_judged",
+                False,
+                tool_output,
+                f"E-ACSL judge left {not_judged} input(s) unjudged; E-ACSL fuzz_clean not granted.",
+                {"module": module, "step": "judge", "engine": "eacsl", "not_judged": not_judged},
+            )
+            continue
+
+        if executions is None:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_not_judged",
+                False,
+                tool_output,
+                f"E-ACSL judge ran ({judged_count} inputs), but dynamic function execution was not measured "
+                f"({unmeasured}); E-ACSL fuzz_clean not granted.",
+                {"module": module, "step": "judge", "engine": "eacsl", "judged": judged_count},
+            )
+            continue
+
+        fn_key = (normalize_file(u["file"]), u["function"])
+        if executions.get(fn_key, 0) == 0:
+            add_evidence(
+                u,
+                "fuzz",
+                "run_eacsl_fuzz.py",
+                "fuzz_not_executed",
+                False,
+                tool_output,
+                "E-ACSL judge: no replayed input executed this function (not evidence of anything).",
+                {"module": module, "step": "judge", "engine": "eacsl"},
+            )
+            continue
+
+        # Check reaching-case cleanliness when any case was blinded, smoke-skipped, or failed.
+        if blinded_case_ids or smoke_skipped_ids or failed_case_ids or status != "clean":
+            fn_cases = reaching_cases.get(fn_key) or reaching_cases.get(("", u["function"])) or set()
+            if not fn_cases:
+                # Fail closed: cannot prove this function's reaching cases were unaffected.
+                if blinded_case_ids:
+                    add_evidence(
+                        u,
+                        "fuzz",
+                        "run_eacsl_fuzz.py",
+                        "fuzz_blinded",
+                        False,
+                        tool_output,
+                        f"E-ACSL judge had blinded case(s) {sorted(blinded_case_ids)} and reaching cases for "
+                        f"{u['function']} could not be isolated; E-ACSL fuzz_clean not granted.",
+                        {"module": module, "step": "judge", "engine": "eacsl", "blinded_cases": sorted(blinded_case_ids)},
+                    )
+                elif smoke_skipped_ids:
+                    add_evidence(
+                        u,
+                        "fuzz",
+                        "run_eacsl_fuzz.py",
+                        "harness_smoke_quarantined",
+                        False,
+                        tool_output,
+                        f"E-ACSL judge skipped smoke-quarantined case(s) {sorted(smoke_skipped_ids)} and reaching "
+                        f"cases for {u['function']} could not be isolated; E-ACSL fuzz_clean not granted.",
+                        {"module": module, "step": "judge", "engine": "eacsl", "quarantined_cases": sorted(smoke_skipped_ids)},
+                    )
+                continue
+            hit_blinded = sorted(fn_cases & blinded_case_ids)
+            if hit_blinded:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_blinded",
+                    False,
+                    tool_output,
+                    f"E-ACSL judge blinded on reaching case(s) {hit_blinded}; E-ACSL fuzz_clean not granted.",
+                    {"module": module, "step": "judge", "engine": "eacsl", "blinded_cases": hit_blinded},
+                )
+                continue
+            hit_quarantined = sorted(fn_cases & smoke_skipped_ids)
+            if hit_quarantined:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "harness_smoke_quarantined",
+                    False,
+                    tool_output,
+                    f"Reaching case(s) {hit_quarantined} were quarantined by smoke gate; E-ACSL fuzz_clean not granted.",
+                    {"module": module, "step": "judge", "engine": "eacsl", "quarantined_cases": hit_quarantined},
+                )
+                continue
+            if fn_cases & failed_case_ids:
+                # A reaching case had an E-ACSL failure; do not grant fuzz_clean.
+                continue
+
+        add_evidence(
+            u,
+            "fuzz",
+            "run_eacsl_fuzz.py",
+            "fuzz_clean",
+            False,
+            tool_output,
+            "E-ACSL judge found no failure (not a proof).",
+            {"module": module, "step": "judge", "engine": "eacsl", "judged": judged_count},
+        )
+    return module
+
+
 @ledger_locked
-def cmd_ingest_fuzz(paths: list[Path]) -> dict:
+def cmd_ingest_fuzz(paths: list[Path], judge_reports: list[Path] | None = None) -> dict:
     units, candidates = load_state()
     reopen = rejection_reopen_enabled()
     findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])} if reopen else {}
@@ -1767,15 +2637,48 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
     kernel = _model_kernel_names()
     stats: dict[str, Any] = {"reports": 0, "candidates": 0}
     ingested_modules: list[str] = []
+    explicit_judge_paths: list[Path] = list(judge_reports or [])
+    judged_modules: set[str] = set()
+
     for path in paths:
         report = load_json_strict(path)
+        if report.get("mode") == "judge":
+            stats["reports"] += 1
+            jmod = _ingest_judge_report_into_state(
+                units,
+                candidates,
+                findings,
+                mm,
+                index,
+                kernel,
+                path=path,
+                report=report,
+                reopen=reopen,
+                stats=stats,
+            )
+            judged_modules.add(jmod)
+            ingested_modules.append(jmod)
+            continue
+
         stats["reports"] += 1
         tool_output = rel(str(path))
         module = report.get("module") or path.stem
         status = report.get("status", "unknown")
+        step = str(report.get("discovering_step") or ("eacsl_fuzz" if report.get("mode") == "eacsl-fuzz" else "campaign"))
         # A sub-module's campaign speaks for the functions in its scope, within its link unit.
         mod_units = _module_units(units, *_report_scope(mm, module))
         engine_note = fuzz_engine_note(report)
+
+        superseded = _supersede_phase1_status_evidence(
+            mod_units,
+            module,
+            tool_output,
+            step=step,
+            ensure_nonempty_if_active=(status in ("crash_found", "timeout_found", "oom_found")),
+        )
+        if superseded:
+            stats["superseded_phase1_evidence"] = stats.get("superseded_phase1_evidence", 0) + superseded
+
         # Each engine that failed is recorded on the module's units whatever the merged status is: a crash
         # by the other engine does not hide it (F9). Placed before the status dispatch, so every branch reaches it.
         engine_errors = report.get("engine_errors")
@@ -1798,7 +2701,7 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
         if isinstance(meta_warnings, list) and meta_warnings:
             stats.setdefault("security_props_warnings", {})[module] = [str(w) for w in meta_warnings]
         meta_lost = _fuzz_security_props_lost(report)
-        if meta_lost and status not in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run"):
+        if meta_lost and status not in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run", "startup_error"):
             for u in mod_units:
                 if u["obligation_class"] in METACSL_CLASSES:
                     add_evidence(
@@ -1812,33 +2715,206 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                         "its result says nothing about this unit's property.",
                     )
 
+        if status == "startup_error":
+            reason = str(report.get("reason") or report.get("startup_error") or "startup_error")
+            stats["startup_errors"] = stats.get("startup_errors", 0) + 1
+            for u in mod_units:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    "fuzz_startup_error",
+                    False,
+                    tool_output,
+                    f"Fuzz binary failed during startup ({reason}); no target candidates created.",
+                    {"module": module, "step": step, "reason": reason},
+                )
+            continue
+
         if status == "clean":
             ingested_modules.append(module)
             executions, unmeasured = _fuzz_coverage_executions(module)
+            ev_details = {"module": module, "step": step} if step != "campaign" else None
+            smoke_skipped = _smoke_quarantined_cases(module, report)
+            judge_skipped = {
+                int(c)
+                for c in (report.get("judge_skipped_cases") or [])
+                if isinstance(c, int) and not isinstance(c, bool) and c >= 0
+            }
+            skipped_cases = smoke_skipped | judge_skipped
+            reaching_cases = _dispatch_reaching_cases(module, mm.dag) if skipped_cases else {}
             for u in mod_units:
-                if executions is None:
-                    add_evidence(
-                        u,
-                        "fuzz",
-                        "run_eacsl_fuzz.py",
-                        "fuzz_clean",
-                        False,
-                        tool_output,
-                        f"{engine_note} campaign found no failure (not a proof). "
-                        f"Which functions ran was not measured ({unmeasured}).",
-                    )
-                    continue
-                if executions.get((normalize_file(u["file"]), u["function"]), 0) == 0:
-                    add_evidence(
-                        u,
-                        "fuzz",
-                        "run_eacsl_fuzz.py",
-                        "fuzz_not_executed",
-                        False,
-                        tool_output,
-                        f"{engine_note} campaign: no replayed input executed this function (not evidence of anything).",
-                    )
-                    continue
+                fn_key = (normalize_file(u["file"]), u["function"])
+                if skipped_cases:
+                    if executions is None:
+                        if smoke_skipped:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "harness_smoke_quarantined",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped smoke-quarantined case(s) {sorted(smoke_skipped)} "
+                                f"and dynamic function execution was not measured ({unmeasured}); "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "quarantined_cases": sorted(smoke_skipped),
+                                    **({"judge_skipped_cases": sorted(judge_skipped)} if judge_skipped else {}),
+                                },
+                            )
+                        else:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "fuzz_not_judged",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped judge-skipped case(s) {sorted(judge_skipped)} "
+                                f"and dynamic function execution was not measured ({unmeasured}); "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "judge_skipped_cases": sorted(judge_skipped),
+                                },
+                            )
+                        continue
+                    fn_cases = reaching_cases.get(fn_key) or reaching_cases.get(("", u["function"])) or set()
+                    if executions.get(fn_key, 0) == 0:
+                        hit_quarantined = sorted(fn_cases & smoke_skipped)
+                        if hit_quarantined:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "harness_smoke_quarantined",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped smoke-quarantined reaching case(s) {hit_quarantined} "
+                                "and no replayed input executed this function; fuzz_clean not granted.",
+                                {"module": module, "step": step, "quarantined_cases": hit_quarantined},
+                            )
+                            continue
+                        hit_judge_skipped = sorted(fn_cases & judge_skipped)
+                        if hit_judge_skipped:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "fuzz_not_judged",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped judge-skipped reaching case(s) {hit_judge_skipped} "
+                                "and no replayed input executed this function; fuzz_clean not granted.",
+                                {"module": module, "step": step, "judge_skipped_cases": hit_judge_skipped},
+                            )
+                            continue
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_not_executed",
+                            False,
+                            tool_output,
+                            f"{engine_note} campaign: no replayed input executed this function (not evidence of anything).",
+                            ev_details,
+                        )
+                        continue
+                    if not fn_cases:
+                        if smoke_skipped:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "harness_smoke_quarantined",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped smoke-quarantined case(s) {sorted(smoke_skipped)} "
+                                f"and reaching cases for {u['function']} could not be isolated; "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "quarantined_cases": sorted(smoke_skipped),
+                                    **({"judge_skipped_cases": sorted(judge_skipped)} if judge_skipped else {}),
+                                },
+                            )
+                        else:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "fuzz_not_judged",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped judge-skipped case(s) {sorted(judge_skipped)} "
+                                f"and reaching cases for {u['function']} could not be isolated; "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "judge_skipped_cases": sorted(judge_skipped),
+                                },
+                            )
+                        continue
+                    hit_quarantined = sorted(fn_cases & smoke_skipped)
+                    if hit_quarantined:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "harness_smoke_quarantined",
+                            False,
+                            tool_output,
+                            f"Reaching case(s) {hit_quarantined} were quarantined by smoke gate; "
+                            "fuzz_clean not granted.",
+                            {"module": module, "step": step, "quarantined_cases": hit_quarantined},
+                        )
+                        continue
+                    hit_judge_skipped = sorted(fn_cases & judge_skipped)
+                    if hit_judge_skipped:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_not_judged",
+                            False,
+                            tool_output,
+                            f"Reaching case(s) {hit_judge_skipped} were skipped after judge failure/blinding; "
+                            "fuzz_clean not granted.",
+                            {"module": module, "step": step, "judge_skipped_cases": hit_judge_skipped},
+                        )
+                        continue
+                else:
+                    if executions is None:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_clean",
+                            False,
+                            tool_output,
+                            f"{engine_note} campaign found no failure (not a proof). "
+                            f"Which functions ran was not measured ({unmeasured}).",
+                            ev_details,
+                        )
+                        continue
+                    if executions.get(fn_key, 0) == 0:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_not_executed",
+                            False,
+                            tool_output,
+                            f"{engine_note} campaign: no replayed input executed this function (not evidence of anything).",
+                            ev_details,
+                        )
+                        continue
                 add_evidence(
                     u,
                     "fuzz",
@@ -1847,9 +2923,20 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     False,
                     tool_output,
                     f"{engine_note} campaign found no failure (not a proof).",
+                    ev_details,
                 )
             continue
-        if status in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run", "insufficient_memory"):
+        if status in (
+            "compile_error",
+            "fuzzer_error",
+            "sandbox_unavailable",
+            "not_run",
+            "insufficient_memory",
+            "skipped",
+            "unspent_blinded",
+            "container_oom",
+            "gate_failed",
+        ):
             if status == "not_run":
                 summary = f"Fuzz campaign was never run ({report.get('reason') or 'no report produced'})."
             elif status == "insufficient_memory":
@@ -1866,6 +2953,27 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
             continue
 
         ingested_modules.append(module)
+        if status in ("blinded", "partial_blinded"):
+            blind_cases = [
+                int(b["case"])
+                for b in (report.get("blinded_cases") or [])
+                if isinstance(b, dict) and isinstance(b.get("case"), int) and not isinstance(b.get("case"), bool)
+            ]
+            blind_fp = report.get("blinded_fingerprint")
+            for u in mod_units:
+                add_evidence(
+                    u,
+                    "fuzz",
+                    "run_eacsl_fuzz.py",
+                    f"fuzz_{status}",
+                    False,
+                    tool_output,
+                    f"{engine_note} campaign ended {status}"
+                    + (f" (cases {sorted(blind_cases)})" if blind_cases else "")
+                    + (f" ({blind_fp})" if blind_fp else "")
+                    + ".",
+                    {"module": module, "step": step, "blinded_cases": sorted(blind_cases)},
+                )
         for kg_error in fuzz_keep_going_errors(report):
             # The crashes below are still ingested; the cases the rounds never got to were not fuzzed.
             for u in mod_units:
@@ -1878,208 +2986,74 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
                     tool_output,
                     f"Keep-going fuzz rounds stopped early, the remaining dispatch cases were not fuzzed: {kg_error}",
                 )
-        resource_aborts: list[tuple[str, dict]] = []
-        link_stub_aborts: list[tuple[str, dict]] = []
-        for art in report.get("artifacts", []):
-            artifact_rel = rel(art["artifact"])
-            if (stub_abort := _link_stub_abort(art)) is not None:
-                # Address-flow link-stub hit: pipeline reach defect, never a target vulnerability candidate.
-                link_stub_aborts.append((artifact_rel, stub_abort))
-                continue
-            failure = art.get("failure")
-            if failure and art.get("fingerprint"):
-                fp = art["fingerprint"]
-                file = normalize_file(failure["file"])
-                # The fingerprint and the location keep the reported name: replay and minimization
-                # match the failures they reproduce against it.
-                function = failure["function"]
-                link_unit = str((mm.modules.get(mm.unit_of(module)) or {}).get("unit") or mm.unit_of(module))
-                source_fn = _located_function(file, failure.get("line"), function, index, kernel, link_unit)
-                # A failed run-time check of a MetAcsl property goes by its own rules (_fuzz_meta_route).
-                meta = _fuzz_meta_route(units, failure, file, source_fn, report)
-                if meta is not None and meta.get("harness_induced"):
-                    # The harness called a protected function itself: listed, never a candidate, no unit.
-                    stats.setdefault("meta_harness_induced", []).append(
-                        {
-                            "module": module,
-                            "property": failure.get("meta_property"),
-                            "function": function,
-                            "caller": failure.get("caller"),
-                            "artifact": artifact_rel,
-                            "fingerprint": fp,
-                        }
-                    )
-                    continue
-                cls = (
-                    meta["cls"]
-                    if meta is not None
-                    else goal_obligation_class(
-                        {"kind": failure.get("kind", ""), "annotation": failure.get("predicate", "")}
-                    )
-                )
-                # A leak has no obligation class (D5): it links no unit, whatever the units of its function are.
-                leak = failure.get("alarm_kind") == "memory_leak"
-                if meta is not None:
-                    linked = list(meta["linked"])
-                else:
-                    linked = (
-                        []
-                        if leak
-                        else [
-                            u["coverage_id"]
-                            for u in units_for_function(units, file, source_fn)
-                            if u["obligation_class"] == cls and u["status"] not in ("out_of_scope", "not_applicable")
-                        ]
-                    )
-                proposed = "confirmed" if art.get("reproducible") else "needs_validation"
-                notes = [] if art.get("reproducible") else ["crash did not reproduce on replay"]
-                if source_fn != function:
-                    notes.append(f"reported in {function}, which is {source_fn} in the source")
-                if meta is not None:
-                    notes.extend(meta["notes"])
-                elif leak:
-                    notes.append("a memory leak has no obligation class: no unit is linked (D5)")
-                elif not linked:
-                    notes.append(f"no ledger unit for {file}#{source_fn}::{cls} (harness or unseeded code)")
-                note = "; ".join(notes) or None
-                # The state read is of the candidate this detection lands on (its key, or the site's unverified one).
-                site = _candidate_site(file, failure.get("line"), source_fn, index)
-                prior = landing_candidate(candidates, fp, site)
-                already_listed = prior is not None and artifact_rel in prior["reproducers"]
-                rejected_before = reopen and prior is not None and _rejected_resolution(prior, findings) is not None
-                cand = upsert_candidate(
-                    candidates,
-                    fp,
-                    "fuzz",
-                    proposed,
-                    module,
-                    {"file": file, "line": failure.get("line", 0), "function": function},
-                    {
-                        "kind": failure.get("alarm_kind") or failure.get("kind") or "assertion",
-                        "predicate": failure.get("predicate", ""),
-                    },
-                    [artifact_rel],
-                    tool_output,
-                    linked,
-                    note,
-                    site=site,
-                    engine=_detection_engine(art, report),
-                )
-                # A detection at a known site lands on that site's candidate: its key, not `fp`, from here on.
-                fp = cand["fingerprint"]
-                for cid in linked:
-                    add_evidence(
-                        units[cid],
-                        "fuzz",
-                        "run_eacsl_fuzz.py",
-                        "fuzz_failure",
-                        False,
-                        tool_output,
-                        f"{engine_note} failure {failure.get('alarm_kind') or failure.get('kind')} at line {failure.get('line')}.",
-                        {"artifact": artifact_rel, "reproducible": art.get("reproducible")},
-                    )
-                    if not rejected_before:
-                        mark_candidate(units[cid], fp)
-                if rejected_before and art.get("reproducible"):
-                    # A reproducer replayed by the campaign on a rejected candidate: reopen it or
-                    # record the contradiction. Its units stay as the rejection left them otherwise.
-                    outcome = tool_evidence_on_verified_candidate(
-                        units,
-                        findings,
-                        candidates[fp],
-                        source="fuzz_reproducer",
-                        phase="fuzz",
-                        producer="run_eacsl_fuzz.py",
-                        artifact=artifact_rel,
-                        tool_output=tool_output,
-                        linked=linked,
-                        already_listed=already_listed,
-                    )
-                    if outcome in ("reopened", "contradicted"):
-                        stats[outcome] = stats.get(outcome, 0) + 1
-            elif (resource_abort := _eacsl_resource_abort(art)) is not None:
-                # The E-ACSL runtime stopped on its own limit (its tracked heap zone): no target check
-                # failed and no sanitizer replay located a failure. Not a candidate; the units say so.
-                resource_aborts.append((artifact_rel, resource_abort))
-                continue
-            else:
-                kind = art.get("kind", "crash")
-                # An OOM is keyed by its input too: `module:oom:` alone merged every OOM of a module (mpack run-4).
-                digest = hashlib.sha256(
-                    f"{module}:{kind}:{art.get('sha256', '') if kind in ('crash', 'leak', 'oom') else ''}".encode()
-                ).hexdigest()[:10]
-                fp = f"harness_{re.sub(r'[^A-Za-z0-9_.-]', '_', module)}.c#unknown_function::{'unparsed_' + kind if kind in ('crash', 'leak') else kind}::{digest}"
-                cand = upsert_candidate(
-                    candidates,
-                    fp,
-                    "fuzz",
-                    "needs_validation",
-                    module,
-                    {"file": f"harness_{module}.c", "line": 0, "function": "unknown_function"},
-                    {"kind": kind, "predicate": ""},
-                    [artifact_rel],
-                    tool_output,
-                    [],
-                    "no E-ACSL failure report could be parsed; verifier must triage and link units"
-                    + ("; did not reproduce on replay" if art.get("reproducible") is False else ""),
-                    engine=_detection_engine(art, report),
-                )
-                fp = cand["fingerprint"]
-            stats["candidates"] += 1
-        if link_stub_aborts:
-            stats["link_stub_aborts"] = stats.get("link_stub_aborts", 0) + len(link_stub_aborts)
-            details = [
-                {
-                    "module": module,
-                    "symbol": a.get("symbol"),
-                    "caller": a.get("caller"),
-                    "artifact": art_rel,
-                    "message": a.get("message"),
-                }
-                for art_rel, a in link_stub_aborts
-            ]
-            stats.setdefault("link_stub_abort_details", []).extend(details)
-            rendered = [f"{d['module']}: {d['symbol']} (caller: {d['caller'] or 'unknown'})" for d in details]
-            stats.setdefault("warnings", []).append(f"link_stub_aborts: [{', '.join(rendered)}]")
-            shown_stubs = [r for r, _ in link_stub_aborts[:5]]
-            more_stubs = f" and {len(link_stub_aborts) - 5} more" if len(link_stub_aborts) > 5 else ""
-            for u in mod_units:
-                add_evidence(
-                    u,
-                    "fuzz",
-                    "run_eacsl_fuzz.py",
-                    "fuzz_link_stub_abort",
-                    False,
-                    tool_output,
-                    f"{len(link_stub_aborts)} input(s) called an address-flow link stub "
-                    f"({', '.join(rendered[:5])}): pipeline reach defect, no target candidate created.",
-                    {"artifacts": shown_stubs + ([more_stubs.strip()] if more_stubs else []), "stubs": details[:5]},
-                )
-        if resource_aborts:
-            stats["eacsl_resource_aborts"] = stats.get("eacsl_resource_aborts", 0) + len(resource_aborts)
-            limits = sorted(
-                {
-                    f"{a.get('resource')} limit"
-                    + (f" of {a['limit_mb']} MiB" if a.get("limit_mb") else "")
-                    + f" (sanitizer replay: {a.get('sanitizer_replay', 'unavailable')})"
-                    for _, a in resource_aborts
-                }
-            )
-            shown = [r for r, _ in resource_aborts[:5]]
-            more = f" and {len(resource_aborts) - 5} more" if len(resource_aborts) > 5 else ""
-            for u in mod_units:
-                add_evidence(
-                    u,
-                    "fuzz",
-                    "run_eacsl_fuzz.py",
-                    "fuzz_eacsl_resource_limit",
-                    False,
-                    tool_output,
-                    f"{len(resource_aborts)} input(s) stopped the E-ACSL runtime on its own {'; '.join(limits)}, "
-                    "not on a target check: no candidate. E-ACSL checked nothing past that allocation for these "
-                    "inputs; replay them on the sanitizer build to cover them.",
-                    {"artifacts": shown + ([more.strip()] if more else [])},
-                )
+        _ingest_fuzz_artifacts(
+            units,
+            candidates,
+            findings,
+            mm,
+            index,
+            kernel,
+            report=report,
+            module=module,
+            mod_units=mod_units,
+            tool_output=tool_output,
+            engine_note=engine_note,
+            reopen=reopen,
+            stats=stats,
+            default_step=step if step in ("explore", "judge", "eacsl_fuzz") else None,
+        )
+
+    # Ingest any explicit --judge-report paths, then auto-discover workspace/reports/judge/<mod>.json
+    # for modules ingested in this call that did not already have an explicit judge report.
+    seen_judge_paths: set[Path] = set()
+    for jpath in explicit_judge_paths:
+        resolved = jpath.resolve()
+        if resolved in seen_judge_paths:
+            continue
+        seen_judge_paths.add(resolved)
+        jreport = load_json_strict(jpath)
+        stats["reports"] += 1
+        jmod = _ingest_judge_report_into_state(
+            units,
+            candidates,
+            findings,
+            mm,
+            index,
+            kernel,
+            path=jpath,
+            report=jreport,
+            reopen=reopen,
+            stats=stats,
+        )
+        judged_modules.add(jmod)
+        ingested_modules.append(jmod)
+
+    for mod_name in list(dict.fromkeys(ingested_modules)):
+        if mod_name in judged_modules:
+            continue
+        auto_judge = JUDGE_REPORT_DIR / f"{mod_name}.json"
+        if not auto_judge.is_file():
+            continue
+        resolved = auto_judge.resolve()
+        if resolved in seen_judge_paths:
+            continue
+        seen_judge_paths.add(resolved)
+        jreport = load_json_strict(auto_judge)
+        stats["reports"] += 1
+        jmod = _ingest_judge_report_into_state(
+            units,
+            candidates,
+            findings,
+            mm,
+            index,
+            kernel,
+            path=auto_judge,
+            report=jreport,
+            reopen=reopen,
+            stats=stats,
+        )
+        judged_modules.add(jmod)
+
     commit(units, candidates)
     if cache.shared_mode() == "rw" and ingested_modules:
         published_corpora: dict[str, int] = {}
@@ -2097,6 +3071,226 @@ def cmd_ingest_fuzz(paths: list[Path]) -> dict:
         if published_corpora:
             stats["published_corpora"] = published_corpora
     return stats
+
+
+@ledger_locked
+def cmd_ingest_judge(paths: list[Path]) -> dict:
+    """Ingest one or more P2d E-ACSL judge reports (`workspace/reports/judge/<mod>.json`)."""
+    units, candidates = load_state()
+    reopen = rejection_reopen_enabled()
+    findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])} if reopen else {}
+    mm = ModuleMap.load(".")
+    index = _dag_line_index(dag=mm.dag)
+    kernel = _model_kernel_names()
+    stats: dict[str, Any] = {"reports": 0, "judge_reports": 0, "candidates": 0}
+    for path in paths:
+        report = load_json_strict(path)
+        stats["reports"] += 1
+        _ingest_judge_report_into_state(
+            units,
+            candidates,
+            findings,
+            mm,
+            index,
+            kernel,
+            path=path,
+            report=report,
+            reopen=reopen,
+            stats=stats,
+        )
+    commit(units, candidates)
+    return stats
+
+
+@contextlib.contextmanager
+def _maybe_chdir(target: Path | None):
+    if target is None or target.resolve() == Path.cwd().resolve():
+        yield
+        return
+    prev = Path.cwd()
+    os.chdir(target)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
+
+
+def _tool_output_module(tool_output: Any) -> str | None:
+    if not isinstance(tool_output, str) or not tool_output:
+        return None
+    p = Path(tool_output)
+    if p.suffix == ".json" and p.stem:
+        return p.stem
+    return None
+
+
+def _candidate_observed_by_module(cand: dict, module: str) -> bool:
+    for obs in cand.get("observations") or []:
+        if not isinstance(obs, dict):
+            continue
+        if obs.get("module") == module or _tool_output_module(obs.get("tool_output")) == module:
+            return True
+    return False
+
+
+def cmd_supersede_candidates(
+    module: str,
+    old_harness_digest: str | None = None,
+    reason: str = "superseded_by_repair",
+    *,
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Mark unverified candidates of `module` from `old_harness_digest` as `superseded_by_repair`
+    (P5 verifier circuit breaker).
+
+    When a candidate was observed by multiple modules (`module_harness_digests`), repairing one
+    module removes only that module's active digest (recording it under `superseded_module_digests`
+    and deterministically re-homing `module`/`harness_digest` when needed) so the candidate remains
+    `unverified` until every observing module is repaired.
+
+    CRITICAL INVARIANT: Never modifies `findings.json`, never touches any candidate whose status
+    is not `"unverified"`, and never touches any candidate whose fingerprint (or resolved
+    fingerprints) has a `"confirmed"` verdict in `findings.json`.
+    """
+    with _maybe_chdir(run_dir), run_lock("ledger"):
+        units, candidates = load_state()
+        findings = {f["fingerprint"]: f for f in load_json_optional(FINDINGS, [])}
+        mm = ModuleMap.load(".")
+        now = utc_now()
+        reason_text = str(reason or "superseded_by_repair")
+        current_digest = phase0_gates.harness_digest(Path("."), module, ignore_exempt=True)
+
+        superseded_fps: list[str] = []
+        partially_superseded_fps: list[str] = []
+        untouched_confirmed = 0
+        for fp, cand in sorted(candidates.items()):
+            cand_mod = str(cand.get("module") or "")
+            cand_harness = _candidate_harness_module(mm, cand)
+            raw_mod_digests = cand.get("module_harness_digests")
+            mod_digests: dict[str, str] = (
+                {
+                    str(k): str(v)
+                    for k, v in raw_mod_digests.items()
+                    if isinstance(k, str) and k and isinstance(v, str) and v
+                }
+                if isinstance(raw_mod_digests, dict)
+                else {}
+            )
+            has_mod_digests = bool(mod_digests)
+
+            matched_mod_key: str | None = None
+            direct_module_match = module in (cand_mod, cand_harness)
+            if has_mod_digests:
+                if module in mod_digests:
+                    matched_mod_key = module
+                elif cand_harness == module and cand_mod in mod_digests:
+                    matched_mod_key = cand_mod
+                else:
+                    continue
+            else:
+                observed_match = _candidate_observed_by_module(cand, module)
+                if not (direct_module_match or observed_match):
+                    continue
+
+            resolved_fps = list(cand.get("resolved_fingerprints") or [fp])
+            is_confirmed = (
+                cand.get("status") == "confirmed"
+                or any((findings.get(rfp) or {}).get("verdict") == "confirmed" for rfp in resolved_fps)
+            )
+            if is_confirmed:
+                untouched_confirmed += 1
+                continue
+            if cand.get("status") != "unverified":
+                continue
+
+            if has_mod_digests and matched_mod_key is not None:
+                active_digest = mod_digests[matched_mod_key]
+                if old_harness_digest is not None and active_digest != old_harness_digest:
+                    continue
+                remaining = {m: d for m, d in mod_digests.items() if m != matched_mod_key}
+                sup_map = cand.setdefault("superseded_module_digests", {})
+                sup_map[matched_mod_key] = active_digest
+                if remaining:
+                    cand["module_harness_digests"] = dict(sorted(remaining.items()))
+                    if cand_mod == matched_mod_key or cand_mod not in remaining:
+                        next_mod, next_digest = sorted(remaining.items())[0]
+                        cand["module"] = next_mod
+                        cand["harness_digest"] = next_digest
+                    else:
+                        cand["harness_digest"] = remaining[cand_mod]
+                    partially_superseded_fps.append(fp)
+                    continue
+                cand["module_harness_digests"] = {}
+            else:
+                cand_digest = cand.get("harness_digest") if isinstance(cand.get("harness_digest"), str) else None
+                if not direct_module_match:
+                    # Legacy multi-module candidate without `module_harness_digests` where `module`
+                    # appears in observations: match only on an explicit digest match.
+                    if old_harness_digest is None or cand_digest != old_harness_digest:
+                        continue
+                elif old_harness_digest is not None:
+                    if cand_digest is not None:
+                        if cand_digest != old_harness_digest:
+                            continue
+                    else:
+                        # Legacy candidate without an embedded harness_digest: supersede only when
+                        # the harness was repaired away from old_harness_digest and origin is harness-based.
+                        if cand.get("origin") not in ("fuzz", "eva"):
+                            continue
+                        if current_digest is not None and current_digest == old_harness_digest:
+                            continue
+
+            cand["status"] = "superseded_by_repair"
+            cand["superseded_reason"] = reason_text
+            cand["superseded_at"] = now
+            if old_harness_digest:
+                cand["superseded_from_harness_digest"] = str(old_harness_digest)
+            superseded_fps.append(fp)
+
+            for cid in cand.get("linked_units") or []:
+                u = units.get(cid)
+                if u is None:
+                    continue
+                if fp in u["result_fingerprints"]:
+                    u["result_fingerprints"] = [x for x in u["result_fingerprints"] if x != fp]
+                    u["attempts"].append(
+                        {
+                            "phase": "verifier",
+                            "agent_id": None,
+                            "decision": "superseded_by_repair",
+                            "reason": reason_text,
+                            "result_fingerprints": [fp],
+                        }
+                    )
+                    add_evidence(
+                        u,
+                        "verifier",
+                        "ledger.py",
+                        "candidate_superseded_by_repair",
+                        False,
+                        (cand.get("tool_outputs") or [None])[0],
+                        f"Unverified candidate {fp} superseded after harness repair ({reason_text}).",
+                        {"fingerprint": fp, "module": module, "old_harness_digest": old_harness_digest},
+                    )
+                    if u["status"] == "candidate" and not u["result_fingerprints"]:
+                        u["status"] = "planned"
+                        u["agent_id"] = None
+                        u["unresolved"] = []
+
+        if superseded_fps or partially_superseded_fps:
+            commit(units, candidates)
+
+        return {
+            "module": module,
+            "old_harness_digest": old_harness_digest,
+            "reason": reason_text,
+            "superseded": len(superseded_fps),
+            "superseded_fingerprints": superseded_fps,
+            "partially_superseded": len(partially_superseded_fps),
+            "partially_superseded_fingerprints": partially_superseded_fps,
+            "untouched_confirmed": untouched_confirmed,
+        }
 
 
 def _alarm_in_file(alarm: dict, unit_file: str) -> bool:
@@ -6246,15 +7440,31 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also re-derive the units without evidence from the current DAG (a Phase 0 re-run on a changed target)",
     )
-    for name in ("ingest-fuzz", "ingest-eva", "ingest-wp"):
+    for name in ("ingest-fuzz", "ingest-judge", "ingest-eva", "ingest-wp"):
         p = sub.add_parser(name)
         p.add_argument("reports", nargs="+", type=Path)
+        if name == "ingest-fuzz":
+            p.add_argument(
+                "--judge-report",
+                dest="judge_reports",
+                action="append",
+                type=Path,
+                default=[],
+                help="Additional workspace/reports/judge/<mod>.json report(s) to ingest alongside fuzz reports (P2c)",
+            )
         if name == "ingest-wp":
             p.add_argument(
                 "--sweep",
                 action="store_true",
                 help="Reports are the trusted wp-sweep re-proof: WP-covered units they do not credit become blocked",
             )
+    p_sup = sub.add_parser(
+        "supersede-candidates",
+        help="Mark unverified candidates from a repaired module's old harness digest as superseded_by_repair (P5)",
+    )
+    p_sup.add_argument("--module", required=True, help="Module whose stale unverified candidates are superseded")
+    p_sup.add_argument("--old-harness-digest", default=None, help="Old harness SHA-256 digest before repair")
+    p_sup.add_argument("--reason", default="superseded_by_repair", help="Reason recorded on superseded candidates")
     p_hyp = sub.add_parser("ingest-agent-hypothesis")
     p_hyp.add_argument("result", type=Path)
     p_hyp.add_argument("--module", default=None)
@@ -6343,7 +7553,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.dag, args.scope, args.callgraph_source, args.profile, args.security_props, refresh=args.refresh
             )
         elif args.cmd == "ingest-fuzz":
-            out = cmd_ingest_fuzz(args.reports)
+            out = cmd_ingest_fuzz(args.reports, judge_reports=args.judge_reports or None)
+        elif args.cmd == "ingest-judge":
+            out = cmd_ingest_judge(args.reports)
+        elif args.cmd == "supersede-candidates":
+            out = cmd_supersede_candidates(
+                module=args.module,
+                old_harness_digest=args.old_harness_digest,
+                reason=args.reason,
+            )
         elif args.cmd == "ingest-eva":
             out = cmd_ingest_eva(args.reports)
         elif args.cmd == "ingest-wp":

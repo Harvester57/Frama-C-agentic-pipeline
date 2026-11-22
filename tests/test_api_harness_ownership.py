@@ -241,7 +241,7 @@ def test_the_unpackers_case_takes_the_rest_of_the_input_and_frees_what_it_return
     assert lay["rest"] == {"call": 0, "param": 2, "kind": "bytes"}, lay
     assert lay["slots"] == [], lay
     # The message it returns is released with the paired destructor, or every run leaks one.
-    assert "if (c0r != 0) { (void)msg__free_unpacked((struct Msg *)c0r, (struct Alloc *)0); }" in text, text
+    assert "if (c0r != 0) { (void)msg__free_unpacked((struct Msg *)c0r, NULL); }" in text, text
 
 
 @pytest.mark.unit

@@ -65,9 +65,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections import defaultdict, deque
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -110,11 +112,101 @@ INPUT_READERS = frozenset(
     }
 )
 LIBRARY_KINDS = frozenset({"static_lib", "shared_lib"})
+HARNESS_SCOPE_V2_ENV = "FRAMAC_HARNESS_SCOPE_V2"
+_OFF_VALUES = frozenset({"off", "0", "false", "no"})
+UNIT_VISIBILITIES = frozenset({"executable", "plugin_so", "public_lib", "internal_convenience"})
 # The deciding source of an untrusted function, most specific first.
 SOURCE_ORDER = ("threat_model", "default", "call_graph", "codeql")
 UNTRUSTED, TRUSTED = "untrusted", "trusted"
 STATUS_OK, STATUS_NONE, STATUS_INVALID = "ok", "no_threat_model", "invalid_threat_model"
 MAX_REASONS = 6
+
+
+def harness_scope_v2_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """True unless FRAMAC_HARNESS_SCOPE_V2 is explicitly off/0/false/no (default on)."""
+    src = os.environ if env is None else env
+    raw = (src.get(HARNESS_SCOPE_V2_ENV) or "").strip().lower()
+    return raw not in _OFF_VALUES
+
+
+def unit_visibility_of(unit: str, units: Mapping[str, dict[str, Any]]) -> str:
+    """External visibility class of a non-test unit (`executable`, `plugin_so`, `public_lib`, `internal_convenience`)."""
+    u = units.get(unit) or {}
+    vis = u.get("unit_visibility")
+    if isinstance(vis, str) and vis in UNIT_VISIBILITIES:
+        return vis
+    kind = u.get("kind")
+    if kind == "executable":
+        return "executable"
+    if kind == "shared_lib":
+        if not (u.get("entry_points") or []) and (u.get("exported_data_symbols") or []):
+            return "plugin_so"
+        return "public_lib"
+    return "public_lib"
+
+
+def plugin_vtable_callbacks(model: dict[str, Any], unit: str) -> list[str]:
+    """
+    Resolve a `plugin_so` unit's `exported_data_symbols` against `global_variables[*].init_functions`
+    (following `init_globals` transitively) to sorted plugin vtable callback function IDs.
+    """
+    units = model.get("units") or {}
+    u = units.get(unit) or {}
+    exported = {str(s) for s in u.get("exported_data_symbols") or [] if isinstance(s, str) and s}
+    if not exported:
+        return []
+    functions = model.get("functions") or {}
+    gvars = {gid: g for gid, g in (model.get("global_variables") or {}).items() if isinstance(g, dict)}
+    unit_by_name: dict[str, list[str]] = defaultdict(list)
+    for fid, frec in sorted(functions.items()):
+        if isinstance(frec, dict):
+            funits = frec.get("units") or []
+            if not funits or unit in funits:
+                unit_by_name[str(frec.get("name") or fid.split("#")[-1])].append(fid)
+
+    ufiles = {str(f) for f in u.get("files") or []}
+    queue: deque[str] = deque()
+    for gid, g in sorted(gvars.items()):
+        if g.get("static"):
+            continue
+        gname = str(g.get("name") or gid.split("#")[-1])
+        if gname not in exported:
+            continue
+        gunits = g.get("units") or []
+        if gunits:
+            if unit not in gunits:
+                continue
+        elif ufiles and str(g.get("file") or "") not in ufiles:
+            continue
+        queue.append(gid)
+
+    seen_globals: set[str] = set()
+    callbacks: list[str] = []
+    seen_fns: set[str] = set()
+    while queue:
+        gid = queue.popleft()
+        if gid in seen_globals:
+            continue
+        seen_globals.add(gid)
+        grec = gvars.get(gid)
+        if not isinstance(grec, dict):
+            continue
+        for ref in grec.get("init_functions") or []:
+            if not isinstance(ref, str) or not ref:
+                continue
+            if ref in functions:
+                if ref not in seen_fns:
+                    seen_fns.add(ref)
+                    callbacks.append(ref)
+            else:
+                for fid in unit_by_name.get(ref, []):
+                    if fid not in seen_fns:
+                        seen_fns.add(fid)
+                        callbacks.append(fid)
+        for ig in grec.get("init_globals") or []:
+            if isinstance(ig, str) and ig in gvars and ig not in seen_globals:
+                queue.append(ig)
+    return sorted(callbacks)
 
 _FENCE_RE = re.compile(
     # `\r` before the line ends: a THREAT_MODEL.md with CRLF line endings (a Windows checkout).
@@ -344,6 +436,7 @@ class _Index:
     """Name and unit lookups over a model."""
 
     def __init__(self, model: dict):
+        self.model = model
         self.functions: dict[str, dict] = model.get("functions") or {}
         self.units: dict[str, dict] = {n: u for n, u in (model.get("units") or {}).items() if not u.get("test")}
         self.by_name: dict[str, list[str]] = defaultdict(list)
@@ -376,8 +469,15 @@ class _Index:
         hits = [n for n in self.units if Path(n).name == ref]
         return hits[0] if len(hits) == 1 else None
 
-    def api(self, unit: str) -> list[str]:
+    def api(self, unit: str, *, scope_v2: bool = False) -> list[str]:
         u = self.units.get(unit) or {}
+        if scope_v2:
+            vis = unit_visibility_of(unit, self.units)
+            if vis == "public_lib":
+                return [f for f in dict.fromkeys(u.get("entry_points") or []) if f in self.functions]
+            if vis == "plugin_so":
+                return [f for f in plugin_vtable_callbacks(self.model, unit) if f in self.functions]
+            return []
         api = list(u.get("entry_points") or []) if u.get("kind") in LIBRARY_KINDS else []
         api += list(u.get("embedded_api") or [])
         return [f for f in dict.fromkeys(api) if f in self.functions]
@@ -387,6 +487,8 @@ class _Marks:
     def __init__(self) -> None:
         self.untrusted: dict[str, dict[str, list[str]]] = defaultdict(dict)
         self.boundary: set[str] = set()
+        self.input_role: dict[str, str] = {}
+        self.attacker_params: dict[str, list[str] | None] = {}
 
     def add(self, fid: str, source: str, reason: str, boundary: bool = False) -> None:
         reasons = self.untrusted[fid].setdefault(source, [])
@@ -395,11 +497,35 @@ class _Marks:
         if boundary:
             self.boundary.add(fid)
 
+    def set_input_source(self, fid: str, role: str, params: list[str] | None) -> None:
+        clean = list(dict.fromkeys(str(p) for p in params if p)) if params is not None else None
+        if fid not in self.input_role:
+            self.input_role[fid] = role
+            self.attacker_params[fid] = clean
+            return
+        if role == "entry":
+            self.input_role[fid] = "entry"
+        prev = self.attacker_params[fid]
+        if prev is None or clean is None:
+            self.attacker_params[fid] = None
+        else:
+            self.attacker_params[fid] = list(dict.fromkeys([*prev, *clean]))
 
-def _threat_rules(idx: _Index, block: dict, marks: _Marks, roots: dict[str, str], warnings: list[str]) -> dict:
+
+def _threat_rules(
+    idx: _Index,
+    block: dict,
+    marks: _Marks,
+    roots: dict[str, str],
+    warnings: list[str],
+    *,
+    scope_v2: bool = False,
+) -> dict:
     """Input sources (marks and roots) and trusted callers (returned: id -> reason)."""
     for item in block.get("input_sources") or []:
         ref, role = str(item.get("function") or ""), item.get("role")
+        raw_params = item.get("params")
+        params = [str(p) for p in raw_params if p] if isinstance(raw_params, list) else None
         fids = idx.resolve(ref)
         name = ref.split("#")[-1]
         if role == "entry":
@@ -407,11 +533,13 @@ def _threat_rules(idx: _Index, block: dict, marks: _Marks, roots: dict[str, str]
                 warnings.append(f"threat model: input source {ref} is not a function of the build")
             for fid in fids:
                 marks.add(fid, "threat_model", "threat-model input source (entry)", boundary=True)
+                marks.set_input_source(fid, "entry", params)
                 roots.setdefault(fid, "threat-model input source")
             continue
         # A reader: its callers get its data. A project reader also handles the raw data itself.
         for fid in fids:
             marks.add(fid, "threat_model", "threat-model input source (reader)")
+            marks.set_input_source(fid, "reader", params)
             roots.setdefault(fid, "threat-model reader")
             for caller in sorted(idx.callers.get(fid, ())):
                 roots.setdefault(caller, f"calls {idx.functions[fid].get('name')} (threat-model reader)")
@@ -432,7 +560,7 @@ def _threat_rules(idx: _Index, block: dict, marks: _Marks, roots: dict[str, str]
             for ref in item.get("except") or []:
                 if not idx.resolve(str(ref)):
                     warnings.append(f"threat model: trusted_callers except {ref} is not a function of the build")
-            for fid in idx.api(unit):
+            for fid in idx.api(unit, scope_v2=scope_v2):
                 if fid not in keep:
                     trusted.setdefault(fid, reason)
         for ref in item.get("functions") or []:
@@ -556,33 +684,85 @@ def _codeql_marks(idx: _Index, codeql: dict, marks: _Marks, warnings: list[str])
     return used, unmatched
 
 
-def compute_trust(model: dict, threat: dict | None = None, codeql: dict | None = None) -> dict:
+def compute_trust(
+    model: dict,
+    threat: dict | None = None,
+    codeql: dict | None = None,
+    *,
+    scope_v2: bool | None = None,
+) -> dict:
     """The trust annotation of a model: {functions, units, summary, warnings} (see the module doc)."""
+    v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     idx = _Index(model)
     marks = _Marks()
     warnings: list[str] = []
     threat = threat or {"status": STATUS_NONE}
-    # Rule 1: library API.
-    for unit in sorted(idx.units):
-        u = idx.units[unit]
-        exported = set(u.get("entry_points") or []) if u.get("kind") in LIBRARY_KINDS else set()
-        for fid in idx.api(unit):
-            what = "API" if fid in exported else "embedded API"
-            marks.add(fid, "default", f"{what} of {unit}", boundary=True)
+    # Rule 1: library API (under FRAMAC_HARNESS_SCOPE_V2, public_lib exports & plugin_so vtable callbacks only).
+    if v2:
+        for unit in sorted(idx.units):
+            vis = unit_visibility_of(unit, idx.units)
+            if vis == "public_lib":
+                for fid in idx.api(unit, scope_v2=True):
+                    marks.add(fid, "default", f"API of {unit}", boundary=True)
+            elif vis == "plugin_so":
+                for fid in idx.api(unit, scope_v2=True):
+                    marks.add(fid, "default", f"plugin vtable callback of {unit}", boundary=True)
+    else:
+        for unit in sorted(idx.units):
+            u = idx.units[unit]
+            exported = set(u.get("entry_points") or []) if u.get("kind") in LIBRARY_KINDS else set()
+            for fid in idx.api(unit):
+                what = "API" if fid in exported else "embedded API"
+                marks.add(fid, "default", f"{what} of {unit}", boundary=True)
     # Rule 2: input roots, then the call graph.
     roots: dict[str, str] = {}
+    reader_roots: dict[str, list[str]] = {}
     if idx.functions and not model_features(model)["external_calls"]:
         warnings.append("the model records no external calls (made before step I7): input readers are not seen")
     for fid, f in sorted(idx.functions.items()):
         readers = sorted(set(f.get("external_calls") or []) & INPUT_READERS)
         if readers:
             roots[fid] = f"calls {', '.join(readers)}"
+            reader_roots[fid] = readers
         if f.get("name") == "main" and not f.get("static") and has_parameters(f.get("signature")):
             roots[fid] = "; ".join(filter(None, ["main with argv", roots.get(fid)]))
             marks.boundary.add(fid)
     trusted: dict[str, str] = {}
-    if threat.get("status") == STATUS_OK and threat.get("block"):
-        trusted = _threat_rules(idx, threat["block"], marks, roots, warnings)
+    missing_tm_warnings: list[str] = []
+    threat_active = threat.get("status") == STATUS_OK and bool(threat.get("block"))
+    if threat_active:
+        trusted = _threat_rules(idx, threat["block"], marks, roots, warnings, scope_v2=v2)
+        if v2:
+            block = threat["block"]
+            tm_input_fids = set(marks.input_role)
+            tm_reader_names = {
+                str(item.get("function") or "").split("#")[-1]
+                for item in block.get("input_sources") or []
+                if isinstance(item, dict) and item.get("role") == "reader"
+            }
+            warned_fids: set[str] = set()
+            for unit in sorted(idx.units):
+                if unit_visibility_of(unit, idx.units) != "public_lib":
+                    continue
+                for fid in idx.api(unit, scope_v2=True):
+                    if fid not in tm_input_fids and fid not in trusted and fid not in warned_fids:
+                        warned_fids.add(fid)
+                        missing_tm_warnings.append(
+                            f"threat model: public_lib export {fid} (unit {unit}) is missing from "
+                            f"{THREAT_MODEL_NAME} input_sources"
+                        )
+            for fid, readers in sorted(reader_roots.items()):
+                if (
+                    fid not in tm_input_fids
+                    and fid not in trusted
+                    and fid not in warned_fids
+                    and not (set(readers) <= tm_reader_names)
+                ):
+                    warned_fids.add(fid)
+                    missing_tm_warnings.append(
+                        f"threat model: input_reader root {fid} (calls {', '.join(readers)}) is missing from "
+                        f"{THREAT_MODEL_NAME} input_sources"
+                    )
     for root, why in sorted(roots.items()):
         marks.add(root, "call_graph", why)
     # Breadth first from every root in turn: a function is visited once, named after the first root.
@@ -607,6 +787,9 @@ def compute_trust(model: dict, threat: dict | None = None, codeql: dict | None =
             codeql_info.update(facts=used, unmatched=len(unmatched))
         else:
             warnings.append(f"codeql: status {codeql.get('status')}, its facts are not used")
+    # Append per-function missing-from-THREAT_MODEL advisory warnings after operational/CodeQL
+    # warnings so truncated CLI summaries (`warnings[:10]`) never drown out CodeQL diagnostics.
+    warnings.extend(missing_tm_warnings)
     # Decide.
     functions: dict[str, dict] = {}
     for fid in sorted(idx.functions):
@@ -640,6 +823,9 @@ def compute_trust(model: dict, threat: dict | None = None, codeql: dict | None =
                 "boundary": False,
                 "reasons": ["not API and not on an input path"],
             }
+        if fid in marks.input_role:
+            rec["input_role"] = marks.input_role[fid]
+            rec["attacker_params"] = marks.attacker_params[fid]
         functions[fid] = rec
     units: dict[str, dict] = {}
     for unit in sorted(idx.units):
@@ -649,7 +835,7 @@ def compute_trust(model: dict, threat: dict | None = None, codeql: dict | None =
             "functions": len(fids),
             "untrusted": sum(1 for f in fids if functions[f]["value"] == UNTRUSTED),
             "boundary": sum(1 for f in fids if functions[f]["boundary"]),
-            "api": len(idx.api(unit)),
+            "api": len(idx.api(unit, scope_v2=v2)),
         }
     by_source: dict[str, int] = defaultdict(int)
     for rec in functions.values():
@@ -749,6 +935,8 @@ def annotate_model(
     codeql_path: Path | None = None,
     metadata: dict | None = None,
     threat: dict | None = None,
+    *,
+    scope_v2: bool | None = None,
 ) -> dict:
     """
     Add `trust` to the model's functions and units and a top-level `trust` block; returns the block.
@@ -759,11 +947,12 @@ def annotate_model(
     if threat is None:
         threat = load_threat_model(find_threat_model(threat_path, model))
     codeql, codeql_state = load_codeql(metadata, codeql_path)
-    result = compute_trust(model, threat, codeql)
+    result = compute_trust(model, threat, codeql, scope_v2=scope_v2)
     if codeql_state.get("status") == "not_run":
-        result["warnings"].append(
+        result["warnings"].insert(
+            0,
             f"codeql: enabled for the run, but there is no report at {codeql_state['path']}: no CodeQL fact is "
-            "used (codeql_trust.py run, then trust.py run)"
+            "used (codeql_trust.py run, then trust.py run)",
         )
     for fid, rec in result["functions"].items():
         model["functions"][fid]["trust"] = rec
@@ -811,6 +1000,12 @@ def function_trust(records: dict, function: str, file: str | None = None) -> dic
     untrusted = [h for h in hits if h.get("value") == UNTRUSTED]
     best = dict(untrusted[0] if untrusted else hits[0])
     best["boundary"] = any(h.get("boundary") for h in hits)
+    if "input_role" not in best:
+        for h in hits:
+            if h.get("input_role") is not None:
+                best["input_role"] = h["input_role"]
+                best["attacker_params"] = h.get("attacker_params")
+                break
     return best
 
 
@@ -850,6 +1045,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     if problems:
         model["warnings"].append(f"schema: {problems[:5]}")
     atomic_write_json(args.model, model)
+    if harness_scope_v2_enabled():
+        for w in block["warnings"]:
+            if "missing from" in w:
+                print(f"warning: {w}", file=sys.stderr)
     out = {
         "ok": True,
         "threat_model": block["threat_model"],

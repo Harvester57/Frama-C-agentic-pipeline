@@ -1,0 +1,115 @@
+{
+  "$comment": "Contract for workspace/reports/smoke/<module>.json, written by scripts/harness_smoke.py run (P3 standalone harness smoke gate): records binary startup verification (sanitizers and optional E-ACSL), per-case dispatch smoke outcomes (passed, quarantined harness_setup_fault, or candidate_warning kept active for Phase 1 fuzzing), quarantined case indices and FRAMAC_FUZZ_SKIP_CASES value, and non-dispatch smoke checks.",
+  "type": "object",
+  "definitions": {
+    "startup_engine_result": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "binary": {"type": "string"},
+        "returncode": {"type": ["integer", "null"]},
+        "timed_out": {"type": "boolean"},
+        "reason": {"type": ["string", "null"]},
+        "stack_trace": {"type": ["string", "null"]},
+        "failure": {"type": ["object", "null"]}
+      },
+      "required": ["ok", "binary", "returncode", "timed_out", "reason", "stack_trace", "failure"],
+      "additionalProperties": false
+    },
+    "case_result": {
+      "type": "object",
+      "properties": {
+        "case": {"type": "integer", "minimum": 0},
+        "entry": {"type": ["string", "null"]},
+        "status": {"type": "string", "enum": ["passed", "quarantined", "candidate_warning"]},
+        "probes_run": {"type": "integer", "minimum": 0},
+        "classification": {
+          "type": ["string", "null"],
+          "enum": ["harness_setup_fault", "empty_input_candidate", "target_crash_candidate", "startup_error", null]
+        },
+        "probe_kind": {"type": ["string", "null"], "enum": ["empty", "zero64", "seed", null]},
+        "payload_len": {"type": ["integer", "null"], "minimum": 0},
+        "kind": {"type": ["string", "null"]},
+        "fingerprint": {"type": ["string", "null"]},
+        "reason": {"type": ["string", "null"]},
+        "returncode": {"type": ["integer", "null"]},
+        "timed_out": {"type": "boolean"},
+        "failure": {"type": ["object", "null"]},
+        "log_tail": {"type": "string"}
+      },
+      "required": ["case", "status", "probes_run"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "module": {"type": "string", "minLength": 1},
+    "harness_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "entry_style": {"type": "string", "minLength": 1},
+    "dispatch_case_count": {"type": "integer", "minimum": 0, "maximum": 4096},
+    "status": {"type": "string", "enum": ["ok", "degraded", "startup_error", "failed"]},
+    "startup": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "engines_checked": {
+          "type": "array",
+          "items": {"type": "string", "enum": ["sanitizers", "eacsl"]},
+          "uniqueItems": true
+        },
+        "failing_engine": {"type": ["string", "null"], "enum": ["sanitizers", "eacsl", null]},
+        "reason": {"type": ["string", "null"]},
+        "stack_trace": {"type": ["string", "null"]},
+        "results": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/definitions/startup_engine_result"}
+        }
+      },
+      "required": ["ok", "engines_checked", "failing_engine", "reason", "stack_trace", "results"],
+      "additionalProperties": false
+    },
+    "quarantined_cases": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "uniqueItems": true
+    },
+    "candidate_warning_cases": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "uniqueItems": true
+    },
+    "skip_cases_env": {
+      "type": "string",
+      "pattern": "^(?:|\\d+(?:,\\d+)*)$"
+    },
+    "case_results": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/case_result"}
+    },
+    "counts": {
+      "type": "object",
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "quarantined": {"type": "integer", "minimum": 0},
+        "candidate_warning": {"type": "integer", "minimum": 0}
+      },
+      "required": ["total", "passed", "quarantined", "candidate_warning"],
+      "additionalProperties": false
+    },
+    "wall_s": {"type": "number", "minimum": 0}
+  },
+  "required": [
+    "schema_version",
+    "module",
+    "harness_digest",
+    "status",
+    "startup",
+    "quarantined_cases",
+    "case_results",
+    "skip_cases_env",
+    "wall_s"
+  ],
+  "additionalProperties": false
+}

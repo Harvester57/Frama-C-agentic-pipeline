@@ -1296,3 +1296,333 @@ def failure_fingerprint(failure: dict | None) -> str | None:
         failure.get("alarm_kind") or failure.get("kind") or "crash",
         failure.get("predicate") or "",
     )
+
+
+# ---------------------------------------------------------------------------
+# Startup failure & standalone harness smoke failure classification (P3)
+# ---------------------------------------------------------------------------
+
+STARTUP_FAILURE_FUNCTIONS = frozenset(
+    {
+        "LLVMFuzzerInitialize",
+        "__e_acsl_globals_init",
+        "__e_acsl_memory_init",
+        "__e_acsl_argv_alloca",
+        "shadow_alloca",
+    }
+)
+
+_STARTUP_ONLY_INIT_FRAMES = frozenset(
+    {
+        "_dl_init",
+        "call_init",
+        "__libc_csu_init",
+        "__do_global_ctors_aux",
+    }
+)
+
+_FUZZ_ENTRY_FRAMES = frozenset(
+    {
+        "LLVMFuzzerTestOneInput",
+        "fuzzer::Fuzzer::ExecuteCallback",
+        "fuzzer::Fuzzer::RunOne",
+    }
+)
+
+_SIGNAL_OR_ABORT_FRAMES = frozenset(
+    {
+        "raise",
+        "abort",
+        "gsignal",
+        "__pthread_kill_implementation",
+        "pthread_kill",
+        "private_abort",
+        "raise_abort",
+        "vabort",
+        "private_assert_fail",
+    }
+)
+
+_STARTUP_LOADER_ERR_RE = re.compile(
+    r"error while loading shared libraries"
+    r"|symbol lookup error"
+    r"|undefined symbol:"
+    r"|Shadow memory range interleaves"
+    r"|AddressSanitizer failed to allocate"
+    r"|ERROR:\s*Failed to mmap",
+    re.IGNORECASE,
+)
+
+_FUZZ_STARTED_INPUT_RE = re.compile(
+    r"(?:^Running:\s+\S|^Executed\s+\S|^#\d+(?:\t|:\s)|LLVMFuzzerTestOneInput)",
+    re.MULTILINE,
+)
+
+_CRASH_OR_ABORT_RE = re.compile(
+    r"ERROR:\s*(?:AddressSanitizer|UndefinedBehaviorSanitizer|libFuzzer)"
+    r"|UndefinedBehaviorSanitizer:DEADLYSIGNAL"
+    r"|SUMMARY:\s*(?:AddressSanitizer|UndefinedBehaviorSanitizer|libFuzzer)"
+    r"|Segmentation fault"
+    r"|Aborted\b"
+    r"|\bSIG(?:ABRT|SEGV|BUS|ILL|FPE)\b"
+    r"|Assertion\s+.+\s+failed"
+    r"|:\s*Error:\s*Assertion failed",
+    re.IGNORECASE,
+)
+
+_LIBFUZZER_BANNER_RE = re.compile(
+    r"^INFO:\s*(?:Running with entropic|Seed:|Loaded \d+ modules)",
+    re.MULTILINE,
+)
+
+_HARNESS_STACK_VAR_RE = re.compile(r"(?:'c\d+a\d+(?:_[A-Za-z0-9_]+)?'|\bc\d+a\d+\b)")
+_NON_MALLOC_FREE_RE = re.compile(r"attempting free on address which was not malloc\(\)-ed", re.IGNORECASE)
+_NULL_DEREF_RE = re.compile(
+    r"null\s+pointer|member access within null pointer|load of null pointer|store to null pointer|null-deref|\bnullptr\b",
+    re.IGNORECASE,
+)
+_SEGV_NULL_ADDR_RE = re.compile(
+    r"(?:SEGV on unknown address 0x0*[0-9a-fA-F]{1,3}(?![0-9a-fA-F])|address points to the zero page)",
+    re.IGNORECASE,
+)
+_ARITH_OR_BUFFER_ALARMS = frozenset(
+    {
+        "index_bound",
+        "signed_overflow",
+        "unsigned_overflow",
+        "shift",
+        "division_by_zero",
+        "dangling_pointer",
+        "separation",
+        "valid_string",
+        "is_nan_or_infinite",
+        "bool_value",
+    }
+)
+_BUFFER_OVERFLOW_KINDS = (
+    "heap_buffer_overflow",
+    "global_buffer_overflow",
+    "stack_buffer_overflow",
+    "heap_use_after_free",
+    "stack_use_after_scope",
+    "stack_use_after_return",
+    "container_overflow",
+    "negative_size_param",
+)
+
+
+def _is_startup_function(name: str | None) -> bool:
+    if not name:
+        return False
+    return (
+        name in STARTUP_FAILURE_FUNCTIONS
+        or name.endswith("LLVMFuzzerInitialize")
+        or name.startswith(("__e_acsl_globals_init", "__e_acsl_memory_init", "__e_acsl_argv_alloca"))
+    )
+
+
+def _is_always_startup_frame(name: str) -> bool:
+    return (
+        (name in STARTUP_FAILURE_FUNCTIONS and name != "shadow_alloca")
+        or name.endswith("LLVMFuzzerInitialize")
+        or name.startswith(("__e_acsl_globals_init", "__e_acsl_memory_init", "__e_acsl_argv_alloca"))
+        or name in _STARTUP_ONLY_INIT_FRAMES
+        or name.startswith("_GLOBAL__sub_I_")
+    )
+
+
+def _is_fuzz_init_file(file_path: str | None) -> bool:
+    if not file_path:
+        return False
+    norm = file_path.replace("\\", "/")
+    return norm == "fuzz_init.c" or norm.endswith("/fuzz_init.c")
+
+
+def _has_non_startup_target_site(failure: dict | None) -> bool:
+    """True when `failure` identifies a concrete, non-startup, non-runtime function or source file."""
+    if not isinstance(failure, dict):
+        return False
+    fn = str(failure.get("function") or "").strip()
+    file_ = str(failure.get("file") or "").strip()
+    if _is_startup_function(fn) or _is_fuzz_init_file(file_):
+        return False
+    if is_runtime_function(fn, file_):
+        return False
+    has_fn = bool(fn) and fn not in ("unknown", "unknown_function")
+    has_file = bool(file_) and file_ not in ("unknown", "<unknown>")
+    return has_fn or has_file
+
+
+def is_startup_failure(failure: dict | None, log_text: str = "") -> tuple[bool, str | None]:
+    """
+    Detect a crash or abort occurring during binary/runtime startup before `LLVMFuzzerTestOneInput`
+    is entered (for example in `LLVMFuzzerInitialize`, `__e_acsl_globals_init`, `__e_acsl_memory_init`,
+    `__e_acsl_argv_alloca`, `shadow_alloca`, global constructors, or dynamic loader initialization).
+    """
+    if isinstance(failure, dict):
+        fn = str(failure.get("function") or "")
+        if _is_startup_function(fn):
+            return True, f"startup failure in {fn}"
+        file_ = str(failure.get("file") or "")
+        if _is_fuzz_init_file(file_):
+            return True, f"startup failure in {Path(file_).name}"
+
+    if not log_text:
+        return False, None
+
+    started_input = _FUZZ_STARTED_INPUT_RE.search(log_text) is not None
+    loader_m = _STARTUP_LOADER_ERR_RE.search(log_text)
+    if loader_m and not started_input:
+        return True, f"startup loader/runtime error: {loader_m.group(0)}"
+
+    frames = list(_STACK_FRAME_RE.finditer(log_text))
+    first_stack = _first_stack(frames, 0) if frames else []
+    entered_fuzz = any(
+        m.group("function") in _FUZZ_ENTRY_FRAMES
+        or m.group("function").startswith(("fuzzer::Fuzzer::ExecuteCallback", "fuzzer::Fuzzer::RunOne"))
+        for m in first_stack
+    )
+
+    # Top non-signal / non-sanitizer-wrapper frame in the crash stack.
+    for m in first_stack:
+        fn = m.group("function")
+        if fn in _SIGNAL_OR_ABORT_FRAMES or fn.startswith(
+            (
+                "__asan",
+                "__ubsan",
+                "__sanitizer",
+                "__interceptor",
+                "fuzzer::PrintStackTrace",
+                "fuzzer::Fuzzer::Crash",
+                "fuzzer::Fuzzer::Static",
+            )
+        ):
+            continue
+        if _is_startup_function(fn):
+            return True, f"startup failure in {fn}"
+        break
+
+    for m in first_stack:
+        fn, fpath = m.group("function"), m.group("file") or ""
+        if _is_always_startup_frame(fn):
+            return True, f"startup failure in {fn}"
+        if _is_fuzz_init_file(fpath):
+            return True, f"startup failure in fuzz_init.c ({fn})"
+        if fn == "shadow_alloca" and not entered_fuzz:
+            return True, "startup failure in shadow_alloca before LLVMFuzzerTestOneInput"
+
+    is_lsan = _LSAN_ERR_RE.search(log_text) is not None
+    if first_stack and not entered_fuzz and not is_lsan:
+        if any(m.group("function").startswith("fuzzer::FuzzerDriver") for m in first_stack):
+            return True, "crash/abort in libFuzzer startup before LLVMFuzzerTestOneInput"
+        has_process_entry = any(
+            m.group("function") in ("_start", "__libc_start_main", "__libc_start_call_main") for m in first_stack
+        )
+        has_target_main = any(
+            m.group("function") == "main" and m.group("file") and not is_runtime_function("main", m.group("file"))
+            for m in first_stack
+        )
+        if has_process_entry and not has_target_main and not started_input:
+            return True, "crash/abort during process startup before LLVMFuzzerTestOneInput"
+
+    if not started_input and not is_lsan and _CRASH_OR_ABORT_RE.search(log_text):
+        for sfn in (
+            "LLVMFuzzerInitialize",
+            "__e_acsl_globals_init",
+            "__e_acsl_memory_init",
+            "__e_acsl_argv_alloca",
+            "shadow_alloca",
+        ):
+            if re.search(rf"\b{re.escape(sfn)}\b", log_text):
+                return True, f"startup failure referencing {sfn}"
+        if _LIBFUZZER_BANNER_RE.search(log_text):
+            eff_failure = failure if isinstance(failure, dict) else parse_runtime_failure(log_text)
+            if not _has_non_startup_target_site(eff_failure):
+                return True, "crash/abort before LLVMFuzzerTestOneInput was entered"
+
+    return False, None
+
+
+def _is_harness_stack_overflow(kind: str, pred: str, replay_log: str) -> bool:
+    if "stack_buffer_overflow" not in kind and "stack-buffer-overflow" not in replay_log.lower():
+        return False
+    arrow_lines = [line for line in replay_log.splitlines() if "<==" in line]
+    if arrow_lines:
+        return any(_HARNESS_STACK_VAR_RE.search(line) is not None for line in arrow_lines)
+    return bool(_HARNESS_STACK_VAR_RE.search(replay_log) or _HARNESS_STACK_VAR_RE.search(pred))
+
+
+def _is_harness_site(failure: dict | None) -> bool:
+    if not isinstance(failure, dict):
+        return False
+    file_ = str(failure.get("file") or "")
+    fn = str(failure.get("function") or "")
+    if file_ and Path(file_).name.startswith("harness_"):
+        return True
+    return bool(fn and is_harness_fuzz_function(fn))
+
+
+def _is_lsan_direct_caller_harness(replay_log: str) -> bool:
+    m = _LSAN_BLOCK_RE.search(replay_log)
+    if not m:
+        return False
+    stack_lines: list[str] = []
+    for line in replay_log[m.end() :].split("\n")[1:]:
+        if not line.strip():
+            break
+        stack_lines.append(line)
+    for frame in _STACK_FRAME_RE.finditer("\n".join(stack_lines)):
+        fn, fpath = frame.group("function"), frame.group("file") or ""
+        base = re.sub(r"^_+(?:interceptor_)?", "", fn)
+        if is_runtime_function(fn, fpath) or base in _LSAN_ALLOCATORS:
+            continue
+        return (bool(fpath) and Path(fpath).name.startswith("harness_")) or is_harness_fuzz_function(fn)
+    return False
+
+
+def classify_smoke_failure(failure: dict | None, payload_len: int, replay_log: str = "") -> str:
+    """
+    Classify a failure observed during standalone harness smoke execution:
+      - "startup_error": failure during binary/runtime initialization before LLVMFuzzerTestOneInput.
+      - "harness_setup_fault": unambiguous harness-side contract breach (non-malloc free,
+        stack-buffer-overflow on harness frame variable `c<N>a<M>`, `lsan_direct_leak` on setup,
+        crash site inside harness code, or NULL pointer deref / NULL member access on `payload_len == 0`
+        with no target-parsing arithmetic/buffer bug).
+      - "empty_input_candidate": `payload_len == 0` target parsing/arithmetic/buffer/logic bug
+        without harness-side markers (kept active, never quarantined).
+      - "target_crash_candidate": `payload_len > 0` target crash without harness-side markers
+        (kept active, never quarantined).
+    """
+    eff_failure = failure if failure is not None else (parse_runtime_failure(replay_log) if replay_log else None)
+    startup, _ = is_startup_failure(eff_failure, replay_log)
+    if startup:
+        return "startup_error"
+
+    kind = str((eff_failure or {}).get("kind") or "").lower()
+    alarm = str((eff_failure or {}).get("alarm_kind") or "").lower()
+    pred = str((eff_failure or {}).get("predicate") or "")
+    msg = str((eff_failure or {}).get("message") or "")
+    combined_text = "\n".join(part for part in (pred, msg, replay_log) if part)
+
+    if "attempting_free_on_address_which_was_not_malloc_ed" in kind or _NON_MALLOC_FREE_RE.search(combined_text):
+        return "harness_setup_fault"
+
+    if _is_harness_stack_overflow(kind, pred, replay_log):
+        return "harness_setup_fault"
+
+    if kind == "lsan_direct_leak" and (
+        payload_len == 0 or _is_harness_site(eff_failure) or _is_lsan_direct_caller_harness(replay_log)
+    ):
+        return "harness_setup_fault"
+
+    if _is_harness_site(eff_failure):
+        return "harness_setup_fault"
+
+    is_arith_or_buf = alarm in _ARITH_OR_BUFFER_ALARMS or any(bk in kind for bk in _BUFFER_OVERFLOW_KINDS)
+    if payload_len == 0 and not is_arith_or_buf:
+        if _NULL_DEREF_RE.search(combined_text) or _SEGV_NULL_ADDR_RE.search(combined_text):
+            return "harness_setup_fault"
+
+    if payload_len == 0:
+        return "empty_input_candidate"
+    return "target_crash_candidate"

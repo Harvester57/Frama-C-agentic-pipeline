@@ -196,7 +196,7 @@ def test_enabled_without_a_facts_file_is_not_run_and_validates(run1, capsys):
     (run1 / FACTS_FILE).unlink()
     model, summary = _model_step(capsys)
     assert model["trust"]["codeql"] == {"status": "not_run", "path": str(FACTS_FILE)}
-    (warning,) = summary["trust"]["warnings"]
+    (warning,) = [w for w in summary["trust"]["warnings"] if w.startswith("codeql:")]
     assert warning.startswith("codeql: enabled for the run, but there is no report at ") and "trust.py run" in warning
     assert not _with_codeql(model)
     assert _marks(_trust_run(capsys)) == _marks(model)  # as trust.py run

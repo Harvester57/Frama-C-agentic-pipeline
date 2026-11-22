@@ -40,6 +40,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import harness_smoke  # noqa: E402
+import resources  # noqa: E402
 from benchmark_compare import SCHEMA_VERSION, Tolerances, compare_runs, load_run, rate_block, render_text  # noqa: E402
 from fingerprint import make_fingerprint, normalize_file  # noqa: E402
 from minischema import Validator, load_schema  # noqa: E402
@@ -961,6 +963,18 @@ def run_stage(
     )
     argv += [command] if _is_windows() else ["--", command]
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    smoke_on = harness_smoke.harness_smoke_enabled()
+    smoke_env_off = (env.get("FRAMAC_HARNESS_SMOKE") or "").strip().lower() in harness_smoke._OFF_VALUES
+    if smoke_on and smoke_env_off:
+        env["FRAMAC_HARNESS_SMOKE"] = "on"
+    elif not smoke_on and not smoke_env_off:
+        env["FRAMAC_HARNESS_SMOKE"] = "off"
+    judge_on = resources.fuzz_explore_judge_enabled()
+    judge_env_off = (env.get("FRAMAC_FUZZ_EXPLORE_JUDGE") or "").strip().lower() in resources._OFF_VALUES
+    if judge_on and judge_env_off:
+        env["FRAMAC_FUZZ_EXPLORE_JUDGE"] = "on"
+    elif not judge_on and not judge_env_off:
+        env["FRAMAC_FUZZ_EXPLORE_JUDGE"] = "off"
     if image and not _is_windows():
         env["FRAMAC_DOCKER_IMAGE"] = image
     started = time.monotonic()
@@ -1169,16 +1183,22 @@ def post_phase0_stages(*, run_fuzz: bool, replays: bool) -> list[tuple[str, str,
     """
     (stage, container command, wrapper class) after Phase 0, in the order /framac-verify runs them.
     build-check builds every module, records the E-ACSL gate the fuzz targets check and, when it
-    passes, the Phase 0 checkpoint. `coverage reach-dynamic` measures what each corpus reached and
-    reopens the reach gate for entry points no input executed, before ingest. wp-queue checks both
-    Phase 0 gates, then checkpoints Phase 2, so an LLM host can continue the run directory with
-    /framac-wp; a refused gate leaves Phase 2 unrecorded.
+    passes, the Phase 0 checkpoint. When FRAMAC_HARNESS_SMOKE is enabled, `smoke` runs after
+    build-check and before fuzz/eva. When FRAMAC_FUZZ_EXPLORE_JUDGE is enabled and fuzzing runs,
+    `judge` runs after fuzz and before eva. `coverage reach-dynamic` measures what each corpus
+    reached and reopens the reach gate for entry points no input executed, before ingest. wp-queue
+    checks both Phase 0 gates, then checkpoints Phase 2, so an LLM host can continue the run
+    directory with /framac-wp; a refused gate leaves Phase 2 unrecorded.
     """
     pm = f"python3 {CONTAINER_SCRIPTS}/pipeline_make.py"
     bench = f"python3 {CONTAINER_SCRIPTS}/benchmark.py"
     out: list[tuple[str, str, str | None]] = [("build", f"{pm} build-check", None)]
+    if harness_smoke.harness_smoke_enabled():
+        out.append(("smoke", f"{pm} run smoke", None))
     if run_fuzz:
         out.append(("fuzz", f"{pm} run fuzz", None))
+        if resources.fuzz_explore_judge_enabled():
+            out.append(("judge", f"{pm} run judge", None))
     out.append(("eva", f"{pm} run eva", None))
     out.append(("coverage", f"{pm} run coverage reach-dynamic", None))
     if replays:
@@ -1315,9 +1335,11 @@ def annotate_replays(replay_doc: dict, spec: dict, run_dir: Path) -> dict:
         report = read_json(reports / "eva" / f"{record['module']}.json")
         record["eva_site"] = eva_site_status(report, item["file"], item["function"], item["lines"])
         fuzz = read_json(reports / "fuzz" / f"{record['module']}.json") or {}
+        judge = read_json(reports / "judge" / f"{record['module']}.json") or {}
         prefix = f"{item['file']}#{item['function']}::{item['alarm_kind']}::"
+        campaign_artifacts = [*(fuzz.get("artifacts") or []), *(judge.get("artifacts") or [])]
         record["found_by_campaign"] = any(
-            str(artifact.get("fingerprint") or "").startswith(prefix) for artifact in fuzz.get("artifacts") or []
+            str(artifact.get("fingerprint") or "").startswith(prefix) for artifact in campaign_artifacts
         )
     return replay_doc
 

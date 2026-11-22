@@ -96,9 +96,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -107,6 +108,7 @@ import crash_replay  # noqa: E402
 import fuzz_build  # noqa: E402
 import fuzz_coverage  # noqa: E402
 import prover_candidates  # noqa: E402
+import resources  # noqa: E402
 import sandbox_exec  # noqa: E402
 from crash_replay import (  # noqa: E402, F401
     _candidate_engine,
@@ -161,6 +163,7 @@ from failure_identity import (  # noqa: E402, F401
     failure_fingerprint,
     is_harness_fuzz_function,
     is_runtime_function,
+    is_startup_failure,
     needs_attribution,
     parse_eacsl_failure,
     parse_eacsl_resource_abort,
@@ -172,10 +175,13 @@ from failure_identity import (  # noqa: E402, F401
 )
 from fingerprint import (  # noqa: E402
     make_fingerprint,
+    normalize_file,
 )
 from framac_common import (  # noqa: E402
     ArtifactError,
+    atomic_write_json,
     normalize_flag_args,
+    utc_now,
 )
 from fuzz_build import (  # noqa: E402, F401
     _ENVIRON_KEEP_SOURCE,
@@ -188,6 +194,7 @@ from fuzz_build import (  # noqa: E402, F401
     _UNDEFINED_REF_RE,
     LINK_GLOBALS_ASSUMPTION,
     LINK_GLOBALS_FILE,
+    PrebuiltBinaryError,
     _build_environ_keep_object,
     _check_options,
     _compile_clang_binary,
@@ -217,6 +224,7 @@ from fuzz_build import (  # noqa: E402, F401
     link_globals_source,
     parse_undefined_references,
     repair_sources_for_link,
+    resolve_prebuilt_binary,
     selftest_blocks_eacsl,
 )
 from fuzz_common import (  # noqa: E402, F401
@@ -342,6 +350,499 @@ _LIBFUZZER_PROGRESS_RE = re.compile(r"^#\d+(?:\t|:\s)", re.MULTILINE)
 _LIBFUZZER_RUNS_RE = re.compile(
     r"^(?:Done (?P<done>\d+) runs|stat::number_of_executed_units:\s*(?P<units>\d+))", re.MULTILINE
 )
+
+# P1a/P1b/P2/P5/P6 constants (docs/plans/fuzz-budget-design.md).
+DISPATCH_ONLY_CASE_ENV = "FRAMAC_FUZZ_ONLY_CASE"
+BLINDING_CASE_THRESHOLD = 16
+BLINDING_FORK_JOBS_THRESHOLD = 64
+FORK_BLIND_PROBE_S = 5
+JUDGE_SCHEMA_VERSION = 1
+JUDGE_CORPUS_CAP_BY_PROFILE: dict[str, int] = {
+    "quick": 512,
+    "standard": 2048,
+    "deep": 4096,
+}
+JUDGE_BATCH_SIZE = 64
+JUDGE_DEFAULT_MAX_TIME_S = 1800
+FLOOR_PASS_BY_PROFILE: dict[str, tuple[int, int]] = {
+    "quick": (5000, 15),
+    "standard": (25000, 120),
+    "deep": (100000, 600),
+}
+FLOOR_PASS_MAX_RESTARTS = 4
+MAX_TELEMETRY_SERIES_POINTS = 128
+CROSS_ENGINE_ADJACENT_LINES = 5
+BLINDING_REMEDIES: tuple[str, ...] = (
+    "Inspect the blinding fingerprint against docs/references/e-acsl-quickref.md for known E-ACSL runtime issues.",
+    "Override this module's engine with `params set --module <mod> --fuzz-engine sanitizers` if E-ACSL is blinded by a toolchain issue.",
+    "Or repair the harness/stub setup fault and rerun `judge` (or the blinded campaign) to spend the unspent budget.",
+)
+
+# P5a libFuzzer status line regexes (standard worker logs and fork-mode parent logs).
+_LF_WORKER_STATUS_RE = re.compile(
+    r"^#(?P<unit>\d+)\s+\S+.*?\bcov:\s*(?P<cov>\d+)\s+ft:\s*(?P<ft>\d+)\s+"
+    r"corp:\s*(?P<corp>\d+)(?:/\S+)?\b.*?\bexec/s:\s*(?P<exec_s>\d+)"
+    r"(?:.*?\brss:\s*(?P<rss_mb>\d+)Mb)?",
+    re.MULTILINE,
+)
+_LF_FORK_STATUS_RE = re.compile(
+    r"^#(?P<unit>\d+):\s+cov:\s*(?P<cov>\d+)\s+ft:\s*(?P<ft>\d+)\s+"
+    r"corp:\s*(?P<corp>\d+)(?:/\S+)?\b.*?\bexec/s:\s*(?P<exec_s>\d+)"
+    r"(?:.*?\boom/timeout/crash:\s*(?P<oom>\d+)/(?P<timeout>\d+)/(?P<crash>\d+))?"
+    r"(?:.*?\btime:\s*(?P<time_s>\d+)s)?"
+    r"(?:.*?\bjob:\s*(?P<job>\d+))?"
+    r"(?:.*?\brss:\s*(?P<rss_mb>\d+)Mb)?",
+    re.MULTILINE,
+)
+_LF_STAT_UNITS_RE = re.compile(r"^stat::number_of_executed_units:\s*(?P<val>\d+)\s*$", re.MULTILINE)
+_LF_STAT_EXEC_S_RE = re.compile(r"^stat::average_exec_per_sec:\s*(?P<val>\d+)\s*$", re.MULTILINE)
+_LF_STAT_PEAK_RSS_RE = re.compile(r"^stat::peak_rss_mb:\s*(?P<val>\d+)\s*$", re.MULTILINE)
+_LF_DONE_RUNS_RE = re.compile(r"^Done\s+(?P<runs>\d+)\s+runs\s+in\s+(?P<secs>\d+)\s+second", re.MULTILINE)
+
+
+def _downsample_series(series: list[dict[str, Any]], limit: int = MAX_TELEMETRY_SERIES_POINTS) -> list[dict[str, Any]]:
+    """Keep up to `limit` points preserving first, last, and evenly spaced interior samples."""
+    if limit <= 0 or len(series) <= limit:
+        return list(series)
+    if limit == 1:
+        return [series[-1]]
+    step = (len(series) - 1) / (limit - 1)
+    indices = sorted({round(i * step) for i in range(limit)})
+    return [series[idx] for idx in indices]
+
+
+def parse_libfuzzer_telemetry(
+    outputs: str | Sequence[str],
+    *,
+    build_s: float = 0.0,
+    fuzz_s: float = 0.0,
+    replay_s: float = 0.0,
+    floor_s: float | None = None,
+    shared_s: float | None = None,
+    oom_kills_delta: int | None = None,
+) -> dict[str, Any]:
+    """
+    Parse multi-job libFuzzer status lines and final statistics (P5a/P5d) into a compact report
+    block with `series`, aggregated executions/exec_s/peak_rss_mb, fork summary (when fork lines
+    are present), and wall-time breakdown (`build_s`, `fuzz_s`, `replay_s`).
+    """
+    streams = [outputs] if isinstance(outputs, str) else [str(s or "") for s in outputs]
+    series: list[dict[str, Any]] = []
+    total_executions = 0
+    total_exec_s = 0.0
+    max_cov = 0
+    max_ft = 0
+    max_corp = 0
+    peak_rss_mb: int | None = None
+    jobs_observed = 0
+
+    fork_seen = False
+    fork_jobs = 0
+    fork_crashes = 0
+    fork_timeouts = 0
+    fork_ooms = 0
+    fork_max_corp = 0
+    fork_max_unit = 0
+
+    for stream in streams:
+        if not stream:
+            continue
+        stream_points: list[dict[str, Any]] = []
+        stream_max_unit = 0
+        stream_last_exec_s = 0.0
+        stream_peak_rss: int | None = None
+
+        for m in _LF_WORKER_STATUS_RE.finditer(stream):
+            unit = int(m.group("unit"))
+            cov = int(m.group("cov"))
+            ft = int(m.group("ft"))
+            corp = int(m.group("corp"))
+            exec_s = int(m.group("exec_s"))
+            rss = int(m.group("rss_mb")) if m.group("rss_mb") is not None else None
+            stream_max_unit = max(stream_max_unit, unit)
+            stream_last_exec_s = float(exec_s)
+            max_cov = max(max_cov, cov)
+            max_ft = max(max_ft, ft)
+            max_corp = max(max_corp, corp)
+            if rss is not None:
+                stream_peak_rss = rss if stream_peak_rss is None else max(stream_peak_rss, rss)
+            stream_points.append(
+                {
+                    "unit": unit,
+                    "cov": cov,
+                    "ft": ft,
+                    "corp": corp,
+                    "exec_s": exec_s,
+                    "rss_mb": rss,
+                }
+            )
+
+        for m in _LF_FORK_STATUS_RE.finditer(stream):
+            fork_seen = True
+            unit = int(m.group("unit"))
+            cov = int(m.group("cov"))
+            ft = int(m.group("ft"))
+            corp = int(m.group("corp"))
+            exec_s = int(m.group("exec_s"))
+            rss = int(m.group("rss_mb")) if m.group("rss_mb") is not None else None
+            oom = int(m.group("oom")) if m.group("oom") is not None else 0
+            to = int(m.group("timeout")) if m.group("timeout") is not None else 0
+            crash = int(m.group("crash")) if m.group("crash") is not None else 0
+            time_s = int(m.group("time_s")) if m.group("time_s") is not None else None
+            job = int(m.group("job")) if m.group("job") is not None else None
+            stream_max_unit = max(stream_max_unit, unit)
+            stream_last_exec_s = float(exec_s)
+            max_cov = max(max_cov, cov)
+            max_ft = max(max_ft, ft)
+            max_corp = max(max_corp, corp)
+            fork_max_unit = max(fork_max_unit, unit)
+            fork_max_corp = max(fork_max_corp, corp)
+            fork_crashes = max(fork_crashes, crash)
+            fork_timeouts = max(fork_timeouts, to)
+            fork_ooms = max(fork_ooms, oom)
+            if job is not None:
+                fork_jobs = max(fork_jobs, job)
+            if rss is not None:
+                stream_peak_rss = rss if stream_peak_rss is None else max(stream_peak_rss, rss)
+            point: dict[str, Any] = {
+                "unit": unit,
+                "cov": cov,
+                "ft": ft,
+                "corp": corp,
+                "exec_s": exec_s,
+                "rss_mb": rss,
+                "crashes": crash,
+            }
+            if job is not None:
+                point["job"] = job
+            if time_s is not None:
+                point["time_s"] = time_s
+            stream_points.append(point)
+
+        unit_stats = [int(m.group("val")) for m in _LF_STAT_UNITS_RE.finditer(stream)]
+        exec_stats = [int(m.group("val")) for m in _LF_STAT_EXEC_S_RE.finditer(stream)]
+        rss_stats = [int(m.group("val")) for m in _LF_STAT_PEAK_RSS_RE.finditer(stream)]
+        done_runs = [int(m.group("runs")) for m in _LF_DONE_RUNS_RE.finditer(stream)]
+
+        stream_has_activity = bool(stream_points or unit_stats or done_runs or rss_stats)
+        if not stream_has_activity:
+            continue
+
+        if unit_stats:
+            total_executions += sum(unit_stats)
+            jobs_observed += len(unit_stats)
+        elif done_runs:
+            total_executions += sum(done_runs)
+            jobs_observed += len(done_runs)
+        else:
+            total_executions += stream_max_unit
+            jobs_observed += 1
+
+        if exec_stats:
+            total_exec_s += float(sum(exec_stats))
+        elif stream_last_exec_s > 0:
+            total_exec_s += stream_last_exec_s
+
+        for rss_val in rss_stats:
+            stream_peak_rss = rss_val if stream_peak_rss is None else max(stream_peak_rss, rss_val)
+        if stream_peak_rss is not None:
+            peak_rss_mb = stream_peak_rss if peak_rss_mb is None else max(peak_rss_mb, stream_peak_rss)
+
+        series.extend(stream_points)
+
+    if total_exec_s <= 0.0 and total_executions > 0 and fuzz_s > 0.0:
+        total_exec_s = round(total_executions / fuzz_s, 2)
+
+    out: dict[str, Any] = {
+        "build_s": round(max(0.0, float(build_s)), 3),
+        "fuzz_s": round(max(0.0, float(fuzz_s)), 3),
+        "replay_s": round(max(0.0, float(replay_s)), 3),
+        "series": _downsample_series(series),
+        "total_executions": int(total_executions),
+        "max_cov": int(max_cov),
+        "max_ft": int(max_ft),
+        "max_corp": int(max_corp),
+        "exec_s": round(max(0.0, float(total_exec_s)), 2),
+        "peak_rss_mb": peak_rss_mb,
+        "jobs_observed": int(jobs_observed),
+    }
+    if floor_s is not None:
+        out["floor_s"] = round(max(0.0, float(floor_s)), 3)
+    if shared_s is not None:
+        out["shared_s"] = round(max(0.0, float(shared_s)), 3)
+    if oom_kills_delta is not None:
+        out["oom_kills_delta"] = max(0, int(oom_kills_delta))
+    if fork_seen:
+        # In libFuzzer fork mode, `#N` counts completed non-crashing executions in the coordinator
+        # when `cov > 0` or `corp > 0`, while crashing jobs fail without growing the corpus.
+        passing_execs = 0 if (fork_max_corp == 0 and max_cov == 0 and fork_max_unit <= fork_crashes) else fork_max_unit
+        out["fork_summary"] = {
+            "jobs": max(fork_jobs, fork_crashes + fork_timeouts + fork_ooms),
+            "crashes": fork_crashes,
+            "timeouts": fork_timeouts,
+            "ooms": fork_ooms,
+            "max_corp": fork_max_corp,
+            "passing_execs": max(0, passing_execs),
+        }
+    return out
+
+
+def merge_telemetry(
+    items: Sequence[dict[str, Any] | None],
+    *,
+    build_s: float | None = None,
+    floor_s: float | None = None,
+    shared_s: float | None = None,
+) -> dict[str, Any]:
+    """Combine telemetry dicts across rounds, passes, or engines."""
+    valid = [t for t in items if isinstance(t, dict)]
+    tot_build = sum(float(t.get("build_s") or 0.0) for t in valid) if build_s is None else float(build_s)
+    tot_fuzz = sum(float(t.get("fuzz_s") or 0.0) for t in valid)
+    tot_replay = sum(float(t.get("replay_s") or 0.0) for t in valid)
+    series: list[dict[str, Any]] = []
+    total_executions = 0
+    max_cov = 0
+    max_ft = 0
+    max_corp = 0
+    peak_rss_mb: float | int | None = None
+    jobs_observed = 0
+    oom_delta: int | None = None
+    fork_summary: dict[str, int] | None = None
+
+    for t in valid:
+        series.extend(t.get("series") or [])
+        total_executions += int(t.get("total_executions") or 0)
+        max_cov = max(max_cov, int(t.get("max_cov") or 0))
+        max_ft = max(max_ft, int(t.get("max_ft") or 0))
+        max_corp = max(max_corp, int(t.get("max_corp") or 0))
+        jobs_observed += int(t.get("jobs_observed") or 0)
+        rss = t.get("peak_rss_mb")
+        if isinstance(rss, (int, float)) and not isinstance(rss, bool):
+            peak_rss_mb = rss if peak_rss_mb is None else max(peak_rss_mb, rss)
+        od = t.get("oom_kills_delta")
+        if isinstance(od, int) and not isinstance(od, bool):
+            oom_delta = (oom_delta or 0) + od
+        fs = t.get("fork_summary")
+        if isinstance(fs, dict):
+            if fork_summary is None:
+                fork_summary = {
+                    "jobs": int(fs.get("jobs") or 0),
+                    "crashes": int(fs.get("crashes") or 0),
+                    "timeouts": int(fs.get("timeouts") or 0),
+                    "ooms": int(fs.get("ooms") or 0),
+                    "max_corp": int(fs.get("max_corp") or 0),
+                    "passing_execs": int(fs.get("passing_execs") or 0),
+                }
+            else:
+                fork_summary["jobs"] += int(fs.get("jobs") or 0)
+                fork_summary["crashes"] += int(fs.get("crashes") or 0)
+                fork_summary["timeouts"] += int(fs.get("timeouts") or 0)
+                fork_summary["ooms"] += int(fs.get("ooms") or 0)
+                fork_summary["max_corp"] = max(fork_summary["max_corp"], int(fs.get("max_corp") or 0))
+                fork_summary["passing_execs"] += int(fs.get("passing_execs") or 0)
+
+    if tot_fuzz > 0.0 and total_executions > 0:
+        exec_s = round(total_executions / tot_fuzz, 2)
+    else:
+        exec_vals = [float(t.get("exec_s") or 0.0) for t in valid if float(t.get("exec_s") or 0.0) > 0.0]
+        exec_s = round(sum(exec_vals) / len(exec_vals), 2) if exec_vals else 0.0
+
+    out: dict[str, Any] = {
+        "build_s": round(max(0.0, tot_build), 3),
+        "fuzz_s": round(max(0.0, tot_fuzz), 3),
+        "replay_s": round(max(0.0, tot_replay), 3),
+        "series": _downsample_series(series),
+        "total_executions": total_executions,
+        "max_cov": max_cov,
+        "max_ft": max_ft,
+        "max_corp": max_corp,
+        "exec_s": exec_s,
+        "peak_rss_mb": peak_rss_mb,
+        "jobs_observed": jobs_observed,
+    }
+    if floor_s is not None:
+        out["floor_s"] = round(max(0.0, float(floor_s)), 3)
+    if shared_s is not None:
+        out["shared_s"] = round(max(0.0, float(shared_s)), 3)
+    if oom_delta is not None:
+        out["oom_kills_delta"] = oom_delta
+    if fork_summary is not None:
+        out["fork_summary"] = fork_summary
+    return out
+
+
+def load_smoke_skipped_cases(smoke_report: Path | None) -> list[int]:
+    """
+    Read smoke-quarantined dispatch case indices from a `harness_smoke.py` JSON report.
+    Returns sorted unique non-negative ints, or `[]` when `smoke_report` is absent/unreadable.
+    """
+    if smoke_report is None:
+        return []
+    path = Path(smoke_report)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    cases: set[int] = set()
+    quarantined = data.get("quarantined_cases")
+    if isinstance(quarantined, list):
+        for item in quarantined:
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                cases.add(item)
+    if not cases:
+        raw_env = data.get("skip_cases_env")
+        if isinstance(raw_env, str) and raw_env.strip():
+            for part in raw_env.split(","):
+                part = part.strip()
+                if part.isdigit():
+                    cases.add(int(part))
+    return sorted(cases)
+
+
+def harness_supports_only_case(sources: Sequence[str | Path] | str | Path | None) -> bool:
+    """True when at least one harness source supports `FRAMAC_FUZZ_ONLY_CASE` (P6a)."""
+    if sources is None:
+        return False
+    items: Sequence[str | Path] = [sources] if isinstance(sources, (str, Path)) else sources
+    for src in items:
+        try:
+            text = Path(src).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if DISPATCH_ONLY_CASE_ENV in text:
+            return True
+    return False
+
+
+def explore_budget_cpu_s(fuzz_budget: int, profile: str = "standard") -> int:
+    """CPU-second share for `explore` (P2a): 100% under quick/standard, 4/5 under deep."""
+    budget = max(0, int(fuzz_budget))
+    if (profile or "").strip().lower() == "deep":
+        return (budget * 4) // 5
+    return budget
+
+
+def eacsl_fuzz_budget_cpu_s(fuzz_budget: int, profile: str = "deep") -> int:
+    """CPU-second share for `eacsl-fuzz` (P2e): remaining 1/5 under deep, 0 under quick/standard."""
+    budget = max(0, int(fuzz_budget))
+    if (profile or "").strip().lower() != "deep":
+        return 0
+    return budget - explore_budget_cpu_s(budget, "deep")
+
+
+class CaseBlindingTracker:
+    """
+    Per-case blinding tracker (P1a): a dispatch case (or single-entry module at case=0) that hits
+    `threshold` (default K_case = 16) consecutive crashes with 0 passing executions on a single
+    fingerprint is marked `blinded`.
+    """
+
+    def __init__(self, threshold: int = BLINDING_CASE_THRESHOLD) -> None:
+        self.threshold = max(1, int(threshold))
+        self._state: dict[int, dict[str, Any]] = {}
+
+    def _entry(self, case: int) -> dict[str, Any]:
+        return self._state.setdefault(
+            int(case),
+            {
+                "passes": 0,
+                "consecutive_crashes": 0,
+                "last_fingerprint": None,
+                "blinded": False,
+                "blinded_fingerprint": None,
+                "blinded_crashes": 0,
+            },
+        )
+
+    def record_pass(self, case: int) -> None:
+        st = self._entry(case)
+        st["passes"] += 1
+        st["consecutive_crashes"] = 0
+        st["last_fingerprint"] = None
+
+    def record_crash(self, case: int, fingerprint: str | None) -> bool:
+        """Record one crashing execution on `case`. Returns True if `case` is newly blinded."""
+        st = self._entry(case)
+        if st["blinded"]:
+            st["blinded_crashes"] += 1
+            return False
+        if st["passes"] > 0:
+            return False
+        fp_key = str(fingerprint) if fingerprint else "__unparsed__"
+        if st["last_fingerprint"] == fp_key:
+            st["consecutive_crashes"] += 1
+        else:
+            st["last_fingerprint"] = fp_key
+            st["consecutive_crashes"] = 1
+        if st["consecutive_crashes"] >= self.threshold:
+            st["blinded"] = True
+            st["blinded_fingerprint"] = fingerprint if fingerprint else None
+            st["blinded_crashes"] = st["consecutive_crashes"]
+            return True
+        return False
+
+    def mark_blinded(self, case: int, fingerprint: str | None, crashes: int | None = None) -> None:
+        st = self._entry(case)
+        st["blinded"] = True
+        st["blinded_fingerprint"] = fingerprint
+        st["blinded_crashes"] = max(self.threshold, int(crashes or self.threshold))
+
+    def is_blinded(self, case: int) -> bool:
+        return bool(self._state.get(int(case), {}).get("blinded"))
+
+    def passes_of(self, case: int) -> int:
+        return int(self._state.get(int(case), {}).get("passes") or 0)
+
+    def blinded_case_ids(self) -> list[int]:
+        return sorted(c for c, st in self._state.items() if st.get("blinded"))
+
+    def blinded_cases_report(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for c in self.blinded_case_ids():
+            st = self._state[c]
+            out.append(
+                {
+                    "case": c,
+                    "fingerprint": st.get("blinded_fingerprint"),
+                    "crashes": int(st.get("blinded_crashes") or self.threshold),
+                    "remedies": list(BLINDING_REMEDIES),
+                }
+            )
+        return out
+
+
+def detect_fork_blinding(
+    telemetry: dict[str, Any] | None,
+    artifacts: Sequence[dict[str, Any]],
+    *,
+    threshold: int = BLINDING_FORK_JOBS_THRESHOLD,
+) -> dict[str, Any] | None:
+    """
+    Detect non-dispatch fork-mode blinding (P1a): `>= threshold` (default 64) crashing jobs with
+    `corp == 0` and `0` passing executions. Returns a blinding summary dict or None.
+    """
+    if not isinstance(telemetry, dict):
+        return None
+    fs = telemetry.get("fork_summary")
+    if not isinstance(fs, dict):
+        return None
+    crashes = int(fs.get("crashes") or 0)
+    max_corp = int(fs.get("max_corp") or 0)
+    passing = int(fs.get("passing_execs") or 0)
+    if crashes < max(1, int(threshold)) or max_corp > 0 or passing > 0:
+        return None
+    fps = Counter(str(a.get("fingerprint")) for a in artifacts if isinstance(a, dict) and a.get("fingerprint"))
+    dominant_fp = fps.most_common(1)[0][0] if fps else None
+    return {
+        "blinded": True,
+        "crashing_jobs": crashes,
+        "fingerprint": dominant_fp,
+        "remedies": list(BLINDING_REMEDIES),
+    }
 
 
 def parse_defined_process_launchers(nm_output: str) -> list[str]:
@@ -630,6 +1131,13 @@ def run_campaign_rounds(
     runtime_skip: bool = False,
     selector: str = DISPATCH_SELECTOR_MODULO,
     workers: int = 1,
+    initial_skipped: Iterable[int] | None = None,
+    explore_judge: bool | None = None,
+    blinding_threshold: int = BLINDING_CASE_THRESHOLD,
+    fork_blinding_threshold: int = BLINDING_FORK_JOBS_THRESHOLD,
+    build_s: float = 0.0,
+    pre_blinded_cases: Sequence[dict[str, Any]] | None = None,
+    smoke_skipped_cases: Sequence[int] | None = None,
 ) -> dict:
     """
     A campaign that keeps going after a crash, within `max_time` wall seconds of fuzzing in all, which
@@ -641,43 +1149,218 @@ def run_campaign_rounds(
     `mask`, binary None when the build failed. When `runtime_skip` is True, `campaign` is called with
     `extra_env={FRAMAC_FUZZ_SKIP_CASES: ...}` on the existing `binary` and `rebuild` is never called.
 
-    - A `dispatch` harness (`n_cases`) runs in rounds: each case an input crashed in is skipped from
-      the next round on, so a shallow bug stops ending every run and the other cases get the rest of
-      the time. Rounds end when a round finds no new crashing case, every case is skipped, less than
-      MIN_ROUND_CPU_S CPU-seconds (wall seconds times `workers`) or a whole wall second are left. A round's
-      wall budget is the wall time left, rounded down (`-max_total_time`), so no round overruns the
-      campaign. A round's new crashing cases cannot be skipped
-      (`unskippable_case`: cases `skippable` and above, for a harness generated before every case
-      was skippable), or a rebuild fails. In the last two, the time left runs in fork mode with
-      crashes ignored on the last binary built (`fork_fallback`).
-    - Any other harness runs once in fork mode with crashes ignored.
-    - Without `keep_going`, one campaign that stops at the first crash, as before.
+    P1c pure execution timing: when a round's result carries `fuzz_s` (measured strictly around
+    the libFuzzer subprocess, excluding post-exit replay and attribution), only `fuzz_s` is charged
+    against the round budget `max_time`. `telemetry` records `{build_s, fuzz_s, replay_s, ...}`.
 
-    A campaign that ran in one process (`single_process_reason` in its result, run_fuzz_campaign) used
-    one CPU: `keep_going.workers` and `cpu_seconds_spent` count that, and `keep_going` carries the
-    reason. Without fork mode a single process stops at its first crash (`stops_at_first_crash`).
+    When `explore_judge` is enabled (via `FRAMAC_FUZZ_EXPLORE_JUDGE` or explicit `explore_judge=True`):
+    - Dispatch harnesses track per-case blinding (`K_case = 16` consecutive crashes with 0 passes
+      on one fingerprint), adding blinded cases to `FRAMAC_FUZZ_SKIP_CASES` so healthy cases
+      continue (`status: "partial_blinded"` or `"blinded"` when all active cases blind).
+    - Non-dispatch fork mode stops early as `blinded` at `64` crashing jobs with `corp == 0` and
+      `0` passing executions, recording remaining budget as `unspent_budget_s`.
     """
+    eff_explore_judge = resources.fuzz_explore_judge_enabled() if explore_judge is None else bool(explore_judge)
+    smoke_list = sorted({int(c) for c in (smoke_skipped_cases or []) if int(c) >= 0})
+
+    def _strip_private(doc: dict[str, Any]) -> dict[str, Any]:
+        doc.pop("_raw_crashes", None)
+        doc.pop("_case_passes", None)
+        return doc
+
     if not keep_going:
-        return campaign(binary, max_time, False)
+        res = _strip_private(dict(campaign(binary, max_time, False)))
+        if smoke_list:
+            res["smoke_skipped_cases"] = smoke_list
+        return res
+
     if not n_cases:
-        res = campaign(binary, max_time, True)
+        if not eff_explore_judge:
+            res = _strip_private(dict(campaign(binary, max_time, True)))
+            res["keep_going"] = {"mode": "fork"}
+            if res.get("single_process_reason"):
+                res["keep_going"]["single_process_reason"] = res["single_process_reason"]
+                res["keep_going"]["stops_at_first_crash"] = True
+            if isinstance(res.get("telemetry"), dict):
+                res["telemetry"] = merge_telemetry([res["telemetry"]], build_s=build_s)
+            return res
+
+        # P1a non-dispatch fork mode under FRAMAC_FUZZ_EXPLORE_JUDGE: probe briefly on long runs
+        # so an immediately blinded binary (64+ crashing jobs, corp == 0, 0 passing execs) stops
+        # early instead of burning its entire budget.
+        probe_budget = min(max_time, FORK_BLIND_PROBE_S) if max_time > FORK_BLIND_PROBE_S else max_time
+        t0 = time.monotonic()
+        first = campaign(binary, probe_budget, True)
+        wall1 = max(0.0, time.monotonic() - t0)
+        spent1 = float(first["fuzz_s"]) if isinstance(first.get("fuzz_s"), (int, float)) else wall1
+        eff_w = 1 if first.get("single_process_reason") else max(1, workers)
+        blind_info = detect_fork_blinding(
+            first.get("telemetry"),
+            first.get("artifacts") or [],
+            threshold=fork_blinding_threshold,
+        )
+        if blind_info is not None:
+            out = _strip_private(dict(first))
+            out["status"] = "blinded"
+            out["partial_blinded"] = False
+            out["blinded_fingerprint"] = blind_info.get("fingerprint")
+            out["blinded_remedies"] = list(blind_info.get("remedies") or BLINDING_REMEDIES)
+            out["unspent_budget_s"] = round(max(0.0, max_time - spent1) * eff_w, 3)
+            out["keep_going"] = {
+                "mode": "fork",
+                "stopped": "blinded",
+                "fuzz_seconds": round(spent1, 1),
+                "workers": eff_w,
+                "cpu_seconds_spent": round(spent1 * eff_w, 1),
+            }
+            if out.get("single_process_reason"):
+                out["keep_going"]["single_process_reason"] = out["single_process_reason"]
+                out["keep_going"]["stops_at_first_crash"] = True
+            if isinstance(out.get("telemetry"), dict):
+                out["telemetry"] = merge_telemetry([out["telemetry"]], build_s=build_s)
+            return out
+
+        rem_wall = int(max_time - spent1)
+        if probe_budget < max_time and rem_wall >= 1 and (max_time - spent1) * eff_w >= MIN_ROUND_CPU_S and first.get("status") != "insufficient_memory":
+            t1 = time.monotonic()
+            second = campaign(binary, rem_wall, True)
+            wall2 = max(0.0, time.monotonic() - t1)
+            spent2 = float(second["fuzz_s"]) if isinstance(second.get("fuzz_s"), (int, float)) else wall2
+            total_spent = spent1 + spent2
+            combined_arts: list[dict] = []
+            seen_keys: set[str] = set()
+            for a in [*(first.get("artifacts") or []), *(second.get("artifacts") or [])]:
+                key = str(a.get("sha256") or a.get("artifact") or "")
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    combined_arts.append(a)
+            merged_arts, dropped_dups = _collapse_duplicate_artifacts(combined_arts)
+            merged_tel = merge_telemetry([first.get("telemetry"), second.get("telemetry")], build_s=build_s)
+            out = _strip_private(dict(second))
+            out["artifacts"] = merged_arts
+            out["telemetry"] = merged_tel
+            out["fuzz_s"] = round(total_spent, 3)
+            out["replay_s"] = round(float(first.get("replay_s") or 0.0) + float(second.get("replay_s") or 0.0), 3)
+            if dropped_dups:
+                omitted = dict(out.get("artifacts_omitted") or {})
+                omitted["duplicates"] = omitted.get("duplicates", 0) + dropped_dups
+                out["artifacts_omitted"] = omitted
+            blind2 = detect_fork_blinding(merged_tel, merged_arts, threshold=fork_blinding_threshold)
+            if blind2 is not None:
+                out["status"] = "blinded"
+                out["partial_blinded"] = False
+                out["blinded_fingerprint"] = blind2.get("fingerprint")
+                out["blinded_remedies"] = list(blind2.get("remedies") or BLINDING_REMEDIES)
+                out["unspent_budget_s"] = round(max(0.0, max_time - total_spent) * eff_w, 3)
+                out["keep_going"] = {"mode": "fork", "stopped": "blinded"}
+            else:
+                if out.get("status") != "insufficient_memory":
+                    out["status"] = classify_campaign(
+                        out.get("returncode") or 0, bool(out.get("timed_out")), merged_arts
+                    )
+                out["keep_going"] = {"mode": "fork"}
+            if out.get("single_process_reason"):
+                out["keep_going"]["single_process_reason"] = out["single_process_reason"]
+                out["keep_going"]["stops_at_first_crash"] = True
+            return out
+
+        res = _strip_private(dict(first))
         res["keep_going"] = {"mode": "fork"}
         if res.get("single_process_reason"):
             res["keep_going"]["single_process_reason"] = res["single_process_reason"]
             res["keep_going"]["stops_at_first_crash"] = True
+        if isinstance(res.get("telemetry"), dict):
+            res["telemetry"] = merge_telemetry([res["telemetry"]], build_s=build_s)
         return res
+
     skippable = n_cases if skippable is None else min(skippable, n_cases)
     if runtime_skip:
         skippable = min(skippable, DISPATCH_RUNTIME_SKIP_MAX_CASES)
 
-    skipped: set[int] = set()
+    skipped: set[int] = {int(c) for c in (initial_skipped or []) if 0 <= int(c) < n_cases}
+    skipped.update(c for c in smoke_list if 0 <= c < n_cases)
+    tracker = CaseBlindingTracker(threshold=blinding_threshold)
+    for entry in pre_blinded_cases or []:
+        if isinstance(entry, dict) and isinstance(entry.get("case"), int):
+            c_idx = int(entry["case"])
+            if 0 <= c_idx < n_cases:
+                tracker.mark_blinded(c_idx, entry.get("fingerprint"), entry.get("crashes"))
+                skipped.add(c_idx)
+
     rounds: list[dict] = []
     collected: list[dict] = []
+    telemetries: list[dict[str, Any]] = []
     spent = 0.0
+    total_replay_s = 0.0
+    total_rebuild_s = 0.0
     last: dict = {}
     fallback_reason: str | None = None
     skip_error: str | None = None
     single_process_reason: str | None = None
+
+    def _record_round_blinding(result: dict) -> list[int]:
+        if not eff_explore_judge:
+            return []
+        newly_blinded: list[int] = []
+        raw_crashes = result.get("_raw_crashes")
+        crash_records = raw_crashes if isinstance(raw_crashes, list) else (result.get("artifacts") or [])
+        # When a round reports passing executions for cases that didn't crash, or an explicit
+        # per-case pass map, keep healthy cases from blinding.
+        case_passes = result.get("_case_passes")
+        if isinstance(case_passes, dict):
+            for c_key, p_cnt in case_passes.items():
+                if int(p_cnt or 0) > 0:
+                    tracker.record_pass(int(c_key))
+        for rec in crash_records:
+            if not isinstance(rec, dict) or rec.get("pre_existing"):
+                continue
+            if rec.get("kind") not in ("crash", "leak", "timeout", "oom"):
+                continue
+            c = rec.get("case")
+            if not isinstance(c, int):
+                c = artifact_dispatch_case(rec, n_cases, selector)
+            if c is None or not (0 <= c < n_cases):
+                continue
+            if tracker.record_crash(c, rec.get("fingerprint")):
+                newly_blinded.append(c)
+        return sorted(set(newly_blinded))
+
+    # If every case is already skipped before round 1 (e.g. smoke + floor pass skipped all cases):
+    if len(skipped) >= n_cases:
+        out_empty: dict[str, Any] = {
+            "status": "clean",
+            "returncode": 0,
+            "timed_out": False,
+            "artifacts": [],
+            "keep_going": {
+                "mode": "dispatch_rounds",
+                "dispatch_cases": n_cases,
+                "dispatch_selector": selector,
+                "skippable_cases": skippable,
+                "skipped_cases": sorted(skipped),
+                "fuzz_seconds": 0.0,
+                "workers": max(1, workers),
+                "cpu_seconds_spent": 0.0,
+                "stopped": "every_case_skipped",
+                "rounds": [],
+            },
+            "telemetry": merge_telemetry([], build_s=build_s),
+        }
+        if runtime_skip:
+            out_empty["keep_going"]["runtime_skip"] = True
+        if smoke_list:
+            out_empty["smoke_skipped_cases"] = smoke_list
+        if eff_explore_judge:
+            blinded_rep = tracker.blinded_cases_report()
+            if blinded_rep:
+                active_cases = max(0, n_cases - len(set(smoke_list)))
+                all_blind = active_cases > 0 and len(tracker.blinded_case_ids()) >= active_cases
+                out_empty["blinded_cases"] = blinded_rep
+                out_empty["partial_blinded"] = not all_blind
+                out_empty["status"] = "blinded" if all_blind else "partial_blinded"
+                out_empty["blinded_remedies"] = list(BLINDING_REMEDIES)
+        return out_empty
+
     while True:
         # A round never runs longer than the wall time the campaign has left. The first round always runs.
         budget = max(1, int(max_time - spent)) if not rounds else int(max_time - spent)
@@ -687,10 +1370,25 @@ def run_campaign_rounds(
             last = campaign(binary, budget, False, extra_env=skip_env)
         else:
             last = campaign(binary, budget, False)
-        spent += time.monotonic() - started
+        wall_elapsed = max(0.0, time.monotonic() - started)
+        # P1c: charge ONLY libFuzzer execution time (`fuzz_s`) when reported, never replay/attribution time.
+        round_fuzz_s = float(last["fuzz_s"]) if isinstance(last.get("fuzz_s"), (int, float)) else wall_elapsed
+        spent += max(0.0, round_fuzz_s)
+        total_replay_s += max(0.0, float(last.get("replay_s") or 0.0))
+        if isinstance(last.get("telemetry"), dict):
+            telemetries.append(last["telemetry"])
+        else:
+            telemetries.append(
+                parse_libfuzzer_telemetry(
+                    str(last.get("log_tail") or ""),
+                    fuzz_s=round_fuzz_s,
+                    replay_s=float(last.get("replay_s") or 0.0),
+                )
+            )
         single_process_reason = single_process_reason or last.get("single_process_reason")
         if single_process_reason:
             workers = 1
+        newly_blinded = _record_round_blinding(last)
         arts = last.get("artifacts") or []
         collected.extend(arts)
         crashed = sorted(
@@ -702,7 +1400,7 @@ def run_campaign_rounds(
                 if c is not None
             }
         )
-        rnd = {
+        rnd: dict[str, Any] = {
             "skipped_cases": sorted(skipped),
             "max_time": budget,
             "status": last.get("status"),
@@ -710,6 +1408,8 @@ def run_campaign_rounds(
             "artifacts": len(arts),
             "crashed_cases": crashed,
         }
+        if newly_blinded:
+            rnd["blinded_cases"] = newly_blinded
         rounds.append(rnd)
         if in_skipped := [c for c in crashed if c in skipped]:
             # The round ran with these cases skipped and an input still crashed in one: the skip did
@@ -746,7 +1446,9 @@ def run_campaign_rounds(
             break
         if not runtime_skip:
             mask = sum(1 << c for c in skipped)
+            rb_t0 = time.perf_counter()
             next_binary, build = rebuild(mask)
+            total_rebuild_s += max(0.0, time.perf_counter() - rb_t0)
             if next_binary is None:
                 comp = (build or {}).get("compile") or {}
                 rnd["stopped"] = fallback_reason = "rebuild_failed"
@@ -765,10 +1467,16 @@ def run_campaign_rounds(
             last = campaign(binary, left, True, extra_env=skip_env)
         else:
             last = campaign(binary, left, True)
-        spent += time.monotonic() - started
+        wall_elapsed = max(0.0, time.monotonic() - started)
+        fb_fuzz_s = float(last["fuzz_s"]) if isinstance(last.get("fuzz_s"), (int, float)) else wall_elapsed
+        spent += max(0.0, fb_fuzz_s)
+        total_replay_s += max(0.0, float(last.get("replay_s") or 0.0))
+        if isinstance(last.get("telemetry"), dict):
+            telemetries.append(last["telemetry"])
         single_process_reason = single_process_reason or last.get("single_process_reason")
         if single_process_reason:
             workers = 1
+        _record_round_blinding(last)
         arts = last.get("artifacts") or []
         collected.extend(arts)
         fallback = {
@@ -790,6 +1498,8 @@ def run_campaign_rounds(
             unique.append(a)
     merged, dropped = _collapse_duplicate_artifacts(unique)
     out = dict(last)
+    out.pop("_raw_crashes", None)
+    out.pop("_case_passes", None)
     out["artifacts"] = merged
     if last.get("status") != "insufficient_memory":
         out["status"] = classify_campaign(last.get("returncode") or 0, bool(last.get("timed_out")), merged)
@@ -797,6 +1507,12 @@ def run_campaign_rounds(
         omitted = dict(out.get("artifacts_omitted") or {})
         omitted["duplicates"] = omitted.get("duplicates", 0) + dropped
         out["artifacts_omitted"] = omitted
+    merged_tel = merge_telemetry(telemetries, build_s=build_s + total_rebuild_s)
+    merged_tel["fuzz_s"] = round(spent, 3)
+    merged_tel["replay_s"] = round(total_replay_s, 3)
+    out["telemetry"] = merged_tel
+    out["fuzz_s"] = round(spent, 3)
+    out["replay_s"] = round(total_replay_s, 3)
     out["keep_going"] = {
         "mode": "dispatch_rounds",
         "dispatch_cases": n_cases,
@@ -820,6 +1536,20 @@ def run_campaign_rounds(
         out["error_summary"] = [*(out.get("error_summary") or []), f"keep-going rounds: {skip_error}"]
     if fallback is not None:
         out["keep_going"]["fork_fallback"] = fallback
+    if smoke_list:
+        out["smoke_skipped_cases"] = smoke_list
+    if eff_explore_judge:
+        blinded_rep = tracker.blinded_cases_report()
+        if blinded_rep and out.get("status") != "insufficient_memory":
+            active_cases = max(0, n_cases - len(set(smoke_list)))
+            all_blind = active_cases > 0 and len(tracker.blinded_case_ids()) >= active_cases
+            out["blinded_cases"] = blinded_rep
+            out["partial_blinded"] = not all_blind
+            out["status"] = "blinded" if all_blind else "partial_blinded"
+            out["blinded_remedies"] = list(BLINDING_REMEDIES)
+        else:
+            out.setdefault("blinded_cases", [])
+            out.setdefault("partial_blinded", False)
     return out
 
 
@@ -843,6 +1573,7 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
                 "fork",
                 "single_process_reason",
                 "multi_process_attempt",
+                "telemetry",
             )
             if key in run
         }
@@ -855,7 +1586,7 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
     else:
         status = classify_campaign(0, False, artifacts)
     last = list(runs.values())[-1]
-    merged = {
+    merged: dict[str, Any] = {
         "status": status,
         "returncode": last.get("returncode"),
         "timed_out": any(bool(r.get("timed_out")) for r in runs.values()),
@@ -864,6 +1595,9 @@ def merge_engine_campaigns(runs: dict[str, dict]) -> dict:
         "engines": engines,
         "log_tail": "\n".join(f"--- {e}\n{(r.get('log_tail') or '')[-2000:]}" for e, r in runs.items()),
     }
+    tels = [r.get("telemetry") for r in runs.values() if isinstance(r.get("telemetry"), dict)]
+    if tels:
+        merged["telemetry"] = merge_telemetry(tels)
     if errors := [f"{engine}: {e}" for engine, run in runs.items() for e in run.get("error_summary") or []]:
         merged["error_summary"] = errors
     # An engine that did not run to completion stays visible even when another engine's crash is the
@@ -911,6 +1645,8 @@ def run_fuzz_campaign(
     fork: bool = False,
     extra_env: dict[str, str] | None = None,
     single_process_reason: str | None = None,
+    runs: int | None = None,
+    seed: int | None = None,
 ) -> dict:
     """
     `corpus_dir` receives new units (writable); `extra_corpus` directories are read-only
@@ -946,6 +1682,8 @@ def run_fuzz_campaign(
         "extra_corpus": extra_corpus,
         "attribution_builder": attribution_builder,
         "extra_env": extra_env,
+        "runs": runs,
+        "seed": seed,
     }
     multi = fork or max(1, int(workers or 1)) > 1 or max(1, int(jobs or 1)) > 1
     reason = single_process_reason if multi else None
@@ -1008,6 +1746,8 @@ def _run_fuzz_campaign_once(
     workers: int = 1,
     fork: bool = False,
     print_funcs: bool = True,
+    runs: int | None = None,
+    seed: int | None = None,
 ) -> dict:
     """One libFuzzer campaign as run_fuzz_campaign describes; `_executed_inputs` says whether any input ran."""
     req_mem = fuzz_required_memory_mb(workers)
@@ -1050,6 +1790,10 @@ def _run_fuzz_campaign_once(
             "-print_final_stats=1",
             str(corpus_dir.resolve()),
         ]
+        if runs is not None and runs >= 0:
+            cmd.insert(-1, f"-runs={int(runs)}")
+        if seed is not None:
+            cmd.insert(-1, f"-seed={int(seed)}")
         if not print_funcs:
             cmd.insert(-1, "-print_funcs=0")
         cmd += [str(Path(d).resolve()) for d in (extra_corpus or []) if Path(d).is_dir()]
@@ -1080,12 +1824,21 @@ def _run_fuzz_campaign_once(
 
         wall_timeout = max_time * waves + 180
         cpu_mult = max(2, eff_workers + 1)
+        oom_before = resources.read_cgroup_oom_kills() if resources.fuzz_explore_judge_enabled() else None
+        fuzz_started = time.monotonic()
         res = sandbox_exec.run_sandboxed(
             cmd,
             writable=[scratch, corpus_dir, artifacts_dir],
             timeout_s=wall_timeout,
             limits=Limits(cpu_seconds=wall_timeout * cpu_mult, ignore_sigpipe=True),
             extra_env=run_env,
+        )
+        fuzz_s = max(0.0, time.monotonic() - fuzz_started)
+        oom_after = resources.read_cgroup_oom_kills() if oom_before is not None else None
+        oom_delta = (
+            max(0, oom_after - oom_before)
+            if (oom_before is not None and oom_after is not None)
+            else None
         )
         MAX_WORKER_LOG_BYTES = 1024 * 1024
         worker_logs: list[str] = []
@@ -1127,6 +1880,7 @@ def _run_fuzz_campaign_once(
         if not selected_files and res.returncode != 0 and all_artifact_files:
             selected_files = [(p, True) for p in all_artifact_files]
 
+        replay_started = time.monotonic()
         artifacts: list[dict] = []
         attribution_state: dict = {"built": False, "binary": None}
 
@@ -1235,17 +1989,54 @@ def _run_fuzz_campaign_once(
                         failure["predicate"],
                     )
             artifacts.append(entry)
+        replay_s = max(0.0, time.monotonic() - replay_started)
+
+        raw_crashes = [
+            {
+                "artifact": a.get("artifact"),
+                "kind": a.get("kind"),
+                "fingerprint": a.get("fingerprint"),
+                "pre_existing": bool(a.get("pre_existing")),
+            }
+            for a in artifacts
+        ]
+        # P7d: if container OOM kills increased during libFuzzer execution, drop artifacts lacking
+        # any parsed failure or libFuzzer OOM/sanitizer report so container kills never become findings.
+        container_oom_dropped = 0
+        if oom_delta and oom_delta > 0:
+            kept_after_oom: list[dict] = []
+            for a in artifacts:
+                if a.get("failure") is None and a.get("kind") != "oom" and not a.get("link_stub_abort"):
+                    container_oom_dropped += 1
+                    continue
+                kept_after_oom.append(a)
+            artifacts = kept_after_oom
 
         artifacts, omitted = _collapse_duplicate_artifacts(artifacts)
         status = classify_campaign(res.returncode, res.timed_out, artifacts)
-        out = {
+        if oom_delta and oom_delta > 0 and container_oom_dropped > 0 and status in ("fuzzer_error", "clean"):
+            status = "container_oom"
+
+        telemetry_streams = [f"{res.stdout}\n{res.stderr}", *worker_logs]
+        telemetry = parse_libfuzzer_telemetry(
+            telemetry_streams,
+            build_s=0.0,
+            fuzz_s=fuzz_s,
+            replay_s=replay_s,
+            oom_kills_delta=oom_delta,
+        )
+        out: dict[str, Any] = {
             "status": status,
             "returncode": res.returncode,
             "timed_out": res.timed_out,
             "sandbox": res.sandbox,
             "artifacts": artifacts,
+            "fuzz_s": round(fuzz_s, 3),
+            "replay_s": round(replay_s, 3),
+            "telemetry": telemetry,
             "log_tail": combined_out[-4000:],
             "_executed_inputs": libfuzzer_executed_inputs(combined_out),
+            "_raw_crashes": raw_crashes,
         }
         if fork:
             out["fork"] = eff_workers
@@ -2717,8 +3508,21 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="mode", required=True)
 
     p_camp = sub.add_parser("campaign")
-    _add_build_args(p_camp)
-    p_camp.add_argument("--out-bin", type=Path, required=True)
+    _add_build_args(p_camp, sources_required=False)
+    p_camp.add_argument("--out-bin", type=Path, default=None)
+    p_camp.add_argument("--build-json", type=Path, default=None, help="Pre-built workspace/build/<mod>.build.json (P7f)")
+    p_camp.add_argument("--smoke-report", type=Path, default=None, help="Optional workspace/reports/smoke/<mod>.json (P3)")
+    p_camp.add_argument(
+        "--profile",
+        choices=["quick", "standard", "deep"],
+        default="standard",
+        help="Pipeline profile (used under FRAMAC_FUZZ_EXPLORE_JUDGE for P2a budget share and P6a floor runs)",
+    )
+    p_camp.add_argument(
+        "--no-floor-pass",
+        action="store_true",
+        help="Skip the P6a per-case floor pass even when FRAMAC_FUZZ_EXPLORE_JUDGE is enabled",
+    )
     p_camp.add_argument("--corpus-dir", type=Path, required=True, help="Writable corpus directory (receives new units)")
     p_camp.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="Read-only seed corpus directories")
     p_camp.add_argument("--artifacts-dir", type=Path, required=True)
@@ -2762,6 +3566,44 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_camp.add_argument("--module", default="")
     p_camp.add_argument("--out-json", type=Path, required=True)
+
+    p_judge = sub.add_parser("judge", help="Judge grown corpus, seeds, and explorer crashes on pre-built E-ACSL (P2d)")
+    p_judge.add_argument("--module", required=True)
+    p_judge.add_argument("--build-json", type=Path, required=True, help="Pre-built workspace/build/<mod>.build.json")
+    p_judge.add_argument("--corpus-dir", type=Path, required=True, help="Grown corpus directory")
+    p_judge.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="Seeds and imported corpus directories")
+    p_judge.add_argument("--explore-report", type=Path, default=None, help="Explorer fuzz report JSON for crashes and D1b linking")
+    p_judge.add_argument("--smoke-report", type=Path, default=None, help="Optional workspace/reports/smoke/<mod>.json")
+    p_judge.add_argument("--profile", choices=["quick", "standard", "deep"], default="standard")
+    p_judge.add_argument("--max-corpus-inputs", type=int, default=None, help="Override profile cap N (512/2048/4096)")
+    p_judge.add_argument("--max-time", type=int, default=JUDGE_DEFAULT_MAX_TIME_S, help="Safety wall-clock stop (seconds)")
+    p_judge.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_judge.add_argument("--batch-size", type=int, default=JUDGE_BATCH_SIZE)
+    p_judge.add_argument("--scratch-dir", type=Path, default=None)
+    p_judge.add_argument("--sources", nargs="*", default=None, help="Optional harness/module sources (defaults to build-json)")
+    p_judge.add_argument("--out-json", type=Path, required=True)
+
+    p_efuzz = sub.add_parser("eacsl-fuzz", help="Run the deep-profile 1/5 E-ACSL fuzz share after judge (P2e)")
+    p_efuzz.add_argument("--module", required=True)
+    p_efuzz.add_argument("--build-json", type=Path, required=True, help="Pre-built workspace/build/<mod>.build.json")
+    p_efuzz.add_argument("--corpus-dir", type=Path, required=True, help="Writable corpus directory")
+    p_efuzz.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="Read-only seed corpus directories")
+    p_efuzz.add_argument("--artifacts-dir", type=Path, required=True)
+    p_efuzz.add_argument("--judge-report", type=Path, default=None, help="workspace/reports/judge/<mod>.json")
+    p_efuzz.add_argument("--smoke-report", type=Path, default=None, help="workspace/reports/smoke/<mod>.json")
+    p_efuzz.add_argument("--profile", choices=["quick", "standard", "deep"], default="deep")
+    p_efuzz.add_argument("--fuzz-budget", type=int, default=None, help="Total module CPU-s budget (1/5 share used)")
+    p_efuzz.add_argument("--max-time", type=int, default=None, help="Explicit wall-clock seconds override")
+    p_efuzz.add_argument("--workers", default="auto")
+    p_efuzz.add_argument("--jobs", type=int, default=None)
+    p_efuzz.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
+    p_efuzz.add_argument("--dict", type=Path, default=None)
+    p_efuzz.add_argument("--no-auto-dict", action="store_true")
+    p_efuzz.add_argument("--cppflags", default="-I.")
+    p_efuzz.add_argument("--sources", nargs="*", default=None)
+    p_efuzz.add_argument("--stop-on-first-crash", action="store_true")
+    p_efuzz.add_argument("--no-cache", action="store_true")
+    p_efuzz.add_argument("--out-json", type=Path, required=True)
 
     p_guard = sub.add_parser("guardrail")
     p_guard.add_argument("--sources", nargs="+", required=True)
@@ -2961,12 +3803,16 @@ def main(argv: list[str] | None = None) -> int:
 
     raw_argv = normalize_flag_args(list(argv) if argv is not None else sys.argv[1:])
     args = parser.parse_args(raw_argv)
-    if args.mode == "campaign" and str(args.workers).strip().lower() != "auto":
+    if args.mode in ("campaign", "eacsl-fuzz") and str(args.workers).strip().lower() != "auto":
         try:
             if int(args.workers) < 1:
                 raise ValueError
         except ValueError:
             parser.error(f"--workers must be 'auto' or a positive integer (got {args.workers!r})")
+    if args.mode == "campaign" and not args.sources and args.build_json is None:
+        parser.error("campaign needs --sources (or --build-json)")
+    if args.mode == "campaign" and args.out_bin is None and args.build_json is None:
+        parser.error("campaign needs --out-bin (or --build-json)")
     if args.mode == "replay" and args.binary is None and not (args.sources and args.out_bin):
         parser.error("replay needs --binary, or --sources with --out-bin")
 
@@ -3077,18 +3923,18 @@ def main(argv: list[str] | None = None) -> int:
             "runs": runs,
         }
         note_security_props(res, (prepared or {}).get("security_props"))
-        args.out_json.parent.mkdir(parents=True, exist_ok=True)
-        args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+        atomic_write_json(args.out_json, res)
         print(json.dumps(_summary(res), indent=2))
         return 0 if res["status"] == "ok" else 1
 
     digest_before = prover_candidates.digest_before_run(args.out_json) if args.mode == "guardrail" else None
     identity: dict = {}
     prior_report: dict | None = None
-    if args.mode == "campaign":
+    if args.mode in ("campaign", "eacsl-fuzz"):
         # Taken before the build: the values the artifacts are found under. The report this run
         # replaces holds the values of the artifacts libFuzzer only re-reports (`pre_existing`).
-        identity = campaign_harness_identity(args.module, args.sources)
+        eff_sources = _sources_for_mode(args)
+        identity = campaign_harness_identity(args.module, eff_sources)
         try:
             loaded = json.loads(args.out_json.read_text(encoding="utf-8"))
             prior_report = loaded if isinstance(loaded, dict) else None
@@ -3100,6 +3946,10 @@ def main(argv: list[str] | None = None) -> int:
             res = run_selftest(args.work_dir, args.machdep, variadic_translation=not args.no_variadic_translation)
         elif args.mode == "campaign":
             res = _run_campaign_mode(args)
+        elif args.mode == "judge":
+            res = _run_judge_mode(args)
+        elif args.mode == "eacsl-fuzz":
+            res = _run_eacsl_fuzz_mode(args)
         elif args.mode == "build":
             res = _run_build_mode(args)
         elif args.mode == "coverage":
@@ -3193,9 +4043,17 @@ def main(argv: list[str] | None = None) -> int:
                 if "diagnostic_hints" not in res:
                     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     except SandboxUnavailable as exc:
-        res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
-        if args.mode == "guardrail":
-            res["crash_input"] = None
+        if args.mode == "judge":
+            res = _judge_error_report(
+                getattr(args, "module", "") or "unknown",
+                profile=getattr(args, "profile", "standard") or "standard",
+                reason=f"sandbox_unavailable: {exc}",
+                corpus_cap=getattr(args, "max_corpus_inputs", None),
+            )
+        else:
+            res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
+            if args.mode == "guardrail":
+                res["crash_input"] = None
 
     if args.mode == "guardrail":
         # What E-ACSL did not execute, on every status: run_guardrail_check set the same fields from the
@@ -3209,13 +4067,12 @@ def main(argv: list[str] | None = None) -> int:
         if hints or "diagnostic_hints" in res:
             res["diagnostic_hints"] = hints
 
-    if args.mode == "campaign":
+    if args.mode in ("campaign", "eacsl-fuzz"):
         import seed_harvest  # lazily: only campaigns read the seed writes' statuses
 
         res["seeds"] = seed_harvest.seeds_report_field(args.module, bool(args.extra_corpus))
         stamp_harness_identity(res, identity, prior_report)
-    args.out_json.parent.mkdir(parents=True, exist_ok=True)
-    args.out_json.write_text(json.dumps(res, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(args.out_json, res)
     summary = _summary(res)
     if args.mode == "guardrail":
         prover_candidates.add_candidate_block(summary, args.out_json, "guardrail", res, digest_before)
@@ -3228,7 +4085,34 @@ def main(argv: list[str] | None = None) -> int:
         if str(res.get("reason") or "").startswith("sandbox_unavailable"):
             return 3
         return 0 if res.get("status") in ("reproduced", "not_reproduced") else 1
+    if args.mode == "judge":
+        if str(res.get("reason") or "").startswith("sandbox_unavailable"):
+            return 3
+        return 0
     return 3 if res.get("status") == "sandbox_unavailable" else 0
+
+
+def _load_json_dict_optional(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        loaded = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _sources_for_mode(args) -> list[str]:
+    srcs = list(getattr(args, "sources", None) or [])
+    if srcs:
+        return srcs
+    bdoc = _load_json_dict_optional(getattr(args, "build_json", None))
+    if bdoc and isinstance(bdoc.get("sources"), list):
+        return [str(s) for s in bdoc["sources"] if isinstance(s, str)]
+    return []
 
 
 def _run_build_mode(args) -> dict:
@@ -3246,6 +4130,8 @@ def _run_build_mode(args) -> dict:
         "cache": comp.get("cache"),
         "compile": comp,
     }
+    if build.get("binaries") is not None:
+        res["binaries"] = build["binaries"]
     if built and build["engine_used"] == "eacsl" and comp.get("reduced_checks"):
         res["reduced_checks"] = comp["reduced_checks"]
     if build["engine_fallback_reason"]:
@@ -3257,7 +4143,9 @@ def _run_build_mode(args) -> dict:
     if build.get("attempts"):
         res["build_attempts"] = build["attempts"]
     note_security_props(res, build_security_props(build))
-    if args.engine == "auto" and build["engine_used"] == "eacsl":
+    if build.get("sanitizer_compile") is not None:
+        res["sanitizer_compile"] = build["sanitizer_compile"]
+    elif args.engine == "auto" and build["engine_used"] == "eacsl":
         # The campaign falls back to the sanitizers when the selftest fails: build them now, with the
         # campaign's arguments, so that it restores them from the cache.
         san = fuzz_build.build_module_binary(
@@ -3289,15 +4177,1277 @@ def campaign_gate_reasons(run_dir: Path, module: str) -> list[str]:
         return [f"cannot read {phase0_gates.GATES_JSON}: {exc}"]
 
 
-def _run_campaign_mode(args) -> dict:
+def _encode_dispatch_selector(case_idx: int, selector: str) -> bytes:
+    width = dispatch_selector_width(selector)
+    return int(case_idx).to_bytes(width, "little")
+
+
+def _file_dispatch_case(path: Path, n_cases: int | None, selector: str) -> int | None:
+    if not n_cases or n_cases <= 0:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            prefix = fh.read(dispatch_selector_width(selector))
+    except OSError:
+        return None
+    return dispatch_case_of_bytes(prefix, n_cases, selector)
+
+
+def run_floor_pass(
+    binary: Path,
+    corpus_dir: Path,
+    artifacts_dir: Path,
+    *,
+    n_cases: int,
+    selector: str,
+    supports_only_case: bool,
+    profile: str = "standard",
+    extra_corpus: Sequence[Path] = (),
+    smoke_skipped: Sequence[int] = (),
+    dict_file: Path | None = None,
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    rss_limit_mb: int = FUZZ_RSS_LIMIT_MB,
+    module: str = "",
+    blinding_threshold: int = BLINDING_CASE_THRESHOLD,
+    max_restarts: int = FLOOR_PASS_MAX_RESTARTS,
+    runs_override: int | None = None,
+    safety_time_override: int | None = None,
+    campaign_runner=None,
+    single_process: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """
+    P6a per-case floor pass for multi-case dispatch harnesses under FRAMAC_FUZZ_EXPLORE_JUDGE.
+    Isolates each non-smoke-skipped case via `FRAMAC_FUZZ_ONLY_CASE=<k>` (falling back to
+    `FRAMAC_FUZZ_SKIP_CASES` + a bootstrap selector seed for legacy harnesses), merges grown
+    per-case corpora into `corpus_dir` with normalized selector bytes, detects per-case blinding
+    (`K_case = 16`), and returns peak per-worker RSS for P7b/P7c sizing.
+    """
+    runner = campaign_runner or run_fuzz_campaign
+    prof = (profile or "standard").strip().lower()
+    default_runs, default_safety = FLOOR_PASS_BY_PROFILE.get(prof, FLOOR_PASS_BY_PROFILE["standard"])
+    case_runs = max(1, int(runs_override if runs_override is not None else default_runs))
+    case_safety_s = max(1, int(safety_time_override if safety_time_override is not None else default_safety))
+    smoke_set = {int(c) for c in smoke_skipped if 0 <= int(c) < n_cases}
+    width = dispatch_selector_width(selector)
+
+    # Partition existing seeds/imported inputs once by dispatch case.
+    seeds_by_case: dict[int, list[Path]] = {k: [] for k in range(n_cases)}
+    for root in (corpus_dir, *extra_corpus):
+        p = Path(root)
+        if not p.is_dir():
+            continue
+        for f in sorted(p.iterdir()):
+            if not f.is_file() or f.is_symlink() or f.name.startswith("."):
+                continue
+            c = _file_dispatch_case(f, n_cases, selector)
+            if c is not None and 0 <= c < n_cases:
+                seeds_by_case[c].append(f)
+
+    tracker = CaseBlindingTracker(threshold=blinding_threshold)
+    case_results: list[dict[str, Any]] = []
+    all_artifacts: list[dict[str, Any]] = []
+    telemetries: list[dict[str, Any]] = []
+    skip_for_shared: set[int] = set(smoke_set)
+    peak_per_worker_mb: float | int | None = None
+    floor_started = time.monotonic()
+
+    scratch_root = Path(tempfile.mkdtemp(prefix=f"floor_{module or 'mod'}_"))
+    try:
+        for k in range(n_cases):
+            if k in smoke_set:
+                case_results.append(
+                    {
+                        "case": k,
+                        "status": "smoke_skipped",
+                        "attempts": 0,
+                        "reached_executions": 0,
+                        "edges": 0,
+                        "corpus_files": 0,
+                        "peak_rss_mb": None,
+                        "fingerprints": [],
+                    }
+                )
+                continue
+
+            case_corpus = scratch_root / f"case_{k}" / "corpus"
+            case_seeds = scratch_root / f"case_{k}" / "seeds"
+            case_corpus.mkdir(parents=True, exist_ok=True)
+            case_seeds.mkdir(parents=True, exist_ok=True)
+            for idx, seed_path in enumerate(seeds_by_case.get(k) or []):
+                with contextlib.suppress(OSError):
+                    shutil.copy2(seed_path, case_seeds / f"s{idx}_{seed_path.name}")
+            if not supports_only_case and not any(case_seeds.iterdir()):
+                (case_seeds / f"bootstrap_case_{k}").write_bytes(_encode_dispatch_selector(k, selector))
+
+            if supports_only_case:
+                case_env = {DISPATCH_ONLY_CASE_ENV: str(k)}
+            else:
+                others = [c for c in range(n_cases) if c != k]
+                case_env = {DISPATCH_SKIP_MACRO: format_skip_cases_env(others)}
+
+            remaining_runs = case_runs
+            restarts = 0
+            case_attempts = 0
+            case_edges = 0
+            case_peak_rss: float | int | None = None
+            case_fps: list[str] = []
+            case_crashed = False
+            case_blinded = False
+            case_hit_safety = False
+            case_seed_val = derive_seed(binary, f"{module}:floor:{k}")
+
+            while remaining_runs > 0:
+                sp_kwargs: dict[str, Any] = (
+                    {"single_process_reason": single_process.get("reason")} if single_process is not None else {}
+                )
+                run = runner(
+                    binary,
+                    case_corpus,
+                    artifacts_dir,
+                    case_safety_s,
+                    dict_file=dict_file,
+                    per_input_timeout=per_input_timeout,
+                    rss_limit_mb=rss_limit_mb,
+                    extra_corpus=[case_seeds],
+                    jobs=1,
+                    workers=1,
+                    fork=False,
+                    extra_env=case_env,
+                    runs=remaining_runs,
+                    seed=case_seed_val + restarts,
+                    **sp_kwargs,
+                )
+                if single_process is not None and run.get("single_process_reason") and "reason" not in single_process:
+                    single_process["reason"] = str(run["single_process_reason"])
+                tel = run.get("telemetry")
+                if isinstance(tel, dict):
+                    telemetries.append(tel)
+                    execs = int(tel.get("total_executions") or 0)
+                    case_attempts += execs
+                    case_edges = max(case_edges, int(tel.get("max_cov") or 0))
+                    rss = tel.get("peak_rss_mb")
+                    if isinstance(rss, (int, float)) and not isinstance(rss, bool):
+                        case_peak_rss = rss if case_peak_rss is None else max(case_peak_rss, rss)
+                        peak_per_worker_mb = rss if peak_per_worker_mb is None else max(peak_per_worker_mb, rss)
+                else:
+                    execs = 0
+
+                arts = [a for a in (run.get("artifacts") or []) if not a.get("pre_existing")]
+                raw_crashes = run.get("_raw_crashes")
+                crash_list = (
+                    [r for r in raw_crashes if isinstance(r, dict) and not r.get("pre_existing")]
+                    if isinstance(raw_crashes, list)
+                    else arts
+                )
+                for a in arts:
+                    all_artifacts.append(a)
+                    if a.get("fingerprint") and str(a["fingerprint"]) not in case_fps:
+                        case_fps.append(str(a["fingerprint"]))
+
+                if not crash_list and run.get("status") == "clean":
+                    if execs > 0:
+                        tracker.record_pass(k)
+                    if execs < remaining_runs and float(run.get("fuzz_s") or 0.0) >= case_safety_s:
+                        case_hit_safety = True
+                    break
+
+                if crash_list:
+                    case_crashed = True
+                    if execs > len(crash_list):
+                        tracker.record_pass(k)
+                    for cr in crash_list:
+                        if tracker.record_crash(k, cr.get("fingerprint")):
+                            case_blinded = True
+                    if case_blinded or tracker.is_blinded(k):
+                        case_blinded = True
+                        break
+                    restarts += 1
+                    remaining_runs = max(0, remaining_runs - max(1, execs))
+                    # Allow up to blinding_threshold probes when 0 passes so blinding is detected cleanly,
+                    # otherwise cap restarts at max_restarts (4).
+                    allowed_restarts = blinding_threshold if tracker.passes_of(k) == 0 else max_restarts
+                    if restarts >= allowed_restarts:
+                        break
+                    continue
+
+                # Non-crash failure (fuzzer_error / insufficient_memory / timeout)
+                if run.get("timed_out"):
+                    case_hit_safety = True
+                break
+
+            # Merge case_corpus into shared corpus_dir with normalized selector bytes.
+            corpus_dir.mkdir(parents=True, exist_ok=True)
+            merged_files = 0
+            sel_prefix = _encode_dispatch_selector(k, selector)
+            for cf in sorted(case_corpus.iterdir()):
+                if not cf.is_file() or cf.is_symlink() or cf.name.startswith("."):
+                    continue
+                with contextlib.suppress(OSError):
+                    raw_bytes = cf.read_bytes()
+                    if len(raw_bytes) >= width:
+                        norm = sel_prefix + raw_bytes[width:]
+                    else:
+                        norm = sel_prefix + raw_bytes
+                    digest = hashlib.sha256(norm).hexdigest()
+                    dest = corpus_dir / f"floor_c{k}_{digest[:16]}"
+                    if not dest.exists():
+                        dest.write_bytes(norm)
+                    merged_files += 1
+
+            if case_blinded:
+                c_status = "blinded"
+                skip_for_shared.add(k)
+            elif case_crashed:
+                c_status = "crashing"
+                skip_for_shared.add(k)
+            elif case_hit_safety or (case_attempts > 0 and case_edges == 0 and merged_files == 0 and restarts >= max_restarts):
+                c_status = "floor_not_reached"
+            else:
+                c_status = "ok"
+
+            case_results.append(
+                {
+                    "case": k,
+                    "status": c_status,
+                    "attempts": case_attempts,
+                    "reached_executions": case_attempts,
+                    "edges": case_edges,
+                    "corpus_files": merged_files,
+                    "peak_rss_mb": case_peak_rss,
+                    "fingerprints": case_fps,
+                }
+            )
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
+
+    floor_s = max(0.0, time.monotonic() - floor_started)
+    merged_tel = merge_telemetry(telemetries, floor_s=floor_s)
+    return {
+        "cases": case_results,
+        "artifacts": all_artifacts,
+        "blinded_cases": tracker.blinded_cases_report(),
+        "skip_for_shared": sorted(skip_for_shared),
+        "peak_per_worker_mb": peak_per_worker_mb,
+        "floor_s": round(floor_s, 3),
+        "telemetry": merged_tel,
+    }
+
+
+def _judge_input_running_at_exit(output: str, batch: Sequence[Path]) -> int | None:
+    """
+    Index in `batch` of the input libFuzzer was executing when the process exited (`Running: <p>`
+    without a matching `Executed <p>`), resilient to resolved/relative/POSIX path formatting.
+    """
+    last_running: str | None = None
+    for m in _RUNNING_RE.finditer(output or ""):
+        if m.group("run") is not None:
+            last_running = m.group("run").strip()
+        elif m.group("done") is not None and m.group("done").strip() == last_running:
+            last_running = None
+    if last_running is None:
+        return None
+    norm_last = last_running.replace("\\", "/")
+    for i, path in enumerate(batch):
+        p = Path(path)
+        if str(p.resolve()) == last_running or str(p) == last_running or p.resolve().as_posix() == norm_last or p.as_posix() == norm_last:
+            return i
+    base = Path(last_running).name
+    matches = [i for i, path in enumerate(batch) if Path(path).name == base]
+    return matches[0] if len(matches) == 1 else None
+
+
+def select_judge_inputs(
+    corpus_dir: Path,
+    extra_corpus: Sequence[Path] = (),
+    explore_report: dict[str, Any] | None = None,
+    *,
+    cap: int = 2048,
+    n_cases: int | None = None,
+    selector: str = DISPATCH_SELECTOR_MODULO,
+    smoke_skipped: Sequence[int] = (),
+) -> dict[str, Any]:
+    """
+    P2d deterministic case-stratified SHA-256 input selection for E-ACSL judging:
+    - Mandatory inputs (always kept): all files from `extra_corpus` (seeds + imported inputs),
+      all targeted files in `corpus_dir` (`TARGETED_CORPUS_PREFIXES`), and all explorer crash
+      artifacts listed in `explore_report`.
+    - Grown corpus inputs (up to `cap`): grouped by dispatch case when `n_cases` is known,
+      deterministically ordered by SHA-256 of filename within each case, and selected round-robin
+      across cases so no high-volume case starves low-volume cases.
+    - Selected inputs are interleaved across dispatch cases for prompt per-case blinding.
+    """
+    smoke_set = {int(c) for c in smoke_skipped if int(c) >= 0}
+    seen_paths: set[str] = set()
+    mandatory_raw: list[Path] = []
+    grown_raw: list[Path] = []
+
+    def _add_unique(p: Path, dest: list[Path]) -> None:
+        if not p.is_file() or p.is_symlink() or p.name.startswith("."):
+            return
+        key = str(p.resolve())
+        if key in seen_paths:
+            return
+        seen_paths.add(key)
+        dest.append(p)
+
+    # 1. Explorer crash artifacts (mandatory)
+    if isinstance(explore_report, dict):
+        for art in explore_report.get("artifacts") or []:
+            if isinstance(art, dict) and art.get("artifact"):
+                _add_unique(Path(str(art["artifact"])), mandatory_raw)
+
+    # 2. Extra corpus directories: seeds and imported inputs (mandatory)
+    for d in extra_corpus:
+        dp = Path(d)
+        if dp.is_file():
+            _add_unique(dp, mandatory_raw)
+        elif dp.is_dir():
+            for f in sorted(dp.iterdir()):
+                _add_unique(f, mandatory_raw)
+
+    # 3. Corpus directory: targeted files are mandatory, rest are grown corpus
+    cdir = Path(corpus_dir)
+    if cdir.is_dir():
+        for f in sorted(cdir.iterdir()):
+            if f.name.startswith(TARGETED_CORPUS_PREFIXES):
+                _add_unique(f, mandatory_raw)
+            else:
+                _add_unique(f, grown_raw)
+
+    # Filter out inputs belonging to smoke-quarantined dispatch cases before cap selection
+    smoke_skipped_count = 0
+    mandatory: list[tuple[Path, int | None]] = []
+    for p in mandatory_raw:
+        c = _file_dispatch_case(p, n_cases, selector)
+        if c is not None and c in smoke_set:
+            smoke_skipped_count += 1
+            continue
+        mandatory.append((p, c))
+
+    grown: list[tuple[Path, int | None]] = []
+    for p in grown_raw:
+        c = _file_dispatch_case(p, n_cases, selector)
+        if c is not None and c in smoke_set:
+            smoke_skipped_count += 1
+            continue
+        grown.append((p, c))
+
+    def _sha_key(item: tuple[Path, int | None]) -> tuple[str, str]:
+        p = item[0]
+        digest = hashlib.sha256(p.name.encode("utf-8", errors="surrogateescape")).hexdigest()
+        return (digest, p.as_posix())
+
+    eff_cap = max(0, int(cap))
+    grown_selected: list[tuple[Path, int | None]] = []
+    if len(grown) <= eff_cap:
+        grown_selected = sorted(grown, key=_sha_key)
+    elif n_cases and n_cases > 0:
+        # Case-stratified round-robin SHA-256 selection
+        buckets: dict[int, deque[tuple[Path, int | None]]] = {}
+        for item in grown:
+            bucket_key = item[1] if item[1] is not None else -1
+            buckets.setdefault(bucket_key, deque()).append(item)
+        for bk in buckets:
+            buckets[bk] = deque(sorted(buckets[bk], key=_sha_key))
+        active_keys = sorted(buckets.keys())
+        while len(grown_selected) < eff_cap and active_keys:
+            next_keys: list[int] = []
+            for bk in active_keys:
+                if len(grown_selected) >= eff_cap:
+                    break
+                q = buckets[bk]
+                if q:
+                    grown_selected.append(q.popleft())
+                if q:
+                    next_keys.append(bk)
+            active_keys = next_keys
+    else:
+        grown_selected = sorted(grown, key=_sha_key)[:eff_cap]
+
+    not_judged_cap = max(0, len(grown) - len(grown_selected))
+
+    # Interleave selected inputs across dispatch cases so broken cases blind early without starving healthy cases.
+    combined = [*mandatory, *grown_selected]
+    if n_cases and n_cases > 0 and combined:
+        inter_buckets: dict[int, deque[Path]] = {}
+        for p, c in combined:
+            bk = c if c is not None else -1
+            inter_buckets.setdefault(bk, deque()).append(p)
+        ordered: list[Path] = []
+        active = sorted(inter_buckets.keys())
+        while active:
+            nxt: list[int] = []
+            for bk in active:
+                iq = inter_buckets[bk]
+                if iq:
+                    ordered.append(iq.popleft())
+                if iq:
+                    nxt.append(bk)
+            active = nxt
+    else:
+        ordered = [p for p, _ in combined]
+
+    total_inputs = len(mandatory_raw) + len(grown_raw)
+    return {
+        "selected": ordered,
+        "total": total_inputs,
+        "mandatory": len(mandatory),
+        "grown_total": len(grown),
+        "grown_selected": len(grown_selected),
+        "not_judged_cap": not_judged_cap,
+        "not_judged_smoke": smoke_skipped_count,
+    }
+
+
+def link_cross_engine_findings(
+    artifact_sha256: str,
+    judge_failure: dict[str, Any] | None,
+    judge_fingerprint: str | None,
+    explore_report: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """
+    D1b cross-engine linking: link an E-ACSL judge finding to explorer findings when they share
+    the same artifact sha256 (`same_artifact`), the same normalized file+function+line (`same_site`),
+    or adjacent lines within `CROSS_ENGINE_ADJACENT_LINES` in the same file+function (`adjacent_line`).
+    """
+    if not isinstance(explore_report, dict):
+        return []
+    exp_arts = explore_report.get("artifacts")
+    if not isinstance(exp_arts, list):
+        return []
+
+    links: list[dict[str, Any]] = []
+    seen: set[tuple[str | None, str | None, str]] = set()
+    j_file = normalize_file(str(judge_failure.get("file") or "")) if isinstance(judge_failure, dict) and judge_failure.get("file") else ""
+    j_fn = str(judge_failure.get("function") or "") if isinstance(judge_failure, dict) else ""
+    j_line = int(judge_failure.get("line") or 0) if isinstance(judge_failure, dict) else 0
+
+    for exp in exp_arts:
+        if not isinstance(exp, dict):
+            continue
+        exp_fp = exp.get("fingerprint")
+        exp_sha = str(exp.get("sha256") or "")
+        exp_engine = str(exp.get("engine") or explore_report.get("engine_used") or "sanitizers")
+        exp_art = str(exp.get("artifact") or "") or None
+        exp_fail = exp.get("failure") if isinstance(exp.get("failure"), dict) else None
+
+        match_kind: str | None = None
+        line_delta: int | None = None
+        if artifact_sha256 and exp_sha and exp_sha == artifact_sha256:
+            match_kind = "same_artifact"
+            if exp_fail and j_line > 0 and int(exp_fail.get("line") or 0) > 0:
+                line_delta = abs(j_line - int(exp_fail.get("line") or 0))
+        elif j_file and j_fn and exp_fail:
+            e_file = normalize_file(str(exp_fail.get("file") or "")) if exp_fail.get("file") else ""
+            e_fn = str(exp_fail.get("function") or "")
+            e_line = int(exp_fail.get("line") or 0)
+            if e_file == j_file and e_fn == j_fn:
+                if j_line > 0 and e_line > 0:
+                    delta = abs(j_line - e_line)
+                    if delta == 0:
+                        match_kind = "same_site"
+                        line_delta = 0
+                    elif delta <= CROSS_ENGINE_ADJACENT_LINES:
+                        match_kind = "adjacent_line"
+                        line_delta = delta
+                else:
+                    match_kind = "same_site"
+
+        if match_kind is None:
+            continue
+        key = (judge_fingerprint, exp_fp, match_kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append(
+            {
+                "judge_fingerprint": judge_fingerprint,
+                "explore_fingerprint": exp_fp,
+                "explore_engine": exp_engine,
+                "match": match_kind,
+                "artifact_sha256": artifact_sha256 or None,
+                "explore_artifact": exp_art,
+                "line_delta": line_delta,
+            }
+        )
+    return links
+
+
+def _judge_error_report(
+    module: str,
+    *,
+    profile: str = "standard",
+    reason: str,
+    corpus_cap: int | None = None,
+    binary: str | None = None,
+) -> dict[str, Any]:
+    """Schema-valid `judge_report.schema.json` report for judge-level errors (e.g. `SandboxUnavailable`)."""
+    prof = (profile or "standard").strip().lower()
+    if prof not in JUDGE_CORPUS_CAP_BY_PROFILE:
+        prof = "standard"
+    cap = int(corpus_cap) if corpus_cap is not None else JUDGE_CORPUS_CAP_BY_PROFILE[prof]
+    mod_name = (module or "").strip() or "unknown"
+    return {
+        "schema_version": JUDGE_SCHEMA_VERSION,
+        "mode": "judge",
+        "module": mod_name,
+        "generated_at": utc_now(),
+        "discovering_step": "judge",
+        "engine_used": "eacsl" if binary else None,
+        "profile": prof,
+        "status": "judge_error",
+        "binary": binary,
+        "corpus_cap": max(0, cap),
+        "inputs": {
+            "total": 0,
+            "mandatory": 0,
+            "grown_total": 0,
+            "grown_selected": 0,
+            "selected": 0,
+            "judged": 0,
+            "passed": 0,
+            "failed": 0,
+            "not_judged": 0,
+            "not_judged_breakdown": {
+                "cap": 0,
+                "timeout": 0,
+                "blinded": 0,
+                "smoke_skipped": 0,
+                "error": 0,
+            },
+        },
+        "not_judged": 0,
+        "artifacts": [],
+        "batch_state_only": [],
+        "cross_engine_links": [],
+        "smoke_skipped_cases": [],
+        "blinded_cases": [],
+        "partial_blinded": False,
+        "telemetry": {
+            "judge_s": 0.0,
+            "batch_s": 0.0,
+            "confirm_s": 0.0,
+            "inputs_per_s": 0.0,
+            "batches_run": 0,
+            "fresh_confirmations": 0,
+        },
+        "harness_digest": None,
+        "dispatch_case_count": None,
+        "dispatch_selector": None,
+        "reason": reason,
+    }
+
+
+def run_judge(
+    module: str,
+    build_json: dict[str, Any] | Path | str,
+    corpus_dir: Path,
+    *,
+    extra_corpus: Sequence[Path] = (),
+    explore_report: dict[str, Any] | Path | None = None,
+    smoke_report: Path | None = None,
+    profile: str = "standard",
+    max_corpus_inputs: int | None = None,
+    max_time: int = JUDGE_DEFAULT_MAX_TIME_S,
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    batch_size: int = JUDGE_BATCH_SIZE,
+    scratch_dir: Path | None = None,
+    sources: Sequence[str] | None = None,
+    blinding_threshold: int = BLINDING_CASE_THRESHOLD,
+) -> dict[str, Any]:
+    """
+    P2d standalone E-ACSL judge:
+    - Resolves the pre-built `.e-acsl` binary from `build_json` via `resolve_prebuilt_binary`.
+    - Selects all mandatory inputs (seeds, imported inputs, explorer crashes) + up to `N`
+      case-stratified SHA-256 grown corpus inputs (`512` quick / `2048` standard / `4096` deep).
+    - Runs inputs in `O(N)` batches, advancing strictly with `batch[culprit + 1 :]` on failure
+      (handling `culprit == last` cleanly with zero infinite loops) and treating `returncode == 0`
+      mid-batch exits (`P8a`) as passes before continuing with `batch[idx + 1 :]`.
+    - Confirms every new fingerprint in a fresh standalone process (`crash_replay.replay_artifact`),
+      separating `batch_state_only` failures from confirmed standalone candidate witnesses.
+    - Tracks per-case blinding (`K_case = 16`), D1b cross-engine linking, and `not_judged` accounting.
+    """
+    prof = (profile or "standard").strip().lower()
+    cap = int(max_corpus_inputs) if max_corpus_inputs is not None else JUDGE_CORPUS_CAP_BY_PROFILE.get(prof, 2048)
+
+    build_doc: dict[str, Any] | None = (
+        build_json if isinstance(build_json, dict) else _load_json_dict_optional(Path(build_json))
+    )
+    explore_doc: dict[str, Any] | None = (
+        explore_report if isinstance(explore_report, dict) else _load_json_dict_optional(explore_report)
+    )
+    smoke_skipped = load_smoke_skipped_cases(smoke_report)
+
+    eff_sources = list(sources or [])
+    if not eff_sources and isinstance(build_doc, dict) and isinstance(build_doc.get("sources"), list):
+        eff_sources = [str(s) for s in build_doc["sources"] if isinstance(s, str)]
+
+    n_cases = dispatch_case_count(eff_sources) if eff_sources else None
+    selector = (dispatch_selector(eff_sources) if eff_sources else None) or DISPATCH_SELECTOR_MODULO
+    if n_cases is None and isinstance(explore_doc, dict):
+        dc = explore_doc.get("dispatch_case_count")
+        if isinstance(dc, int) and dc > 0:
+            n_cases = dc
+            selector = str(explore_doc.get("dispatch_selector") or selector)
+
+    harness_digest = (
+        explore_doc.get("harness_digest")
+        if isinstance(explore_doc, dict) and explore_doc.get("harness_digest")
+        else (campaign_harness_identity(module, eff_sources).get("harness_digest") if eff_sources else None)
+    )
+
+    selection = select_judge_inputs(
+        corpus_dir,
+        extra_corpus,
+        explore_doc,
+        cap=cap,
+        n_cases=n_cases,
+        selector=selector,
+        smoke_skipped=smoke_skipped,
+    )
+    selected: list[Path] = list(selection["selected"])
+
+    def _base_report(
+        *,
+        status: str,
+        binary_str: str | None,
+        passed: int,
+        failed: int,
+        not_judged_timeout: int = 0,
+        not_judged_blinded: int = 0,
+        not_judged_error: int = 0,
+        artifacts: list[dict[str, Any]] | None = None,
+        batch_state_only: list[dict[str, Any]] | None = None,
+        cross_links: list[dict[str, Any]] | None = None,
+        blinded_cases: list[dict[str, Any]] | None = None,
+        partial_blinded: bool = False,
+        blinded_fp: str | None = None,
+        judge_s: float = 0.0,
+        batch_s: float = 0.0,
+        confirm_s: float = 0.0,
+        batches_run: int = 0,
+        fresh_confirmations: int = 0,
+        reason: str | None = None,
+        startup_error: str | None = None,
+        omitted_dups: int = 0,
+    ) -> dict[str, Any]:
+        judged = passed + failed
+        nj_cap = int(selection["not_judged_cap"])
+        nj_smoke = int(selection["not_judged_smoke"])
+        nj_total = nj_cap + nj_smoke + not_judged_timeout + not_judged_blinded + not_judged_error
+        ips = round(judged / judge_s, 2) if judge_s > 0.0 and judged > 0 else 0.0
+        report: dict[str, Any] = {
+            "schema_version": JUDGE_SCHEMA_VERSION,
+            "mode": "judge",
+            "module": module,
+            "generated_at": utc_now(),
+            "discovering_step": "judge",
+            "engine_used": "eacsl" if binary_str else None,
+            "profile": prof,
+            "status": status,
+            "binary": binary_str,
+            "corpus_cap": cap,
+            "inputs": {
+                "total": int(selection["total"]),
+                "mandatory": int(selection["mandatory"]),
+                "grown_total": int(selection["grown_total"]),
+                "grown_selected": int(selection["grown_selected"]),
+                "selected": len(selected),
+                "judged": judged,
+                "passed": passed,
+                "failed": failed,
+                "not_judged": nj_total,
+                "not_judged_breakdown": {
+                    "cap": nj_cap,
+                    "timeout": not_judged_timeout,
+                    "blinded": not_judged_blinded,
+                    "smoke_skipped": nj_smoke,
+                    "error": not_judged_error,
+                },
+            },
+            "not_judged": nj_total,
+            "artifacts": list(artifacts or []),
+            "batch_state_only": list(batch_state_only or []),
+            "cross_engine_links": list(cross_links or []),
+            "smoke_skipped_cases": list(smoke_skipped),
+            "blinded_cases": list(blinded_cases or []),
+            "partial_blinded": bool(partial_blinded),
+            "telemetry": {
+                "judge_s": round(max(0.0, judge_s), 3),
+                "batch_s": round(max(0.0, batch_s), 3),
+                "confirm_s": round(max(0.0, confirm_s), 3),
+                "inputs_per_s": ips,
+                "batches_run": batches_run,
+                "fresh_confirmations": fresh_confirmations,
+            },
+            "harness_digest": harness_digest,
+            "dispatch_case_count": n_cases,
+            "dispatch_selector": selector if n_cases is not None else None,
+        }
+        if blinded_fp is not None:
+            report["blinded_fingerprint"] = blinded_fp
+        if blinded_cases or status == "blinded":
+            report["blinded_remedies"] = list(BLINDING_REMEDIES)
+        if omitted_dups > 0:
+            report["artifacts_omitted"] = {"duplicates": omitted_dups}
+        if reason is not None:
+            report["reason"] = reason
+        if startup_error is not None:
+            report["startup_error"] = startup_error
+        return report
+
+    try:
+        eacsl_binary = fuzz_build.resolve_prebuilt_binary(build_json, "eacsl")
+    except (PrebuiltBinaryError, ValueError, TypeError) as exc:
+        return _base_report(
+            status="skipped",
+            binary_str=None,
+            passed=0,
+            failed=0,
+            not_judged_error=len(selected),
+            reason=str(exc),
+        )
+
+    seed = derive_seed(eacsl_binary, module)
+    eff_batch = max(1, int(batch_size or JUDGE_BATCH_SIZE))
+    pending: deque[list[Path]] = deque(
+        selected[i : i + eff_batch] for i in range(0, len(selected), eff_batch)
+    )
+    skipped_cases: set[int] = set(smoke_skipped)
+    tracker = CaseBlindingTracker(threshold=blinding_threshold)
+    confirmed_standalone_fps: set[str] = set()
+    artifacts: list[dict[str, Any]] = []
+    batch_state_only: list[dict[str, Any]] = []
+    cross_links: list[dict[str, Any]] = []
+    cross_link_keys: set[tuple[str | None, str | None, str, str | None]] = set()
+
+    passed = 0
+    failed = 0
+    not_judged_timeout = 0
+    not_judged_blinded = 0
+    not_judged_error = 0
+    batches_run = 0
+    fresh_confirmations = 0
+    batch_s = 0.0
+    confirm_s = 0.0
+    startup_err: str | None = None
+    sandbox_err: str | None = None
+    module_blinded_non_dispatch = False
+    non_dispatch_blind_fp: str | None = None
+
+    own_scratch = scratch_dir is None
+    scratch = Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp(prefix=f"judge_{module}_"))
+    scratch.mkdir(parents=True, exist_ok=True)
+    judge_started = time.monotonic()
+    deadline = judge_started + max(1, int(max_time))
+    min_wall = 2 * int(per_input_timeout) + 10
+
+    def _case_of(p: Path) -> int | None:
+        return _file_dispatch_case(p, n_cases, selector)
+
+    def _record_passes(items: Sequence[Path]) -> None:
+        nonlocal passed
+        for item in items:
+            passed += 1
+            if n_cases and n_cases > 0:
+                c = _case_of(item)
+                if c is not None:
+                    tracker.record_pass(c)
+            else:
+                tracker.record_pass(0)
+
+    def _handle_failure(culprit_path: Path, batch_output: str, batch_rc: int | None, batch_to: bool) -> None:
+        nonlocal failed, confirm_s, fresh_confirmations, module_blinded_non_dispatch, non_dispatch_blind_fp
+        failed += 1
+        c_idx = _case_of(culprit_path)
+        sha = sha256_file(culprit_path)
+        size = culprit_path.stat().st_size if culprit_path.is_file() else 0
+        stub_abort = parse_link_stub_abort(batch_output)
+        batch_failure = None if stub_abort else parse_runtime_failure(batch_output, binary=eacsl_binary)
+        batch_fp = (
+            make_fingerprint(
+                batch_failure["file"],
+                batch_failure["function"],
+                batch_failure["alarm_kind"] or batch_failure["kind"],
+                batch_failure["predicate"],
+            )
+            if batch_failure
+            else None
+        )
+
+        # Fresh-process standalone confirmation for every new fingerprint (or unparsed crash).
+        need_confirm = batch_fp is None or batch_fp not in confirmed_standalone_fps
+        standalone_rep: dict[str, Any] | None = None
+        if need_confirm:
+            fresh_confirmations += 1
+            ct0 = time.monotonic()
+            standalone_rep = crash_replay.replay_artifact(
+                eacsl_binary,
+                culprit_path,
+                scratch,
+                module=module,
+                per_input_timeout=per_input_timeout,
+            )
+            confirm_s += max(0.0, time.monotonic() - ct0)
+            if not standalone_rep.get("reproduced"):
+                batch_state_only.append(
+                    {
+                        "input": culprit_path.as_posix(),
+                        "sha256": sha,
+                        "case": c_idx,
+                        "batch_returncode": batch_rc,
+                        "batch_timed_out": bool(batch_to),
+                        "batch_failure": batch_failure,
+                        "batch_fingerprint": batch_fp,
+                        "standalone_returncode": standalone_rep.get("returncode"),
+                        "standalone_timed_out": bool(standalone_rep.get("timed_out")),
+                    }
+                )
+                return
+
+        eff_stub = (standalone_rep.get("link_stub_abort") if standalone_rep else None) or stub_abort
+        eff_failure = (
+            None
+            if eff_stub
+            else ((standalone_rep.get("failure") if standalone_rep else None) or batch_failure)
+        )
+        eff_fp = (
+            make_fingerprint(
+                eff_failure["file"],
+                eff_failure["function"],
+                eff_failure["alarm_kind"] or eff_failure["kind"],
+                eff_failure["predicate"],
+            )
+            if eff_failure
+            else batch_fp
+        )
+        if eff_fp:
+            confirmed_standalone_fps.add(eff_fp)
+
+        links = link_cross_engine_findings(sha, eff_failure, eff_fp, explore_doc)
+        for lk in links:
+            lkey = (lk.get("judge_fingerprint"), lk.get("explore_fingerprint"), str(lk.get("match")), lk.get("artifact_sha256"))
+            if lkey not in cross_link_keys:
+                cross_link_keys.add(lkey)
+                cross_links.append(lk)
+
+        art_entry: dict[str, Any] = {
+            "artifact": culprit_path.as_posix(),
+            "kind": _artifact_kind(culprit_path.name) or ("timeout" if batch_to else "crash"),
+            "sha256": sha,
+            "size_bytes": size,
+            "case": c_idx,
+            "engine": "eacsl",
+            "discovering_step": "judge",
+            "reproducible": True,
+            "standalone_confirmed": True,
+            "returncode": standalone_rep.get("returncode") if standalone_rep else batch_rc,
+            "timed_out": bool(standalone_rep.get("timed_out")) if standalone_rep else bool(batch_to),
+            "failure": eff_failure,
+            "failure_source": "primary" if eff_failure else None,
+            "fingerprint": eff_fp,
+            "frames": (standalone_rep.get("frames") if standalone_rep else None) or stack_frames(batch_output),
+            "replay_log_tail": (standalone_rep.get("log_tail") if standalone_rep else batch_output[-3000:]),
+            "cross_engine_links": links,
+            "harness_digest": harness_digest,
+            "dispatch_case_count": n_cases,
+            "dispatch_selector": selector if n_cases is not None else None,
+        }
+        if eff_stub is not None:
+            art_entry["link_stub_abort"] = eff_stub
+        elif not eff_failure:
+            res_abort = (standalone_rep.get("resource_abort") if standalone_rep else None) or parse_eacsl_resource_abort(batch_output)
+            if res_abort is not None:
+                art_entry["eacsl_resource_abort"] = res_abort
+        artifacts.append(art_entry)
+
+        # Update per-case (or single-entry) blinding tracker.
+        if n_cases and n_cases > 0:
+            if c_idx is not None and tracker.record_crash(c_idx, eff_fp):
+                skipped_cases.add(c_idx)
+        else:
+            if tracker.record_crash(0, eff_fp):
+                module_blinded_non_dispatch = True
+                non_dispatch_blind_fp = eff_fp
+
+    try:
+        while pending:
+            if module_blinded_non_dispatch:
+                not_judged_blinded += sum(len(b) for b in pending)
+                pending.clear()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                not_judged_timeout += sum(len(b) for b in pending)
+                pending.clear()
+                break
+
+            raw_batch = pending.popleft()
+            if n_cases and n_cases > 0 and skipped_cases:
+                batch: list[Path] = []
+                for item in raw_batch:
+                    c = _case_of(item)
+                    if c is not None and c in skipped_cases:
+                        not_judged_blinded += 1
+                    else:
+                        batch.append(item)
+                if not batch:
+                    continue
+            else:
+                batch = raw_batch
+
+            batches_run += 1
+            wall = min(int(per_input_timeout) * len(batch) + 30, max(int(remaining), min_wall))
+            run_env = dict(SANITIZER_RUNTIME_ENV)
+            if skipped_cases:
+                run_env[DISPATCH_SKIP_MACRO] = format_skip_cases_env(skipped_cases)
+            bt0 = time.monotonic()
+            res = sandbox_exec.run_sandboxed(
+                [
+                    str(eacsl_binary.resolve()),
+                    f"-timeout={per_input_timeout}",
+                    f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+                    f"-seed={seed}",
+                    f"-artifact_prefix={replay_artifact_dir(scratch)}/",
+                    *[str(Path(f).resolve()) for f in batch],
+                ],
+                writable=[scratch],
+                timeout_s=wall,
+                limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
+                extra_env=run_env,
+            )
+            batch_s += max(0.0, time.monotonic() - bt0)
+            out_text = f"{res.stdout}\n{res.stderr}"
+
+            if res.returncode == 0 and not res.timed_out:
+                # P8a: handle clean _Exit(0) mid-batch as a pass for batch[:idx+1], then continue with batch[idx+1:].
+                exited_idx = _judge_input_running_at_exit(out_text, batch)
+                if exited_idx is not None:
+                    _record_passes(batch[: exited_idx + 1])
+                    rest = batch[exited_idx + 1 :]
+                    if rest:
+                        pending.appendleft(rest)
+                else:
+                    _record_passes(batch)
+                continue
+
+            # Non-zero exit or timeout: check for startup failure before LLVMFuzzerTestOneInput.
+            batch_fail_probe = parse_runtime_failure(out_text, binary=eacsl_binary)
+            is_start, start_reason = is_startup_failure(batch_fail_probe, out_text)
+            if is_start and _judge_input_running_at_exit(out_text, batch) is None:
+                startup_err = start_reason or "startup failure before LLVMFuzzerTestOneInput"
+                not_judged_error += len(batch) + sum(len(b) for b in pending)
+                pending.clear()
+                break
+
+            if len(batch) == 1:
+                _handle_failure(batch[0], out_text, res.returncode, res.timed_out)
+                continue
+
+            culprit = _judge_input_running_at_exit(out_text, batch)
+            if culprit is not None:
+                if culprit > 0:
+                    _record_passes(batch[:culprit])
+                _handle_failure(batch[culprit], out_text, res.returncode, res.timed_out)
+                # P2d O(N) continuation: strictly advance past culprit; when culprit == len(batch) - 1,
+                # `rest` is empty so we never re-enqueue or loop.
+                rest = batch[culprit + 1 :]
+                if rest:
+                    pending.appendleft(rest)
+                continue
+
+            # Output did not identify the running input: bisect deterministically.
+            mid = len(batch) // 2
+            pending.appendleft(batch[mid:])
+            pending.appendleft(batch[:mid])
+    except SandboxUnavailable as exc:
+        sandbox_err = f"sandbox_unavailable: {exc}"
+        accounted = passed + failed + not_judged_timeout + not_judged_blinded + not_judged_error
+        not_judged_error += max(0, len(selected) - accounted)
+        pending.clear()
+    finally:
+        if own_scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    judge_s = max(0.0, time.monotonic() - judge_started)
+    collapsed_arts, omitted_dups = _collapse_duplicate_artifacts(artifacts)
+    blinded_rep = tracker.blinded_cases_report() if (n_cases and n_cases > 0) else []
+    partial_blinded = False
+    blinded_fp: str | None = non_dispatch_blind_fp
+
+    if sandbox_err is not None:
+        status = "judge_error"
+    elif startup_err is not None:
+        status = "startup_error"
+    elif module_blinded_non_dispatch:
+        status = "blinded"
+    elif blinded_rep:
+        active_cases = max(0, (n_cases or 0) - len(set(smoke_skipped)))
+        all_blind = active_cases > 0 and len(tracker.blinded_case_ids()) >= active_cases
+        status = "blinded" if all_blind else "partial_blinded"
+        partial_blinded = not all_blind
+    elif collapsed_arts:
+        status = "crash_found"
+    elif not_judged_timeout > 0:
+        status = "partial"
+    else:
+        status = "clean"
+
+    return _base_report(
+        status=status,
+        binary_str=str(eacsl_binary),
+        passed=passed,
+        failed=failed,
+        not_judged_timeout=not_judged_timeout,
+        not_judged_blinded=not_judged_blinded,
+        not_judged_error=not_judged_error,
+        artifacts=collapsed_arts,
+        batch_state_only=batch_state_only,
+        cross_links=cross_links,
+        blinded_cases=blinded_rep,
+        partial_blinded=partial_blinded,
+        blinded_fp=blinded_fp,
+        judge_s=judge_s,
+        batch_s=batch_s,
+        confirm_s=confirm_s,
+        batches_run=batches_run,
+        fresh_confirmations=fresh_confirmations,
+        reason=sandbox_err,
+        startup_error=startup_err,
+        omitted_dups=omitted_dups,
+    )
+
+
+def _run_judge_mode(args) -> dict:
+    return run_judge(
+        args.module,
+        args.build_json,
+        args.corpus_dir,
+        extra_corpus=args.extra_corpus,
+        explore_report=args.explore_report,
+        smoke_report=args.smoke_report,
+        profile=args.profile,
+        max_corpus_inputs=args.max_corpus_inputs,
+        max_time=args.max_time,
+        per_input_timeout=args.per_input_timeout,
+        batch_size=args.batch_size,
+        scratch_dir=args.scratch_dir,
+        sources=args.sources,
+    )
+
+
+def _judge_skipped_cases(judge_report: dict[str, Any] | None, n_cases: int | None, selector: str) -> list[int]:
+    """Dispatch case indices that crashed or blinded during `judge` (to pre-skip in `eacsl-fuzz`)."""
+    if not isinstance(judge_report, dict):
+        return []
+    cases: set[int] = set()
+    for entry in judge_report.get("blinded_cases") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("case"), int) and entry["case"] >= 0:
+            cases.add(int(entry["case"]))
+    for art in judge_report.get("artifacts") or []:
+        if not isinstance(art, dict):
+            continue
+        c = art.get("case")
+        if isinstance(c, int) and c >= 0:
+            cases.add(c)
+        elif n_cases and n_cases > 0:
+            dc = artifact_dispatch_case(art, n_cases, selector)
+            if dc is not None and dc >= 0:
+                cases.add(dc)
+    return sorted(cases)
+
+
+def _run_eacsl_fuzz_mode(args) -> dict:
+    """
+    P2e `eacsl-fuzz` subcommand (deep profile only): runs the remaining 1/5 CPU budget on the
+    pre-built `.e-acsl` binary, skipping cases that crashed or blinded in `judge` and cases
+    quarantined by `smoke`.
+    """
+    prof = (args.profile or "deep").strip().lower()
+    smoke_skipped = load_smoke_skipped_cases(args.smoke_report)
+    judge_doc = _load_json_dict_optional(args.judge_report)
+    eff_sources = _sources_for_mode(args)
+    n_cases = dispatch_case_count(eff_sources) if eff_sources else None
+    selector = (dispatch_selector(eff_sources) if eff_sources else None) or DISPATCH_SELECTOR_MODULO
+    if n_cases is None and isinstance(judge_doc, dict) and isinstance(judge_doc.get("dispatch_case_count"), int):
+        dc = int(judge_doc["dispatch_case_count"])
+        if dc > 0:
+            n_cases = dc
+            selector = str(judge_doc.get("dispatch_selector") or selector)
+    judge_skipped = _judge_skipped_cases(judge_doc, n_cases, selector)
+
+    share_cpu_s = eacsl_fuzz_budget_cpu_s(args.fuzz_budget, prof) if args.fuzz_budget is not None else None
+    if prof != "deep":
+        return {
+            "mode": "eacsl-fuzz",
+            "module": args.module,
+            "status": "skipped",
+            "engine_used": "eacsl",
+            "discovering_step": "eacsl_fuzz",
+            "reason": f"eacsl-fuzz runs under 'deep' profile only (got {prof!r})",
+            "smoke_skipped_cases": smoke_skipped,
+            "judge_skipped_cases": judge_skipped,
+            "blinded_cases": [],
+            "partial_blinded": False,
+            "unspent_budget_s": 0.0,
+            "artifacts": [],
+            "telemetry": merge_telemetry([], build_s=0.0),
+        }
+
+    try:
+        eacsl_binary = fuzz_build.resolve_prebuilt_binary(args.build_json, "eacsl")
+    except (PrebuiltBinaryError, ValueError, TypeError) as exc:
+        return {
+            "mode": "eacsl-fuzz",
+            "module": args.module,
+            "status": "skipped",
+            "engine_used": None,
+            "discovering_step": "eacsl_fuzz",
+            "reason": str(exc),
+            "smoke_skipped_cases": smoke_skipped,
+            "judge_skipped_cases": judge_skipped,
+            "blinded_cases": [],
+            "partial_blinded": False,
+            "unspent_budget_s": float(share_cpu_s or 0.0),
+            "artifacts": [],
+            "telemetry": merge_telemetry([], build_s=0.0),
+        }
+
+    pre_skipped = sorted(set(smoke_skipped) | set(judge_skipped))
+    whole_blinded = (isinstance(judge_doc, dict) and judge_doc.get("status") == "blinded") or (
+        n_cases is not None and n_cases > 0 and len(pre_skipped) >= n_cases
+    )
+    if whole_blinded:
+        return {
+            "mode": "eacsl-fuzz",
+            "module": args.module,
+            "status": "unspent_blinded",
+            "engine_used": "eacsl",
+            "discovering_step": "eacsl_fuzz",
+            "reason": "module was fully blinded in judge; eacsl-fuzz 1/5 share recorded as unspent_blinded",
+            "smoke_skipped_cases": smoke_skipped,
+            "judge_skipped_cases": judge_skipped,
+            "blinded_cases": list((judge_doc or {}).get("blinded_cases") or []),
+            "partial_blinded": False,
+            "blinded_remedies": list(BLINDING_REMEDIES),
+            "unspent_budget_s": float(share_cpu_s if share_cpu_s is not None else (args.max_time or 0)),
+            "artifacts": [],
+            "telemetry": merge_telemetry([], build_s=0.0),
+        }
+
     workers = resolve_workers(args.workers)
+    if str(args.workers).strip().lower() == "auto" and share_cpu_s is not None and share_cpu_s > 0:
+        workers = max(1, min(workers, max(1, share_cpu_s // MIN_FUZZ_WALL_S)))
     jobs = args.jobs if args.jobs else workers
-    max_time = campaign_wall_time(args.max_time, args.fuzz_budget, workers)
+    max_time = campaign_wall_time(args.max_time, share_cpu_s, workers)
     sizing = {
         "workers": workers,
         "jobs": jobs,
         "max_time": max_time,
-        "fuzz_budget_cpu_s": args.fuzz_budget,
+        "fuzz_budget_cpu_s": share_cpu_s,
+        "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
+        "per_input_timeout": args.per_input_timeout,
+    }
+    dict_file, dict_info = resolve_campaign_dictionary(
+        args.dict,
+        eff_sources,
+        args.module,
+        args.corpus_dir,
+        auto=not getattr(args, "no_auto_dict", False),
+        cppflags=args.cppflags,
+    )
+    skippable = dispatch_skippable_cases(eff_sources, n_cases) if n_cases is not None else None
+    runtime_skip = bool(
+        n_cases is not None
+        and n_cases <= DISPATCH_RUNTIME_SKIP_MAX_CASES
+        and (harness_supports_runtime_skip_cases(eff_sources) if eff_sources else True)
+    )
+    single_process: dict[str, str] = {}
+
+    def _campaign(binary: Path, seconds: int, fork: bool, *, extra_env: dict[str, str] | None = None) -> dict:
+        run = run_fuzz_campaign(
+            binary,
+            args.corpus_dir,
+            args.artifacts_dir,
+            seconds,
+            dict_file,
+            args.per_input_timeout,
+            extra_corpus=args.extra_corpus,
+            jobs=jobs,
+            workers=workers,
+            fork=fork,
+            extra_env=extra_env,
+            single_process_reason=single_process.get("reason"),
+        )
+        if run.get("single_process_reason") and "reason" not in single_process:
+            single_process["reason"] = str(run["single_process_reason"])
+        return run
+
+    def _no_rebuild(mask: int) -> tuple[Path | None, dict]:
+        return None, {"compile": {"returncode": 1, "log_tail": "P7f: no compilation inside eacsl-fuzz lease"}}
+
+    fuzz = run_campaign_rounds(
+        eacsl_binary,
+        max_time,
+        campaign=_campaign,
+        rebuild=_no_rebuild,
+        n_cases=n_cases,
+        keep_going=not args.stop_on_first_crash,
+        skippable=skippable,
+        runtime_skip=runtime_skip,
+        selector=selector,
+        workers=workers,
+        initial_skipped=pre_skipped,
+        explore_judge=True,
+        build_s=0.0,
+        smoke_skipped_cases=smoke_skipped,
+    )
+    for art in fuzz.get("artifacts") or []:
+        art["engine"] = "eacsl"
+        art["discovering_step"] = "eacsl_fuzz"
+    res: dict[str, Any] = {
+        "mode": "eacsl-fuzz",
+        "module": args.module,
+        "sources": eff_sources,
+        "engine_used": "eacsl",
+        "discovering_step": "eacsl_fuzz",
+        "binary": str(eacsl_binary),
+        "smoke_skipped_cases": smoke_skipped,
+        "judge_skipped_cases": judge_skipped,
+        "dictionary": dict_info,
+        "sizing": sizing,
+        **fuzz,
+    }
+    res.setdefault("blinded_cases", [])
+    res.setdefault("partial_blinded", False)
+    return res
+
+
+def _run_campaign_mode(args) -> dict:
+    explore_judge = resources.fuzz_explore_judge_enabled()
+    profile = str(getattr(args, "profile", "standard") or "standard").strip().lower()
+    smoke_skipped = load_smoke_skipped_cases(getattr(args, "smoke_report", None))
+    eff_sources = _sources_for_mode(args)
+    build_json_path: Path | None = getattr(args, "build_json", None)
+
+    workers = resolve_workers(args.workers)
+    effective_budget = (
+        explore_budget_cpu_s(args.fuzz_budget, profile)
+        if (explore_judge and args.fuzz_budget is not None)
+        else args.fuzz_budget
+    )
+    if explore_judge and str(args.workers).strip().lower() == "auto" and effective_budget is not None and effective_budget > 0:
+        workers = max(1, min(workers, max(1, effective_budget // MIN_FUZZ_WALL_S)))
+    jobs = args.jobs if args.jobs else workers
+    effective_max_time = args.max_time
+    if explore_judge and effective_max_time is not None and args.fuzz_budget is None and profile == "deep":
+        effective_max_time = max(1, (effective_max_time * 4) // 5)
+    max_time = campaign_wall_time(effective_max_time, effective_budget, workers)
+    sizing = {
+        "workers": workers,
+        "jobs": jobs,
+        "max_time": max_time,
+        "fuzz_budget_cpu_s": effective_budget,
         "rss_limit_mb": FUZZ_RSS_LIMIT_MB,
         "per_input_timeout": args.per_input_timeout,
     }
@@ -3312,7 +5462,7 @@ def _run_campaign_mode(args) -> dict:
         return {
             "mode": "campaign",
             "module": args.module,
-            "sources": args.sources,
+            "sources": eff_sources,
             "status": "insufficient_memory",
             "reason": "insufficient_memory",
             "error_summary": [note],
@@ -3326,7 +5476,29 @@ def _run_campaign_mode(args) -> dict:
             "sizing": {**sizing, "memory_limit_mb": mem_limit},
         }
     use_cache = not getattr(args, "no_cache", False)
-    build = fuzz_build.build_module_binary(args.sources, args.out_bin, **_build_options(args))
+
+    # P2a Explore mode under FRAMAC_FUZZ_EXPLORE_JUDGE + --engine auto (or --engine sanitizers):
+    # executes ASan+UBSan using the pre-built .san binary (or compiled sanitizer binary when
+    # --build-json is omitted), setting discovering_step = "explore", with 100% budget (quick/standard)
+    # or 4/5 budget (deep). E-ACSL judging runs in the standalone `judge` subcommand.
+    if explore_judge and args.engine in ("auto", "sanitizers"):
+        return _run_explore_campaign_mode(
+            args,
+            eff_sources=eff_sources,
+            build_json_path=build_json_path,
+            smoke_skipped=smoke_skipped,
+            profile=profile,
+            workers=workers,
+            jobs=jobs,
+            max_time=max_time,
+            effective_budget=effective_budget,
+            sizing=sizing,
+            use_cache=use_cache,
+        )
+
+    build_t0 = time.monotonic()
+    build = fuzz_build.build_module_binary(eff_sources, args.out_bin, **_build_options(args))
+    build_s = max(0.0, time.monotonic() - build_t0)
     comp = build["compile"]
     engine_used = build["engine_used"]
     res: dict = {"mode": "campaign", "module": args.module}
@@ -3336,29 +5508,29 @@ def _run_campaign_mode(args) -> dict:
         attribution_builder = None
         if engine_used == "eacsl" and not args.no_attribution_replay:
             attribution_builder = fuzz_build._sanitizer_attribution_builder(
-                build.get("sources") or args.sources, args.out_bin, args.cppflags, args.ldflags, use_cache=use_cache
+                build.get("sources") or eff_sources, args.out_bin, args.cppflags, args.ldflags, use_cache=use_cache
             )
 
         warm_started = cache.warm_start_corpus(args.module, args.corpus_dir) if (args.module and use_cache) else 0
         dict_file, dict_info = resolve_campaign_dictionary(
             args.dict,
-            args.sources,
+            eff_sources,
             args.module,
             args.corpus_dir,
             auto=not getattr(args, "no_auto_dict", False),
             cppflags=args.cppflags,
         )
 
-        n_cases = dispatch_case_count(args.sources)
-        selector = dispatch_selector(args.sources) or DISPATCH_SELECTOR_MODULO
-        skippable = dispatch_skippable_cases(args.sources, n_cases) if n_cases is not None else None
+        n_cases = dispatch_case_count(eff_sources)
+        selector = dispatch_selector(eff_sources) or DISPATCH_SELECTOR_MODULO
+        skippable = dispatch_skippable_cases(eff_sources, n_cases) if n_cases is not None else None
         harness_runtime_skip = bool(
             n_cases is not None
             and n_cases <= DISPATCH_RUNTIME_SKIP_MAX_CASES
-            and harness_supports_runtime_skip_cases(args.sources)
+            and harness_supports_runtime_skip_cases(eff_sources)
         )
 
-        def _engine_campaign(engine: str, binary: Path, seconds: int) -> dict:
+        def _engine_campaign(engine: str, binary: Path, seconds: int, eng_build_s: float = 0.0) -> dict:
             attribution = attribution_builder if engine == "eacsl" else None
             # The harness reads the skip set with getenv(); in an E-ACSL build the runtime's
             # argv/environ setup leaves `environ` empty unless the `environ_keep` shim is linked
@@ -3400,7 +5572,7 @@ def _run_campaign_mode(args) -> dict:
                     / f".skip_{args.out_bin.name}"
                     / f"{args.out_bin.stem}_skip{args.out_bin.suffix}"
                 )
-                rebuilt = fuzz_build.build_module_binary(args.sources, skip_bin, **opts)
+                rebuilt = fuzz_build.build_module_binary(eff_sources, skip_bin, **opts)
                 ok = rebuilt["compile"]["returncode"] == 0 and rebuilt["engine_used"] == engine
                 return (Path(rebuilt["compile"]["binary"]) if ok else None), rebuilt
 
@@ -3415,6 +5587,10 @@ def _run_campaign_mode(args) -> dict:
                 runtime_skip=runtime_skip,
                 selector=selector,
                 workers=workers,
+                initial_skipped=smoke_skipped or None,
+                explore_judge=explore_judge,
+                build_s=eng_build_s,
+                smoke_skipped_cases=smoke_skipped or None,
             )
             if harness_runtime_skip and not runtime_skip and isinstance(out.get("keep_going"), dict):
                 out["keep_going"]["runtime_skip_unavailable"] = (
@@ -3429,25 +5605,30 @@ def _run_campaign_mode(args) -> dict:
         # first (faster, and it catches what E-ACSL does not check, such as heap-use-after-free on a reused block), then
         # E-ACSL on the grown corpus, which replays every corpus input under its contract checks.
         second = None
+        san_build_s = 0.0
         if args.engine == "auto" and engine_used == "eacsl":
+            st0 = time.monotonic()
             san = fuzz_build.build_module_binary(
-                args.sources, args.out_bin, **{**_build_options(args), "engine": "sanitizers"}
+                eff_sources, args.out_bin, **{**_build_options(args), "engine": "sanitizers"}
             )
+            san_build_s = max(0.0, time.monotonic() - st0)
             if san["compile"]["returncode"] == 0 and san["engine_used"] == "sanitizers":
                 second = san
             else:
                 res["dual_engine_skipped"] = "sanitizer build failed"
         if second is None:
-            fuzz = _engine_campaign(engine_used, Path(comp["binary"]), max_time)
-            res.update({"sources": args.sources, "engine_used": engine_used, "compile": comp, **fuzz})
+            fuzz = _engine_campaign(engine_used, Path(comp["binary"]), max_time, eng_build_s=build_s)
+            res.update({"sources": eff_sources, "engine_used": engine_used, "compile": comp, **fuzz})
         else:
             share = max(MIN_FUZZ_WALL_S, max_time // 2)
             runs = {
-                "sanitizers": _engine_campaign("sanitizers", Path(second["compile"]["binary"]), share),
-                "eacsl": _engine_campaign("eacsl", Path(comp["binary"]), share),
+                "sanitizers": _engine_campaign(
+                    "sanitizers", Path(second["compile"]["binary"]), share, eng_build_s=san_build_s
+                ),
+                "eacsl": _engine_campaign("eacsl", Path(comp["binary"]), share, eng_build_s=build_s),
             }
             fuzz = merge_engine_campaigns(runs)
-            res.update({"sources": args.sources, "engine_used": DUAL_ENGINE, "compile": comp, **fuzz})
+            res.update({"sources": eff_sources, "engine_used": DUAL_ENGINE, "compile": comp, **fuzz})
             res["sanitizer_compile"] = second["compile"]
         published = (
             cache.publish_corpus(args.module, args.corpus_dir)
@@ -3459,6 +5640,8 @@ def _run_campaign_mode(args) -> dict:
             res["corpus_cache"] = {"warm_started": warm_started, "published": published}
         if engine_used == "eacsl" and comp.get("reduced_checks"):
             res["reduced_checks"] = comp["reduced_checks"]
+        if smoke_skipped:
+            res["smoke_skipped_cases"] = smoke_skipped
     res["sizing"] = sizing
     if build["engine_fallback_reason"]:
         res["engine_fallback_reason"] = build["engine_fallback_reason"]
@@ -3479,6 +5662,312 @@ def _run_campaign_mode(args) -> dict:
                 "not a candidate against the target",
                 file=sys.stderr,
             )
+    res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
+    return res
+
+
+def _run_explore_campaign_mode(
+    args,
+    *,
+    eff_sources: list[str],
+    build_json_path: Path | None,
+    smoke_skipped: list[int],
+    profile: str,
+    workers: int,
+    jobs: int,
+    max_time: int,
+    effective_budget: int | None,
+    sizing: dict[str, Any],
+    use_cache: bool,
+) -> dict[str, Any]:
+    """
+    P2a Explore mode under `FRAMAC_FUZZ_EXPLORE_JUDGE`:
+    Resolves the pre-built `.san` binary via `fuzz_build.resolve_prebuilt_binary(build_json, "sanitizers")`
+    (falling back to `.e-acsl` if sanitizers failed, or compiling sanitizers when `--build-json` is absent),
+    runs optional P6a floor pass + P6b shared pass with per-case blinding and smoke-quarantined skips,
+    and stamps `discovering_step = "explore"`.
+    """
+    build_s = 0.0
+    build_doc: dict[str, Any] | None = None
+    compile_rec: dict[str, Any] | None = None
+    engine_used = "sanitizers"
+    binary_path: Path | None = None
+    dual_skipped_note: str | None = None
+
+    if build_json_path is not None:
+        build_doc = _load_json_dict_optional(build_json_path)
+        try:
+            binary_path = fuzz_build.resolve_prebuilt_binary(build_json_path, "sanitizers")
+            engine_used = "sanitizers"
+        except PrebuiltBinaryError as san_exc:
+            if args.engine == "auto":
+                try:
+                    binary_path = fuzz_build.resolve_prebuilt_binary(build_json_path, "eacsl")
+                    engine_used = "eacsl"
+                    dual_skipped_note = f"sanitizer prebuilt binary unavailable ({san_exc})"
+                except PrebuiltBinaryError as eacsl_exc:
+                    return {
+                        "mode": "campaign",
+                        "module": args.module,
+                        "sources": eff_sources,
+                        "status": "compile_error",
+                        "engine_used": "sanitizers",
+                        "discovering_step": "explore",
+                        "reason": str(eacsl_exc),
+                        "smoke_skipped_cases": smoke_skipped,
+                        "blinded_cases": [],
+                        "partial_blinded": False,
+                        "artifacts": [],
+                        "sizing": sizing,
+                        "telemetry": merge_telemetry([], build_s=0.0),
+                    }
+            else:
+                return {
+                    "mode": "campaign",
+                    "module": args.module,
+                    "sources": eff_sources,
+                    "status": "compile_error",
+                    "engine_used": "sanitizers",
+                    "discovering_step": "explore",
+                    "reason": str(san_exc),
+                    "smoke_skipped_cases": smoke_skipped,
+                    "blinded_cases": [],
+                    "partial_blinded": False,
+                    "artifacts": [],
+                    "sizing": sizing,
+                    "telemetry": merge_telemetry([], build_s=0.0),
+                }
+        if isinstance(build_doc, dict):
+            compile_rec = (
+                build_doc.get("sanitizer_compile")
+                if engine_used == "sanitizers" and isinstance(build_doc.get("sanitizer_compile"), dict)
+                else build_doc.get("compile")
+            )
+    else:
+        build_t0 = time.monotonic()
+        opts = {**_build_options(args), "engine": "sanitizers"}
+        build = fuzz_build.build_module_binary(eff_sources, args.out_bin, **opts)
+        build_s = max(0.0, time.monotonic() - build_t0)
+        compile_rec = build["compile"]
+        engine_used = build["engine_used"]
+        if compile_rec["returncode"] != 0 and args.engine == "auto":
+            et0 = time.monotonic()
+            eb = fuzz_build.build_module_binary(eff_sources, args.out_bin, **{**_build_options(args), "engine": "eacsl"})
+            build_s += max(0.0, time.monotonic() - et0)
+            if eb["compile"]["returncode"] == 0:
+                compile_rec = eb["compile"]
+                engine_used = "eacsl"
+                dual_skipped_note = "sanitizer build failed"
+        if compile_rec["returncode"] != 0:
+            return {
+                "mode": "campaign",
+                "module": args.module,
+                "sources": eff_sources,
+                "status": "compile_error",
+                "engine_used": engine_used,
+                "discovering_step": "explore",
+                "compile": compile_rec,
+                "smoke_skipped_cases": smoke_skipped,
+                "blinded_cases": [],
+                "partial_blinded": False,
+                "artifacts": [],
+                "sizing": sizing,
+                "telemetry": merge_telemetry([], build_s=build_s),
+            }
+        binary_path = Path(str(compile_rec["binary"]))
+
+    assert binary_path is not None
+    warm_started = cache.warm_start_corpus(args.module, args.corpus_dir) if (args.module and use_cache) else 0
+    dict_file, dict_info = resolve_campaign_dictionary(
+        args.dict,
+        eff_sources,
+        args.module,
+        args.corpus_dir,
+        auto=not getattr(args, "no_auto_dict", False),
+        cppflags=args.cppflags,
+    )
+
+    n_cases = dispatch_case_count(eff_sources) if eff_sources else None
+    selector = (dispatch_selector(eff_sources) if eff_sources else None) or DISPATCH_SELECTOR_MODULO
+    skippable = dispatch_skippable_cases(eff_sources, n_cases) if (eff_sources and n_cases is not None) else n_cases
+    runtime_skip = bool(
+        n_cases is not None
+        and n_cases <= DISPATCH_RUNTIME_SKIP_MAX_CASES
+        and (harness_supports_runtime_skip_cases(eff_sources) if eff_sources else True)
+    )
+    supports_only = harness_supports_only_case(eff_sources) if eff_sources else True
+
+    floor_result: dict[str, Any] | None = None
+    floor_artifacts: list[dict[str, Any]] = []
+    pre_blinded: list[dict[str, Any]] = []
+    shared_initial_skipped: list[int] = list(smoke_skipped)
+    eff_workers = workers
+    eff_jobs = jobs
+    eff_max_time = max_time
+
+    single_process: dict[str, str] = {}
+    attribution_builder = None
+    if engine_used == "eacsl" and not args.no_attribution_replay:
+        attribution_builder = fuzz_build._sanitizer_attribution_builder(
+            eff_sources, args.out_bin, args.cppflags, args.ldflags, use_cache=use_cache
+        )
+
+    if (
+        n_cases is not None
+        and n_cases > 0
+        and not args.stop_on_first_crash
+        and not getattr(args, "no_floor_pass", False)
+    ):
+        floor_result = run_floor_pass(
+            binary_path,
+            args.corpus_dir,
+            args.artifacts_dir,
+            n_cases=n_cases,
+            selector=selector,
+            supports_only_case=supports_only,
+            profile=profile,
+            extra_corpus=args.extra_corpus,
+            smoke_skipped=smoke_skipped,
+            dict_file=dict_file,
+            per_input_timeout=args.per_input_timeout,
+            module=args.module,
+            single_process=single_process,
+        )
+        floor_artifacts = list(floor_result.get("artifacts") or [])
+        pre_blinded = list(floor_result.get("blinded_cases") or [])
+        shared_initial_skipped = sorted(set(shared_initial_skipped) | set(floor_result.get("skip_for_shared") or []))
+        peak_mb = floor_result.get("peak_per_worker_mb")
+        if peak_mb is not None and str(args.workers).strip().lower() == "auto":
+            sized_workers = resources.fuzz_workers_from_rss(peak_rss_mb=float(peak_mb))
+            if effective_budget is not None and effective_budget > 0:
+                sized_workers = max(1, min(sized_workers, max(1, effective_budget // MIN_FUZZ_WALL_S)))
+            eff_workers = sized_workers
+            eff_jobs = args.jobs if args.jobs else eff_workers
+            eff_max_time = campaign_wall_time(
+                args.max_time if (args.max_time is None or profile != "deep") else max(1, (args.max_time * 4) // 5),
+                effective_budget,
+                eff_workers,
+            )
+            sizing["workers"] = eff_workers
+            sizing["jobs"] = eff_jobs
+            sizing["max_time"] = eff_max_time
+            sizing["peak_per_worker_mb"] = peak_mb
+
+    def _campaign(binary: Path, seconds: int, fork: bool, *, extra_env: dict[str, str] | None = None) -> dict:
+        run = run_fuzz_campaign(
+            binary,
+            args.corpus_dir,
+            args.artifacts_dir,
+            seconds,
+            dict_file,
+            args.per_input_timeout,
+            extra_corpus=args.extra_corpus,
+            attribution_builder=attribution_builder,
+            jobs=eff_jobs,
+            workers=eff_workers,
+            fork=fork,
+            extra_env=extra_env,
+            single_process_reason=single_process.get("reason"),
+        )
+        if run.get("single_process_reason") and "reason" not in single_process:
+            single_process["reason"] = str(run["single_process_reason"])
+        return run
+
+    def _rebuild(mask: int) -> tuple[Path | None, dict]:
+        if build_json_path is not None:
+            return None, {"compile": {"returncode": 1, "log_tail": "P7f: no compilation inside explore fuzz lease"}}
+        opts = {**_build_options(args), "engine": engine_used, "use_cache": False}
+        opts["cppflags"] = f"{opts['cppflags'] or ''} {dispatch_skip_cppflags(mask)}".strip()
+        skip_bin = (
+            args.out_json.parent
+            / f".skip_{args.out_bin.name}"
+            / f"{args.out_bin.stem}_skip{args.out_bin.suffix}"
+        )
+        rebuilt = fuzz_build.build_module_binary(eff_sources, skip_bin, **opts)
+        ok = rebuilt["compile"]["returncode"] == 0 and rebuilt["engine_used"] == engine_used
+        return (Path(rebuilt["compile"]["binary"]) if ok else None), rebuilt
+
+    shared_t0 = time.monotonic()
+    fuzz = run_campaign_rounds(
+        binary_path,
+        eff_max_time,
+        campaign=_campaign,
+        rebuild=_rebuild,
+        n_cases=n_cases,
+        keep_going=not args.stop_on_first_crash,
+        skippable=skippable,
+        runtime_skip=runtime_skip,
+        selector=selector,
+        workers=eff_workers,
+        initial_skipped=shared_initial_skipped,
+        explore_judge=True,
+        build_s=build_s,
+        pre_blinded_cases=pre_blinded,
+        smoke_skipped_cases=smoke_skipped,
+    )
+    shared_s = max(0.0, time.monotonic() - shared_t0)
+
+    # Merge floor pass artifacts + shared pass artifacts cleanly.
+    all_arts: list[dict[str, Any]] = []
+    seen_art_keys: set[str] = set()
+    for a in [*floor_artifacts, *(fuzz.get("artifacts") or [])]:
+        key = str(a.get("sha256") or a.get("artifact") or "")
+        if key not in seen_art_keys:
+            seen_art_keys.add(key)
+            all_arts.append(a)
+    merged_arts, extra_dups = _collapse_duplicate_artifacts(all_arts)
+    for art in merged_arts:
+        art["engine"] = engine_used
+        art["discovering_step"] = "explore"
+    fuzz["artifacts"] = merged_arts
+    if extra_dups:
+        omitted = dict(fuzz.get("artifacts_omitted") or {})
+        omitted["duplicates"] = omitted.get("duplicates", 0) + extra_dups
+        fuzz["artifacts_omitted"] = omitted
+    if floor_artifacts and fuzz.get("status") == "clean":
+        fuzz["status"] = classify_campaign(0, False, merged_arts)
+
+    tels = [floor_result.get("telemetry") if floor_result else None, fuzz.get("telemetry")]
+    fuzz["telemetry"] = merge_telemetry(
+        tels,
+        build_s=build_s,
+        floor_s=floor_result.get("floor_s") if floor_result else None,
+        shared_s=shared_s,
+    )
+
+    published = (
+        cache.publish_corpus(args.module, args.corpus_dir)
+        if args.module and use_cache and fuzz.get("status") != "insufficient_memory"
+        else 0
+    )
+    res: dict[str, Any] = {
+        "mode": "campaign",
+        "module": args.module,
+        "sources": eff_sources,
+        "engine_used": engine_used,
+        "discovering_step": "explore",
+        "binary": str(binary_path),
+        "smoke_skipped_cases": smoke_skipped,
+        "dictionary": dict_info,
+        "sizing": sizing,
+        **fuzz,
+    }
+    res.setdefault("blinded_cases", [])
+    res.setdefault("partial_blinded", False)
+    if compile_rec is not None:
+        res["compile"] = compile_rec
+        if engine_used == "eacsl" and compile_rec.get("reduced_checks"):
+            res["reduced_checks"] = compile_rec["reduced_checks"]
+    if dual_skipped_note is not None:
+        res["dual_engine_skipped"] = dual_skipped_note
+    if floor_result is not None:
+        res["floor_pass"] = {
+            "cases": floor_result["cases"],
+            "peak_per_worker_mb": floor_result["peak_per_worker_mb"],
+            "floor_s": floor_result["floor_s"],
+        }
+    if warm_started or published:
+        res["corpus_cache"] = {"warm_started": warm_started, "published": published}
     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     return res
 

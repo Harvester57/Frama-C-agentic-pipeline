@@ -82,7 +82,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +109,7 @@ from generate_harness import (  # noqa: E402
     dispatch_selector_width,
 )
 from module_map import ModuleMap, load_sidecars  # noqa: E402
+from trust import harness_scope_v2_enabled  # noqa: E402
 
 DEFAULT_DAG = Path("workspace/reports/callgraph_dag.json")
 DEFAULT_HARNESS_DIR = Path("workspace/harnesses")
@@ -119,9 +120,174 @@ MODULE_EXEMPT_FILE = "reach_exempt_modules.json"
 HARNESSED_TIER_PREFIXES = ("Tier 1A", "Tier 1B", "Tier 2")
 # Entry styles that drive a whole program through its `main` (generate_harness.MAIN_ENTRY_STYLES).
 WHOLE_PROGRAM_ENTRY_STYLES = ("argv", "stdin")
+AUTO_EXEMPT_EXACT_REASONS = frozenset(
+    {
+        "no attacker data per the threat model",
+        "refcount helper requires producer-allocated object",
+    }
+)
+AUTO_EXEMPT_TRUSTED_PREFIX = "trusted parameter "
+AUTO_EXEMPT_STATIC_REASON = "static: not callable from the harness"
 _IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
 _DEFINE_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(.*)$")
 _HEADER_SUFFIXES = (".h", ".hh", ".hpp", ".inc")
+
+
+def is_accepted_auto_exempt_reason(reason: object) -> bool:
+    """True when `reason` is a P2A automatic exemption reason accepted under FRAMAC_HARNESS_SCOPE_V2."""
+    if not isinstance(reason, str):
+        return False
+    text = reason.strip()
+    if text in AUTO_EXEMPT_EXACT_REASONS or text == AUTO_EXEMPT_STATIC_REASON:
+        return True
+    return text.startswith(AUTO_EXEMPT_TRUSTED_PREFIX) and len(text) > len(AUTO_EXEMPT_TRUSTED_PREFIX)
+
+
+def _resolve_fn_key(fn: str, functions: dict[str, Any], unit: str | None = None) -> str | None:
+    """Resolve a DAG key or plain function name against `functions`, preferring `unit` when given."""
+    if fn in functions and isinstance(functions[fn], dict):
+        return fn
+    matches = [
+        (k, rec)
+        for k, rec in functions.items()
+        if isinstance(rec, dict) and (str(rec.get("name") or "") == fn or k.rpartition("#")[2] == fn)
+    ]
+    if unit:
+        same_unit = [kr for kr in matches if kr[1].get("module") == unit]
+        if same_unit:
+            matches = same_unit
+    return matches[0][0] if len(matches) == 1 else None
+
+
+def _is_static_entry(key: str, functions: dict[str, Any]) -> bool:
+    """True for a file-local (`static`, non-header) DAG function that a harness cannot call directly."""
+    rec = functions.get(key)
+    return isinstance(rec, dict) and bool(rec.get("is_static")) and not bool(rec.get("header"))
+
+
+def _unit_caller_map(unit: str | None, functions: dict[str, Any]) -> dict[str, set[str]]:
+    """Reverse call graph (callee DAG key -> caller DAG keys) scoped to `unit` when provided."""
+    callers_of: dict[str, set[str]] = {}
+
+    def _in_unit(fn_rec: dict[str, Any]) -> bool:
+        mod = str(fn_rec.get("module") or "")
+        return not unit or not mod or mod == unit
+
+    for k, fn_rec in functions.items():
+        if not isinstance(fn_rec, dict):
+            continue
+        if _in_unit(fn_rec):
+            for edge_field in ("internal_callees", "indirect_callees"):
+                for raw_callee in fn_rec.get(edge_field) or []:
+                    if not isinstance(raw_callee, str):
+                        continue
+                    callee_k = _resolve_fn_key(raw_callee, functions, unit)
+                    if callee_k is not None:
+                        callers_of.setdefault(callee_k, set()).add(k)
+        for raw_caller in fn_rec.get("internal_callers") or []:
+            if not isinstance(raw_caller, str):
+                continue
+            caller_k = _resolve_fn_key(raw_caller, functions, unit)
+            if caller_k is not None:
+                caller_rec = functions.get(caller_k)
+                if isinstance(caller_rec, dict) and _in_unit(caller_rec):
+                    callers_of.setdefault(k, set()).add(caller_k)
+    return callers_of
+
+
+def _has_public_caller_in_unit(
+    key: str,
+    unit: str | None,
+    functions: dict[str, Any],
+    callers_of: dict[str, set[str]] | None = None,
+) -> bool:
+    """
+    True when `key` has at least one non-static (public) caller — direct or transitive through static
+    helpers — within `unit` (or `key`'s own module when `unit` is None).
+    """
+    rec = functions.get(key)
+    if not isinstance(rec, dict):
+        return False
+    target_unit = unit or str(rec.get("module") or "") or None
+    cmap = callers_of if callers_of is not None else _unit_caller_map(target_unit, functions)
+    visited: set[str] = {key}
+    work: list[str] = list(cmap.get(key) or ())
+    while work:
+        caller_k = work.pop()
+        if caller_k in visited:
+            continue
+        visited.add(caller_k)
+        caller_rec = functions.get(caller_k)
+        if not isinstance(caller_rec, dict):
+            continue
+        if not caller_rec.get("is_static"):
+            return True
+        work.extend(c for c in cmap.get(caller_k) or () if c not in visited)
+    return False
+
+
+def _is_nonstatic_root(root: str, unit: str, by_name: dict[str, list[tuple[str, dict[str, Any]]]]) -> bool:
+    """True when harness root `root` resolves to a non-static function in `unit` (or globally if outside)."""
+    recs = by_name.get(root) or []
+    same_unit = [kr for kr in recs if kr[1].get("module") == unit]
+    chosen = same_unit or recs
+    return any(not rec.get("is_static") for _, rec in chosen)
+
+
+def _static_reached_reason(nonstatic_roots: list[str]) -> str:
+    shown = ", ".join(nonstatic_roots[:3])
+    suffix = f" (+{len(nonstatic_roots) - 3} more)" if len(nonstatic_roots) > 3 else ""
+    return f"static: reached via non-static harness root(s) {shown}{suffix}"
+
+
+def sidecar_exemptions(
+    sidecar: dict[str, Any] | None,
+    *,
+    scope_v2: bool | None = None,
+    functions: dict[str, Any] | None = None,
+    unit: str | None = None,
+) -> dict[str, str]:
+    """
+    Entry-point exemptions from a sidecar: manual `reach_exempt`, plus (under FRAMAC_HARNESS_SCOPE_V2)
+    accepted automatic reasons from `api_auto_exempt` or `api_skipped`.
+
+    `AUTO_EXEMPT_STATIC_REASON` ("static: not callable from the harness") is accepted only when `functions`
+    confirms the entry is a file-local `static` function with at least one public caller in `unit`.
+    """
+    if not isinstance(sidecar, dict):
+        return {}
+    raw = sidecar.get("reach_exempt")
+    exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
+    if v2:
+        caller_maps: dict[str | None, dict[str, set[str]]] = {}
+        for field in ("api_auto_exempt", "api_skipped"):
+            extra = sidecar.get(field)
+            if not isinstance(extra, dict):
+                continue
+            for fn, why in extra.items():
+                if not is_accepted_auto_exempt_reason(why):
+                    continue
+                if str(why).strip() == AUTO_EXEMPT_STATIC_REASON:
+                    if not isinstance(functions, dict):
+                        continue
+                    key = _resolve_fn_key(str(fn), functions, unit)
+                    if key is None or not _is_static_entry(key, functions):
+                        continue
+                    target_unit = unit or str((functions.get(key) or {}).get("module") or "") or None
+                    if target_unit not in caller_maps:
+                        caller_maps[target_unit] = _unit_caller_map(target_unit, functions)
+                    if not _has_public_caller_in_unit(key, target_unit, functions, caller_maps[target_unit]):
+                        continue
+                exempt.setdefault(str(fn), str(why))
+    return exempt
+
+
+def _module_has_explicit_v2_scope(mod_info: dict[str, Any]) -> bool:
+    """True when `mod_info` carries explicit P1 visibility scoping so empty `candidate_entry_points` is intentional."""
+    return any(
+        key in mod_info for key in ("unit_visibility", "harness_scope_note", "deferred_non_attacker_entries")
+    )
 
 
 def _logical_lines(text: str) -> list[str]:
@@ -461,6 +627,9 @@ def check_module(
     include_dirs: list[Path],
     mm: ModuleMap | None = None,
     run_dir: Path = Path("."),
+    *,
+    scope_v2: bool | None = None,
+    tf_covered: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """
     The gate row of one harness module. A target fuzz module (sidecar `target_fuzzer`) wraps the
@@ -472,6 +641,7 @@ def check_module(
     only (`direct`); `reached_only_through` lists the others some root calls into, with those roots.
     An `argv` harness (the program's `main` is the entry) keeps the transitive reach.
     """
+    v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     by_name = _functions_by_name(dag)
     fn_names = set(by_name)
     unit = mm.unit_of(module) if mm is not None else module
@@ -509,7 +679,7 @@ def check_module(
     else:
         mod_fns = [f for f in mod_info.get("functions") or [] if isinstance(f, str)]
         entries = [f for f in mod_info.get("candidate_entry_points") or [] if isinstance(f, str)]
-        if not entries:
+        if not entries and not (v2 and _module_has_explicit_v2_scope(mod_info)):
             entries = [f for f in mod_fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
     entries = built_entries(entries, dag.get("functions") or {})
 
@@ -538,12 +708,22 @@ def check_module(
     whole_program = sidecar.get("entry_style") in WHOLE_PROGRAM_ENTRY_STYLES
     direct = reached if whole_program else callee_closure(roots, by_name, unit, follow=is_header_inline)
 
-    exempt_raw = sidecar.get("reach_exempt")
-    exempt = {str(k): str(v) for k, v in exempt_raw.items()} if isinstance(exempt_raw, dict) else {}
-    match = exemption_matcher(exempt, dag.get("functions") or {})
-    unreached = sorted(f for f in entries if f not in direct)
+    functions = dag.get("functions") or {}
+    exempt = sidecar_exemptions(sidecar, scope_v2=v2, functions=functions, unit=unit)
+    match = exemption_matcher(exempt, functions)
+    tf_map: dict[str, list[str]] = {}
+    if v2 and tf_covered:
+        tf_map = {f: sorted(tf_covered[f]) for f in entries if f not in direct and tf_covered.get(f)}
+    unreached = sorted(f for f in entries if f not in direct and f not in tf_map)
     only_through = transitive_only_roots([f for f in unreached if f in reached], roots, by_name, unit)
-    exempted = {f: why for f in unreached if (why := match(f)) is not None}
+    exempted: dict[str, str] = {}
+    for f in unreached:
+        if (why := match(f)) is not None:
+            exempted[f] = why
+        elif v2 and _is_static_entry(f, functions):
+            nonstatic_roots = [r for r in only_through.get(f) or [] if _is_nonstatic_root(r, unit, by_name)]
+            if nonstatic_roots:
+                exempted[f] = _static_reached_reason(nonstatic_roots)
     gaps = [f for f in unreached if f not in exempted]
     row: dict[str, Any] = {
         "module": module,
@@ -561,6 +741,8 @@ def check_module(
         "gaps": gaps,
         "passed": not gaps,
     }
+    if tf_map:
+        row["covered_by_target_fuzzers"] = dict(sorted(tf_map.items()))
     if unit != module:
         row["unit"] = unit
     if fuzzer_text is not None:
@@ -596,12 +778,18 @@ def check_unit(
     mm: ModuleMap,
     harness_modules: list[str],
     module_exempt: dict[str, Any],
+    *,
+    scope_v2: bool | None = None,
+    tf_covered: dict[str, list[str]] | None = None,
+    passing_tfs: list[str] | None = None,
+    reached_by_nonstatic_roots: dict[str, list[str]] | None = None,
 ) -> dict[str, Any] | None:
     """
     The gate row of a link unit for its Tier 1/2 entry points outside every harness module's scope
     (all of them without a harness), or None when it has nothing to answer for: a unit-named harness
     covers the whole unit, and Tier 3 code without a harness is deferred by design.
     """
+    v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     info = mm.modules.get(unit) or {}
     tier = info.get("tier")
     if not harness_modules and unit in module_exempt and _is_harnessed_tier(tier):
@@ -620,6 +808,23 @@ def check_unit(
 
     unharnessed = [e for e in entries if e not in covered and _is_harnessed_tier(fn_tier(e))]
     if not entries and not harness_modules and _is_harnessed_tier(tier):
+        if v2:
+            if (
+                info.get("unit_visibility") == "internal_convenience"
+                or info.get("harness_scope_note") == "internal_convenience_covered_by_consumers"
+            ):
+                note = str(info.get("harness_scope_note") or "internal_convenience_covered_by_consumers")
+                return {"module": unit, "tier": tier, "passed": True, "exempt": note}
+            if info.get("deferred_non_attacker_entries"):
+                return {"module": unit, "tier": tier, "passed": True, "exempt": "all_entries_deferred_non_attacker"}
+            if passing_tfs:
+                return {
+                    "module": unit,
+                    "tier": tier,
+                    "passed": True,
+                    "covered_by_target_fuzzers": {},
+                    "exempt": f"covered by target fuzzers: {', '.join(sorted(passing_tfs))}",
+                }
         # No API entry point to place: the whole unit needs a harness or an exemption, as a module did.
         lexers = [str(m) for m in info.get("lexer_modules") or []]
         if lexers and all(m in module_exempt for m in lexers):
@@ -627,26 +832,58 @@ def check_unit(
         return {"module": unit, "tier": tier, "passed": False, "error": "no_harness"}
     if not unharnessed:
         return None
+    covered_tf: dict[str, list[str]] = {}
+    if v2 and tf_covered:
+        covered_tf = {e: sorted(tf_covered[e]) for e in unharnessed if tf_covered.get(e)}
+    remaining = [e for e in unharnessed if e not in covered_tf]
     # The unit's name exempts it unless it also names one of the DAG's lexer modules (tweetnacl's
     # executable `main` holds the lexer module `main`): that key then exempts that lexer module only.
     unit_key = unit in module_exempt and (not harness_modules or unit not in mm.lexer_modules)
     sidecar_exempt: dict[str, str] = {}
     for h in harness_modules:
-        raw = (mm.sidecars.get(h) or {}).get("reach_exempt")
-        if isinstance(raw, dict):
-            for fn, why in raw.items():
-                sidecar_exempt.setdefault(str(fn), str(why))
+        for fn, why in sidecar_exemptions(
+            mm.sidecars.get(h), scope_v2=v2, functions=mm.functions, unit=unit
+        ).items():
+            sidecar_exempt.setdefault(fn, why)
     match = exemption_matcher(sidecar_exempt, mm.functions)
     exempt: dict[str, str] = {}
-    for e in unharnessed:
+    for e in remaining:
         if lexer_of[e] in module_exempt:
             exempt[e] = f"module {lexer_of[e]}: {module_exempt[lexer_of[e]]}"
         elif unit_key:
             exempt[e] = f"unit {unit}: {module_exempt[unit]}"
-        elif (why := match(e)) is not None:
-            exempt[e] = why
-    gaps = [e for e in unharnessed if e not in exempt]
+        elif (matched_reason := match(e)) is not None:
+            exempt[e] = matched_reason
+        elif v2 and _is_static_entry(e, mm.functions):
+            nonstatic_roots = (reached_by_nonstatic_roots or {}).get(e) or []
+            if nonstatic_roots:
+                exempt[e] = _static_reached_reason(nonstatic_roots)
+    gaps = [e for e in remaining if e not in exempt]
     if not harness_modules:
+        if covered_tf:
+            if gaps:
+                row_fail: dict[str, Any] = {
+                    "module": unit,
+                    "tier": tier,
+                    "passed": False,
+                    "error": "no_harness",
+                    "unharnessed_entry_points": remaining,
+                    "covered_by_target_fuzzers": dict(sorted(covered_tf.items())),
+                    "gaps": gaps,
+                }
+                if exempt:
+                    row_fail["exempt"] = exempt
+                return row_fail
+            return {
+                "module": unit,
+                "tier": tier,
+                "entry_points": len(entries),
+                "unharnessed_entry_points": [],
+                "covered_by_target_fuzzers": dict(sorted(covered_tf.items())),
+                "exempt": exempt,
+                "gaps": [],
+                "passed": True,
+            }
         if gaps:
             return {
                 "module": unit,
@@ -658,16 +895,19 @@ def check_unit(
             }
         lexers = sorted({lexer_of[e] for e in unharnessed})
         return {"module": unit, "tier": tier, "passed": True, "exempt": _exempt_note(lexers, module_exempt, unit)}
-    return {
+    row: dict[str, Any] = {
         "module": unit,
         "tier": tier,
         "harness_modules": harness_modules,
         "entry_points": len(entries),
-        "unharnessed_entry_points": unharnessed,
+        "unharnessed_entry_points": remaining if covered_tf else unharnessed,
         "exempt": exempt,
         "gaps": gaps,
         "passed": not gaps,
     }
+    if covered_tf:
+        row["covered_by_target_fuzzers"] = dict(sorted(covered_tf.items()))
+    return row
 
 
 def _exempt_note(lexers: list[str], module_exempt: dict[str, Any], unit: str | None = None) -> str:
@@ -678,9 +918,52 @@ def _exempt_note(lexers: list[str], module_exempt: dict[str, Any], unit: str | N
     return "every entry point is in an exempt module (" + "; ".join(parts) + ")"
 
 
-def run_check(
-    dag_path: Path, harness_dir: Path, modules: list[str] | None, run_dir: Path = Path(".")
+def _eval_sidecar_row(
+    sidecar_path: Path,
+    sidecar: dict[str, Any],
+    module: str,
+    dag: dict[str, Any],
+    dag_modules: dict[str, Any],
+    mm: ModuleMap,
+    link_units: bool,
+    tf: bool,
+    run_dir: Path,
+    *,
+    scope_v2: bool,
+    tf_covered: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
+    if (mm.unit_of(module) if link_units or tf else module) not in dag_modules:
+        return {"module": module, "passed": True, "skipped": "module_not_in_dag"}
+    if (failed := _prelude_failure(sidecar)) is not None:
+        return {"module": module, "tier": mm.tier_of(module), "passed": False, "error": failed}
+    harness_file = _harness_path(sidecar, sidecar_path)
+    try:
+        harness_text = harness_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"module": module, "passed": False, "error": f"harness_unreadable: {exc}"}
+    include_dirs = _include_dirs_from_cppflags(str(sidecar.get("cppflags") or ""))
+    return check_module(
+        module,
+        dag,
+        sidecar,
+        harness_text,
+        include_dirs,
+        mm=mm if link_units or tf else None,
+        run_dir=run_dir,
+        scope_v2=scope_v2,
+        tf_covered=tf_covered,
+    )
+
+
+def run_check(
+    dag_path: Path,
+    harness_dir: Path,
+    modules: list[str] | None,
+    run_dir: Path = Path("."),
+    *,
+    scope_v2: bool | None = None,
+) -> dict[str, Any]:
+    v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     dag = load_json_strict(dag_path)
     if not isinstance(dag, dict):
         raise ValueError(f"{dag_path}: not a call-graph DAG object")
@@ -692,44 +975,117 @@ def run_check(
     link_units = mm.units_are_link_units
     results: list[dict[str, Any]] = []
     harnessed: set[str] = set()
+
+    sidecar_entries: list[tuple[Path, dict[str, Any], str, bool]] = []
     for sidecar_path in sorted(harness_dir.glob("harness_*.json")):
         sidecar = load_json_optional(sidecar_path, {})
         if not isinstance(sidecar, dict):
             continue
         module = str(sidecar.get("module") or sidecar_path.stem[len("harness_") :])
-        # A target fuzz module is never a DAG module: it is gated under the unit its sidecar names, and
-        # it is additive, so it never stands for its unit's entry points (`check_unit` ignores it).
         tf = isinstance(sidecar.get("target_fuzzer"), dict)
         if not tf:
             harnessed.add(module)
-        if wanted and module not in wanted:
-            continue
-        if (mm.unit_of(module) if link_units or tf else module) not in dag_modules:
-            results.append({"module": module, "passed": True, "skipped": "module_not_in_dag"})
-            continue
-        if (failed := _prelude_failure(sidecar)) is not None:
-            results.append({"module": module, "tier": mm.tier_of(module), "passed": False, "error": failed})
-            continue
-        harness_file = _harness_path(sidecar, sidecar_path)
-        try:
-            harness_text = harness_file.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            results.append({"module": module, "passed": False, "error": f"harness_unreadable: {exc}"})
-            continue
-        include_dirs = _include_dirs_from_cppflags(str(sidecar.get("cppflags") or ""))
-        results.append(
-            check_module(
-                module, dag, sidecar, harness_text, include_dirs, mm=mm if link_units or tf else None, run_dir=run_dir
+        sidecar_entries.append((sidecar_path, sidecar, module, tf))
+
+    # Under FRAMAC_HARNESS_SCOPE_V2, evaluate passing tf_* modules first so their reached entry points
+    # credit their link unit (and any sibling harnesses of the same unit).
+    tf_rows: dict[str, dict[str, Any]] = {}
+    tf_credit_by_unit: dict[str, dict[str, list[str]]] = {}
+    passing_tf_by_unit: dict[str, list[str]] = {}
+    if v2:
+        by_name = _functions_by_name(dag)
+        for sidecar_path, sidecar, module, tf in sidecar_entries:
+            if not tf:
+                continue
+            tf_unit = mm.unit_of(module)
+            if wanted and module not in wanted and tf_unit not in wanted and not any(
+                mm.unit_of(w) == tf_unit for w in wanted
+            ):
+                continue
+            row = _eval_sidecar_row(
+                sidecar_path, sidecar, module, dag, dag_modules, mm, link_units, True, run_dir, scope_v2=True
             )
+            tf_rows[module] = row
+            if row.get("passed") and not row.get("skipped") and tf_unit in dag_modules:
+                passing_tf_by_unit.setdefault(tf_unit, []).append(module)
+                tf_roots = {str(r) for r in row.get("roots") or [] if isinstance(r, str)}
+                tf_reached = callee_closure(tf_roots, by_name, tf_unit)
+                unit_info = dag_modules.get(tf_unit) or {}
+                unit_entries = built_entries(
+                    [e for e in unit_info.get("candidate_entry_points") or [] if isinstance(e, str)],
+                    dag.get("functions") or {},
+                )
+                unit_map = tf_credit_by_unit.setdefault(tf_unit, {})
+                for ep in unit_entries:
+                    if ep in tf_reached:
+                        unit_map.setdefault(ep, []).append(module)
+
+    unit_nonstatic_roots: dict[str, set[str]] = {}
+    for sidecar_path, sidecar, module, tf in sidecar_entries:
+        mod_unit = mm.unit_of(module)
+        needed_for_unit = v2 and link_units and not tf and bool(wanted) and mod_unit in wanted
+        if wanted and module not in wanted and not needed_for_unit:
+            continue
+        if tf and module in tf_rows:
+            results.append(tf_rows[module])
+            continue
+        unit_tf = tf_credit_by_unit.get(mod_unit) if (v2 and not tf) else None
+        row = _eval_sidecar_row(
+            sidecar_path,
+            sidecar,
+            module,
+            dag,
+            dag_modules,
+            mm,
+            link_units,
+            tf,
+            run_dir,
+            scope_v2=v2,
+            tf_covered=unit_tf,
         )
+        if not wanted or module in wanted:
+            results.append(row)
+        if v2 and not tf and row.get("roots"):
+            unit_nonstatic_roots.setdefault(mod_unit, set()).update(
+                r for r in row["roots"] if isinstance(r, str) and _is_nonstatic_root(r, mod_unit, by_name)
+            )
     if link_units:
+        functions = dag.get("functions") or {}
         for unit in sorted(dag_modules):
             if wanted and unit not in wanted:
                 continue
             subs = sorted(h for h in harnessed if mm.unit_of(h) == unit)
-            row = check_unit(unit, mm, subs, module_exempt)
-            if row is not None:
-                results.append(row)
+            unit_static_reached: dict[str, list[str]] | None = None
+            if v2 and unit_nonstatic_roots.get(unit):
+                unit_info = dag_modules.get(unit) or {}
+                static_eps = [
+                    e
+                    for e in built_entries(
+                        [e for e in unit_info.get("candidate_entry_points") or [] if isinstance(e, str)],
+                        functions,
+                    )
+                    if _is_static_entry(e, functions)
+                ]
+                if static_eps:
+                    unit_static_reached = {
+                        e: r
+                        for e, r in transitive_only_roots(
+                            static_eps, unit_nonstatic_roots[unit], by_name, unit
+                        ).items()
+                        if r
+                    }
+            unit_row = check_unit(
+                unit,
+                mm,
+                subs,
+                module_exempt,
+                scope_v2=v2,
+                tf_covered=tf_credit_by_unit.get(unit) if v2 else None,
+                passing_tfs=passing_tf_by_unit.get(unit) if v2 else None,
+                reached_by_nonstatic_roots=unit_static_reached,
+            )
+            if unit_row is not None:
+                results.append(unit_row)
         return _report(dag_path, results)
     for module, info in sorted(dag_modules.items()):
         if module in harnessed or (wanted and module not in wanted) or not isinstance(info, dict):
@@ -755,14 +1111,24 @@ def _report(dag_path: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def record_exempt(
-    harness_dir: Path, module: str, function: str | None, reason: str, dag_path: Path | None = None
+    harness_dir: Path,
+    module: str,
+    function: str | Sequence[str] | None,
+    reason: str,
+    dag_path: Path | None = None,
 ) -> dict[str, Any]:
     """
     Record an exemption: a whole module (a lexer module or link unit name) without `function`, else
-    one entry point in the module's sidecar. A link unit without a harness of its own records an entry
-    point it leaves unharnessed in the sidecar of its first sub-module (read from `dag_path`).
+    one or more entry points in the module's sidecar (written atomically once for a batch). A link
+    unit without a harness of its own records an entry point it leaves unharnessed in the sidecar of
+    its first sub-module (read from `dag_path`).
     """
-    if function is None:
+    fns: list[str] = []
+    if isinstance(function, str):
+        fns = [function]
+    elif function is not None:
+        fns = [str(f) for f in function if f]
+    if not fns:
         path = harness_dir / MODULE_EXEMPT_FILE
         exempt_modules = load_json_optional(path, {})
         exempt_modules = dict(exempt_modules) if isinstance(exempt_modules, dict) else {}
@@ -783,12 +1149,14 @@ def record_exempt(
         raise ValueError(f"{sidecar_path}: not a harness sidecar object")
     exempt = sidecar.get("reach_exempt")
     exempt = dict(exempt) if isinstance(exempt, dict) else {}
-    exempt[function] = reason
+    for fn in fns:
+        exempt[fn] = reason
     sidecar["reach_exempt"] = dict(sorted(exempt.items()))
     from generate_harness import write_sidecar
 
     write_sidecar(sidecar_path, sidecar)  # checks the sidecar's schema (R5)
-    return {"module": module, "function": function, "reason": reason, "reach_exempt": sidecar["reach_exempt"]}
+    reported_fn: str | list[str] = fns[0] if len(fns) == 1 else list(fns)
+    return {"module": module, "function": reported_fn, "reason": reason, "reach_exempt": sidecar["reach_exempt"]}
 
 
 def regate_after_exempt(run_dir: Path, dag_path: Path, harness_dir: Path, module: str) -> dict[str, Any]:
@@ -849,7 +1217,7 @@ _STACK_FRAME_RE = re.compile(
 _CRASH_NOTES_MAX = 20
 
 
-def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str]:
+def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap, *, scope_v2: bool = False) -> list[str]:
     """
     The entry points the reach gate holds a harness module to (as `check_module` does): for a sub-module,
     its unit's entry points within its scope (`ModuleMap.scope_entry_points`); for a unit, its DAG
@@ -862,7 +1230,7 @@ def _module_entries(module: str, dag: dict[str, Any], mm: ModuleMap) -> list[str
         return built_entries(mm.scope_entry_points(module), dag.get("functions") or {})
     info = (dag.get("modules") or {}).get(module) or {}
     entries = [f for f in info.get("candidate_entry_points") or [] if isinstance(f, str)]
-    if not entries:
+    if not entries and not (scope_v2 and _module_has_explicit_v2_scope(info)):
         by_name = _functions_by_name(dag)
         fns = [f for f in info.get("functions") or [] if isinstance(f, str)]
         entries = [f for f in fns if not any(r.get("is_static") for _, r in by_name.get(f) or [])]
@@ -1375,6 +1743,61 @@ def _header_api_fields(
     }
 
 
+def _collect_dynamic_tf_credit(
+    dag: dict[str, Any],
+    mm: ModuleMap,
+    coverage_dir: Path,
+    fuzz_dir: Path | None = None,
+    harnesses_dir: Path | None = None,
+) -> tuple[dict[str, dict[str, list[str]]], dict[str, list[str]]]:
+    """
+    Under FRAMAC_HARNESS_SCOPE_V2, aggregate dynamically executed entry points from passing `tf_*`
+    target-fuzzer modules belonging to each link unit:
+      (unit -> {entry_point -> sorted tf_* module names}, unit -> sorted passing tf_* module names).
+    """
+    tf_credit: dict[str, dict[str, list[str]]] = {}
+    passing_tfs: dict[str, list[str]] = {}
+    hdir = Path(harnesses_dir or DEFAULT_HARNESS_DIR)
+    run_dir = hdir.parent.parent if hdir.parts[-2:] == tuple(Path(DEFAULT_HARNESS_DIR).parts) else Path(".")
+    for tf_mod, sidecar in sorted(mm.sidecars.items()):
+        if not isinstance(sidecar.get("target_fuzzer"), dict):
+            continue
+        unit = mm.unit_of(tf_mod)
+        cov = load_json_optional(coverage_dir / f"{tf_mod}.json", None)
+        if not isinstance(cov, dict) or cov.get("status") not in _COVERAGE_OK:
+            continue
+        if partial_coverage_reason(cov) is not None:
+            continue
+        passing_tfs.setdefault(unit, []).append(tf_mod)
+        runs = _executions(cov)
+        for alias, names in cppflag_renames(str(sidecar.get("cppflags") or "")).items():
+            for name in names:
+                if alias in runs:
+                    runs[name] = [*runs.get(name, []), *runs[alias]]
+        unit_entries = _module_entries(unit, dag, mm, scope_v2=True)
+        unit_map = tf_credit.setdefault(unit, {})
+        unexec: list[str] = []
+        for ep in unit_entries:
+            if (_entry_executions(ep, dag, runs) or 0) > 0:
+                unit_map.setdefault(ep, []).append(tf_mod)
+            else:
+                unexec.append(ep)
+        if unexec and fuzz_dir is not None:
+            crashed, _ = _crashed_entry_points(
+                tf_mod,
+                unexec,
+                dag,
+                sidecar,
+                fuzz_dir,
+                _candidate_roots(fuzz_dir, hdir),
+                harness_digest=phase0_gates.harness_digest(run_dir, tf_mod, ignore_exempt=True),
+                harness_file=hdir / f"harness_{tf_mod}.c",
+            )
+            for ep in crashed:
+                unit_map.setdefault(ep, []).append(tf_mod)
+    return tf_credit, passing_tfs
+
+
 def check_dynamic(
     module: str,
     dag: dict[str, Any],
@@ -1386,6 +1809,8 @@ def check_dynamic(
     harness_dir: Path | None = None,
     static_gaps: set[str] | list[str] | None = None,
     model: dict[str, Any] | None = None,
+    scope_v2: bool | None = None,
+    tf_covered: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """
     The dynamic reach row of a harness module: its gate entry points the corpus never executed, minus
@@ -1395,11 +1820,13 @@ def check_dynamic(
     as never executed unless proven by a fuzz crash. With the Phase 0 `model`, the row also reports the
     public header functions the corpus never executed (`_header_api_fields`); they decide nothing.
     """
+    v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     resolved_hdir = harnesses_dir if harnesses_dir is not None else harness_dir
     sidecar = _load_module_sidecar(module, mm, resolved_hdir)
-    raw = sidecar.get("reach_exempt")
-    exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
-    match = exemption_matcher(exempt, dag.get("functions") or {})
+    functions = dag.get("functions") or {}
+    unit = mm.unit_of(module)
+    exempt = sidecar_exemptions(sidecar, scope_v2=v2, functions=functions, unit=unit)
+    match = exemption_matcher(exempt, functions)
     static_gap_set = set(static_gaps) if static_gaps is not None else set()
     runs = _executions(coverage)
     # The coverage build names a renamed function by its alias (an `argv` harness's program `main` is
@@ -1410,11 +1837,15 @@ def check_dynamic(
                 runs[name] = [*runs.get(name, []), *runs[alias]]
     executed: dict[str, int] = {}
     unexecuted: list[str] = []
-    for e in _module_entries(module, dag, mm):
+    covered_tf: dict[str, list[str]] = {}
+    for e in _module_entries(module, dag, mm, scope_v2=v2):
         n = _entry_executions(e, dag, runs) or 0
         executed[e] = n
-        if not n and match(e) is None:
-            unexecuted.append(e)
+        if not n:
+            if v2 and tf_covered and tf_covered.get(e):
+                covered_tf[e] = sorted(tf_covered[e])
+            elif match(e) is None:
+                unexecuted.append(e)
     crash_candidates = [e for e in unexecuted if e not in static_gap_set]
     hdir = Path(resolved_hdir or DEFAULT_HARNESS_DIR)
     # The run directory the harness directory lives in: the campaign stamps phase0_gates' digest of it.
@@ -1437,13 +1868,15 @@ def check_dynamic(
         "coverage_status": coverage.get("status"),
         "corpus_inputs": (coverage.get("inputs") or {}).get("replayed"),
         "entry_points": len(executed),
-        "entry_points_executed": sum(1 for n in executed.values() if n) + len(crashed),
+        "entry_points_executed": sum(1 for e, n in executed.items() if n or e in covered_tf) + len(crashed),
         "crashed_entry_points": crashed,
         "executions": dict(sorted(executed.items())),
         "gaps": never,
         "passed": not never,
         **_header_api_fields(module, dag, mm, model, runs),
     }
+    if covered_tf:
+        row["covered_by_target_fuzzers"] = dict(sorted(covered_tf.items()))
     if crash_notes and never:
         # Why the crashes of the fuzz report did not close these gaps.
         row["crash_notes"] = crash_notes
@@ -1501,7 +1934,9 @@ def run_dynamic(
     fuzz_dir: Path | None = None,
     *,
     harnesses_dir: Path | None = None,
+    scope_v2: bool | None = None,
 ) -> dict[str, Any]:
+    v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     resolved_hdir = harnesses_dir if harnesses_dir is not None else harness_dir
     dag = load_json_strict(dag_path)
     if not isinstance(dag, dict):
@@ -1515,10 +1950,48 @@ def run_dynamic(
         model = None
     if not isinstance(model, dict):
         model = None
+    tf_credit_by_unit: dict[str, dict[str, list[str]]] = {}
+    passing_tf_by_unit: dict[str, list[str]] = {}
+    if v2:
+        tf_credit_by_unit, passing_tf_by_unit = _collect_dynamic_tf_credit(
+            dag, mm, coverage_dir, fuzz_dir=fuzz_dir, harnesses_dir=resolved_hdir
+        )
+    if modules:
+        target_modules = list(modules)
+    else:
+        target_modules = sorted(mm.sidecars)
+        if v2 and mm.units_are_link_units:
+            regular_units = {
+                mm.unit_of(m)
+                for m, sc in mm.sidecars.items()
+                if not isinstance(sc.get("target_fuzzer"), dict)
+            }
+            for unit in sorted(passing_tf_by_unit):
+                if unit in mm.modules and unit not in regular_units and unit not in target_modules:
+                    if _module_entries(unit, dag, mm, scope_v2=True):
+                        target_modules.append(unit)
     rows: list[dict[str, Any]] = []
-    for module in modules or sorted(mm.sidecars):
+    for module in target_modules:
+        unit = mm.unit_of(module)
+        is_tf = isinstance((mm.sidecars.get(module) or {}).get("target_fuzzer"), dict)
+        mod_tf_covered = tf_credit_by_unit.get(unit) if (v2 and not is_tf) else None
         cov = load_json_optional(coverage_dir / f"{module}.json", None)
         if not isinstance(cov, dict) or cov.get("status") not in _COVERAGE_OK:
+            if v2 and not is_tf and unit == module and passing_tf_by_unit.get(unit):
+                row = check_dynamic(
+                    module,
+                    dag,
+                    mm,
+                    {"status": "ok", "functions": []},
+                    fuzz_dir=fuzz_dir,
+                    harnesses_dir=resolved_hdir,
+                    static_gaps=static_gaps.get(module),
+                    model=model,
+                    scope_v2=v2,
+                    tf_covered=mod_tf_covered,
+                )
+                rows.append(row)
+                continue
             status = cov.get("status") if isinstance(cov, dict) else "missing"
             # No usable coverage (F2): the module is still measured when its reproducible crashes prove
             # every entry point ran, as a report that lists no function executed nothing. A gap the
@@ -1533,6 +2006,8 @@ def run_dynamic(
                 harnesses_dir=resolved_hdir,
                 static_gaps=static_gaps.get(module),
                 model=model,
+                scope_v2=v2,
+                tf_covered=mod_tf_covered,
             )
             if proven["passed"]:
                 # No coverage measured the header functions: their count stays, not which ones ran.
@@ -1550,6 +2025,8 @@ def run_dynamic(
             harnesses_dir=resolved_hdir,
             static_gaps=static_gaps.get(module),
             model=model,
+            scope_v2=v2,
+            tf_covered=mod_tf_covered,
         )
         if (reason := partial_coverage_reason(cov)) is not None:
             # Keep what was measured for the reader; the gaps are only a lower bound and decide nothing.
@@ -1690,8 +2167,12 @@ def apply_dynamic(
         if d.get("harness_digest") not in current:
             continue
         sidecar = load_json_optional(harness_dir / f"harness_{row['module']}.json", {})
-        raw = sidecar.get("reach_exempt") if isinstance(sidecar, dict) else None
-        exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+        unit_name = str(row.get("unit") or row.get("module") or "")
+        exempt = sidecar_exemptions(
+            sidecar if isinstance(sidecar, dict) else {},
+            functions=functions,
+            unit=unit_name or None,
+        )
         match = exemption_matcher(exempt, functions)
         gaps = [g for g in d["gaps"] if match(g) is None]
         if gaps:
@@ -1743,11 +2224,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "exempt":
             if not args.reason.strip():
                 raise ValueError("--reason must not be empty")
-            recorded: dict[str, Any] = {}
-            for fn in args.function or [None]:
-                recorded = record_exempt(args.harness_dir, args.module, fn, args.reason.strip(), args.dag)
-            if len(args.function) > 1:
-                recorded["function"] = list(args.function)
+            fn_arg: str | Sequence[str] | None = args.function if args.function else None
+            recorded = record_exempt(args.harness_dir, args.module, fn_arg, args.reason.strip(), args.dag)
             # The gate reads recorded rows, and the sidecar just changed: re-record them here, so no
             # target stops at a stale row until someone runs `reach-gate`.
             recorded["gate"] = regate_after_exempt(Path("."), args.dag, args.harness_dir, args.module)

@@ -56,6 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import target_env  # noqa: E402
 import tiers  # noqa: E402
+import trust  # noqa: E402
 import unit_split  # noqa: E402
 from framac_common import VA_PARAMS, is_pipeline_output_dir  # noqa: E402
 
@@ -875,6 +876,14 @@ def _flow_globals(
             "init_functions": sorted({key_of[f] for f in g["init_functions"] if f in key_of}),
             "init_globals": sorted(str(x) for x in g.get("init_globals") or []),
         }
+        if isinstance(g.get("type"), str):
+            entry["type"] = g["type"]
+        if isinstance(g.get("const"), bool):
+            entry["const"] = g["const"]
+        if isinstance(g.get("has_init"), bool):
+            entry["has_init"] = g["has_init"]
+        if isinstance(g.get("raw_type"), str):
+            entry["raw_type"] = g["raw_type"]
         if isinstance(g.get("size"), int) and g["size"] > 0:
             entry["size"] = g["size"]
         if file and not file.endswith(".c"):
@@ -1355,7 +1364,116 @@ def unit_module_name(unit: str) -> str:
     return name if name not in _RESERVED_MODULE_NAMES else f"{name}_unit"
 
 
-def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = None) -> dict:
+def _is_tm_input_source(fn_rec: dict) -> bool:
+    """True when `fn_rec` is named in THREAT_MODEL.md `input_sources` (not overridden by `trusted_callers`)."""
+    tr = fn_rec.get("trust")
+    if not isinstance(tr, dict):
+        return False
+    if tr.get("value") == "trusted" and tr.get("source") == "threat_model":
+        return False
+    return tr.get("input_role") in ("entry", "reader") or (
+        tr.get("source") == "threat_model" and tr.get("value") == "untrusted"
+    )
+
+
+def _is_tm_trusted_caller(fn_rec: dict) -> bool:
+    """True when THREAT_MODEL.md `trusted_callers` marks `fn_rec` as trusted."""
+    tr = fn_rec.get("trust")
+    return isinstance(tr, dict) and tr.get("value") == "trusted" and tr.get("source") == "threat_model"
+
+
+def _select_v2_entries(
+    unit: str,
+    rec: dict,
+    fns: list[str],
+    fn_set: set[str],
+    functions: dict[str, dict],
+    key_of: dict[str, str],
+    model: dict,
+    units: dict[str, dict],
+    threat_active: bool,
+) -> tuple[list[str], dict]:
+    """
+    Compute `(candidate_entry_points, extra_module_fields)` for a link unit under
+    `FRAMAC_HARNESS_SCOPE_V2`, scoped by `unit_visibility`.
+    """
+    vis = trust.unit_visibility_of(unit, units)
+    tm_entries = [k for k in fns if k in fn_set and _is_tm_input_source(functions[k])]
+    tm_set = set(tm_entries)
+    extra: dict = {}
+
+    if vis == "executable":
+        mains = [
+            k
+            for k in fns
+            if k in fn_set and functions[k].get("name") == "main" and not functions[k].get("is_static")
+        ]
+        entries = list(dict.fromkeys([*mains, *tm_entries]))
+        if threat_active and tm_entries:
+            extra["threat_model_entries"] = tm_entries
+        return entries, extra
+
+    if vis == "plugin_so":
+        vtable_fids = trust.plugin_vtable_callbacks(model, unit)
+        raw_entries = [k for k in dict.fromkeys(key_of[f] for f in vtable_fids if f in key_of) if k in fn_set]
+        for k in tm_entries:
+            if k not in raw_entries:
+                raw_entries.append(k)
+        if threat_active:
+            deferred = [k for k in raw_entries if _is_tm_trusted_caller(functions[k])]
+            deferred_set = set(deferred)
+            entries = [k for k in raw_entries if k not in deferred_set]
+            if tm_entries:
+                extra["threat_model_entries"] = tm_entries
+            if deferred:
+                extra["deferred_non_attacker_entries"] = deferred
+            return entries, extra
+        return raw_entries, extra
+
+    if vis == "internal_convenience":
+        entries = list(tm_entries)
+        if threat_active:
+            extra["threat_model_entries"] = tm_entries
+        if not entries:
+            extra["harness_scope_note"] = "internal_convenience_covered_by_consumers"
+        return entries, extra
+
+    # public_lib: exported entry_points + header_api; under active threat model attach
+    # threat_model_entries and separate trusted_callers / non-attacker entries into
+    # deferred_non_attacker_entries (still kept in DAG/ledger for WP).
+    api = list(rec.get("entry_points") or [])
+    entries = [k for k in dict.fromkeys(key_of[e] for e in api if e in key_of) if k in fn_set]
+    entries = entries or [k for k in fns if k in fn_set and not functions[k].get("is_static")]
+    header = [key_of[e] for e in rec.get("header_api") or [] if e in key_of]
+    entries += [k for k in dict.fromkeys(header) if k in fn_set and k not in entries]
+    if threat_active:
+        tm_ordered = [k for k in entries if k in tm_set] + [k for k in tm_entries if k not in set(entries)]
+        extra["threat_model_entries"] = tm_ordered
+        if tm_ordered:
+            tm_ord_set = set(tm_ordered)
+            deferred = [k for k in entries if k not in tm_ord_set]
+            entries = [k for k in entries if k in tm_ord_set]
+            entries += [k for k in tm_ordered if k not in entries]
+        else:
+            deferred = [
+                k
+                for k in entries
+                if _is_tm_trusted_caller(functions[k]) or (functions[k].get("trust") or {}).get("value") == "trusted"
+            ]
+            deferred_set = set(deferred)
+            entries = [k for k in entries if k not in deferred_set]
+        extra["deferred_non_attacker_entries"] = deferred
+    return entries, extra
+
+
+def unit_view(
+    dag: dict,
+    model: dict,
+    root: str = "",
+    capture: dict | None = None,
+    *,
+    scope_v2: bool | None = None,
+) -> dict:
     """
     The model's DAG (`model_view`) with the build's link units as its modules (step I5b):
 
@@ -1415,6 +1533,8 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
         if path_mod:
             path_votes[path_mod][names[u]] += 1
 
+    v2 = trust.harness_scope_v2_enabled() if scope_v2 is None else scope_v2
+    model_tm_status = ((model.get("trust") or {}).get("threat_model") or {}).get("status")
     modules: dict[str, dict] = {}
     linked_units_of: dict[str, list[str]] = {}
     closure_failed: set[str] = set()
@@ -1446,21 +1566,38 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             folded.append(f"unit {u}: compiles only sources of an earlier unit, analysed there")
             continue
         fn_set = {k for k in fns if not functions[k].get("model_only")}  # entry points the build defines
-        api = [*(rec.get("entry_points") or []), *(rec.get("embedded_api") or [])]
-        entries = [k for k in dict.fromkeys(key_of[e] for e in api if e in key_of) if k in fn_set]
-        entries = entries or [k for k in fns if k in fn_set and not functions[k].get("is_static")]
-        # Functions defined in a public header (no global symbol) come after the global ones, so
-        # their harness cases follow the existing ones (docs/plans/header-entry-points-plan.md, HD4).
-        header = [key_of[e] for e in rec.get("header_api") or [] if e in key_of]
-        entries += [k for k in dict.fromkeys(header) if k in fn_set and k not in entries]
+        scope_extra: dict = {}
+        if v2:
+            unit_tm_status = model_tm_status if model_tm_status is not None else (rec.get("trust") or {}).get("threat_model")
+            entries, scope_extra = _select_v2_entries(
+                u,
+                rec,
+                fns,
+                fn_set,
+                functions,
+                key_of,
+                model,
+                units,
+                threat_active=unit_tm_status == trust.STATUS_OK,
+            )
+        else:
+            api = [*(rec.get("entry_points") or []), *(rec.get("embedded_api") or [])]
+            entries = [k for k in dict.fromkeys(key_of[e] for e in api if e in key_of) if k in fn_set]
+            entries = entries or [k for k in fns if k in fn_set and not functions[k].get("is_static")]
+            # Functions defined in a public header (no global symbol) come after the global ones, so
+            # their harness cases follow the existing ones (docs/plans/header-entry-points-plan.md, HD4).
+            header = [key_of[e] for e in rec.get("header_api") or [] if e in key_of]
+            entries += [k for k in dict.fromkeys(header) if k in fn_set and k not in entries]
         sources = compiled.map(sources)
         flags, forced = unit_cppflags(
             list(rec.get("cppflags") or []), include_dirs(sources, capture), root, generated_headers
         )
+        unit_vis = rec.get("unit_visibility")
         modules[name] = {
             "module": name,
             "unit": u,
             "kind": rec.get("kind"),
+            **({"unit_visibility": unit_vis} if isinstance(unit_vis, str) and unit_vis in trust.UNIT_VISIBILITIES else {}),
             "concurrent": bool(rec.get("concurrent")),
             **(
                 {"callgraph_fallback": (rec.get("parse") or {}).get("error") or "Frama-C could not parse this unit"}
@@ -1477,6 +1614,7 @@ def unit_view(dag: dict, model: dict, root: str = "", capture: dict | None = Non
             "function_count": len(fns),
             "functions": fns,
             "candidate_entry_points": entries,
+            **scope_extra,
             "lexer_modules": sorted({functions[k]["lexer_module"] for k in fns if functions[k].get("lexer_module")}),
             # Step I7: the threat model's status for the unit (each function's `trust` holds its own).
             "threat_model": (rec.get("trust") or {}).get("threat_model"),
@@ -1536,6 +1674,8 @@ def build_dag(
     units: bool = True,
     split_max_functions: int = unit_split.MAX_FUNCTIONS,
     split_max_lines: int = unit_split.MAX_LINES,
+    *,
+    scope_v2: bool | None = None,
 ) -> dict:
     """The DAG of `model` over the project tree `target_dir` (the run's workspace/work overlay)."""
     target_dir = target_dir.resolve()
@@ -1556,7 +1696,7 @@ def build_dag(
                 "behind a macro the compiler defines and Frama-C does not: Eva, WP and E-ACSL do not see it"
             )
     if units:
-        view = unit_view(view, model, root=root, capture=capture)
+        view = unit_view(view, model, root=root, capture=capture, scope_v2=scope_v2)
     # Step I8: tiers per function from trust, then oversized units split into sub-modules.
     tiers.apply(view)
     view = unit_split.apply(view, split_max_functions, split_max_lines)

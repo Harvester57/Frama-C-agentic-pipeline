@@ -222,7 +222,7 @@ def prepare_replay_binary(
     fingerprints: the identity of a violation does not hold the path of its meta file
     (failure_identity._meta_failure).
     """
-    build = fuzz_build.build_module_binary(sources, Path(out_bin), **build_options)
+    build = fuzz_build.build_module_binary(sources, Path(out_bin), dual_prebuilt=False, **build_options)
     comp = build["compile"]
     prepared: dict = {
         "module": module,

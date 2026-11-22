@@ -1,0 +1,57 @@
+{
+  "$comment": "Contract for workspace/reports/harness_reach.json, written by scripts/harness_reach.py check: static Phase 0 harness reachability gate per harness module and link unit.",
+  "type": "object",
+  "definitions": {
+    "strings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "module_row": {
+      "type": "object",
+      "properties": {
+        "module": {"type": "string", "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "tier": {"type": ["string", "null"]},
+        "harness_file": {"type": ["string", "null"]},
+        "target_fuzzer": {"type": "string"},
+        "harness_modules": {"$ref": "#/definitions/strings"},
+        "entry_points": {"type": "integer", "minimum": 0},
+        "entry_points_reached": {"type": "integer", "minimum": 0},
+        "functions": {"type": "integer", "minimum": 0},
+        "functions_reached": {"type": "integer", "minimum": 0},
+        "roots": {"$ref": "#/definitions/strings"},
+        "unreached_entry_points": {"$ref": "#/definitions/strings"},
+        "unharnessed_entry_points": {"$ref": "#/definitions/strings"},
+        "reached_only_through": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/definitions/strings"}
+        },
+        "covered_by_target_fuzzers": {
+          "$comment": "FRAMAC_HARNESS_SCOPE_V2: entry points credited to passing tf_* target-fuzzer modules belonging to the same unit (entry point -> sorted tf_* module names)",
+          "type": "object",
+          "additionalProperties": {"$ref": "#/definitions/strings"}
+        },
+        "exempt": {
+          "anyOf": [
+            {"type": "string"},
+            {"type": "object", "additionalProperties": {"type": "string"}}
+          ]
+        },
+        "gaps": {"$ref": "#/definitions/strings"},
+        "passed": {"type": "boolean"},
+        "error": {"type": "string", "minLength": 1},
+        "skipped": {"type": "string", "minLength": 1}
+      },
+      "required": ["module", "passed"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "generated_at": {"type": "string", "minLength": 1},
+    "dag": {"type": "string", "minLength": 1},
+    "passed": {"type": "boolean"},
+    "modules": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/module_row"}
+    }
+  },
+  "required": ["generated_at", "dag", "passed", "modules"],
+  "additionalProperties": false
+}

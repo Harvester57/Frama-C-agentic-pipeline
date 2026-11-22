@@ -621,7 +621,7 @@ def validate_phase0_gates(data: Any) -> Errors:
     if not isinstance(data, dict):
         errors.add("$: must be an object")
         return errors
-    for section, flag, row_flag in (("reach", "passed", "passed"), ("build_check", "ok", "ok")):
+    for section, flag, row_flag in (("reach", "passed", "passed"), ("build_check", "ok", "ok"), ("smoke", "ok", "ok")):
         entry = data.get(section)
         if entry is None:
             continue
@@ -908,14 +908,77 @@ def validate_traces(path: Path) -> Errors:
     return errors
 
 
+def validate_harness_reach(data: Any) -> Errors:
+    return _schema_check("harness_reach", data)
+
+
+def validate_harness_smoke(data: Any, module: str | None = None) -> Errors:
+    """Validate workspace/reports/smoke/<module>.json against schemas/harness_smoke.schema.json."""
+    errors = _schema_check("harness_smoke", data)
+    if errors:
+        return errors
+    if module is not None and data["module"] != module:
+        errors.add(f"$.module: {data['module']!r} does not match the file name ({module}.json)")
+    quarantined = sorted(data.get("quarantined_cases") or [])
+    skip_env = str(data.get("skip_cases_env") or "")
+    parsed_skip = sorted(int(x) for x in skip_env.split(",") if x) if skip_env else []
+    if parsed_skip != quarantined:
+        errors.add(
+            f"$.skip_cases_env: {skip_env!r} does not match quarantined_cases {quarantined}"
+        )
+    counts = data.get("counts")
+    case_results = data.get("case_results") or []
+    if isinstance(counts, dict):
+        if counts.get("total") != len(case_results):
+            errors.add(f"$.counts.total: {counts.get('total')} does not match len(case_results) ({len(case_results)})")
+        for key in ("passed", "quarantined", "candidate_warning"):
+            actual = sum(1 for c in case_results if isinstance(c, dict) and c.get("status") == key)
+            if counts.get(key) != actual:
+                errors.add(f"$.counts.{key}: {counts.get(key)} does not match case_results ({actual})")
+    return errors
+
+
+def validate_judge_report(data: Any, module: str | None = None) -> Errors:
+    """Validate workspace/reports/judge/<module>.json against schemas/judge_report.schema.json."""
+    errors = _schema_check("judge_report", data)
+    if errors:
+        return errors
+    if module is not None and data["module"] != module:
+        errors.add(f"$.module: {data['module']!r} does not match the file name ({module}.json)")
+    inputs = data["inputs"]
+    if inputs["not_judged"] != data["not_judged"]:
+        errors.add(
+            f"$.not_judged: {data['not_judged']} does not match $.inputs.not_judged ({inputs['not_judged']})"
+        )
+    if inputs["judged"] != inputs["passed"] + inputs["failed"]:
+        errors.add(
+            f"$.inputs.judged: {inputs['judged']} must equal passed ({inputs['passed']}) + failed ({inputs['failed']})"
+        )
+    bd = inputs["not_judged_breakdown"]
+    bd_sum = sum(int(v) for v in bd.values())
+    if bd_sum != inputs["not_judged"]:
+        errors.add(f"$.inputs.not_judged_breakdown: sum ({bd_sum}) must equal $.inputs.not_judged ({inputs['not_judged']})")
+    return errors
+
+
+def validate_fuzz_report(data: Any) -> Errors:
+    """Validate workspace/reports/fuzz/<module>.json against schemas/fuzz_report.schema.json."""
+    return _schema_check("fuzz_report", data)
+
+
 REPORTS = "workspace/reports"
 HARNESS_DIR = "workspace/harnesses"
 TRACES_JSONL = "workspace/seed_records/traces.jsonl"
+SMOKE_REPORTS_DIR = f"{REPORTS}/smoke"
+JUDGE_REPORTS_DIR = f"{REPORTS}/judge"
+FUZZ_REPORTS_DIR = f"{REPORTS}/fuzz"
+EACSL_FUZZ_REPORTS_DIR = f"{REPORTS}/eacsl-fuzz"
 PHASE0_ARTIFACTS: tuple[tuple[str, Any], ...] = (
     (f"{REPORTS}/build_capture.json", validate_build_capture),
     (f"{REPORTS}/phase0_model.json", validate_phase0_model),
     (f"{REPORTS}/security_props.json", validate_security_props),
     (f"{REPORTS}/callgraph_dag.json", validate_dag),
+    (f"{REPORTS}/harness_reach.json", validate_harness_reach),
     (f"{REPORTS}/build_check.json", validate_build_check),
     (f"{REPORTS}/harness_reach_dynamic.json", validate_dynamic_reach),
     (f"{REPORTS}/seed_harvest.json", validate_seed_harvest),
@@ -1025,9 +1088,72 @@ def validate_phase0_artifacts(run_dir: Path) -> Errors:
     return errors
 
 
+def validate_phase1_reports(run_dir: Path) -> Errors:
+    """
+    Validate Phase 1 smoke (`workspace/reports/smoke/*.json`), judge (`workspace/reports/judge/*.json`),
+    campaign (`workspace/reports/fuzz/*.json` carrying `mode in ("campaign", "eacsl-fuzz")`), and
+    deep `eacsl-fuzz` (`workspace/reports/eacsl-fuzz/*.json`) reports present in `run_dir`. Legacy
+    dummy fuzz stubs without `mode` and replay reports are left untouched to keep existing fixtures
+    backwards compatible.
+    """
+    errors = Errors()
+    smoke_dir = run_dir / SMOKE_REPORTS_DIR
+    for path in sorted(smoke_dir.glob("*.json")) if smoke_dir.is_dir() else []:
+        rel = f"{SMOKE_REPORTS_DIR}/{path.name}"
+        try:
+            data = load_json_strict(path)
+        except ArtifactError as exc:
+            errors.add(f"{rel}: {exc}")
+            continue
+        for e in validate_harness_smoke(data, path.stem):
+            errors.add(f"{rel}: {e}")
+
+    judge_dir = run_dir / JUDGE_REPORTS_DIR
+    for path in sorted(judge_dir.glob("*.json")) if judge_dir.is_dir() else []:
+        rel = f"{JUDGE_REPORTS_DIR}/{path.name}"
+        try:
+            data = load_json_strict(path)
+        except ArtifactError as exc:
+            errors.add(f"{rel}: {exc}")
+            continue
+        for e in validate_judge_report(data, path.stem):
+            errors.add(f"{rel}: {e}")
+
+    fuzz_dir = run_dir / FUZZ_REPORTS_DIR
+    for path in sorted(fuzz_dir.glob("*.json")) if fuzz_dir.is_dir() else []:
+        rel = f"{FUZZ_REPORTS_DIR}/{path.name}"
+        try:
+            data = load_json_strict(path)
+        except ArtifactError as exc:
+            errors.add(f"{rel}: {exc}")
+            continue
+        if isinstance(data, dict) and (
+            data.get("mode") == "eacsl-fuzz"
+            or (data.get("mode") == "campaign" and data.get("status") not in ("not_run", "no_crash"))
+        ):
+            for e in validate_fuzz_report(data):
+                errors.add(f"{rel}: {e}")
+
+    eacsl_fuzz_dir = run_dir / EACSL_FUZZ_REPORTS_DIR
+    for path in sorted(eacsl_fuzz_dir.glob("*.json")) if eacsl_fuzz_dir.is_dir() else []:
+        rel = f"{EACSL_FUZZ_REPORTS_DIR}/{path.name}"
+        try:
+            data = load_json_strict(path)
+        except ArtifactError as exc:
+            errors.add(f"{rel}: {exc}")
+            continue
+        for e in validate_fuzz_report(data):
+            errors.add(f"{rel}: {e}")
+    return errors
+
+
 PHASE0_COMMANDS: dict[str, Any] = {
     "dag": validate_dag,
     "sidecar": validate_sidecar,
+    "harness-reach": validate_harness_reach,
+    "harness-smoke": validate_harness_smoke,
+    "judge-report": validate_judge_report,
+    "fuzz-report": validate_fuzz_report,
     "build-check": validate_build_check,
     "reach-dynamic": validate_dynamic_reach,
     "seed-harvest": validate_seed_harvest,
@@ -1067,6 +1193,8 @@ def stray_fuzzer_artifacts(run_dir: Path) -> Errors:
 def validate_run_dir(run_dir: Path) -> Errors:
     errors = _validate_run_dir_core(run_dir)
     for e in validate_phase0_artifacts(run_dir):
+        errors.add(e)
+    for e in validate_phase1_reports(run_dir):
         errors.add(e)
     return errors
 

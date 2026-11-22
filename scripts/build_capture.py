@@ -86,7 +86,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -1089,6 +1089,26 @@ def unit_cppflags(compiles: Iterable[dict]) -> list[str]:
 # ---------------------------------------------------------------------------------------------------
 
 
+FUNCTION_TYPES = {"T", "W", "i"}
+DATA_TYPES = frozenset({"D", "R", "B", "G", "S", "V", "W"})
+# Linker-synthesized ELF section boundary / dynamic symbols that `nm -D --defined-only` emits
+# on shared libraries even when no project global data symbol is exported.
+_LINKER_DATA_SYMBOLS = frozenset(
+    {
+        "__bss_start",
+        "_edata",
+        "_end",
+        "__TMC_END__",
+        "__dso_handle",
+        "_DYNAMIC",
+        "_GLOBAL_OFFSET_TABLE_",
+        "_IO_stdin_used",
+        "__data_start",
+        "data_start",
+    }
+)
+
+
 def parse_nm(text: str) -> dict[str, tuple[str, str | None]]:
     """`nm --defined-only [-l]` output: symbol -> (type letter, defining file from debug info or None)."""
     syms: dict[str, tuple[str, str | None]] = {}
@@ -1099,12 +1119,74 @@ def parse_nm(text: str) -> dict[str, tuple[str, str | None]]:
             name = parts[2].split("@", 1)[0]
             file = re.sub(r":\d+$", "", loc.strip()) or None
             syms.setdefault(name, (parts[1], file))
-        elif len(parts) == 2 and parts[0] in ("T", "t", "W", "w", "i"):
-            syms.setdefault(parts[1], (parts[0], None))
+        elif len(parts) == 2 and (parts[0] in ("T", "t", "W", "w", "i") or parts[0] in DATA_TYPES):
+            syms.setdefault(parts[1].split("@", 1)[0], (parts[0], None))
     return syms
 
 
-FUNCTION_TYPES = {"T", "W", "i"}
+def _install_header_fallback_warning(name: str, warnings: Sequence[str]) -> bool:
+    """True when `static_lib_entries` recorded that installed headers declared none of `name`'s globals."""
+    prefix = f"{name}: the install public headers declare none of its "
+    return any(isinstance(w, str) and w.startswith(prefix) for w in warnings)
+
+
+def _is_abs_header_path(path: str) -> bool:
+    """True for an absolute path in either POSIX (`/framac-scratch/...`) or host OS form."""
+    return posixpath.isabs(path) or os.path.isabs(path)
+
+
+def classify_unit_visibility(
+    name: str,
+    unit: dict[str, Any],
+    units: dict[str, dict[str, Any]],
+    public: dict[str, Any],
+    *,
+    declared_in_installed: bool | None = None,
+    installed_archive: bool = False,
+    warnings: Sequence[str] | None = None,
+) -> str:
+    """
+    External visibility class of a non-test link unit for harness scoping:
+      - `executable`: executables
+      - `plugin_so`: shared_lib with 0 exported function entry_points and >=1 exported_data_symbols
+      - `public_lib`: shared_lib with entry_points (or fallback when neither functions nor data are exported),
+        standalone static_lib not linked by any non-test in-tree executable/shared_lib, or a static_lib
+        linked by in-tree consumers whose archive is itself installed (`installed_archive`) or whose own
+        functions are declared in installed public headers (`public["method"] == "install"` without falling
+        back to consumer/project headers)
+      - `internal_convenience`: static_lib linked by at least one non-test in-tree executable/shared_lib
+        that is neither installed nor declared in installed headers (or unlinked object groups)
+    """
+    kind = unit.get("kind")
+    if kind == "executable":
+        return "executable"
+    if kind == "shared_lib":
+        if not unit.get("entry_points") and unit.get("exported_data_symbols"):
+            return "plugin_so"
+        return "public_lib"
+    if kind == "static_lib":
+        linked_by_nontest = any(
+            name in (v.get("links") or []) and not v.get("test") and v.get("kind") in ("executable", "shared_lib")
+            for v in units.values()
+        )
+        if not linked_by_nontest:
+            return "public_lib"
+        if installed_archive:
+            return "public_lib"
+        if public.get("method") == "install":
+            if declared_in_installed is not None:
+                return "public_lib" if declared_in_installed else "internal_convenience"
+            has_api = bool(unit.get("entry_points") or unit.get("header_api"))
+            if warnings is not None:
+                if _install_header_fallback_warning(name, warnings):
+                    return "internal_convenience"
+                return "public_lib" if has_api else "internal_convenience"
+            files = [str(f) for f in (public.get("files") or []) if isinstance(f, str)]
+            if has_api and files and all(_is_abs_header_path(f) for f in files):
+                return "public_lib"
+            return "internal_convenience"
+        return "internal_convenience"
+    return "internal_convenience"
 
 
 def _linkage_brace_indices(tokens: list[Any], ignored: frozenset[int], close_alias: Any) -> set[int]:
@@ -2337,9 +2419,14 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     # Public headers (static libraries).
     public: dict[str, Any] = {"method": None, "files": []}
     public_paths: list[Path] = []
+    installed_archives: set[str] = set()
     static_units = [n for n, u in units.items() if u["kind"] == "static_lib" and not u["test"]]
     if static_units:
         installed, why = try_install(tree, scratch, recipe, INSTALL_TIMEOUT_S)
+        if why in ("install", "install staged no header"):
+            staging = scratch / "install"
+            if staging.is_dir():
+                installed_archives = {p.name for p in staging.rglob("*.a") if p.is_file()}
         if installed:
             public = {"method": "install", "files": [str(p) for p in installed]}
             public_paths = installed
@@ -2354,6 +2441,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     report["public_headers"] = public
 
     # Entry points.
+    declared_in_installed: dict[str, bool] = {}
     for name, u in units.items():
         own = [compiles[o] for o in u["objects"]]
         u["cppflags"] = unit_cppflags(own)
@@ -2372,6 +2460,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
             )
         entries_: set[str] = set()
         embedded: set[str] = set()
+        exported_data: set[str] = set()
         globals_: dict[str, str] = {}
         for c in own:
             for fname, info in fn_of[c["object"]].items():
@@ -2390,17 +2479,48 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
                     embedded = {api[n] for n in declared_in([tree / h for h in headers], set(api), flags)}
         elif u["kind"] == "shared_lib":
             rc, out, _ = run_tool(["nm", "-D", "--defined-only", str(tree / name)])
-            exported = {s for s, (typ, _) in parse_nm(out).items() if typ in FUNCTION_TYPES} if rc == 0 else set()
+            nm_syms = parse_nm(out) if rc == 0 else {}
+            exported = {s for s, (typ, _) in nm_syms.items() if typ in FUNCTION_TYPES}
             entries_ = {i for n, i in globals_.items() if n in exported}
+            linked_fns = {
+                fname
+                for lk in u["links"]
+                if lk in units
+                for o in units[lk]["objects"]
+                if o in fn_of
+                for fname, info in fn_of[o].items()
+                if info["global"]
+            }
+            exported_data = {
+                s
+                for s, (typ, _) in nm_syms.items()
+                if typ in DATA_TYPES and s not in globals_ and s not in linked_fns and s not in _LINKER_DATA_SYMBOLS
+            }
         elif u["kind"] == "static_lib":
             flags = absolute_flags(own[0]["flags"], t) + own[0]["system_flags"] if own else []
             entries_, warning = static_lib_entries(
                 name, globals_, units, compiles, public, public_paths, project_headers, tree, flags
             )
+            if public.get("method") == "install":
+                declared_in_installed[name] = bool(entries_) and warning is None
             if warning:
                 report["warnings"].append(warning)
         u["entry_points"] = sorted(entries_)
         u["embedded_api"] = sorted(embedded)
+        if u["kind"] == "executable" and embedded:
+            u["embedded_api_source"] = "header_declared_internal"
+        u["exported_data_symbols"] = sorted(exported_data)
+    for name, u in units.items():
+        if not u["test"]:
+            u["unit_visibility"] = classify_unit_visibility(
+                name,
+                u,
+                units,
+                public,
+                declared_in_installed=declared_in_installed.get(name),
+                installed_archive=Path(name).name in installed_archives,
+                warnings=report["warnings"],
+            )
     report["units"] = {n: units[n] for n in sorted(units)}
     report["entry_points"] = sorted({e for u in units.values() if not u["test"] for e in u["entry_points"]})
     for c in entries:

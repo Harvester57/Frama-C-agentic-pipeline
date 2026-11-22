@@ -1,0 +1,157 @@
+{
+  "$comment": "Contract for workspace/reports/fuzz/<module>.json (campaign and eacsl-fuzz modes of scripts/run_eacsl_fuzz.py), including P1a/P1b per-case blinding, P1c pure execution timing, P2a Explore mode, P2e eacsl-fuzz mode, P3 smoke integration, and P5a/P5d telemetry.",
+  "type": "object",
+  "definitions": {
+    "telemetry_point": {
+      "type": "object",
+      "properties": {
+        "unit": {"type": "integer", "minimum": 0},
+        "cov": {"type": "integer", "minimum": 0},
+        "ft": {"type": "integer", "minimum": 0},
+        "corp": {"type": "integer", "minimum": 0},
+        "exec_s": {"type": "number", "minimum": 0},
+        "rss_mb": {"type": ["number", "null"], "minimum": 0},
+        "job": {"type": ["integer", "null"], "minimum": 0},
+        "crashes": {"type": ["integer", "null"], "minimum": 0},
+        "time_s": {"type": ["number", "null"], "minimum": 0}
+      },
+      "required": ["cov", "ft", "corp", "exec_s", "rss_mb"],
+      "additionalProperties": false
+    },
+    "blinded_case": {
+      "type": "object",
+      "properties": {
+        "case": {"type": "integer", "minimum": 0},
+        "fingerprint": {"type": ["string", "null"]},
+        "crashes": {"type": "integer", "minimum": 1},
+        "remedies": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "required": ["case", "fingerprint", "crashes"],
+      "additionalProperties": false
+    },
+    "fork_summary": {
+      "type": "object",
+      "properties": {
+        "jobs": {"type": "integer", "minimum": 0},
+        "crashes": {"type": "integer", "minimum": 0},
+        "timeouts": {"type": "integer", "minimum": 0},
+        "ooms": {"type": "integer", "minimum": 0},
+        "max_corp": {"type": "integer", "minimum": 0},
+        "passing_execs": {"type": "integer", "minimum": 0}
+      },
+      "required": ["jobs", "crashes", "timeouts", "ooms", "max_corp", "passing_execs"],
+      "additionalProperties": false
+    },
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "build_s": {"type": "number", "minimum": 0},
+        "fuzz_s": {"type": "number", "minimum": 0},
+        "replay_s": {"type": "number", "minimum": 0},
+        "floor_s": {"type": ["number", "null"], "minimum": 0},
+        "shared_s": {"type": ["number", "null"], "minimum": 0},
+        "series": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/telemetry_point"}
+        },
+        "total_executions": {"type": "integer", "minimum": 0},
+        "max_cov": {"type": "integer", "minimum": 0},
+        "max_ft": {"type": "integer", "minimum": 0},
+        "max_corp": {"type": "integer", "minimum": 0},
+        "exec_s": {"type": "number", "minimum": 0},
+        "peak_rss_mb": {"type": ["number", "null"], "minimum": 0},
+        "jobs_observed": {"type": "integer", "minimum": 0},
+        "oom_kills_delta": {"type": ["integer", "null"], "minimum": 0},
+        "fork_summary": {
+          "anyOf": [
+            {"$ref": "#/definitions/fork_summary"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "required": [
+        "build_s",
+        "fuzz_s",
+        "replay_s",
+        "series",
+        "total_executions",
+        "max_cov",
+        "max_ft",
+        "max_corp",
+        "exec_s",
+        "peak_rss_mb",
+        "jobs_observed"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["campaign", "eacsl-fuzz"]
+    },
+    "module": {"type": "string"},
+    "status": {
+      "type": "string",
+      "enum": [
+        "clean",
+        "crash_found",
+        "timeout_found",
+        "oom_found",
+        "fuzzer_error",
+        "compile_error",
+        "insufficient_memory",
+        "sandbox_unavailable",
+        "gate_failed",
+        "partial_blinded",
+        "blinded",
+        "unspent_blinded",
+        "skipped",
+        "container_oom",
+        "startup_error"
+      ]
+    },
+    "engine_used": {"type": ["string", "null"]},
+    "discovering_step": {
+      "type": ["string", "null"],
+      "enum": ["explore", "judge", "eacsl_fuzz", null]
+    },
+    "blinded_cases": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/blinded_case"}
+    },
+    "partial_blinded": {"type": "boolean"},
+    "blinded_fingerprint": {"type": ["string", "null"]},
+    "blinded_remedies": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "smoke_skipped_cases": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "uniqueItems": true
+    },
+    "judge_skipped_cases": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "uniqueItems": true
+    },
+    "unspent_budget_s": {"type": ["number", "null"], "minimum": 0},
+    "telemetry": {"$ref": "#/definitions/telemetry"},
+    "artifacts": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "keep_going": {"type": "object"},
+    "floor_pass": {"type": "object"},
+    "sizing": {"type": "object"},
+    "harness_digest": {"type": ["string", "null"]},
+    "dispatch_case_count": {"type": ["integer", "null"], "minimum": 0},
+    "dispatch_selector": {"type": ["string", "null"]}
+  },
+  "required": ["mode", "status"],
+  "additionalProperties": true
+}
