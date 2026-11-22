@@ -1136,3 +1136,340 @@ def test_batch_exempt_repeatable_function_runs_regate_once(
     out_single = json.loads(capsys.readouterr().out)
     assert out_single["function"] == "fn_a"
     assert len(regate_calls) == 2
+
+
+def test_static_reader_auto_exempt_and_reach_v2_off_vs_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Under FRAMAC_HARNESS_SCOPE_V2=on, file-local `static` required roots (like nanopb's `buf_read` and
+    `pb_readbyte`) are auto-exempted when:
+      (a) statically reached from at least one reached non-static harness root, OR
+      (b) explicitly recorded as `static: not callable from the harness` in `api_auto_exempt` while
+          having at least one public caller in the unit.
+    Genuinely unreachable public functions (even if transitively reached or falsely listed as static)
+    and uncalled static functions without any public caller MUST stay gaps.
+    Under FRAMAC_HARNESS_SCOPE_V2=off, behavior is 100% unchanged.
+    """
+    monkeypatch.chdir(tmp_path)
+    fns = {
+        "pb_read": {
+            "name": "pb_read",
+            "file": "pb_decode.c",
+            "module": "libprotobuf_nanopb_a",
+            "is_static": False,
+            "header": False,
+            "internal_callees": ["buf_read", "public_transitive_only"],
+            "internal_callers": [],
+        },
+        "pb_decode_tag": {
+            "name": "pb_decode_tag",
+            "file": "pb_decode.c",
+            "module": "libprotobuf_nanopb_a",
+            "is_static": False,
+            "header": False,
+            "internal_callees": ["pb_decode_varint32_eof"],
+            "internal_callers": [],
+        },
+        "pb_decode_varint32_eof": {
+            "name": "pb_decode_varint32_eof",
+            "file": "pb_decode.c",
+            "module": "libprotobuf_nanopb_a",
+            "is_static": True,
+            "header": False,
+            "internal_callees": ["pb_readbyte"],
+            "internal_callers": ["pb_decode_tag"],
+        },
+        "buf_read": {
+            "name": "buf_read",
+            "file": "pb_decode.c",
+            "module": "libprotobuf_nanopb_a",
+            "is_static": True,
+            "header": False,
+            "internal_callees": [],
+            "internal_callers": ["pb_read"],
+        },
+        "pb_readbyte": {
+            "name": "pb_readbyte",
+            "file": "pb_decode.c",
+            "module": "libprotobuf_nanopb_a",
+            "is_static": True,
+            "header": False,
+            "internal_callees": [],
+            "internal_callers": ["pb_decode_varint32_eof"],
+        },
+        "orphan_static": {
+            "name": "orphan_static",
+            "file": "pb_decode.c",
+            "module": "libprotobuf_nanopb_a",
+            "is_static": True,
+            "header": False,
+            "internal_callees": [],
+            "internal_callers": [],
+        },
+        "public_transitive_only": {
+            "name": "public_transitive_only",
+            "file": "pb_decode.c",
+            "module": "libprotobuf_nanopb_a",
+            "is_static": False,
+            "header": False,
+            "internal_callees": [],
+            "internal_callers": ["pb_read"],
+        },
+    }
+    dag = {
+        "schema_version": 1,
+        "module_kind": "link_unit",
+        "callgraph_source": "frama_c",
+        "warnings": [],
+        "modules": {
+            "libprotobuf_nanopb_a": {
+                "module": "libprotobuf_nanopb_a",
+                "unit": "build/libprotobuf-nanopb.a",
+                "kind": "static_lib",
+                "unit_visibility": "public_lib",
+                "tier": TIER_1A,
+                "functions": list(fns),
+                "candidate_entry_points": [
+                    "pb_read",
+                    "pb_decode_tag",
+                    "buf_read",
+                    "pb_readbyte",
+                    "orphan_static",
+                    "public_transitive_only",
+                ],
+            }
+        },
+        "functions": fns,
+    }
+    reports = tmp_path / "workspace" / "reports"
+    reports.mkdir(parents=True)
+    dag_path = reports / "callgraph_dag.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+
+    hdir = tmp_path / "workspace" / "harnesses"
+    hdir.mkdir(parents=True)
+    # Harness calls only `pb_read` (not `pb_decode_tag`, not `buf_read`, not `pb_readbyte`).
+    (hdir / "harness_libprotobuf_nanopb_a.c").write_text(
+        "void drive(void) { pb_read(); }\n", encoding="utf-8"
+    )
+    sidecar = {
+        "module": "libprotobuf_nanopb_a",
+        "unit": "libprotobuf_nanopb_a",
+        "harness_file": "workspace/harnesses/harness_libprotobuf_nanopb_a.c",
+        "sources": ["pb_decode.c"],
+        "cppflags": "-I.",
+        "entry_fn": "pb_read",
+        "entry_style": "dispatch",
+        "reach_exempt": {},
+        "api_auto_exempt": {
+            "pb_decode_tag": "trusted parameter fields has no instance",
+            # Static reader with transitive public caller (pb_decode_tag -> pb_decode_varint32_eof -> pb_readbyte):
+            "pb_readbyte": hr.AUTO_EXEMPT_STATIC_REASON,
+            # Static function with ZERO public callers: MUST NOT be auto-exempted!
+            "orphan_static": hr.AUTO_EXEMPT_STATIC_REASON,
+            # Non-static public function wrongly marked static: MUST NOT be auto-exempted!
+            "public_transitive_only": hr.AUTO_EXEMPT_STATIC_REASON,
+        },
+    }
+    (hdir / "harness_libprotobuf_nanopb_a.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    reach_schema = load_schema(SCHEMAS_DIR / "harness_reach.schema.json")
+
+    # Flag OFF: none of the v2 static-reader rules or api_auto_exempt apply.
+    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    rep_off = hr.run_check(dag_path, hdir, ["libprotobuf_nanopb_a"], run_dir=tmp_path)
+    assert Validator(reach_schema).errors(rep_off) == []
+    assert rep_off["passed"] is False
+    assert set(rep_off["modules"][0]["gaps"]) == {
+        "pb_decode_tag",
+        "buf_read",
+        "pb_readbyte",
+        "orphan_static",
+        "public_transitive_only",
+    }
+
+    # Flag ON:
+    # - buf_read is satisfied via non-static harness root `pb_read` (even without api_auto_exempt!)
+    # - pb_readbyte is satisfied via api_auto_exempt ("static: not callable from the harness") + public caller
+    # - pb_decode_tag is satisfied via trusted-parameter api_auto_exempt
+    # - orphan_static (no public caller) and public_transitive_only (non-static) stay GAPS!
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "on")
+    rep_on = hr.run_check(dag_path, hdir, ["libprotobuf_nanopb_a"], run_dir=tmp_path)
+    assert Validator(reach_schema).errors(rep_on) == []
+    row = rep_on["modules"][0]
+    assert row["passed"] is False
+    assert row["gaps"] == ["orphan_static", "public_transitive_only"]
+    assert row["exempt"]["pb_readbyte"] == hr.AUTO_EXEMPT_STATIC_REASON
+    assert row["exempt"]["buf_read"] == "static: reached via non-static harness root(s) pb_read"
+    assert row["exempt"]["pb_decode_tag"] == "trusted parameter fields has no instance"
+
+    # Dynamic check under V2=on mirrors sidecar static-with-public-caller exemption and keeps
+    # orphan_static + public_transitive_only as gaps.
+    cov_dir = reports / "coverage"
+    cov_dir.mkdir(parents=True)
+    (cov_dir / "libprotobuf_nanopb_a.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "inputs": {"total": 1, "replayed": 1, "failed": 0, "not_replayed": 0},
+                "functions": [
+                    {"function": "pb_read", "file": "pb_decode.c", "executions": 1},
+                    {"function": "buf_read", "file": "pb_decode.c", "executions": 1},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    dyn = hr.run_dynamic(dag_path, hdir, ["libprotobuf_nanopb_a"], coverage_dir=cov_dir)
+    assert dyn["modules"][0]["gaps"] == ["orphan_static", "public_transitive_only"]
+
+
+def test_check_unit_static_reader_from_submodule_harness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    In `check_unit()` under FRAMAC_HARNESS_SCOPE_V2=on, unharnessed static required roots in a link
+    unit are satisfied when reached from a non-static root of a sub-module harness OR recorded as
+    `static: not callable from the harness` with a public caller in the unit, while an uncalled
+    static root without a public caller stays a gap.
+    """
+    monkeypatch.chdir(tmp_path)
+    fns = {
+        "pub_entry": {
+            "name": "pub_entry",
+            "file": "src/api.c",
+            "module": "libdemo_a",
+            "lexer_module": "api",
+            "is_static": False,
+            "header": False,
+            "internal_callees": ["static_reached"],
+            "internal_callers": [],
+            "tier": TIER_1A,
+        },
+        "pub_other": {
+            "name": "pub_other",
+            "file": "src/io.c",
+            "module": "libdemo_a",
+            "lexer_module": "io",
+            "is_static": False,
+            "header": False,
+            "internal_callees": ["static_with_caller"],
+            "internal_callers": [],
+            "tier": TIER_1A,
+        },
+        "static_reached": {
+            "name": "static_reached",
+            "file": "src/io.c",
+            "module": "libdemo_a",
+            "lexer_module": "io",
+            "is_static": True,
+            "header": False,
+            "internal_callees": [],
+            "internal_callers": ["pub_entry"],
+            "tier": TIER_1A,
+        },
+        "static_with_caller": {
+            "name": "static_with_caller",
+            "file": "src/io.c",
+            "module": "libdemo_a",
+            "lexer_module": "io",
+            "is_static": True,
+            "header": False,
+            "internal_callees": [],
+            "internal_callers": ["pub_other"],
+            "tier": TIER_1A,
+        },
+        "static_orphan": {
+            "name": "static_orphan",
+            "file": "src/io.c",
+            "module": "libdemo_a",
+            "lexer_module": "io",
+            "is_static": True,
+            "header": False,
+            "internal_callees": [],
+            "internal_callers": [],
+            "tier": TIER_1A,
+        },
+    }
+    dag = {
+        "schema_version": 1,
+        "module_kind": "link_unit",
+        "callgraph_source": "frama_c",
+        "warnings": [],
+        "modules": {
+            "libdemo_a": {
+                "module": "libdemo_a",
+                "unit": "build/libdemo.a",
+                "kind": "static_lib",
+                "unit_visibility": "public_lib",
+                "tier": TIER_1A,
+                "functions": list(fns),
+                "candidate_entry_points": [
+                    "pub_entry",
+                    "static_reached",
+                    "static_with_caller",
+                    "static_orphan",
+                ],
+                "lexer_modules": ["api", "io"],
+            }
+        },
+        "lexer_modules": {
+            "api": {"module": "api", "tier": TIER_1A, "functions": ["pub_entry"]},
+            "io": {
+                "module": "io",
+                "tier": TIER_1A,
+                "functions": ["pub_other", "static_reached", "static_with_caller", "static_orphan"],
+            },
+        },
+        "unit_of_lexer_module": {"api": "libdemo_a", "io": "libdemo_a"},
+        "functions": fns,
+    }
+    reports = tmp_path / "workspace" / "reports"
+    reports.mkdir(parents=True)
+    dag_path = reports / "callgraph_dag.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+
+    hdir = tmp_path / "workspace" / "harnesses"
+    hdir.mkdir(parents=True)
+    (hdir / "harness_api.c").write_text("void drive(void) { pub_entry(); }\n", encoding="utf-8")
+    sidecar = {
+        "module": "api",
+        "unit": "libdemo_a",
+        "harness_file": "workspace/harnesses/harness_api.c",
+        "sources": ["src/api.c", "src/io.c"],
+        "scope_files": ["src/api.c"],
+        "cppflags": "-I.",
+        "entry_fn": "pub_entry",
+        "entry_style": "dispatch",
+        "reach_exempt": {},
+        "api_auto_exempt": {
+            "static_with_caller": hr.AUTO_EXEMPT_STATIC_REASON,
+            "static_orphan": hr.AUTO_EXEMPT_STATIC_REASON,
+        },
+    }
+    (hdir / "harness_api.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    reach_schema = load_schema(SCHEMAS_DIR / "harness_reach.schema.json")
+
+    # Flag OFF: all three unharnessed static roots remain gaps on the unit row.
+    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    rep_off = hr.run_check(dag_path, hdir, None, run_dir=tmp_path)
+    by_mod_off = {r["module"]: r for r in rep_off["modules"]}
+    assert set(by_mod_off["libdemo_a"]["gaps"]) == {
+        "static_reached",
+        "static_with_caller",
+        "static_orphan",
+    }
+
+    # Flag ON (unfiltered and filtered --module libdemo_a): static_reached and static_with_caller are
+    # auto-exempted; static_orphan (zero public callers) stays a gap.
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "on")
+    for mod_filter in (None, ["libdemo_a"]):
+        rep_on = hr.run_check(dag_path, hdir, mod_filter, run_dir=tmp_path)
+        assert Validator(reach_schema).errors(rep_on) == []
+        by_mod_on = {r["module"]: r for r in rep_on["modules"]}
+        unit_row = by_mod_on["libdemo_a"]
+        assert unit_row["gaps"] == ["static_orphan"]
+        assert unit_row["exempt"]["static_reached"] == "static: reached via non-static harness root(s) pub_entry"
+        assert unit_row["exempt"]["static_with_caller"] == hr.AUTO_EXEMPT_STATIC_REASON

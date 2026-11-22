@@ -127,6 +127,7 @@ AUTO_EXEMPT_EXACT_REASONS = frozenset(
     }
 )
 AUTO_EXEMPT_TRUSTED_PREFIX = "trusted parameter "
+AUTO_EXEMPT_STATIC_REASON = "static: not callable from the harness"
 _IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
 _DEFINE_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(.*)$")
 _HEADER_SUFFIXES = (".h", ".hh", ".hpp", ".inc")
@@ -137,15 +138,121 @@ def is_accepted_auto_exempt_reason(reason: object) -> bool:
     if not isinstance(reason, str):
         return False
     text = reason.strip()
-    if text in AUTO_EXEMPT_EXACT_REASONS:
+    if text in AUTO_EXEMPT_EXACT_REASONS or text == AUTO_EXEMPT_STATIC_REASON:
         return True
     return text.startswith(AUTO_EXEMPT_TRUSTED_PREFIX) and len(text) > len(AUTO_EXEMPT_TRUSTED_PREFIX)
 
 
-def sidecar_exemptions(sidecar: dict[str, Any] | None, *, scope_v2: bool | None = None) -> dict[str, str]:
+def _resolve_fn_key(fn: str, functions: dict[str, Any], unit: str | None = None) -> str | None:
+    """Resolve a DAG key or plain function name against `functions`, preferring `unit` when given."""
+    if fn in functions and isinstance(functions[fn], dict):
+        return fn
+    matches = [
+        (k, rec)
+        for k, rec in functions.items()
+        if isinstance(rec, dict) and (str(rec.get("name") or "") == fn or k.rpartition("#")[2] == fn)
+    ]
+    if unit:
+        same_unit = [kr for kr in matches if kr[1].get("module") == unit]
+        if same_unit:
+            matches = same_unit
+    return matches[0][0] if len(matches) == 1 else None
+
+
+def _is_static_entry(key: str, functions: dict[str, Any]) -> bool:
+    """True for a file-local (`static`, non-header) DAG function that a harness cannot call directly."""
+    rec = functions.get(key)
+    return isinstance(rec, dict) and bool(rec.get("is_static")) and not bool(rec.get("header"))
+
+
+def _unit_caller_map(unit: str | None, functions: dict[str, Any]) -> dict[str, set[str]]:
+    """Reverse call graph (callee DAG key -> caller DAG keys) scoped to `unit` when provided."""
+    callers_of: dict[str, set[str]] = {}
+
+    def _in_unit(fn_rec: dict[str, Any]) -> bool:
+        mod = str(fn_rec.get("module") or "")
+        return not unit or not mod or mod == unit
+
+    for k, fn_rec in functions.items():
+        if not isinstance(fn_rec, dict):
+            continue
+        if _in_unit(fn_rec):
+            for edge_field in ("internal_callees", "indirect_callees"):
+                for raw_callee in fn_rec.get(edge_field) or []:
+                    if not isinstance(raw_callee, str):
+                        continue
+                    callee_k = _resolve_fn_key(raw_callee, functions, unit)
+                    if callee_k is not None:
+                        callers_of.setdefault(callee_k, set()).add(k)
+        for raw_caller in fn_rec.get("internal_callers") or []:
+            if not isinstance(raw_caller, str):
+                continue
+            caller_k = _resolve_fn_key(raw_caller, functions, unit)
+            if caller_k is not None:
+                caller_rec = functions.get(caller_k)
+                if isinstance(caller_rec, dict) and _in_unit(caller_rec):
+                    callers_of.setdefault(k, set()).add(caller_k)
+    return callers_of
+
+
+def _has_public_caller_in_unit(
+    key: str,
+    unit: str | None,
+    functions: dict[str, Any],
+    callers_of: dict[str, set[str]] | None = None,
+) -> bool:
+    """
+    True when `key` has at least one non-static (public) caller — direct or transitive through static
+    helpers — within `unit` (or `key`'s own module when `unit` is None).
+    """
+    rec = functions.get(key)
+    if not isinstance(rec, dict):
+        return False
+    target_unit = unit or str(rec.get("module") or "") or None
+    cmap = callers_of if callers_of is not None else _unit_caller_map(target_unit, functions)
+    visited: set[str] = {key}
+    work: list[str] = list(cmap.get(key) or ())
+    while work:
+        caller_k = work.pop()
+        if caller_k in visited:
+            continue
+        visited.add(caller_k)
+        caller_rec = functions.get(caller_k)
+        if not isinstance(caller_rec, dict):
+            continue
+        if not caller_rec.get("is_static"):
+            return True
+        work.extend(c for c in cmap.get(caller_k) or () if c not in visited)
+    return False
+
+
+def _is_nonstatic_root(root: str, unit: str, by_name: dict[str, list[tuple[str, dict[str, Any]]]]) -> bool:
+    """True when harness root `root` resolves to a non-static function in `unit` (or globally if outside)."""
+    recs = by_name.get(root) or []
+    same_unit = [kr for kr in recs if kr[1].get("module") == unit]
+    chosen = same_unit or recs
+    return any(not rec.get("is_static") for _, rec in chosen)
+
+
+def _static_reached_reason(nonstatic_roots: list[str]) -> str:
+    shown = ", ".join(nonstatic_roots[:3])
+    suffix = f" (+{len(nonstatic_roots) - 3} more)" if len(nonstatic_roots) > 3 else ""
+    return f"static: reached via non-static harness root(s) {shown}{suffix}"
+
+
+def sidecar_exemptions(
+    sidecar: dict[str, Any] | None,
+    *,
+    scope_v2: bool | None = None,
+    functions: dict[str, Any] | None = None,
+    unit: str | None = None,
+) -> dict[str, str]:
     """
     Entry-point exemptions from a sidecar: manual `reach_exempt`, plus (under FRAMAC_HARNESS_SCOPE_V2)
     accepted automatic reasons from `api_auto_exempt` or `api_skipped`.
+
+    `AUTO_EXEMPT_STATIC_REASON` ("static: not callable from the harness") is accepted only when `functions`
+    confirms the entry is a file-local `static` function with at least one public caller in `unit`.
     """
     if not isinstance(sidecar, dict):
         return {}
@@ -153,13 +260,26 @@ def sidecar_exemptions(sidecar: dict[str, Any] | None, *, scope_v2: bool | None 
     exempt = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
     v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     if v2:
+        caller_maps: dict[str | None, dict[str, set[str]]] = {}
         for field in ("api_auto_exempt", "api_skipped"):
             extra = sidecar.get(field)
             if not isinstance(extra, dict):
                 continue
             for fn, why in extra.items():
-                if is_accepted_auto_exempt_reason(why):
-                    exempt.setdefault(str(fn), str(why))
+                if not is_accepted_auto_exempt_reason(why):
+                    continue
+                if str(why).strip() == AUTO_EXEMPT_STATIC_REASON:
+                    if not isinstance(functions, dict):
+                        continue
+                    key = _resolve_fn_key(str(fn), functions, unit)
+                    if key is None or not _is_static_entry(key, functions):
+                        continue
+                    target_unit = unit or str((functions.get(key) or {}).get("module") or "") or None
+                    if target_unit not in caller_maps:
+                        caller_maps[target_unit] = _unit_caller_map(target_unit, functions)
+                    if not _has_public_caller_in_unit(key, target_unit, functions, caller_maps[target_unit]):
+                        continue
+                exempt.setdefault(str(fn), str(why))
     return exempt
 
 
@@ -588,14 +708,22 @@ def check_module(
     whole_program = sidecar.get("entry_style") in WHOLE_PROGRAM_ENTRY_STYLES
     direct = reached if whole_program else callee_closure(roots, by_name, unit, follow=is_header_inline)
 
-    exempt = sidecar_exemptions(sidecar, scope_v2=v2)
-    match = exemption_matcher(exempt, dag.get("functions") or {})
+    functions = dag.get("functions") or {}
+    exempt = sidecar_exemptions(sidecar, scope_v2=v2, functions=functions, unit=unit)
+    match = exemption_matcher(exempt, functions)
     tf_map: dict[str, list[str]] = {}
     if v2 and tf_covered:
         tf_map = {f: sorted(tf_covered[f]) for f in entries if f not in direct and tf_covered.get(f)}
     unreached = sorted(f for f in entries if f not in direct and f not in tf_map)
     only_through = transitive_only_roots([f for f in unreached if f in reached], roots, by_name, unit)
-    exempted = {f: why for f in unreached if (why := match(f)) is not None}
+    exempted: dict[str, str] = {}
+    for f in unreached:
+        if (why := match(f)) is not None:
+            exempted[f] = why
+        elif v2 and _is_static_entry(f, functions):
+            nonstatic_roots = [r for r in only_through.get(f) or [] if _is_nonstatic_root(r, unit, by_name)]
+            if nonstatic_roots:
+                exempted[f] = _static_reached_reason(nonstatic_roots)
     gaps = [f for f in unreached if f not in exempted]
     row: dict[str, Any] = {
         "module": module,
@@ -654,6 +782,7 @@ def check_unit(
     scope_v2: bool | None = None,
     tf_covered: dict[str, list[str]] | None = None,
     passing_tfs: list[str] | None = None,
+    reached_by_nonstatic_roots: dict[str, list[str]] | None = None,
 ) -> dict[str, Any] | None:
     """
     The gate row of a link unit for its Tier 1/2 entry points outside every harness module's scope
@@ -712,7 +841,9 @@ def check_unit(
     unit_key = unit in module_exempt and (not harness_modules or unit not in mm.lexer_modules)
     sidecar_exempt: dict[str, str] = {}
     for h in harness_modules:
-        for fn, why in sidecar_exemptions(mm.sidecars.get(h), scope_v2=v2).items():
+        for fn, why in sidecar_exemptions(
+            mm.sidecars.get(h), scope_v2=v2, functions=mm.functions, unit=unit
+        ).items():
             sidecar_exempt.setdefault(fn, why)
     match = exemption_matcher(sidecar_exempt, mm.functions)
     exempt: dict[str, str] = {}
@@ -723,6 +854,10 @@ def check_unit(
             exempt[e] = f"unit {unit}: {module_exempt[unit]}"
         elif (matched_reason := match(e)) is not None:
             exempt[e] = matched_reason
+        elif v2 and _is_static_entry(e, mm.functions):
+            nonstatic_roots = (reached_by_nonstatic_roots or {}).get(e) or []
+            if nonstatic_roots:
+                exempt[e] = _static_reached_reason(nonstatic_roots)
     gaps = [e for e in remaining if e not in exempt]
     if not harness_modules:
         if covered_tf:
@@ -885,33 +1020,60 @@ def run_check(
                     if ep in tf_reached:
                         unit_map.setdefault(ep, []).append(module)
 
+    unit_nonstatic_roots: dict[str, set[str]] = {}
     for sidecar_path, sidecar, module, tf in sidecar_entries:
-        if wanted and module not in wanted:
+        mod_unit = mm.unit_of(module)
+        needed_for_unit = v2 and link_units and not tf and bool(wanted) and mod_unit in wanted
+        if wanted and module not in wanted and not needed_for_unit:
             continue
         if tf and module in tf_rows:
             results.append(tf_rows[module])
             continue
-        unit_tf = tf_credit_by_unit.get(mm.unit_of(module)) if (v2 and not tf) else None
-        results.append(
-            _eval_sidecar_row(
-                sidecar_path,
-                sidecar,
-                module,
-                dag,
-                dag_modules,
-                mm,
-                link_units,
-                tf,
-                run_dir,
-                scope_v2=v2,
-                tf_covered=unit_tf,
-            )
+        unit_tf = tf_credit_by_unit.get(mod_unit) if (v2 and not tf) else None
+        row = _eval_sidecar_row(
+            sidecar_path,
+            sidecar,
+            module,
+            dag,
+            dag_modules,
+            mm,
+            link_units,
+            tf,
+            run_dir,
+            scope_v2=v2,
+            tf_covered=unit_tf,
         )
+        if not wanted or module in wanted:
+            results.append(row)
+        if v2 and not tf and row.get("roots"):
+            unit_nonstatic_roots.setdefault(mod_unit, set()).update(
+                r for r in row["roots"] if isinstance(r, str) and _is_nonstatic_root(r, mod_unit, by_name)
+            )
     if link_units:
+        functions = dag.get("functions") or {}
         for unit in sorted(dag_modules):
             if wanted and unit not in wanted:
                 continue
             subs = sorted(h for h in harnessed if mm.unit_of(h) == unit)
+            unit_static_reached: dict[str, list[str]] | None = None
+            if v2 and unit_nonstatic_roots.get(unit):
+                unit_info = dag_modules.get(unit) or {}
+                static_eps = [
+                    e
+                    for e in built_entries(
+                        [e for e in unit_info.get("candidate_entry_points") or [] if isinstance(e, str)],
+                        functions,
+                    )
+                    if _is_static_entry(e, functions)
+                ]
+                if static_eps:
+                    unit_static_reached = {
+                        e: r
+                        for e, r in transitive_only_roots(
+                            static_eps, unit_nonstatic_roots[unit], by_name, unit
+                        ).items()
+                        if r
+                    }
             unit_row = check_unit(
                 unit,
                 mm,
@@ -920,6 +1082,7 @@ def run_check(
                 scope_v2=v2,
                 tf_covered=tf_credit_by_unit.get(unit) if v2 else None,
                 passing_tfs=passing_tf_by_unit.get(unit) if v2 else None,
+                reached_by_nonstatic_roots=unit_static_reached,
             )
             if unit_row is not None:
                 results.append(unit_row)
@@ -1660,8 +1823,10 @@ def check_dynamic(
     v2 = harness_scope_v2_enabled() if scope_v2 is None else scope_v2
     resolved_hdir = harnesses_dir if harnesses_dir is not None else harness_dir
     sidecar = _load_module_sidecar(module, mm, resolved_hdir)
-    exempt = sidecar_exemptions(sidecar, scope_v2=v2)
-    match = exemption_matcher(exempt, dag.get("functions") or {})
+    functions = dag.get("functions") or {}
+    unit = mm.unit_of(module)
+    exempt = sidecar_exemptions(sidecar, scope_v2=v2, functions=functions, unit=unit)
+    match = exemption_matcher(exempt, functions)
     static_gap_set = set(static_gaps) if static_gaps is not None else set()
     runs = _executions(coverage)
     # The coverage build names a renamed function by its alias (an `argv` harness's program `main` is
@@ -2002,7 +2167,12 @@ def apply_dynamic(
         if d.get("harness_digest") not in current:
             continue
         sidecar = load_json_optional(harness_dir / f"harness_{row['module']}.json", {})
-        exempt = sidecar_exemptions(sidecar if isinstance(sidecar, dict) else {})
+        unit_name = str(row.get("unit") or row.get("module") or "")
+        exempt = sidecar_exemptions(
+            sidecar if isinstance(sidecar, dict) else {},
+            functions=functions,
+            unit=unit_name or None,
+        )
         match = exemption_matcher(exempt, functions)
         gaps = [g for g in d["gaps"] if match(g) is None]
         if gaps:

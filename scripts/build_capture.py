@@ -86,7 +86,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -1124,21 +1124,38 @@ def parse_nm(text: str) -> dict[str, tuple[str, str | None]]:
     return syms
 
 
+def _install_header_fallback_warning(name: str, warnings: Sequence[str]) -> bool:
+    """True when `static_lib_entries` recorded that installed headers declared none of `name`'s globals."""
+    prefix = f"{name}: the install public headers declare none of its "
+    return any(isinstance(w, str) and w.startswith(prefix) for w in warnings)
+
+
+def _is_abs_header_path(path: str) -> bool:
+    """True for an absolute path in either POSIX (`/framac-scratch/...`) or host OS form."""
+    return posixpath.isabs(path) or os.path.isabs(path)
+
+
 def classify_unit_visibility(
     name: str,
     unit: dict[str, Any],
     units: dict[str, dict[str, Any]],
     public: dict[str, Any],
+    *,
+    declared_in_installed: bool | None = None,
+    installed_archive: bool = False,
+    warnings: Sequence[str] | None = None,
 ) -> str:
     """
     External visibility class of a non-test link unit for harness scoping:
       - `executable`: executables
       - `plugin_so`: shared_lib with 0 exported function entry_points and >=1 exported_data_symbols
       - `public_lib`: shared_lib with entry_points (or fallback when neither functions nor data are exported),
-        installed static_lib (`public["method"] == "install"`), or non-installed static_lib not linked by any
-        non-test in-tree executable/shared_lib
-      - `internal_convenience`: non-installed static_lib linked by at least one non-test in-tree
-        executable/shared_lib (or unlinked object groups)
+        standalone static_lib not linked by any non-test in-tree executable/shared_lib, or a static_lib
+        linked by in-tree consumers whose archive is itself installed (`installed_archive`) or whose own
+        functions are declared in installed public headers (`public["method"] == "install"` without falling
+        back to consumer/project headers)
+      - `internal_convenience`: static_lib linked by at least one non-test in-tree executable/shared_lib
+        that is neither installed nor declared in installed headers (or unlinked object groups)
     """
     kind = unit.get("kind")
     if kind == "executable":
@@ -1148,13 +1165,27 @@ def classify_unit_visibility(
             return "plugin_so"
         return "public_lib"
     if kind == "static_lib":
-        if public.get("method") == "install":
-            return "public_lib"
         linked_by_nontest = any(
             name in (v.get("links") or []) and not v.get("test") and v.get("kind") in ("executable", "shared_lib")
             for v in units.values()
         )
-        return "internal_convenience" if linked_by_nontest else "public_lib"
+        if not linked_by_nontest:
+            return "public_lib"
+        if installed_archive:
+            return "public_lib"
+        if public.get("method") == "install":
+            if declared_in_installed is not None:
+                return "public_lib" if declared_in_installed else "internal_convenience"
+            has_api = bool(unit.get("entry_points") or unit.get("header_api"))
+            if warnings is not None:
+                if _install_header_fallback_warning(name, warnings):
+                    return "internal_convenience"
+                return "public_lib" if has_api else "internal_convenience"
+            files = [str(f) for f in (public.get("files") or []) if isinstance(f, str)]
+            if has_api and files and all(_is_abs_header_path(f) for f in files):
+                return "public_lib"
+            return "internal_convenience"
+        return "internal_convenience"
     return "internal_convenience"
 
 
@@ -2388,9 +2419,14 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     # Public headers (static libraries).
     public: dict[str, Any] = {"method": None, "files": []}
     public_paths: list[Path] = []
+    installed_archives: set[str] = set()
     static_units = [n for n, u in units.items() if u["kind"] == "static_lib" and not u["test"]]
     if static_units:
         installed, why = try_install(tree, scratch, recipe, INSTALL_TIMEOUT_S)
+        if why in ("install", "install staged no header"):
+            staging = scratch / "install"
+            if staging.is_dir():
+                installed_archives = {p.name for p in staging.rglob("*.a") if p.is_file()}
         if installed:
             public = {"method": "install", "files": [str(p) for p in installed]}
             public_paths = installed
@@ -2405,6 +2441,7 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     report["public_headers"] = public
 
     # Entry points.
+    declared_in_installed: dict[str, bool] = {}
     for name, u in units.items():
         own = [compiles[o] for o in u["objects"]]
         u["cppflags"] = unit_cppflags(own)
@@ -2464,6 +2501,8 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
             entries_, warning = static_lib_entries(
                 name, globals_, units, compiles, public, public_paths, project_headers, tree, flags
             )
+            if public.get("method") == "install":
+                declared_in_installed[name] = bool(entries_) and warning is None
             if warning:
                 report["warnings"].append(warning)
         u["entry_points"] = sorted(entries_)
@@ -2473,7 +2512,15 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
         u["exported_data_symbols"] = sorted(exported_data)
     for name, u in units.items():
         if not u["test"]:
-            u["unit_visibility"] = classify_unit_visibility(name, u, units, public)
+            u["unit_visibility"] = classify_unit_visibility(
+                name,
+                u,
+                units,
+                public,
+                declared_in_installed=declared_in_installed.get(name),
+                installed_archive=Path(name).name in installed_archives,
+                warnings=report["warnings"],
+            )
     report["units"] = {n: units[n] for n in sorted(units)}
     report["entry_points"] = sorted({e for u in units.values() if not u["test"] for e in u["entry_points"]})
     for c in entries:
