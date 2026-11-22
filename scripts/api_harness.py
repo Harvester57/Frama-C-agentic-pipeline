@@ -336,6 +336,8 @@ MAX_SCHEMA_INSTANCES = 4
 NO_ATTACKER_DATA_REASON = "no attacker data per the threat model"
 TRUSTED_PARAM_NO_INSTANCE_FMT = "trusted parameter {name} has no instance"
 REFCOUNT_EXEMPT_REASON = "refcount helper requires producer-allocated object"
+STATIC_NOT_CALLABLE_REASON = "static: not callable from the harness"
+_NULLABLE_ALLOCATOR_NAMES = frozenset({"allocator", "alloc", "mem_alloc"})
 # S2 widened builder names (by-value builders like `pb_istream_from_buffer`, schema-taking builders like
 # `pb_field_iter_begin`, `mbedtls_cipher_setup`, `foo_make_*`).
 _BY_VAL_BUILDER_NAME_RE = re.compile(
@@ -953,6 +955,197 @@ def _struct_value(case: _Case, call: int, param: int, v: str, ctype: str) -> Non
         case.note(call, param, f"{ctype}: a union with pointers or _Bool: zeroed, not read from the input")
 
 
+def _is_nullable_allocator_param(param_name: str | None, p: dict[str, Any]) -> bool:
+    """
+    Under `FRAMAC_API_TRUST_SCHEMA`, whether a `"trusted"` pointer parameter is a nullable default
+    allocator (`ProtobufCAllocator *allocator`, `alloc`, `mem_alloc`) that may safely bind to `NULL`.
+    Never matches schema/descriptor/iterator/field pointers (`pb_msgdesc_t`,
+    `ProtobufCMessageDescriptor`, `pb_field_iter_t`, `pb_field_t`, etc.).
+    """
+    if p.get("kind") != "ptr":
+        return False
+    pname_low = (param_name or "").strip().lower()
+    if pname_low in _NULLABLE_ALLOCATOR_NAMES or "allocator" in _words(param_name):
+        return True
+    for spelling in (p.get("pointee"), p.get("decl"), p.get("type")):
+        if isinstance(spelling, str) and "allocator" in spelling.lower():
+            return True
+    return False
+
+
+def _strip_builder_pair_sizes(params: list[dict], formals: list[dict], rec: dict) -> dict:
+    """
+    Drop call-site `param_sizes` entries on an S2 builder's read-only `(buf, len)` / `(len, buf)`
+    pairs so internal small-buffer call sites (e.g. nanopb's 10-byte `pb_istream_from_buffer`
+    call site) do not pin the builder to a fixed stack buffer instead of feeding whole-input `rest`.
+    """
+    raw_sizes = rec.get("param_sizes")
+    if not isinstance(raw_sizes, dict) or not raw_sizes:
+        return rec
+    drop: set[str] = set()
+    n = len(params)
+    for idx in range(n):
+        if _is_pair(params, idx, formals) and _is_input(formals, idx):
+            drop.add(str(idx))
+        elif (
+            idx + 1 < n
+            and params[idx]["kind"] == "int"
+            and (fname := _name(formals, idx))
+            and _LEN_NAME_RE.search(fname)
+            and is_length(params[idx], fname)
+            and params[idx + 1]["kind"] == "ptr"
+            and _charlike(params[idx + 1])
+            and idx + 1 < len(formals)
+            and isinstance(formals[idx + 1], dict)
+            and formals[idx + 1].get("kind") == "const_pointer"
+            and not _is_pair(params, idx + 1, formals)
+        ):
+            drop.add(str(idx + 1))
+    if not drop:
+        return rec
+    return {**rec, "param_sizes": {k: v for k, v in raw_sizes.items() if k not in drop}}
+
+
+def _struct_claims_rest(api: ApiInfo, lay: dict | None, seen: frozenset[str] = frozenset()) -> bool:
+    """Whether `_fill_fields` would claim `case.rest` for a struct value or const struct pointer."""
+    if not isinstance(lay, dict) or lay.get("what") != "struct" or _raw_ok(lay):
+        return False
+    if api.trust_schema and _bsd_queue_head_fields(lay) is not None:
+        return False
+    fields = list(lay.get("fields") or [])
+    i = 0
+    while i < len(fields):
+        f = fields[i]
+        nxt = fields[i + 1] if i + 1 < len(fields) else None
+        pair: tuple[dict, dict] | None = None
+        if f["kind"] == "ptr" and nxt is not None and _len_field(nxt):
+            pair = (f, nxt)
+        elif nxt is not None and _len_ptr_pair(fields, i):
+            pair = (nxt, f)
+        if pair is not None:
+            if pair[0].get("const"):
+                return True
+            i += 2
+            continue
+        if f["kind"] == "record" and f.get("what") == "struct":
+            sub_ctype = str(f.get("ctype") or "")
+            if sub_ctype in api.structs and sub_ctype not in seen:
+                if _struct_claims_rest(api, api.structs[sub_ctype], seen | {sub_ctype}):
+                    return True
+        i += 1
+    return False
+
+
+def _target_claims_rest(
+    name: str,
+    params: list[dict],
+    formals: list[dict],
+    rec: dict,
+    api: ApiInfo,
+    shared: dict[int, str],
+    roles: list[str] | None,
+    schema_bindings: dict[int, tuple[str, bool]],
+) -> bool:
+    """
+    Whether any parameter of target function `name` itself (excluding S2 builder-initialized params
+    and trusted params) would claim `case.rest`. When False, an S2 stream/buffer builder IS the
+    whole-input consumer and feeds its read-only `(buf, len)` pair directly from `rest`.
+    """
+    varlen = _variable_length(params, formals, rec, shared)
+    handles = api.handles.get(name) or {}
+    outs = api.outs.get(name) or {}
+    i = 0
+    n = len(params)
+    while i < n:
+        p = params[i]
+        nxt = params[i + 1] if i + 1 < n else None
+        role = roles[i] if roles is not None else None
+        if i in schema_bindings or role == "trusted_scalar":
+            i += 1
+            continue
+        if (
+            api.trust_schema
+            and role == "trusted"
+            and p["kind"] == "ptr"
+            and i not in shared
+            and _is_nullable_allocator_param(_name(formals, i), p)
+        ):
+            i += 1
+            continue
+        htype = handles.get(i) if i not in shared and p["kind"] == "ptr" else None
+        if htype is not None and _constructible(api, htype) and _releasable(api, htype):
+            if sum(1 for t in handles.values() if t == htype) == 1:
+                i += 1
+                continue
+        if i not in shared and p["kind"] == "ptr" and not _is_input(formals, i) and outs.get(i) is not None:
+            i += 1
+            continue
+        if i in shared:
+            if nxt is not None and (i + 1) not in shared and _is_pair(params, i, formals):
+                i += 2
+            else:
+                i += 1
+            continue
+        if p["kind"] == "int" and (i + 1) not in shared and _len_ptr_params(params, i, formals, rec):
+            return True
+        if p["kind"] == "fnptr":
+            i += 1
+            continue
+        if p["kind"] == "ptr":
+            pointee = str(p.get("pointee") or "void")
+            is_input = False if role == "output" else _is_input(formals, i)
+            size = None if varlen and _lone_output(params, formals, i) else param_size(rec, i)
+            own_init = (i == 0 and name in api.candidates.get(pointee, set())) or (
+                api.trust_schema and name in api.candidates.get(pointee, set())
+            )
+            if pointee in api.inits and not own_init:
+                i += 1
+                continue
+            if _table_type(api, p) is not None or role == "trusted":
+                i += 1
+                continue
+            j = _array_count(params, i, formals)
+            if j is not None and not any(
+                k in shared or k in handles or k in outs or str(params[k].get("pointee") or "") in api.inits
+                for k in range(i, j + 1)
+            ):
+                i = j + 1
+                continue
+            if (
+                _is_pair(params, i, formals)
+                and nxt is not None
+                and (i + 1) not in shared
+                and (roles is None or roles[i + 1] != "trusted_scalar")
+            ):
+                if is_input and size is None:
+                    return True
+                i += 2
+                continue
+            if _charlike(p):
+                if size is None and is_input and pointee in ("char", "signed char"):
+                    return True
+                i += 1
+                continue
+            if is_input and _is_record(pointee) and _struct_claims_rest(api, api.structs.get(pointee)):
+                return True
+            i += 1
+            continue
+        if p["kind"] == "struct":
+            ctype = str(p.get("ctype") or "")
+            if api.trust_schema and ctype in api.inits and name not in api.candidates.get(ctype, set()):
+                i += 1
+                continue
+            if role == "trusted":
+                i += 1
+                continue
+            if _struct_claims_rest(api, api.structs.get(ctype)):
+                return True
+            i += 1
+            continue
+        i += 1
+    return False
+
+
 def _init_call(
     case: _Case,
     pointee: str,
@@ -962,15 +1155,19 @@ def _init_call(
     *,
     var: str | None = None,
     schema_inst: dict[str, Any] | None = None,
+    feed_rest: bool = False,
 ) -> str:
     """
     The initializer or S2 builder call of a struct object before call `call`.
     For a pointer initializer, `target` is its address expression (`&var` or a shared buffer);
     for a by-value builder (S2, `fn in api.byval_inits`), `var` is assigned the returned struct.
+    When `feed_rest=True` under `FRAMAC_API_TRUST_SCHEMA`, call-site `param_sizes` on read-only
+    `(buf, len)` / `(len, buf)` pairs are stripped so the builder consumes whole-input `rest`.
     """
     fn = case.api.inits[pointee]
     rec = case.api.records.get(fn) or {}
-    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    formals = list(rec.get("formals") or [])
+    params, _ = plan_params(str(rec.get("signature") or ""), formals)
     k = case.ncalls + len(case.inits)
     case.inits.append({"fn": fn, "call": k, "for": {"call": call, "param": param}})
     if case.api.trust_schema and case.builder is None:
@@ -987,31 +1184,40 @@ def _init_call(
         gname = str(inst["name"])
         _record_schema_extern(case.api, inst, s_pointee)
         schema_bindings = {s_idx: (gname, True)}
+    use_builder_rest = case.api.trust_schema and feed_rest
+    call_rec = _strip_builder_pair_sizes(params or [], formals, rec) if use_builder_rest else rec
     if case.api.trust_schema and fn in case.api.byval_inits:
         stmt = _bind_call(
             case,
             k,
             fn,
             params or [],
-            list(rec.get("formals") or []),
-            rec,
+            formals,
+            call_rec,
             shared={},
             allow_init=False,
             schema_bindings=schema_bindings,
+            builder_rest=use_builder_rest,
         )
+        if isinstance(case.rest, dict) and case.rest.get("call") == k:
+            case.builder = fn
         lhs = var or target.lstrip("&")
         return stmt.replace(f"(void){fn}(", f"{lhs} = {fn}(", 1)
-    return _bind_call(
+    stmt = _bind_call(
         case,
         k,
         fn,
         params or [],
-        list(rec.get("formals") or []),
-        rec,
+        formals,
+        call_rec,
         {0: target},
         allow_init=False,
         schema_bindings=schema_bindings,
+        builder_rest=use_builder_rest,
     )
+    if case.api.trust_schema and isinstance(case.rest, dict) and case.rest.get("call") == k:
+        case.builder = fn
+    return stmt
 
 
 def _choose_handle_ctor(api: ApiInfo, htype: str, caller_name: str | None) -> str:
@@ -1394,11 +1600,15 @@ def _owner_release(case: _Case, call: int, made: str, expr: str) -> str:
     api = case.api
     fn = api.owners[made]
     rec = api.records.get(fn) or {}
-    params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    formals = list(rec.get("formals") or [])
+    params, why = plan_params(str(rec.get("signature") or ""), formals)
     if not params:
         raise _CaseError(f"{fn}, the destructor of {made}: {why}")
     args = [f"({params[0]['type']}){expr}"]
     for j in range(1, len(params)):
+        if api.trust_schema and _is_nullable_allocator_param(_name(formals, j), params[j]):
+            args.append("NULL")
+            continue
         if _table_type(api, params[j]) is None:
             raise _CaseError(f"{fn}, the destructor of {made}: argument {j} is not a table of function pointers")
         args.append(_table_arg(case, call, j, params[j], f"c{call}d{j}", noted=False))
@@ -1958,6 +2168,7 @@ def _bind_call(
     entry_trust: _EntryTrust | None = None,
     schema_bindings: dict[int, tuple[str, bool]] | None = None,
     builder_schema: dict[int, dict[str, Any]] | None = None,
+    builder_rest: bool = False,
 ) -> str:
     """
     The declarations and slots of one call's arguments (added to `case`); returns the call statement,
@@ -1974,6 +2185,11 @@ def _bind_call(
         raise _AutoExempt(REFCOUNT_EXEMPT_REASON)
     roles = (
         _param_roles(params, formals, rec, api, entry_trust) if (api.trust_schema and entry_trust is not None) else None
+    )
+    target_claims_rest = (
+        api.trust_schema
+        and allow_init
+        and _target_claims_rest(name, params, formals, rec, api, shared, roles, schema_bindings)
     )
     varlen = _variable_length(params, formals, rec, shared)
     args: list[str] = []
@@ -2012,6 +2228,17 @@ def _bind_call(
             case.decls.append(f"{p['ctype']} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
             case.note(call, i, "trusted scalar parameter per threat model: zeroed, not read from the input")
             args.append(v)
+            i += 1
+            continue
+        if (
+            api.trust_schema
+            and role == "trusted"
+            and p["kind"] == "ptr"
+            and i not in shared
+            and _is_nullable_allocator_param(_name(formals, i), p)
+        ):
+            case.note(call, i, "trusted nullable default allocator parameter: NULL")
+            args.append("NULL")
             i += 1
             continue
         htype = handles.get(i) if i not in shared and p["kind"] == "ptr" else None
@@ -2086,8 +2313,14 @@ def _bind_call(
             q = params[i + 1]
             if case.rest is None:
                 case.rest = {"call": call, "param": i + 1, "kind": "bytes"}
-                args.append(f"({p['type']})(fuzz_len - fuzz_off)")
-                args.append(f"({q['type']})(fuzz_buf + fuzz_off)")
+                if builder_rest:
+                    empty_var = case.declare(f"{v}_empty")
+                    case.decls.append(f"static uint8_t {empty_var}[1] = {{0}};")
+                    args.append(f"({p['type']})((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U)")
+                    args.append(f"({q['type']})((fuzz_len > fuzz_off) ? (fuzz_buf + fuzz_off) : {empty_var})")
+                else:
+                    args.append(f"({p['type']})(fuzz_len - fuzz_off)")
+                    args.append(f"({q['type']})(fuzz_buf + fuzz_off)")
                 case.note(call, i, "length before the byte pointer it counts: the rest of the input")
             else:
                 dv = f"c{call}a{i + 1}"
@@ -2178,7 +2411,32 @@ def _bind_call(
                     pname = _name(formals, i) or f"param{i}"
                     raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
                 case.decls.append(f"{p.get('decl') or pointee} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
-                before.append(_init_call(case, pointee, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)))
+                if api.trust_schema and target_claims_rest:
+                    reserved = case.rest is None
+                    if reserved:
+                        case.rest = _RESERVED_REST
+                    try:
+                        before.append(
+                            _init_call(
+                                case, pointee, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)
+                            )
+                        )
+                    finally:
+                        if reserved and case.rest is _RESERVED_REST:
+                            case.rest = None
+                else:
+                    before.append(
+                        _init_call(
+                            case,
+                            pointee,
+                            f"&{v}",
+                            call,
+                            i,
+                            var=v,
+                            schema_inst=builder_schema.get(i),
+                            feed_rest=api.trust_schema,
+                        )
+                    )
                 args.append(f"&{v}")
                 release = _struct_release(api, pointee, name, f"&{v}")
                 if release:
@@ -2215,9 +2473,16 @@ def _bind_call(
             ):
                 if is_input and case.rest is None and size is None:
                     case.rest = {"call": call, "param": i, "kind": "bytes"}
-                    args.append(f"({p['type']})(fuzz_buf + fuzz_off)")
-                    args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
-                    pairs.append((i, "(fuzz_len - fuzz_off)", True))
+                    if builder_rest:
+                        empty_var = case.declare(f"{v}_empty")
+                        case.decls.append(f"static uint8_t {empty_var}[1] = {{0}};")
+                        args.append(f"({p['type']})((fuzz_len > fuzz_off) ? (fuzz_buf + fuzz_off) : {empty_var})")
+                        args.append(f"({nxt['type']})((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U)")
+                        pairs.append((i, "((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U)", True))
+                    else:
+                        args.append(f"({p['type']})(fuzz_buf + fuzz_off)")
+                        args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
+                        pairs.append((i, "(fuzz_len - fuzz_off)", True))
                 else:
                     buf = size or case.spare
                     case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
@@ -2376,7 +2641,32 @@ def _bind_call(
                     pname = _name(formals, i) or f"param{i}"
                     raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
                 case.decls.append(f"{ctype} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
-                before.append(_init_call(case, ctype, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)))
+                if api.trust_schema and target_claims_rest:
+                    reserved = case.rest is None
+                    if reserved:
+                        case.rest = _RESERVED_REST
+                    try:
+                        before.append(
+                            _init_call(
+                                case, ctype, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)
+                            )
+                        )
+                    finally:
+                        if reserved and case.rest is _RESERVED_REST:
+                            case.rest = None
+                else:
+                    before.append(
+                        _init_call(
+                            case,
+                            ctype,
+                            f"&{v}",
+                            call,
+                            i,
+                            var=v,
+                            schema_inst=builder_schema.get(i),
+                            feed_rest=api.trust_schema,
+                        )
+                    )
                 args.append(v)
                 i += 1
                 continue
@@ -2734,7 +3024,13 @@ def _single_cases_for_entry(
                     return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
                 builder_schema_opts[i] = (s_pointee, insts)
                 continue
-            if role == "trusted" and not is_handle and not has_builder and _table_type(api, p) is None:
+            if (
+                role == "trusted"
+                and not is_handle
+                and not has_builder
+                and _table_type(api, p) is None
+                and not _is_nullable_allocator_param(pname, p)
+            ):
                 insts = _lookup_schema_instances(api, pointee, decl)
                 if not insts:
                     return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
@@ -4082,7 +4378,9 @@ def plan(
                 skipped[key] = HEADER_NOT_VISIBLE
             continue
         if drec.get("is_static"):
-            skipped[key] = "static: not callable from the harness"
+            skipped[key] = STATIC_NOT_CALLABLE_REASON
+            if effective_trust_schema:
+                auto_exempt[key] = STATIC_NOT_CALLABLE_REASON
             continue
         mrec = _model_record(model, drec, key)
         if not mrec:

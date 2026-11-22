@@ -422,10 +422,13 @@ def test_nanopb_s1_s2_s3_trusted_schema_never_fuzzed_and_capped_at_4(monkeypatch
     ]
     for stmt, lay in decode_pairs:
         inst = lay["schema_instance"]
-        # S2 by-value builder builds the stream directly from fuzz bytes.
+        # S2 by-value builder builds the stream directly from fuzz bytes (with safe non-NULL empty slice).
         assert lay["builder"] == "pb_istream_from_buffer"
+        assert "static uint8_t c1a0_empty[1] = {0};" in stmt
         assert (
-            "c0a0 = pb_istream_from_buffer((unsigned char *)(fuzz_buf + fuzz_off), (unsigned long)(fuzz_len - fuzz_off));"
+            "c0a0 = pb_istream_from_buffer("
+            "(unsigned char *)((fuzz_len > fuzz_off) ? (fuzz_buf + fuzz_off) : c1a0_empty), "
+            "(unsigned long)((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U));"
             in stmt
         )
         # Trusted descriptor is bound to the real const schema instance, NEVER fuzzed!
@@ -455,8 +458,11 @@ def test_nanopb_s1_s2_s3_trusted_schema_never_fuzzed_and_capped_at_4(monkeypatch
     assert len(reader_pairs) == 1
     r_stmt, r_lay = reader_pairs[0]
     assert r_lay["builder"] == "pb_istream_from_buffer"
+    assert "static uint8_t c1a0_empty[1] = {0};" in r_stmt
     assert (
-        "c0a0 = pb_istream_from_buffer((unsigned char *)(fuzz_buf + fuzz_off), (unsigned long)(fuzz_len - fuzz_off));"
+        "c0a0 = pb_istream_from_buffer("
+        "(unsigned char *)((fuzz_len > fuzz_off) ? (fuzz_buf + fuzz_off) : c1a0_empty), "
+        "(unsigned long)((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U));"
         in r_stmt
     )
     assert r_lay["slots"] == []
@@ -910,3 +916,479 @@ def test_sudo_tailq_stailq_init_and_refcount_skips(monkeypatch: pytest.MonkeyPat
     assert "sudo_rcstr_addref" in by_fn_off
     assert "sudo_rcstr_delref" in by_fn_off
     assert planned_off["auto_exempt"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Wave 6 follow-up fixes (W7-C):
+#   1. Whole-input `rest` feeding for S2 `(buf, len)` builders (even with param_sizes)
+#   2. Nullable default-allocator trusted pointer params (`ProtobufCAllocator *`)
+#   3. `static` functions recorded in `api_auto_exempt`
+# ---------------------------------------------------------------------------
+
+
+def test_s2_builder_with_param_sizes_feeds_whole_input_rest_and_maps_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Reproduces Wave 6 A/B-1b (`nanopb`): `pb_istream_from_buffer` had internal call-site
+    `param_sizes={"0": {"min": 10, "max": 10}}`, which pinned it to a 10-byte stack buffer
+    (`slots=2, rest=None`) and made `fuzz_assets._whole_input_selectors` map 0 cases.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _nanopb_fixture(include_globals=False)
+    # Real nanopb internal call site records param_sizes=10 on pb_istream_from_buffer(buf, msglen).
+    model["functions"]["pb_decode.c#pb_istream_from_buffer"]["param_sizes"] = {"0": {"min": 10, "max": 10}}
+    # Add pb_read (output buf, count) and a target function that claims rest itself.
+    dag["functions"]["pb_decode.c#pb_read"] = {
+        "name": "pb_read",
+        "file": "pb_decode.c",
+        "is_static": False,
+        "module": "nanopb",
+        "trust": {"value": "untrusted", "source": "threat_model", "input_role": "reader", "attacker_params": None},
+    }
+    dag["functions"]["pb_decode.c#pb_compare_extra"] = {
+        "name": "pb_compare_extra",
+        "file": "pb_decode.c",
+        "is_static": False,
+        "module": "nanopb",
+        "trust": {
+            "value": "untrusted",
+            "source": "threat_model",
+            "input_role": "entry",
+            "attacker_params": ["stream", "extra"],
+        },
+    }
+    dag["modules"]["nanopb"]["candidate_entry_points"].extend(["pb_decode.c#pb_read", "pb_decode.c#pb_compare_extra"])
+    dag["modules"]["nanopb"]["functions"].extend(["pb_decode.c#pb_read", "pb_decode.c#pb_compare_extra"])
+    model["functions"]["pb_decode.c#pb_read"] = {
+        "name": "pb_read",
+        "file": "pb_decode.c",
+        "signature": "_Bool(struct pb_istream_s *,unsigned char *,unsigned long)",
+        "formals": [
+            {"name": "stream", "kind": "pointer"},
+            {"name": "buf", "kind": "pointer"},
+            {"name": "count", "kind": "value"},
+        ],
+    }
+    model["functions"]["pb_decode.c#pb_compare_extra"] = {
+        "name": "pb_compare_extra",
+        "file": "pb_decode.c",
+        "signature": "_Bool(struct pb_istream_s *,unsigned char *,unsigned long)",
+        "formals": [
+            {"name": "stream", "kind": "pointer"},
+            {"name": "extra", "kind": "const_pointer"},
+            {"name": "extra_len", "kind": "value"},
+        ],
+    }
+
+    reports = tmp_path / "workspace" / "reports"
+    harnesses = tmp_path / "workspace" / "harnesses"
+    reports.mkdir(parents=True)
+    harnesses.mkdir(parents=True)
+    dag_path = reports / "callgraph_dag.json"
+    model_path = reports / "phase0_model.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+
+    res = ah.generate(
+        module="nanopb",
+        header="none",
+        max_input_size=256,
+        cppflags="",
+        out_dir=harnesses,
+        unit="nanopb",
+        auto_prelude=False,
+        probe=False,
+        dag_path=dag_path,
+        model_path=model_path,
+        struct_layouts=layouts,
+        variadic={},
+    )
+    harness_c = Path(res["harness_file"]).read_text(encoding="utf-8")
+    sidecar = json.loads(Path(res["harness_meta"]).read_text(encoding="utf-8"))
+    assert not validate_sidecar(sidecar, module="nanopb")
+
+    # Eva soundness: full-range Frama_C_make_unknown over input_buf preserved.
+    assert "Frama_C_make_unknown((char *)input_buf, input_len);" in harness_c
+
+    from seed_harvest import harness_cases
+
+    by_fn = {lay["calls"][0]: lay for lay in sidecar["api_cases"]}
+    case_body = dict(harness_cases(harness_c))
+    case_line = {fn: case_body[lay["selector"]] for fn, lay in by_fn.items()}
+    # pb_decode_varint: builder consumes whole-input rest (NO 10-byte stack buffer, 0 slots!).
+    varint_lay = by_fn["pb_decode_varint"]
+    assert varint_lay["slots"] == []
+    assert varint_lay["rest"] == {"call": 1, "param": 0, "kind": "bytes"}
+    assert varint_lay["builder"] == "pb_istream_from_buffer"
+    assert "c1a0[10]" not in case_line["pb_decode_varint"]
+    assert "c1a0_empty" in case_line["pb_decode_varint"]
+
+    # pb_read: its `(buf, count)` is a writable output pair, so pb_istream_from_buffer STILL claims rest!
+    read_lay = by_fn["pb_read"]
+    assert read_lay["rest"] == {"call": 1, "param": 0, "kind": "bytes"}
+    assert read_lay["builder"] == "pb_istream_from_buffer"
+    assert "c1a0[10]" not in case_line["pb_read"]
+    assert "c1a0_empty" in case_line["pb_read"]
+
+    # pb_compare_extra: target ITSELF has an attacker `(const buf, len)` pair -> target claims rest, not builder!
+    cmp_lay = by_fn["pb_compare_extra"]
+    assert cmp_lay["rest"] == {"call": 0, "param": 1, "kind": "bytes"}
+    assert "c1a0[10]" in case_line["pb_compare_extra"]
+
+    # fuzz_assets maps whole-input corpus onto S2-builder cases (>0 mapped cases, via target OR builder name).
+    corpus_dir = tmp_path / "workspace" / "fuzz_assets" / "corpora" / "nanopb_corpus"
+    corpus_dir.mkdir(parents=True)
+    (corpus_dir / "aabbccdd00112233").write_bytes(b"\x08\xac\x02")
+    fa_doc = {
+        "schema_version": 1,
+        "generated_at": "2026-11-22T00:00:00Z",
+        "target": "/target",
+        "fuzzers": [],
+        "corpora": [{"id": "nanopb_corpus", "path": "tests/corpus", "kind": "dir", "imported": {"kept": 1}}],
+        "mappings": [
+            {
+                "corpus": "nanopb_corpus",
+                "fuzzer": None,
+                "functions": ["pb_istream_from_buffer"],
+                "ignored": False,
+                "reason": None,
+                "source": "agent",
+            }
+        ],
+        "warnings": [],
+    }
+    report = fa.write_module("nanopb", sidecar, harness_c, fa_doc)
+    assert report["inputs"] > 0
+    assert str(varint_lay["selector"]) in report["cases"]
+
+    # Also maps when mapped directly to `pb_decode_varint`.
+    assert fa._whole_input_selectors(sidecar, harness_c, {"pb_decode_varint"}) == [varint_lay["selector"]]
+
+    # Flag off: legacy behavior preserved (no builder rest mapping in fuzz_assets, no S2 by-value builder).
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "off")
+    assert fa._whole_input_selectors(sidecar, harness_c, {"pb_decode_varint"}) == []
+    planned_off = ah.plan(dag, model, "nanopb", "nanopb", 256, struct_layouts=layouts)
+    varint_off = next(
+        (s, lay)
+        for s, lay in zip(planned_off["cases"], planned_off["layouts"], strict=True)
+        if lay["calls"] == ["pb_decode_varint"]
+    )
+    assert "pb_istream_from_buffer" not in varint_off[0]
+    assert "c1a0_empty" not in varint_off[0]
+
+
+def test_s2_pointer_init_builder_with_param_sizes_feeds_whole_input_rest(monkeypatch: pytest.MonkeyPatch):
+    """Pointer-init S2 builder `reader_init(struct reader *, const char *, size_t)` with param_sizes gets rest."""
+    dag_fns = {
+        "r.c#reader_init": {"name": "reader_init", "file": "r.c", "is_static": False, "module": "m"},
+        "r.c#reader_parse": {
+            "name": "reader_parse",
+            "file": "r.c",
+            "is_static": False,
+            "module": "m",
+            "trust": {"value": "untrusted", "source": "threat_model", "input_role": "entry", "attacker_params": ["r"]},
+        },
+    }
+    dag = {
+        "module_kind": "link_unit",
+        "trust": {"threat_model": {"status": "ok"}},
+        "modules": {"m": {"candidate_entry_points": list(dag_fns), "functions": list(dag_fns)}},
+        "functions": dag_fns,
+    }
+    model = {
+        "status": "ok",
+        "trust": {"threat_model": {"status": "ok"}},
+        "functions": {
+            "r.c#reader_init": {
+                "name": "reader_init",
+                "file": "r.c",
+                "signature": "void(struct reader *,char *,unsigned long)",
+                "formals": [
+                    {"name": "r", "kind": "pointer"},
+                    {"name": "buf", "kind": "const_pointer"},
+                    {"name": "len", "kind": "value"},
+                ],
+                "param_sizes": {"1": {"min": 12, "max": 12}},
+            },
+            "r.c#reader_parse": {
+                "name": "reader_parse",
+                "file": "r.c",
+                "signature": "int(struct reader *)",
+                "formals": [{"name": "r", "kind": "pointer"}],
+            },
+        },
+    }
+
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    planned = ah.plan(dag, model, "m", "m", 256, struct_layouts={})
+    assert len(planned["layouts"]) == 1
+    stmt, lay = planned["cases"][0], planned["layouts"][0]
+    assert lay["calls"] == ["reader_parse"]
+    assert lay["builder"] == "reader_init"
+    assert lay["slots"] == []
+    assert lay["rest"] == {"call": 1, "param": 1, "kind": "bytes"}
+    assert "static uint8_t c1a1_empty[1] = {0};" in stmt
+    assert "(fuzz_len > fuzz_off) ? (fuzz_buf + fuzz_off) : c1a1_empty" in stmt
+
+    # Flag off: legacy behavior keeps 12-byte param_sizes stack buffer and rest=None.
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "off")
+    planned_off = ah.plan(dag, model, "m", "m", 256, struct_layouts={})
+    parse_off = next(
+        (s, lay)
+        for s, lay in zip(planned_off["cases"], planned_off["layouts"], strict=True)
+        if lay["calls"] == ["reader_parse"]
+    )
+    assert parse_off[1]["rest"] is None
+    assert len(parse_off[1]["slots"]) == 2
+    assert "c1a1[12]" in parse_off[0]
+
+
+def test_nullable_default_allocator_trusted_pointer_and_strict_schema_guardrail(monkeypatch: pytest.MonkeyPatch):
+    """
+    Reproduces Wave 6 A/B-1a / A/B-4b (`sudo`):
+    - `ProtobufCAllocator *allocator` (and `alloc` / `mem_alloc` / type containing `Allocator`)
+      receives `NULL` under `FRAMAC_API_TRUST_SCHEMA=on` instead of being skipped.
+    - Non-allocator trusted schema pointers (`pb_msgdesc_t *fields`, `ProtobufCMessageDescriptor *desc`,
+      `pb_field_iter_t *iter`, `pb_field_t *field`) MUST STILL refuse with
+      `"trusted parameter <name> has no instance"` when no S3 instance exists.
+    """
+    dag_fns = {
+        "log_server.pb-c.c#client_message__unpack": {
+            "name": "client_message__unpack",
+            "file": "log_server.pb-c.c",
+            "is_static": False,
+            "module": "liblogsrv_a",
+            "trust": {
+                "value": "untrusted",
+                "source": "threat_model",
+                "input_role": "entry",
+                "attacker_params": ["data"],
+            },
+        },
+        "log_server.pb-c.c#server_message__unpack": {
+            "name": "server_message__unpack",
+            "file": "log_server.pb-c.c",
+            "is_static": False,
+            "module": "liblogsrv_a",
+            "trust": {
+                "value": "untrusted",
+                "source": "threat_model",
+                "input_role": "entry",
+                "attacker_params": ["data"],
+            },
+        },
+        "log_server.pb-c.c#custom_alloc_unpack": {
+            "name": "custom_alloc_unpack",
+            "file": "log_server.pb-c.c",
+            "is_static": False,
+            "module": "liblogsrv_a",
+            "trust": {
+                "value": "untrusted",
+                "source": "threat_model",
+                "input_role": "entry",
+                "attacker_params": ["data"],
+            },
+        },
+        "log_server.pb-c.c#generic_unpack_needs_desc": {
+            "name": "generic_unpack_needs_desc",
+            "file": "log_server.pb-c.c",
+            "is_static": False,
+            "module": "liblogsrv_a",
+            "trust": {
+                "value": "untrusted",
+                "source": "threat_model",
+                "input_role": "entry",
+                "attacker_params": ["data"],
+            },
+        },
+        "pb_decode.c#pb_decode": {
+            "name": "pb_decode",
+            "file": "pb_decode.c",
+            "is_static": False,
+            "module": "liblogsrv_a",
+            "trust": {
+                "value": "untrusted",
+                "source": "threat_model",
+                "input_role": "entry",
+                "attacker_params": ["data"],
+            },
+        },
+    }
+    dag = {
+        "module_kind": "link_unit",
+        "trust": {"threat_model": {"status": "ok"}},
+        "modules": {"liblogsrv_a": {"candidate_entry_points": list(dag_fns), "functions": list(dag_fns)}},
+        "functions": dag_fns,
+        "global_variables": {},
+    }
+    model = {
+        "status": "ok",
+        "trust": {"threat_model": {"status": "ok"}},
+        "functions": {
+            "log_server.pb-c.c#client_message__unpack": {
+                "name": "client_message__unpack",
+                "file": "log_server.pb-c.c",
+                "signature": "struct _ClientMessage *(struct _ProtobufCAllocator *,unsigned long,unsigned char *)",
+                "formals": [
+                    {"name": "allocator", "kind": "pointer"},
+                    {"name": "len", "kind": "value"},
+                    {"name": "data", "kind": "const_pointer"},
+                ],
+            },
+            # Matched via type name (`ProtobufCAllocator`) even when param name is generic `a`.
+            "log_server.pb-c.c#server_message__unpack": {
+                "name": "server_message__unpack",
+                "file": "log_server.pb-c.c",
+                "signature": "struct _ServerMessage *(struct ProtobufCAllocator *,unsigned long,unsigned char *)",
+                "formals": [
+                    {"name": "a", "kind": "pointer"},
+                    {"name": "len", "kind": "value"},
+                    {"name": "data", "kind": "const_pointer"},
+                ],
+            },
+            # Matched via param name (`mem_alloc`) even when type does not contain "Allocator".
+            "log_server.pb-c.c#custom_alloc_unpack": {
+                "name": "custom_alloc_unpack",
+                "file": "log_server.pb-c.c",
+                "signature": "int(struct mem_ops *,unsigned long,unsigned char *)",
+                "formals": [
+                    {"name": "mem_alloc", "kind": "pointer"},
+                    {"name": "len", "kind": "value"},
+                    {"name": "data", "kind": "const_pointer"},
+                ],
+            },
+            # Has BOTH a descriptor (`desc`) and an allocator (`allocator`): MUST STILL refuse without desc instance!
+            "log_server.pb-c.c#generic_unpack_needs_desc": {
+                "name": "generic_unpack_needs_desc",
+                "file": "log_server.pb-c.c",
+                "signature": "void *(struct _ProtobufCMessageDescriptor *,struct _ProtobufCAllocator *,unsigned long,unsigned char *)",
+                "formals": [
+                    {"name": "desc", "kind": "const_pointer"},
+                    {"name": "allocator", "kind": "pointer"},
+                    {"name": "len", "kind": "value"},
+                    {"name": "data", "kind": "const_pointer"},
+                ],
+            },
+            # Non-allocator schema descriptor `fields`: MUST STILL refuse without an S3 instance!
+            "pb_decode.c#pb_decode": {
+                "name": "pb_decode",
+                "file": "pb_decode.c",
+                "signature": "_Bool(unsigned char *,unsigned long,struct pb_msgdesc_s *)",
+                "formals": [
+                    {"name": "data", "kind": "const_pointer"},
+                    {"name": "len", "kind": "value"},
+                    {"name": "fields", "kind": "const_pointer"},
+                ],
+            },
+        },
+        "global_variables": {},
+    }
+
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    planned = ah.plan(dag, model, "liblogsrv_a", "liblogsrv_a", 256, struct_layouts={})
+    by_fn = {lay["calls"][0]: (stmt, lay) for stmt, lay in zip(planned["cases"], planned["layouts"], strict=True)}
+
+    # All three allocator-taking unpackers are generated with NULL for allocator and rest for (len, data).
+    for fn in ("client_message__unpack", "server_message__unpack", "custom_alloc_unpack"):
+        assert fn in by_fn
+        stmt, lay = by_fn[fn]
+        assert f"{fn}(NULL, (unsigned long)(fuzz_len - fuzz_off), (unsigned char *)(fuzz_buf + fuzz_off));" in stmt
+        assert lay["slots"] == []
+        assert lay["rest"] == {"call": 0, "param": 2, "kind": "bytes"}
+
+    # STRICT GUARDRAIL: non-allocator trusted descriptors NEVER receive NULL and still auto-exempt.
+    assert "pb_decode" not in by_fn
+    assert planned["auto_exempt"]["pb_decode.c#pb_decode"] == "trusted parameter fields has no instance"
+    assert "generic_unpack_needs_desc" not in by_fn
+    assert (
+        planned["auto_exempt"]["log_server.pb-c.c#generic_unpack_needs_desc"]
+        == "trusted parameter desc has no instance"
+    )
+
+    # Flag off: legacy behavior does NOT pass NULL for allocator without null_defaults doc comment.
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "off")
+    planned_off = ah.plan(dag, model, "liblogsrv_a", "liblogsrv_a", 256, struct_layouts={})
+    by_fn_off = {lay["calls"][0]: stmt for stmt, lay in zip(planned_off["cases"], planned_off["layouts"], strict=True)}
+    assert "client_message__unpack(NULL," not in by_fn_off["client_message__unpack"]
+    assert "client_message__unpack(&c0a0," in by_fn_off["client_message__unpack"]
+    assert planned_off["auto_exempt"] == {}
+
+
+def test_static_functions_recorded_in_api_auto_exempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """
+    Reproduces Wave 6 A/B-1b / A/B-4a (`nanopb` static readers `buf_read`, `pb_readbyte`):
+    when `FRAMAC_API_TRUST_SCHEMA=on`, skipped `static` functions are recorded in `api_auto_exempt`
+    as `"static: not callable from the harness"`; when `off`, `api_auto_exempt` stays absent/empty.
+    """
+    monkeypatch.chdir(tmp_path)
+    dag, model, layouts = _nanopb_fixture(include_globals=False)
+    dag["functions"]["pb_decode.c#buf_read"] = {
+        "name": "buf_read",
+        "file": "pb_decode.c",
+        "is_static": True,
+        "module": "nanopb",
+        "trust": {"value": "untrusted", "source": "threat_model", "input_role": "reader", "attacker_params": None},
+    }
+    dag["functions"]["pb_decode.c#pb_readbyte"] = {
+        "name": "pb_readbyte",
+        "file": "pb_decode.c",
+        "is_static": True,
+        "module": "nanopb",
+        "trust": {"value": "untrusted", "source": "threat_model", "input_role": "reader", "attacker_params": None},
+    }
+    dag["modules"]["nanopb"]["candidate_entry_points"].extend(["pb_decode.c#buf_read", "pb_decode.c#pb_readbyte"])
+    dag["modules"]["nanopb"]["functions"].extend(["pb_decode.c#buf_read", "pb_decode.c#pb_readbyte"])
+
+    reports = tmp_path / "workspace" / "reports"
+    harnesses = tmp_path / "workspace" / "harnesses"
+    reports.mkdir(parents=True)
+    harnesses.mkdir(parents=True)
+    dag_path = reports / "callgraph_dag.json"
+    model_path = reports / "phase0_model.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    res_on = ah.generate(
+        module="nanopb",
+        header="none",
+        max_input_size=256,
+        cppflags="",
+        out_dir=harnesses,
+        unit="nanopb",
+        auto_prelude=False,
+        probe=False,
+        dag_path=dag_path,
+        model_path=model_path,
+        struct_layouts=layouts,
+        variadic={},
+    )
+    sidecar_on = json.loads(Path(res_on["harness_meta"]).read_text(encoding="utf-8"))
+    assert not validate_sidecar(sidecar_on, module="nanopb")
+    for key in ("pb_decode.c#buf_read", "pb_decode.c#pb_readbyte"):
+        assert sidecar_on["api_skipped"][key] == ah.STATIC_NOT_CALLABLE_REASON
+        assert sidecar_on["api_auto_exempt"][key] == ah.STATIC_NOT_CALLABLE_REASON
+        assert res_on["api_auto_exempt"][key] == ah.STATIC_NOT_CALLABLE_REASON
+
+    # Flag off: static functions stay in api_skipped only; api_auto_exempt is absent.
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "off")
+    res_off = ah.generate(
+        module="nanopb",
+        header="none",
+        max_input_size=256,
+        cppflags="",
+        out_dir=harnesses,
+        unit="nanopb",
+        auto_prelude=False,
+        probe=False,
+        dag_path=dag_path,
+        model_path=model_path,
+        struct_layouts=layouts,
+        variadic={},
+    )
+    sidecar_off = json.loads(Path(res_off["harness_meta"]).read_text(encoding="utf-8"))
+    assert "api_auto_exempt" not in sidecar_off
+    assert "api_auto_exempt" not in res_off
+    assert sidecar_off["api_skipped"]["pb_decode.c#buf_read"] == ah.STATIC_NOT_CALLABLE_REASON

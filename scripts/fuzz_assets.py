@@ -886,9 +886,10 @@ def _whole_input_selectors(sidecar: dict[str, Any], harness_c: str, functions: s
             if isinstance(k, int) and 0 <= k < len(calls) and calls[k] in functions:
                 sels.append(lay["selector"])
             elif trust_schema and isinstance(k, int):
-                # Under FRAMAC_API_TRUST_SCHEMA, whole-input corpora also map onto S3 cases whose
-                # input bytes flow through an S2 builder (`inits`, e.g. `pb_istream_from_buffer`
-                # feeding `pb_decode` + `&AllTypes_msg`).
+                # Under FRAMAC_API_TRUST_SCHEMA, whole-input corpora also map onto S2/S3 cases
+                # whose input bytes flow through an S2 stream/buffer builder (`inits` / `builder`,
+                # e.g. `pb_istream_from_buffer` feeding `pb_decode` or `pb_decode_varint`).
+                matched = False
                 for init in lay.get("inits") or []:
                     if not isinstance(init, dict) or init.get("call") != k:
                         continue
@@ -898,7 +899,16 @@ def _whole_input_selectors(sidecar: dict[str, Any], harness_c: str, functions: s
                         isinstance(target_idx, int) and 0 <= target_idx < len(calls) and calls[target_idx] in functions
                     ) or init.get("fn") in functions:
                         sels.append(lay["selector"])
+                        matched = True
                         break
+                if (
+                    not matched
+                    and not lay.get("inits")
+                    and isinstance(lay.get("builder"), str)
+                    and lay["builder"]
+                    and (lay["builder"] in functions or any(c in functions for c in calls))
+                ):
+                    sels.append(lay["selector"])
         return sels
     from seed_harvest import case_bindings, harness_cases, whole_input_cases
 
