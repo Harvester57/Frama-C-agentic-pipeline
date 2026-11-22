@@ -120,6 +120,20 @@ def build_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, str]
 CORE_LIMIT_BYTES = 1
 
 
+def _clamped_core_limit(resource_mod: typing.Any) -> int:
+    """Clamp CORE_LIMIT_BYTES to the process's current hard RLIMIT_CORE (P10c)."""
+    getrlimit = getattr(resource_mod, "getrlimit", None)
+    if getrlimit is None:
+        return CORE_LIMIT_BYTES
+    _soft, hard = getrlimit(resource_mod.RLIMIT_CORE)
+    rlim_inf = getattr(resource_mod, "RLIM_INFINITY", -1)
+    if hard == 0:
+        return 0
+    if hard == rlim_inf or hard < 0:
+        return CORE_LIMIT_BYTES
+    return min(CORE_LIMIT_BYTES, int(hard))
+
+
 def _make_preexec(limits: Limits):
     def _apply() -> None:
         import resource  # POSIX only; imported lazily so the module loads on any host
@@ -134,7 +148,7 @@ def _make_preexec(limits: Limits):
         _set(resource.RLIMIT_NPROC, limits.processes)  # type: ignore[attr-defined]
         if limits.address_space_mb:
             _set(resource.RLIMIT_AS, limits.address_space_mb * 1024 * 1024)  # type: ignore[attr-defined]
-        _set(resource.RLIMIT_CORE, CORE_LIMIT_BYTES)  # type: ignore[attr-defined]
+        _set(resource.RLIMIT_CORE, _clamped_core_limit(resource))  # type: ignore[attr-defined]
         if limits.ignore_sigpipe:
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)  # type: ignore[attr-defined]
 

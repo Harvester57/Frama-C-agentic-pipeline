@@ -83,6 +83,9 @@ WP_MEMLIMIT_MB = 1000
 FUZZ_RSS_LIMIT_MB = 2048
 FRAMAC_KERNEL_RESERVE_MB = 768
 FUZZ_WORKER_OVERHEAD_MB = 512
+FUZZ_RSS_WORKER_FLOOR_MB = 512
+FUZZ_RSS_SAFETY_MARGIN = 1.5
+FUZZ_SPIKE_CUSHION_MB = 2048
 DEFAULT_PIDS_LIMIT = 4096
 
 PROBE_MEMO_S = 5.0
@@ -547,6 +550,36 @@ def cgroup_stats(root: Path | str = "/") -> dict:
             usage = _int(_read_file(view.cpu_dir / "cpuacct.usage"))
             out["cpu_usec"] = usage // 1000 if usage is not None else None
     return out
+
+
+def read_cgroup_oom_kills(
+    root: Path | str = "/",
+    *,
+    events_path: Path | str | None = None,
+    since: int | None = None,
+) -> int | None:
+    """
+    Read the cgroup `oom_kill` event counter (v2 `memory.events` or v1 `memory.oom_control`),
+    or return the non-negative delta since `since` when provided (P7d).
+    Accepts a probe root directory or a direct `memory.events` file path (`events_path` or `root`).
+    Returns None gracefully on non-Linux hosts or when cgroup files do not exist.
+    """
+    val: int | None = None
+    if events_path is not None:
+        val = _kv(_read_file(Path(events_path))).get("oom_kill")
+    else:
+        root_p = _probe_root(root)
+        if not _is_real_root(root_p) and root_p.is_file():
+            val = _kv(_read_file(root_p)).get("oom_kill")
+        else:
+            val = cgroup_stats(root_p).get("oom_kill")
+            if val is None:
+                val = _kv(_read_file(_join(root_p, "/sys/fs/cgroup/memory.events"))).get("oom_kill")
+    if val is None:
+        return None
+    if since is not None:
+        return max(0, int(val) - int(since))
+    return int(val)
 
 
 # Compatibility helpers (single-value views of cgroup_view()).
@@ -1365,13 +1398,16 @@ def job_budget(root: Path | str = "/", *, use_available: bool = True) -> Budget:
     CPUs and memory this job may use: the minimum of the broker's grant (FRAMAC_JOB_CPUS /
     FRAMAC_JOB_MEM_MB), the cgroup limits (walked up the hierarchy) and the CPUs/memory the OS
     reports. Cgroup files are re-read on every call, so a resized container is never hidden
-    behind a stale grant. `use_available=False` sizes memory from MemTotal instead of
-    MemAvailable (the container broker accounts for its own leases' usage itself).
+    behind a stale grant. When FRAMAC_SUBLEASE_ID is set, FRAMAC_CGROUP_ENFORCED=1 belongs to
+    the outer container rather than the inner sub-lease, so the grant is always included in
+    min(...) (P7e). `use_available=False` sizes memory from MemTotal instead of MemAvailable
+    (the container broker accounts for its own leases' usage itself).
     """
     root = _probe_root(root)
     cpu_sources: list[tuple[float, str]] = []
     mem_sources: list[tuple[int, str]] = []
-    cgroup_enforced = os.environ.get("FRAMAC_CGROUP_ENFORCED", "").strip() == "1"
+    sublease = bool((os.environ.get("FRAMAC_SUBLEASE_ID") or "").strip())
+    cgroup_enforced = os.environ.get("FRAMAC_CGROUP_ENFORCED", "").strip() == "1" and not sublease
     env_cpus, env_mem = _env_int("FRAMAC_JOB_CPUS"), parse_mem(os.environ.get("FRAMAC_JOB_MEM_MB"))
     view = cgroup_view(root)
     if view.cpu_quota:
@@ -1409,7 +1445,8 @@ def job_budget(root: Path | str = "/", *, use_available: bool = True) -> Budget:
 def enforced_memory_mb(root: Path | str = "/") -> int | None:
     """The memory limit actually imposed on this job (its grant or its cgroup), or None when unlimited."""
     cg_mem = cgroup_view(_probe_root(root)).mem_limit_mb
-    cgroup_enforced = os.environ.get("FRAMAC_CGROUP_ENFORCED", "").strip() == "1"
+    sublease = bool((os.environ.get("FRAMAC_SUBLEASE_ID") or "").strip())
+    cgroup_enforced = os.environ.get("FRAMAC_CGROUP_ENFORCED", "").strip() == "1" and not sublease
     if cgroup_enforced and cg_mem is not None:
         return cg_mem
     limits = [v for v in (parse_mem(os.environ.get("FRAMAC_JOB_MEM_MB")), cg_mem) if v]
@@ -1428,6 +1465,39 @@ def fuzz_workers(budget: Budget | None = None) -> int:
     b = budget or job_budget()
     by_mem = (b.mem_mb - FUZZ_WORKER_OVERHEAD_MB) // int(FUZZ_RSS_LIMIT_MB * 1.25)
     return max(1, min(b.cpus, by_mem))
+
+
+def fuzz_worker_mem_mb(peak_rss_mb: float | None = None) -> int:
+    """Per-worker memory reservation (MiB) from measured libFuzzer peak RSS (P7b)."""
+    if peak_rss_mb is None or peak_rss_mb <= 0:
+        return int(FUZZ_RSS_LIMIT_MB * 1.25)
+    return max(FUZZ_RSS_WORKER_FLOOR_MB, int(math.ceil(FUZZ_RSS_SAFETY_MARGIN * float(peak_rss_mb))))
+
+
+def fuzz_workers_from_rss(
+    budget: Budget | None = None,
+    peak_rss_mb: float | None = None,
+    cushion_mb: int = FUZZ_SPIKE_CUSHION_MB,
+) -> int:
+    """
+    LibFuzzer workers sized from measured per-worker peak RSS plus a container spike cushion (P7b/P7c).
+    Reserves max(512 MiB, ceil(1.5 * peak_rss_mb)) per worker (or the unmeasured 2560 MiB/worker
+    fallback when peak_rss_mb is None or <= 0), keeping FUZZ_WORKER_OVERHEAD_MB + cushion_mb
+    unallocated so a single worker spiking toward -rss_limit_mb=2048 stays within container memory.max.
+    """
+    b = budget or job_budget()
+    per_worker = fuzz_worker_mem_mb(peak_rss_mb)
+    cushion = max(0, int(cushion_mb))
+    usable = b.mem_mb - FUZZ_WORKER_OVERHEAD_MB - cushion
+    by_mem = usable // per_worker
+    return max(1, min(b.cpus, by_mem))
+
+
+def fuzz_explore_judge_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """True when FRAMAC_FUZZ_EXPLORE_JUDGE enables the P2/P7f explore/judge split (default off)."""
+    src = os.environ if env is None else env
+    raw = (src.get("FRAMAC_FUZZ_EXPLORE_JUDGE") or "").strip().lower()
+    return raw in ("on", "1", "true", "yes")
 
 
 def pool_budget() -> Budget:
