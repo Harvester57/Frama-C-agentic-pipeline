@@ -88,6 +88,8 @@ services:
       - FRAMAC_HARNESS_SMOKE
       - FRAMAC_FUZZ_EXPLORE_JUDGE
       - FRAMAC_VERIFIER_BREAKER
+      - FRAMAC_JUDGE_FRONTIER
+      - FRAMAC_FUZZ_PLATEAU_STOP
       - FRAMAC_RESOURCES_VERBOSE
     volumes:
       - ${TARGET_REPO_PATH:?set TARGET_REPO_PATH to the target repository}:/target:ro
