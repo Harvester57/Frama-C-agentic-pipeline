@@ -76,6 +76,8 @@
         "calls": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 2},
         "slots": {"type": "array", "items": {"$ref": "#/definitions/slot"}},
         "rest": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/rest"}]},
+        "entry": {"$comment": "a stateful case (api_harness.stateful_prefixes): the DAG key of the API entry point its last call is, which a fresh context only takes to an error path; the calls before it set up the state it needs. A sequence replayed from a recorded chain has none.", "type": "string", "minLength": 1},
+        "state": {"$comment": "where a stateful case's calls before its entry point come from: `recorded` (what the target's tests called on the same object first) or `model` (the paired opener, then data calls)", "type": "string", "enum": ["recorded", "model"]},
         "inits": {"type": "array", "items": {"$ref": "#/definitions/init"}},
         "notes": {"$comment": "arguments the generator zeroed instead of reading from the input, and why", "$ref": "#/definitions/strings"},
         "schema_instance": {"$comment": "S3 const global schema instance bound to a trusted parameter in this case (FRAMAC_API_TRUST_SCHEMA)", "type": "string", "minLength": 1},
