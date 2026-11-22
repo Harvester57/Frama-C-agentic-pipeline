@@ -39,6 +39,58 @@
             "required": ["count", "functions"],
             "additionalProperties": false
           },
+          "threat_model_coverage": {
+            "$comment": "W1-E: threat-model input-source execution summary, unexecuted api_auto_exempt functions grouped by reason, and per-.c-file region coverage for untrusted files (flagging < 50%)",
+            "type": "object",
+            "properties": {
+              "input_sources_total": {"type": "integer", "minimum": 0},
+              "executed": {"type": "integer", "minimum": 0},
+              "unexecuted_total": {"type": "integer", "minimum": 0},
+              "auto_exempt_by_reason": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "count": {"type": "integer", "minimum": 1},
+                    "functions": {
+                      "type": "array",
+                      "maxItems": 10,
+                      "items": {"type": "string", "minLength": 1}
+                    }
+                  },
+                  "required": ["count", "functions"],
+                  "additionalProperties": false
+                }
+              },
+              "untrusted_files": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "file": {"type": "string", "minLength": 1},
+                    "covered": {"type": "integer", "minimum": 0},
+                    "total": {"type": "integer", "minimum": 0},
+                    "pct": {"type": "number", "minimum": 0, "maximum": 100},
+                    "zero_exec_functions": {
+                      "type": "array",
+                      "items": {"type": "string", "minLength": 1}
+                    },
+                    "below_threshold": {"type": "boolean"}
+                  },
+                  "required": ["file", "covered", "total", "pct", "zero_exec_functions", "below_threshold"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "input_sources_total",
+              "executed",
+              "unexecuted_total",
+              "auto_exempt_by_reason",
+              "untrusted_files"
+            ],
+            "additionalProperties": false
+          },
           "measured_by": {"$comment": "`crashes` when the module had no usable coverage report and its reproducible fuzz crashes proved every entry point executed (run_dynamic); absent when the coverage report measured it", "const": "crashes"},
           "harness_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
         },
