@@ -715,17 +715,19 @@ def resolve_fc_stubs_dir() -> Path | None:
             try:
                 import ctypes
 
-                parts = list(local_dir.parts)
-                buf = ctypes.create_unicode_buffer(500)
-                short_parts: list[str] = [parts[0]]
-                cur = parts[0]
-                for part in parts[1:]:
-                    cur = os.path.join(cur, part)
-                    if " " in part:
-                        ctypes.windll.kernel32.GetShortPathNameW(cur, buf, 500)
-                        part = Path(buf.value).name
-                    short_parts.append(part)
-                return Path(*short_parts)
+                windll = getattr(ctypes, "windll", None)
+                if windll is not None:
+                    parts = list(local_dir.parts)
+                    buf = ctypes.create_unicode_buffer(500)
+                    short_parts: list[str] = [parts[0]]
+                    cur = parts[0]
+                    for part in parts[1:]:
+                        cur = os.path.join(cur, part)
+                        if " " in part:
+                            windll.kernel32.GetShortPathNameW(cur, buf, 500)
+                            part = Path(buf.value).name
+                        short_parts.append(part)
+                    return Path(*short_parts)
             except Exception:
                 pass
         return local_dir

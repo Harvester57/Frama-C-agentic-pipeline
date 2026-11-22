@@ -2668,7 +2668,8 @@ def _pid_is_alive(pid: int) -> bool:
         handle = kernel32.OpenProcess(process_query_limited_info, False, pid)
         if not handle:
             # ERROR_ACCESS_DENIED (5): process exists, caller lacks permission to query it.
-            return int(ctypes.get_last_error()) == 5
+            get_last_error = getattr(ctypes, "get_last_error", None)
+            return get_last_error is not None and int(get_last_error()) == 5
         try:
             exit_code = ctypes.c_ulong()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
