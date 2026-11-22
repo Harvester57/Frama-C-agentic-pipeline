@@ -23,11 +23,12 @@
         "entry": {"type": ["string", "null"]},
         "status": {"type": "string", "enum": ["passed", "quarantined", "candidate_warning"]},
         "probes_run": {"type": "integer", "minimum": 0},
+        "engine": {"type": ["string", "null"], "enum": ["sanitizers", "eacsl", null]},
         "classification": {
           "type": ["string", "null"],
           "enum": ["harness_setup_fault", "empty_input_candidate", "target_crash_candidate", "startup_error", null]
         },
-        "probe_kind": {"type": ["string", "null"], "enum": ["empty", "zero64", "seed", null]},
+        "probe_kind": {"type": ["string", "null"], "enum": ["empty", "zero64", "exact_slots", "seed", null]},
         "payload_len": {"type": ["integer", "null"], "minimum": 0},
         "kind": {"type": ["string", "null"]},
         "fingerprint": {"type": ["string", "null"]},
@@ -49,6 +50,11 @@
     "entry_style": {"type": "string", "minLength": 1},
     "dispatch_case_count": {"type": "integer", "minimum": 0, "maximum": 4096},
     "status": {"type": "string", "enum": ["ok", "degraded", "startup_error", "failed"]},
+    "case_engines_checked": {
+      "type": "array",
+      "items": {"type": "string", "enum": ["sanitizers", "eacsl"]},
+      "uniqueItems": true
+    },
     "startup": {
       "type": "object",
       "properties": {

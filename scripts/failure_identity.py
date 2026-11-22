@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from acsl_ast import tokenize_c_acsl
 from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code
@@ -496,7 +498,9 @@ _EACSL_GEN_PREFIX = "__gen_e_acsl_"
 def _caller_of_eacsl_runtime(text: str) -> tuple[str, str]:
     """
     (function, `file:line`) of the first stack frame after the innermost E-ACSL runtime frame: the
-    target code that called the checked libc function. libFuzzer and libc frames come first in a
+    target code that called the checked libc function, or the harness fuzz entry itself
+    (`LLVMFuzzerTestOneInput` / `is_harness_fuzz_function`) when zero target frames sit between
+    the E-ACSL runtime and the harness entry point. libFuzzer and libc frames come first in a
     deadly-signal stack (`fuzzer::PrintStackTrace`, `raise`), so the first non-runtime frame is not it.
     The file is the instrumented source, whose line numbers mean nothing in the target's sources.
     """
@@ -511,11 +515,16 @@ def _caller_of_eacsl_runtime(text: str) -> tuple[str, str]:
     if last_rt < 0:
         return "", ""
     for m in frames[last_rt + 1 :]:
-        fn = m.group("function")
-        if is_runtime_function(fn, m.group("file")) or is_harness_fuzz_function(fn):
+        fn, fpath = m.group("function"), m.group("file")
+        if is_runtime_function(fn, fpath):
             continue
-        where = f"{m.group('file')}:{m.group('line')}" if m.group("file") and m.group("line") else ""
-        return fn.removeprefix(_EACSL_GEN_PREFIX), where
+        cleaned = fn.removeprefix(_EACSL_GEN_PREFIX)
+        where = f"{fpath}:{m.group('line')}" if fpath and m.group("line") else ""
+        if is_harness_fuzz_function(cleaned):
+            return cleaned, where
+        if fn in _PROCESS_FRAME_FNS and (not fpath or fn != "main"):
+            continue
+        return cleaned, where
     return "", ""
 
 
@@ -524,7 +533,8 @@ def _parse_libc_failure(text: str) -> dict | None:
     A report of E-ACSL's libc replacements or format-string checks. It has no location: `file` is
     `unknown` and `line` 0, so the campaign replays the input on its sanitizer build for one (ASan
     locates the memory errors, not the format errors). `function` is the caller found in the stack,
-    when libFuzzer printed one.
+    when libFuzzer printed one. When triggered directly from `LLVMFuzzerTestOneInput` (zero target
+    frames between E-ACSL runtime and harness entry), sets `harness_self_fault: True`.
     """
     best: tuple[int, re.Match[str], str | None, str, str] | None = None
     for rx, alarm, kind, stable in _LIBC_TEMPLATES:
@@ -552,6 +562,8 @@ def _parse_libc_failure(text: str) -> dict | None:
     }
     if where:
         res["instrumented_location"] = where
+    if function and is_harness_fuzz_function(function):
+        res["harness_self_fault"] = True
     if frozenset((groups.get("exp", ""), groups.get("act", ""))) in _SIGNEDNESS_PAIRS:
         # A signed/unsigned pair of one rank. The patched runtime (EACSL_FORMAT_RUNTIME_PATCH) lets it
         # through when the value fits both types, so this abort means it did not (a negative int for %u),
@@ -1202,6 +1214,8 @@ def parse_eacsl_resource_abort(text: str) -> dict | None:
     if resource is None:
         return None
     caller, _ = _caller_of_eacsl_runtime(text)
+    if caller and (is_harness_fuzz_function(caller) or caller in _PROCESS_FRAME_FNS):
+        caller = ""
     if not caller:
         # Runtime frames named by function only (`unsafe_malloc`, `malloc` in the runtime's files).
         for m in frames:
@@ -1337,9 +1351,33 @@ _SIGNAL_OR_ABORT_FRAMES = frozenset(
         "__pthread_kill_implementation",
         "pthread_kill",
         "private_abort",
+        "private_abort_fail",
         "raise_abort",
         "vabort",
         "private_assert_fail",
+    }
+)
+
+_PURE_HARNESS_LIBC_FNS = frozenset(
+    {
+        "memcpy",
+        "memmove",
+        "memset",
+        "memcmp",
+        "strlen",
+        "strnlen",
+        "strcpy",
+        "strncpy",
+        "strcat",
+        "strncat",
+        "strcmp",
+        "strncmp",
+        "strdup",
+        "strndup",
+        "free",
+        "malloc",
+        "calloc",
+        "realloc",
     }
 )
 
@@ -1552,6 +1590,48 @@ def _is_harness_stack_overflow(kind: str, pred: str, replay_log: str) -> bool:
     return bool(_HARNESS_STACK_VAR_RE.search(replay_log) or _HARNESS_STACK_VAR_RE.search(pred))
 
 
+def _frame_fn_and_file(frame: Any) -> tuple[str, str]:
+    if isinstance(frame, dict):
+        return str(frame.get("function") or ""), str(frame.get("file") or "")
+    if isinstance(frame, re.Match):
+        return str(frame.group("function") or ""), str(frame.group("file") or "")
+    return "", ""
+
+
+def is_pure_harness_crash(
+    failure: dict[str, Any] | None,
+    frames: Sequence[dict[str, Any] | re.Match[str]] | None = None,
+) -> bool:
+    """
+    True when `failure` attributes the crash directly to `LLVMFuzzerTestOneInput` (or another
+    `is_harness_fuzz_function`) and the parsed stack frames between the sanitizer/E-ACSL runtime
+    and `LLVMFuzzerTestOneInput` contain zero target functions.
+    """
+    if not isinstance(failure, dict):
+        return False
+    fn = str(failure.get("function") or "").strip()
+    if not fn or not is_harness_fuzz_function(fn):
+        return False
+    for frame in frames or ():
+        frame_fn, frame_file = _frame_fn_and_file(frame)
+        if not frame_fn:
+            continue
+        cleaned = frame_fn.removeprefix(_EACSL_GEN_PREFIX)
+        if is_harness_fuzz_function(cleaned):
+            break
+        if (
+            "::" in frame_fn
+            or is_runtime_function(frame_fn, frame_file)
+            or frame_fn in _SIGNAL_OR_ABORT_FRAMES
+            or (frame_fn in _PROCESS_FRAME_FNS and (not frame_file or frame_fn != "main"))
+            or (not frame_file and frame_fn in _PURE_HARNESS_LIBC_FNS)
+            or (bool(frame_file) and Path(frame_file).name.startswith("harness_"))
+        ):
+            continue
+        return False
+    return True
+
+
 def _is_harness_site(failure: dict | None) -> bool:
     if not isinstance(failure, dict):
         return False
@@ -1615,7 +1695,7 @@ def classify_smoke_failure(failure: dict | None, payload_len: int, replay_log: s
     ):
         return "harness_setup_fault"
 
-    if _is_harness_site(eff_failure):
+    if is_pure_harness_crash(eff_failure, stack_frames(replay_log)) or _is_harness_site(eff_failure):
         return "harness_setup_fault"
 
     is_arith_or_buf = alarm in _ARITH_OR_BUFFER_ALARMS or any(bk in kind for bk in _BUFFER_OVERFLOW_KINDS)
