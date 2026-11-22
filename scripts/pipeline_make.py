@@ -1841,7 +1841,7 @@ def _stage(target: str, *, legacy: bool = False) -> int | None:
         return None
     kind, _ = split
     if kind == "module":
-        return table["build"] if legacy else table["eva"]
+        return table["build"] if legacy else table["ingest"]
     return table.get(kind)
 
 
@@ -1918,7 +1918,7 @@ def _node_deps(node: str, plan: Plan) -> list[str]:
     if kind == "module":
         deps: list[str] = []
         if mod in plan.fuzz_modules:
-            if fuzz_explore_judge_enabled():
+            if fuzz_explore_judge_enabled() or harness_smoke_enabled():
                 deps.append(f"build-{mod}")
             if harness_smoke_enabled():
                 deps.append(f"smoke-{mod}")
@@ -2188,11 +2188,25 @@ def run_targets(
             for t in targets
         )
     )
+    expanded_module_targets: set[str] = set()
+    if not use_legacy_stages and any((sp := _split_module_target(t)) is not None and sp[0] == "module" for t in targets):
+        expand_plan = build_plan(run_dir, templates_dir)
+        expanded: list[str] = []
+        for t in targets:
+            sp = _split_module_target(t)
+            if sp is not None and sp[0] == "module" and _target_problem(t, expand_plan) is None:
+                expanded.extend(_node_deps(t, expand_plan))
+                expanded.append(t)
+                expanded_module_targets.add(t)
+            else:
+                expanded.append(t)
+        targets = list(dict.fromkeys(expanded))
     stamp = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}"
     log_rel = f"{LOG_DIR}/run-{stamp}.log"
     (run_dir / LOG_DIR).mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     summary: dict = {"ok": True, "targets": {}, "stages": [], "jobs": jobs, "log": log_rel}
+    prior_failed: set[str] = set()
     with contextlib.ExitStack() as stack:
         priv_dir: Path | None = None
         priv_makefile: Path | None = None
@@ -2220,6 +2234,9 @@ def run_targets(
             outputs = {n: _node_output(n, plan) for n in nodes}
             before = {out: _output_state(run_dir, out) for out in outputs.values() if out}
             eff_makefile = str(priv_makefile) if priv_makefile is not None else MAKEFILE
+            make_vars = [f"S={SCRIPTS_DIR.as_posix()}"]
+            if any(t in expanded_module_targets for t in runnable):
+                make_vars.append("MODULE_STAGES_DONE=1")
             cmd = [
                 make_bin,
                 "-f",
@@ -2227,7 +2244,7 @@ def run_targets(
                 f"-j{jobs}",
                 "-k",
                 "--output-sync=target",
-                f"S={SCRIPTS_DIR.as_posix()}",
+                *make_vars,
                 *runnable,
             ]
             rc, failed, tail = _run_stage(make_runner, cmd, run_dir, log)
@@ -2238,11 +2255,12 @@ def run_targets(
                 stage_info["log_tail"] = tail
                 summary["ok"] = False
             summary["stages"].append(stage_info)
+            all_failed = prior_failed | failed
             cache: dict[str, str] = {}
             for target in runnable:
                 entries = {}
                 for node in _target_nodes(target, plan):
-                    info: dict = {"status": _node_status(node, plan, run_dir, failed, cache)}
+                    info: dict = {"status": _node_status(node, plan, run_dir, all_failed, cache)}
                     out = outputs.get(node) or _node_output(node, plan)
                     if out:
                         after = _output_state(run_dir, out)
@@ -2252,10 +2270,11 @@ def run_targets(
                         info.update(_report_brief(run_dir / out))
                     entries[node] = info
                 bad = sorted(n for n, e in entries.items() if e["status"] in ("failed", "skipped"))
-                result: dict = {"status": "failed" if bad or target in failed else "ok", "nodes": entries}
+                result: dict = {"status": "failed" if bad or target in all_failed else "ok", "nodes": entries}
                 if not entries:
                     result["note"] = "no runnable module"
                 summary["targets"][target] = result
+            prior_failed.update(failed)
     summary["elapsed_s"] = round(time.monotonic() - started, 1)
     summary["ok"] = summary["ok"] and all(t.get("status") == "ok" for t in summary["targets"].values())
     try:

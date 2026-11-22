@@ -143,18 +143,23 @@ seeds:
 	-for m in $(FUZZ_MODULES); do $(RUN) --class light --key seeds -- $(PY) $(S)/fuzz_assets.py write --module $$m || true; done
 
 # Standalone harness smoke gate (P3): validates compiled fuzz binaries before fuzzing and Eva,
-# quarantining unambiguous harness setup faults and recording the gate stamp.
+# quarantining unambiguous harness setup faults and recording the gate stamp (even on startup_error
+# or failed exit, so a failing smoke run overwrites any prior passing stamp before Make fails).
 smoke: $(SMOKE_TARGETS)
 $(SMOKE_TARGETS): smoke-%:
 	$(GATE) --module $* --need reach
-	$(RUN) --class replay --key $*:smoke --output workspace/reports/smoke/$*.json -- \
-		$(PY) $(S)/harness_smoke.py run --module $* \
-		--build-json workspace/build/$*.build.json \
-		--sidecar workspace/harnesses/harness_$*.json \
-		--seeds-dir workspace/seeds/$* \
-		--out-json workspace/reports/smoke/$*.json
-	$(RUN) --class light --key $*:smoke -- $(PY) $(S)/phase0_gates.py record-smoke \
-		--module $* --report workspace/reports/smoke/$*.json
+	rm -f workspace/reports/smoke/$*.json; rc=0; \
+		$(RUN) --class replay --key $*:smoke -- \
+			$(PY) $(S)/harness_smoke.py run --module $* \
+			--build-json workspace/build/$*.build.json \
+			--sidecar workspace/harnesses/harness_$*.json \
+			--seeds-dir workspace/seeds/$* \
+			--out-json workspace/reports/smoke/$*.json || rc=$$?; \
+		if [ -f workspace/reports/smoke/$*.json ]; then \
+			$(RUN) --class light --key $*:smoke -- $(PY) $(S)/phase0_gates.py record-smoke \
+				--module $* --report workspace/reports/smoke/$*.json || { r2=$$?; [ $$rc -eq 0 ] && rc=$$r2; }; \
+		fi; \
+		exit $$rc
 
 # One campaign per module. Its effort is a CPU-second budget spread over the workers the lease
 # allows (pipeline_make.py: per harness case, capped per unit and profile); FUZZ_MAX_TIME_<mod>
@@ -461,14 +466,25 @@ report:
 
 # module-<mod>: the module's own fuzz (with its build) and Eva targets, then ingestion of its
 # reports only, then its facts from the new Eva report. Under FUZZ_EXPLORE_JUDGE / HARNESS_SMOKE,
-# also pulls in build/smoke/judge (and deep eacsl-fuzz).
+# pipeline_make.py run module-<mod> executes each per-module stage in strict pipeline order
+# (passing MODULE_STAGES_DONE=1 for the final ingest+facts step), while direct `make module-<mod>`
+# runs the same per-module stages sequentially via recursive $(MAKE) so build/smoke/fuzz/judge/
+# eacsl-fuzz/eva never run out of order or concurrently.
+ifndef MODULE_STAGES_DONE
+ifeq ($(or $(HARNESS_SMOKE),$(FUZZ_EXPLORE_JUDGE)),)
 $(foreach m,$(MODULES),$(eval module-$(m): $(filter fuzz-$(m) eva-$(m),$(FUZZ_TARGETS) $(EVA_TARGETS))))
-ifdef FUZZ_EXPLORE_JUDGE
-$(foreach m,$(FUZZ_MODULES),$(eval module-$(m): build-$(m) judge-$(m)$(if $(filter deep,$(PROFILE)), eacsl-fuzz-$(m))))
 endif
-ifdef HARNESS_SMOKE
-$(foreach m,$(FUZZ_MODULES),$(eval module-$(m): smoke-$(m)))
 endif
 $(MODULE_TARGETS): module-%:
+ifneq ($(or $(HARNESS_SMOKE),$(FUZZ_EXPLORE_JUDGE)),)
+ifndef MODULE_STAGES_DONE
+	$(if $(filter $*,$(FUZZ_MODULES)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" build-$*)
+	$(if $(filter $*,$(FUZZ_MODULES)),$(if $(HARNESS_SMOKE),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" smoke-$*))
+	$(if $(filter $*,$(FUZZ_MODULES)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" fuzz-$*)
+	$(if $(filter $*,$(FUZZ_MODULES)),$(if $(FUZZ_EXPLORE_JUDGE),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" judge-$*))
+	$(if $(filter $*,$(FUZZ_MODULES)),$(if $(FUZZ_EXPLORE_JUDGE),$(if $(filter deep,$(PROFILE)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" eacsl-fuzz-$*)))
+	$(if $(filter $*,$(EVA_MODULES)),$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" S="$(S)" eva-$*)
+endif
+endif
 	$(RUN) --class light --key ingest -- $(PM) ingest --module $*
 	$(call FACTS_RECIPE,$*)

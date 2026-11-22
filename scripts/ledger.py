@@ -2726,32 +2726,186 @@ def cmd_ingest_fuzz(paths: list[Path], judge_reports: list[Path] | None = None) 
             ingested_modules.append(module)
             executions, unmeasured = _fuzz_coverage_executions(module)
             ev_details = {"module": module, "step": step} if step != "campaign" else None
+            smoke_skipped = _smoke_quarantined_cases(module, report)
+            judge_skipped = {
+                int(c)
+                for c in (report.get("judge_skipped_cases") or [])
+                if isinstance(c, int) and not isinstance(c, bool) and c >= 0
+            }
+            skipped_cases = smoke_skipped | judge_skipped
+            reaching_cases = _dispatch_reaching_cases(module, mm.dag) if skipped_cases else {}
             for u in mod_units:
-                if executions is None:
-                    add_evidence(
-                        u,
-                        "fuzz",
-                        "run_eacsl_fuzz.py",
-                        "fuzz_clean",
-                        False,
-                        tool_output,
-                        f"{engine_note} campaign found no failure (not a proof). "
-                        f"Which functions ran was not measured ({unmeasured}).",
-                        ev_details,
-                    )
-                    continue
-                if executions.get((normalize_file(u["file"]), u["function"]), 0) == 0:
-                    add_evidence(
-                        u,
-                        "fuzz",
-                        "run_eacsl_fuzz.py",
-                        "fuzz_not_executed",
-                        False,
-                        tool_output,
-                        f"{engine_note} campaign: no replayed input executed this function (not evidence of anything).",
-                        ev_details,
-                    )
-                    continue
+                fn_key = (normalize_file(u["file"]), u["function"])
+                if skipped_cases:
+                    if executions is None:
+                        if smoke_skipped:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "harness_smoke_quarantined",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped smoke-quarantined case(s) {sorted(smoke_skipped)} "
+                                f"and dynamic function execution was not measured ({unmeasured}); "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "quarantined_cases": sorted(smoke_skipped),
+                                    **({"judge_skipped_cases": sorted(judge_skipped)} if judge_skipped else {}),
+                                },
+                            )
+                        else:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "fuzz_not_judged",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped judge-skipped case(s) {sorted(judge_skipped)} "
+                                f"and dynamic function execution was not measured ({unmeasured}); "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "judge_skipped_cases": sorted(judge_skipped),
+                                },
+                            )
+                        continue
+                    fn_cases = reaching_cases.get(fn_key) or reaching_cases.get(("", u["function"])) or set()
+                    if executions.get(fn_key, 0) == 0:
+                        hit_quarantined = sorted(fn_cases & smoke_skipped)
+                        if hit_quarantined:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "harness_smoke_quarantined",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped smoke-quarantined reaching case(s) {hit_quarantined} "
+                                "and no replayed input executed this function; fuzz_clean not granted.",
+                                {"module": module, "step": step, "quarantined_cases": hit_quarantined},
+                            )
+                            continue
+                        hit_judge_skipped = sorted(fn_cases & judge_skipped)
+                        if hit_judge_skipped:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "fuzz_not_judged",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped judge-skipped reaching case(s) {hit_judge_skipped} "
+                                "and no replayed input executed this function; fuzz_clean not granted.",
+                                {"module": module, "step": step, "judge_skipped_cases": hit_judge_skipped},
+                            )
+                            continue
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_not_executed",
+                            False,
+                            tool_output,
+                            f"{engine_note} campaign: no replayed input executed this function (not evidence of anything).",
+                            ev_details,
+                        )
+                        continue
+                    if not fn_cases:
+                        if smoke_skipped:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "harness_smoke_quarantined",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped smoke-quarantined case(s) {sorted(smoke_skipped)} "
+                                f"and reaching cases for {u['function']} could not be isolated; "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "quarantined_cases": sorted(smoke_skipped),
+                                    **({"judge_skipped_cases": sorted(judge_skipped)} if judge_skipped else {}),
+                                },
+                            )
+                        else:
+                            add_evidence(
+                                u,
+                                "fuzz",
+                                "run_eacsl_fuzz.py",
+                                "fuzz_not_judged",
+                                False,
+                                tool_output,
+                                f"{engine_note} campaign skipped judge-skipped case(s) {sorted(judge_skipped)} "
+                                f"and reaching cases for {u['function']} could not be isolated; "
+                                "fuzz_clean not granted.",
+                                {
+                                    "module": module,
+                                    "step": step,
+                                    "judge_skipped_cases": sorted(judge_skipped),
+                                },
+                            )
+                        continue
+                    hit_quarantined = sorted(fn_cases & smoke_skipped)
+                    if hit_quarantined:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "harness_smoke_quarantined",
+                            False,
+                            tool_output,
+                            f"Reaching case(s) {hit_quarantined} were quarantined by smoke gate; "
+                            "fuzz_clean not granted.",
+                            {"module": module, "step": step, "quarantined_cases": hit_quarantined},
+                        )
+                        continue
+                    hit_judge_skipped = sorted(fn_cases & judge_skipped)
+                    if hit_judge_skipped:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_not_judged",
+                            False,
+                            tool_output,
+                            f"Reaching case(s) {hit_judge_skipped} were skipped after judge failure/blinding; "
+                            "fuzz_clean not granted.",
+                            {"module": module, "step": step, "judge_skipped_cases": hit_judge_skipped},
+                        )
+                        continue
+                else:
+                    if executions is None:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_clean",
+                            False,
+                            tool_output,
+                            f"{engine_note} campaign found no failure (not a proof). "
+                            f"Which functions ran was not measured ({unmeasured}).",
+                            ev_details,
+                        )
+                        continue
+                    if executions.get(fn_key, 0) == 0:
+                        add_evidence(
+                            u,
+                            "fuzz",
+                            "run_eacsl_fuzz.py",
+                            "fuzz_not_executed",
+                            False,
+                            tool_output,
+                            f"{engine_note} campaign: no replayed input executed this function (not evidence of anything).",
+                            ev_details,
+                        )
+                        continue
                 add_evidence(
                     u,
                     "fuzz",

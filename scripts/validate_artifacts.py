@@ -972,6 +972,7 @@ TRACES_JSONL = "workspace/seed_records/traces.jsonl"
 SMOKE_REPORTS_DIR = f"{REPORTS}/smoke"
 JUDGE_REPORTS_DIR = f"{REPORTS}/judge"
 FUZZ_REPORTS_DIR = f"{REPORTS}/fuzz"
+EACSL_FUZZ_REPORTS_DIR = f"{REPORTS}/eacsl-fuzz"
 PHASE0_ARTIFACTS: tuple[tuple[str, Any], ...] = (
     (f"{REPORTS}/build_capture.json", validate_build_capture),
     (f"{REPORTS}/phase0_model.json", validate_phase0_model),
@@ -1090,9 +1091,10 @@ def validate_phase0_artifacts(run_dir: Path) -> Errors:
 def validate_phase1_reports(run_dir: Path) -> Errors:
     """
     Validate Phase 1 smoke (`workspace/reports/smoke/*.json`), judge (`workspace/reports/judge/*.json`),
-    and campaign/eacsl-fuzz (`workspace/reports/fuzz/*.json` carrying `mode in ("campaign", "eacsl-fuzz")`)
-    reports present in `run_dir`. Legacy dummy fuzz stubs without `mode` and replay reports are left
-    untouched to keep existing fixtures backwards compatible.
+    campaign (`workspace/reports/fuzz/*.json` carrying `mode in ("campaign", "eacsl-fuzz")`), and
+    deep `eacsl-fuzz` (`workspace/reports/eacsl-fuzz/*.json`) reports present in `run_dir`. Legacy
+    dummy fuzz stubs without `mode` and replay reports are left untouched to keep existing fixtures
+    backwards compatible.
     """
     errors = Errors()
     smoke_dir = run_dir / SMOKE_REPORTS_DIR
@@ -1131,6 +1133,17 @@ def validate_phase1_reports(run_dir: Path) -> Errors:
         ):
             for e in validate_fuzz_report(data):
                 errors.add(f"{rel}: {e}")
+
+    eacsl_fuzz_dir = run_dir / EACSL_FUZZ_REPORTS_DIR
+    for path in sorted(eacsl_fuzz_dir.glob("*.json")) if eacsl_fuzz_dir.is_dir() else []:
+        rel = f"{EACSL_FUZZ_REPORTS_DIR}/{path.name}"
+        try:
+            data = load_json_strict(path)
+        except ArtifactError as exc:
+            errors.add(f"{rel}: {exc}")
+            continue
+        for e in validate_fuzz_report(data):
+            errors.add(f"{rel}: {e}")
     return errors
 
 

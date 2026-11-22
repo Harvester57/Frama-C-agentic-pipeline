@@ -506,3 +506,120 @@ def test_params_set_fuzz_engine_eacsl_emits_dual_engine_warning(tmp_path, capsys
     assert captured_auto.err == ""
     payload_auto = json.loads(captured_auto.out)
     assert not any("--fuzz-engine auto" in w for w in payload_auto["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# 5. Wave 5 regression tests: module-<mod> ordering & smoke-% record-smoke
+# ---------------------------------------------------------------------------
+
+
+def test_run_targets_module_target_orders_stages_strictly_under_flags(tmp_path, monkeypatch):
+    # Deep profile + both flags: build -> smoke -> fuzz -> judge -> eacsl-fuzz -> eva -> module (ingest+facts).
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "on")
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "on")
+    run_deep = _make_run(tmp_path / "deep", profile="deep")
+    pm.generate(run_deep, templates_dir=ACSL)
+    fake_deep = _FakeMake()
+    rc, out = pm.run_targets(["module-mod_a"], run_deep, jobs=4, make_runner=fake_deep, templates_dir=ACSL)
+    assert rc == 0 and out["ok"] is True
+    assert [c[7:] for c in fake_deep.calls] == [
+        ["build-mod_a"],
+        ["smoke-mod_a"],
+        ["fuzz-mod_a"],
+        ["judge-mod_a"],
+        ["eacsl-fuzz-mod_a"],
+        ["eva-mod_a"],
+        ["MODULE_STAGES_DONE=1", "module-mod_a"],
+    ]
+
+    # Standard profile + HARNESS_SMOKE only: build -> smoke -> fuzz -> eva -> module.
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "on")
+    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    run_smoke = _make_run(tmp_path / "smoke_only", profile="standard")
+    pm.generate(run_smoke, templates_dir=ACSL)
+    fake_smoke = _FakeMake()
+    rc_s, out_s = pm.run_targets(["module-mod_a"], run_smoke, jobs=2, make_runner=fake_smoke, templates_dir=ACSL)
+    assert rc_s == 0 and out_s["ok"] is True
+    assert [c[7:] for c in fake_smoke.calls] == [
+        ["build-mod_a"],
+        ["smoke-mod_a"],
+        ["fuzz-mod_a"],
+        ["eva-mod_a"],
+        ["MODULE_STAGES_DONE=1", "module-mod_a"],
+    ]
+
+    # Standard profile + FUZZ_EXPLORE_JUDGE only: build -> fuzz -> judge -> eva -> module.
+    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "on")
+    run_ej = _make_run(tmp_path / "ej_only", profile="standard")
+    pm.generate(run_ej, templates_dir=ACSL)
+    fake_ej = _FakeMake()
+    rc_e, out_e = pm.run_targets(["module-mod_a"], run_ej, jobs=2, make_runner=fake_ej, templates_dir=ACSL)
+    assert rc_e == 0 and out_e["ok"] is True
+    assert [c[7:] for c in fake_ej.calls] == [
+        ["build-mod_a"],
+        ["fuzz-mod_a"],
+        ["judge-mod_a"],
+        ["eva-mod_a"],
+        ["MODULE_STAGES_DONE=1", "module-mod_a"],
+    ]
+
+    # Failure in an earlier expanded stage (smoke-mod_a) propagates to module-mod_a.
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "on")
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "on")
+    fake_fail = _FakeMake(failing={"smoke-mod_a": 1})
+    rc_f, out_f = pm.run_targets(["module-mod_a"], run_deep, jobs=2, make_runner=fake_fail, templates_dir=ACSL)
+    assert rc_f == 1 and out_f["ok"] is False
+    assert out_f["targets"]["smoke-mod_a"]["status"] == "failed"
+    assert out_f["targets"]["module-mod_a"]["status"] == "failed"
+
+    # Legacy flags off: single-stage module-mod_a invocation preserved unchanged.
+    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
+    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    run_leg = _make_run(tmp_path / "legacy", profile="standard")
+    pm.generate(run_leg, templates_dir=ACSL)
+    fake_leg = _FakeMake()
+    rc_l, out_l = pm.run_targets(["module-mod_a"], run_leg, jobs=2, make_runner=fake_leg, templates_dir=ACSL)
+    assert rc_l == 0 and out_l["ok"] is True
+    assert [c[7:] for c in fake_leg.calls] == [["module-mod_a"]]
+
+
+def test_pipeline_mk_module_target_orders_direct_make_and_smoke_records_on_failure():
+    mk = PIPELINE_MK.read_text(encoding="utf-8")
+
+    # BLOCKER-3: direct `make module-<m>` under HARNESS_SMOKE/FUZZ_EXPLORE_JUDGE runs stages sequentially via $(MAKE).
+    mod_rule = makefile_rule(mk, "$(MODULE_TARGETS)")
+    assert mod_rule.pattern == "module-%"
+    mod_text = "\n".join(mod_rule.recipe)
+    assert "build-$*" in mod_text
+    assert "smoke-$*" in mod_text
+    assert "fuzz-$*" in mod_text
+    assert "judge-$*" in mod_text
+    assert "eacsl-fuzz-$*" in mod_text
+    assert "eva-$*" in mod_text
+    assert "ingest --module $*" in mod_text
+    assert (
+        mod_text.index("build-$*")
+        < mod_text.index("smoke-$*")
+        < mod_text.index("fuzz-$*")
+        < mod_text.index("judge-$*")
+        < mod_text.index("eacsl-fuzz-$*")
+        < mod_text.index("eva-$*")
+        < mod_text.index("ingest --module $*")
+        < mod_text.index("$(call FACTS_RECIPE,$*)")
+    )
+    # Legacy flags=off prerequisite evaluation stays intact and guarded.
+    assert "ifeq ($(or $(HARNESS_SMOKE),$(FUZZ_EXPLORE_JUDGE)),)" in mk
+    assert "ifndef MODULE_STAGES_DONE" in mk
+
+    # MINOR-6: smoke-% captures exit code, records the smoke report even on non-zero exit, and propagates exit $$rc.
+    smoke_rule = makefile_rule(mk, "$(SMOKE_TARGETS)")
+    smoke_text = "\n".join(smoke_rule.recipe)
+    assert "--output workspace/reports/smoke/$*.json" not in smoke_text
+    assert "rm -f workspace/reports/smoke/$*.json" in smoke_text
+    assert "rc=0;" in smoke_text
+    assert "|| rc=$$?" in smoke_text
+    assert "if [ -f workspace/reports/smoke/$*.json ]; then" in smoke_text
+    assert "phase0_gates.py record-smoke --module $* --report workspace/reports/smoke/$*.json" in smoke_text
+    assert "exit $$rc" in smoke_text
+    assert smoke_text.index("harness_smoke.py run") < smoke_text.index("record-smoke") < smoke_text.index("exit $$rc")

@@ -571,7 +571,7 @@ def load_phase1_fuzz_reports(run_dir: Path) -> list[dict]:
     """
     Phase 1 Explore (`mode == "campaign"`, `discovering_step == "explore"` or P4 telemetry/blinding)
     and deep `eacsl-fuzz` (`mode == "eacsl-fuzz"` / `discovering_step == "eacsl_fuzz"`) reports from
-    `workspace/reports/fuzz/*.json` and `workspace/reports/eacsl_fuzz/*.json`. Returns `[]` on legacy
+    `workspace/reports/fuzz/*.json` and `workspace/reports/eacsl-fuzz/*.json`. Returns `[]` on legacy
     runs that have no Explore/Judge or telemetry data.
     """
     rdir = Path(run_dir)
@@ -579,7 +579,7 @@ def load_phase1_fuzz_reports(run_dir: Path) -> list[dict]:
         path.stem for path in (rdir / "workspace/reports/judge").glob("*.json")
     } if (rdir / "workspace/reports/judge").is_dir() else set()
     reports: list[dict] = []
-    for sub in ("workspace/reports/fuzz", "workspace/reports/eacsl_fuzz"):
+    for sub in ("workspace/reports/fuzz", "workspace/reports/eacsl-fuzz"):
         d = rdir / sub
         if not d.is_dir():
             continue

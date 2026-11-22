@@ -823,6 +823,186 @@ def test_validate_run_dir_passes_and_rejects_invalid_smoke_and_judge(tmp_path: P
     write_json(tmp_path / "workspace/reports/fuzz/snmp.json", {})
     assert list(V.validate_run_dir(tmp_path)) == []
 
+    # Deep eacsl-fuzz reports live under workspace/reports/eacsl-fuzz/ and are validated against fuzz_report.schema.json.
+    write_json(
+        tmp_path / "workspace/reports/eacsl-fuzz/snmp.json",
+        _valid_explore_report(
+            "snmp",
+            status="clean",
+            mode="eacsl-fuzz",
+            discovering_step="eacsl_fuzz",
+            engine_used="eacsl",
+            total_executions=1000,
+            max_cov=40,
+            unspent_budget_s=0.0,
+        ),
+    )
+    assert list(V.validate_run_dir(tmp_path)) == []
+
+    write_json(
+        tmp_path / "workspace/reports/eacsl-fuzz/snmp.json",
+        {"mode": "eacsl-fuzz", "module": "snmp", "status": "bogus"},
+    )
+    errs_ef = list(V.validate_run_dir(tmp_path))
+    assert any("workspace/reports/eacsl-fuzz/snmp.json" in e for e in errs_ef)
+
+
+def test_ingest_fuzz_clean_refuses_fuzz_clean_for_smoke_quarantined_cases(run_dir: Path) -> None:
+    seed(run_dir)
+    # 1) Without coverage (executions is None), smoke_skipped_cases must fail closed: NO fuzz_clean.
+    fuzz_path = run_dir / "workspace/reports/fuzz/snmp.json"
+    write_json(
+        fuzz_path,
+        {
+            **_valid_explore_report("snmp", status="clean"),
+            "smoke_skipped_cases": [0],
+        },
+    )
+    L.cmd_ingest_fuzz([fuzz_path])
+    units = units_by_id(run_dir)
+    for cid in (
+        "src/snmp/ber.c#ber_decode_len::rte",
+        "src/snmp/ber.c#ber_decode_tag::rte",
+        "src/snmp/pdu.c#snmp_parse_pdu::rte",
+    ):
+        results = [e["result"] for e in units[cid]["evidence"] if e["phase"] == "fuzz"]
+        assert results == ["harness_smoke_quarantined"], f"{cid} must not get fuzz_clean without coverage: {results}"
+
+    # 2) With dispatch sidecar + coverage: case 0 -> ber_decode_len (quarantined),
+    #    case 1 -> ber_decode_tag (healthy), snmp_parse_pdu (unisolatable -> fail closed).
+    write_json(
+        run_dir / "workspace/harnesses/harness_snmp.json",
+        {
+            "module": "snmp",
+            "harness_file": "workspace/harnesses/harness_snmp.c",
+            "sources": ["src/snmp/ber.c", "src/snmp/pdu.c"],
+            "cppflags": "",
+            "entry_fn": "LLVMFuzzerTestOneInput",
+            "entry_style": "dispatch",
+            "dispatch_case_count": 2,
+            "dispatch_cases": ["ber_decode_len(buf, len);", "ber_decode_tag(buf, len);"],
+            "api_harness": True,
+            "api_cases": [
+                {"selector": 0, "kind": "single", "calls": ["ber_decode_len"], "slots": [], "rest": None, "entry": "ber_decode_len"},
+                {"selector": 1, "kind": "single", "calls": ["ber_decode_tag"], "slots": [], "rest": None, "entry": "ber_decode_tag"},
+            ],
+        },
+    )
+    _write_coverage(
+        run_dir,
+        "snmp",
+        [
+            _cov_row("ber_decode_len", "src/snmp/ber.c", 5),
+            _cov_row("ber_decode_tag", "src/snmp/ber.c", 8),
+            _cov_row("snmp_parse_pdu", "src/snmp/pdu.c", 3),
+        ],
+    )
+    L.cmd_ingest_fuzz([fuzz_path])
+    units = units_by_id(run_dir)
+    assert [e["result"] for e in units["src/snmp/ber.c#ber_decode_tag::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "fuzz_clean"
+    ]
+    assert [e["result"] for e in units["src/snmp/ber.c#ber_decode_len::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "harness_smoke_quarantined"
+    ]
+    assert [e["result"] for e in units["src/snmp/pdu.c#snmp_parse_pdu::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "harness_smoke_quarantined"
+    ]
+
+    # 3) If quarantined case 0 had 0 executions in coverage, it still records harness_smoke_quarantined (never fuzz_clean).
+    _write_coverage(
+        run_dir,
+        "snmp",
+        [
+            _cov_row("ber_decode_len", "src/snmp/ber.c", 0),
+            _cov_row("ber_decode_tag", "src/snmp/ber.c", 8),
+            _cov_row("snmp_parse_pdu", "src/snmp/pdu.c", 0),
+        ],
+    )
+    L.cmd_ingest_fuzz([fuzz_path])
+    units = units_by_id(run_dir)
+    assert [e["result"] for e in units["src/snmp/ber.c#ber_decode_len::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "harness_smoke_quarantined"
+    ]
+    assert [e["result"] for e in units["src/snmp/ber.c#ber_decode_tag::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "fuzz_clean"
+    ]
+    assert [e["result"] for e in units["src/snmp/pdu.c#snmp_parse_pdu::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "fuzz_not_executed"
+    ]
+    assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
+
+def test_ingest_fuzz_clean_refuses_fuzz_clean_for_deep_eacsl_fuzz_judge_skipped_cases(run_dir: Path) -> None:
+    seed(run_dir)
+    ef_path = run_dir / "workspace/reports/eacsl-fuzz/snmp.json"
+    write_json(
+        ef_path,
+        {
+            **_valid_explore_report(
+                "snmp",
+                status="clean",
+                mode="eacsl-fuzz",
+                discovering_step="eacsl_fuzz",
+                engine_used="eacsl",
+            ),
+            "judge_skipped_cases": [0],
+        },
+    )
+
+    # 1) Without coverage (executions is None), judge_skipped_cases fails closed with fuzz_not_judged.
+    L.cmd_ingest_fuzz([ef_path])
+    units = units_by_id(run_dir)
+    for cid in (
+        "src/snmp/ber.c#ber_decode_len::rte",
+        "src/snmp/ber.c#ber_decode_tag::rte",
+        "src/snmp/pdu.c#snmp_parse_pdu::rte",
+    ):
+        results = [e["result"] for e in units[cid]["evidence"] if e["phase"] == "fuzz"]
+        assert results == ["fuzz_not_judged"], f"{cid} must not get fuzz_clean without coverage: {results}"
+
+    # 2) With dispatch sidecar + coverage: case 0 -> ber_decode_len (judge-skipped),
+    #    case 1 -> ber_decode_tag (healthy -> fuzz_clean), snmp_parse_pdu (unisolatable -> fuzz_not_judged).
+    write_json(
+        run_dir / "workspace/harnesses/harness_snmp.json",
+        {
+            "module": "snmp",
+            "harness_file": "workspace/harnesses/harness_snmp.c",
+            "sources": ["src/snmp/ber.c", "src/snmp/pdu.c"],
+            "cppflags": "",
+            "entry_fn": "LLVMFuzzerTestOneInput",
+            "entry_style": "dispatch",
+            "dispatch_case_count": 2,
+            "dispatch_cases": ["ber_decode_len(buf, len);", "ber_decode_tag(buf, len);"],
+            "api_harness": True,
+            "api_cases": [
+                {"selector": 0, "kind": "single", "calls": ["ber_decode_len"], "slots": [], "rest": None, "entry": "ber_decode_len"},
+                {"selector": 1, "kind": "single", "calls": ["ber_decode_tag"], "slots": [], "rest": None, "entry": "ber_decode_tag"},
+            ],
+        },
+    )
+    _write_coverage(
+        run_dir,
+        "snmp",
+        [
+            _cov_row("ber_decode_len", "src/snmp/ber.c", 5),
+            _cov_row("ber_decode_tag", "src/snmp/ber.c", 8),
+            _cov_row("snmp_parse_pdu", "src/snmp/pdu.c", 3),
+        ],
+    )
+    L.cmd_ingest_fuzz([ef_path])
+    units = units_by_id(run_dir)
+    assert [e["result"] for e in units["src/snmp/ber.c#ber_decode_tag::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "fuzz_clean"
+    ]
+    assert [e["result"] for e in units["src/snmp/ber.c#ber_decode_len::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "fuzz_not_judged"
+    ]
+    assert [e["result"] for e in units["src/snmp/pdu.c#snmp_parse_pdu::rte"]["evidence"] if e["phase"] == "fuzz"] == [
+        "fuzz_not_judged"
+    ]
+    assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []
+
 
 # ---------------------------------------------------------------------------
 # 5. generate_report.py: smoke gate, explore/judge/eacsl-fuzz, circuit breaker
@@ -875,7 +1055,7 @@ def test_generate_report_renders_new_sections_and_keeps_legacy_clean(tmp_path: P
         ),
     )
     write_json(
-        modern / "workspace/reports/eacsl_fuzz/snmp.json",
+        modern / "workspace/reports/eacsl-fuzz/snmp.json",
         _valid_explore_report(
             "snmp",
             status="clean",
