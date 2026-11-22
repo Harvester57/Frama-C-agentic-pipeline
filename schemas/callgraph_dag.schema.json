@@ -11,6 +11,7 @@
         "module": {"type": "string", "minLength": 1},
         "unit": {"type": "string", "minLength": 1},
         "kind": {"type": ["string", "null"]},
+        "unit_visibility": {"$comment": "External visibility class of a non-test link unit carried from phase0_model.json", "type": "string", "enum": ["executable", "plugin_so", "public_lib", "internal_convenience"]},
         "concurrent": {"type": "boolean"},
         "callgraph_fallback": {"$comment": "Frama-C's first error for a unit on the GCC fallback", "type": "string", "minLength": 1},
         "files": {"$ref": "#/definitions/strings"},
@@ -23,6 +24,9 @@
         "function_count": {"type": "integer", "minimum": 0},
         "functions": {"$ref": "#/definitions/keys"},
         "candidate_entry_points": {"$ref": "#/definitions/keys"},
+        "threat_model_entries": {"$comment": "FRAMAC_HARNESS_SCOPE_V2: unit functions explicitly listed in THREAT_MODEL.md input_sources", "$ref": "#/definitions/keys"},
+        "deferred_non_attacker_entries": {"$comment": "FRAMAC_HARNESS_SCOPE_V2: exported/vtable entries excluded from fuzzing by THREAT_MODEL.md trusted_callers or non-attacker role (kept in DAG/ledger for WP)", "$ref": "#/definitions/keys"},
+        "harness_scope_note": {"$comment": "FRAMAC_HARNESS_SCOPE_V2: why a unit has no direct harness entry points (e.g. internal_convenience_covered_by_consumers)", "type": "string", "minLength": 1},
         "lexer_modules": {"$ref": "#/definitions/strings"},
         "threat_model": {"type": ["string", "object", "null"]},
         "split": {
@@ -116,7 +120,13 @@
         "tier": {"type": "string", "minLength": 1},
         "tier_reasons": {"$ref": "#/definitions/strings"},
         "untrusted_path": {"type": "boolean"},
-        "trust": {"type": "object"},
+        "trust": {
+          "type": "object",
+          "properties": {
+            "input_role": {"type": ["string", "null"], "enum": ["entry", "reader", null]},
+            "attacker_params": {"type": ["array", "null"], "items": {"type": "string", "minLength": 1}}
+          }
+        },
         "wp_blockers": {"$ref": "#/definitions/strings"},
         "wp_notes": {"$ref": "#/definitions/strings"},
         "security_properties": {"type": "array", "items": {"type": "object"}}
@@ -186,6 +196,10 @@
           "name": {"type": "string"},
           "file": {"type": "string"},
           "static": {"type": "boolean"},
+          "type": {"type": "string"},
+          "const": {"type": "boolean"},
+          "has_init": {"type": "boolean"},
+          "raw_type": {"type": "string"},
           "size": {"type": ["integer", "null"], "minimum": 1},
           "compiled_in": {"$ref": "#/definitions/strings"},
           "init_functions": {"$ref": "#/definitions/keys"},

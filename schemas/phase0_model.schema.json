@@ -22,7 +22,9 @@
         "sources": {"type": "array", "items": {"type": "string", "enum": ["default", "call_graph", "threat_model", "codeql"]}},
         "boundary": {"type": "boolean"},
         "reasons": {"type": "array", "items": {"type": "string"}},
-        "overridden": {"$comment": "rules a threat-model trusted_callers decision overrode", "type": "array", "items": {"type": "string"}}
+        "overridden": {"$comment": "rules a threat-model trusted_callers decision overrode", "type": "array", "items": {"type": "string"}},
+        "input_role": {"$comment": "THREAT_MODEL.md input_sources role (`entry` or `reader`), or null", "type": ["string", "null"], "enum": ["entry", "reader", null]},
+        "attacker_params": {"$comment": "THREAT_MODEL.md input_sources parameter names carrying attacker data (null when all parameters carry attacker data)", "type": ["array", "null"], "items": {"type": "string", "minLength": 1}}
       },
       "required": ["value", "source", "sources", "boundary", "reasons"],
       "additionalProperties": false
