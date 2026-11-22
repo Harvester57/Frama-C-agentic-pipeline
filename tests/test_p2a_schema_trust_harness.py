@@ -1391,3 +1391,272 @@ def test_static_functions_recorded_in_api_auto_exempt(tmp_path: Path, monkeypatc
     assert "api_auto_exempt" not in sidecar_off
     assert "api_auto_exempt" not in res_off
     assert sidecar_off["api_skipped"]["pb_decode.c#buf_read"] == ah.STATIC_NOT_CALLABLE_REASON
+
+
+# ---------------------------------------------------------------------------
+# Trusted NUL-terminated string parameters (QCBOR run-1 `szLabel`)
+# ---------------------------------------------------------------------------
+
+
+def _cstring_fixture(
+    *,
+    label_type: str = "char const *",
+    label_kind: str = "const_pointer",
+    attacker: tuple[str, ...] = ("c", "out"),
+    label_sizes: dict[str, int] | None = None,
+    after_label: tuple[str, str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    """
+    A QCBOR-shaped map lookup `int lookup(struct ctx *c, const char *szLabel, int *out)` whose
+    threat-model `input_sources` entry lists only the context and the output (`params`): the label is
+    chosen by the application, so it is a trusted parameter, not attacker data. `after_label` adds a
+    scalar `(ctype, name)` between the label and `out` (QCBOR's `uint32_t uConvertTypes`).
+    """
+    extra_types = f"{after_label[0]}," if after_label else ""
+    extra_formals = [{"name": after_label[1], "kind": "value"}] if after_label else []
+    key = "lookup.c#lookup"
+    tm_block: dict[str, Any] = {
+        "status": "ok",
+        "input_sources": [
+            {"function": "lookup", "role": "entry", "params": list(attacker), "description": "map search by label"},
+        ],
+    }
+    rec: dict[str, Any] = {
+        "name": "lookup",
+        "file": "lookup.c",
+        "signature": f"int(struct ctx *,{label_type},{extra_types}int *)",
+        "formals": [
+            {"name": "c", "kind": "pointer"},
+            {"name": "szLabel", "kind": label_kind},
+            *extra_formals,
+            {"name": "out", "kind": "pointer"},
+        ],
+    }
+    if label_sizes is not None:
+        rec["param_sizes"] = {"1": label_sizes}
+    dag: dict[str, Any] = {
+        "module_kind": "link_unit",
+        "trust": {"threat_model": tm_block},
+        "modules": {"qcbor": {"candidate_entry_points": [key], "functions": [key], "files": ["lookup.c"]}},
+        "functions": {key: {"name": "lookup", "file": "lookup.c", "is_static": False, "module": "qcbor"}},
+        "global_variables": {},
+    }
+    model: dict[str, Any] = {
+        "status": "ok",
+        "trust": {"threat_model": tm_block},
+        "units": {"qcbor": {"kind": "static_lib", "test": False, "files": ["lookup.c"], "links": []}},
+        "functions": {key: rec},
+        "global_variables": {},
+    }
+    layouts: dict[str, dict[str, Any]] = {
+        "struct ctx": {
+            "what": "struct",
+            "size": 8,
+            "align": 4,
+            "pointers": False,
+            "fields": [
+                {"name": "pos", "kind": "int", "off": 0, "size": 4, "pointers": False, "ctype": "int"},
+                {"name": "len", "kind": "int", "off": 4, "size": 4, "pointers": False, "ctype": "int"},
+            ],
+        }
+    }
+    return dag, model, layouts
+
+
+def _lookup_cases(planned: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (stmt, lay)
+        for stmt, lay in zip(planned["cases"], planned["layouts"], strict=True)
+        if lay["calls"] == ["lookup"]
+    ]
+
+
+def test_trusted_cstring_param_is_bound_to_a_literal_not_exempted(monkeypatch: pytest.MonkeyPatch):
+    """
+    QCBOR run-1 (2026-11-22): 27 `--api` entry points such as `QCBORDecode_SeekToLabelSZ(pCtx,
+    const char *szLabel)` landed in `api_auto_exempt` as `trusted parameter szLabel has no instance`,
+    so the text-label map search was never driven. A trusted `const char *` is bound to a fixed
+    NUL-terminated literal, a value the application could pass, never to fuzz bytes.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture()
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    assert "lookup.c#lookup" not in planned["auto_exempt"], planned["auto_exempt"]
+    assert "lookup.c#lookup" not in planned["skipped"], planned["skipped"]
+    cases = _lookup_cases(planned)
+    assert len(cases) == 1
+    stmt, lay = cases[0]
+    literal = '"' + ah.TRUSTED_STRING_DEFAULT + '"'
+    assert f"(char const *){literal}" in stmt
+    assert "lookup(" in stmt
+    # The label is never read from the input: no slot and no rest for argument 1.
+    assert all(s.get("param") != 1 for s in lay["slots"])
+    assert lay["rest"] is None or lay["rest"].get("param") != 1
+    assert any("argument 1: trusted string parameter" in n and literal in n for n in lay.get("notes") or [])
+
+
+def test_trusted_cstring_param_prefers_the_literal_the_tests_pass(monkeypatch: pytest.MonkeyPatch):
+    """The recorded seed traces give the label the target's own tests pass (most frequent wins)."""
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture()
+    traces = [
+        [
+            {"fn": "lookup", "args": {"1": [["s", 0, b"first integer".hex()]]}},
+            {"fn": "lookup", "args": {"1": [["s", 0, b"map in a map".hex()]]}},
+            {"fn": "lookup", "args": {"1": [["s", 0, b"map in a map".hex()]]}},
+            # Not printable, or too long: never a literal.
+            {"fn": "lookup", "args": {"1": [["s", 0, "0a00ff"]]}},
+            {"fn": "lookup", "args": {"1": [["s", 0, ("41" * (ah.TRUSTED_STRING_MAX_BYTES + 1))]]}},
+            {"fn": "lookup", "args": {"1": [["s", 0, "0a00ff"]]}},
+            {"fn": "lookup", "args": {"1": [["s", 0, "0a00ff"]]}},
+        ]
+    ]
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, traces=traces, struct_layouts=layouts)
+
+    (stmt, lay), *_ = _lookup_cases(planned)
+    assert '(char const *)"map in a map"' in stmt
+    assert any("recorded" in n and '"map in a map"' in n for n in lay.get("notes") or [])
+
+
+def test_trusted_cstring_recorded_literal_is_escaped(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture()
+    text = b'say "hi"? \\'
+    traces = [[{"fn": "lookup", "args": {"1": [["s", 0, text.hex()]]}}, {"fn": "other", "args": {}}]]
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, traces=traces, struct_layouts=layouts)
+
+    (stmt, _lay), *_ = _lookup_cases(planned)
+    assert f"(char const *){ah.c_string_literal(text)}" in stmt
+
+
+def test_attacker_cstring_param_is_still_fuzzed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture(attacker=("c", "szLabel", "out"))
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    (stmt, lay), *_ = _lookup_cases(planned)
+    assert lay["rest"] == {"call": 0, "param": 1, "kind": "string"}
+    assert f'"{ah.TRUSTED_STRING_DEFAULT}"' not in stmt
+    assert not any("trusted string parameter" in n for n in lay.get("notes") or [])
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        # A byte buffer, not a string: a literal could be shorter than what the callee reads.
+        {"label_type": "void const *"},
+        {"label_type": "unsigned char const *"},
+        # The callers pass a fixed-size object: its size, not a string's NUL, bounds the read.
+        {"label_sizes": {"min": 16, "max": 16, "n": 2}},
+        # Not positively read-only per the model: the callee may write through it.
+        {"label_kind": "pointer"},
+    ],
+)
+def test_trusted_non_string_pointer_stays_exempt(monkeypatch: pytest.MonkeyPatch, variant: dict[str, Any]):
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture(**variant)
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    if variant.get("label_kind") == "pointer":
+        # A writable `char *` the threat model does not list is an output buffer: never a literal.
+        for stmt, _lay in _lookup_cases(planned):
+            assert f'"{ah.TRUSTED_STRING_DEFAULT}"' not in stmt
+        return
+    assert planned["auto_exempt"]["lookup.c#lookup"] == "trusted parameter szLabel has no instance"
+    assert _lookup_cases(planned) == []
+
+
+@pytest.mark.parametrize(
+    "after_label",
+    [("unsigned int", "uConvertTypes"), ("unsigned char", "uTagRequirement"), ("unsigned long", "uOptions")],
+)
+def test_trusted_cstring_beside_a_trusted_scalar_gets_the_literal(
+    monkeypatch: pytest.MonkeyPatch, after_label: tuple[str, str]
+):
+    """
+    QCBOR's `QCBORDecode_GetInt64ConvertAllInMapSZ(pCtx, szLabel, uint32_t uConvertTypes, pnValue)`:
+    the unsigned scalar after the label looks like a length, but the threat model leaves it trusted,
+    so it is zeroed and the label still gets its literal.
+    """
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture(after_label=after_label)
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    assert "lookup.c#lookup" not in planned["auto_exempt"], planned["auto_exempt"]
+    (stmt, lay), *_ = _lookup_cases(planned)
+    assert f'(char const *)"{ah.TRUSTED_STRING_DEFAULT}", c0a2,' in stmt
+    assert f"{after_label[0]} c0a2; memset(&c0a2, 0, sizeof(c0a2));" in stmt
+    assert all(s.get("param") not in (1, 2) for s in lay["slots"])
+
+
+def test_trusted_cstring_beside_an_attacker_length_stays_exempt(monkeypatch: pytest.MonkeyPatch):
+    """A length the attacker controls beside a literal would read past it: no case, as before."""
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture(after_label=("unsigned long", "uLen"), attacker=("c", "uLen", "out"))
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    assert planned["auto_exempt"]["lookup.c#lookup"] == "trusted parameter szLabel has no instance"
+
+
+def test_trusted_cstring_flag_off_is_unchanged(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "off")
+    dag, model, layouts = _cstring_fixture()
+
+    planned = ah.plan(dag, model, "qcbor", "qcbor", 256, struct_layouts=layouts)
+
+    assert planned["auto_exempt"] == {}
+    (stmt, lay), *_ = _lookup_cases(planned)
+    assert f'"{ah.TRUSTED_STRING_DEFAULT}"' not in stmt
+    assert lay["rest"] == {"call": 0, "param": 1, "kind": "string"}
+
+
+def test_trusted_cstring_generate_sidecar_valid_and_both_copies_bind_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(ah.API_TRUST_SCHEMA_ENV, "on")
+    dag, model, layouts = _cstring_fixture()
+    reports = tmp_path / "workspace" / "reports"
+    harnesses = tmp_path / "workspace" / "harnesses"
+    reports.mkdir(parents=True)
+    harnesses.mkdir(parents=True)
+    dag_path = reports / "callgraph_dag.json"
+    model_path = reports / "phase0_model.json"
+    dag_path.write_text(json.dumps(dag), encoding="utf-8")
+    model_path.write_text(json.dumps(model), encoding="utf-8")
+
+    res = ah.generate(
+        module="qcbor",
+        header="none",
+        max_input_size=256,
+        cppflags="",
+        out_dir=harnesses,
+        unit="qcbor",
+        auto_prelude=False,
+        probe=False,
+        dag_path=dag_path,
+        model_path=model_path,
+        struct_layouts=layouts,
+        variadic={},
+    )
+    sidecar = json.loads(Path(res["harness_meta"]).read_text(encoding="utf-8"))
+    harness_c = Path(res["harness_file"]).read_text(encoding="utf-8")
+
+    assert not validate_sidecar(sidecar, module="qcbor")
+    assert "lookup.c#lookup" not in (sidecar.get("api_auto_exempt") or {})
+    case = next(c for c in sidecar["api_cases"] if c["calls"] == ["lookup"])
+    assert any("trusted string parameter" in n for n in case.get("notes") or [])
+    # The Eva entry and the LibFuzzer entry dispatch the same case body, literal included.
+    call = f'(char const *)"{ah.TRUSTED_STRING_DEFAULT}"'
+    eva_part, fuzz_part = harness_c.split("LLVMFuzzerTestOneInput", 1)
+    assert "int eva_main(void)" in eva_part
+    assert eva_part.count(call) == 1
+    assert fuzz_part.count(call) == 1
