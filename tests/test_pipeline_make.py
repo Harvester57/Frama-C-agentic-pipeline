@@ -1220,10 +1220,11 @@ def test_make_dry_run(tmp_path):
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return proc.stdout.replace("\\\n", " ")
 
-    out = make("-n", "fuzz", "eva", "module-snmp", "ingest", "wp-queue", "wp-sweep")
+    out = make("-n", "build", "smoke", "fuzz", "judge", "eva", "module-snmp", "ingest", "wp-queue", "wp-sweep")
     assert "resources.py run --class fuzz --key snmp --output workspace/reports/fuzz/snmp.json --" in out
     assert "run_eacsl_fuzz.py campaign --module snmp" in out and "--max-time 30" in out
     assert "--dict=workspace/dicts/snmp.dict" in out and "--fuzz-budget 300" in out
+    assert "harness_smoke.py run --module snmp" in out and "run_eacsl_fuzz.py judge --module snmp" in out
     assert "resources.py run --class eva --key snmp" in out and "--slevel 250" in out and "--extra-domains taint" in out
     assert "resources.py run --class selftest" in out and "run_eacsl_fuzz.py build --module cfg" in out
     assert "pipeline_make.py ingest --module snmp" in out and "wp_scheduler.py init" in out
