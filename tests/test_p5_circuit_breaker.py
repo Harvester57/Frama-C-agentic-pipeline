@@ -513,8 +513,23 @@ def test_sync_excludes_startup_quarantined_and_superseded_candidates(sim: Sim) -
 def test_supersede_ledger_candidates_helper_handles_present_and_absent_subcommand(
     sim: Sim, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Without Wave 3's ledger subcommand wired yet: fails soft cleanly with ok=True, supported=False.
-    res_soft = S._supersede_ledger_candidates(sim.run_dir, "sudoers", "a" * 64, "repaired")
+    # Real wired Wave 3 subcommand succeeds via ledger.cmd_supersede_candidates.
+    res_real = S._supersede_ledger_candidates(sim.run_dir, "sudoers", "a" * 64, "repaired")
+    assert res_real["ok"] is True
+    assert res_real["supported"] is True
+    assert res_real["result"]["module"] == "sudoers"
+
+    # When ledger.cmd_supersede_candidates and CLI subcommand are absent: fails soft cleanly.
+    import sys as _sys
+
+    def _missing_cli(_argv: list[str] | None = None) -> int:
+        print("ledger.py: error: argument cmd: invalid choice: 'supersede-candidates'", file=_sys.stderr)
+        raise SystemExit(2)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(L, "cmd_supersede_candidates", None)
+        mp.setattr(L, "main", _missing_cli)
+        res_soft = S._supersede_ledger_candidates(sim.run_dir, "sudoers", "a" * 64, "repaired")
     assert res_soft["ok"] is True
     assert res_soft["supported"] is False
 

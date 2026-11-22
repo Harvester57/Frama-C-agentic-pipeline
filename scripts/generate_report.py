@@ -373,6 +373,9 @@ def load_inputs(run_dir: Path) -> dict:
         "security_props": load_json_optional(run_dir / "workspace/reports/security_props.json", None),
         "merge_notes": load_merge_notes(run_dir),
         "fuzz_security_props": load_fuzz_security_props(run_dir),
+        "smoke_reports": load_smoke_reports(run_dir),
+        "judge_reports": load_judge_reports(run_dir),
+        "phase1_fuzz_reports": load_phase1_fuzz_reports(run_dir),
     }
 
 
@@ -528,6 +531,248 @@ def load_coverage_reports(run_dir: Path) -> list[dict]:
             report = {"status": "unreadable"}
         reports.append({**report, "module": str(report.get("module") or path.stem)})
     return reports
+
+
+def load_smoke_reports(run_dir: Path) -> list[dict]:
+    """`harness_smoke.py run` reports from `workspace/reports/smoke/*.json`, sorted by module."""
+    smoke_dir = Path(run_dir) / "workspace/reports/smoke"
+    if not smoke_dir.is_dir():
+        return []
+    reports: list[dict] = []
+    for path in sorted(smoke_dir.glob("*.json")):
+        try:
+            report = load_json_strict(path)
+        except ArtifactError:
+            report = None
+        if not isinstance(report, dict):
+            report = {"status": "unreadable"}
+        reports.append({**report, "module": str(report.get("module") or path.stem)})
+    return reports
+
+
+def load_judge_reports(run_dir: Path) -> list[dict]:
+    """`run_eacsl_fuzz.py judge` reports from `workspace/reports/judge/*.json`, sorted by module."""
+    judge_dir = Path(run_dir) / "workspace/reports/judge"
+    if not judge_dir.is_dir():
+        return []
+    reports: list[dict] = []
+    for path in sorted(judge_dir.glob("*.json")):
+        try:
+            report = load_json_strict(path)
+        except ArtifactError:
+            report = None
+        if not isinstance(report, dict):
+            report = {"status": "unreadable"}
+        reports.append({**report, "module": str(report.get("module") or path.stem)})
+    return reports
+
+
+def load_phase1_fuzz_reports(run_dir: Path) -> list[dict]:
+    """
+    Phase 1 Explore (`mode == "campaign"`, `discovering_step == "explore"` or P4 telemetry/blinding)
+    and deep `eacsl-fuzz` (`mode == "eacsl-fuzz"` / `discovering_step == "eacsl_fuzz"`) reports from
+    `workspace/reports/fuzz/*.json` and `workspace/reports/eacsl_fuzz/*.json`. Returns `[]` on legacy
+    runs that have no Explore/Judge or telemetry data.
+    """
+    rdir = Path(run_dir)
+    judge_mods = {
+        path.stem for path in (rdir / "workspace/reports/judge").glob("*.json")
+    } if (rdir / "workspace/reports/judge").is_dir() else set()
+    reports: list[dict] = []
+    for sub in ("workspace/reports/fuzz", "workspace/reports/eacsl_fuzz"):
+        d = rdir / sub
+        if not d.is_dir():
+            continue
+        for path in sorted(d.glob("*.json")):
+            try:
+                report = load_json_strict(path)
+            except ArtifactError:
+                continue
+            if not isinstance(report, dict):
+                continue
+            mode = report.get("mode")
+            if mode not in ("campaign", "eacsl-fuzz"):
+                continue
+            step = report.get("discovering_step")
+            mod = str(report.get("module") or path.stem)
+            has_p4_fields = bool(
+                step in ("explore", "eacsl_fuzz")
+                or mode == "eacsl-fuzz"
+                or isinstance(report.get("telemetry"), dict)
+                or report.get("blinded_cases")
+                or report.get("partial_blinded")
+                or report.get("status") in ("blinded", "partial_blinded", "unspent_blinded", "startup_error")
+                or mod in judge_mods
+            )
+            if not has_p4_fields:
+                continue
+            reports.append({**report, "module": mod})
+    return reports
+
+
+def harness_smoke_lines(reports: list[dict] | None) -> list[str]:
+    """
+    Harness Smoke Gate summary (P3): startup errors and quarantined cases per module from
+    `workspace/reports/smoke/*.json`. Returns `[]` when no smoke reports exist.
+    """
+    if not reports:
+        return []
+    lines = [
+        "### Harness Smoke Gate",
+        "",
+        "| Module | Status | Startup | Quarantined cases | Candidate warnings | Wall (s) |",
+        "| :--- | :--- | :--- | :--- | :--- | ---: |",
+    ]
+    startup_notes: list[str] = []
+    for r in reports:
+        mod = md_escape(str(r.get("module") or "?"))
+        status = md_escape(str(r.get("status") or "unknown"))
+        raw_startup = r.get("startup")
+        startup: dict = raw_startup if isinstance(raw_startup, dict) else {}
+        if startup.get("ok") is True:
+            startup_cell = "ok"
+        elif startup.get("ok") is False:
+            eng = startup.get("failing_engine") or "unknown"
+            startup_cell = f"failed (`{md_escape(str(eng))}`)"
+            reason = md_escape(str(startup.get("reason") or "startup failure"))
+            startup_notes.append(f"- `{mod}` startup error (`{md_escape(str(eng))}`): {reason}")
+        else:
+            startup_cell = "n/a"
+        q_cases = [str(c) for c in (r.get("quarantined_cases") or [])]
+        w_cases = [str(c) for c in (r.get("candidate_warning_cases") or [])]
+        q_cell = ", ".join(q_cases) if q_cases else "none"
+        w_cell = ", ".join(w_cases) if w_cases else "none"
+        wall = r.get("wall_s")
+        wall_cell = f"{wall:.2f}" if isinstance(wall, (int, float)) else "n/a"
+        lines.append(f"| `{mod}` | `{status}` | {startup_cell} | {q_cell} | {w_cell} | {wall_cell} |")
+    lines.append("")
+    if startup_notes:
+        lines += ["Startup errors:", "", *startup_notes, ""]
+    return lines
+
+
+def _format_blinded_cases(report: dict) -> str:
+    raw_cases = report.get("blinded_cases")
+    cases: list = raw_cases if isinstance(raw_cases, list) else []
+    ids = [str(c["case"]) for c in cases if isinstance(c, dict) and "case" in c]
+    if ids:
+        prefix = "partial: " if report.get("partial_blinded") else ""
+        return prefix + ", ".join(ids)
+    if report.get("status") == "blinded":
+        fp = report.get("blinded_fingerprint")
+        return f"all (`{md_escape(str(fp))}`)" if fp else "all"
+    if report.get("status") == "partial_blinded":
+        return "partial"
+    return "none"
+
+
+def phase1_explore_judge_lines(
+    fuzz_reports: list[dict] | None,
+    judge_reports: list[dict] | None,
+) -> list[str]:
+    """
+    Phase 1 Explore / Judge Breakdown (`P2c`): renders `explore` (execs, coverage, blinded/partial_blinded),
+    `judge` (judged, failed, not_judged, batch_state_only), and `eacsl_fuzz` (under `deep`).
+    Returns `[]` when neither Explore/Judge nor `eacsl-fuzz` reports exist.
+    """
+    explore_rows = [
+        r for r in (fuzz_reports or []) if r.get("mode") != "eacsl-fuzz" and r.get("discovering_step") != "eacsl_fuzz"
+    ]
+    eacsl_fuzz_rows = [
+        r for r in (fuzz_reports or []) if r.get("mode") == "eacsl-fuzz" or r.get("discovering_step") == "eacsl_fuzz"
+    ]
+    judge_rows = list(judge_reports or [])
+    if not explore_rows and not judge_rows and not eacsl_fuzz_rows:
+        return []
+
+    lines = ["### Phase 1 Explore / Judge Breakdown", ""]
+    if explore_rows:
+        lines += [
+            "**Explore:**",
+            "",
+            "| Module | Status | Executions | Max cov | Blinded |",
+            "| :--- | :--- | ---: | ---: | :--- |",
+        ]
+        for r in sorted(explore_rows, key=lambda x: str(x.get("module") or "")):
+            mod = md_escape(str(r.get("module") or "?"))
+            status = md_escape(str(r.get("status") or "unknown"))
+            raw_tel = r.get("telemetry")
+            tel: dict = raw_tel if isinstance(raw_tel, dict) else {}
+            execs = tel.get("total_executions")
+            max_cov = tel.get("max_cov")
+            execs_cell = str(execs) if isinstance(execs, int) else "n/a"
+            cov_cell = str(max_cov) if isinstance(max_cov, int) else "n/a"
+            lines.append(f"| `{mod}` | `{status}` | {execs_cell} | {cov_cell} | {_format_blinded_cases(r)} |")
+        lines.append("")
+
+    if judge_rows:
+        lines += [
+            "**Judge (E-ACSL):**",
+            "",
+            "| Module | Status | Judged | Failed | Not judged | Batch-state-only | Blinded |",
+            "| :--- | :--- | ---: | ---: | ---: | ---: | :--- |",
+        ]
+        for r in sorted(judge_rows, key=lambda x: str(x.get("module") or "")):
+            mod = md_escape(str(r.get("module") or "?"))
+            status = md_escape(str(r.get("status") or "unknown"))
+            raw_inp = r.get("inputs")
+            inp: dict = raw_inp if isinstance(raw_inp, dict) else {}
+            judged = inp.get("judged", 0)
+            failed = inp.get("failed", 0)
+            not_judged = r.get("not_judged", inp.get("not_judged", 0))
+            bso = len(r.get("batch_state_only") or [])
+            lines.append(
+                f"| `{mod}` | `{status}` | {judged} | {failed} | {not_judged} | {bso} | {_format_blinded_cases(r)} |"
+            )
+        lines.append("")
+
+    if eacsl_fuzz_rows:
+        lines += [
+            "**E-ACSL Fuzz (`deep`):**",
+            "",
+            "| Module | Status | Executions | Max cov | Unspent budget (s) |",
+            "| :--- | :--- | ---: | ---: | ---: |",
+        ]
+        for r in sorted(eacsl_fuzz_rows, key=lambda x: str(x.get("module") or "")):
+            mod = md_escape(str(r.get("module") or "?"))
+            status = md_escape(str(r.get("status") or "unknown"))
+            raw_ef_tel = r.get("telemetry")
+            ef_tel: dict = raw_ef_tel if isinstance(raw_ef_tel, dict) else {}
+            execs = ef_tel.get("total_executions")
+            max_cov = ef_tel.get("max_cov")
+            unspent = r.get("unspent_budget_s")
+            execs_cell = str(execs) if isinstance(execs, int) else "n/a"
+            cov_cell = str(max_cov) if isinstance(max_cov, int) else "n/a"
+            unspent_cell = f"{unspent:.1f}" if isinstance(unspent, (int, float)) else "0.0"
+            lines.append(f"| `{mod}` | `{status}` | {execs_cell} | {cov_cell} | {unspent_cell} |")
+        lines.append("")
+
+    return lines
+
+
+def verifier_circuit_breaker_lines(candidates: list[dict] | None) -> list[str]:
+    """
+    Verifier Circuit Breaker summary (P5): count of candidates superseded after harness repair
+    (`superseded_by_repair`) vs. verified candidates. Returns `[]` when no candidates were superseded.
+    """
+    cands = list(candidates or [])
+    superseded = [c for c in cands if c.get("status") == "superseded_by_repair"]
+    if not superseded:
+        return []
+    verified = [c for c in cands if c.get("status") == "verified"]
+    by_mod: Counter = Counter(str(c.get("module") or "unknown") for c in superseded)
+    out = [
+        "### Verifier Circuit Breaker",
+        "",
+        f"- **Superseded after harness repair (`superseded_by_repair`):** {len(superseded)} candidate(s) "
+        f"(vs. {len(verified)} verified candidate(s)).",
+    ]
+    for mod, count in sorted(by_mod.items()):
+        reasons = sorted({str(c.get("superseded_reason")) for c in superseded if str(c.get("module") or "unknown") == mod and c.get("superseded_reason")})
+        suffix = f": {md_escape(reasons[0])}" if reasons else ""
+        out.append(f"  - `{md_escape(mod)}`: {count} superseded{suffix}")
+    out.append("")
+    return out
 
 
 def fuzz_reach_lines(reports: list[dict]) -> list[str]:
@@ -1813,6 +2058,7 @@ def render_report(data: dict) -> str:
     out.append("")
     out += rejection_basis_lines(rejected)
     out += reopening_lines(data["candidates"])
+    out += verifier_circuit_breaker_lines(data["candidates"])
     out += sink_conflict_lines(data["findings"], data["candidates"])
     out += decision_point_basis_lines([*confirmed, *needs])
     by_fp = {r["fingerprint"]: r for r in data["findings"]}
@@ -1924,6 +2170,8 @@ def render_report(data: dict) -> str:
     if data.get("run_dir"):
         out += dynamic_gate_lines(Path(data["run_dir"]))
         out += header_api_lines(Path(data["run_dir"]))
+    out += harness_smoke_lines(data.get("smoke_reports"))
+    out += phase1_explore_judge_lines(data.get("phase1_fuzz_reports"), data.get("judge_reports"))
 
     hardening = [h for u in ledger for h in u.get("bookkeeping", {}).get("hardening", [])]
     if hardening:
