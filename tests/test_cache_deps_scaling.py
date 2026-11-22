@@ -55,16 +55,17 @@ class CdsRunner:
 
     def __call__(self, cmd, **kwargs):
         cmd = list(cmd)
+        timeout = float(kwargs.get("timeout") or 0.0)
         with self._lock:
             self.calls.append(cmd)
-            self.timeouts.append(kwargs.get("timeout"))
+            self.timeouts.append(timeout)
         srcs = _cds_srcs_in(cmd)
         if self.limit is not None and len(srcs) > self.limit:
-            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd, timeout)
         if self.fail_on is not None and self.fail_on in srcs:
             if self.rc:
                 return subprocess.CompletedProcess(cmd, self.rc, stdout="", stderr="fatal error: boom.h: No such file")
-            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd, timeout)
         extra = f" {CDS_FC_HEADER}" if cmd[0] == "gcc" else ""
         out = "".join(f"{s[:-2]}.o: {s} {CDS_HEADER}{extra} \\\n  gen_{s[:-2]}.h\n" for s in srcs)
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
@@ -200,7 +201,7 @@ class CdsSlowScanToolchain(FakeToolchain):
     def __call__(self, cmd, **kwargs):
         if "-M" in cmd:
             self.calls.append(list(cmd))
-            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd, float(kwargs.get("timeout") or 0.0))
         return super().__call__(cmd, **kwargs)
 
 
