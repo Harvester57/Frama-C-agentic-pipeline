@@ -91,6 +91,8 @@ AB_SWITCHES = (
     "FRAMAC_HARNESS_SMOKE",
     "FRAMAC_FUZZ_EXPLORE_JUDGE",
     "FRAMAC_VERIFIER_BREAKER",
+    "FRAMAC_JUDGE_FRONTIER",
+    "FRAMAC_FUZZ_PLATEAU_STOP",
 )
 # The value that turns each switch to its baseline side.
 AB_BASELINE = {name: "off" for name in AB_SWITCHES} | {"FRAMAC_CANDIDATE_RANK": "legacy"}
