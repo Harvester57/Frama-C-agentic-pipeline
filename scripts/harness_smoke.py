@@ -8,12 +8,15 @@ before Phase 1 fuzzing:
      empty / out-of-range selector invocation. Any abort before `LLVMFuzzerTestOneInput`
      ends with `status = "startup_error"` and non-zero exit.
   2. Per-case smoke pass (dispatch harnesses): constructs 0-payload, 64-byte zeroed,
-     and up to 2 harvested seed probes per case `k` in `0..dispatch_case_count-1`.
-     Executes `.san` in batched mode and isolates any failing case via
-     `FRAMAC_FUZZ_ONLY_CASE=k` plus single-probe replay so culprit input and
-     `payload_len` are exact. Only unambiguous `harness_setup_fault` failures are
-     quarantined; `empty_input_candidate` and `target_crash_candidate` are recorded
-     as `candidate_warning` and stay active for Phase 1 fuzzing.
+     exact-slot-length (`rest_n == 0`) zeroed probes for every `api_cases` entry with
+     a `rest` field, and up to 2 harvested seed probes per case `k` in
+     `0..dispatch_case_count-1`. Executes `.san` in batched mode and, when `.e-acsl`
+     is built, also runs a fast single-batch replay on `.e-acsl` across non-quarantined
+     cases, isolating any failing case via `FRAMAC_FUZZ_ONLY_CASE=k` plus single-probe
+     replay so culprit input and `payload_len` are exact. Only unambiguous
+     `harness_setup_fault` / `is_pure_harness_crash` failures are quarantined;
+     `empty_input_candidate` and `target_crash_candidate` are recorded as
+     `candidate_warning` and stay active for Phase 1 fuzzing.
   3. Non-dispatch harnesses (`argv`, `stdin`, `tf_*`, single-entry): startup check +
      1 empty input + up to 4 harvested seeds.
 
@@ -46,9 +49,11 @@ from failure_identity import (  # noqa: E402
     _STACK_FRAME_RE,
     classify_smoke_failure,
     failure_fingerprint,
+    is_pure_harness_crash,
     is_startup_failure,
     parse_link_stub_abort,
     parse_runtime_failure,
+    stack_frames,
 )
 from framac_common import (  # noqa: E402
     ArtifactError,
@@ -75,7 +80,9 @@ from sandbox_exec import Limits, SandboxResult, SandboxUnavailable  # noqa: E402
 SCHEMA_VERSION = 1
 DEFAULT_SMOKE_TIMEOUT_S = 10
 SMOKE_BATCH_CASES = 32
+EACSL_SMOKE_BATCH_CASES = 256
 ZERO_PAYLOAD_LEN = 64
+MAX_EXACT_SLOTS_BYTES = 65536
 MAX_DISPATCH_SEEDS_PER_CASE = 2
 MAX_NON_DISPATCH_SEEDS = 4
 LOG_TAIL_CHARS = 3000
@@ -98,7 +105,7 @@ def harness_smoke_enabled() -> bool:
 @dataclass(frozen=True)
 class _Probe:
     case: int
-    kind: str  # "empty" | "zero64" | "seed"
+    kind: str  # "empty" | "zero64" | "exact_slots" | "seed"
     payload_len: int
     path: Path
 
@@ -289,6 +296,46 @@ def _case_entry_map(sidecar: dict[str, Any]) -> dict[int, str]:
         calls = item.get("calls")
         if isinstance(calls, list) and calls and isinstance(calls[0], str):
             mapping[sel] = calls[0]
+    return mapping
+
+
+def exact_slot_lengths(sidecar: dict[str, Any], width: int) -> dict[int, int]:
+    """
+    Map dispatch case index -> exact total probe length `S = width + sum(slot["size"])`
+    for each case in `sidecar["api_cases"]` that has a non-empty `rest` field and integer
+    non-negative fixed slot sizes. A zeroed input of length `S` fills all fixed slots and
+    leaves `rest_n == 0` at one-past-the-end of the input buffer.
+    """
+    mapping: dict[int, int] = {}
+    api_cases = sidecar.get("api_cases")
+    if not isinstance(api_cases, list) or width < 0:
+        return mapping
+    for item in api_cases:
+        if not isinstance(item, dict):
+            continue
+        sel = item.get("selector")
+        if not isinstance(sel, int) or isinstance(sel, bool) or sel < 0:
+            continue
+        if not item.get("rest"):
+            continue
+        raw_slots = item.get("slots")
+        if raw_slots is None:
+            raw_slots = []
+        if not isinstance(raw_slots, list):
+            continue
+        slot_sum = 0
+        valid = True
+        for slot in raw_slots:
+            if not isinstance(slot, dict):
+                valid = False
+                break
+            sz = slot.get("size")
+            if not isinstance(sz, int) or isinstance(sz, bool) or sz < 0:
+                valid = False
+                break
+            slot_sum += sz
+        if valid and slot_sum <= MAX_EXACT_SLOTS_BYTES:
+            mapping[sel] = width + slot_sum
     return mapping
 
 
@@ -486,6 +533,8 @@ def _build_failure_case_record(
     stub_abort = parse_link_stub_abort(out)
     failure = None if stub_abort else parse_runtime_failure(out, binary=binary)
     classification = classify_smoke_failure(failure, probe.payload_len, out)
+    if classification != "startup_error" and is_pure_harness_crash(failure, stack_frames(out)):
+        classification = "harness_setup_fault"
 
     if classification == "startup_error":
         _, sf_reason = is_startup_failure(failure, out)
@@ -504,6 +553,7 @@ def _build_failure_case_record(
                 "entry": entry_name,
                 "status": "candidate_warning",
                 "probes_run": probes_run,
+                "engine": primary_engine,
                 "classification": "startup_error",
                 "probe_kind": probe.kind,
                 "payload_len": probe.payload_len,
@@ -541,6 +591,7 @@ def _build_failure_case_record(
         "entry": entry_name,
         "status": case_status,
         "probes_run": probes_run,
+        "engine": primary_engine,
         "classification": classification,
         "probe_kind": probe.kind,
         "payload_len": probe.payload_len,
@@ -603,22 +654,18 @@ def _isolate_case(
     )
 
 
-def _run_dispatch_smoke(
-    san_bin: Path,
+def _build_dispatch_probes(
     n_cases: int,
     selector: str,
     width: int,
-    entry_map: dict[int, str],
     seeds_dir: Path | None,
-    scratch: Path,
+    probes_dir: Path,
     *,
-    timeout_s: int,
-    module: str,
-    primary_engine: str = "sanitizers",
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    probes_dir = scratch / "probes"
+    exact_lengths: dict[int, int] | None = None,
+) -> dict[int, list[_Probe]]:
     probes_dir.mkdir(parents=True, exist_ok=True)
     seeds_by_case = _collect_dispatch_seeds(seeds_dir, n_cases, selector, width)
+    exact_map = exact_lengths or {}
 
     probes_by_case: dict[int, list[_Probe]] = {}
     for k in range(n_cases):
@@ -633,17 +680,39 @@ def _run_dispatch_smoke(
         p_zero.write_bytes(sel_bytes + (b"\x00" * ZERO_PAYLOAD_LEN))
         case_probes.append(_Probe(case=k, kind="zero64", payload_len=ZERO_PAYLOAD_LEN, path=p_zero))
 
-        for s_idx, raw_seed in enumerate(seeds_by_case.get(k, [])):
-            p_seed = probes_dir / f"case_{k:04d}_p{2 + s_idx}_seed.bin"
+        if k in exact_map:
+            slot_payload_len = max(0, exact_map[k] - width)
+            p_exact = probes_dir / f"case_{k:04d}_p{len(case_probes)}_exact_slots.bin"
+            p_exact.write_bytes(sel_bytes + (b"\x00" * slot_payload_len))
+            case_probes.append(_Probe(case=k, kind="exact_slots", payload_len=slot_payload_len, path=p_exact))
+
+        for raw_seed in seeds_by_case.get(k, []):
+            p_seed = probes_dir / f"case_{k:04d}_p{len(case_probes)}_seed.bin"
             p_seed.write_bytes(raw_seed)
             case_probes.append(_Probe(case=k, kind="seed", payload_len=max(0, len(raw_seed) - width), path=p_seed))
 
         probes_by_case[k] = case_probes
+    return probes_by_case
 
+
+def _run_dispatch_smoke_pass(
+    binary: Path,
+    cases_to_run: Sequence[int],
+    probes_by_case: dict[int, list[_Probe]],
+    entry_map: dict[int, str],
+    scratch: Path,
+    *,
+    timeout_s: int,
+    module: str,
+    primary_engine: str,
+    batch_size: int,
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any] | None]:
     results_by_case: dict[int, dict[str, Any]] = {}
     queue: collections.deque[list[int]] = collections.deque()
-    for start in range(0, n_cases, SMOKE_BATCH_CASES):
-        queue.append(list(range(start, min(start + SMOKE_BATCH_CASES, n_cases))))
+    step = max(1, int(batch_size))
+    ordered = list(cases_to_run)
+    for start in range(0, len(ordered), step):
+        queue.append(ordered[start : start + step])
 
     while queue:
         batch_cases = queue.popleft()
@@ -651,7 +720,7 @@ def _run_dispatch_smoke(
             continue
         batch_probes = [p for k in batch_cases for p in probes_by_case[k]]
         res = _run_probe_files(
-            san_bin,
+            binary,
             [p.path for p in batch_probes],
             scratch,
             timeout_s=timeout_s,
@@ -673,7 +742,7 @@ def _run_dispatch_smoke(
         if len(batch_cases) == 1:
             k = batch_cases[0]
             rec, escalated, esc_info = _isolate_case(
-                san_bin,
+                binary,
                 k,
                 entry_map.get(k),
                 probes_by_case[k],
@@ -686,7 +755,7 @@ def _run_dispatch_smoke(
             )
             results_by_case[k] = rec
             if escalated:
-                return [results_by_case[i] for i in sorted(results_by_case)], esc_info
+                return results_by_case, esc_info
             continue
 
         if not is_lsan:
@@ -694,7 +763,7 @@ def _run_dispatch_smoke(
             if hit_idx is not None:
                 hit_case = batch_probes[hit_idx].case
                 rec, escalated, esc_info = _isolate_case(
-                    san_bin,
+                    binary,
                     hit_case,
                     entry_map.get(hit_case),
                     probes_by_case[hit_case],
@@ -706,7 +775,7 @@ def _run_dispatch_smoke(
                 )
                 if escalated:
                     results_by_case[hit_case] = rec
-                    return [results_by_case[i] for i in sorted(results_by_case)], esc_info
+                    return results_by_case, esc_info
                 if rec["status"] != "passed":
                     results_by_case[hit_case] = rec
                     remaining = [k for k in batch_cases if k != hit_case]
@@ -718,7 +787,118 @@ def _run_dispatch_smoke(
         queue.appendleft(batch_cases[mid:])
         queue.appendleft(batch_cases[:mid])
 
-    return [results_by_case[k] for k in range(n_cases)], None
+    return results_by_case, None
+
+
+def _run_dispatch_smoke(
+    san_bin: Path,
+    n_cases: int,
+    selector: str,
+    width: int,
+    entry_map: dict[int, str],
+    seeds_dir: Path | None,
+    scratch: Path,
+    *,
+    timeout_s: int,
+    module: str,
+    primary_engine: str = "sanitizers",
+    exact_lengths: dict[int, int] | None = None,
+    secondary_eacsl_bin: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, list[str]]:
+    probes_by_case = _build_dispatch_probes(
+        n_cases,
+        selector,
+        width,
+        seeds_dir,
+        scratch / "probes",
+        exact_lengths=exact_lengths,
+    )
+
+    primary_batch_size = EACSL_SMOKE_BATCH_CASES if primary_engine == "eacsl" else SMOKE_BATCH_CASES
+    results_by_case, escalation = _run_dispatch_smoke_pass(
+        san_bin,
+        list(range(n_cases)),
+        probes_by_case,
+        entry_map,
+        scratch,
+        timeout_s=timeout_s,
+        module=module,
+        primary_engine=primary_engine,
+        batch_size=primary_batch_size,
+    )
+    engines_checked = [primary_engine]
+    if escalation is not None:
+        return [results_by_case[i] for i in sorted(results_by_case)], escalation, engines_checked
+
+    if secondary_eacsl_bin is not None:
+        active_cases = [k for k in range(n_cases) if results_by_case[k]["status"] != "quarantined"]
+        if active_cases:
+            engines_checked.append("eacsl")
+            eacsl_results, eacsl_escalation = _run_dispatch_smoke_pass(
+                secondary_eacsl_bin,
+                active_cases,
+                probes_by_case,
+                entry_map,
+                scratch,
+                timeout_s=timeout_s,
+                module=module,
+                primary_engine="eacsl",
+                batch_size=EACSL_SMOKE_BATCH_CASES,
+            )
+            for k, rec in eacsl_results.items():
+                if rec["status"] == "quarantined":
+                    results_by_case[k] = rec
+                elif rec["status"] == "candidate_warning" and results_by_case[k]["status"] == "passed":
+                    results_by_case[k] = rec
+                elif rec.get("classification") == "startup_error":
+                    results_by_case[k] = rec
+            if eacsl_escalation is not None:
+                return [results_by_case[i] for i in sorted(results_by_case)], eacsl_escalation, engines_checked
+
+    return [results_by_case[k] for k in range(n_cases)], None, engines_checked
+
+
+def _run_non_dispatch_smoke_pass(
+    binary: Path,
+    entry_name: str | None,
+    probes: Sequence[_Probe],
+    scratch: Path,
+    *,
+    timeout_s: int,
+    module: str,
+    primary_engine: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    res = _run_probe_files(
+        binary,
+        [p.path for p in probes],
+        scratch,
+        timeout_s=timeout_s,
+        module=module,
+    )
+    if res.returncode == 0 and not res.timed_out:
+        return (
+            {
+                "case": 0,
+                "entry": entry_name,
+                "status": "passed",
+                "probes_run": len(probes),
+            },
+            None,
+        )
+
+    rec, escalated, esc_info = _isolate_case(
+        binary,
+        0,
+        entry_name,
+        probes,
+        scratch,
+        timeout_s=timeout_s,
+        module=module,
+        use_only_case_env=False,
+        fallback_batch_res=res,
+        primary_engine=primary_engine,
+    )
+    return rec, esc_info if escalated else None
 
 
 def _run_non_dispatch_smoke(
@@ -730,7 +910,8 @@ def _run_non_dispatch_smoke(
     timeout_s: int,
     module: str,
     primary_engine: str = "sanitizers",
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    secondary_eacsl_bin: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, list[str]]:
     probes_dir = scratch / "probes"
     probes_dir.mkdir(parents=True, exist_ok=True)
 
@@ -744,39 +925,38 @@ def _run_non_dispatch_smoke(
         p_seed.write_bytes(raw_seed)
         probes.append(_Probe(case=0, kind="seed", payload_len=len(raw_seed), path=p_seed))
 
-    res = _run_probe_files(
+    rec, escalation = _run_non_dispatch_smoke_pass(
         san_bin,
-        [p.path for p in probes],
-        scratch,
-        timeout_s=timeout_s,
-        module=module,
-    )
-    if res.returncode == 0 and not res.timed_out:
-        return (
-            [
-                {
-                    "case": 0,
-                    "entry": entry_name,
-                    "status": "passed",
-                    "probes_run": len(probes),
-                }
-            ],
-            None,
-        )
-
-    rec, escalated, esc_info = _isolate_case(
-        san_bin,
-        0,
         entry_name,
         probes,
         scratch,
         timeout_s=timeout_s,
         module=module,
-        use_only_case_env=False,
-        fallback_batch_res=res,
         primary_engine=primary_engine,
     )
-    return [rec], esc_info if escalated else None
+    engines_checked = [primary_engine]
+    if escalation is not None:
+        return [rec], escalation, engines_checked
+
+    if secondary_eacsl_bin is not None and rec["status"] != "quarantined":
+        engines_checked.append("eacsl")
+        eacsl_rec, eacsl_escalation = _run_non_dispatch_smoke_pass(
+            secondary_eacsl_bin,
+            entry_name,
+            probes,
+            scratch,
+            timeout_s=timeout_s,
+            module=module,
+            primary_engine="eacsl",
+        )
+        if eacsl_escalation is not None:
+            return [eacsl_rec], eacsl_escalation, engines_checked
+        if eacsl_rec["status"] == "quarantined" or (
+            eacsl_rec["status"] == "candidate_warning" and rec["status"] == "passed"
+        ):
+            rec = eacsl_rec
+
+    return [rec], None, engines_checked
 
 
 def _apply_startup_escalation(startup: dict[str, Any], escalation: dict[str, Any]) -> None:
@@ -839,6 +1019,7 @@ def run_smoke(
         startup: dict[str, Any],
         case_results: list[dict[str, Any]],
         exit_code: int,
+        case_engines_checked: list[str] | None = None,
     ) -> tuple[dict[str, Any], int]:
         if is_dispatch:
             quarantined = sorted(c["case"] for c in case_results if c.get("status") == "quarantined")
@@ -856,6 +1037,7 @@ def run_smoke(
             "entry_style": entry_style,
             "dispatch_case_count": n_cases if is_dispatch else 0,
             "status": status,
+            "case_engines_checked": list(case_engines_checked or []),
             "startup": startup,
             "quarantined_cases": quarantined,
             "candidate_warning_cases": warnings,
@@ -869,10 +1051,13 @@ def run_smoke(
 
     has_san = resolved_san is not None and resolved_san.is_file()
     has_eacsl = resolved_eacsl is not None and resolved_eacsl.is_file()
+    secondary_eacsl_bin: Path | None = None
     if has_san:
         assert resolved_san is not None
         probe_bin = resolved_san
         primary_engine = "sanitizers"
+        if has_eacsl:
+            secondary_eacsl_bin = resolved_eacsl
     elif san_bin is None and has_eacsl:
         # `--fuzz-engine eacsl` (or a sanitizer-less build.json / explicit --eacsl-bin):
         # probe the E-ACSL binary directly instead of failing with "sanitizer binary not found".
@@ -911,7 +1096,8 @@ def run_smoke(
 
             if is_dispatch:
                 entry_map = _case_entry_map(sidecar)
-                case_results, escalation = _run_dispatch_smoke(
+                exact_lengths = exact_slot_lengths(sidecar, width)
+                case_results, escalation, case_engines = _run_dispatch_smoke(
                     probe_bin,
                     n_cases,
                     selector,
@@ -922,11 +1108,13 @@ def run_smoke(
                     timeout_s=timeout_s,
                     module=module,
                     primary_engine=primary_engine,
+                    exact_lengths=exact_lengths,
+                    secondary_eacsl_bin=secondary_eacsl_bin,
                 )
             else:
                 entry_fn = sidecar.get("entry_fn")
                 entry_name = str(entry_fn) if isinstance(entry_fn, str) and entry_fn else None
-                case_results, escalation = _run_non_dispatch_smoke(
+                case_results, escalation, case_engines = _run_non_dispatch_smoke(
                     probe_bin,
                     entry_name,
                     seeds_dir,
@@ -934,6 +1122,7 @@ def run_smoke(
                     timeout_s=timeout_s,
                     module=module,
                     primary_engine=primary_engine,
+                    secondary_eacsl_bin=secondary_eacsl_bin,
                 )
         except SandboxUnavailable as exc:
             startup = {
@@ -948,19 +1137,19 @@ def run_smoke(
 
     if escalation is not None:
         _apply_startup_escalation(startup, escalation)
-        return _finish("startup_error", startup, case_results, 1)
+        return _finish("startup_error", startup, case_results, 1, case_engines)
 
     quarantined_count = sum(1 for c in case_results if c.get("status") == "quarantined")
     if is_dispatch:
         if quarantined_count == 0:
-            return _finish("ok", startup, case_results, 0)
+            return _finish("ok", startup, case_results, 0, case_engines)
         if quarantined_count < n_cases:
-            return _finish("degraded", startup, case_results, 0)
-        return _finish("failed", startup, case_results, 1)
+            return _finish("degraded", startup, case_results, 0, case_engines)
+        return _finish("failed", startup, case_results, 1, case_engines)
 
     if quarantined_count > 0:
-        return _finish("failed", startup, case_results, 1)
-    return _finish("ok", startup, case_results, 0)
+        return _finish("failed", startup, case_results, 1, case_engines)
+    return _finish("ok", startup, case_results, 0, case_engines)
 
 
 def _build_parser() -> argparse.ArgumentParser:

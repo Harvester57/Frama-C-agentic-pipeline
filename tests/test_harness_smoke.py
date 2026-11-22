@@ -12,6 +12,7 @@ import failure_identity as FI
 import harness_smoke as HS
 import minischema
 import sandbox_exec
+import validate_artifacts
 from sandbox_exec import SandboxResult
 
 pytestmark = pytest.mark.unit
@@ -23,6 +24,8 @@ _SMOKE_SCHEMA = minischema.load_schema(_SCHEMA_PATH)
 def _assert_valid_smoke_report(report: dict[str, Any]) -> None:
     errors = minischema.validate(report, _SMOKE_SCHEMA)
     assert errors == [], f"schema validation failed: {errors}"
+    va_errors = validate_artifacts.validate_harness_smoke(report, report.get("module"))
+    assert not va_errors, f"validate_artifacts failed: {va_errors}"
 
 
 def _write_sidecar(
@@ -913,4 +916,256 @@ def test_smoke_falls_back_to_eacsl_binary_when_san_intentionally_skipped(tmp_pat
     assert report["startup"]["ok"] is True
     assert report["startup"]["engines_checked"] == ["eacsl"]
     assert report["counts"] == {"total": 2, "passed": 2, "quarantined": 0, "candidate_warning": 0}
+    _assert_valid_smoke_report(report)
+
+
+# ---------------------------------------------------------------------------
+# W1-C: exact_slots probes & batched .e-acsl per-case smoke pass
+# ---------------------------------------------------------------------------
+
+_LOG_EACSL_CASE116_MEMCPY_SELF_FAULT = """\
+Running: {probe_path}
+memcpy: unallocated (or insufficient) space in source space
+==14== ERROR: libFuzzer: deadly signal
+    #0 0x00000046d818 in __sanitizer_print_stack_trace (/w/fuzz_mod.e-acsl+0x46d818)
+    #1 0x0000004403ec in fuzzer::PrintStackTrace() (/w/fuzz_mod.e-acsl+0x4403ec)
+    #2 0x78eefb65bc41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)
+    #3 0x00000058cb90 in raise_abort /w/e-acsl/internals/e_acsl_private_assert.c:26:3
+    #4 0x00000058cb90 in private_abort_fail /w/e-acsl/internals/e_acsl_private_assert.c:43:3
+    #5 0x0000005a0dee in validate_allocated_space /w/e-acsl/libc_replacements/e_acsl_string.c:102:5
+    #6 0x0000005a0dee in __e_acsl_builtin_memcpy /w/e-acsl/libc_replacements/e_acsl_string.c:222:3
+    #7 0x00000056739b in LLVMFuzzerTestOneInput /w/fuzz_mod.instrumented.c:189684:13
+    #8 0x000000426a6a in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/w/fuzz_mod.e-acsl+0x426a6a)
+    #9 0x000000440f56 in main (/w/fuzz_mod.e-acsl+0x440f56)
+SUMMARY: libFuzzer: deadly signal
+"""
+
+_LOG_EACSL_TARGET_MEMCPY_FAULT = """\
+Running: {probe_path}
+memcpy: unallocated (or insufficient) space in source space
+==14== ERROR: libFuzzer: deadly signal
+    #0 0x00000046d818 in __sanitizer_print_stack_trace (/w/fuzz_mod.e-acsl+0x46d818)
+    #1 0x78eefb65bc41 in raise (/lib/x86_64-linux-gnu/libc.so.6+0x3fc41)
+    #2 0x00000058cb90 in raise_abort /w/e-acsl/internals/e_acsl_private_assert.c:26:3
+    #3 0x0000005a0dee in __e_acsl_builtin_memcpy /w/e-acsl/libc_replacements/e_acsl_string.c:222:3
+    #4 0x000000550120 in __gen_e_acsl_QCBORDecode_GetNext /w/fuzz_mod.instrumented.c:44102:9
+    #5 0x00000056739b in LLVMFuzzerTestOneInput /w/fuzz_mod.instrumented.c:189684:13
+    #6 0x000000440f56 in main (/w/fuzz_mod.e-acsl+0x440f56)
+SUMMARY: libFuzzer: deadly signal
+"""
+
+
+def test_exact_slot_lengths_computes_selector_plus_fixed_slots():
+    sidecar = {
+        "api_cases": [
+            # No rest field -> no exact_slots probe.
+            {"selector": 0, "slots": [{"size": 4}], "rest": None},
+            # QCBOR Case 116 shape: 4 + 1 + 6*4 + 2*1 = 31 slot bytes + rest string.
+            {
+                "selector": 1,
+                "slots": [
+                    {"size": 4},
+                    {"size": 1},
+                    {"size": 4},
+                    {"size": 4},
+                    {"size": 4},
+                    {"size": 4},
+                    {"size": 4},
+                    {"size": 4},
+                    {"size": 1},
+                    {"size": 1},
+                ],
+                "rest": {"call": 11, "param": 0, "kind": "string"},
+            },
+            # Empty slots + rest -> exact length equals selector width.
+            {"selector": 2, "slots": [], "rest": {"call": 1, "param": 0, "kind": "string"}},
+            # Unknown slot size (None) -> omitted safely.
+            {"selector": 3, "slots": [{"size": 4}, {"size": None}], "rest": {"call": 0, "param": 1, "kind": "bytes"}},
+        ]
+    }
+    assert HS.exact_slot_lengths(sidecar, 1) == {1: 32, 2: 1}
+    assert HS.exact_slot_lengths(sidecar, 2) == {1: 33, 2: 2}
+
+
+def test_smoke_exact_slots_and_batched_eacsl_quarantines_unguarded_zero_len_memcpy(tmp_path, monkeypatch):
+    # Case 0: no rest (clean).
+    # Case 1: 31 fixed slot bytes + string rest -> exact_slots probe has total length S = 32 (payload_len = 31).
+    #         .san passes every probe (ASan permits zero-length memcpy at one-past-the-end),
+    #         while .e-acsl aborts with a pure-harness memcpy fault ONLY on the exact_slots probe (len == 32).
+    # Case 2: 8 fixed slot bytes + bytes rest (clean on both engines).
+    api_cases = [
+        {"selector": 0, "kind": "single", "calls": ["api_ok"], "slots": [{"size": 4}], "rest": None, "entry": "api_ok"},
+        {
+            "selector": 1,
+            "kind": "sequence",
+            "calls": ["QCBORDecode_Init", "QCBORDecode_Finish"],
+            "slots": [
+                {"size": 4},
+                {"size": 1},
+                {"size": 4},
+                {"size": 4},
+                {"size": 4},
+                {"size": 4},
+                {"size": 4},
+                {"size": 4},
+                {"size": 1},
+                {"size": 1},
+            ],
+            "rest": {"call": 11, "param": 0, "kind": "string"},
+            "entry": "QCBORDecode_Init",
+        },
+        {
+            "selector": 2,
+            "kind": "single",
+            "calls": ["UsefulInputBuf_GetBytes"],
+            "slots": [{"size": 8}],
+            "rest": {"call": 1, "param": 1, "kind": "bytes"},
+            "entry": "UsefulInputBuf_GetBytes",
+        },
+    ]
+    sidecar = _write_sidecar(tmp_path, "mod_qcbor116", dispatch_case_count=3, api_cases=api_cases)
+    san_bin = _make_fake_bin(tmp_path / "workspace" / "harnesses" / "fuzz_mod_qcbor116.san")
+    eacsl_bin = _make_fake_bin(tmp_path / "workspace" / "harnesses" / "fuzz_mod_qcbor116.e-acsl")
+    out_json = tmp_path / "workspace" / "reports" / "smoke" / "mod_qcbor116.json"
+
+    san_probes_seen: list[tuple[int, int]] = []
+    eacsl_batch_sizes: list[int] = []
+
+    def fake_run(argv, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        bin_name = Path(argv[0]).name
+        probes = _extract_probe_paths(argv)
+        is_eacsl = bin_name.endswith(".e-acsl")
+        if is_eacsl and len(probes) > 1:
+            eacsl_batch_sizes.append(len(probes))
+        for p in probes:
+            raw = p.read_bytes()
+            if not raw or raw == b"\xff":
+                continue
+            sel = raw[0]
+            if not is_eacsl:
+                san_probes_seen.append((sel, len(raw)))
+            if is_eacsl and sel == 1 and len(raw) == 32:
+                # Unguarded memcpy(dst, fuzz_buf + 31, 0) on exact-slot length (rest_n == 0).
+                assert raw == b"\x01" + (b"\x00" * 31)
+                return SandboxResult(
+                    returncode=77,
+                    stdout="",
+                    stderr=_LOG_EACSL_CASE116_MEMCPY_SELF_FAULT.format(probe_path=p),
+                    timed_out=False,
+                    sandbox="rlimits",
+                    command=list(argv),
+                )
+        return SandboxResult(returncode=0, stdout="", stderr="", timed_out=False, sandbox="rlimits", command=list(argv))
+
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
+    report, rc = HS.run_smoke(
+        module="mod_qcbor116",
+        sidecar_path=sidecar,
+        out_json=out_json,
+        san_bin=san_bin,
+        eacsl_bin=eacsl_bin,
+    )
+
+    # Exact-slot probes were generated for case 1 (S=32) and case 2 (S=9), and NOT for case 0 (rest=None).
+    assert (1, 32) in san_probes_seen
+    assert (2, 9) in san_probes_seen
+    assert [length for sel, length in san_probes_seen if sel == 0] == [1, 65]
+    # .e-acsl ran a single initial batch covering all 3 cases (2 + 3 + 3 = 8 probes).
+    assert eacsl_batch_sizes[0] == 8
+
+    assert rc == 0
+    assert report["status"] == "degraded"
+    assert report["case_engines_checked"] == ["sanitizers", "eacsl"]
+    assert report["quarantined_cases"] == [1]
+    assert report["skip_cases_env"] == "1"
+    assert report["candidate_warning_cases"] == []
+
+    by_case = {c["case"]: c for c in report["case_results"]}
+    assert by_case[0]["status"] == "passed"
+    assert by_case[2]["status"] == "passed"
+    assert by_case[1]["status"] == "quarantined"
+    assert by_case[1]["engine"] == "eacsl"
+    assert by_case[1]["classification"] == "harness_setup_fault"
+    assert by_case[1]["probe_kind"] == "exact_slots"
+    assert by_case[1]["payload_len"] == 31
+    assert by_case[1]["failure"]["function"] == "LLVMFuzzerTestOneInput"
+    assert by_case[1]["failure"]["harness_self_fault"] is True
+    _assert_valid_smoke_report(report)
+
+
+def test_smoke_eacsl_target_frame_crash_stays_candidate_warning_and_skips_san_quarantined(tmp_path, monkeypatch):
+    # Case 0: quarantined by .san -> must NOT be re-probed on .e-acsl.
+    # Case 1: passes .san, hits E-ACSL memcpy fault inside a TARGET function on exact_slots -> candidate_warning, NOT quarantined.
+    api_cases = [
+        {"selector": 0, "kind": "single", "calls": ["obj_destroy"], "slots": [], "rest": None, "entry": "obj_destroy"},
+        {
+            "selector": 1,
+            "kind": "single",
+            "calls": ["QCBORDecode_GetNext"],
+            "slots": [{"size": 4}],
+            "rest": {"call": 0, "param": 1, "kind": "bytes"},
+            "entry": "QCBORDecode_GetNext",
+        },
+    ]
+    sidecar = _write_sidecar(tmp_path, "mod_eacsl_target", dispatch_case_count=2, api_cases=api_cases)
+    san_bin = _make_fake_bin(tmp_path / "fuzz_mod_eacsl_target.san")
+    eacsl_bin = _make_fake_bin(tmp_path / "fuzz_mod_eacsl_target.e-acsl")
+    out_json = tmp_path / "smoke_target.json"
+
+    eacsl_cases_seen: set[int] = set()
+
+    def fake_run(argv, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        is_eacsl = Path(argv[0]).name.endswith(".e-acsl")
+        for p in _extract_probe_paths(argv):
+            raw = p.read_bytes()
+            if not raw or raw == b"\xff":
+                continue
+            sel = raw[0]
+            if is_eacsl:
+                eacsl_cases_seen.add(sel)
+            if not is_eacsl and sel == 0 and len(raw) == 65:
+                return SandboxResult(
+                    returncode=1,
+                    stdout="",
+                    stderr=_LOG_NON_MALLOC_FREE.format(probe_path=p),
+                    timed_out=False,
+                    sandbox="rlimits",
+                    command=list(argv),
+                )
+            if is_eacsl and sel == 1 and len(raw) == 5:
+                return SandboxResult(
+                    returncode=77,
+                    stdout="",
+                    stderr=_LOG_EACSL_TARGET_MEMCPY_FAULT.format(probe_path=p),
+                    timed_out=False,
+                    sandbox="rlimits",
+                    command=list(argv),
+                )
+        return SandboxResult(returncode=0, stdout="", stderr="", timed_out=False, sandbox="rlimits", command=list(argv))
+
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
+    report, rc = HS.run_smoke(
+        module="mod_eacsl_target",
+        sidecar_path=sidecar,
+        out_json=out_json,
+        san_bin=san_bin,
+        eacsl_bin=eacsl_bin,
+    )
+
+    assert rc == 0
+    assert report["status"] == "degraded"
+    assert eacsl_cases_seen == {1}  # Case 0 was already quarantined by .san
+    assert report["quarantined_cases"] == [0]
+    assert report["candidate_warning_cases"] == [1]
+
+    by_case = {c["case"]: c for c in report["case_results"]}
+    assert by_case[0]["status"] == "quarantined"
+    assert by_case[0]["engine"] == "sanitizers"
+    assert by_case[1]["status"] == "candidate_warning"
+    assert by_case[1]["engine"] == "eacsl"
+    assert by_case[1]["classification"] == "target_crash_candidate"
+    assert by_case[1]["probe_kind"] == "exact_slots"
+    assert by_case[1]["payload_len"] == 4
+    assert by_case[1]["failure"]["function"] == "QCBORDecode_GetNext"
+    assert not by_case[1]["failure"].get("harness_self_fault")
     _assert_valid_smoke_report(report)
