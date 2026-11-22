@@ -51,6 +51,7 @@ typedef uint64_t __uint64_t;
 #define framac_fuzz_skip_case framac_fuzz_skip_case
 static inline int framac_fuzz_skip_case(unsigned int c) {
     static unsigned long long framac_fuzz_rt_skip_words[64];
+    static int framac_fuzz_rt_only_case = -1;
     static int framac_fuzz_rt_skip_init = 0;
     if (!framac_fuzz_rt_skip_init) {
         const char *env = getenv("FRAMAC_FUZZ_SKIP_CASES");
@@ -81,7 +82,18 @@ static inline int framac_fuzz_skip_case(unsigned int c) {
                 }
             }
         }
+        const char *only_env = getenv("FRAMAC_FUZZ_ONLY_CASE");
+        if (only_env != NULL && *only_env >= '0' && *only_env <= '9') {
+            char *endptr = NULL;
+            long only_val = strtol(only_env, &endptr, 10);
+            if (endptr != only_env && endptr != NULL && *endptr == '\0' && only_val >= 0L && only_val < 4096L) {
+                framac_fuzz_rt_only_case = (int)only_val;
+            }
+        }
         framac_fuzz_rt_skip_init = 1;
+    }
+    if (framac_fuzz_rt_only_case >= 0 && c != (unsigned int)framac_fuzz_rt_only_case) {
+        return 1;
     }
     if (c >= 4096U) {
         return 0;
