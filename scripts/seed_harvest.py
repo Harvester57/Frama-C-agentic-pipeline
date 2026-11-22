@@ -77,7 +77,8 @@ import re
 import shutil
 import sys
 import time
-from collections.abc import Sequence
+from collections import OrderedDict
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -110,8 +111,10 @@ MAX_FILES = 64  # secondary seeds: data files the tests open
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SEEDS_PER_MODULE = 2000
 WRAP_LIMIT = 4000  # functions one recorder can wrap
-MAX_TRACE_CALLS = 256  # calls kept, in order, of one process's trace
-MAX_TRACES = 512  # distinct traces kept (one per process)
+MAX_TRACE_CALLS = 256  # calls kept, in order, of one trace segment
+MAX_TRACES = 512  # distinct trace segments kept across all processes
+MAX_ACTIVE_CONTEXTS = 4096  # open per-address context segments tracked simultaneously per process
+NON_CONTEXT_WINDOW_CALLS = 64  # bounded sliding window for non-context / unlinked calls
 EXECUTABLE_TIMEOUT_S = 60  # one run of a non-test executable, when the recipe has no test command
 SEED_PREFIX = "seed-"
 
@@ -168,6 +171,13 @@ _ATTR_START_RE = re.compile(r"\b__attribute(?:__)?\s*\(")
 _SHARED_OBJECT_RE = re.compile(r"\.so(?:\.\d+)*$")
 _TAG_RE = re.compile(r"^(struct|union|enum)\s+([A-Za-z_]\w*)$")
 _IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
+# Lifecycle boundaries for per-context trace segmentation (matching api_harness._INIT_NAME_RE).
+_INIT_NAME_RE = re.compile(r"(?:^|(?<=[a-z0-9_]))Init(?=[A-Z0-9_]|$)|(?:^|_)(?:init|new|create)(?:$|_)")
+_DTOR_NAME_RE = re.compile(
+    r"(?:^|_)(?:release|free|destroy|delete|cleanup|deinit|fini|unref)(?:$|_)|"
+    r"(?:^|(?<=[a-z0-9_]))(?:Free|Destroy|Release|Delete|Cleanup|Deinit|Fini|Unref)(?=[A-Z0-9_]|$)|"
+    r"(?:^|_)(?:close|finish)$|(?:^|_)Close$|(?:^|_)Finish$"
+)
 
 
 class SeedError(RuntimeError):
@@ -1109,48 +1119,216 @@ def _sandboxed(argv: list[str], cwd: Path, scratch: Path, timeout: int, env: dic
     return run_sandboxed(argv, [scratch], timeout, cwd=cwd, limits=limits, extra_env=env)
 
 
+def _valid_ptr_addr(addr: Any) -> str | None:
+    if isinstance(addr, str) and addr and addr not in ("0", "-"):
+        return addr
+    return None
+
+
+def _segment_richness(calls: Sequence[dict[str, Any]]) -> tuple[int, int]:
+    """Score a segment for tie-breaking identical function-name signatures: recorded args, then total bytes."""
+    arg_count = 0
+    byte_count = 0
+    for call in calls:
+        for vals in (call.get("args") or {}).values():
+            for _kind, _off, hexv in vals:
+                arg_count += 1
+                byte_count += len(hexv) // 2
+    return (arg_count, byte_count)
+
+
+def _emit_sliding_windows(
+    items: list[tuple[int, dict[str, Any]]],
+    win_cap: int,
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield bounded sliding windows (2..win_cap calls) over chronologically ordered fallback calls."""
+    step = max(1, win_cap // 2)
+    buf: list[dict[str, Any]] = []
+    has_new = False
+    for _seq, call in items:
+        buf.append(call)
+        has_new = True
+        if len(buf) >= win_cap:
+            yield list(buf)
+            buf = buf[step:]
+            has_new = False
+    if has_new and len(buf) >= 2:
+        yield buf
+
+
+def iter_trace_segments(
+    calls: Iterable[dict[str, Any]],
+    max_calls: int | None = None,
+    non_context_window: int | None = None,
+) -> Iterator[list[dict[str, Any]]]:
+    """
+    Stream a single process's recorded trace calls into bounded per-context segments (`2..max_calls`).
+
+    Calls carrying a first pointer argument address (`addrs["0"]`) are grouped per context address; a
+    new segment starts whenever an initializer-like function (`_INIT_NAME_RE`) or the first
+    non-destructor call after a destructor-like function (`_DTOR_NAME_RE`) reuses that address. Calls
+    whose `addrs["0"]` is new but another pointer argument references an open non-destroyed context
+    attach to that context (preserving producer-consumer chains such as `keypair -> box`). Calls
+    without a context address (and single-call orphan segments) flow through a bounded sliding window.
+    """
+    cap = max(2, MAX_TRACE_CALLS if max_calls is None else max_calls)
+    win_cap = max(2, min(NON_CONTEXT_WINDOW_CALLS if non_context_window is None else non_context_window, cap))
+    step = max(1, win_cap // 2)
+
+    active: OrderedDict[str, list[tuple[int, dict[str, Any]]]] = OrderedDict()
+    dtor_seen: dict[str, bool] = {}
+    fallback_buf: list[tuple[int, dict[str, Any]]] = []
+    fallback_dirty = False
+    orphans: list[tuple[int, dict[str, Any]]] = []
+
+    def _push_fallback(entry: tuple[int, dict[str, Any]]) -> list[dict[str, Any]] | None:
+        nonlocal fallback_buf, fallback_dirty
+        fallback_buf.append(entry)
+        fallback_dirty = True
+        if len(fallback_buf) >= win_cap:
+            emitted = [c for _, c in fallback_buf]
+            fallback_buf = fallback_buf[step:]
+            fallback_dirty = False
+            return emitted
+        return None
+
+    def _flush_orphans_if_large() -> Iterator[list[dict[str, Any]]]:
+        nonlocal orphans
+        if len(orphans) < MAX_ACTIVE_CONTEXTS:
+            return
+        orphans.sort(key=lambda pair: pair[0])
+        cut = len(orphans) // 2
+        yield from _emit_sliding_windows(orphans[:cut], win_cap)
+        orphans = orphans[cut:]
+
+    for seq, call in enumerate(calls):
+        fn = str(call.get("fn") or "")
+        addrs = call.get("addrs") or {}
+        addr0 = _valid_ptr_addr(addrs.get("0"))
+        is_init = bool(_INIT_NAME_RE.search(fn))
+        is_dtor = bool(_DTOR_NAME_RE.search(fn))
+
+        if addr0 is not None:
+            if addr0 in active:
+                if is_init or (dtor_seen.get(addr0, False) and not is_dtor):
+                    old = active.pop(addr0)
+                    dtor_seen.pop(addr0, None)
+                    if len(old) >= 2:
+                        yield [c for _, c in old]
+                    elif old:
+                        orphans.append(old[0])
+                        yield from _flush_orphans_if_large()
+                    active[addr0] = [(seq, call)]
+                    dtor_seen[addr0] = is_dtor
+                else:
+                    seg = active[addr0]
+                    if len(seg) < cap:
+                        seg.append((seq, call))
+                    active.move_to_end(addr0)
+                    if is_dtor:
+                        dtor_seen[addr0] = True
+                continue
+
+            linked_addr: str | None = None
+            if not is_init:
+                for idx in sorted(addrs):
+                    if idx == "0":
+                        continue
+                    other = _valid_ptr_addr(addrs[idx])
+                    if other is not None and other in active and not dtor_seen.get(other, False):
+                        linked_addr = other
+                        break
+            if linked_addr is not None:
+                seg = active[linked_addr]
+                if len(seg) < cap:
+                    seg.append((seq, call))
+                active.move_to_end(linked_addr)
+                continue
+
+            active[addr0] = [(seq, call)]
+            dtor_seen[addr0] = is_dtor
+            if len(active) > MAX_ACTIVE_CONTEXTS:
+                old_addr, old = active.popitem(last=False)
+                dtor_seen.pop(old_addr, None)
+                if len(old) >= 2:
+                    yield [c for _, c in old]
+                elif old:
+                    orphans.append(old[0])
+                    yield from _flush_orphans_if_large()
+        else:
+            emitted = _push_fallback((seq, call))
+            if emitted is not None:
+                yield emitted
+
+    for seg in active.values():
+        if len(seg) >= 2:
+            yield [c for _, c in seg]
+        elif seg:
+            orphans.append(seg[0])
+
+    if orphans:
+        combined = sorted([*fallback_buf, *orphans], key=lambda pair: pair[0])
+        yield from _emit_sliding_windows(combined, win_cap)
+    elif fallback_dirty and len(fallback_buf) >= 2:
+        yield [c for _, c in fallback_buf]
+
+
 def _collect(report: dict, out_dir: Path, opened: list[str], tree: Path, started: float) -> None:
     """Deduplicate the recorded calls into workspace/seed_records, copy the data files, finish the report."""
     if RECORDS_DIR.exists():
         shutil.rmtree(RECORDS_DIR)
     (RECORDS_DIR / "files").mkdir(parents=True)
     seen: set[str] = set()
-    seen_traces: set[str] = set()
+    # Ordered function-name tuple -> (pid, calls, richness); preserves first-seen order while allowing
+    # a richer instance of the same signature to upgrade its slot without consuming extra capacity.
+    kept_traces: dict[tuple[str, ...], tuple[str, list[dict[str, Any]], tuple[int, int]]] = {}
     per_fn: dict[str, int] = {}
     total = unique = bad = 0
-    with (
-        (RECORDS_DIR / "calls.jsonl").open("w", encoding="utf-8", newline="\n") as out,
-        (RECORDS_DIR / "traces.jsonl").open("w", encoding="utf-8", newline="\n") as tr_out,
-    ):
-        # One file per process, its calls in order: the trace of that process.
+    max_traces = max(0, MAX_TRACES)
+
+    def _record_segment(pid: str, seg: list[dict[str, Any]]) -> None:
+        if len(seg) < 2 or max_traces == 0:
+            return
+        sig = tuple(str(c["fn"]) for c in seg)
+        richness = _segment_richness(seg)
+        existing = kept_traces.get(sig)
+        if existing is not None:
+            if richness > existing[2]:
+                kept_traces[sig] = (pid, seg, richness)
+        elif len(kept_traces) < max_traces:
+            kept_traces[sig] = (pid, seg, richness)
+
+    with (RECORDS_DIR / "calls.jsonl").open("w", encoding="utf-8", newline="\n") as out:
+        # One file per process, streamed in full into bounded per-context trace segments.
         for path in sorted(out_dir.glob("calls-*.txt")) if out_dir.is_dir() else []:
-            trace: list[dict] = []
-            for line in path.read_text(encoding="ascii", errors="replace").splitlines():
-                rec = parse_record_line(line)
-                if rec is None:
-                    bad += 1
-                    continue
-                total += 1
-                if len(trace) < MAX_TRACE_CALLS:
-                    trace.append(trace_call(rec))
-                # Addresses differ between runs: the same arguments are the same call.
-                call = {"fn": rec["fn"], "args": rec["args"]}
-                text = json.dumps(call, separators=(",", ":"), sort_keys=True)
-                key = hashlib.sha256(text.encode()).hexdigest()
-                if key in seen or per_fn.get(rec["fn"], 0) >= MAX_UNIQUE_CALLS_PER_FUNCTION:
-                    continue
-                seen.add(key)
-                per_fn[rec["fn"]] = per_fn.get(rec["fn"], 0) + 1
-                unique += 1
-                out.write(json.dumps(call, separators=(",", ":")) + "\n")
-            if len(trace) > 1 and len(seen_traces) < MAX_TRACES:
-                shape = json.dumps([[c["fn"], c["args"]] for c in trace], separators=(",", ":"), sort_keys=True)
-                digest = hashlib.sha256(shape.encode()).hexdigest()
-                if digest not in seen_traces:
-                    seen_traces.add(digest)
-                    tr_out.write(
-                        json.dumps({"pid": path.stem.split("-", 1)[-1], "calls": trace}, separators=(",", ":")) + "\n"
-                    )
+            pid = path.stem.split("-", 1)[-1]
+
+            def _stream_file(p: Path) -> Iterator[dict[str, Any]]:
+                nonlocal total, unique, bad
+                with p.open("r", encoding="ascii", errors="replace") as fh:
+                    for line in fh:
+                        rec = parse_record_line(line)
+                        if rec is None:
+                            bad += 1
+                            continue
+                        total += 1
+                        # Addresses differ between runs: the same arguments are the same call.
+                        call = {"fn": rec["fn"], "args": rec["args"]}
+                        text = json.dumps(call, separators=(",", ":"), sort_keys=True)
+                        key = hashlib.sha256(text.encode()).hexdigest()
+                        if key not in seen and per_fn.get(rec["fn"], 0) < MAX_UNIQUE_CALLS_PER_FUNCTION:
+                            seen.add(key)
+                            per_fn[rec["fn"]] = per_fn.get(rec["fn"], 0) + 1
+                            unique += 1
+                            out.write(json.dumps(call, separators=(",", ":")) + "\n")
+                        yield trace_call(rec)
+
+            for seg in iter_trace_segments(_stream_file(path)):
+                _record_segment(pid, seg)
+
+    with (RECORDS_DIR / "traces.jsonl").open("w", encoding="utf-8", newline="\n") as tr_out:
+        for pid, seg, _richness in kept_traces.values():
+            tr_out.write(json.dumps({"pid": pid, "calls": seg}, separators=(",", ":")) + "\n")
     files: list[dict] = []
     for p in opened:
         path = Path(p)
@@ -1160,7 +1338,7 @@ def _collect(report: dict, out_dir: Path, opened: list[str], tree: Path, started
         digest = hashlib.sha256(data).hexdigest()
         (RECORDS_DIR / "files" / digest[:32]).write_bytes(data)
         files.append({"path": path.relative_to(tree).as_posix(), "bytes": len(data), "sha256": digest})
-    report["traces"] = len(seen_traces)
+    report["traces"] = len(kept_traces)
     report["calls"] = {
         "recorded": total,
         "unique": unique,
