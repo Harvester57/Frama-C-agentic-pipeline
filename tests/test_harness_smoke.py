@@ -185,6 +185,9 @@ Direct leak of 64 byte(s) in 1 object(s) allocated from:
         ("on", True),
         ("1", True),
         ("true", True),
+        ("yes", True),
+        ("YES", True),
+        (" yes ", True),
         ("ON", True),
         (" True ", True),
     ],
@@ -800,3 +803,114 @@ def test_smoke_schema_rejects_malformed_reports():
 
     extra_prop = {**valid, "unexpected_key": 123}
     assert minischema.validate(extra_prop, _SMOKE_SCHEMA)
+
+
+def test_is_startup_failure_does_not_misclassify_parsed_target_eacsl_abort_on_seed_zero():
+    # MINOR-3 regression: an E-ACSL abort on seed 0 of a directory run may print `INFO: Seed:`
+    # followed by `<file>:<line>: Error: Assertion failed:` without `Running:` / `#N` / stack trace.
+    # Because the parsed failure identifies a non-startup target site, it must NOT be treated as a
+    # startup failure.
+    eacsl_seed0_log = (
+        "INFO: Seed: 12345\n"
+        "src/parser.c: In function 'parse_hdr'\n"
+        "src/parser.c:42: Error: Assertion failed:\n"
+        "        The failing predicate is:\n"
+        "        rte/mem_access:\n"
+        "            \\valid_read(p).\n"
+    )
+    parsed = FI.parse_runtime_failure(eacsl_seed0_log)
+    assert parsed is not None
+    assert parsed["function"] == "parse_hdr"
+    assert FI.is_startup_failure(parsed, eacsl_seed0_log) == (False, None)
+    assert FI.is_startup_failure(None, eacsl_seed0_log) == (False, None)
+
+    # An unattributed banner abort (no target function/file) STILL classifies as a startup failure.
+    unattributed_banner_log = "INFO: Seed: 42\n==99==ERROR: AddressSanitizer: SEGV on unknown address 0x0\n"
+    parsed_unattr = FI.parse_runtime_failure(unattributed_banner_log)
+    ok_none, _ = FI.is_startup_failure(None, unattributed_banner_log)
+    ok_parsed, _ = FI.is_startup_failure(parsed_unattr, unattributed_banner_log)
+    assert ok_none is True
+    assert ok_parsed is True
+
+
+def test_resolve_binaries_prefers_build_json_binaries_map(tmp_path):
+    # MINOR-5 regression: `build.json["binaries"]` (written by fuzz_build.py) takes precedence
+    # over legacy `sanitizer_compile` / `binary` fields.
+    san_new = _make_fake_bin(tmp_path / "fuzz_m.san")
+    eacsl_new = _make_fake_bin(tmp_path / "fuzz_m.e-acsl")
+    san_old = _make_fake_bin(tmp_path / "legacy.san")
+    eacsl_old = _make_fake_bin(tmp_path / "legacy.e-acsl")
+    build_json = tmp_path / "m.build.json"
+    build_json.write_text(
+        json.dumps(
+            {
+                "mode": "build",
+                "module": "m",
+                "status": "built",
+                "engine_used": "eacsl",
+                "binary": str(eacsl_old),
+                "sanitizer_compile": {"returncode": 0, "binary": str(san_old)},
+                "binaries": {
+                    "sanitizers": str(san_new),
+                    "eacsl": str(eacsl_new),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolved_san, resolved_eacsl = HS.resolve_binaries(None, None, build_json)
+    assert resolved_san == san_new
+    assert resolved_eacsl == eacsl_new
+
+
+def test_smoke_falls_back_to_eacsl_binary_when_san_intentionally_skipped(tmp_path, monkeypatch):
+    # MINOR-5 regression: when a module builds with `--fuzz-engine eacsl` (no sanitizer binary in
+    # build.json), `harness_smoke.py` probes `.e-acsl` cleanly instead of failing with
+    # "sanitizer binary not found".
+    sidecar = _write_sidecar(tmp_path, "mod_eacsl_only", dispatch_case_count=2)
+    eacsl_bin = _make_fake_bin(tmp_path / "workspace" / "harnesses" / "fuzz_mod_eacsl_only.e-acsl")
+    build_json = tmp_path / "workspace" / "build" / "mod_eacsl_only.build.json"
+    build_json.parent.mkdir(parents=True, exist_ok=True)
+    build_json.write_text(
+        json.dumps(
+            {
+                "mode": "build",
+                "module": "mod_eacsl_only",
+                "status": "built",
+                "engine_used": "eacsl",
+                "binary": str(eacsl_bin),
+                "compile": {"returncode": 0, "binary": str(eacsl_bin), "engine": "eacsl"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_json = tmp_path / "workspace" / "reports" / "smoke" / "mod_eacsl_only.json"
+    seen_bins: list[str] = []
+
+    def fake_run(argv, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        seen_bins.append(Path(argv[0]).name)
+        return SandboxResult(returncode=0, stdout="", stderr="", timed_out=False, sandbox="rlimits", command=list(argv))
+
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
+    rc = HS.main(
+        [
+            "run",
+            "--module",
+            "mod_eacsl_only",
+            "--build-json",
+            str(build_json),
+            "--sidecar",
+            str(sidecar),
+            "--out-json",
+            str(out_json),
+        ]
+    )
+    assert rc == 0
+    assert seen_bins and all(name == "fuzz_mod_eacsl_only.e-acsl" for name in seen_bins)
+    report = json.loads(out_json.read_text(encoding="utf-8"))
+    assert report["status"] == "ok"
+    assert report["startup"]["ok"] is True
+    assert report["startup"]["engines_checked"] == ["eacsl"]
+    assert report["counts"] == {"total": 2, "passed": 2, "quarantined": 0, "candidate_warning": 0}
+    _assert_valid_smoke_report(report)
+

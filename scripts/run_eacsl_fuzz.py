@@ -1163,15 +1163,20 @@ def run_campaign_rounds(
     eff_explore_judge = resources.fuzz_explore_judge_enabled() if explore_judge is None else bool(explore_judge)
     smoke_list = sorted({int(c) for c in (smoke_skipped_cases or []) if int(c) >= 0})
 
+    def _strip_private(doc: dict[str, Any]) -> dict[str, Any]:
+        doc.pop("_raw_crashes", None)
+        doc.pop("_case_passes", None)
+        return doc
+
     if not keep_going:
-        res = campaign(binary, max_time, False)
+        res = _strip_private(dict(campaign(binary, max_time, False)))
         if smoke_list:
             res["smoke_skipped_cases"] = smoke_list
         return res
 
     if not n_cases:
         if not eff_explore_judge:
-            res = campaign(binary, max_time, True)
+            res = _strip_private(dict(campaign(binary, max_time, True)))
             res["keep_going"] = {"mode": "fork"}
             if res.get("single_process_reason"):
                 res["keep_going"]["single_process_reason"] = res["single_process_reason"]
@@ -1195,7 +1200,7 @@ def run_campaign_rounds(
             threshold=fork_blinding_threshold,
         )
         if blind_info is not None:
-            out = dict(first)
+            out = _strip_private(dict(first))
             out["status"] = "blinded"
             out["partial_blinded"] = False
             out["blinded_fingerprint"] = blind_info.get("fingerprint")
@@ -1231,7 +1236,7 @@ def run_campaign_rounds(
                     combined_arts.append(a)
             merged_arts, dropped_dups = _collapse_duplicate_artifacts(combined_arts)
             merged_tel = merge_telemetry([first.get("telemetry"), second.get("telemetry")], build_s=build_s)
-            out = dict(second)
+            out = _strip_private(dict(second))
             out["artifacts"] = merged_arts
             out["telemetry"] = merged_tel
             out["fuzz_s"] = round(total_spent, 3)
@@ -1259,7 +1264,7 @@ def run_campaign_rounds(
                 out["keep_going"]["stops_at_first_crash"] = True
             return out
 
-        res = dict(first)
+        res = _strip_private(dict(first))
         res["keep_going"] = {"mode": "fork"}
         if res.get("single_process_reason"):
             res["keep_going"]["single_process_reason"] = res["single_process_reason"]
@@ -4038,9 +4043,17 @@ def main(argv: list[str] | None = None) -> int:
                 if "diagnostic_hints" not in res:
                     res["diagnostic_hints"] = derive_eacsl_diagnostic_hints(res)
     except SandboxUnavailable as exc:
-        res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
-        if args.mode == "guardrail":
-            res["crash_input"] = None
+        if args.mode == "judge":
+            res = _judge_error_report(
+                getattr(args, "module", "") or "unknown",
+                profile=getattr(args, "profile", "standard") or "standard",
+                reason=f"sandbox_unavailable: {exc}",
+                corpus_cap=getattr(args, "max_corpus_inputs", None),
+            )
+        else:
+            res = {"mode": args.mode, "status": "sandbox_unavailable", "reason": str(exc)}
+            if args.mode == "guardrail":
+                res["crash_input"] = None
 
     if args.mode == "guardrail":
         # What E-ACSL did not execute, on every status: run_guardrail_check set the same fields from the
@@ -4072,6 +4085,10 @@ def main(argv: list[str] | None = None) -> int:
         if str(res.get("reason") or "").startswith("sandbox_unavailable"):
             return 3
         return 0 if res.get("status") in ("reproduced", "not_reproduced") else 1
+    if args.mode == "judge":
+        if str(res.get("reason") or "").startswith("sandbox_unavailable"):
+            return 3
+        return 0
     return 3 if res.get("status") == "sandbox_unavailable" else 0
 
 
@@ -4649,6 +4666,71 @@ def link_cross_engine_findings(
     return links
 
 
+def _judge_error_report(
+    module: str,
+    *,
+    profile: str = "standard",
+    reason: str,
+    corpus_cap: int | None = None,
+    binary: str | None = None,
+) -> dict[str, Any]:
+    """Schema-valid `judge_report.schema.json` report for judge-level errors (e.g. `SandboxUnavailable`)."""
+    prof = (profile or "standard").strip().lower()
+    if prof not in JUDGE_CORPUS_CAP_BY_PROFILE:
+        prof = "standard"
+    cap = int(corpus_cap) if corpus_cap is not None else JUDGE_CORPUS_CAP_BY_PROFILE[prof]
+    mod_name = (module or "").strip() or "unknown"
+    return {
+        "schema_version": JUDGE_SCHEMA_VERSION,
+        "mode": "judge",
+        "module": mod_name,
+        "generated_at": utc_now(),
+        "discovering_step": "judge",
+        "engine_used": "eacsl" if binary else None,
+        "profile": prof,
+        "status": "judge_error",
+        "binary": binary,
+        "corpus_cap": max(0, cap),
+        "inputs": {
+            "total": 0,
+            "mandatory": 0,
+            "grown_total": 0,
+            "grown_selected": 0,
+            "selected": 0,
+            "judged": 0,
+            "passed": 0,
+            "failed": 0,
+            "not_judged": 0,
+            "not_judged_breakdown": {
+                "cap": 0,
+                "timeout": 0,
+                "blinded": 0,
+                "smoke_skipped": 0,
+                "error": 0,
+            },
+        },
+        "not_judged": 0,
+        "artifacts": [],
+        "batch_state_only": [],
+        "cross_engine_links": [],
+        "smoke_skipped_cases": [],
+        "blinded_cases": [],
+        "partial_blinded": False,
+        "telemetry": {
+            "judge_s": 0.0,
+            "batch_s": 0.0,
+            "confirm_s": 0.0,
+            "inputs_per_s": 0.0,
+            "batches_run": 0,
+            "fresh_confirmations": 0,
+        },
+        "harness_digest": None,
+        "dispatch_case_count": None,
+        "dispatch_selector": None,
+        "reason": reason,
+    }
+
+
 def run_judge(
     module: str,
     build_json: dict[str, Any] | Path | str,
@@ -4842,6 +4924,7 @@ def run_judge(
     batch_s = 0.0
     confirm_s = 0.0
     startup_err: str | None = None
+    sandbox_err: str | None = None
     module_blinded_non_dispatch = False
     non_dispatch_blind_fp: str | None = None
 
@@ -5070,6 +5153,11 @@ def run_judge(
             mid = len(batch) // 2
             pending.appendleft(batch[mid:])
             pending.appendleft(batch[:mid])
+    except SandboxUnavailable as exc:
+        sandbox_err = f"sandbox_unavailable: {exc}"
+        accounted = passed + failed + not_judged_timeout + not_judged_blinded + not_judged_error
+        not_judged_error += max(0, len(selected) - accounted)
+        pending.clear()
     finally:
         if own_scratch:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -5080,7 +5168,9 @@ def run_judge(
     partial_blinded = False
     blinded_fp: str | None = non_dispatch_blind_fp
 
-    if startup_err is not None:
+    if sandbox_err is not None:
+        status = "judge_error"
+    elif startup_err is not None:
         status = "startup_error"
     elif module_blinded_non_dispatch:
         status = "blinded"
@@ -5115,6 +5205,7 @@ def run_judge(
         confirm_s=confirm_s,
         batches_run=batches_run,
         fresh_confirmations=fresh_confirmations,
+        reason=sandbox_err,
         startup_error=startup_err,
         omitted_dups=omitted_dups,
     )

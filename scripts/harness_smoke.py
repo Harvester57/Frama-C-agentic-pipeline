@@ -81,7 +81,7 @@ MAX_NON_DISPATCH_SEEDS = 4
 LOG_TAIL_CHARS = 3000
 STACK_TRACE_MAX_CHARS = 4000
 
-_ON_VALUES = frozenset({"on", "1", "true"})
+_ON_VALUES = frozenset({"on", "1", "true", "yes"})
 _RUNNING_RE = re.compile(r"^Running:\s+(?P<path>\S+)\s*$", re.MULTILINE)
 _ERROR_LINE_RE = re.compile(
     r"(?:==\d+==ERROR:|SUMMARY:|runtime error:|Error:|Aborted\b|Segmentation fault|"
@@ -91,7 +91,7 @@ _ERROR_LINE_RE = re.compile(
 
 
 def harness_smoke_enabled() -> bool:
-    """Whether the standalone harness smoke gate is enabled (`FRAMAC_HARNESS_SMOKE=on|1|true`, default off)."""
+    """Whether the standalone harness smoke gate is enabled (`FRAMAC_HARNESS_SMOKE=on|1|true|yes`, default off)."""
     return (os.environ.get("FRAMAC_HARNESS_SMOKE") or "").strip().lower() in _ON_VALUES
 
 
@@ -189,7 +189,12 @@ def resolve_binaries(
     if primary_bin is None and isinstance(data.get("compile"), dict):
         primary_bin = _pick_path(data["compile"].get("binary"))
 
-    san_from_json = _pick_path(data.get("san_bin")) or _pick_path(data.get("sanitizer_binary"))
+    raw_binaries = data.get("binaries")
+    binaries_map: dict[str, Any] = raw_binaries if isinstance(raw_binaries, dict) else {}
+
+    san_from_json = _pick_path(binaries_map.get("sanitizers"))
+    if san_from_json is None:
+        san_from_json = _pick_path(data.get("san_bin")) or _pick_path(data.get("sanitizer_binary"))
     if san_from_json is None and isinstance(data.get("sanitizer_compile"), dict):
         san_comp = data["sanitizer_compile"]
         if san_comp.get("returncode") in (0, None):
@@ -197,7 +202,9 @@ def resolve_binaries(
     if san_from_json is None and engine_used == "sanitizers":
         san_from_json = primary_bin
 
-    eacsl_from_json = _pick_path(data.get("eacsl_bin")) or _pick_path(data.get("eacsl_binary"))
+    eacsl_from_json = _pick_path(binaries_map.get("eacsl"))
+    if eacsl_from_json is None:
+        eacsl_from_json = _pick_path(data.get("eacsl_bin")) or _pick_path(data.get("eacsl_binary"))
     if eacsl_from_json is None and engine_used == "eacsl":
         eacsl_from_json = primary_bin
 
@@ -373,7 +380,7 @@ def _input_running_at_exit(output: str, probes: Sequence[_Probe]) -> int | None:
 
 
 def _check_startup(
-    san_bin: Path,
+    san_bin: Path | None,
     eacsl_bin: Path | None,
     startup_probe: Path,
     scratch: Path,
@@ -382,7 +389,9 @@ def _check_startup(
     timeout_s: int,
     module: str,
 ) -> dict[str, Any]:
-    engines: list[tuple[str, Path]] = [("sanitizers", san_bin)]
+    engines: list[tuple[str, Path]] = []
+    if san_bin is not None and san_bin.is_file():
+        engines.append(("sanitizers", san_bin))
     if eacsl_bin is not None and eacsl_bin.is_file():
         engines.append(("eacsl", eacsl_bin))
 
@@ -470,6 +479,8 @@ def _build_failure_case_record(
     probe: _Probe,
     res: SandboxResult,
     binary: Path,
+    *,
+    primary_engine: str = "sanitizers",
 ) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
     out = res.stdout + "\n" + res.stderr
     stub_abort = parse_link_stub_abort(out)
@@ -479,7 +490,7 @@ def _build_failure_case_record(
     if classification == "startup_error":
         _, sf_reason = is_startup_failure(failure, out)
         escalation = {
-            "engine": "sanitizers",
+            "engine": primary_engine,
             "binary": binary.as_posix(),
             "returncode": res.returncode,
             "timed_out": res.timed_out,
@@ -555,6 +566,7 @@ def _isolate_case(
     module: str,
     use_only_case_env: bool,
     fallback_batch_res: SandboxResult | None = None,
+    primary_engine: str = "sanitizers",
 ) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
     extra_env = {"FRAMAC_FUZZ_ONLY_CASE": str(case_idx)} if use_only_case_env else None
     for idx, probe in enumerate(probes, start=1):
@@ -567,13 +579,17 @@ def _isolate_case(
             extra_env=extra_env,
         )
         if res.returncode != 0 or res.timed_out:
-            return _build_failure_case_record(case_idx, entry_name, idx, probe, res, san_bin)
+            return _build_failure_case_record(
+                case_idx, entry_name, idx, probe, res, san_bin, primary_engine=primary_engine
+            )
 
     if fallback_batch_res is not None and probes:
         out = fallback_batch_res.stdout + "\n" + fallback_batch_res.stderr
         hit = _input_running_at_exit(out, probes)
         culprit = probes[hit] if hit is not None else probes[-1]
-        return _build_failure_case_record(case_idx, entry_name, len(probes), culprit, fallback_batch_res, san_bin)
+        return _build_failure_case_record(
+            case_idx, entry_name, len(probes), culprit, fallback_batch_res, san_bin, primary_engine=primary_engine
+        )
 
     return (
         {
@@ -598,6 +614,7 @@ def _run_dispatch_smoke(
     *,
     timeout_s: int,
     module: str,
+    primary_engine: str = "sanitizers",
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     probes_dir = scratch / "probes"
     probes_dir.mkdir(parents=True, exist_ok=True)
@@ -665,6 +682,7 @@ def _run_dispatch_smoke(
                 module=module,
                 use_only_case_env=True,
                 fallback_batch_res=res,
+                primary_engine=primary_engine,
             )
             results_by_case[k] = rec
             if escalated:
@@ -684,6 +702,7 @@ def _run_dispatch_smoke(
                     timeout_s=timeout_s,
                     module=module,
                     use_only_case_env=True,
+                    primary_engine=primary_engine,
                 )
                 if escalated:
                     results_by_case[hit_case] = rec
@@ -710,6 +729,7 @@ def _run_non_dispatch_smoke(
     *,
     timeout_s: int,
     module: str,
+    primary_engine: str = "sanitizers",
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     probes_dir = scratch / "probes"
     probes_dir.mkdir(parents=True, exist_ok=True)
@@ -754,6 +774,7 @@ def _run_non_dispatch_smoke(
         module=module,
         use_only_case_env=False,
         fallback_batch_res=res,
+        primary_engine=primary_engine,
     )
     return [rec], esc_info if escalated else None
 
@@ -846,7 +867,19 @@ def run_smoke(
         atomic_write_json(out_json, report)
         return report, exit_code
 
-    if resolved_san is None or not resolved_san.is_file():
+    has_san = resolved_san is not None and resolved_san.is_file()
+    has_eacsl = resolved_eacsl is not None and resolved_eacsl.is_file()
+    if has_san:
+        assert resolved_san is not None
+        probe_bin = resolved_san
+        primary_engine = "sanitizers"
+    elif san_bin is None and has_eacsl:
+        # `--fuzz-engine eacsl` (or a sanitizer-less build.json / explicit --eacsl-bin):
+        # probe the E-ACSL binary directly instead of failing with "sanitizer binary not found".
+        assert resolved_eacsl is not None
+        probe_bin = resolved_eacsl
+        primary_engine = "eacsl"
+    else:
         missing_desc = str(resolved_san) if resolved_san is not None else "(unresolved)"
         startup = {
             "ok": False,
@@ -865,8 +898,8 @@ def run_smoke(
 
         try:
             startup = _check_startup(
-                resolved_san,
-                resolved_eacsl,
+                resolved_san if has_san else None,
+                resolved_eacsl if has_eacsl else None,
                 startup_probe,
                 scratch,
                 is_dispatch=is_dispatch,
@@ -879,7 +912,7 @@ def run_smoke(
             if is_dispatch:
                 entry_map = _case_entry_map(sidecar)
                 case_results, escalation = _run_dispatch_smoke(
-                    resolved_san,
+                    probe_bin,
                     n_cases,
                     selector,
                     width,
@@ -888,17 +921,19 @@ def run_smoke(
                     scratch,
                     timeout_s=timeout_s,
                     module=module,
+                    primary_engine=primary_engine,
                 )
             else:
                 entry_fn = sidecar.get("entry_fn")
                 entry_name = str(entry_fn) if isinstance(entry_fn, str) and entry_fn else None
                 case_results, escalation = _run_non_dispatch_smoke(
-                    resolved_san,
+                    probe_bin,
                     entry_name,
                     seeds_dir,
                     scratch,
                     timeout_s=timeout_s,
                     module=module,
+                    primary_engine=primary_engine,
                 )
         except SandboxUnavailable as exc:
             startup = {
@@ -959,8 +994,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.cmd == "run":
-        if args.san_bin is None and args.build_json is None:
-            parser.error("either --san-bin or --build-json is required")
+        if args.san_bin is None and args.eacsl_bin is None and args.build_json is None:
+            parser.error("one of --san-bin, --eacsl-bin, or --build-json is required")
         _, rc = run_smoke(
             module=args.module,
             sidecar_path=args.sidecar,

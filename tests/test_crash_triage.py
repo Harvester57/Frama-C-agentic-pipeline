@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 
 import crash_triage
+import resources
+import wp_scheduler
 
 pytestmark = pytest.mark.unit
 
@@ -62,16 +64,44 @@ def test_verifier_breaker_enabled_default_off(monkeypatch: pytest.MonkeyPatch) -
     assert crash_triage.verifier_breaker_enabled() is False
 
 
-@pytest.mark.parametrize("value", ["on", "ON", "On", "1", "true", "TRUE", "  true  ", " 1 "])
+@pytest.mark.parametrize("value", ["on", "ON", "On", "1", "true", "TRUE", "  true  ", " 1 ", "yes", "YES", " yes "])
 def test_verifier_breaker_enabled_truthy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv(crash_triage.VERIFIER_BREAKER_ENV, value)
     assert crash_triage.verifier_breaker_enabled() is True
 
 
-@pytest.mark.parametrize("value", ["", "   ", "off", "OFF", "0", "false", "FALSE", "no", "yes", "enabled"])
+@pytest.mark.parametrize("value", ["", "   ", "off", "OFF", "0", "false", "FALSE", "no", "enabled"])
 def test_verifier_breaker_enabled_falsy_values(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv(crash_triage.VERIFIER_BREAKER_ENV, value)
     assert crash_triage.verifier_breaker_enabled() is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("off", False),
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("on", True),
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("YES", True),
+        (" yes ", True),
+    ],
+)
+def test_wp_scheduler_fuzz_explore_judge_delegates_to_resources(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: bool
+) -> None:
+    if value is None:
+        monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    else:
+        monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", value)
+    assert wp_scheduler._fuzz_explore_judge_enabled() is expected
+    assert wp_scheduler._fuzz_explore_judge_enabled() is resources.fuzz_explore_judge_enabled()
 
 
 # ---------------------------------------------------------------------------
