@@ -31,7 +31,7 @@ class TestBenchmarkPostPhase0Stages:
     @pytest.mark.parametrize(
         ("smoke", "judge", "expected"),
         [
-            (None, None, ["build", "fuzz", "eva", "coverage", "replay", "ingest", "gate", "queue"]),
+            (None, None, ["build", "smoke", "fuzz", "judge", "eva", "coverage", "replay", "ingest", "gate", "queue"]),
             ("off", "off", ["build", "fuzz", "eva", "coverage", "replay", "ingest", "gate", "queue"]),
             ("on", "off", ["build", "smoke", "fuzz", "eva", "coverage", "replay", "ingest", "gate", "queue"]),
             ("off", "on", ["build", "fuzz", "judge", "eva", "coverage", "replay", "ingest", "gate", "queue"]),
@@ -98,7 +98,7 @@ class TestBenchmarkSeededStages:
     @pytest.mark.parametrize(
         ("smoke", "judge", "expected_post"),
         [
-            (None, None, ["build", "fuzz", "eva", "coverage", "ingest"]),
+            (None, None, ["build", "smoke", "fuzz", "judge", "eva", "coverage", "ingest"]),
             ("off", "off", ["build", "fuzz", "eva", "coverage", "ingest"]),
             ("on", "off", ["build", "smoke", "fuzz", "eva", "coverage", "ingest"]),
             ("off", "on", ["build", "fuzz", "judge", "eva", "coverage", "ingest"]),
@@ -115,7 +115,7 @@ class TestBenchmarkSeededStages:
         _set_flags(monkeypatch, smoke, judge)
         post = bs.post_stages()
         assert [name for name, _ in post] == expected_post
-        if smoke in (None, "off") and judge in (None, "off"):
+        if smoke == "off" and judge == "off":
             assert post == list(bs.POST_STAGES)
 
         plan = bs.stage_plan(Path("s04_force_include"), 45)
@@ -172,13 +172,21 @@ class TestStageExecutionAndEnvForwarding:
         assert captured_envs[-1]["FRAMAC_HARNESS_SMOKE"] == "1"
         assert captured_envs[-1]["FRAMAC_FUZZ_EXPLORE_JUDGE"] == "yes"
 
-        # Even if helpers are patched without env vars set, run_stage forwards "on".
-        _set_flags(monkeypatch, None, None)
+        # If helpers are patched to True while env vars say off, run_stage forwards "on".
+        _set_flags(monkeypatch, "off", "off")
         monkeypatch.setattr(harness_smoke, "harness_smoke_enabled", lambda: True)
         monkeypatch.setattr(resources, "fuzz_explore_judge_enabled", lambda: True)
         benchmark.run_stage("judge", f"{bs.PM} run judge", tmp_path, tmp_path, "repo")
         assert captured_envs[-1]["FRAMAC_HARNESS_SMOKE"] == "on"
         assert captured_envs[-1]["FRAMAC_FUZZ_EXPLORE_JUDGE"] == "on"
+
+        # Symmetrically, if helpers are patched to False while env vars are unset, run_stage forwards "off".
+        _set_flags(monkeypatch, None, None)
+        monkeypatch.setattr(harness_smoke, "harness_smoke_enabled", lambda: False)
+        monkeypatch.setattr(resources, "fuzz_explore_judge_enabled", lambda: False)
+        benchmark.run_stage("build", f"{bs.PM} build-check", tmp_path, tmp_path, "repo")
+        assert captured_envs[-1]["FRAMAC_HARNESS_SMOKE"] == "off"
+        assert captured_envs[-1]["FRAMAC_FUZZ_EXPLORE_JUDGE"] == "off"
 
     def test_run_target_executes_smoke_and_judge_when_enabled(
         self,

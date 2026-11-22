@@ -3320,6 +3320,7 @@ def build_module_binary(
     dag_path: Path | str | None = None,
     link_module: str | None = None,
     security_props: str | None = None,
+    dual_prebuilt: bool | None = None,
 ) -> dict:
     """
     Compile a module's fuzz binary the way a campaign does, without running it: E-ACSL for
@@ -3352,7 +3353,7 @@ def build_module_binary(
     """
 
     out_bin = Path(out_bin)
-    dual_prebuilt = resources.fuzz_explore_judge_enabled() and engine == "auto"
+    dual_prebuilt = (resources.fuzz_explore_judge_enabled() and engine == "auto") if dual_prebuilt is None else bool(dual_prebuilt)
     # e-acsl-gcc already writes the instrumented executable to `<out_bin>.e-acsl` (select_eacsl_binary),
     # while Clang writes the sanitizer binary directly to `san_out` (`<out_bin>.san` under P7f).
     eacsl_out = out_bin

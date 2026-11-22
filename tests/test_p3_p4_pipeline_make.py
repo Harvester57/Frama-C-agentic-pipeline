@@ -219,7 +219,7 @@ def test_run_targets_never_overlaps_fuzz_and_eva_under_flags(tmp_path, monkeypat
 
 def test_run_targets_smoke_before_fuzz_and_eva_under_smoke_flag(tmp_path, monkeypatch):
     monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "true")
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)
     fake = _FakeMake()
@@ -230,8 +230,8 @@ def test_run_targets_smoke_before_fuzz_and_eva_under_smoke_flag(tmp_path, monkey
 
 
 def test_run_targets_preserves_legacy_grouping_when_flags_off(tmp_path, monkeypatch):
-    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "off")
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)
     fake = _FakeMake()
@@ -306,8 +306,8 @@ def test_pipeline_mk_new_targets_and_flag_wiring():
 
 
 def test_modules_mk_emits_flag_variables_only_when_enabled(tmp_path, monkeypatch):
-    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "off")
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)
     mk_off = (run / pm.MODULES_MK).read_text(encoding="utf-8")
@@ -323,8 +323,8 @@ def test_modules_mk_emits_flag_variables_only_when_enabled(tmp_path, monkeypatch
 
 
 def test_node_deps_and_outputs_reflect_flags_and_profile(tmp_path, monkeypatch):
-    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "off")
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run = _make_run(tmp_path, profile="standard")
     plan_off = pm.build_plan(run, templates_dir=ACSL)
     assert pm._node_deps("fuzz-mod_a", plan_off) == ["selftest", "build-mod_a"]
@@ -451,7 +451,7 @@ def test_p3_worker_clamping_prevents_wall_floor_cpu_inflation():
 
 
 def test_legacy_budgets_preserved_when_explore_judge_flag_off(tmp_path, monkeypatch):
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     for profile in ("quick", "standard", "deep"):
         run = _make_run(tmp_path / f"legacy_{profile}", profile=profile, cases_by_mod={"mod_a": 40})
         plan = pm.build_plan(run, templates_dir=ACSL)
@@ -534,7 +534,7 @@ def test_run_targets_module_target_orders_stages_strictly_under_flags(tmp_path, 
 
     # Standard profile + HARNESS_SMOKE only: build -> smoke -> fuzz -> eva -> module.
     monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "on")
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run_smoke = _make_run(tmp_path / "smoke_only", profile="standard")
     pm.generate(run_smoke, templates_dir=ACSL)
     fake_smoke = _FakeMake()
@@ -549,7 +549,7 @@ def test_run_targets_module_target_orders_stages_strictly_under_flags(tmp_path, 
     ]
 
     # Standard profile + FUZZ_EXPLORE_JUDGE only: build -> fuzz -> judge -> eva -> module.
-    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "off")
     monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "on")
     run_ej = _make_run(tmp_path / "ej_only", profile="standard")
     pm.generate(run_ej, templates_dir=ACSL)
@@ -574,8 +574,8 @@ def test_run_targets_module_target_orders_stages_strictly_under_flags(tmp_path, 
     assert out_f["targets"]["module-mod_a"]["status"] == "failed"
 
     # Legacy flags off: single-stage module-mod_a invocation preserved unchanged.
-    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "off")
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run_leg = _make_run(tmp_path / "legacy", profile="standard")
     pm.generate(run_leg, templates_dir=ACSL)
     fake_leg = _FakeMake()

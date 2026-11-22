@@ -299,11 +299,12 @@ def _tm_block(**kw: Any) -> dict[str, Any]:
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        (None, False),
-        ("", False),
+        (None, True),
+        ("", True),
         ("off", False),
         ("0", False),
         ("false", False),
+        ("no", False),
         ("on", True),
         ("1", True),
         ("true", True),
@@ -327,7 +328,7 @@ def test_trust_rule1_scoping_off_vs_on(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _sudo_shaped_model()
 
     # Legacy mode (flag off).
-    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "off")
     res_off = T.compute_trust(model)
     f_off = res_off["functions"]
     assert f_off["src/internal.c#unused_internal"]["boundary"] is True
@@ -412,7 +413,7 @@ def test_trust_propagates_input_role_attacker_params_and_missing_warnings(
     threat = {"status": T.STATUS_OK, "block": block, "path": "THREAT_MODEL.md", "sha256": "a" * 64, "errors": []}
 
     # Always safe to populate input_role / attacker_params even with flag off.
-    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "off")
     res_off = T.compute_trust(model, threat)
     assert res_off["functions"]["lib/util/parse.c#util_parse"]["input_role"] == "entry"
     assert res_off["functions"]["lib/util/parse.c#util_parse"]["attacker_params"] == ["buf", "len"]
@@ -479,7 +480,7 @@ def test_dag_propagates_globals_and_visibility_and_scopes_entries(
     threat = {"status": T.STATUS_OK, "block": block, "path": "THREAT_MODEL.md", "sha256": "b" * 64, "errors": []}
 
     # --- Flag OFF: legacy candidate_entry_points + additive metadata ---
-    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "off")
     model_off = _sudo_shaped_model()
     T.annotate_model(model_off, threat=threat)
     dag_off = bcd.build_dag(tmp_path, model_off)
@@ -731,7 +732,7 @@ def test_tf_static_reach_credit_off_vs_on_and_schema(
     reach_schema = load_schema(SCHEMAS_DIR / "harness_reach.schema.json")
 
     # Flag OFF: sudoers_so fails no_harness, internal_convenience fails no_harness.
-    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "off")
     rep_off = hr.run_check(dag_path, hdir, None, run_dir=run_dir)
     assert Validator(reach_schema).errors(rep_off) == []
     assert rep_off["passed"] is False
@@ -964,7 +965,7 @@ def test_auto_exempt_reasons_static_and_dynamic(tmp_path: Path, monkeypatch: pyt
     (hdir / "harness_libapi_a.json").write_text(json.dumps(sidecar), encoding="utf-8")
 
     # Flag OFF: none of api_auto_exempt are honored.
-    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "off")
     rep_off = hr.run_check(dag_path, hdir, ["libapi_a"], run_dir=tmp_path)
     assert rep_off["passed"] is False
     assert set(rep_off["modules"][0]["gaps"]) == {
@@ -1277,7 +1278,7 @@ def test_static_reader_auto_exempt_and_reach_v2_off_vs_on(
     reach_schema = load_schema(SCHEMAS_DIR / "harness_reach.schema.json")
 
     # Flag OFF: none of the v2 static-reader rules or api_auto_exempt apply.
-    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "off")
     rep_off = hr.run_check(dag_path, hdir, ["libprotobuf_nanopb_a"], run_dir=tmp_path)
     assert Validator(reach_schema).errors(rep_off) == []
     assert rep_off["passed"] is False
@@ -1453,7 +1454,7 @@ def test_check_unit_static_reader_from_submodule_harness(
     reach_schema = load_schema(SCHEMAS_DIR / "harness_reach.schema.json")
 
     # Flag OFF: all three unharnessed static roots remain gaps on the unit row.
-    monkeypatch.delenv(T.HARNESS_SCOPE_V2_ENV, raising=False)
+    monkeypatch.setenv(T.HARNESS_SCOPE_V2_ENV, "off")
     rep_off = hr.run_check(dag_path, hdir, None, run_dir=tmp_path)
     by_mod_off = {r["module"]: r for r in rep_off["modules"]}
     assert set(by_mod_off["libdemo_a"]["gaps"]) == {

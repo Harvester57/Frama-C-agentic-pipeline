@@ -79,10 +79,11 @@ def test_merge_runs_a_later_replay_replaces_the_earlier_one():
 def test_stage_list_runs_coverage_and_reach_dynamic_before_ingest():
     stages = benchmark.post_phase0_stages(run_fuzz=True, replays=True)
     names = [s[0] for s in stages]
-    assert names == ["build", "fuzz", "eva", "coverage", "replay", "ingest", "gate", "queue"]
+    assert names == ["build", "smoke", "fuzz", "judge", "eva", "coverage", "replay", "ingest", "gate", "queue"]
     assert dict((n, c) for n, c, _ in stages)["coverage"].endswith("pipeline_make.py run coverage reach-dynamic")
     assert [s[0] for s in benchmark.post_phase0_stages(run_fuzz=False, replays=False)] == [
         "build",
+        "smoke",
         "eva",
         "coverage",
         "ingest",
@@ -151,7 +152,7 @@ def test_phase0_runs_the_post_stages_only_after_a_passing_phase0(tmp_path, monke
     monkeypatch.setattr(benchmark, "run_stage", fake_stage)
     monkeypatch.setattr(benchmark, "collect_target_metrics", lambda run_dir, target, notes: {"problems": notes})
     benchmark.run_target(_target(), {"bugs": []}, tmp_path, "r", run_fuzz=True, fuzz_budget=None, eva_timeout=None)
-    assert started == ["phase0", "build", "fuzz", "eva", "coverage", "ingest", "queue"]
+    assert started == ["phase0", "build", "smoke", "fuzz", "judge", "eva", "coverage", "ingest", "queue"]
 
 
 @pytest.mark.unit

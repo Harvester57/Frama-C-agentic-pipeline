@@ -95,7 +95,7 @@ Crash verification runs right after Phases 1 and 2, before WP:
 
 ### Phase 1/2 Stage Graph, Harness Smoke Gate (P3), Explore/Judge (P4) and Verifier Circuit Breaker (P5)
 
-Five opt-in A/B switches (all defaulting to `off` pending Wave 6 A/B evaluation; see [`./resources-and-caching.md`](./resources-and-caching.md#4-knobs)) harden Phase 0–2 harness quality, fuzzing throughput, and Crash Verifier triage without lowering the evidence bar:
+Five default-on A/B switches (set `=off` for A/B rollback; see [`./resources-and-caching.md`](./resources-and-caching.md#4-knobs)) harden Phase 0–2 harness quality, fuzzing throughput, and Crash Verifier triage without lowering the evidence bar:
 
 - **Strict Make stage graph ([`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py), `STAGE_OF_TARGET`):**
   `build` (4) -> `smoke` (5) -> `fuzz` (6) -> `judge` / `coverage` (7) -> `reach-dynamic` / `eacsl-fuzz` (8) -> `eva` / `eva-tune-base` (9) -> `eva-tune` (10) -> `facts` / `ingest` / `replay` / `minimize` / `wp-replay` / `wp-queue` / `wp-baseline` / `flamegraph` (11) -> `wp-sweep` (12) -> `report` (13).

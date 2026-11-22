@@ -69,7 +69,7 @@ Frama-C needs exactly the files, include paths and macros each compilation unit 
 
 ## 2a. Unit-Visibility Scoping, Reach Credit & Deterministic `--api` Upgrades (P1 / P2A)
 
-Two opt-in A/B switches (both defaulting to `off` pending Wave 6 A/B evaluation; see [`./resources-and-caching.md`](./resources-and-caching.md#4-knobs)) tighten Phase 0 entry-point scoping and deterministic `--api` harness synthesis for multi-binary, plugin, and schema-driven targets:
+Two default-on A/B switches (set `=off` for A/B rollback; see [`./resources-and-caching.md`](./resources-and-caching.md#4-knobs)) tighten Phase 0 entry-point scoping and deterministic `--api` harness synthesis for multi-binary, plugin, and schema-driven targets:
 
 ### P1 Unit-Visibility Scoping & Reachability (`FRAMAC_HARNESS_SCOPE_V2`)
 

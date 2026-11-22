@@ -4213,6 +4213,7 @@ def run_floor_pass(
     runs_override: int | None = None,
     safety_time_override: int | None = None,
     campaign_runner=None,
+    single_process: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     P6a per-case floor pass for multi-case dispatch harnesses under FRAMAC_FUZZ_EXPLORE_JUDGE.
@@ -4296,6 +4297,9 @@ def run_floor_pass(
             case_seed_val = derive_seed(binary, f"{module}:floor:{k}")
 
             while remaining_runs > 0:
+                sp_kwargs: dict[str, Any] = (
+                    {"single_process_reason": single_process.get("reason")} if single_process is not None else {}
+                )
                 run = runner(
                     binary,
                     case_corpus,
@@ -4311,7 +4315,10 @@ def run_floor_pass(
                     extra_env=case_env,
                     runs=remaining_runs,
                     seed=case_seed_val + restarts,
+                    **sp_kwargs,
                 )
+                if single_process is not None and run.get("single_process_reason") and "reason" not in single_process:
+                    single_process["reason"] = str(run["single_process_reason"])
                 tel = run.get("telemetry")
                 if isinstance(tel, dict):
                     telemetries.append(tel)
@@ -5798,6 +5805,13 @@ def _run_explore_campaign_mode(
     eff_jobs = jobs
     eff_max_time = max_time
 
+    single_process: dict[str, str] = {}
+    attribution_builder = None
+    if engine_used == "eacsl" and not args.no_attribution_replay:
+        attribution_builder = fuzz_build._sanitizer_attribution_builder(
+            eff_sources, args.out_bin, args.cppflags, args.ldflags, use_cache=use_cache
+        )
+
     if (
         n_cases is not None
         and n_cases > 0
@@ -5817,6 +5831,7 @@ def _run_explore_campaign_mode(
             dict_file=dict_file,
             per_input_timeout=args.per_input_timeout,
             module=args.module,
+            single_process=single_process,
         )
         floor_artifacts = list(floor_result.get("artifacts") or [])
         pre_blinded = list(floor_result.get("blinded_cases") or [])
@@ -5838,8 +5853,6 @@ def _run_explore_campaign_mode(
             sizing["max_time"] = eff_max_time
             sizing["peak_per_worker_mb"] = peak_mb
 
-    single_process: dict[str, str] = {}
-
     def _campaign(binary: Path, seconds: int, fork: bool, *, extra_env: dict[str, str] | None = None) -> dict:
         run = run_fuzz_campaign(
             binary,
@@ -5849,6 +5862,7 @@ def _run_explore_campaign_mode(
             dict_file,
             args.per_input_timeout,
             extra_corpus=args.extra_corpus,
+            attribution_builder=attribution_builder,
             jobs=eff_jobs,
             workers=eff_workers,
             fork=fork,
@@ -5942,6 +5956,8 @@ def _run_explore_campaign_mode(
     res.setdefault("partial_blinded", False)
     if compile_rec is not None:
         res["compile"] = compile_rec
+        if engine_used == "eacsl" and compile_rec.get("reduced_checks"):
+            res["reduced_checks"] = compile_rec["reduced_checks"]
     if dual_skipped_note is not None:
         res["dual_engine_skipped"] = dual_skipped_note
     if floor_result is not None:

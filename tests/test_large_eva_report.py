@@ -849,6 +849,7 @@ def test_repair_waits_for_all_open_verifiers_of_module_and_accumulates_reasons(t
         },
     )
 
+    monkeypatch.setenv("FRAMAC_VERIFIER_BREAKER", "off")
     monkeypatch.setattr(S.DEPS, "recommend", lambda max_agents=None: {"max_agents": 4})
     monkeypatch.setattr(
         S.DEPS,

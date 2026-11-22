@@ -19,10 +19,10 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture
 def sim(run_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Sim:
-    # Default all new flags off unless a test explicitly enables them.
-    monkeypatch.delenv("FRAMAC_VERIFIER_BREAKER", raising=False)
-    monkeypatch.delenv("FRAMAC_HARNESS_SMOKE", raising=False)
-    monkeypatch.delenv("FRAMAC_FUZZ_EXPLORE_JUDGE", raising=False)
+    # Explicitly disable the A/B flags in the baseline fixture so tests opt in explicitly.
+    monkeypatch.setenv("FRAMAC_VERIFIER_BREAKER", "off")
+    monkeypatch.setenv("FRAMAC_HARNESS_SMOKE", "off")
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     return Sim(run_dir, monkeypatch)
 
 

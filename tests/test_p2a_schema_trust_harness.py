@@ -22,11 +22,12 @@ pytestmark = pytest.mark.unit
 
 
 def test_api_trust_schema_env_flag():
-    assert ah.api_trust_schema_enabled({}) is False
-    assert ah.api_trust_schema_enabled({ah.API_TRUST_SCHEMA_ENV: ""}) is False
+    assert ah.api_trust_schema_enabled({}) is True
+    assert ah.api_trust_schema_enabled({ah.API_TRUST_SCHEMA_ENV: ""}) is True
     assert ah.api_trust_schema_enabled({ah.API_TRUST_SCHEMA_ENV: "off"}) is False
     assert ah.api_trust_schema_enabled({ah.API_TRUST_SCHEMA_ENV: "0"}) is False
     assert ah.api_trust_schema_enabled({ah.API_TRUST_SCHEMA_ENV: "false"}) is False
+    assert ah.api_trust_schema_enabled({ah.API_TRUST_SCHEMA_ENV: "no"}) is False
     for val in ("on", "ON", "1", "true", "True", "yes", "YES"):
         assert ah.api_trust_schema_enabled({ah.API_TRUST_SCHEMA_ENV: val}) is True
 

@@ -81,7 +81,7 @@ MAX_NON_DISPATCH_SEEDS = 4
 LOG_TAIL_CHARS = 3000
 STACK_TRACE_MAX_CHARS = 4000
 
-_ON_VALUES = frozenset({"on", "1", "true", "yes"})
+_OFF_VALUES = frozenset({"off", "0", "false", "no"})
 _RUNNING_RE = re.compile(r"^Running:\s+(?P<path>\S+)\s*$", re.MULTILINE)
 _ERROR_LINE_RE = re.compile(
     r"(?:==\d+==ERROR:|SUMMARY:|runtime error:|Error:|Aborted\b|Segmentation fault|"
@@ -91,8 +91,8 @@ _ERROR_LINE_RE = re.compile(
 
 
 def harness_smoke_enabled() -> bool:
-    """Whether the standalone harness smoke gate is enabled (`FRAMAC_HARNESS_SMOKE=on|1|true|yes`, default off)."""
-    return (os.environ.get("FRAMAC_HARNESS_SMOKE") or "").strip().lower() in _ON_VALUES
+    """Whether the standalone harness smoke gate is enabled (`FRAMAC_HARNESS_SMOKE`, default on; `=off` disables)."""
+    return (os.environ.get("FRAMAC_HARNESS_SMOKE") or "").strip().lower() not in _OFF_VALUES
 
 
 @dataclass(frozen=True)

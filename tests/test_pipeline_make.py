@@ -98,6 +98,8 @@ GOLDEN_MODULES_MK = f"""\
 # and run-metadata.json; do not edit (`pipeline_make.py run` regenerates it). Every value is
 # a shell word (shlex.quote) with $ and # escaped for make.
 PROFILE := quick
+HARNESS_SMOKE := 1
+FUZZ_EXPLORE_JUDGE := 1
 MODULES := cfg log snmp
 FUZZ_MODULES := cfg log snmp
 EVA_MODULES := cfg log snmp
@@ -608,7 +610,9 @@ def test_run_rejects_unknown_and_excluded_targets(tmp_path):
     assert "no harness sidecar" in out["targets"]["eva-glue"]["error"]
 
 
-def test_run_summary_and_command(tmp_path):
+def test_run_summary_and_command(tmp_path, monkeypatch):
+    # Legacy mode where fuzz-cfg depends on build-cfg in the same Make stage.
+    monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "off")
     run = _make_run(tmp_path)
     pm.generate(run, templates_dir=ACSL)
     write_json(run / "workspace/reports/fuzz/log.json", {"status": "crash_found"})  # stale, from an earlier run
@@ -649,7 +653,15 @@ def test_run_orders_targets_in_stages(tmp_path):
     rc, out = pm.run_targets(
         ["ingest", "wp-queue", "fuzz", "eva", "module-log", "report"], run, jobs=1, make_runner=fake, templates_dir=ACSL
     )
-    assert [c[7:] for c in fake.calls] == [["fuzz", "eva", "module-log"], ["ingest", "wp-queue"], ["report"]]
+    assert [c[7:] for c in fake.calls] == [
+        ["build-log"],
+        ["smoke-log"],
+        ["fuzz", "fuzz-log"],
+        ["judge-log"],
+        ["eva", "eva-log"],
+        ["MODULE_STAGES_DONE=1", "ingest", "wp-queue", "module-log"],
+        ["report"],
+    ]
     assert out["targets"]["eva"]["nodes"]["eva-cfg"]["status"] == "no_output"
 
 
@@ -2159,7 +2171,7 @@ def test_fuzz_budget_per_case_capped_per_unit(tmp_path):
     plan = pm.build_plan(_make_run(tmp_path, sidecars=sidecars, params=SNMP_PARAMS), templates_dir=ACSL)
     log = plan.modules["log"].params
     assert log["fuzz_budget_source"] == "unit_cap" and log["fuzz_cases"] == 40
-    assert log["fuzz_budget"] == pm.FUZZ_UNIT_CAP_BY_PROFILE["quick"]
+    assert log["fuzz_budget"] == pm.sublinear_unit_cap("quick", 40)
     assert pm.harness_case_count(None) == 1 and pm.harness_case_count({"dispatch_cases": "x"}) == 1
 
 

@@ -113,6 +113,7 @@ INPUT_READERS = frozenset(
 )
 LIBRARY_KINDS = frozenset({"static_lib", "shared_lib"})
 HARNESS_SCOPE_V2_ENV = "FRAMAC_HARNESS_SCOPE_V2"
+_OFF_VALUES = frozenset({"off", "0", "false", "no"})
 UNIT_VISIBILITIES = frozenset({"executable", "plugin_so", "public_lib", "internal_convenience"})
 # The deciding source of an untrusted function, most specific first.
 SOURCE_ORDER = ("threat_model", "default", "call_graph", "codeql")
@@ -122,10 +123,10 @@ MAX_REASONS = 6
 
 
 def harness_scope_v2_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """True when FRAMAC_HARNESS_SCOPE_V2 enables P1 visibility-aware scoping (default off)."""
+    """True unless FRAMAC_HARNESS_SCOPE_V2 is explicitly off/0/false/no (default on)."""
     src = os.environ if env is None else env
     raw = (src.get(HARNESS_SCOPE_V2_ENV) or "").strip().lower()
-    return raw in ("on", "1", "true", "yes")
+    return raw not in _OFF_VALUES
 
 
 def unit_visibility_of(unit: str, units: Mapping[str, dict[str, Any]]) -> str:
@@ -727,6 +728,7 @@ def compute_trust(
             roots[fid] = "; ".join(filter(None, ["main with argv", roots.get(fid)]))
             marks.boundary.add(fid)
     trusted: dict[str, str] = {}
+    missing_tm_warnings: list[str] = []
     threat_active = threat.get("status") == STATUS_OK and bool(threat.get("block"))
     if threat_active:
         trusted = _threat_rules(idx, threat["block"], marks, roots, warnings, scope_v2=v2)
@@ -745,7 +747,7 @@ def compute_trust(
                 for fid in idx.api(unit, scope_v2=True):
                     if fid not in tm_input_fids and fid not in trusted and fid not in warned_fids:
                         warned_fids.add(fid)
-                        warnings.append(
+                        missing_tm_warnings.append(
                             f"threat model: public_lib export {fid} (unit {unit}) is missing from "
                             f"{THREAT_MODEL_NAME} input_sources"
                         )
@@ -757,7 +759,7 @@ def compute_trust(
                     and not (set(readers) <= tm_reader_names)
                 ):
                     warned_fids.add(fid)
-                    warnings.append(
+                    missing_tm_warnings.append(
                         f"threat model: input_reader root {fid} (calls {', '.join(readers)}) is missing from "
                         f"{THREAT_MODEL_NAME} input_sources"
                     )
@@ -785,6 +787,9 @@ def compute_trust(
             codeql_info.update(facts=used, unmatched=len(unmatched))
         else:
             warnings.append(f"codeql: status {codeql.get('status')}, its facts are not used")
+    # Append per-function missing-from-THREAT_MODEL advisory warnings after operational/CodeQL
+    # warnings so truncated CLI summaries (`warnings[:10]`) never drown out CodeQL diagnostics.
+    warnings.extend(missing_tm_warnings)
     # Decide.
     functions: dict[str, dict] = {}
     for fid in sorted(idx.functions):
@@ -944,9 +949,10 @@ def annotate_model(
     codeql, codeql_state = load_codeql(metadata, codeql_path)
     result = compute_trust(model, threat, codeql, scope_v2=scope_v2)
     if codeql_state.get("status") == "not_run":
-        result["warnings"].append(
+        result["warnings"].insert(
+            0,
             f"codeql: enabled for the run, but there is no report at {codeql_state['path']}: no CodeQL fact is "
-            "used (codeql_trust.py run, then trust.py run)"
+            "used (codeql_trust.py run, then trust.py run)",
         )
     for fid, rec in result["functions"].items():
         model["functions"][fid]["trust"] = rec

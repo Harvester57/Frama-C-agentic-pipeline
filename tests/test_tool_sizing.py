@@ -358,7 +358,7 @@ def _campaign(monkeypatch, tmp_path, *extra):
 
     def fake_campaign(binary, corpus, artifacts, max_time, *a, **k):
         seen.update(max_time=max_time, jobs=k["jobs"], workers=k["workers"])
-        return {"status": "clean", "artifacts": []}
+        return {"status": "clean", "artifacts": [], "fuzz_s": 0.0}
 
     monkeypatch.setattr(R, "run_fuzz_campaign", fake_campaign)
     out = tmp_path / "out.json"

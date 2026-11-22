@@ -963,20 +963,18 @@ def run_stage(
     )
     argv += [command] if _is_windows() else ["--", command]
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    if harness_smoke.harness_smoke_enabled() and (env.get("FRAMAC_HARNESS_SMOKE") or "").strip().lower() not in (
-        "on",
-        "1",
-        "true",
-        "yes",
-    ):
+    smoke_on = harness_smoke.harness_smoke_enabled()
+    smoke_env_off = (env.get("FRAMAC_HARNESS_SMOKE") or "").strip().lower() in harness_smoke._OFF_VALUES
+    if smoke_on and smoke_env_off:
         env["FRAMAC_HARNESS_SMOKE"] = "on"
-    if resources.fuzz_explore_judge_enabled() and (env.get("FRAMAC_FUZZ_EXPLORE_JUDGE") or "").strip().lower() not in (
-        "on",
-        "1",
-        "true",
-        "yes",
-    ):
+    elif not smoke_on and not smoke_env_off:
+        env["FRAMAC_HARNESS_SMOKE"] = "off"
+    judge_on = resources.fuzz_explore_judge_enabled()
+    judge_env_off = (env.get("FRAMAC_FUZZ_EXPLORE_JUDGE") or "").strip().lower() in resources._OFF_VALUES
+    if judge_on and judge_env_off:
         env["FRAMAC_FUZZ_EXPLORE_JUDGE"] = "on"
+    elif not judge_on and not judge_env_off:
+        env["FRAMAC_FUZZ_EXPLORE_JUDGE"] = "off"
     if image and not _is_windows():
         env["FRAMAC_DOCKER_IMAGE"] = image
     started = time.monotonic()

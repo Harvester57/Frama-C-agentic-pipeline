@@ -329,9 +329,9 @@ _NULL_WORD_RE = re.compile(r"\bNULL\b")
 _NOT_NULL_RE = re.compile(r"\b(?:not|never|cannot|can't|mustn't|non)\b[\s-]+(?:be\s+)?(?:a\s+)?NULL\b", re.IGNORECASE)
 _DEFAULT_WORD_RE = re.compile(r"\b(?:default|system|standard|built-?in)\b", re.IGNORECASE)
 
-# --- P2A schema/trust-driven API harness (FRAMAC_API_TRUST_SCHEMA, default off) ----------------------
+# --- P2A schema/trust-driven API harness (FRAMAC_API_TRUST_SCHEMA, default on) -----------------------
 API_TRUST_SCHEMA_ENV = "FRAMAC_API_TRUST_SCHEMA"
-_TRUTHY_ENV = frozenset({"on", "1", "true", "yes"})
+_OFF_VALUES = frozenset({"off", "0", "false", "no"})
 MAX_SCHEMA_INSTANCES = 4
 NO_ATTACKER_DATA_REASON = "no attacker data per the threat model"
 TRUSTED_PARAM_NO_INSTANCE_FMT = "trusted parameter {name} has no instance"
@@ -356,9 +356,9 @@ _CTOR_BOILERPLATE_WORDS = frozenset({"new", "init", "create", "alloc", "make", "
 
 
 def api_trust_schema_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """Whether P2A schema/trust-driven `--api` upgrades are enabled (`FRAMAC_API_TRUST_SCHEMA`, default off)."""
+    """Whether P2A schema/trust-driven `--api` upgrades are enabled (`FRAMAC_API_TRUST_SCHEMA`, default on)."""
     src = os.environ if env is None else env
-    return (src.get(API_TRUST_SCHEMA_ENV) or "").strip().lower() in _TRUTHY_ENV
+    return (src.get(API_TRUST_SCHEMA_ENV) or "").strip().lower() not in _OFF_VALUES
 
 
 def _words(name: str | None) -> list[str]:

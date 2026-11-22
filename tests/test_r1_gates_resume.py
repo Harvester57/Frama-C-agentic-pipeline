@@ -216,6 +216,7 @@ def test_the_minimum_per_campaign_pushing_a_unit_over_its_cap_warns(tmp_path, mo
     assert not [w for w in plan.warnings if "fuzz budget" in w]
     # Three campaigns of one unit under a 50 s cap: each keeps the 30 s minimum, 90 s in all.
     monkeypatch.setitem(pm.FUZZ_UNIT_CAP_BY_PROFILE, "quick", 50)
+    monkeypatch.setitem(pm.P3_FUZZ_BASE_CAP_BY_PROFILE, "quick", 50)
     monkeypatch.setattr(plan.mm, "unit_of", lambda name: "u")
     plan.warnings.clear()
     pm.allocate_fuzz_budgets(plan)

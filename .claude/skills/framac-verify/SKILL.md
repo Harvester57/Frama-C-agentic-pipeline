@@ -53,7 +53,7 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 - `--profile quick|standard|deep`: Run profile (default `standard`; see `docs/guides/v2-design.md` Section 9). Profiles change breadth, never the evidence bar.
 - `--scope <path>`: Restrict to repository-relative paths (repeatable). Everything else is seeded `out_of_scope`.
 - `--max-agents <N>`: Cap on concurrent LLM subagents: pass it as `wp_scheduler.py step --max-agents <N>`. Default: what `resources.py recommend` derives from the measured machine (`max_agents`), capped at 16, or 32 on 32+ CPUs and 64 on 64+ CPUs; `FRAMAC_MAX_AGENTS` replaces that cap.
-- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's CPU-second budget per harness case (quick 60, standard 120, deep 900, capped per link unit at 480 / 1200 / 7200; under `FRAMAC_FUZZ_EXPLORE_JUDGE=on`, sublinear budgets 60 / 600 / 3600 per case with sqrt unit cap on base 480 / 7200 / 43200), divided by the clamped worker count.
+- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's sublinear CPU-second budget per harness case (quick 60, standard 600, deep 3600 per case with sqrt unit cap on base 480 / 7200 / 43200; under legacy `FRAMAC_FUZZ_EXPLORE_JUDGE=off`, 60 / 120 / 900 per case capped at 480 / 1200 / 7200), divided by the clamped worker count.
 - `--run-dir <dir>`: Resume an existing run directory instead of creating a new one.
 
 ## Resources
@@ -185,12 +185,12 @@ Operational kill switches:
 - `FRAMAC_BROKER=off` (or `-NoBroker`): the wrapper's previous static sizing.
 - `FRAMAC_SCHEDULER=waves`: wave-by-wave dispatch with barriers.
 
-Harness & fuzzing overhaul A/B feature flags (all five are forwarded by `wrappers/framac-docker.ps1`, `wrappers/framac-docker.sh`, and `docker-compose.yml`, and **default to `off`** while A/B evaluation runs):
-- `FRAMAC_HARNESS_SCOPE_V2` (`off` | `on`): P1 unit-visibility scoping (`executable`, `plugin_so`, `internal_convenience`, `public_lib`), first-class `tf_*` reach credit, and sidecar `api_auto_exempt` acceptance (`/framac-slice`).
-- `FRAMAC_API_TRUST_SCHEMA` (`off` | `on`): P2A deterministic `--api` upgrades: threat-model parameter roles (S1), widened by-value and schema-taking builders (S2), `const` schema instances (S3), and `--api` hygiene (`/framac-slice`).
-- `FRAMAC_HARNESS_SMOKE` (`off` | `on`): P3 standalone harness smoke gate (`smoke` / `smoke-%` running `harness_smoke.py run` + `phase0_gates.py record-smoke` before fuzzing and Eva) (`/framac-slice`, `/framac-fuzz`).
-- `FRAMAC_FUZZ_EXPLORE_JUDGE` (`off` | `on`): P4 Explore / Judge split (pre-built `.san` Explore, standalone `.e-acsl` Judge, `deep`-only `eacsl-fuzz`, per-case blinding at `K_case = 16`, sublinear fuzz budgets) (`/framac-fuzz`).
-- `FRAMAC_VERIFIER_BREAKER` (`off` | `on`): P5 crash clustering, small probe-batch dispatch, and verifier circuit breaker pausing pending verifiers to open `repair:<mod>` on harness-induced storms (`/framac-wp`).
+Harness & fuzzing overhaul A/B feature flags (all five are forwarded by `wrappers/framac-docker.ps1`, `wrappers/framac-docker.sh`, and `docker-compose.yml`, and **default to `on`**; pass `=off` for A/B rollback):
+- `FRAMAC_HARNESS_SCOPE_V2` (`on` | `off`, default `on`): P1 unit-visibility scoping (`executable`, `plugin_so`, `internal_convenience`, `public_lib`), first-class `tf_*` reach credit, and sidecar `api_auto_exempt` acceptance (`/framac-slice`).
+- `FRAMAC_API_TRUST_SCHEMA` (`on` | `off`, default `on`): P2A deterministic `--api` upgrades: threat-model parameter roles (S1), widened by-value and schema-taking builders (S2), `const` schema instances (S3), and `--api` hygiene (`/framac-slice`).
+- `FRAMAC_HARNESS_SMOKE` (`on` | `off`, default `on`): P3 standalone harness smoke gate (`smoke` / `smoke-%` running `harness_smoke.py run` + `phase0_gates.py record-smoke` before fuzzing and Eva) (`/framac-slice`, `/framac-fuzz`).
+- `FRAMAC_FUZZ_EXPLORE_JUDGE` (`on` | `off`, default `on`): P4 Explore / Judge split (pre-built `.san` Explore, standalone `.e-acsl` Judge, `deep`-only `eacsl-fuzz`, per-case blinding at `K_case = 16`, sublinear fuzz budgets) (`/framac-fuzz`).
+- `FRAMAC_VERIFIER_BREAKER` (`on` | `off`, default `on`): P5 crash clustering, small probe-batch dispatch, and verifier circuit breaker pausing pending verifiers to open `repair:<mod>` on harness-induced storms (`/framac-wp`).
 
 ## Recording pipeline bugs
 
