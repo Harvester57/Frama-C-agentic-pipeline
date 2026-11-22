@@ -212,6 +212,14 @@ ARRAY_STRING_BYTES = 16  # the storage of each element of an array of `const` st
 # input bytes, its last byte 0. Small, since the slot is read whole or not at all; room for a dotted
 # IPv4 address or `/dev/ttyUSB0` and its NUL.
 STRING_SLOT_BYTES = 16
+# Under FRAMAC_API_TRUST_SCHEMA, a trusted NUL-terminated string (`const char *szLabel` the threat
+# model does not list as attacker data; QCBOR run-1's map labels) is bound to a fixed literal, a value
+# the application could pass: the one the target's tests pass most often (recorded seed traces), else
+# this one. Recorded strings longer than TRUSTED_STRING_MAX_BYTES, empty or not printable ASCII are
+# never taken.
+TRUSTED_STRING_DEFAULT = "a"
+TRUSTED_STRING_MAX_BYTES = 64
+MAX_RECORDED_SCALARS = 8  # values a trusted scalar of a sequence case keeps, of those the tests passed
 # The formal name of an element count: `count`, `cnt`, `n`, `nItems`, `num_pts`, `nmemb`, `nelem`,
 # and `nb` as a word (libmodbus's `nb`, `nb_bits`, `write_nb`, `read_nb`).
 _ARRAY_COUNT_RE = re.compile(
@@ -335,6 +343,7 @@ _OFF_VALUES = frozenset({"off", "0", "false", "no"})
 MAX_SCHEMA_INSTANCES = 4
 NO_ATTACKER_DATA_REASON = "no attacker data per the threat model"
 TRUSTED_PARAM_NO_INSTANCE_FMT = "trusted parameter {name} has no instance"
+CALLER_STORAGE_NOTE = "trusted caller-storage buffer: backed by fixed harness array"
 REFCOUNT_EXEMPT_REASON = "refcount helper requires producer-allocated object"
 STATIC_NOT_CALLABLE_REASON = "static: not callable from the harness"
 _NULLABLE_ALLOCATOR_NAMES = frozenset({"allocator", "alloc", "mem_alloc"})
@@ -568,6 +577,13 @@ class ApiInfo:
     schema_inits: dict[str, tuple[int, str]] = field(default_factory=dict)
     schema_globals: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     schema_externs: dict[str, str] = field(default_factory=dict)
+    # Per function, per argument index: the string the recorded traces pass most often there
+    # (`recorded_strings`), the literal of a trusted string parameter (`_trusted_string_arg`).
+    trusted_strings: dict[str, dict[int, str]] = field(default_factory=dict)
+    # Per function, per argument index: the integers the recorded traces pass there, (byte width,
+    # unsigned value), most frequent first (`recorded_scalars`): what a trusted scalar takes in a
+    # sequence case.
+    trusted_scalars: dict[str, dict[int, list[tuple[int, int]]]] = field(default_factory=dict)
 
 
 class _Case:
@@ -589,6 +605,9 @@ class _Case:
         self.owned_frees: list[str] = []
         self.schema_instance: str | None = None
         self.builder: str | None = None
+        # A sequence case replays calls the target's tests made: a trusted scalar takes one of the
+        # values they passed there (`ApiInfo.trusted_scalars`) instead of 0.
+        self.recorded_scalars = False
 
     def declare(self, name: str) -> str:
         """
@@ -973,6 +992,217 @@ def _is_nullable_allocator_param(param_name: str | None, p: dict[str, Any]) -> b
     return False
 
 
+def _is_writable_byte_ptr_field(f: dict[str, Any]) -> bool:
+    """Whether a struct field is a non-const byte/void pointer (`void *`, `unsigned char *`, `uint8_t *`, `char *`)."""
+    if f.get("kind") != "ptr" or f.get("const"):
+        return False
+    if f.get("bytes") is True:
+        return True
+    if f.get("bytes") is False:
+        return False
+    pointee = str(f.get("pointee") or "").strip()
+    if pointee:
+        norm = _norm_type(pointee)
+        return norm in _BYTE_POINTEES or norm == "uint8_t"
+    return False
+
+
+def _is_caller_storage_len_field(f: dict[str, Any]) -> bool:
+    """Whether a struct field is a size/length integer field of a caller-storage buffer struct."""
+    if not _len_field(f):
+        return False
+    fname = str(f.get("name") or "")
+    return bool(_LEN_NAME_RE.search(fname) or (set(_words(fname)) & _TRIPLE_SIZE_WORDS))
+
+
+def _writable_buffer_struct_fields(lay: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """
+    S2 caller-storage shape (a): a struct whose fields are exactly one writable byte/void pointer
+    (`void *`, `unsigned char *`, `uint8_t *`, `char *`, non-`const` pointee) and one size/length
+    integer field, in either `{ptr, len}` or `{len, ptr}` field order, with no function-pointer or
+    other pointer fields (e.g. QCBOR's `UsefulBuf { void *ptr; size_t len; }`).
+    Returns `(ptr_field, len_field)` or None.
+    """
+    if not isinstance(lay, dict) or lay.get("what") != "struct":
+        return None
+    fields = list(lay.get("fields") or [])
+    if len(fields) != 2 or not all(isinstance(f, dict) for f in fields):
+        return None
+    f0, f1 = fields[0], fields[1]
+    if _is_writable_byte_ptr_field(f0) and _is_caller_storage_len_field(f1):
+        return f0, f1
+    if _is_caller_storage_len_field(f0) and _is_writable_byte_ptr_field(f1):
+        return f1, f0
+    return None
+
+
+def _is_caller_storage_pair(
+    params: list[dict[str, Any]],
+    i: int,
+    formals: list[dict[str, Any]],
+    rec: dict[str, Any],
+    api: ApiInfo,
+) -> bool:
+    """
+    S2 caller-storage shape (b): a trusted writable `(void */byte *, size_t)` scratch pair whose
+    pointer is non-`const` (`formals[i]["kind"] == "pointer"`), not an opaque handle, followed by
+    a length integer whose name says length/size/capacity (or an unnamed `size_t`/`unsigned long`).
+    """
+    if i + 1 >= len(params) or not _is_pair(params, i, formals):
+        return False
+    if _is_input(formals, i):
+        return False
+    fn_name = str(rec.get("name") or "")
+    if i in (api.handles.get(fn_name) or {}):
+        return False
+    lname = _name(formals, i + 1)
+    if lname:
+        return bool(_LEN_NAME_RE.search(lname) or (set(_words(lname)) & _TRIPLE_SIZE_WORDS))
+    return str(params[i + 1].get("ctype") or "") in ("unsigned long", "unsigned long long")
+
+
+def _is_trusted_cstring(params: list[dict], formals: list[dict], rec: dict, i: int, roles: list[str] | None) -> bool:
+    """
+    Under `FRAMAC_API_TRUST_SCHEMA`, whether trusted parameter `i` is a NUL-terminated string the
+    application chooses (QCBOR's `const char *szLabel`), bound to a literal (`_trusted_string_arg`)
+    instead of exempting the entry point. Only a `char`/`signed char` pointee the model positively
+    marks read-only (`const_pointer`), with no size its call sites give: a byte buffer (`void`,
+    `unsigned char`), a fixed-size object or a pointer the callee may write keeps the
+    `TRUSTED_PARAM_NO_INSTANCE_FMT` exemption. An unsigned scalar beside it that the threat model
+    leaves trusted (`trusted_scalar`: QCBOR's `szLabel, uint32_t uConvertTypes`) is no length of
+    the string, only zeroed; one it gives the attacker would be a length beside a literal: exempt.
+    """
+    if roles is None or i >= len(params) or i >= len(formals) or i >= len(roles) or roles[i] != "trusted":
+        return False
+    p = params[i]
+    if p.get("kind") != "ptr" or str(p.get("pointee") or "") not in ("char", "signed char"):
+        return False
+    if not isinstance(formals[i], dict) or formals[i].get("kind") != "const_pointer":
+        return False
+    if param_size(rec, i) is not None:
+        return False
+    if _is_pair(params, i, formals) and (i + 1 >= len(roles) or roles[i + 1] != "trusted_scalar"):
+        return False
+    return not (i > 0 and _len_ptr_params(params, i - 1, formals, rec) and roles[i - 1] != "trusted_scalar")
+
+
+def recorded_strings(traces: list[list[dict]] | None) -> dict[str, dict[int, str]]:
+    """
+    Per function and argument index, the NUL-terminated string (`s` records of seed_harvest.py
+    traces) the target's tests pass most often there; ties go to the shorter, then the smaller text.
+    Only printable ASCII of 1 to `TRUSTED_STRING_MAX_BYTES` bytes counts, so the literal is stable.
+    """
+    counts: dict[tuple[str, int], dict[str, int]] = {}
+    for trace in traces or []:
+        for call in trace:
+            fn = call.get("fn")
+            args = call.get("args")
+            if not isinstance(fn, str) or not isinstance(args, dict):
+                continue
+            for idx, vals in args.items():
+                if not str(idx).isdigit() or not isinstance(vals, list):
+                    continue
+                for val in vals:
+                    if not (isinstance(val, list) and len(val) == 3 and val[0] == "s" and isinstance(val[2], str)):
+                        continue
+                    try:
+                        data = bytes.fromhex(val[2])
+                    except ValueError:
+                        continue
+                    if not 0 < len(data) <= TRUSTED_STRING_MAX_BYTES or not all(0x20 <= b < 0x7F for b in data):
+                        continue
+                    seen = counts.setdefault((fn, int(idx)), {})
+                    text = data.decode("ascii")
+                    seen[text] = seen.get(text, 0) + 1
+    out: dict[str, dict[int, str]] = {}
+    for (fn, idx), seen in sorted(counts.items()):
+        out.setdefault(fn, {})[idx] = min(seen, key=lambda t: (-seen[t], len(t), t))
+    return out
+
+
+def recorded_scalars(traces: list[list[dict]] | None) -> dict[str, dict[int, list[tuple[int, int]]]]:
+    """
+    Per function and argument index, the integers (`i` records of seed_harvest.py traces, little
+    endian, at most 8 bytes) the target's tests pass there, as (byte width, unsigned value): at most
+    `MAX_RECORDED_SCALARS` distinct ones, the most frequent first, ties by value.
+    `_recorded_scalar_arg` reads them with the parameter's signedness.
+    """
+    counts: dict[tuple[str, int], dict[tuple[int, int], int]] = {}
+    for trace in traces or []:
+        for call in trace:
+            fn = call.get("fn")
+            args = call.get("args")
+            if not isinstance(fn, str) or not isinstance(args, dict):
+                continue
+            for idx, vals in args.items():
+                if not str(idx).isdigit() or not isinstance(vals, list):
+                    continue
+                for val in vals:
+                    if not (isinstance(val, list) and len(val) == 3 and val[0] == "i" and val[1] == 0):
+                        continue
+                    try:
+                        data = bytes.fromhex(str(val[2]))
+                    except ValueError:
+                        continue
+                    if not 0 < len(data) <= 8:
+                        continue
+                    seen = counts.setdefault((fn, int(idx)), {})
+                    key = (len(data), int.from_bytes(data, "little"))
+                    seen[key] = seen.get(key, 0) + 1
+    out: dict[str, dict[int, list[tuple[int, int]]]] = {}
+    for (fn, idx), seen in sorted(counts.items()):
+        out.setdefault(fn, {})[idx] = sorted(seen, key=lambda k: (-seen[k], k[1], k[0]))[:MAX_RECORDED_SCALARS]
+    return out
+
+
+def _recorded_scalar_arg(case: _Case, call: int, i: int, p: dict, v: str, recorded: list[tuple[int, int]]) -> None:
+    """
+    A trusted scalar of a sequence case (`_Case.recorded_scalars`) the traces recorded: read from the
+    input, then kept to the values the target's tests passed there (the application's own choices,
+    as `_trusted_string_arg`'s literal), never zero unless they passed zero.
+    """
+    ctype = str(p["ctype"])
+    signed = not (ctype.startswith(("unsigned", "enum", "_Bool")) or ctype in ("char", "size_t", "uint8_t"))
+    values: list[int] = []
+    for width, value in recorded:
+        if signed and value >= 1 << (8 * width - 1):
+            value -= 1 << (8 * width)
+        if value not in values:
+            values.append(value)
+    lits = [f"{x}LL" if x < 0 else f"{x}ULL" for x in values]
+    case.slot(v, SCALAR_BYTES.get(ctype), call, i, "int")
+    member = " || ".join(f"(long long){v} == (long long){lit}" for lit in lits)
+    case.decls.append(
+        f"if (!({member})) {{ static const long long fc_r[{len(lits)}] = {{ {', '.join(f'(long long){lit}' for lit in lits)} }}; "
+        f"{v} = ({ctype})fc_r[(unsigned long long){v} % {len(lits)}U]; }}"
+    )
+    case.note(
+        call,
+        i,
+        f"trusted scalar parameter per threat model: one of the {len(lits)} values the target's tests pass "
+        "there (recorded seed traces), picked by the input",
+    )
+
+
+def _trusted_string_arg(case: _Case, call: int, i: int, p: dict, name: str) -> str:
+    """The argument of a trusted string parameter (`_is_trusted_cstring`): a string literal, no slot."""
+    recorded = (case.api.trusted_strings.get(name) or {}).get(i)
+    text = recorded if recorded is not None else TRUSTED_STRING_DEFAULT
+    literal = c_string_literal(text.encode("ascii"))
+    why = (
+        "the value the target's tests pass most often (recorded seed traces)"
+        if recorded is not None
+        else "a fixed literal (no value recorded from the target's tests)"
+    )
+    case.note(
+        call,
+        i,
+        f"trusted string parameter per threat model: the literal {literal}, {why}, a value the application "
+        "could pass; not read from the input",
+    )
+    return f"({p['type']}){literal}"
+
+
 def _strip_builder_pair_sizes(params: list[dict], formals: list[dict], rec: dict) -> dict:
     """
     Drop call-site `param_sizes` entries on an S2 builder's read-only `(buf, len)` / `(len, buf)`
@@ -1060,7 +1290,7 @@ def _target_claims_rest(
         p = params[i]
         nxt = params[i + 1] if i + 1 < n else None
         role = roles[i] if roles is not None else None
-        if i in schema_bindings or role == "trusted_scalar":
+        if i in schema_bindings or role in ("trusted_scalar", "caller_storage_len"):
             i += 1
             continue
         if (
@@ -1093,7 +1323,7 @@ def _target_claims_rest(
             continue
         if p["kind"] == "ptr":
             pointee = str(p.get("pointee") or "void")
-            is_input = False if role == "output" else _is_input(formals, i)
+            is_input = False if role in ("output", "caller_storage") else _is_input(formals, i)
             size = None if varlen and _lone_output(params, formals, i) else param_size(rec, i)
             own_init = (i == 0 and name in api.candidates.get(pointee, set())) or (
                 api.trust_schema and name in api.candidates.get(pointee, set())
@@ -1103,6 +1333,12 @@ def _target_claims_rest(
                 continue
             if _table_type(api, p) is not None or role == "trusted":
                 i += 1
+                continue
+            if role == "caller_storage":
+                if _is_pair(params, i, formals) and nxt is not None and (i + 1) not in shared:
+                    i += 2
+                else:
+                    i += 1
                 continue
             j = _array_count(params, i, formals)
             if j is not None and not any(
@@ -1135,7 +1371,7 @@ def _target_claims_rest(
             if api.trust_schema and ctype in api.inits and name not in api.candidates.get(ctype, set()):
                 i += 1
                 continue
-            if role == "trusted":
+            if role in ("trusted", "caller_storage"):
                 i += 1
                 continue
             if _struct_claims_rest(api, api.structs.get(ctype)):
@@ -2098,10 +2334,16 @@ def _param_roles(
     entry_trust: _EntryTrust,
 ) -> list[str]:
     """
-    S1 per-parameter roles when a threat model is active:
+    S1/S2 per-parameter roles when a threat model is active:
       - `attacker`: fuzzed as today (or built via an S2 byte-taking builder);
-      - `trusted`: pointer/struct not in `attacker_params` -> ONLY S3 schema instance or S2 builder,
-        else skipped with `"trusted parameter <name> has no instance"`;
+      - `caller_storage`: trusted caller-owned writable buffer struct (`{ptr, len}` / `{len, ptr}`
+        with a single writable byte/void pointer and length) or writable `(void */byte *, size_t)`
+        scratch pair -> backed by a fixed `_Alignas(16)` harness array;
+      - `caller_storage_len`: trusted length integer paired with a `caller_storage` pointer -> set
+        to `sizeof(<var>_buf)` (zeroed if standalone);
+      - `trusted`: pointer/struct not in `attacker_params` -> ONLY S3 schema instance or S2 builder
+        (a read-only NUL-terminated string: a fixed literal, `_is_trusted_cstring`), else skipped
+        with `"trusted parameter <name> has no instance"`;
       - `output`: non-const writable buffer or scalar out-parameter -> clean zeroed buffer;
       - `trusted_scalar`: scalar not in `attacker_params` -> zeroed without fuzz slot.
     """
@@ -2120,12 +2362,24 @@ def _param_roles(
                 roles.append("attacker")
             elif i + 1 < n and _len_ptr_params(params, i, formals, rec) and _name(formals, i + 1) in att:
                 roles.append("attacker")
+            elif (
+                i > 0
+                and roles[i - 1] == "caller_storage"
+                and _is_caller_storage_pair(params, i - 1, formals, rec, api)
+            ):
+                roles.append("caller_storage_len")
             elif p["kind"] == "struct":
-                roles.append("trusted")
+                ctype = str(p.get("ctype") or "")
+                if _writable_buffer_struct_fields(api.structs.get(ctype)) is not None:
+                    roles.append("caller_storage")
+                else:
+                    roles.append("trusted")
             elif p["kind"] == "ptr":
                 pointee = str(p.get("pointee") or "")
                 if (_is_record(pointee) and "*" not in pointee) or is_in:
                     roles.append("trusted")
+                elif _is_caller_storage_pair(params, i, formals, rec, api):
+                    roles.append("caller_storage")
                 else:
                     roles.append("output")
             elif p["kind"] == "fnptr":
@@ -2145,8 +2399,16 @@ def _param_roles(
                 roles.append("attacker")
             elif p["kind"] == "struct" and str(p.get("ctype") or "") in api.inits:
                 roles.append("attacker")
+            elif (
+                p["kind"] == "struct"
+                and _writable_buffer_struct_fields(api.structs.get(str(p.get("ctype") or ""))) is not None
+            ):
+                roles.append("caller_storage")
             elif p["kind"] == "ptr" and not is_in:
-                roles.append("output")
+                if _is_caller_storage_pair(params, i, formals, rec, api):
+                    roles.append("caller_storage")
+                else:
+                    roles.append("output")
             elif p["kind"] == "ptr" and _is_record(str(p.get("pointee") or "")) and is_in:
                 roles.append("trusted")
             else:
@@ -2224,9 +2486,18 @@ def _bind_call(
             args.append(f"&{gname}" if by_ref else gname)
             i += 1
             continue
-        if role == "trusted_scalar":
+        if role in ("trusted_scalar", "caller_storage_len"):
             case.decls.append(f"{p['ctype']} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
-            case.note(call, i, "trusted scalar parameter per threat model: zeroed, not read from the input")
+            recorded = (
+                (api.trusted_scalars.get(name) or {}).get(i)
+                if case.recorded_scalars and p["kind"] == "int" and p.get("ctype") != "_Bool"
+                else None
+            )
+            if recorded:
+                # QCBOR run-1: a zeroed `uType` made `EnterBoundedMapOrArray` enter nothing in a chain.
+                _recorded_scalar_arg(case, call, i, p, v, recorded)
+            else:
+                case.note(call, i, "trusted scalar parameter per threat model: zeroed, not read from the input")
             args.append(v)
             i += 1
             continue
@@ -2239,6 +2510,12 @@ def _bind_call(
         ):
             case.note(call, i, "trusted nullable default allocator parameter: NULL")
             args.append("NULL")
+            i += 1
+            continue
+        if api.trust_schema and i not in shared and _is_trusted_cstring(params, formals, rec, i, roles):
+            # QCBOR run-1: a label the application chooses (`const char *szLabel`) is a literal it
+            # could pass, never fuzz bytes; without it the entry point was exempted unreached.
+            args.append(_trusted_string_arg(case, call, i, p, name))
             i += 1
             continue
         htype = handles.get(i) if i not in shared and p["kind"] == "ptr" else None
@@ -2362,7 +2639,7 @@ def _bind_call(
             continue
         if p["kind"] == "ptr":
             pointee = p.get("pointee") or "void"
-            is_input = False if role == "output" else _is_input(formals, i)
+            is_input = False if role in ("output", "caller_storage") else _is_input(formals, i)
             size = None if varlen and _lone_output(params, formals, i) else param_size(rec, i)
             charlike = _charlike(p)
             pair = _is_pair(params, i, formals)
@@ -2464,6 +2741,37 @@ def _bind_call(
                 i = j + 1
                 continue
             if (
+                api.trust_schema
+                and role == "caller_storage"
+                and pair
+                and nxt is not None
+                and (i + 1) not in shared
+            ):
+                # S2 caller-storage shape (b): trusted writable `(void */byte *, size_t)` scratch pair.
+                buf_var = case.declare(f"{v}_buf")
+                case.decls.append(_byte_buffer("static ", buf_var, case.spare))
+                ln = f"c{call}a{i + 1}"
+                attacker_sized = roles is not None and roles[i + 1] == "attacker"
+                if attacker_sized:
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+                    case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
+                    case.decls.append(
+                        f"if ((unsigned long long){ln} > sizeof({buf_var})) {{ {ln} = ({nxt['ctype']})sizeof({buf_var}); }}"
+                    )
+                    case.note(
+                        call,
+                        i,
+                        f"{CALLER_STORAGE_NOTE} (attacker-sized length clamped to 0..sizeof({buf_var}))",
+                    )
+                else:
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)} = ({nxt['ctype']})sizeof({buf_var});")
+                    case.note(call, i, CALLER_STORAGE_NOTE)
+                args.append(f"({p['type']}){buf_var}")
+                args.append(ln)
+                pairs.append((i, ln, False))
+                i += 2
+                continue
+            if (
                 pair
                 and nxt is not None
                 and (i + 1) not in shared
@@ -2536,8 +2844,9 @@ def _bind_call(
                 elif size is None and is_input and pointee in ("char", "signed char") and case.rest is None:
                     case.rest = {"call": call, "param": i, "kind": "string"}
                     case.post.append(
-                        f"{{ size_t rest_n = fuzz_len - fuzz_off; if (rest_n > sizeof({v}) - 1) "
-                        f"{{ rest_n = sizeof({v}) - 1; }} memcpy({v}, {FUZZ_COPY}, rest_n); {v}[rest_n] = 0; }}"
+                        f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                        f"if (rest_n > sizeof({v}) - 1) {{ rest_n = sizeof({v}) - 1; }} "
+                        f"if (rest_n > 0) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} {v}[rest_n] = 0; }}"
                     )
                 bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
@@ -2666,6 +2975,23 @@ def _bind_call(
                 args.append(v)
                 i += 1
                 continue
+            if api.trust_schema and role == "caller_storage":
+                # S2 caller-storage shape (a): trusted by-value writable buffer struct (`{ptr, len}` / `{len, ptr}`).
+                buf_fields = _writable_buffer_struct_fields(api.structs.get(ctype))
+                if buf_fields is not None:
+                    pf, lf = buf_fields
+                    buf_var = case.declare(f"{v}_buf")
+                    case.decls.append(_byte_buffer("static ", buf_var, case.spare))
+                    case.decls.append(f"{ctype} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                    case.decls.append(
+                        f"{v}.{pf['name']} = (void *){buf_var}; {v}.{lf['name']} = ({lf['ctype']})sizeof({buf_var});"
+                    )
+                    case.note(call, i, CALLER_STORAGE_NOTE)
+                    args.append(v)
+                    i += 1
+                    continue
+                pname = _name(formals, i) or f"param{i}"
+                raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
             if role == "trusted":
                 pname = _name(formals, i) or f"param{i}"
                 raise _AutoExempt(TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname))
@@ -3026,6 +3352,7 @@ def _single_cases_for_entry(
                 and not has_builder
                 and _table_type(api, p) is None
                 and not _is_nullable_allocator_param(pname, p)
+                and not _is_trusted_cstring(params, formals, model_rec, i, roles)
             ):
                 insts = _lookup_schema_instances(api, pointee, decl)
                 if not insts:
@@ -3043,6 +3370,7 @@ def _single_cases_for_entry(
                 builder_schema_opts[i] = (s_pointee, insts)
                 continue
             if role == "trusted" and not has_builder:
+                # Caller-storage buffer structs have role == "caller_storage" (backed by fixed harness array).
                 insts = _lookup_schema_instances(api, ctype, None)
                 if not insts:
                     return [], TRUSTED_PARAM_NO_INSTANCE_FMT.format(name=pname), True, set()
@@ -3943,7 +4271,13 @@ def chains(trace: list[dict]) -> list[list[int]]:
     return [g for g in groups.values() if len(g) > 1]
 
 
-def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], addr: str) -> int:
+def _shared_size(
+    trace: list[dict],
+    chain: list[int],
+    records: dict[str, dict],
+    addr: str,
+    api: ApiInfo | None = None,
+) -> int:
     """
     The size of a buffer shared by the calls of a chain: the largest the model gives any of its uses,
     0 (a spare buffer) when no use has one or a use is the lone output of a variable-length call. The
@@ -3951,7 +4285,8 @@ def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], 
     """
     sizes: list[int] = []
     for j in chain:
-        rec = records.get(trace[j]["fn"]) or {}
+        fn = trace[j]["fn"]
+        rec = records.get(fn) or (api.records.get(fn) if api is not None and api.trust_schema else None) or {}
         params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         formals = list(rec.get("formals") or [])
         for i_s, a in (trace[j].get("addrs") or {}).items():
@@ -3970,27 +4305,46 @@ def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], 
 
 
 def sequence_case(
-    trace: list[dict], chain: list[int], records: dict[str, dict], spare: int, api: ApiInfo | None = None
+    trace: list[dict],
+    chain: list[int],
+    records: dict[str, dict],
+    spare: int,
+    api: ApiInfo | None = None,
+    trust: Mapping[str, _EntryTrust] | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """
     The case that replays one chain of a trace: one buffer per shared address (the largest size the
     model or the trace gives it), passed to every call that used that address; every other argument
     as in a single case. The layout's slots name the trace call (`call`, its position in the chain).
     A shared struct object whose first use is not one of its initializers gets the initializer first.
+    `trust` gives each function's threat-model roles (by name), bound as in its single case: a trusted
+    string is its literal, and a trusted scalar takes one of the values the traces recorded there
+    (`_recorded_scalar_arg`), zero when none was. Under `FRAMAC_API_TRUST_SCHEMA`, optional
+    `no-attacker-data` configurator/setup calls absent from `records` may be resolved from
+    `api.records` (treating their non-shared parameters as trusted) as long as at least one call in
+    `chain` is a real entry point in `records`.
     """
     try:
-        return _sequence_case(trace, chain, records, spare, api)
+        return _sequence_case(trace, chain, records, spare, api, trust)
     except _CaseError as e:
         return None, None, str(e)
 
 
 def _sequence_case(
-    trace: list[dict], chain: list[int], records: dict[str, dict], spare: int, api: ApiInfo | None
+    trace: list[dict],
+    chain: list[int],
+    records: dict[str, dict],
+    spare: int,
+    api: ApiInfo | None,
+    trust: Mapping[str, _EntryTrust] | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     case = _Case(spare, api, calls=len(chain))
+    case.recorded_scalars = True
     buffers: dict[str, str] = {}
     calls: list[str] = []
     names: list[str] = []
+    if not any(trace[k]["fn"] in records for k in chain):
+        return None, None, "sequence has no API entry point"
     seen_addr: dict[str, int] = {}
     for call in (trace[k] for k in chain):
         for addr in (call.get("addrs") or {}).values():
@@ -4001,8 +4355,13 @@ def _sequence_case(
         call = trace[k]
         name = call["fn"]
         rec = records.get(name)
+        is_configurator = False
         if rec is None:
-            return None, None, f"{name} is not an API function of this module"
+            if case.api.trust_schema and name in case.api.records:
+                rec = case.api.records[name]
+                is_configurator = True
+            else:
+                return None, None, f"{name} is not an API function of this module"
         params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         if params is None:
             return None, None, f"{name}: {why}"
@@ -4020,7 +4379,7 @@ def _sequence_case(
                 continue
             if addr not in buffers:
                 var = f"s{len(buffers)}"
-                size = _shared_size(trace, chain, records, addr)
+                size = _shared_size(trace, chain, records, addr, case.api)
                 pointee = str(params[idx].get("pointee") or "")
                 is_record = _is_record(pointee)
                 lay = case.api.structs.get(pointee) if is_record else None
@@ -4033,19 +4392,31 @@ def _sequence_case(
                 # Filled from the input when its first use reads it, its size is known, and it holds
                 # no pointer.
                 raw_ok = not is_record or _raw_ok(lay)
-                if size and _is_input(list(rec.get("formals") or []), idx) and raw_ok:
+                if not is_configurator and size and _is_input(list(rec.get("formals") or []), idx) and raw_ok:
                     case.slot(var, size, pos, idx, "bytes", addr=False)
                 buffers[addr] = var
                 own_init = idx == 0 and name in case.api.candidates.get(pointee, set())
                 if pointee in case.api.inits and not own_init:
-                    before.append(_init_call(case, pointee, var, pos, idx))
+                    if case.api.trust_schema and case.api.inits[pointee] in case.api.byval_inits:
+                        # QCBOR run-1: `s1 = UsefulBuf_FromSZ(...)` assigned a struct to the byte array, and
+                        # the compile probe dropped the recorded encoder chain. Assign through the type.
+                        obj = _anon_record_spelling(case.api, pointee)
+                        before.append(_init_call(case, pointee, var, pos, idx, var=f"*({obj} *){var}"))
+                    else:
+                        before.append(_init_call(case, pointee, var, pos, idx))
                 elif not own_init and pointee in case.api.init_skip_notes:
                     for note_msg in case.api.init_skip_notes[pointee]:
                         case.note(pos, idx, note_msg)
             shared[idx] = buffers[addr]
-        calls.append(
-            " ".join([*before, _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared)])
-        )
+        if is_configurator:
+            # W2-C: optional no-attacker-data configurator call in a recorded chain — treat all
+            # non-shared parameters as trusted so caller-storage buffers get fixed harness arrays,
+            # trusted C-strings get literals, and trusted scalars take recorded values or zero.
+            et: _EntryTrust | None = _EntryTrust(input_role="entry", attacker_params=[])
+        else:
+            et = (trust or {}).get(name)
+        bound = _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared, entry_trust=et)
+        calls.append(" ".join([*before, bound]))
         names.append(name)
     return case.statements(calls), case.layout("sequence", names), None
 
@@ -4154,10 +4525,344 @@ def _lifecycle_case(
     return case.statements([make, loop, *frees]), layout, None
 
 
+# --- stateful cases: the state an entry point needs before it does more than fail ------------------------
+#
+# QCBOR run-1 (2026-11-22): every single case calls its entry point once, right after the context's
+# initializer. `QCBOREncode_CloseAndSortMap` then closes a map nobody opened, and the `*InMapSZ`
+# accessors search a map nobody entered: both return an error on every input. A stateful case is a
+# `sequence` case that leads up to such an entry point: the context's initializer, the calls that set
+# up the state it needs, then the entry point.
+
+STATE_MAX_CASES = 96  # stateful cases per harness, after the recorded sequences and lifecycle cases
+STATE_MAX_PREFIX = 6  # calls before the entry point in a stateful case (its initializer not counted)
+STATE_FEED_CALLS = 4  # data calls a model-built case makes on a context whose initializer reads no data
+STATE_REACH_DEPTH = 8  # call-graph depth of `_reach`
+_OPENER_WORDS = frozenset({"open", "enter", "begin", "start", "push"})
+_CLOSER_WORDS = {"close": "open", "exit": "enter", "leave": "enter", "end": "begin", "stop": "start", "pop": "push"}
+_CANCEL_WORDS = frozenset({"cancel", "abort"})  # undo an opener: a closer without a paired name
+_SCOPE_WORDS = frozenset({"in", "from", "inside", "within"})
+
+
+def _scope_noun(words: list[str]) -> str | None:
+    """The noun of a scope an accessor works in (`get_int_in_map` -> `map`), or None."""
+    for k, w in enumerate(words[:-1]):
+        if w in _SCOPE_WORDS:
+            return words[k + 1]
+    return None
+
+
+def _closer_word(words: list[str]) -> str | None:
+    return next((w for w in words if w in _CLOSER_WORDS or w in _CANCEL_WORDS), None)
+
+
+def _is_opener(words: list[str]) -> bool:
+    return any(w in _OPENER_WORDS for w in words) and _closer_word(words) is None and _scope_noun(words) is None
+
+
+def _reach(callees: Mapping[str, set[str]], name: str, depth: int = STATE_REACH_DEPTH) -> set[str]:
+    """The functions `name` reaches through the model's direct call sites, within `depth` calls."""
+    seen: set[str] = set()
+    frontier = set(callees.get(name, ()))
+    for _ in range(depth):
+        frontier -= seen
+        if not frontier:
+            break
+        seen |= frontier
+        frontier = set().union(*(callees.get(f, set()) for f in frontier))
+    return seen
+
+
+def _context_type(rec: dict, api: ApiInfo) -> str | None:
+    """The struct a function works on through its first parameter, when an initializer sets it up."""
+    params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+    if not params or params[0]["kind"] != "ptr":
+        return None
+    pointee = str(params[0].get("pointee") or "")
+    return pointee if _is_record(pointee) and "*" not in pointee and pointee in api.inits else None
+
+
+def _input_of(layout: dict) -> tuple[bool, bool]:
+    """
+    Of a single case: (whether the entry point's own call reads the input, whether the initializer of
+    its context reads data, not only a size). An initializer or builder made for another argument of
+    the call (`inits[].for.param` other than 0) feeds the call's own input.
+    """
+    ctx_inits = {
+        int(i["call"])
+        for i in layout.get("inits") or []
+        if isinstance(i, dict) and (i.get("for") or {}).get("call") == 0 and (i.get("for") or {}).get("param") == 0
+    }
+    used = [*(layout.get("slots") or []), *([layout["rest"]] if layout.get("rest") else [])]
+    own = any(int(s.get("call", 0)) not in ctx_inits for s in used)
+    data = any(int(s.get("call", 0)) in ctx_inits and s.get("kind") not in ("int", "field_len") for s in used)
+    return own, data
+
+
+def _context_segments(traces: list[list[dict]] | None, init_names: set[str]) -> list[tuple[str, list[dict]]]:
+    """
+    The calls of the traces on one context object, with the initializer that set it up: from a call of
+    an initializer on an address (its first argument) to the next one on that address, the initializer
+    left out. Calls on an address no recorded initializer set up are in no segment.
+    """
+    out: list[tuple[str, list[dict]]] = []
+    for trace in traces or []:
+        open_seg: dict[str, list[dict]] = {}
+        for call in trace:
+            addr = (call.get("addrs") or {}).get("0")
+            if not isinstance(addr, str) or addr in ("0", "-"):
+                continue
+            if call.get("fn") in init_names:
+                open_seg[addr] = []
+                out.append((str(call["fn"]), open_seg[addr]))
+            elif addr in open_seg:
+                open_seg[addr].append(call)
+    return [(fn, s) for fn, s in out if s]
+
+
+def _compress_prefix(pre: list[dict]) -> list[dict]:
+    """
+    At most `STATE_MAX_PREFIX` of a recorded prefix: the openers still open when the entry point ran,
+    then the calls just before it, back to the last closer or the innermost of those openers.
+    """
+    if len(pre) <= STATE_MAX_PREFIX:
+        return pre
+    stack: list[int] = []
+    for k, c in enumerate(pre):
+        words = _words(str(c.get("fn")))
+        if _closer_word(words) is not None:
+            if stack:
+                stack.pop()
+        elif _is_opener(words):
+            stack.append(k)
+    keep = stack[-STATE_MAX_PREFIX:]
+    lo = keep[-1] if keep else -1
+    k = len(pre) - 1
+    while len(keep) < STATE_MAX_PREFIX and k > lo:
+        if _closer_word(_words(str(pre[k].get("fn")))) is not None:
+            break
+        keep.append(k)
+        k -= 1
+    return [pre[k] for k in sorted(set(keep))]
+
+
+def _best_opener(
+    cands: list[str], against: set[str], words: dict[str, list[str]], rank: dict[str, tuple[Any, ...]]
+) -> str:
+    """The opener sharing most words with `against` (open/close words aside), then the most recorded."""
+    plain = against - _OPENER_WORDS - set(_CLOSER_WORDS) - _CANCEL_WORDS
+    return min(cands, key=lambda o: (-len(plain & set(words[o])), *rank[o]))
+
+
+def stateful_prefixes(
+    records: dict[str, dict],
+    singles: dict[str, dict],
+    api: ApiInfo,
+    model_functions: dict,
+    traces: list[list[dict]] | None = None,
+    configurators: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    The entry points whose single case can only reach an error path on a fresh context, each with the
+    calls that set up the state it needs: [{entry, state, calls, why}], `calls` ending with the entry
+    point. `records` are the entry points with a single case (`singles`: name -> its layout); the
+    context of a function is the struct its first parameter points to, when an initializer sets it up.
+
+    Which entry points (each rule names the opener it needs, if any):
+      - a closer (`close`, `exit`, `end`, `leave`, `pop`, `cancel`, ...): the opener of the same name
+        with the opening word (`close_nesting` -> `open_nesting`), its own or a direct callee's, else
+        the opener sharing most words with it;
+      - an accessor of a scope (`get_int_in_map`, `enter_array_from_map`): an opener whose name has the
+        scope's noun (`enter_bounded_map`); and any other function of the context that reaches the
+        functions all of those accessors reach and neither the opener nor the initializer does (QCBOR's
+        `SeekToLabelN` reaches `MapSearch` as the `*InMap*` accessors do);
+      - a function whose case reads no input of its own, on a context whose initializer reads no data
+        (QCBOR's encoder: its only input was the storage size).
+    The calls before it (at most `STATE_MAX_PREFIX`): (a) `recorded`, the calls the target's tests made
+    on the same object before calling it (`_compress_prefix`), when a trace holds one with an opener
+    (or any call, for the third rule); else (b) `model`, the opener, then `STATE_FEED_CALLS` calls of
+    the context's most recorded data call when its initializer reads no data. Deterministic.
+    """
+    callees = _callee_names(model_functions)
+    counts: dict[str, int] = {}
+    for trace in traces or []:
+        for call in trace:
+            if isinstance(call.get("fn"), str):
+                counts[call["fn"]] = counts.get(call["fn"], 0) + 1
+    by_ctx: dict[str, list[str]] = {}
+    for name in sorted(records):
+        ctx = _context_type(records[name], api)
+        if ctx is None or name == api.inits.get(ctx) or _INIT_NAME_RE.search(name) or name not in singles:
+            continue
+        by_ctx.setdefault(ctx, []).append(name)
+    init_names = set(api.inits.values()) | {
+        n for names in api.candidates.values() for n in names if _INIT_NAME_RE.search(n)
+    }
+    prefix_allowed = set(records) | (set(configurators) if configurators else set())
+    segments = _context_segments(traces, init_names)
+
+    def nparams(n: str) -> int:
+        parts = split_signature(str(records[n].get("signature") or ""))
+        return len(parts[1]) if parts else 99
+
+    out: list[dict[str, Any]] = []
+    for ctx, methods in sorted(by_ctx.items()):
+        words = {m: _words(m) for m in methods}
+        common = set.intersection(*(set(w) for w in words.values()))
+        openers = [m for m in methods if _is_opener(words[m])]
+        inputs = {m: _input_of(singles[m]) for m in methods}
+        init_data = any(data for _own, data in inputs.values())
+        rank = {o: (-counts.get(o, 0), nparams(o), o) for o in openers}
+        needs: dict[str, tuple[str | None, str]] = {}
+        groups: dict[str, list[str]] = {}  # per opener, the accessors of its scope
+        for m in methods:
+            if m in openers:
+                pass
+            elif (cw := _closer_word(words[m])) is not None:
+                paired = None
+                for callee in [m, *sorted(callees.get(m, ()))]:
+                    c_words = _words(callee)
+                    c_cw = _closer_word(c_words)
+                    if c_cw in _CLOSER_WORDS:
+                        want = [_CLOSER_WORDS[c_cw] if w == c_cw else w for w in c_words]
+                        paired = next((o for o in openers if words[o] == want), None)
+                        if paired is not None:
+                            break
+                if paired is None and openers:
+                    paired = _best_opener(openers, set(words[m]) - common, words, rank)
+                if paired is not None:
+                    needs[m] = (paired, f"is a closer ({cw}): {paired} opens first")
+                    continue
+            elif (noun := _scope_noun(words[m])) is not None:
+                scoped = [o for o in openers if noun in words[o]]
+                if scoped:
+                    entered = _best_opener(scoped, set(words[m]) - common, words, rank)
+                    needs[m] = (entered, f"works in a {noun}: {entered} enters one first")
+                    groups.setdefault(entered, []).append(m)
+                    continue
+            own, _data = inputs[m]
+            # A destructor releases the object whatever it holds: no state to set up first.
+            if not own and not init_data and m not in api.struct_dtor_names.get(ctx, set()):
+                needs[m] = (None, "reads no input of its own, and the context's initializer reads no data")
+        # The scope closure: what every accessor of one opener's scope reaches and the setup does not.
+        init_reach = _reach(callees, api.inits[ctx]) | {api.inits[ctx]}
+        for o, members in sorted(groups.items()):
+            if len(members) < 2:
+                continue
+            guarded = set.intersection(*(_reach(callees, m) for m in members)) - _reach(callees, o) - init_reach
+            guarded -= set(methods) | {o}
+            # The entry points of that part of the call graph: functions of it no other one calls.
+            tops = {g for g in guarded if not any(g in callees.get(h, set()) for h in guarded)}
+            for m in methods:
+                if m in needs or m in openers or not tops:
+                    continue
+                hit = sorted(_reach(callees, m) & tops)
+                if hit:
+                    needs[m] = (o, f"reaches {hit[0]} as the accessors of that scope do: {o} enters one first")
+        feeders = [m for m in methods if m not in needs and m not in openers and inputs[m][0]]
+        feeder = min(feeders, key=lambda f: (-counts.get(f, 0), nparams(f), f)) if feeders else None
+        for m in sorted(needs):
+            opener, why = needs[m]
+            prefix: list[str] | None = None
+            state = "model"
+            for seg_init, seg in segments:
+                if seg_init != api.inits[ctx] and seg_init not in api.candidates.get(ctx, set()):
+                    continue  # another object at a reused address
+                for j, c in enumerate(seg):
+                    if c.get("fn") != m:
+                        continue
+                    pre = [x for x in seg[:j] if x.get("fn") in prefix_allowed]
+                    if not pre or (opener is not None and not any(_is_opener(_words(str(x["fn"]))) for x in pre)):
+                        continue
+                    prefix = [str(x["fn"]) for x in _compress_prefix(pre)]
+                    state = "recorded"
+                    break
+                if prefix is not None:
+                    break
+            if prefix is None:
+                prefix = [opener] if opener is not None else []
+                if not init_data and feeder is not None:
+                    prefix += [feeder] * STATE_FEED_CALLS
+            prefix = prefix[:STATE_MAX_PREFIX]
+            if prefix:
+                out.append({"entry": m, "state": state, "calls": [*prefix, m], "why": why})
+    return out
+
+
 # A function defined in a public header (static) has no symbol to link: a case calls the copy the
 # harness compiles from the header, which the layout probe must have seen declared.
 HEADER_NOT_VISIBLE = "static header function: the layout probe did not see the harness declare it"
 HEADER_VARIADIC = "static header function, variadic: the generator takes no call site for it"
+
+
+def _sequence_configurator_records(
+    dag: dict,
+    model: dict,
+    module: str,
+    mm: Any,
+    records: dict[str, dict],
+    api: ApiInfo,
+    anon_tags: dict[str, str],
+    visible: set[str] | None,
+    tm_active: bool,
+    entry_trust_map: Mapping[str, _EntryTrust],
+    skipped: Mapping[str, str],
+    cluster_budget: _ClusterInitBudget | None = None,
+) -> dict[str, dict]:
+    """
+    W2-C: module-local, non-static, non-variadic, header-visible `no-attacker-data` configurator
+    and setup calls (e.g., `QCBORDecode_SetMemPool`, `QCBOREncode_Init`, `UsefulOutBuf_Init`,
+    `QCBORDecode_CompatibilityV1`) that may remain inside recorded trace segments alongside real
+    entry points in `records`.
+
+    Excludes `main`, static/header-inline functions, variadic functions, path-taking functions,
+    trusted-only (`trusted_caller`) functions, already-skipped attacker-data entry points, freeing
+    destructors, refcount helpers without a producer, and functions outside the module's scope.
+    Disabled when `api.trust_schema` is False (`FRAMAC_API_TRUST_SCHEMA=off` rollback).
+    """
+    if not api.trust_schema:
+        return {}
+    functions = dag.get("functions") or {}
+    scope_keys = list(mm.scope_functions(module))
+    if not scope_keys:
+        scope_keys = list((mm.unit_record(module)).get("functions") or [])
+    scope_key_set = set(scope_keys) | set(mm.scope_entry_points(module))
+    forbidden_dtors = (
+        {n for ns in api.owner_names.values() for n in ns}
+        | set(api.struct_freers.values())
+        | {n for ns in api.dtor_names.values() for n in ns}
+    )
+    out: dict[str, dict] = {}
+    for key in sorted(scope_key_set):
+        drec = functions.get(key) or {}
+        name = str(drec.get("name") or key.split("#")[-1])
+        if not name or name == "main" or name in records or name in out or name in forbidden_dtors:
+            continue
+        if drec.get("is_static"):
+            continue
+        if tm_active:
+            et = entry_trust_map.get(key) or _EntryTrust()
+            if et.trusted_caller or et.input_role is not None:
+                continue
+        elif key in skipped:
+            continue
+        mrec = _model_record(model, drec, key)
+        if not mrec or mrec.get("static"):
+            continue
+        if visible is not None and name not in visible:
+            continue
+        if _unspelled_anon_record(mrec, anon_tags):
+            continue
+        if is_variadic(str(mrec.get("signature") or ""), mrec.get("formals")):
+            continue
+        if path_parameter(mrec):
+            continue
+        if cluster_budget is not None and not cluster_budget.fits(name):
+            continue
+        params, _ = plan_params(str(mrec.get("signature") or ""), mrec.get("formals"))
+        if params is None or _is_refcount_without_producer(name, params, api):
+            continue
+        out[name] = mrec
+    return out
 
 
 def plan(
@@ -4188,9 +4893,11 @@ def plan(
     (`variadic_calls.load_cases`): its cases come after the single ones, and it is skipped only when
     it has none. `variadic_dropped` lists the call sites that made no case, with the reason.
     An entry point defined in a public header (`static`, `header`: the model's `header_api`) gets a
-    single case when `visible` has it, after every other generated case (so the cases of the global
-    entry points keep their selectors, and these go first over the case limit); without the probe it
-    is skipped as `HEADER_NOT_VISIBLE`.
+    single case when `visible` has it, after every other generated case but the stateful ones (so the
+    cases of the global entry points keep their selectors, and these go over the case limit before
+    them); without the probe it is skipped as `HEADER_NOT_VISIBLE`. The stateful cases
+    (`stateful_prefixes`) come last and go over the case limit first: every entry point keeps its
+    single case.
     """
     effective_trust_schema = api_trust_schema_enabled() if trust_schema is None else bool(trust_schema)
     max_cases = max(0, MAX_CASES - reserve)
@@ -4350,7 +5057,12 @@ def plan(
         byval_inits=byval_inits,
         schema_inits=schema_inits,
         schema_globals=schema_globals,
+        trusted_strings=recorded_strings(traces) if effective_trust_schema else {},
+        trusted_scalars=recorded_scalars(traces) if effective_trust_schema else {},
     )
+    # Each function's threat-model roles by name, for the sequence cases (bound as in its single case).
+    trust_by_name: dict[str, _EntryTrust] = {}
+    singles: dict[str, dict] = {}
     header_entries: list[tuple[str, str]] = []
     for key in entries:
         drec = functions.get(key) or {}
@@ -4405,23 +5117,59 @@ def plan(
         schema_sources.update(used_srcs)
         records[name] = mrec
         names.append(key)
+        if et is not None:
+            trust_by_name[name] = et
+        singles[name] = made_cases[0][1]
         for c_stmt, c_layout in made_cases:
             cases.append(c_stmt)
             layouts.append({**c_layout, "entry": key})
     for v_stmt, v_layout in variadic_made:
         cases.append(v_stmt)
         layouts.append(v_layout)
+    configurators = _sequence_configurator_records(
+        dag,
+        model,
+        module,
+        mm,
+        records,
+        api,
+        anon_tags,
+        visible,
+        tm_active,
+        entry_trust_map,
+        skipped,
+        cluster_budget,
+    )
+    for cname, crec in configurators.items():
+        api.records.setdefault(cname, crec)
+    seq_allowed = set(records) | set(configurators)
     seq_seen: set[tuple[str, ...]] = set()
     for full in traces or []:
         # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
         # produced comes from the input instead, and the rest of the chain stays.
-        trace = [c for c in full if c.get("fn") in records]
+        trace = [c for c in full if c.get("fn") in seq_allowed]
         for chain in chains(trace):
+            if not any(trace[k]["fn"] in records for k in chain):
+                continue
             sig = tuple(trace[k]["fn"] for k in chain)
             if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
                 continue
-            seq_stmt, seq_layout, _why = sequence_case(trace, chain, records, spare, api)
+            seq_stmt, seq_layout, _why = sequence_case(trace, chain, records, spare, api, trust_by_name)
             if seq_stmt is None or seq_layout is None:
+                if any(trace[k]["fn"] not in records for k in chain):
+                    rec_trace = [trace[k] for k in chain if trace[k]["fn"] in records]
+                    for sub_chain in chains(rec_trace):
+                        sub_sig = tuple(rec_trace[k]["fn"] for k in sub_chain)
+                        if sub_sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
+                            continue
+                        sub_stmt, sub_layout, _ = sequence_case(
+                            rec_trace, sub_chain, records, spare, api, trust_by_name
+                        )
+                        if sub_stmt is None or sub_layout is None:
+                            continue
+                        seq_seen.add(sub_sig)
+                        cases.append(sub_stmt)
+                        layouts.append(sub_layout)
                 continue
             seq_seen.add(sig)
             cases.append(seq_stmt)
@@ -4441,9 +5189,10 @@ def plan(
         n_seq += 1
         cases.append(lc_stmt)
         layouts.append(lc_layout)
-    # The functions defined in a public header, last: the cases above keep their selectors, and these
-    # are the first to go over the case limit. They stay out of `records`, which builds the sequence
-    # and lifecycle cases above, so those are the same with or without them.
+    # The functions defined in a public header, after the cases above: those keep their selectors,
+    # and these go over the case limit before them (only the stateful cases below go first). They
+    # stay out of `records`, which builds the sequence and lifecycle cases above, so those are the
+    # same with or without them.
     for key, name in header_entries:
         mrec = _model_record(model, functions.get(key) or {}, key)
         if not mrec:
@@ -4464,6 +5213,43 @@ def plan(
         for stmt, layout in made_cases:
             cases.append(stmt)
             layouts.append({**layout, "entry": key})
+    # Stateful cases, last: an entry point that fails on a fresh context, after the calls that set up
+    # the state it needs (`stateful_prefixes`), within their own cap. Its single case stays, and over
+    # the case limit these go first, so no entry point loses its single case to them.
+    header_keys = {k for k, _ in header_entries}
+    key_of = {str((functions.get(k) or {}).get("name") or k.split("#")[-1]): k for k in names if k not in header_keys}
+    n_state = 0
+    for plan_st in stateful_prefixes(
+        records, singles, api, model.get("functions") or {}, traces, configurators=configurators
+    ):
+        sig = tuple(plan_st["calls"])
+        if n_state >= STATE_MAX_CASES or sig in seq_seen:
+            continue
+        ctx_trace = [{"fn": fn, "args": {}, "addrs": {"0": "fc_ctx"}} for fn in plan_st["calls"]]
+        st_stmt, st_layout, _why = sequence_case(
+            ctx_trace, list(range(len(ctx_trace))), records, spare, api, trust_by_name
+        )
+        if st_stmt is None or st_layout is None:
+            if any(fn not in records for fn in plan_st["calls"]):
+                rec_calls = [fn for fn in plan_st["calls"] if fn in records]
+                rec_sig = tuple(rec_calls)
+                if len(rec_calls) > 1 and rec_sig not in seq_seen:
+                    rec_trace = [{"fn": fn, "args": {}, "addrs": {"0": "fc_ctx"}} for fn in rec_calls]
+                    st_stmt, st_layout, _why = sequence_case(
+                        rec_trace, list(range(len(rec_trace))), records, spare, api, trust_by_name
+                    )
+                    if st_stmt is not None and st_layout is not None:
+                        sig = rec_sig
+            if st_stmt is None or st_layout is None:
+                continue
+        seq_seen.add(sig)
+        n_state += 1
+        st_layout["notes"] = [
+            *(st_layout.get("notes") or []),
+            f"stateful case ({plan_st['state']}): {plan_st['entry']} {plan_st['why']}",
+        ]
+        cases.append(st_stmt)
+        layouts.append({**st_layout, "entry": key_of[plan_st["entry"]], "state": plan_st["state"]})
     if len(cases) > max_cases:
         for lay in layouts[max_cases:]:
             if lay.get("entry"):
@@ -5824,6 +6610,9 @@ def generate(
         p = copy.deepcopy(planned)
         cases, layouts, skipped = with_custom(p)
         dropped: list[dict] = list(p["variadic_dropped"])
+        # The sequence and lifecycle cases the compile probe refused: a stateful case's entry point keeps
+        # its single case, and a recorded chain names none, so `api_skipped` would never show them.
+        refused: list[dict[str, Any]] = []
         result: dict[str, Any] = {}
         # Struct layouts come from the first harness written (its headers and prelude): the cases are
         # planned again with them before the compile probe. Each later round drops at least one case, so
@@ -5935,6 +6724,16 @@ def generate(
                 if layouts[i]["kind"] == VARIADIC_KIND:
                     why = f"the case does not compile with the target's headers: {diag}"
                     dropped.append(_dropped_variadic(layouts[i], why))
+                if layouts[i]["kind"] in ("sequence", "lifecycle"):
+                    gone = {"kind": layouts[i]["kind"], "calls": list(layouts[i].get("calls") or [])}
+                    if layouts[i].get("entry"):
+                        gone["entry"] = layouts[i]["entry"]
+                    refused.append({**gone, "why": f"the case does not compile with the target's headers: {diag}"})
+                    print(
+                        f"api_harness: warning: dropped a {gone['kind']} case ({' -> '.join(gone['calls'][:4])}"
+                        f"{' ...' if len(gone['calls']) > 4 else ''}): {diag}",
+                        file=sys.stderr,
+                    )
             if not keep and more:
                 raise _HeadersBroken([bad[i] for i in sorted(bad)][:3])
             if not keep:
@@ -5943,7 +6742,7 @@ def generate(
             layouts = [layouts[i] for i in keep]
             for sel, lay in enumerate(layouts):
                 lay["selector"] = sel
-        return p, cases, layouts, skipped, dropped, result
+        return p, cases, layouts, skipped, dropped, result, refused
 
     # An automatic header choice degrades in steps and never fails the module for its own headers:
     # each abandoned attempt leaves the harness files as they were before it, and is recorded.
@@ -5957,7 +6756,7 @@ def generate(
                 print(f"api_harness: warning: {warnings[-1]}", file=sys.stderr)
             try:
                 with harness_files_kept_on_failure(out_dir, module):
-                    p, cases, layouts, skipped, dropped, result = attempt(hdr, extra, n + 1 < len(attempts))
+                    p, cases, layouts, skipped, dropped, result, refused = attempt(hdr, extra, n + 1 < len(attempts))
                 api_headers = attempts[n][2]
                 break
             except _HeadersBroken as exc:
@@ -5996,6 +6795,8 @@ def generate(
         api_sequences=sum(1 for lay in layouts if lay["kind"] == "sequence"),
         api_lifecycles=sum(1 for lay in layouts if lay["kind"] == "lifecycle"),
         api_custom=sum(1 for lay in layouts if lay["kind"] == CUSTOM_KIND),
+        api_stateful=sum(1 for lay in layouts if lay.get("state")),
+        api_dropped_cases=refused,
         api_skipped=skipped,
     )
     if effective_trust_schema and auto_exempt:

@@ -501,9 +501,24 @@ def test_the_harness_copies_input_through_the_macro_and_seeds_still_read_the_slo
     # The scalar and the string are the harness's own copies: never straight from fuzz_buf, whose
     # bytes Eva cannot show initialized behind the length guard.
     assert "memcpy(&c0a0, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), sizeof(c0a0));" in stmt
-    assert "memcpy(c0a1, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), rest_n); c0a1[rest_n] = 0;" in stmt
+    assert "if (rest_n > 0) { memcpy(c0a1, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), rest_n); } c0a1[rest_n] = 0;" in stmt
     assert "fuzz_buf + fuzz_off" not in stmt
     assert sh.case_bindings(stmt, {"resolve"})["slots"] == ["c0a0"]
+
+
+def test_string_rest_memcpy_is_guarded_when_rest_n_is_zero():
+    """F3 regression: exact-slot inputs leave fuzz_off == fuzz_len (rest_n == 0).
+
+    E-ACSL's __e_acsl_builtin_memcpy aborts on memcpy(dst, buf + len, 0) because
+    source points one past the end of the allocation. Guarding with if (rest_n > 0)
+    still NUL-terminates the destination while skipping the zero-length memcpy.
+    """
+    rec = {"signature": "int(unsigned int,char const *)", "formals": _formals("value", "value")}
+    stmt, layout, _ = ah.single_case("resolve", rec, SPARE, _api())
+    assert stmt is not None and layout is not None
+    assert layout["rest"] == {"call": 0, "param": 1, "kind": "string"}
+    assert "if (rest_n > 0) { memcpy(c0a1, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), rest_n); }" in stmt
+    assert "c0a1[rest_n] = 0;" in stmt
 
 
 def test_the_template_gives_eva_an_initialized_shadow_for_those_copies():

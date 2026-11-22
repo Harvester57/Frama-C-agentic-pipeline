@@ -1699,6 +1699,194 @@ def _load_module_sidecar(module: str, mm: ModuleMap, harnesses_dir: Path | None)
 
 
 _HEADER_API_NAMES_MAX = 20
+_AUTO_EXEMPT_SAMPLES_MAX = 10
+THREAT_MODEL_FILE_COVERAGE_THRESHOLD_PCT = 50.0
+
+
+def _norm_rel_path(path: str) -> str:
+    """Normalize a source path to a forward-slash relative path without `./` or `workspace/work/`."""
+    p = str(path).replace("\\", "/").lstrip("./")
+    return p[len("workspace/work/") :] if p.startswith("workspace/work/") else p
+
+
+def _threat_model_coverage(
+    module: str,
+    dag: dict[str, Any],
+    mm: ModuleMap,
+    model: dict[str, Any] | None,
+    sidecar: dict[str, Any],
+    coverage: dict[str, Any],
+    runs: dict[str, list[tuple[str, int]]],
+    *,
+    crashed_set: set[str] | frozenset[str] = frozenset(),
+    covered_tf: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
+    """
+    W1-E: join `phase0_model.json` trust entries, harness sidecar `api_auto_exempt`, and
+    `coverage/<mod>.json` into a `threat_model_coverage` summary for a dynamic reach row:
+      - `input_sources_total`, `executed`, `unexecuted_total`
+      - `auto_exempt_by_reason`: unexecuted auto-exempt functions grouped by reason
+        (`reason -> {count, functions}` with sorted sample functions capped at `_AUTO_EXEMPT_SAMPLES_MAX`)
+      - `untrusted_files`: per-`.c`-file region coverage (`file`, `covered`, `total`, `pct`,
+        `zero_exec_functions`, `below_threshold` for `< 50%`) sorted ascending by `pct`.
+    Returns `{}` when `model` is absent, the module is a target fuzzer, or neither trust metadata nor
+    auto-exempt entries exist for the module.
+    """
+    if model is None or isinstance((mm.sidecars.get(module) or {}).get("target_fuzzer"), dict):
+        return {}
+    raw_unit = mm.unit_record(module).get("unit")
+    if isinstance(raw_unit, str) and raw_unit:
+        unit_name = raw_unit
+    else:
+        sc_unit = sidecar.get("unit")
+        unit_name = sc_unit if isinstance(sc_unit, str) and sc_unit else mm.unit_of(module)
+
+    dag_fns = dag.get("functions") or {}
+    dag_unit = mm.unit_of(module)
+    is_submodule = mm.units_are_link_units and dag_unit != module
+    scope_fns = set(mm.scope_functions(module)) if is_submodule else None
+
+    model_units = model.get("units")
+    unit_files: set[str] = set()
+    if isinstance(model_units, dict) and isinstance(model_units.get(unit_name), dict):
+        unit_files = {_norm_rel_path(f) for f in model_units[unit_name].get("files") or [] if isinstance(f, str)}
+
+    def _dag_key(fid: str) -> str:
+        plain = fid.rpartition("#")[2]
+        return fid if fid in dag_fns or plain not in dag_fns else plain
+
+    def _fn_in_unit(frec: dict[str, Any]) -> bool:
+        funits = frec.get("units")
+        if isinstance(funits, list) and funits:
+            return unit_name in funits
+        if unit_files:
+            return _norm_rel_path(str(frec.get("file") or "")) in unit_files
+        return not isinstance(model_units, dict) or len(model_units) <= 1 or unit_name in model_units
+
+    has_trust_entries = False
+    input_sources: list[tuple[str, str]] = []
+    untrusted_c_files: set[str] = set()
+    model_fns = model.get("functions")
+    if isinstance(model_fns, dict):
+        for fid, frec in sorted(model_fns.items()):
+            if not isinstance(fid, str) or not isinstance(frec, dict) or not _fn_in_unit(frec):
+                continue
+            key = _dag_key(fid)
+            if scope_fns is not None and key not in scope_fns:
+                continue
+            trust = frec.get("trust")
+            if not isinstance(trust, dict):
+                continue
+            has_trust_entries = True
+            trust_val = trust.get("value")
+            trust_src = trust.get("source")
+            raw_srcs = trust.get("sources")
+            trust_srcs: list[Any] = raw_srcs if isinstance(raw_srcs, list) else []
+            if trust_val == "untrusted":
+                if (
+                    trust_src == "threat_model"
+                    or "threat_model" in trust_srcs
+                    or trust.get("input_role") in ("entry", "reader")
+                ):
+                    input_sources.append((fid, key))
+                f_rel = _norm_rel_path(str(frec.get("file") or (fid.partition("#")[0] if "#" in fid else "")))
+                if f_rel.endswith(".c"):
+                    untrusted_c_files.add(f_rel)
+
+    auto_map: dict[str, str] = {}
+    raw_auto = sidecar.get("api_auto_exempt")
+    if isinstance(raw_auto, dict):
+        for fn, why in raw_auto.items():
+            if isinstance(fn, str) and isinstance(why, str) and why.strip():
+                auto_map[fn] = why.strip()
+    raw_skipped = sidecar.get("api_skipped")
+    if isinstance(raw_skipped, dict):
+        for fn, why in raw_skipped.items():
+            if isinstance(fn, str) and is_accepted_auto_exempt_reason(why):
+                auto_map.setdefault(fn, str(why).strip())
+    if scope_fns is not None:
+        auto_map = {
+            fn: why
+            for fn, why in auto_map.items()
+            if fn in scope_fns or (_resolve_fn_key(fn, dag_fns, dag_unit) in scope_fns)
+        }
+
+    if not has_trust_entries and not auto_map:
+        return {}
+
+    tf_map = covered_tf or {}
+    executed_count = 0
+    for fid, key in input_sources:
+        ex = _entry_executions(fid, {}, runs)
+        if ex is None and key != fid:
+            ex = _entry_executions(key, dag, runs)
+        if (ex or 0) > 0 or key in crashed_set or fid in crashed_set or key in tf_map or fid in tf_map:
+            executed_count += 1
+    input_sources_total = len(input_sources)
+    unexecuted_total = input_sources_total - executed_count
+
+    grouped_auto: dict[str, list[str]] = {}
+    for fn, why in sorted(auto_map.items()):
+        key = _resolve_fn_key(fn, dag_fns, dag_unit) or fn
+        ex = _entry_executions(key, dag, runs)
+        if ex is None and key != fn:
+            ex = _entry_executions(fn, {}, runs)
+        if (ex or 0) > 0 or key in crashed_set or fn in crashed_set or key in tf_map or fn in tf_map:
+            continue
+        grouped_auto.setdefault(why, []).append(fn)
+    auto_exempt_by_reason = {
+        reason: {"count": len(fns), "functions": fns[:_AUTO_EXEMPT_SAMPLES_MAX]}
+        for reason, fns in sorted(grouped_auto.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    }
+
+    file_regions: dict[str, list[int]] = {}
+    file_fn_execs: dict[str, dict[str, int]] = {}
+    for cov_row in coverage.get("functions") or []:
+        if not isinstance(cov_row, dict):
+            continue
+        f_rel = _norm_rel_path(str(cov_row.get("file") or ""))
+        if not f_rel.endswith(".c") or f_rel not in untrusted_c_files:
+            continue
+        reg = cov_row.get("regions")
+        reg_dict = reg if isinstance(reg, dict) else {}
+        cov_n = max(0, int(reg_dict.get("covered") or 0))
+        tot_n = max(0, int(reg_dict.get("total") or 0))
+        bucket = file_regions.setdefault(f_rel, [0, 0])
+        bucket[0] += cov_n
+        bucket[1] += tot_n
+        fn_name = str(cov_row.get("function") or "")
+        if fn_name:
+            ex_map = file_fn_execs.setdefault(f_rel, {})
+            ex_map[fn_name] = ex_map.get(fn_name, 0) + max(0, int(cov_row.get("executions") or 0))
+
+    untrusted_files: list[dict[str, Any]] = []
+    for f_rel in sorted(untrusted_c_files):
+        if f_rel not in file_regions:
+            continue
+        cov_n, tot_n = file_regions[f_rel]
+        pct = min(100.0, round(100.0 * cov_n / tot_n, 1)) if tot_n > 0 else 0.0
+        zero_fns = sorted(fn for fn, ex in (file_fn_execs.get(f_rel) or {}).items() if ex == 0)
+        untrusted_files.append(
+            {
+                "file": f_rel,
+                "covered": cov_n,
+                "total": tot_n,
+                "pct": pct,
+                "zero_exec_functions": zero_fns,
+                "below_threshold": tot_n > 0 and pct < THREAT_MODEL_FILE_COVERAGE_THRESHOLD_PCT,
+            }
+        )
+    untrusted_files.sort(key=lambda item: (float(item["pct"]), str(item["file"])))
+
+    return {
+        "threat_model_coverage": {
+            "input_sources_total": input_sources_total,
+            "executed": executed_count,
+            "unexecuted_total": unexecuted_total,
+            "auto_exempt_by_reason": auto_exempt_by_reason,
+            "untrusted_files": untrusted_files,
+        }
+    }
 
 
 def _header_api_fields(
@@ -1871,6 +2059,17 @@ def check_dynamic(
         "gaps": never,
         "passed": not never,
         **_header_api_fields(module, dag, mm, model, runs),
+        **_threat_model_coverage(
+            module,
+            dag,
+            mm,
+            model,
+            sidecar,
+            coverage,
+            runs,
+            crashed_set=crashed_set,
+            covered_tf=covered_tf,
+        ),
     }
     if covered_tf:
         row["covered_by_target_fuzzers"] = dict(sorted(covered_tf.items()))
@@ -2007,6 +2206,7 @@ def run_dynamic(
             if proven["passed"]:
                 # No coverage measured the header functions: their count stays, not which ones ran.
                 proven.pop("header_api_unexecuted", None)
+                proven.pop("threat_model_coverage", None)
                 rows.append({**proven, "measured_by": "crashes"})
                 continue
             rows.append({"module": module, "mode": "dynamic", "passed": None, "error": f"no coverage ({status})"})
@@ -2027,6 +2227,7 @@ def run_dynamic(
             # Keep what was measured for the reader; the gaps are only a lower bound and decide nothing.
             row.update(passed=None, error=reason, gaps_lower_bound=row.pop("gaps"))
             row.pop("header_api_unexecuted", None)
+            row.pop("threat_model_coverage", None)
         rows.append(row)
     crashed_total = sum(len(r.get("crashed_entry_points") or []) for r in rows if r.get("passed") is not None)
     return {
