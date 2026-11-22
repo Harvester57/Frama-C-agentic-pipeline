@@ -17,6 +17,8 @@
    - per defined function and global, the file Frama-C parsed it from (schema 7, `root`): the
      outermost file of its location's inclusion chain, so a location that a line directive moved
      into a header can still be traced to its compiled source.
+   - per defined global, its constness, whether it has an explicit initializer, and its raw
+     un-canonicalized C type (schema 8, `const`, `has_init`, `raw_type`).
 
    Locations stay raw strings (Fclib.Fileloc.pretty), parsed by phase0_model.py; line spans are
    source lines (Fclib.Filepos.line), not lines of the preprocessed file. *)
@@ -354,27 +356,29 @@ let run () =
                 ("formals", formals_json kf); ("decl", S (loc_s vi.vdecl)); ("proto", S (one_line Printer.pp_vdecl vi)) ]
             :: !declared);
     let taken = Hashtbl.fold (fun k () acc -> S k :: acc) address_taken [] in
-    (* Defined global variables, where the security properties that name them are anchored (I9), and
-       what their initializers name (schema 6). *)
+    (* Defined global variables, where the security properties that name them are anchored (I9),
+       what their initializers name (schema 6), and const/has_init/raw_type (schema 8). *)
     let names l = L (List.map (fun s -> S s) (List.sort compare l)) in
     let globals =
       List.filter_map
         (function
-          | GVar (vi, _, loc) as g when not (is_fun_var vi) ->
+          | GVar (vi, ii, loc) as g when not (is_fun_var vi) ->
             let r = new_refs () in
             ignore (Visitor.visitFramacGlobal (new ref_scan r) g);
             let gvars = List.filter (fun n -> n <> vi.vname) r.gvars in
             let size_field = match bytes_of vi.vtype with Some n -> [ ("size", I n) ] | None -> [] in
             Some
               (O ([ ("name", S vi.vorig_name); ("kernel_name", S vi.vname); ("loc", S (loc_s loc));
-                    ("root", S (root_s loc)); ("static", B (vi.vstorage = Static)); ("type", S (canon vi.vtype)) ]
+                    ("root", S (root_s loc)); ("static", B (vi.vstorage = Static)); ("type", S (canon vi.vtype));
+                    ("const", B (Ast_types.is_const vi.vtype)); ("has_init", B (Option.is_some ii.init));
+                    ("raw_type", S (one_line Printer.pp_typ vi.vtype)) ]
                   @ size_field
                   @ [ ("init_functions", names r.faddr); ("init_globals", names gvars) ]))
           | _ -> None)
         (Ast.get ()).globals
     in
     let doc =
-      O [ ("schema", I 7); ("functions", L (List.rev !functions)); ("declared", L !declared);
+      O [ ("schema", I 8); ("functions", L (List.rev !functions)); ("declared", L !declared);
           ("address_taken", L taken); ("globals", L globals) ]
     in
     let b = Buffer.create 65536 in

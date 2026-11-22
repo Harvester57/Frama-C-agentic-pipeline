@@ -1368,12 +1368,21 @@ class ModelBuilder:
                         "file": grel,
                         "static": bool(g.get("static")),
                         "type": str(g.get("type") or ""),
+                        "const": bool(g.get("const", False)),
+                        "has_init": bool(g.get("has_init", False)),
+                        "raw_type": str(g.get("raw_type") or ""),
                         "units": [],
                     },
                 )
                 rec["units"] = sorted(set(rec["units"]) | set(units))
                 if isinstance(g.get("size"), int) and g["size"] > 0 and rec.get("size") is None:
                     rec["size"] = g["size"]
+                if g.get("const"):
+                    rec["const"] = True
+                if g.get("has_init"):
+                    rec["has_init"] = True
+                if g.get("raw_type") and not rec.get("raw_type"):
+                    rec["raw_type"] = str(g["raw_type"])
                 if flow:
                     rec.setdefault("init_functions", [])
                     rec.setdefault("init_globals", [])
@@ -1774,6 +1783,12 @@ def build_model(
     units_out: dict[str, dict] = {}
     for name, u in sorted((capture.get("units") or {}).items()):
         rec = {k: u.get(k) for k in ("kind", "test", "files", "links", "cppflags", "entry_points", "embedded_api")}
+        if u.get("embedded_api_source") is not None:
+            rec["embedded_api_source"] = str(u["embedded_api_source"])
+        if u.get("unit_visibility") is not None:
+            rec["unit_visibility"] = str(u["unit_visibility"])
+        if u.get("exported_data_symbols") is not None:
+            rec["exported_data_symbols"] = list(u["exported_data_symbols"])
         if u.get("test"):
             rec["parse"] = {"status": "skipped_test"}
         elif name not in unit_job:

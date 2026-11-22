@@ -169,7 +169,10 @@
           "cppflags": {"type": "array", "items": {"type": "string"}},
           "semantic_flags": {"$comment": "Effective semantic compiler flags across the unit's own compiles, with scope (all/partial) and affected files; empty when none. Absent in older captures.", "type": "array", "items": {"$ref": "#/definitions/semantic_flag_entry"}},
           "entry_points": {"type": "array", "items": {"$ref": "#/definitions/function_id"}},
-          "embedded_api": {"$comment": "executables: globals of non-main files declared in the project headers they include", "type": "array", "items": {"$ref": "#/definitions/function_id"}}
+          "embedded_api": {"$comment": "executables: globals of non-main files declared in the project headers they include", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
+          "embedded_api_source": {"$comment": "Origin of embedded_api on an executable (e.g. header_declared_internal). Absent when embedded_api is empty or in older captures.", "type": "string", "minLength": 1},
+          "exported_data_symbols": {"$comment": "shared_lib: exported non-function global data objects from nm -D --defined-only (e.g. plugin descriptor structs). Absent in older captures.", "type": "array", "items": {"type": "string", "minLength": 1}},
+          "unit_visibility": {"$comment": "External visibility class of a non-test link unit for harness scoping. Absent on test units and in older captures.", "type": "string", "enum": ["executable", "plugin_so", "public_lib", "internal_convenience"]}
         },
         "required": ["kind", "test", "test_reason", "files", "objects", "links", "external_libs", "cppflags", "entry_points", "embedded_api"]
       }
