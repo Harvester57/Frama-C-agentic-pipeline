@@ -106,8 +106,8 @@ class TestTrustCommonMarkEdgeCases:
             ("~~~", "~~~", True),
             ("````", "````", True),
             ("````", "```", False),  # Closing fence shorter than opening fence must not close
-            ("```", "````", True),   # Closing fence longer than opening fence must close
-            ("```", "~~~", False),   # Mismatched delimiter types must not close
+            ("```", "````", True),  # Closing fence longer than opening fence must close
+            ("```", "~~~", False),  # Mismatched delimiter types must not close
             ("~~~", "```", False),
             ("~~~~", "~~~", False),
         ],
@@ -180,10 +180,7 @@ class TestTrustCommonMarkEdgeCases:
 
     def test_multiple_framac_blocks_rejected(self) -> None:
         """Multiple framac-threat-model blocks must be rejected with an explicit error."""
-        content = (
-            '```framac-threat-model\n{"block": 1}\n```\n\n'
-            '```framac-threat-model\n{"block": 2}\n```\n'
-        )
+        content = '```framac-threat-model\n{"block": 1}\n```\n\n```framac-threat-model\n{"block": 2}\n```\n'
         block, errors = trust.extract_block(content)
         assert block is None
         assert len(errors) == 1
@@ -589,4 +586,3 @@ class TestWpSchedulerPlaceholderDynamicReIteration2:
         assert pat.search("{dotted.key}") is not None
         assert pat.search("{dottedXkey}") is None
         assert pat.search("{plus+key}") is not None
-

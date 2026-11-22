@@ -170,7 +170,12 @@ def test_stamp_carries_the_selector_but_absence_still_means_modulo():
     assert report["dispatch_selector"] == "identity"
     assert report["artifacts"][0]["dispatch_selector"] == "identity"
     # The carried-over artifact keeps what the prior report recorded: no selector, i.e. modulo.
-    assert report["artifacts"][1] == {"sha256": "y", "pre_existing": True, "harness_digest": "d", "dispatch_case_count": 3}
+    assert report["artifacts"][1] == {
+        "sha256": "y",
+        "pre_existing": True,
+        "harness_digest": "d",
+        "dispatch_case_count": 3,
+    }
 
 
 # --- harness_reach --------------------------------------------------------------------------------
@@ -211,7 +216,13 @@ def _art(run: Path, data: bytes, function: str = "rec_check", **extra) -> dict:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
     failure = {"function": function, "file": "workspace/work/src/api.c", "line": 4}
-    return {"artifact": "workspace/crashes/api/crash-x", "reproducible": True, "kind": "crash", "failure": failure, **extra}
+    return {
+        "artifact": "workspace/crashes/api/crash-x",
+        "reproducible": True,
+        "kind": "crash",
+        "failure": failure,
+        **extra,
+    }
 
 
 @pytest.mark.parametrize(("selector", "credited"), [("identity", []), (None, ["rec_parse"])])

@@ -267,9 +267,13 @@ def test_harvest_reads_the_programs_sources_and_groups_the_call_sites(tmp_path, 
     assert [(c["varargs"][0]["type"], c["sites"]) for c in scan["cases"]] == [("char[80]", 3), ("char[8]", 1)]
     assert scan["cases"][0]["data"] == [{"0": b"foo,bar,baz".hex()}, {"0": b",bar".hex()}]
     assert scan["cases"][0]["callers"] == ["tests.c:test_s"]
-    assert scan["skipped"] == [
-        {"source": "tests.c", "caller": "test_s", "why": scan["skipped"][0]["why"]},
-    ] and "pointer variable" in scan["skipped"][0]["why"]
+    assert (
+        scan["skipped"]
+        == [
+            {"source": "tests.c", "caller": "test_s", "why": scan["skipped"][0]["why"]},
+        ]
+        and "pointer variable" in scan["skipped"][0]["why"]
+    )
 
 
 def test_harvest_statuses_are_reasons_not_failures(tmp_path):
@@ -452,10 +456,10 @@ def test_harvest_with_clang_itself(tmp_path, monkeypatch):
     )
     (work / "tests.c").write_text(
         '#include "lib.h"\n#define LEN 80\n'
-        "void test_s(void) { char value[LEN]; scan(\"foo,bar\", \"s\", value); }\n"
-        "void test_many(const char *sentence) { int t; struct fl f; scan(sentence, \"tf\", &t, &f); }\n"
-        "void test_fmt(const char *fmt) { char c; scan(\"x\", fmt, &c); }\n"
-        "void test_ptr(char *out) { scan(\"x\", \"s\", out); }\n"
+        'void test_s(void) { char value[LEN]; scan("foo,bar", "s", value); }\n'
+        'void test_many(const char *sentence) { int t; struct fl f; scan(sentence, "tf", &t, &f); }\n'
+        'void test_fmt(const char *fmt) { char c; scan("x", fmt, &c); }\n'
+        'void test_ptr(char *out) { scan("x", "s", out); }\n'
     )
     capture = {
         "status": "ok",
@@ -759,7 +763,9 @@ def test_a_case_the_compiler_refuses_is_dropped_and_the_function_stays_called(tm
     ]
     # With every case of the function refused, it is skipped, with the compiler's reason.
     monkeypatch.setattr(
-        ah, "probe_cases", lambda h, c, clang=None: ({i: "e" for i, t in enumerate(Path(h).read_text().splitlines()) if "scan(" in t}, [])
+        ah,
+        "probe_cases",
+        lambda h, c, clang=None: ({i: "e" for i, t in enumerate(Path(h).read_text().splitlines()) if "scan(" in t}, []),
     )
     result, side = _generate(tmp_path, monkeypatch, variadic={"scan": [S_SITE, TF_SITE]})
     assert [lay["kind"] for lay in side["api_cases"]] == ["single"]

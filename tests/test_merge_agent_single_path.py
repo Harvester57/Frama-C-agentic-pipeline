@@ -87,9 +87,7 @@ def test_without_a_module_the_defaults_are_unchanged(tmp_path: Path, monkeypatch
     assert (call["sources"], call["cppflags"], call["ldflags"]) == (None, "-I.", "")
 
 
-def test_a_module_without_sources_fails_instead_of_skipping_the_guardrail(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_a_module_without_sources_fails_instead_of_skipping_the_guardrail(tmp_path: Path, monkeypatch, capsys) -> None:
     run_dir = _overlay(tmp_path, {"module": "m", "cppflags": "-Iinc"})
     calls = _capture(monkeypatch)
     assert workspace_overlay.main(_argv(run_dir, "--module", "m")) == 1

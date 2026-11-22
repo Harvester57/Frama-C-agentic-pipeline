@@ -582,7 +582,7 @@ def test_a_skeleton_filled_as_written_passes_eva_in_the_image(tmp_path):
     )
     script = (
         "cd /w && timeout 300 frama-c -no-unicode -machdep gcc_x86_64 -cpp-extra-args='-I/w/stubs -I/w/inc' a.c "
-        "-eva -eva-no-alloc-returns-null; echo \"frama_c_exit=$?\""
+        '-eva -eva-no-alloc-returns-null; echo "frama_c_exit=$?"'
     )
     proc = subprocess.run(
         ["docker", "run", "--rm", "--network", "none", "-v", f"{tmp_path}:/w:ro",

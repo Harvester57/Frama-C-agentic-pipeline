@@ -23,6 +23,7 @@ CSV_HEADER = "emitter\tfile\tfunction\tline\tkind\tstatus\tproperty\n"
 # 1. Stress Tests: classify_vacuity_log
 # ===========================================================================
 
+
 @pytest.mark.unit
 def test_vacuity_prover_models_doomed_requires() -> None:
     """Varied prover memory models with doomed requires must return contradictory."""
@@ -30,10 +31,7 @@ def test_vacuity_prover_models_doomed_requires() -> None:
     clauses = ["default", "r1", "pre_condition_2", "tag_requires"]
     for m in models:
         for c in clauses:
-            log = (
-                f"[wp] [Failed] (Doomed) {m}fn_wp_smoke_{c}_requires (Qed)\n"
-                f"Smoke Tests: 0 / 1\n"
-            )
+            log = f"[wp] [Failed] (Doomed) {m}fn_wp_smoke_{c}_requires (Qed)\nSmoke Tests: 0 / 1\n"
             res = W.classify_vacuity_log(log)
             assert res["status"] == "contradictory", f"Model {m} clause {c} failed: {res}"
             assert c in res["doomed"]
@@ -46,10 +44,7 @@ def test_vacuity_prover_models_dead_goals() -> None:
     kinds = ["dead_code_s1", "dead_call_s2", "dead_loop_s3", "dead_local_init_s4"]
     for m in models:
         for k in kinds:
-            log = (
-                f"[wp] [Failed] (Doomed) {m}fn_wp_smoke_{k} (Qed)\n"
-                f"Smoke Tests: 0 / 1\n"
-            )
+            log = f"[wp] [Failed] (Doomed) {m}fn_wp_smoke_{k} (Qed)\nSmoke Tests: 0 / 1\n"
             res = W.classify_vacuity_log(log)
             assert res["dead_goals"] == 1, f"Model {m} kind {k} failed: {res}"
 
@@ -57,10 +52,7 @@ def test_vacuity_prover_models_dead_goals() -> None:
 @pytest.mark.unit
 def test_vacuity_k_less_than_n_without_dead_goals_fails_closed() -> None:
     """When k < n and dead goals list is empty, must fail closed to inconclusive."""
-    log = (
-        "[wp] [Timeout] typed_f_contract (Alt-Ergo)\n"
-        "Smoke Tests: 1 / 3\n"
-    )
+    log = "[wp] [Timeout] typed_f_contract (Alt-Ergo)\nSmoke Tests: 1 / 3\n"
     res = W.classify_vacuity_log(log)
     assert res["status"] == "inconclusive"
     assert "without recognised doomed goals" in res["reason"]
@@ -75,10 +67,7 @@ def test_vacuity_k_less_than_n_with_fewer_dead_goals_than_failures_xfail() -> No
     Current implementation bug: returns 'consistent' because `not dead` evaluates to False.
     Safe behavior: must fail closed to inconclusive.
     """
-    log = (
-        "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s1 (Qed)\n"
-        "Smoke Tests: 1 / 3\n"
-    )
+    log = "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s1 (Qed)\nSmoke Tests: 1 / 3\n"
     res = W.classify_vacuity_log(log)
     assert res["status"] == "inconclusive", (
         f"Unsound fail-open: returned {res['status']!r} despite unexplained failed smoke test!"
@@ -132,6 +121,7 @@ def test_vacuity_multiline_logs() -> None:
 # ===========================================================================
 # 2. Stress Tests: run_wp_on_function proven goals backstop
 # ===========================================================================
+
 
 @pytest.mark.unit
 def test_wp_backstop_report_csv_statuses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -206,10 +196,7 @@ def test_wp_backstop_degenerated_goal_waiver(tmp_path: Path, monkeypatch: pytest
         def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             if "-wp" in cmd and "-report-csv" in cmd:
                 csv_path = Path(cmd[cmd.index("-report-csv") + 1])
-                csv_content = (
-                    CSV_HEADER
-                    + ".\tf.c\tf\t1\tpointer_value\tUnknown\t\\valid_function(fp)\n"
-                )
+                csv_content = CSV_HEADER + ".\tf.c\tf\t1\tpointer_value\tUnknown\t\\valid_function(fp)\n"
                 csv_path.write_text(csv_content, encoding="utf-8")
                 return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -224,17 +211,13 @@ def test_wp_backstop_degenerated_goal_waiver(tmp_path: Path, monkeypatch: pytest
 
     # Degenerated waiver with Proved goals: 0 / 1 -> unproven_goals_remain
     stdout_zero_proved = (
-        "[wp] [Timeout] typed_f_assert_rte_pointer_value (Qed) (Degenerated)\n"
-        "[wp] Proved goals: 0 / 1\n"
+        "[wp] [Timeout] typed_f_assert_rte_pointer_value (Qed) (Degenerated)\n[wp] Proved goals: 0 / 1\n"
     )
     res = run_degen(stdout_zero_proved)
     assert res["status"] == "unproven_goals_remain"
 
     # Degenerated waiver with Proved goals: 1 / 1 -> all_proven
-    stdout_proved = (
-        "[wp] [Timeout] typed_f_assert_rte_pointer_value (Qed) (Degenerated)\n"
-        "[wp] Proved goals: 1 / 1\n"
-    )
+    stdout_proved = "[wp] [Timeout] typed_f_assert_rte_pointer_value (Qed) (Degenerated)\n[wp] Proved goals: 1 / 1\n"
     res = run_degen(stdout_proved)
     assert res["status"] == "all_proven"
 
@@ -242,6 +225,7 @@ def test_wp_backstop_degenerated_goal_waiver(tmp_path: Path, monkeypatch: pytest
 # ===========================================================================
 # 3. Stress Tests: _kernel_error_line in scripts/loop_seeds.py
 # ===========================================================================
+
 
 @pytest.mark.unit
 def test_kernel_error_line_suffix_overlap_rejected() -> None:

@@ -98,6 +98,7 @@ known-first-party = [
     "tiers",
     "trust",
     "unit_split",
+    "upstream_audit",
     "validate_artifacts",
     "variadic_calls",
     "workspace_overlay",

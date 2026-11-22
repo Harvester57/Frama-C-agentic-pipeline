@@ -57,9 +57,11 @@ def _fail_on_write_sidecar(monkeypatch, nth: int, exc: BaseException, when: Call
 
 def _assert_rolled_back(out_dir: Path, before: dict[str, bytes]) -> None:
     assert _snapshot(out_dir) == before
-    meta = json.loads((out_dir / "harness_mod.json").read_text(encoding="utf-8")) if (
-        out_dir / "harness_mod.json"
-    ).is_file() else None
+    meta = (
+        json.loads((out_dir / "harness_mod.json").read_text(encoding="utf-8"))
+        if (out_dir / "harness_mod.json").is_file()
+        else None
+    )
     if meta is not None:
         assert meta.get("repair_attempts", 0) == 0
 
@@ -189,7 +191,15 @@ def _api_setup(tmp_path: Path, monkeypatch, capsys) -> tuple[Path, list[str]]:
     assert gh.main(base) == 0
     capsys.readouterr()
     sidecar = tmp_path / "workspace" / "harnesses" / "harness_mod.json"
-    repair = [*base, "--dispatch-case", "(void)lib_decode(fuzz_buf, 0);", "--record-repair", str(sidecar), "--reason", "r"]
+    repair = [
+        *base,
+        "--dispatch-case",
+        "(void)lib_decode(fuzz_buf, 0);",
+        "--record-repair",
+        str(sidecar),
+        "--reason",
+        "r",
+    ]
     return sidecar.parent, repair
 
 

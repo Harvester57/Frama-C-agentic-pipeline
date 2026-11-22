@@ -1060,9 +1060,7 @@ def _bytes_retry_trigger(res: dict, log_text: str) -> str | None:
     return None
 
 
-def decide_bytes_retry(
-    typed_status: str, typed_unproven: int, typed_sound: bool, bytes_res: dict
-) -> tuple[bool, str]:
+def decide_bytes_retry(typed_status: str, typed_unproven: int, typed_sound: bool, bytes_res: dict) -> tuple[bool, str]:
     """(kept, reason): the `Bytes` result replaces the `Typed` one only when it is sound and strictly better."""
     status = bytes_res.get("status")
     soundness = bytes_res.get("soundness") or {}
@@ -1216,7 +1214,9 @@ def scan_wp_log_soundness(
         }
     )
     if skipped_rte and _INDIRECT_CALL_UNSOUND_RE.search(log_text):
-        tier_b_unsound_set.add("indirect call present without '//@ calls' while \\valid_function RTE guards are skipped")
+        tier_b_unsound_set.add(
+            "indirect call present without '//@ calls' while \\valid_function RTE guards are skipped"
+        )
 
     fpv_goals = sorted({m.group(1) for m in _FPV_DEGEN_RE.finditer(log_text)})
 
@@ -2610,9 +2610,7 @@ def collect_counter_example_models(res: dict, call_args: dict[str, Any]) -> dict
         )
     except Exception as exc:  # a failed model pass never changes the proof result
         model_res = {"status": "model_pass_error", "reason": f"{type(exc).__name__}: {exc}"}
-    res["counter_example_goals"] = [
-        g for g in model_res.get("counter_example_goals") or [] if g.get("goal") in failed
-    ]
+    res["counter_example_goals"] = [g for g in model_res.get("counter_example_goals") or [] if g.get("goal") in failed]
     res["counter_example_pass"] = {
         "status": model_res.get("status"),
         "log": str(out_dir / f"wp_{fn_name}{model_suffix}.log"),
@@ -4837,9 +4835,7 @@ def resolve_security_meta(spec: str | None, c_file: Path, fn_name: str, out_dir:
     }
 
 
-def code_check_rows(
-    rows: list[dict], checks: list[dict], fn_name: str
-) -> tuple[dict[int, str], list[dict[str, int]]]:
+def code_check_rows(rows: list[dict], checks: list[dict], fn_name: str) -> tuple[dict[int, str], list[dict[str, int]]]:
     """
     Name the rows of the in-code checks security_props.py wrote into `fn_name` (`checks`: those of
     a property that keeps its MetAcsl text; code_check_names audits the others against the source). Frama-C's report gives a code `check` its file, line and predicate, not
@@ -5099,7 +5095,9 @@ def main(argv: list[str] | None = None) -> int:
     if (args.wrap_lines or args.wrap_code_lines) and not args.no_warn_unsigned:
         parser.error("--wrap-lines and --wrap-code-lines only apply with --no-warn-unsigned")
     if args.waive_signed_downcast and not (args.no_warn_unsigned and (args.wrap_lines or args.wrap_code_lines)):
-        parser.error("--waive-signed-downcast only applies with --no-warn-unsigned and --wrap-lines / --wrap-code-lines")
+        parser.error(
+            "--waive-signed-downcast only applies with --no-warn-unsigned and --wrap-lines / --wrap-code-lines"
+        )
 
     # --prop and --dump-goal are partial runs: they say nothing about the candidate as a whole.
     whole_run = not (args.prop or args.dump_goal)

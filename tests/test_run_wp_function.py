@@ -170,10 +170,7 @@ def test_vacuity_fails_closed_on_invalid_smoke_ratio_bounds() -> None:
 @pytest.mark.unit
 def test_vacuity_fails_closed_on_unexplained_failed_smoke_tests() -> None:
     # 2 failures, only 1 dead goal -> 1 unexplained failure
-    log_unexplained = (
-        "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s1 (Qed)\n"
-        "Smoke Tests: 1 / 3\n"
-    )
+    log_unexplained = "[wp] [Failed] (Doomed) typed_f_wp_smoke_dead_code_s1 (Qed)\nSmoke Tests: 1 / 3\n"
     res = W.classify_vacuity_log(log_unexplained, returncode=0)
     assert res["status"] == "inconclusive"
     assert res["reason"] == "smoke test failure (1/3) without recognised doomed goals"
@@ -268,9 +265,7 @@ def test_wp_backstop_degenerated_goal_waiver_requires_proved_goals(
 
 
 @pytest.mark.unit
-def test_wp_backstop_valid_proved_goals_returns_all_proven(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_wp_backstop_valid_proved_goals_returns_all_proven(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out_dir = tmp_path / "wp"
     out_dir.mkdir()
     c_file = tmp_path / "f.c"
@@ -361,10 +356,7 @@ def test_missing_spec_multiline_extraction_and_limits() -> None:
 
 @pytest.mark.unit
 def test_missing_assigns_two_line_macro_loop_folding() -> None:
-    stdout_2line = (
-        "[wp] macro_test.c:3: Warning:\n"
-        "  Missing assigns clause (assigns 'everything' instead)\n"
-    )
+    stdout_2line = "[wp] macro_test.c:3: Warning:\n  Missing assigns clause (assigns 'everything' instead)\n"
     soundness = W.scan_wp_log_soundness(stdout_2line)
     assert any("macro_test.c:3" in msg for msg in soundness["tier_b_unsound"])
 
@@ -384,7 +376,10 @@ _COST_REPORT_ENTRIES: list[dict] = [
         "smoke": False,
         "passed": False,
         "verdict": "unknown",
-        "provers": [{"prover": "qed", "time": 0.000584, "success": 0}, {"prover": "CVC5:1.1.2", "time": 0, "success": 0}],
+        "provers": [
+            {"prover": "qed", "time": 0.000584, "success": 0},
+            {"prover": "CVC5:1.1.2", "time": 0, "success": 0},
+        ],
         "unknown": 1,
     },
     {
@@ -405,7 +400,10 @@ _COST_REPORT_ENTRIES: list[dict] = [
         "smoke": False,
         "passed": True,
         "verdict": "valid",
-        "provers": [{"prover": "qed", "time": 0.00461, "success": 0}, {"prover": "Alt-Ergo:2.4.3", "time": 0.0171, "success": 1}],
+        "provers": [
+            {"prover": "qed", "time": 0.00461, "success": 0},
+            {"prover": "Alt-Ergo:2.4.3", "time": 0.0171, "success": 1},
+        ],
         "proved": 1,
     },
     {
@@ -415,7 +413,10 @@ _COST_REPORT_ENTRIES: list[dict] = [
         "smoke": False,
         "passed": True,
         "verdict": "valid",
-        "provers": [{"prover": "qed", "time": 0.00336, "success": 0}, {"prover": "Z3:4.13.3", "time": 2.5, "success": 1}],
+        "provers": [
+            {"prover": "qed", "time": 0.00336, "success": 0},
+            {"prover": "Z3:4.13.3", "time": 2.5, "success": 1},
+        ],
         "proved": 1,
     },
     {  # cached: its time is the run that filled the cache, never this one
@@ -483,21 +484,55 @@ def test_goal_costs_from_report_fails_closed() -> None:
         {"property": "no_goal", "passed": False, "verdict": "timeout"},
         {"goal": "typed_f_odd_verdict", "function": "f", "passed": False, "verdict": "computing"},
         {"goal": "typed_f_no_passed", "function": "f", "verdict": "timeout"},
-        {"goal": "typed_f_bad_provers", "function": "f", "passed": False, "verdict": "stepout", "provers": "Alt-Ergo",
-         "file": 7, "line": "12"},
-        {"goal": "typed_f_bad_time", "function": "f", "passed": True, "verdict": "valid",
-         "provers": [{"prover": "Z3", "time": "12", "success": 1}, {"prover": "CVC5", "time": True, "success": 1}]},
-        {"goal": "typed_f_measured", "function": "f", "passed": False, "verdict": "failed",
-         "provers": [{"prover": "Z3:4.13.3", "time": 0.25, "success": 0}], "cached": True},
+        {
+            "goal": "typed_f_bad_provers",
+            "function": "f",
+            "passed": False,
+            "verdict": "stepout",
+            "provers": "Alt-Ergo",
+            "file": 7,
+            "line": "12",
+        },
+        {
+            "goal": "typed_f_bad_time",
+            "function": "f",
+            "passed": True,
+            "verdict": "valid",
+            "provers": [{"prover": "Z3", "time": "12", "success": 1}, {"prover": "CVC5", "time": True, "success": 1}],
+        },
+        {
+            "goal": "typed_f_measured",
+            "function": "f",
+            "passed": False,
+            "verdict": "failed",
+            "provers": [{"prover": "Z3:4.13.3", "time": 0.25, "success": 0}],
+            "cached": True,
+        },
     ]
     unproven, slowest = W.goal_costs_from_report(entries, "f")
     assert unproven == [
         # A file that is not a string and a line that is not a number are dropped, not guessed.
-        {"goal": "typed_f_bad_provers", "property": None, "file": None, "line": None, "verdict_kind": "stepout",
-         "provers": [], "time_ms": None, "cached": False},
+        {
+            "goal": "typed_f_bad_provers",
+            "property": None,
+            "file": None,
+            "line": None,
+            "verdict_kind": "stepout",
+            "provers": [],
+            "time_ms": None,
+            "cached": False,
+        },
         # A positive time is a measurement and is kept; `cached: true` (a bool, not WP's count) is not read as cached.
-        {"goal": "typed_f_measured", "property": None, "file": None, "line": None, "verdict_kind": "failed",
-         "provers": ["Z3"], "time_ms": 250, "cached": False},
+        {
+            "goal": "typed_f_measured",
+            "property": None,
+            "file": None,
+            "line": None,
+            "verdict_kind": "failed",
+            "provers": ["Z3"],
+            "time_ms": 250,
+            "cached": False,
+        },
     ]
     assert slowest == []
 
@@ -505,8 +540,13 @@ def test_goal_costs_from_report_fails_closed() -> None:
 @pytest.mark.unit
 def test_slowest_proved_goals_keeps_five() -> None:
     entries = [
-        {"goal": f"typed_f_g{i}", "function": "f", "passed": True, "verdict": "valid",
-         "provers": [{"prover": "Alt-Ergo:2.4.3", "time": i / 10, "success": 1}]}
+        {
+            "goal": f"typed_f_g{i}",
+            "function": "f",
+            "passed": True,
+            "verdict": "valid",
+            "provers": [{"prover": "Alt-Ergo:2.4.3", "time": i / 10, "success": 1}],
+        }
         for i in range(1, 9)
     ]
     _, slowest = W.goal_costs_from_report(entries, "f")
@@ -589,7 +629,14 @@ def test_collect_goal_costs_prefers_the_json_report(tmp_path: Path) -> None:
 
 
 def _cost(goal: str, kind: str, time_ms: int | None = None, cached: bool = False) -> dict:
-    return {"goal": goal, "property": None, "verdict_kind": kind, "provers": ["Z3"], "time_ms": time_ms, "cached": cached}
+    return {
+        "goal": goal,
+        "property": None,
+        "verdict_kind": kind,
+        "provers": ["Z3"],
+        "time_ms": time_ms,
+        "cached": cached,
+    }
 
 
 def _cost_res(costs: list[dict], provers: list[str] | None = None, **extra: object) -> dict:
@@ -679,7 +726,8 @@ def test_run_wp_on_function_reports_goal_costs(tmp_path: Path, monkeypatch: pyte
     c_file.write_text("int f(int x) { return x; }\n", encoding="utf-8")
     stale = out_dir / "wp_f.wp-report-json"
     stale.write_text(
-        json.dumps([{"goal": "typed_f_stale", "function": "f", "passed": False, "verdict": "timeout"}]), encoding="utf-8"
+        json.dumps([{"goal": "typed_f_stale", "function": "f", "passed": False, "verdict": "timeout"}]),
+        encoding="utf-8",
     )
     seen: list[list[str]] = []
 
@@ -689,7 +737,9 @@ def test_run_wp_on_function_reports_goal_costs(tmp_path: Path, monkeypatch: pyte
             Path(cmd[cmd.index("-report-csv") + 1]).write_text(
                 CSV_HEADER + ".\tf.c\tf\t1\tpostcondition\tUnknown\tfast_false: \\result > 50\n", encoding="utf-8"
             )
-            Path(cmd[cmd.index("-wp-report-json") + 1]).write_text(json.dumps(_COST_REPORT_ENTRIES[:1]), encoding="utf-8")
+            Path(cmd[cmd.index("-wp-report-json") + 1]).write_text(
+                json.dumps(_COST_REPORT_ENTRIES[:1]), encoding="utf-8"
+            )
             stdout = "[wp] [Unknown] typed_f_ensures_fast_false (Qed 0.58ms) (CVC5)\n[wp] Proved goals:    0 / 1\n"
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -698,7 +748,14 @@ def test_run_wp_on_function_reports_goal_costs(tmp_path: Path, monkeypatch: pyte
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(W.GOAL_COSTS_ENV, raising=False)
     res = W.run_wp_on_function(
-        c_file, "f", out_dir, timeout=8, retry_bitwise=False, retry_tail=False, retry_cast_probe=False, retry_bytes=False
+        c_file,
+        "f",
+        out_dir,
+        timeout=8,
+        retry_bitwise=False,
+        retry_tail=False,
+        retry_cast_probe=False,
+        retry_bytes=False,
     )
     assert seen and seen[0][seen[0].index("-wp-report-json") + 1] == str(stale)
     assert res["status"] == "unproven_goals_remain"
@@ -2048,9 +2105,7 @@ def test_scan_wp_log_soundness_extracts_checked_memory_model_hypotheses() -> Non
 
 
 @pytest.mark.unit
-def test_why3_anomaly_and_failure_goal_parsing_and_bytes_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_why3_anomaly_and_failure_goal_parsing_and_bytes_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Verbatim Frama-C 34 log & CSV from MIT-licensed sysprog21/frama-c-mcp pointer-cast-anomaly.c :: nextblk
     typed_log = (
         "[wp] fixtures/pointer-cast-anomaly.c:30: Warning: \n"

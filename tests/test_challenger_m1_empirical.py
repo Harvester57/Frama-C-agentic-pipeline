@@ -167,7 +167,6 @@ class TestAcslClauseIterationAdversarial:
         assert acsl_ast.find_named_clause(text, "r2") == "x > 0"
 
 
-
 # ===========================================================================
 # 2. Stress-test spec mutation (mutation_check.spec_mutants)
 # ===========================================================================
@@ -178,11 +177,7 @@ class TestSpecMutantsAdversarial:
 
     def test_equivalence_operator_never_corrupted(self):
         """Complex formulas with <==>, ==>, <=, >= must never mutate <==> into <=>."""
-        contract = (
-            "/*@ ensures (a <= b <==> c >= d) ==> (e <= f <==> g >= h);\n"
-            "    ensures x <= y <==> z >= w;\n"
-            "*/"
-        )
+        contract = "/*@ ensures (a <= b <==> c >= d) ==> (e <= f <==> g >= h);\n    ensures x <= y <==> z >= w;\n*/"
         mutants = dict(mutation_check.spec_mutants(contract, 10))
         for name, mut in mutants.items():
             assert "<=>" not in mut, f"Corrupted equivalence operator found in {name}: {mut}"
@@ -328,7 +323,9 @@ class TestLogicSignaturesAdversarial:
     def test_forbidden_c_int_return_types_flagged(self, sig):
         tokens = tokenize_c_acsl(sig)
         errors = acsl_ast.find_unsound_acsl_keywords(tokens)
-        assert any("forbidden C integer type in ACSL logic signature" in e for e in errors), f"Failed for {sig}: {errors}"
+        assert any("forbidden C integer type in ACSL logic signature" in e for e in errors), (
+            f"Failed for {sig}: {errors}"
+        )
 
     @pytest.mark.parametrize(
         "sig",
@@ -356,7 +353,7 @@ class TestFunctionSliceTolerantTokenizing:
     def test_acsl_syntax_error_attributes_populated(self):
         """AcslSyntaxError must provide line, kind, and offset attributes."""
         with pytest.raises(AcslSyntaxError) as exc_info:
-            tokenize_c_acsl("int a = 1;\nchar *s = \"unclosed;")
+            tokenize_c_acsl('int a = 1;\nchar *s = "unclosed;')
         exc = exc_info.value
         assert exc.line == 2
         assert exc.kind == "string_literal"
@@ -386,13 +383,7 @@ class TestFunctionSliceTolerantTokenizing:
 
     def test_tokenize_tolerant_recovers_multiple_bad_literals(self):
         """_tokenize_tolerant blanks up to 64 bad lines while keeping line numbers intact."""
-        code = (
-            "int a = 1;\n"
-            "char *s1 = 'bad1;\n"
-            "int b = 2;\n"
-            "char *s2 = \"bad2;\n"
-            "int c = 3;\n"
-        )
+        code = "int a = 1;\nchar *s1 = 'bad1;\nint b = 2;\nchar *s2 = \"bad2;\nint c = 3;\n"
         clean, toks = function_slice._tokenize_tolerant(code)
         tokens_text = [t.text for t in toks if t.kind == "c_token"]
         assert "a" in tokens_text

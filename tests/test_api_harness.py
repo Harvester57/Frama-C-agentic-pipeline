@@ -474,9 +474,7 @@ def _declared(stmt: str) -> list[str]:
     """The zero-initialized variables a case declares (`<type> <name>[...]; memset(...)`), as the generator writes them."""
     import re
 
-    return re.findall(
-        r"(?:^|; |\} )(?:static )?(?:_Alignas\(\d+\) )?(?:[A-Za-z_]\w* )+([^ ;=]+?)(?:\[[^;]*\])?;", stmt
-    )
+    return re.findall(r"(?:^|; |\} )(?:static )?(?:_Alignas\(\d+\) )?(?:[A-Za-z_]\w* )+([^ ;=]+?)(?:\[[^;]*\])?;", stmt)
 
 
 def test_pointer_field_storage_of_a_struct_in_an_array_has_an_identifier_for_a_name():
@@ -489,7 +487,9 @@ def test_pointer_field_storage_of_a_struct_in_an_array_has_an_identifier_for_a_n
     # ... and the storage of its lone pointer field was `static unsigned char c0a0[0]f2[N]`: a second
     # `c0a0`, of type `unsigned char[0]`.
     assert "c0a0[0]f" not in stmt
-    assert f"static _Alignas(16) unsigned char c0a0_0_f2[{SPARE}];" in stmt and "c0a0[0].Name = (void *)c0a0_0_f2;" in stmt
+    assert (
+        f"static _Alignas(16) unsigned char c0a0_0_f2[{SPARE}];" in stmt and "c0a0[0].Name = (void *)c0a0_0_f2;" in stmt
+    )
     names = _declared(stmt)
     assert names == ["c0a0", "c0a0_0_f2", "c0a1"]
     # Without a call-site size the object is one struct, named as before.
@@ -808,4 +808,3 @@ def test_api_lifecycle_names_respect_word_boundaries():
 
     for name in ["Freeze", "Freezer", "Freelist", "Freedom", "Destroyer", "Releasable"]:
         assert not ah._DTOR_NAME_RE.search(name), f"Dtor regex false positive: {name}"
-

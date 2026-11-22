@@ -252,7 +252,7 @@ class TestAdversarialStructMembersAndLayout:
         assert members["packed_s"] == ["id"]
 
     def test_fail_closed_on_unclosed_literals_and_comments(self, tmp_path):
-        bad_text = "struct broken { int x; char *s = \"unclosed string; };"
+        bad_text = 'struct broken { int x; char *s = "unclosed string; };'
         with pytest.raises(AcslSyntaxError):
             stub_check.struct_members(bad_text)
         res = stub_check.check_shipped_layout("bad.h", bad_text, tmp_path, [], tmp_path)
@@ -444,9 +444,7 @@ class TestAdversarialCompilerTempsAndCallerLinking:
                 {"lval": "tmp_99", "base": "tmp_99", "base_kind": "local", "loc": "file.c:15"},
             ],
             "loops": [],
-            "return_paths": [
-                {"value": "__retres", "conditions": ["tmp > 0", "tmp_99 != 0"], "loc": "file.c:16"}
-            ],
+            "return_paths": [{"value": "__retres", "conditions": ["tmp > 0", "tmp_99 != 0"], "loc": "file.c:16"}],
         }
         rec = function_facts._function_record(
             raw,
@@ -483,9 +481,7 @@ class TestAdversarialCompilerTempsAndCallerLinking:
             ],
         }
         callee_raw = {"kernel_name": "callee_fn", "name": "callee_fn", "loc": "c.c:20"}
-        records: dict[str, dict] = {
-            "c.c#callee_fn": {"kernel_name": "callee_fn", "name": "callee_fn", "called_by": []}
-        }
+        records: dict[str, dict] = {"c.c#callee_fn": {"kernel_name": "callee_fn", "name": "callee_fn", "called_by": []}}
         function_facts._link_callers([caller_raw, callee_raw], records)
         called_by = records["c.c#callee_fn"]["called_by"]
         assert len(called_by) == 1
@@ -503,9 +499,7 @@ class TestAdversarialCompilerTempsAndCallerLinking:
         # When a caller record comes from an older schema without 'in_loop':
         legacy_rec = {
             "name": "target_fn",
-            "called_by": [
-                {"caller": "old_caller", "args": ["a"], "conditions": ["tmp > 0", "a > 0"]}
-            ],
+            "called_by": [{"caller": "old_caller", "args": ["a"], "conditions": ["tmp > 0", "a > 0"]}],
         }
         lines: list[str] = []
         function_facts._render_callers(legacy_rec, lines)

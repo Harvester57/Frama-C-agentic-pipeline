@@ -483,7 +483,10 @@ def test_the_callers_goal_is_false_before_and_gone_after_in_the_image(model_run,
 @pytest.mark.slow
 @pytest.mark.parametrize("violate", [False, True], ids=["complete", "byte_unset"])
 def test_a_forwarding_wrapper_without_calls_gets_no_credit_in_the_image(
-    model_run, tmp_path, monkeypatch, violate  # noqa: F811
+    model_run,  # noqa: F811
+    tmp_path,
+    monkeypatch,
+    violate,
 ):
     """
     The inner sinks declared too and no `checked_at`: the wrapper forwards, so its callers have no goal and

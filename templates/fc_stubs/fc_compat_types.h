@@ -284,7 +284,9 @@ long syscall(long number, ...);
  * No <sys/socket.h> here: the getsockopt block below must be the first to include it. No `\old` in an
  * `assigns`: WP 35 with -wp-check-memory-model crashed on `\old(*(unsigned int *)addrlen)` there
  * (Wp__NormAtLabels.LabelError). */
+#if !defined(__has_include) || __has_include("__fc_builtin.h")
 #include "__fc_builtin.h"
+#endif
 
 /* read(2), x86_64 number 0. */
 /*@ requires buf_has_room: \valid((char *)buf + (0 .. count - 1));

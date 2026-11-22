@@ -203,7 +203,16 @@ def test_an_open_initializer_check_under_eva_keeps_the_unit_from_an_eva_cover(ru
     row = {"file": "prog.c", "line": 12, "function": "flush", "kind": "user check", "annotation": "ready != 0"}
     touched: set[str] = set()
     L._ingest_eva_meta(
-        state, {}, section, NK_MODULE, {}, "eva.json", {}, touched, code_rows=[("unknown", row)], lines=L._code_lines(L._code_checks())
+        state,
+        {},
+        section,
+        NK_MODULE,
+        {},
+        "eva.json",
+        {},
+        touched,
+        code_rows=[("unknown", row)],
+        lines=L._code_lines(L._code_checks()),
     )
     assert state[cid("flush")]["bookkeeping"]["eva_verdicts"][NK_MODULE] == "unknown"
 
@@ -250,9 +259,7 @@ def test_the_checks_of_one_line_are_named_by_their_index():
     ]
     named, unnamed = rwf.code_check_rows(rows, CHECKS_64, "f_init")
     assert named == {1: "L5_sanitized_net_send", 3: "L6_no_leak_key"} and unnamed == []
-    items = [
-        {"kind": rows[i]["kind"], "annotation": f"{name}: {rows[i]['property']}"} for i, name in named.items()
-    ]
+    items = [{"kind": rows[i]["kind"], "annotation": f"{name}: {rows[i]['property']}"} for i, name in named.items()]
     assert [rwf.goal_obligation_class(i) for i in items] == ["l5_sanitized", "l6_no_leak"]
     # The index, not the list order, decides.
     named, _ = rwf.code_check_rows(rows, list(reversed(CHECKS_64)), "f_init")
@@ -304,7 +311,7 @@ def test_resolve_security_meta_returns_the_code_checks_of_the_function(tmp_path,
 
 LOG_675 = (
     "[meta] Will process 1 properties\n"
-    "  Raised at MetAcsl__Meta_annotate.writing_visitor#external_assigns.(fun) in file \"meta_annotate.ml\", "
+    '  Raised at MetAcsl__Meta_annotate.writing_visitor#external_assigns.(fun) in file "meta_annotate.ml", '
     "line 675, characters 19-31\n"
     '[kernel] Unexpected error (File "meta_annotate.ml", line 675, characters 19-25: Assertion failed).\n'
     "  Please report as 'crash' at https://git.frama-c.com/pub/frama-c/issues\n"
@@ -325,7 +332,7 @@ def test_the_set_valued_assigns_failure_is_recognised_with_the_callee(tmp_path):
     found = rwf.metacsl_set_assigns_failure(LOG_675, [str(src)])
     assert found is not None and found["callees"] == ["pair", "two"]
     assert 'meta_annotate.ml", line 675' in found["message"] and "assigns" in found["cause"]
-    assert rwf.metacsl_set_assigns_failure("[kernel] Unexpected error (File \"other.ml\", line 3)", [str(src)]) is None
+    assert rwf.metacsl_set_assigns_failure('[kernel] Unexpected error (File "other.ml", line 3)', [str(src)]) is None
     res = rwf._analysis_error_result("f", src, rwf.METACSL_SET_ASSIGNS, 125, {}, LOG_675)
     res["metacsl_failure"] = found
     hints = rwf.derive_wp_diagnostic_hints(res, LOG_675)
@@ -487,7 +494,11 @@ def test_initializer_calls_end_to_end_in_the_image(tmp_path, monkeypatch, violat
         state = _ledger_units(run)
         for check in placed[function]:
             name, cls = check["property"], E2E_CLASS[check["property"]]
-            mine = [g for g in goals if str(g.get("annotation") or "").startswith(f"{name}: ") and g["line"] == check["line"]]
+            mine = [
+                g
+                for g in goals
+                if str(g.get("annotation") or "").startswith(f"{name}: ") and g["line"] == check["line"]
+            ]
             detail = json.dumps({"goals": goals, "report": report.get("by_obligation_class")}, indent=1)[-4000:]
             assert len(mine) == 1 and mine[0]["obligation_class"] == cls, f"{function} {name}\n{detail}"
             unit = state[f"prog.c#{function}::{cls}"]
@@ -534,4 +545,6 @@ def test_the_set_valued_assigns_failure_is_named_in_the_image(tmp_path):
     report = _forward_wp(target, run, "store")
     assert report["status"] == "analysis_error" and report["reason"] == rwf.METACSL_SET_ASSIGNS, report.get("reason")
     assert report["metacsl_failure"]["callees"] == ["two"]
-    assert "meta_annotate.ml" in report["diagnostic_hints"][0] and "Re-run once" not in " ".join(report["diagnostic_hints"])
+    assert "meta_annotate.ml" in report["diagnostic_hints"][0] and "Re-run once" not in " ".join(
+        report["diagnostic_hints"]
+    )

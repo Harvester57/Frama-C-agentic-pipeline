@@ -85,4 +85,3 @@ def test_d8_predicate_label_stripping_preserves_identifiers():
     assert detect_alarm_kind("mem_access: \\valid_read(p)") == "mem_access"
     assert detect_alarm_kind("signed_overflow: x + 1") == "signed_overflow"
     assert detect_alarm_kind("unknown_alarm") == ""
-

@@ -237,7 +237,9 @@ def test_the_same_function_defined_in_both_arms_keeps_the_first_definition() -> 
 
 
 def test_a_linkage_block_opened_under_cplusplus_still_shows_its_prototypes() -> None:
-    source = '#ifdef __cplusplus\nextern "C" {\n#endif\nint api(int a);\n#ifdef __cplusplus\n}\n#endif\nint more(void);\n'
+    source = (
+        '#ifdef __cplusplus\nextern "C" {\n#endif\nint api(int a);\n#ifdef __cplusplus\n}\n#endif\nint more(void);\n'
+    )
     assert [s.function for s in locate_all_prototype_spans(source)] == ["api", "more"]
 
 
@@ -285,9 +287,7 @@ def test_splice_of_a_function_after_the_conditional_end_to_end() -> None:
 def test_splice_of_the_function_holding_the_conditional_keeps_both_arms(contract_only: bool) -> None:
     base = LIBMODBUS_CONNECT + AFTER
     agent = _proved(base, "_connect", "requires sockfd >= 0;")
-    spliced = splice_prover_changes(
-        base, agent, base, "_connect", path="src/modbus-tcp.c", contract_only=contract_only
-    )
+    spliced = splice_prover_changes(base, agent, base, "_connect", path="src/modbus-tcp.c", contract_only=contract_only)
     assert spliced == agent
 
 

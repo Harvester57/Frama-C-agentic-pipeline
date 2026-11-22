@@ -149,7 +149,9 @@ WEAK_H = BASELINE_H.replace(
 )
 
 
-def _init_tree(tmp_path: Path, tree_c: str = BASELINE_C, tree_h: str = BASELINE_H, agents: int = 1) -> tuple[Path, Path]:
+def _init_tree(
+    tmp_path: Path, tree_c: str = BASELINE_C, tree_h: str = BASELINE_H, agents: int = 1
+) -> tuple[Path, Path]:
     """A run whose shared tree already holds `tree_c` / `tree_h` when the agents' scratch overlays are cut from it."""
     target = tmp_path / "target"
     target.mkdir()

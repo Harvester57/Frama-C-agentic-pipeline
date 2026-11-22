@@ -106,7 +106,7 @@ def test_every_case_of_a_large_dispatch_harness_is_skippable(tmp_path):
     out = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.split("\n")
     ran = {int(b): int(r) for b, r in (line.split() for line in out if line)}
     for b, r in ran.items():
-        assert r == (-1 if b % 179 in skip else b % 179), b
+        assert r == (-1 if b >= 179 or b in skip else b), b
 
 
 def test_a_harness_generated_before_every_case_was_skippable_skips_cases_below_64_only(tmp_path):

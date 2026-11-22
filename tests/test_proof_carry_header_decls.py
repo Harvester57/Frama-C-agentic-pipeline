@@ -65,6 +65,8 @@ def test_a_lone_header_definition_resolves_to_its_own_header(tmp_path: Path) -> 
 
 
 def test_replace_span_in_a_header_targets_the_prototype(tmp_path: Path) -> None:
-    out = pc._replace_span(TWO_DECLS_H, "get", "/*@ assigns \\nothing; */\nstatic inline int get(const int *p);", True, "u.h")
+    out = pc._replace_span(
+        TWO_DECLS_H, "get", "/*@ assigns \\nothing; */\nstatic inline int get(const int *p);", True, "u.h"
+    )
     assert out is not None and out.count("assigns \\nothing") == 1
     assert out.index("assigns") < out.index("static inline int get(const int *p);")

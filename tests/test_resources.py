@@ -1371,7 +1371,8 @@ def test_exec_mounts_this_repositorys_cache_partition_writable_only_for_allowlis
 
 def test_exec_puts_the_cache_in_a_named_volume_when_the_engine_runs_in_a_vm(tmp_path, fake_engine, monkeypatch, capsys):
     fake_engine(DOCKER_DESKTOP)
-    monkeypatch.setattr(sys, "platform", "win32")  # Docker Desktop from the Windows host: vm_backed
+    # Docker Desktop outside WSL2 is vm_backed; avoid mutating sys.platform (breaks shutil.which on Linux/3.12+).
+    monkeypatch.setattr(R, "is_wsl2", lambda *a, **kw: False)
     monkeypatch.setenv("FRAMAC_CACHE_VOLUME", "auto")
     monkeypatch.setenv("FRAMAC_REPO", "net-snmp")
     monkeypatch.setenv("FRAMAC_REPO_KEY", "net-snmp-0123456789ab")

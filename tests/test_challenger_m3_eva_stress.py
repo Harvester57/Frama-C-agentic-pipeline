@@ -66,6 +66,7 @@ def _run_eva_mock(monkeypatch, tmp_path, sigs, rows, log=_EVA_DONE, write_csv=Tr
 # 1. Stress Tests: run_eva_slice.py (Missing Spec & Error Summary)
 # ===========================================================================
 
+
 def test_missing_spec_variants_generator() -> None:
     """Generate all combinatorial variants of missing spec clauses and verify classification."""
     cases = [
@@ -148,8 +149,7 @@ def test_error_summary_extraction_kernel_and_compiler_variants() -> None:
         "  unbound logic variable val.\n"
         "bar.c:12:5: error: unknown type name 'size_t'\n"
         "baz.c:1:2: error: stray '\u2018' in program\n"
-        "[kernel] fatal error: out of memory\n"
-        + "\n".join(f"normal log line {i}" for i in range(100))
+        "[kernel] fatal error: out of memory\n" + "\n".join(f"normal log line {i}" for i in range(100))
     )
     summary = E.extract_error_summary(log, max_lines=10)
     assert len(summary) == 5
@@ -162,10 +162,7 @@ def test_error_summary_extraction_kernel_and_compiler_variants() -> None:
 
 def test_error_summary_deduplication_and_limit() -> None:
     """Duplicate diagnostics must be deduplicated and max_lines respected."""
-    dup_lines = [
-        "[kernel] user error: duplicate error line\n"
-        for _ in range(30)
-    ]
+    dup_lines = ["[kernel] user error: duplicate error line\n" for _ in range(30)]
     log = "".join(dup_lines)
     summary = E.extract_error_summary(log, max_lines=5)
     assert len(summary) == 1
@@ -212,6 +209,7 @@ def test_missing_spec_mixed_plugin_and_raw_dropped_behavior() -> None:
 # ===========================================================================
 # 2. Stress Tests: stub_check.py (check_eva Handling of CSV and Log Alarms)
 # ===========================================================================
+
 
 def test_check_eva_valid_vs_invalid_statuses(monkeypatch, tmp_path) -> None:
     """Verify check_eva property status matrix across ok and short calls."""
@@ -284,8 +282,7 @@ def test_check_eva_uncarried_log_warning_fallback(monkeypatch, tmp_path) -> None
     sigs, line, _ = _smoke_sigs()
     log = (
         f"[eva:alarm] fc_stub_smoke.c:{line['ml_sum', 'ok']}: Warning: \n"
-        "  function ml_sum, behavior default: precondition 'uncarried_pred' got status unknown.\n"
-        + _EVA_DONE
+        "  function ml_sum, behavior default: precondition 'uncarried_pred' got status unknown.\n" + _EVA_DONE
     )
     # CSV has valid call as Valid, so CSV alone would pass
     rows = [
@@ -337,6 +334,7 @@ def test_check_eva_empty_csv_handling(monkeypatch, tmp_path) -> None:
 # ===========================================================================
 # 3. Stress Tests: eva_loops.py (Loop Annotations & Unroll Merging)
 # ===========================================================================
+
 
 def test_eva_loops_multiline_leading_at_clauses() -> None:
     """Stress test multi-line loop annotations with leading @, tabs, spaces, and multiple clauses."""
@@ -465,15 +463,7 @@ def test_eva_loops_single_line_acsl_continuation() -> None:
 
 def test_eva_loops_preexisting_multiline_unroll_detected() -> None:
     """Pre-existing multi-line loop unroll annotation must be detected and dropped."""
-    source = (
-        "void f(int n) {\n"
-        "  /*@\n"
-        "    @ loop\n"
-        "    @   unroll 16;\n"
-        "    @*/\n"
-        "  for (int i = 0; i < n; i++) {}\n"
-        "}\n"
-    )
+    source = "void f(int n) {\n  /*@\n    @ loop\n    @   unroll 16;\n    @*/\n  for (int i = 0; i < n; i++) {}\n}\n"
     refs = [LoopRef("a.c", "f", 0, 32)]
     annotated, applied, dropped = eva_loops.annotate_source(source, refs)
     assert applied == []
@@ -506,4 +496,3 @@ def test_eva_loops_infinite_loops_and_labels() -> None:
     assert annotated.count("/*@") == 2
     assert "loop unroll 4;" in annotated
     assert "loop unroll 8;" in annotated
-

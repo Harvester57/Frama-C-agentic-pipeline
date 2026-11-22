@@ -39,7 +39,9 @@ DIRECT_CALLER = "prog.c#ping::l5_sanitized"
 def _before() -> dict:
     """The property at the callers of `send_frame`, as a run recorded it before the move."""
     sinks = [tw.CHECKED_AT_SINK, tw.TCP_SINK, tw.RTU_SINK]
-    return sp.generate(tw.wrapper_model(), tsp.threat(output_sinks=sinks), keep_at_callers={"send_frame": "not applied"})
+    return sp.generate(
+        tw.wrapper_model(), tsp.threat(output_sinks=sinks), keep_at_callers={"send_frame": "not applied"}
+    )
 
 
 def _unproven_report(function: str, annotation: str) -> dict:

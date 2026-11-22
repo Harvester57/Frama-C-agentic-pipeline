@@ -223,7 +223,9 @@ def test_a_lib_new_kind_constructor_builds_the_handle():
     model = {"status": "ok", "functions": {f"modbus.c#{n}": r for n, r in recs.items()}}
     p = ah.plan(dag, model, "lib", "lib", 64, [], None, {}, declared)
     assert p["skipped"] == {}
-    flush = next(t for t, lay in zip(p["cases"], p["layouts"], strict=True) if lay.get("entry") == "modbus.c#modbus_flush")
+    flush = next(
+        t for t, lay in zip(p["cases"], p["layouts"], strict=True) if lay.get("entry") == "modbus.c#modbus_flush"
+    )
     assert "modbus_new_tcp(" in flush and "modbus_flush(" in flush and "modbus_free(" in flush
 
 

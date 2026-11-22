@@ -212,7 +212,11 @@ def _callee_contract_digest(work: Path, callee_file: str, name: str, extra_heade
 def _header_prototype_span(text: str, function: str, header: str) -> Span | None:
     """The first prototype of `function` in a header (its definition, if the header has one, is not it)."""
     return next(
-        (d.span for d in contract_declaration_spans(text, function, is_header=True, path=header) if d.kind == "prototype"),
+        (
+            d.span
+            for d in contract_declaration_spans(text, function, is_header=True, path=header)
+            if d.kind == "prototype"
+        ),
         None,
     )
 

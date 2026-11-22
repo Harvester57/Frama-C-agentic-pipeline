@@ -242,7 +242,7 @@ def test_the_harness_flags_get_the_targets_feature_macros(fm_host):
     assert "-D_GNU_SOURCE=" in flags and "-D_FILE_OFFSET_BITS=64" in flags, flags
     assert not [f for f in flags if "FM_HAVE_PKTINFO" in f or "INCLUDED" in f], flags
     assert pipeline_make.check_flags(flags) == [], "the Make builds' flag allowlist takes a valueless -DX="
-    pre =[c for c in calls if c[:3] == ["gcc", "-E", "-dD"]]
+    pre = [c for c in calls if c[:3] == ["gcc", "-E", "-dD"]]
     assert len(pre) == 1 and pre[0][-1].endswith("workspace/work/src/fm.c"), calls
     meta = json.loads((run / "workspace" / "harnesses" / "harness_fm.json").read_text(encoding="utf-8"))
     fm = meta["feature_macros"]

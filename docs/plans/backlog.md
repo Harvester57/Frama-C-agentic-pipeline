@@ -103,6 +103,16 @@ Proposal of 2026-11-20 from ten public projects (frama-c-mcp, frama-c-lsp, VerNF
 - [x] **Tier 5, two small checks (completed 2026-11-20):** [part 1] capped (at most 2) `return <parameter>` stub mutants in `mutation_check.py` (canonical multi-token C types, 1D array decay, by-value `struct`/`union` support, pre-cap body-identical filter, `all(...)` aggregation in `trivial_body_rejected`, verified via 6-function Docker replay in `framac-analysis:latest` + `165 passed`); [part 2, `9fae206` in Tier 1] well-founded descent check (`acsl_ast.find_unsound_recursive_logic`, wired into `find_unsound_acsl_keywords`, `verify_acsl_only`, and `run_wp_function.py`).
 - [ ] **Decision D1, verker as a ground-truth set for Phase 3:** recommendation is not now (note `contract_refinement.py compare` needs shared vocabulary and often returns `undecided`); reconsider only if Tier 4 builds a lemma library. The user's call.
 
+## 1h. API-sequence fuzzing paper ([`./api-sequence-fuzzing-papers-generalization-plan.md`](./api-sequence-fuzzing-papers-generalization-plan.md))
+
+Proposal of 2026-11-20 from STITCH (CCS 2026). Nothing is built, and nothing can be built today.
+
+- [x] **Tier 1, a second level of dynamic reach (closed 2026-11-20, stop):** on nanopb run-1 (36 entry points, the coverage report of the generated harness), 14 entry functions have every region covered, among them `pb_decode`, `pb_decode_tag` and `pb_decode_varint32`, whose cases run on a zeroed stream. The measure does rank some refused cases low (`pb_write`, on a zeroed output stream), but it misses the ones the gap is about, and no verified good case was available to test the other direction. Over the callee closure the regions are shared between entry points and cannot be attributed. A form that could work needs a coverage replay per case; it is not designed.
+- [ ] **Entry points reached only on their refusal path (still open):** the dynamic reach gate counts them as reached (QCBOR run-6 `*InMap*` accessors, nanopb run-1 readers). Tier 1 does not address it; S1 and S2 of [`./schema-driven-api-harness-plan.md`](./schema-driven-api-harness-plan.md) remove nanopb's case at the source.
+- [ ] **Tier 2, call sequences on a struct the library initializes (trial):** Step 0a, an offline count on a Phase 0 model (methods per initialized struct type, whether the initializer's data argument would carry input bytes in a loop case, what recorded chains already cover). Step 0b, one hand-written loop case on QCBOR's decode module in one target run, the user's call. Build behind `FRAMAC_API_STRUCT_LIFECYCLE` only on a go, after the two open items of the lifecycle troubleshooting entry.
+- [ ] **Decision D1, state guards in lifecycle cases (typestate):** recommendation is none; reconsider if Tier 2's Step 0b stops on call-order crashes. The user's call.
+- [ ] **Decision D2, STITCH itself or its published specifications:** recommendation is nothing now; reading the published specifications of c-ares and libpng is cheap but needs a download. The user's call.
+
 ## 2. Verification gaps (not testable on this machine)
 
 - [ ] **Podman**, rootless and rootful: per-controller flags, the refusal when memory/pids limits cannot be enforced, and `sandbox.outer: podman-hardened`. Podman is not installed here (it would need installing in WSL Ubuntu).

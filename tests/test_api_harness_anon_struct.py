@@ -60,7 +60,11 @@ AS_FIELDS: dict[str, list[tuple[str, str, str | None]]] = {
     "str_t": [("len", "size_t", "unsigned long"), ("data", "unsigned char *", None)],
     "kv_t": [("key", "str_t", None), ("value", "str_t", None)],
     "num_t": [("i", "int", None), ("f", "float", None)],
-    "sbuf_t": [("buf", "unsigned char *", None), ("cap", "size_t", "unsigned long"), ("used", "size_t", "unsigned long")],
+    "sbuf_t": [
+        ("buf", "unsigned char *", None),
+        ("cap", "size_t", "unsigned long"),
+        ("used", "size_t", "unsigned long"),
+    ],
     "big_t": [("alloc_", "int", None), ("size", "int", None), ("limbs", "unsigned long *", None)],
 }
 AS_WHAT = {"str_t": "struct", "kv_t": "struct", "num_t": "union", "sbuf_t": "struct", "big_t": "struct"}
@@ -118,7 +122,13 @@ def _as_tree(names: list[str], api: dict | None = None) -> dict:
                         "kind": "ElaboratedType",
                         "type": {"qualType": f"{what} {tname}"},
                         "ownedTagDecl": {"id": rid, "kind": "RecordDecl", "name": ""},
-                        "inner": [{"kind": "RecordType", "type": {"qualType": tname}, "decl": {"id": rid, "kind": "RecordDecl", "name": ""}}],
+                        "inner": [
+                            {
+                                "kind": "RecordType",
+                                "type": {"qualType": tname},
+                                "decl": {"id": rid, "kind": "RecordDecl", "name": ""},
+                            }
+                        ],
                     }
                 ],
             }
@@ -191,7 +201,10 @@ def _clamped(stmt: str, length: str) -> bool:
 @pytest.mark.unit
 def test_the_probe_lays_out_records_declared_through_a_typedef_of_an_anonymous_record():
     layouts, _ = ah.record_layouts(_as_tree(list(AS_API)))
-    assert [(f["name"], f["kind"], f["off"]) for f in layouts["str_t"]["fields"]] == [("len", "int", 0), ("data", "ptr", 8)]
+    assert [(f["name"], f["kind"], f["off"]) for f in layouts["str_t"]["fields"]] == [
+        ("len", "int", 0),
+        ("data", "ptr", 8),
+    ]
     assert layouts["str_t"]["what"] == "struct" and layouts["str_t"]["size"] == 16
     assert layouts["num_t"]["what"] == "union" and layouts["num_t"]["size"] == 4
     # A field of such a type is a record of that typedef: kv_t and the named struct holder get a layout.

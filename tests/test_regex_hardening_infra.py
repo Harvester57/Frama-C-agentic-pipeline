@@ -195,7 +195,11 @@ def test_fixture_models_still_match_their_schema():
 
 
 def test_copied_patterns_are_defined_once_per_schema():
-    for name, definition in (("benchmark-run", "sha256"), ("candidates", "fingerprint"), ("threat_model", "identifier")):
+    for name, definition in (
+        ("benchmark-run", "sha256"),
+        ("candidates", "fingerprint"),
+        ("threat_model", "identifier"),
+    ):
         text = (SCHEMA_DIR / f"{name}.schema.json").read_text(encoding="utf-8")
         pattern = json.dumps(_schema(name)["definitions"][definition]["pattern"])
         assert text.count(f'"pattern": {pattern}') == 1, name
@@ -219,7 +223,9 @@ def _threat_model(size: str) -> dict:
     }
 
 
-@pytest.mark.parametrize("size", ["32", "len", "len * 2", "(len + 1) / 2", "ctx->len", "sizeof(key) / 4", "2 * (n - 1)"])
+@pytest.mark.parametrize(
+    "size", ["32", "len", "len * 2", "(len + 1) / 2", "ctx->len", "sizeof(key) / 4", "2 * (n - 1)"]
+)
 def test_threat_model_size_accepts_c_expressions(size):
     assert trust.validate_block(_threat_model(size)) == []
 
@@ -300,28 +306,34 @@ def test_benchmark_assert_no_host_paths_refuses_escaped_and_nested(host_path):
 
 
 def test_benchmark_assert_no_host_paths_accepts_container_and_relative():
-    benchmark.assert_no_host_paths({
-        "container": "/framac-run/workspace/work/a.c",
-        "relative": "workspace/reports/summary.json",
-        "url": "https://github.com/example/repo",
-        "status": "ok",
-        "version": "v1.0",
-    })
+    benchmark.assert_no_host_paths(
+        {
+            "container": "/framac-run/workspace/work/a.c",
+            "relative": "workspace/reports/summary.json",
+            "url": "https://github.com/example/repo",
+            "status": "ok",
+            "version": "v1.0",
+        }
+    )
 
 
 def test_benchmark_assert_no_host_paths_refuses_dict_keys():
     with pytest.raises(benchmark.BenchmarkError, match=r"\$\.files\.\(key\)"):
-        benchmark.assert_no_host_paths({
-            "files": {
-                r"C:\Users\florian\secret\main.c": {"lines": 100},
+        benchmark.assert_no_host_paths(
+            {
+                "files": {
+                    r"C:\Users\florian\secret\main.c": {"lines": 100},
+                }
             }
-        })
+        )
     with pytest.raises(benchmark.BenchmarkError, match=r"\$\.files\.\(key\)"):
-        benchmark.assert_no_host_paths({
-            "files": {
-                "/home/florian/code/secret.c": {"lines": 200},
+        benchmark.assert_no_host_paths(
+            {
+                "files": {
+                    "/home/florian/code/secret.c": {"lines": 200},
+                }
             }
-        })
+        )
 
 
 @pytest.mark.parametrize(
@@ -386,7 +398,10 @@ def test_benchmark_scrub_host_paths_scrubs_dict_keys():
         ("Calling undeclared function json_object_from_fd. Old style K&R code?", ["json_object_from_fd"]),
         ("Calling undeclared function ‘json_object_from_fd’. Old style K&R code?", ["json_object_from_fd"]),
         ("Calling undeclared function 'json_object_from_fd'. Old style K&R code?", ["json_object_from_fd"]),
-        ("warning: implicit declaration of function ‘snmp_pdu_create’ [-Wimplicit-function-declaration]", ["snmp_pdu_create"]),
+        (
+            "warning: implicit declaration of function ‘snmp_pdu_create’ [-Wimplicit-function-declaration]",
+            ["snmp_pdu_create"],
+        ),
     ],
 )
 def test_scan_undeclared_functions_curly_quotes(log, expected):
@@ -548,4 +563,3 @@ def test_phase0_model_header_declarations_audit():
     assert phase0_model.header_declared_functions(model, "./include/api.h") == {"api_func", "ext_header_func"}
     assert phase0_model.header_declared_functions(model, "include\\api.h") == {"api_func", "ext_header_func"}
     assert phase0_model.header_declared_functions(model, "include/missing.h") == set()
-

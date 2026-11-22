@@ -336,9 +336,7 @@ def test_an_nb_count_before_its_buffer_is_bounded_by_it():
     p = _plan(MODBUS_RECS)
     text, lay = _case(p, "modbus_write_registers")
     spare = ah.spare_bytes(64)
-    assert (
-        f"static unsigned short c0a3[({spare} + sizeof(unsigned short) - 1) / sizeof(unsigned short)];" in text
-    ), text
+    assert f"static unsigned short c0a3[({spare} + sizeof(unsigned short) - 1) / sizeof(unsigned short)];" in text, text
     assert _bound("c0a2", "int", _half("c0a3")) in text, text
     assert "c0a1 = " not in text, text
     assert {"call": 0, "param": 3, "size": 2, "kind": "pointee"} in lay["slots"], lay
@@ -353,6 +351,11 @@ def test_an_nb_count_before_its_buffer_is_bounded_by_it():
 def test_an_index_of_a_call_with_a_length_is_left_to_the_callee():
     # A (buffer, length) pair: the callee can check an offset against the length, so the offset
     # stays as read (a missing check is the library's bug, not the harness's).
-    recs = {"peek": ("int(unsigned char *,unsigned long,unsigned long)", [("buf", "const_pointer"), ("len", "value"), ("offset", "value")])}
+    recs = {
+        "peek": (
+            "int(unsigned char *,unsigned long,unsigned long)",
+            [("buf", "const_pointer"), ("len", "value"), ("offset", "value")],
+        )
+    }
     text, _ = _case(_plan(recs), "peek")
     assert "c0a2 = " not in text, text

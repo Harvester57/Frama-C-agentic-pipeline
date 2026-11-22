@@ -358,9 +358,7 @@ def context_prelude(context: Sequence[str] = ()) -> list[str]:
     return [CONTEXT_COMMENT, *context] if context else []
 
 
-def smoke_source(
-    include: str, sigs: list[dict], context: Sequence[str] = ()
-) -> tuple[str, dict[int, tuple[str, str]]]:
+def smoke_source(include: str, sigs: list[dict], context: Sequence[str] = ()) -> tuple[str, dict[int, tuple[str, str]]]:
     """(the Eva smoke program, line -> (function, `ok` | `short`) of each call)."""
     out = [
         *context_prelude(context),
@@ -664,7 +662,9 @@ def check_abi(
     feature_flags: Sequence[str] = (),
 ) -> dict:
     src = work / ABI_SRC
-    src.write_text("".join(f"{line}\n" for line in context_prelude(context)) + f"#include <{include}>\n", encoding="utf-8")
+    src.write_text(
+        "".join(f"{line}\n" for line in context_prelude(context)) + f"#include <{include}>\n", encoding="utf-8"
+    )
     cmd = ["gcc", "-fsyntax-only", "-DFC_STUB_DRAFT", *feature_flags, f"-I{overlay.as_posix()}", *sys_flags, src.name]
     rc, log = _run(cmd, work)
     (work / ABI_LOG).write_text(f"$ {shlex.join(cmd)}\n{log}", encoding="utf-8")
@@ -796,7 +796,11 @@ def build_driver(work: Path, ldflags: str, feature_flags: Sequence[str] = ()) ->
     rc, log = _run(cmd1, work)
     (work / INSTRUMENT_LOG).write_text(f"$ {shlex.join(cmd1)}\n{log}", encoding="utf-8")
     if rc != 0 or not instrumented.is_file():
-        return {"status": "build_failed", "reason": _first_error(log) or f"e-acsl-gcc exited {rc}", "log": INSTRUMENT_LOG}
+        return {
+            "status": "build_failed",
+            "reason": _first_error(log) or f"e-acsl-gcc exited {rc}",
+            "log": INSTRUMENT_LOG,
+        }
     text = instrumented.read_text(encoding="utf-8", errors="replace")
     for repair in (rewrite_trailing_alignas, mark_wrapper_results_initialized, mark_formals_initialized):
         text, _ = repair(text)
@@ -1025,7 +1029,9 @@ def _memory_explained(pred: str, values: list[tuple[str, str]]) -> bool:
     parts = _top_split(expr, "&&")
     if len(parts) > 1:
         explained = [_memory_explained(p, values) for p in parts]
-        return any(explained) and all(e or _held(_strip_parens(p), values) for e, p in zip(explained, parts, strict=True))
+        return any(explained) and all(
+            e or _held(_strip_parens(p), values) for e, p in zip(explained, parts, strict=True)
+        )
     return _memory_atom(expr, values)
 
 
@@ -1407,7 +1413,11 @@ def _extract_member_name_from_decl(tokens: list[Token]) -> str | None:
             for t in inner:
                 if t.text == "[":
                     break
-                if _is_ident(t.text) and t.text not in _STRUCT_QUALIFIERS and t.text not in TYPE_MODIFIERS_AND_PRIMITIVES:
+                if (
+                    _is_ident(t.text)
+                    and t.text not in _STRUCT_QUALIFIERS
+                    and t.text not in TYPE_MODIFIERS_AND_PRIMITIVES
+                ):
                     return t.text
 
     candidates: list[str] = []
@@ -1463,8 +1473,7 @@ def _parse_stmt_members(stmt: list[Token]) -> list[str]:
                 start_idx = 1
         else:
             while start_idx < len(clean) and (
-                clean[start_idx].text in TYPE_MODIFIERS_AND_PRIMITIVES
-                or clean[start_idx].text in _STRUCT_QUALIFIERS
+                clean[start_idx].text in TYPE_MODIFIERS_AND_PRIMITIVES or clean[start_idx].text in _STRUCT_QUALIFIERS
             ):
                 start_idx += 1
             if start_idx == 0:
@@ -1489,9 +1498,7 @@ def struct_members(text: str) -> dict[str, list[str]]:
     listed as `name[]` (FLEXIBLE_SUFFIX): it has an offset but no size.
     """
     raw_tokens = tokenize_c_acsl(text)
-    all_tokens = _without_attributes(
-        [t for t in raw_tokens if t.kind in ("c_token", "string", "pp_directive")]
-    )
+    all_tokens = _without_attributes([t for t in raw_tokens if t.kind in ("c_token", "string", "pp_directive")])
     out: dict[str, list[str]] = {}
     stack: list[dict[str, Any]] = []
 

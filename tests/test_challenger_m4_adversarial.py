@@ -217,18 +217,10 @@ class TestB5FormalParameterSignatureExtraction:
 
     def test_b5_void_and_empty_signature_with_model(self):
         """Verify void parameter lists return empty list without fallback error."""
-        m_void = {
-            "functions": {
-                "f": {"name": "f", "signature": "void f(void)", "formals": []}
-            }
-        }
+        m_void = {"functions": {"f": {"name": "f", "signature": "void f(void)", "formals": []}}}
         assert gh.extract_function_prototype("f", model=m_void) == []
 
-        m_empty = {
-            "functions": {
-                "f": {"name": "f", "signature": "void f()", "formals": []}
-            }
-        }
+        m_empty = {"functions": {"f": {"name": "f", "signature": "void f()", "formals": []}}}
         assert gh.extract_function_prototype("f", model=m_empty) == []
 
     def test_b5_declaration_extraction_model_and_fallback(self, tmp_path: Path):
@@ -341,7 +333,7 @@ class TestB7MainDefinitionDetection:
             'const char *s = "int main(int argc, char **argv) { return 0; }";\n',
             'const char *s = "void main(void) {";\n',
             'const char *s = "int main() {";\n',
-            'char s[] = "\\"int main(void) {\\"\";\n',
+            'char s[] = "\\"int main(void) {\\"";\n',
         ]
         for idx, text in enumerate(literals):
             src = tmp_path / f"literal_{idx}.c"
@@ -367,10 +359,7 @@ class TestB7MainDefinitionDetection:
         """
         src = tmp_path / "macro_main.c"
         src.write_text(
-            "#define APP_ENTRY main\n"
-            "int APP_ENTRY(void) {\n"
-            "    return 0;\n"
-            "}\n",
+            "#define APP_ENTRY main\nint APP_ENTRY(void) {\n    return 0;\n}\n",
             encoding="utf-8",
         )
 

@@ -600,9 +600,15 @@ $hardeningArgs = @(
 # directory never collects root-owned files. Windows Docker Desktop bind mounts are not uid-owned, and
 # Podman (rootless) maps the caller to the container's root already.
 if ($OuterSandbox -eq "docker-hardened" -and ($IsLinux -or $IsMacOS)) {
-    $hostUid = ([string](& id -u | Select-Object -First 1)).Trim()
-    $hostGid = ([string](& id -g | Select-Object -First 1)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $hostUid -notmatch '^\d+$' -or $hostGid -notmatch '^\d+$') {
+    # Capture output and exit code before Select-Object: piping directly to Select-Object -First 1 stops
+    # the upstream native command early in PowerShell 7 on Linux, leaving $LASTEXITCODE stale or non-zero.
+    $uidOut = & id -u
+    $uidRc = $LASTEXITCODE
+    $gidOut = & id -g
+    $gidRc = $LASTEXITCODE
+    $hostUid = ([string]($uidOut | Select-Object -First 1)).Trim()
+    $hostGid = ([string]($gidOut | Select-Object -First 1)).Trim()
+    if ($uidRc -ne 0 -or $gidRc -ne 0 -or $hostUid -notmatch '^\d+$' -or $hostGid -notmatch '^\d+$') {
         throw "Could not determine the host uid/gid with 'id -u' / 'id -g'."
     }
     $hardeningArgs += @("--user", "${hostUid}:${hostGid}")

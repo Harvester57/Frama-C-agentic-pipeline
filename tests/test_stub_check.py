@@ -236,8 +236,12 @@ def _epoll_inputs() -> None:
     write_json(Path("workspace/reports/stubs.json"), {"headers": {EPOLL_HDR: {
         "include_name": "sys/epoll.h", "digest": "e1", "problems": [],
         "functions": {"epoll_create1": {"state": "filled"}}}}})  # fmt: skip
-    write_json(Path("workspace/reports/phase0_model.json"), {"external_decls": {"epoll_create1": {"proto": EPOLL_CREATE1}}})
-    write_json(Path("workspace/reports/callgraph_dag.json"), {"modules": {"m": {"external_callees": ["epoll_create1"]}}})
+    write_json(
+        Path("workspace/reports/phase0_model.json"), {"external_decls": {"epoll_create1": {"proto": EPOLL_CREATE1}}}
+    )
+    write_json(
+        Path("workspace/reports/callgraph_dag.json"), {"modules": {"m": {"external_callees": ["epoll_create1"]}}}
+    )
 
 
 @pytest.mark.unit
@@ -254,9 +258,7 @@ def test_run_keeps_each_headers_logs_and_names_them(run_dir, monkeypatch):
     assert rec["eva"]["status"] == "error"
     assert rec["eva"]["log"] == f"{EPOLL_LOGS}/eva.log"
     assert rec["artifacts"] == {"dir": EPOLL_LOGS, "files": ["fc_stub_smoke.c", "eva.log"]}
-    assert rec["reasons"] == [
-        f"Frama-C: {stub_check._first_error(eva)} (see {EPOLL_LOGS}/eva.log)"
-    ]
+    assert rec["reasons"] == [f"Frama-C: {stub_check._first_error(eva)} (see {EPOLL_LOGS}/eva.log)"]
     assert "no \\from part for clause" in rec["reasons"][0]
     kept = (run_dir / EPOLL_LOGS / "eva.log").read_text(encoding="utf-8")
     assert kept.startswith("$ frama-c ") and "Deferred error" in kept
@@ -279,9 +281,7 @@ def test_an_eacsl_annotation_error_in_the_header_blocks_it(run_dir, monkeypatch)
     data = json.loads((run_dir / stub_check.STUB_CHECK_REL).read_text(encoding="utf-8"))
     rec = data["headers"][EPOLL_HDR]
     assert rec["dynamic"]["status"] == "build_failed"
-    assert rec["reasons"] == [
-        f"E-ACSL: {stub_check._first_error(eacsl)} (see {EPOLL_LOGS}/eacsl_instrument.log)"
-    ]
+    assert rec["reasons"] == [f"E-ACSL: {stub_check._first_error(eacsl)} (see {EPOLL_LOGS}/eacsl_instrument.log)"]
     assert data["blocked_modules"] == {"m": [EPOLL_HDR]}
 
 
@@ -670,7 +670,9 @@ def test_the_context_scan_drops_undefined_guards_and_system_macros(tmp_path):
     assert scan["entered"] == real.as_posix()
     # Q_H is the header's own include guard: defining it in a probe would empty the header.
     assert stub_check.select_context(scan, snapshot_root=str(tmp_path / "snap" / "root")) == ["#define Q_MODE 2"]
-    assert stub_check.scan_preprocessed('# 0 "/t/a.c"\n#define X 1\n', "q.h", tree="/t", generated=None)["entered"] is None
+    assert (
+        stub_check.scan_preprocessed('# 0 "/t/a.c"\n#define X 1\n', "q.h", tree="/t", generated=None)["entered"] is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1133,9 @@ def test_the_header_verdict_follows_the_dynamic_classification(run_dir, monkeypa
     def fake_run(cmd, **_):
         return sandbox_exec.SandboxResult(-6, "", logs[order[int(cmd[1])]], False, "test")
 
-    monkeypatch.setattr(stub_check, "build_driver", lambda *a, **k: {"status": "built", "binary": "drv", "log": "b.log"})
+    monkeypatch.setattr(
+        stub_check, "build_driver", lambda *a, **k: {"status": "built", "binary": "drv", "log": "b.log"}
+    )
     monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake_run)
     _op_check_inputs()
     assert stub_check.main(["run", "--checks", "dynamic"]) == 1

@@ -326,8 +326,26 @@ def _preprocess_framac(flags: list[str], source: str, machdep: str, run_dir: Pat
     return proc.stdout
 
 
+def _strip_compat_include(flags: list[str]) -> list[str]:
+    """Drop force-includes of Frama-C's `fc_compat_types.h`, which expects `__fc_libc` headers."""
+    out: list[str] = []
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag == "-include" and i + 1 < len(flags) and flags[i + 1].endswith("fc_compat_types.h"):
+            i += 2
+            continue
+        if flag.startswith("-include") and flag.endswith("fc_compat_types.h"):
+            i += 1
+            continue
+        out.append(flag)
+        i += 1
+    return out
+
+
 def _preprocess_gcc(flags: list[str], source: str, run_dir: Path, runner: Callable | None) -> str:
-    proc = _run_tool(["gcc", "-E", "-dD", *cache.FRAMAC_DEP_DEFINES, *flags, source], run_dir, runner)
+    gcc_flags = _strip_compat_include(flags)
+    proc = _run_tool(["gcc", "-E", "-dD", *cache.FRAMAC_DEP_DEFINES, *gcc_flags, source], run_dir, runner)
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         raise _ToolFailure(_failure_text(proc))
     return proc.stdout

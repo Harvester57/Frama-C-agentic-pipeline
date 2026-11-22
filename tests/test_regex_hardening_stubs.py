@@ -83,9 +83,7 @@ def test_check_eva_reads_the_precondition_rows_of_the_report(monkeypatch, tmp_pa
     rows = [
         _call_row(line["ml_hash", "ok"], "fc_smoke_ok_ml_hash", "ml_hash", "Valid", _VALID_DATA),
         _call_row(line["ml_hash", "ok"], "fc_smoke_ok_ml_hash", "ml_hash", "Valid", _VALID_OUT),
-        _call_row(
-            line["ml_hash", "short"], "fc_smoke_short_ml_hash", "ml_hash", "Invalid or unreachable", _VALID_DATA
-        ),
+        _call_row(line["ml_hash", "short"], "fc_smoke_short_ml_hash", "ml_hash", "Invalid or unreachable", _VALID_DATA),
         _call_row(line["ml_hash", "short"], "fc_smoke_short_ml_hash", "ml_hash", "Valid", _VALID_OUT),
         _call_row(line["ml_sum", "ok"], "fc_smoke_ok_ml_sum", "ml_sum", "Valid", _VALID_S),
         _call_row(line["ml_sum", "short"], "fc_smoke_short_ml_sum", "ml_sum", "Unknown", _VALID_S),
@@ -169,7 +167,10 @@ def test_a_log_warning_the_report_does_not_carry_is_still_an_alarm(monkeypatch, 
         ("void ( __attribute__((__noreturn__)) die3)(int code)", True),
         ("void *alloc(size_t n)", False),
         ("int *mk(void)", False),
-        ("int ( __attribute__((__warn_unused_result__)) checked)(char const * restrict s, unsigned char out[32])", False),
+        (
+            "int ( __attribute__((__warn_unused_result__)) checked)(char const * restrict s, unsigned char out[32])",
+            False,
+        ),
         ("int (*getcb(int which))(int )", False),
         ("void (*signal_like(int sig, void (*handler)(int )))(int )", False),
         ("char const *name_of(struct ctx const *c)", False),
@@ -364,7 +365,13 @@ def _user_retres_raw() -> dict:
         ],
         "reads": [],
         "return_paths": [
-            {"value": "1", "conditions": ["__retres > 3"], "conditions_partial": False, "in_loop": None, "loc": "t.c:7"},
+            {
+                "value": "1",
+                "conditions": ["__retres > 3"],
+                "conditions_partial": False,
+                "in_loop": None,
+                "loc": "t.c:7",
+            },
             {
                 "value": "0",
                 "conditions": ["!(__retres > 3)"],
@@ -458,7 +465,13 @@ def _user_tmp_raw() -> dict:
         "reads": [read],
         "return_paths": [
             {"value": "100", "conditions": ["tmp > 100"], "conditions_partial": False, "in_loop": None, "loc": "t.c:5"},
-            {"value": "tmp", "conditions": ["!(tmp > 100)"], "conditions_partial": False, "in_loop": None, "loc": "t.c:5"},
+            {
+                "value": "tmp",
+                "conditions": ["!(tmp > 100)"],
+                "conditions_partial": False,
+                "in_loop": None,
+                "loc": "t.c:5",
+            },
         ],
         "derived_pointers": [],
         "temps": ["tmp_0"],

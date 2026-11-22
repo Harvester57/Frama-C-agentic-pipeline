@@ -361,4 +361,3 @@ def test_b7_source_defines_main_uses_symbols_and_masks_literals(tmp_path):
         ]
     }
     assert pm._source_defines_main(src, capture=capture) is True
-

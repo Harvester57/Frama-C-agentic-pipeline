@@ -1906,6 +1906,8 @@ INIT_STRONG = {
     "scope": ["h_init", "h_assign"],
     "description": "d",
 }
+
+
 def _init_model() -> dict:
     """local_init.c as the model would give it: every `_init` function calls in an initializer."""
 

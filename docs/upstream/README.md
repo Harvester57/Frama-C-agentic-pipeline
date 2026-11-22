@@ -2,6 +2,7 @@
 
 - **Documentation Hub:** [`../README.md`](../README.md)
 - **Confirmed Target Advisories:** [`../bugs-found/README.md`](../bugs-found/README.md)
+- **Upstream Frama-C / MetAcsl Reporting Skill:** [`../../skills/upstream-bug-report/SKILL.md`](../../skills/upstream-bug-report/SKILL.md) (`/upstream-bug-report`, enforcing [Frama-C Guidelines for reporting bugs](https://git.frama-c.com/pub/frama-c/-/wikis/Guidelines-for-reporting-bugs) via [`../../tools/upstream_audit/file_upstream.py`](../../tools/upstream_audit/file_upstream.py) `check`)
 
 This directory organizes artifacts prepared for or extracted from upstream projects into four subdirectories:
 

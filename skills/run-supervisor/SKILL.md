@@ -120,7 +120,7 @@ A fingerprint that matches one you already fixed means the fix missed it, and it
 
 ## Upstream (category d)
 
-Write a minimal standalone reproducer and run it in the analysis image. Check for duplicates in [`../../docs/upstream/frama-c/frama-c-e-acsl-issues.md`](../../docs/upstream/frama-c/frama-c-e-acsl-issues.md) and the work-items CSV beside it. Write the draft by following [`../../docs/upstream/frama-c/README.md`](../../docs/upstream/frama-c/README.md), and add it to that index.
+Follow [`../upstream-bug-report/SKILL.md`](../upstream-bug-report/SKILL.md) (`/upstream-bug-report`): write a minimal standalone reproducer and run it in the analysis image, check for duplicates in [`../../docs/upstream/frama-c/frama-c-e-acsl-issues.md`](../../docs/upstream/frama-c/frama-c-e-acsl-issues.md) and the work-items CSV beside it, draft the report following [Frama-C Guidelines for reporting bugs](https://git.frama-c.com/pub/frama-c/-/wikis/Guidelines-for-reporting-bugs) and [`../../docs/upstream/frama-c/filing/README.md`](../../docs/upstream/frama-c/filing/README.md), validate any `filing/` issue text with `python tools/upstream_audit/file_upstream.py check`, and add it to [`../../docs/upstream/frama-c/README.md`](../../docs/upstream/frama-c/README.md). Never file upstream.
 
 ## Stop or escalate
 

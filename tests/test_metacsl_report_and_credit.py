@@ -430,7 +430,9 @@ def test_the_real_generator_warnings_land_under_the_right_heading():
     """The texts above are copies: this one goes through security_props.generate."""
     model = _init_model()
     lists = {"assets": [{"name": "ghost", "lvalue": "nowhere", "writers": [], "description": "d"}]}
-    doc = sp.generate(model, threat(**lists, call_rules=[{"function": "missing", "predicate": "1", "description": "d"}]))
+    doc = sp.generate(
+        model, threat(**lists, call_rules=[{"function": "missing", "predicate": "1", "description": "d"}])
+    )
     lines = gr.security_props_lines(doc)
     items = section(lines, HEAD_ITEMS)
     assert any(line.startswith("- asset ghost:") for line in items), doc["warnings"]
@@ -486,7 +488,9 @@ def test_long_lists_are_capped():
     sites = [{"function": f"prog.c#f{i}", "reason": "r"} for i in range(35)]
     many = [{"callee": "fill", "callers": [f"prog.c#f{i}" for i in range(12)]}]
     props = [{"name": NK_CALL, "unchecked": sites, "declared_callees": {"no_assigns": many}}]
-    lines = gr.security_props_lines({"warnings": [f"asset a{i}: not generated" for i in range(33)], "properties": props})
+    lines = gr.security_props_lines(
+        {"warnings": [f"asset a{i}: not generated" for i in range(33)], "properties": props}
+    )
     found = section(lines, HEAD_UNCHECKED)
     assert len(found) == 31 and found[-1].startswith("- ... and 5 more")
     items = section(lines, HEAD_ITEMS)
@@ -625,7 +629,9 @@ def _synthetic_doc() -> dict:
         {"class": "l4_call_rule", "property": NK_INVARIANT, "reason": "r"},
         {"class": "l5_sanitized", "property": NK_SANITIZED, "reason": "r"},
     ]
-    doc["code_checks"] = [{"file": "prog.c", "line": 30, "function": "prog.c#store", "property": NK_WRITERS, "index": 0}]
+    doc["code_checks"] = [
+        {"file": "prog.c", "line": 30, "function": "prog.c#store", "property": NK_WRITERS, "index": 0}
+    ]
     doc["warnings"] = [
         REFUSED["asset"],
         KEPT_PROPERTY[0].replace("L3_readers_cfg", NK_READERS),

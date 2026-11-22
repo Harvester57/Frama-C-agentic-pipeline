@@ -966,7 +966,11 @@ def test_no_harm_that_cannot_run_withholds_nothing_and_says_so(tmp_path: Path) -
 
 @pytest.mark.unit
 def test_kernel_error_line_rejects_prefix_overlapping_filename() -> None:
-    result = {"syntax_check": {"errors": ["[kernel] not_sum.c:9: User Error: boom", "prefix_sum.c:10: error", "other-sum.c:12: error"]}}
+    result = {
+        "syntax_check": {
+            "errors": ["[kernel] not_sum.c:9: User Error: boom", "prefix_sum.c:10: error", "other-sum.c:12: error"]
+        }
+    }
     assert ls._kernel_error_line(result, "sum.c") is None
     result_match = {"syntax_check": {"errors": ["[kernel] sum.c:9: User Error: boom"]}}
     assert ls._kernel_error_line(result_match, "sum.c") == 9
@@ -980,4 +984,3 @@ def test_kernel_error_line_rejects_prefix_overlapping_filename() -> None:
     assert ls._kernel_error_line(result_ws, "sum.c") == 9
     result_dir_overlap = {"syntax_check": {"errors": ["[kernel] dir/not_sum.c:9: error", "dir/prefix_sum.c:10: error"]}}
     assert ls._kernel_error_line(result_dir_overlap, "sum.c") is None
-

@@ -8,6 +8,7 @@ length is zero-terminated.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -267,6 +268,19 @@ def test_generated_case_with_stub_and_terminator_runs_clean_under_asan(tmp_path)
         for n in ("good", "null", "unterm")
     )
     if clang:
+        run_env = os.environ.copy()
+        if os.name == "nt":
+            # Windows Clang ASan binaries link dynamically against clang_rt.asan_dynamic-*.dll.
+            rt_dirs = [str(Path(clang).resolve().parent)]
+            for flag in ("-print-runtime-dir", "-print-resource-dir"):
+                probe = subprocess.run([clang, flag], capture_output=True, text=True, check=False)
+                if probe.returncode == 0 and probe.stdout.strip():
+                    base = Path(probe.stdout.strip())
+                    rt_dirs.append(str(base))
+                    win_lib = base / "lib" / "windows"
+                    if win_lib.is_dir():
+                        rt_dirs.append(str(win_lib))
+            run_env["PATH"] = os.pathsep.join(rt_dirs) + os.pathsep + run_env.get("PATH", "")
         out = []
         for n in ("good", "null", "unterm"):
             exe = tmp_path / f"{n}.exe"
@@ -276,7 +290,7 @@ def test_generated_case_with_stub_and_terminator_runs_clean_under_asan(tmp_path)
                 capture_output=True, text=True, check=False,
             )  # fmt: skip
             assert cc.returncode == 0, cc.stderr
-            out.append(f"{n}={subprocess.run([str(exe)], capture_output=True, check=False).returncode}")
+            out.append(f"{n}={subprocess.run([str(exe)], env=run_env, capture_output=True, check=False).returncode}")
         stdout = "\n".join(out)
     else:
         proc = _docker(tmp_path, script)

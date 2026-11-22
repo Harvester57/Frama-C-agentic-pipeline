@@ -1,6 +1,34 @@
 # Frama-C filing texts
 
 - **Parent index, coverage table and filing order:** [`../README.md`](../README.md)
+- **Dedicated reporting & filing skill:** [`../../../../skills/upstream-bug-report/SKILL.md`](../../../../skills/upstream-bug-report/SKILL.md) (`/upstream-bug-report`)
+- **Upstream reporting guidelines:** [Guidelines for reporting bugs](https://git.frama-c.com/pub/frama-c/-/wikis/Guidelines-for-reporting-bugs)
+- **Automated validator & filer:** [`../../../../tools/upstream_audit/file_upstream.py`](../../../../tools/upstream_audit/file_upstream.py)
+
+Invoke `/upstream-bug-report` whenever drafting, auditing, updating, or filing any text in this folder.
+
+## Mandatory reporting guidelines & enforcement
+
+Every `NN-<slug>-issue.md` (other than the `00` overview discussion) must follow upstream's [Guidelines for reporting bugs](https://git.frama-c.com/pub/frama-c/-/wikis/Guidelines-for-reporting-bugs) and `bug_report.md` template:
+
+- **English only**, LF line endings, balanced Markdown code fences, title <= 255 characters, and a single `<!-- Everything below this line... -->` description marker.
+- **Category:** start the H1 title with a bracketed component tag (`[E-ACSL]`, `[e-acsl-gcc]`, `[Kernel]`, `[Libc]`, `[WP]`, `[Eva]`, `[RTE]`, `[Installation]`, `[GUI]`, `[Documentation]`) on `pub/frama-c`, and populate `Plug-in used:` in `### Contextual information` (note `kernel (Frama-C libc)` for libc issues). On `pub/meta`, omit the title tag and put `Tracker: pub/meta (MetAcsl), not pub/frama-c.` in the HTML marker.
+- **Self-contained minimal reproducer (`### Steps to reproduce the issue`):** inline every minimal input file and exact command line; inline file line numbers must match every `file.c:N:` diagnostic quoted in `### Actual behaviour`. Never link into this repository (`](../`, `](./`) or refer to an unattached file. When using `-no-frama-c-stdlib` or `e-acsl-gcc` with non-freestanding host headers, state the host libc/compiler version (or provide a preprocessed `.i` file).
+- **Obtained and expected behavior:** separate `### Expected behaviour` and `### Actual behaviour` sections with verbatim output and exit status. Place `Cause`, `Fix`, and workarounds under `### Additional information (optional)`.
+- **Crashes, backtraces, and journals:** on any Frama-C OCaml crash (`Unexpected error`, `aborted: internal error`, `Please report as 'crash'`), include the verbatim backtrace (`-debug 1` / `OCAMLRUNPARAM=b`, collapsed in `<details>` if long) rather than stripping it. Record a `-journal-enable` journal (`frama_c_journal.ml`) when reproduction is stateful or GUI-driven.
+- **Contextual information (`### Contextual information`):** include `Frama-C installation mode`, `Frama-C version`, `Plug-in used`, `OS name`, and `OS version`.
+
+Validate every draft before handoff or filing:
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"
+python tools/upstream_audit/file_upstream.py check            # validate all issue drafts
+python tools/upstream_audit/file_upstream.py check NN         # validate one package
+```
+
+`file_upstream.py show`, `issue`, and `mr` also run this check automatically and refuse to post any non-compliant draft or any `Tracker: pub/meta` text onto `pub/frama-c`. Note that the unfiled rough draft [`./46-libc-sched-cpu-set-issue.md`](./46-libc-sched-cpu-set-issue.md) predates this gate and must be rewritten to pass `file_upstream.py check 46` before filing.
+
+---
 
 Paste-ready texts for [`pub/frama-c`](https://git.frama-c.com/pub/frama-c):
 

@@ -851,14 +851,7 @@ def test_annotation_joins_an_existing_loop_annotation_as_its_first_clause():
 
 @pytest.mark.unit
 def test_annotation_joins_multiline_loop_annotation_with_leading_at() -> None:
-    source = (
-        "void f(int n) {\n"
-        "  /*@\n"
-        "    @ loop invariant 0 <= i;\n"
-        "    @*/\n"
-        "  for (int i = 0; i < n; i++) {}\n"
-        "}\n"
-    )
+    source = "void f(int n) {\n  /*@\n    @ loop invariant 0 <= i;\n    @*/\n  for (int i = 0; i < n; i++) {}\n}\n"
     refs = [LoopRef("a.c", "f", 0, 8)]
     text, applied, dropped = eva_loops.annotate_source(source, refs)
     assert applied == refs and dropped == []
@@ -869,15 +862,7 @@ def test_annotation_joins_multiline_loop_annotation_with_leading_at() -> None:
 
 @pytest.mark.unit
 def test_find_loops_sees_multiline_unroll_annotation() -> None:
-    source = (
-        "void f(int n) {\n"
-        "  /*@\n"
-        "    @ loop\n"
-        "    @ unroll 8;\n"
-        "    @*/\n"
-        "  for (int i = 0; i < n; i++) {}\n"
-        "}\n"
-    )
+    source = "void f(int n) {\n  /*@\n    @ loop\n    @ unroll 8;\n    @*/\n  for (int i = 0; i < n; i++) {}\n}\n"
     # If the loop already has an unroll annotation, annotate_source must drop it and keep the decision
     refs = [LoopRef("a.c", "f", 0, 16)]
     _, applied, dropped = eva_loops.annotate_source(source, refs)

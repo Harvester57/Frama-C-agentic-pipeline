@@ -1025,7 +1025,9 @@ def test_libc_gap_names_are_declared_for_eva_and_wp_after_the_renaming_blocks():
     assert order == sorted(order)
     assert fc_libc.count("#include <netdb.h>") == 1
     # The netinet/tcp block includes <netinet/in.h> again, so it still parses with FC_STUBS_NO_NETDB_DECLS.
-    netdb_block = fc_libc.split("#ifndef FC_STUBS_NO_NETDB_DECLS", 1)[1].split("#endif /* FC_STUBS_NO_NETDB_DECLS */", 1)[0]
+    netdb_block = fc_libc.split("#ifndef FC_STUBS_NO_NETDB_DECLS", 1)[1].split(
+        "#endif /* FC_STUBS_NO_NETDB_DECLS */", 1
+    )[0]
     assert netdb_block.count("#include <netinet/in.h>") == 1
     # E-ACSL builds take all of them from glibc.
     eacsl_branch = text.split("#if defined(__FRAMAC_EACSL__)", 1)[1].split("#else /* Frama-C __fc_libc */", 1)[0]

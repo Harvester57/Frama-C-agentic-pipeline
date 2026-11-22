@@ -214,7 +214,12 @@ if [[ ${NEW_RUN} -eq 1 ]]; then
     BASE="${HOME}/framac-pipeline/${REPO}"
     mkdir -p "${BASE}"
     # new-run allocation: start after the highest run-<N>, claim it with a mkdir that fails when the
-    # directory exists (no -p), and on a lost race try the next number.
+    # directory exists (no -p), and on a lost race try the next number. Serialize with flock when
+    # available so non-GNU mkdir implementations (e.g. uutils on Ubuntu 26.04) cannot race on EEXIST.
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${BASE}/.new-run.lock"
+        flock 9
+    fi
     MAX=0
     for d in "${BASE}"/run-*; do
         [[ -d "$d" ]] || continue
@@ -234,6 +239,9 @@ if [[ ${NEW_RUN} -eq 1 ]]; then
         N=$((N + 1))
     done
     RUN_DIR="${BASE}/run-${N}"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>&-
+    fi
     # end new-run allocation
 fi
 [[ -z "${RUN_DIR}" ]] && { echo "[framac-docker] specify --run-dir DIR or --new-run" >&2; exit 2; }

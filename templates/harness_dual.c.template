@@ -3,6 +3,10 @@
  * Generated/Customized by /framac-slice for Module: {{MODULE_NAME}}
  */
 
+#if defined(_WIN32) && !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS 1
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -49,6 +53,9 @@ typedef uint64_t __uint64_t;
 /* runtime dispatch case skip */
 #define FRAMAC_FUZZ_RUNTIME_SKIP_CASES 1
 #define framac_fuzz_skip_case framac_fuzz_skip_case
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(__FRAMAC__)
+__attribute__((unused))
+#endif
 static inline int framac_fuzz_skip_case(unsigned int c) {
     static unsigned long long framac_fuzz_rt_skip_words[64];
     static int framac_fuzz_rt_skip_init = 0;

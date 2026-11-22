@@ -129,7 +129,10 @@ def test_the_prefixed_spellings_of_an_interceptor_name_the_same_call(frame, tmp_
     ("helpers", "call"),
     [
         (["StrstrCheck(void*, char*, char const*, char const*) asan_interceptors.cpp.o", f"strstr {_BARE}"], "strstr"),
-        (["StrtolFixAndCheck(void*, char const*, char**, char*, int) asan_interceptors.cpp.o", f"strtol {_BARE}"], "strtol"),
+        (
+            ["StrtolFixAndCheck(void*, char const*, char**, char*, int) asan_interceptors.cpp.o", f"strtol {_BARE}"],
+            "strtol",
+        ),
         (
             [
                 "printf_common(void*, char const*, __va_list_tag*) asan_interceptors.cpp.o",

@@ -100,7 +100,9 @@ def test_declared_lines_are_recorded_and_the_proof_stands(monkeypatch, source) -
     assert res["status"] == "all_proven" and res["unproven_count"] == 0
     wraps = res["unsigned_wraps"]
     assert wraps["status"] == "ok" and wraps["undeclared"] == []
-    assert wraps["declared"] == [{"line": 2, "code_line": 1, "annotations": ["p2"], "properties": ["unsigned_overflow"]}]
+    assert wraps["declared"] == [
+        {"line": 2, "code_line": 1, "annotations": ["p2"], "properties": ["unsigned_overflow"]}
+    ]
     assert wraps["declared_code_lines"] == [1]
     assert any("declared deliberate wraps at L2" in item for item in res["soundness"]["reduced_checks"])
     assert any("OFF" in item for item in res["soundness"]["reduced_checks"]), "the parent still infers the flag"
@@ -327,7 +329,9 @@ def test_main_waives_signed_downcasts_on_declared_lines(monkeypatch, tmp_path: P
         ("--waive-signed-downcast", "--wrap-lines", "2"),
     ],
 )
-def test_main_rejects_the_waiver_without_the_opt_out_and_declared_lines(monkeypatch, tmp_path: Path, capsys, extra) -> None:
+def test_main_rejects_the_waiver_without_the_opt_out_and_declared_lines(
+    monkeypatch, tmp_path: Path, capsys, extra
+) -> None:
     with pytest.raises(SystemExit):
         _main(monkeypatch, tmp_path, *extra)
     assert "--waive-signed-downcast" in capsys.readouterr().err

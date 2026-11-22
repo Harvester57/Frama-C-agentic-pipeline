@@ -24,7 +24,6 @@ from test_pipeline_make import REPO, _make_run
 pytestmark = pytest.mark.unit
 
 
-
 # ---------------------------------------------------------------------------
 # 1. Skip a ladder no rung can finish
 # ---------------------------------------------------------------------------

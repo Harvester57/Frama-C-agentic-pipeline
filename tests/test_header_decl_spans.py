@@ -113,7 +113,9 @@ def test_an_edit_outside_every_declaration_is_refused(agent_edit) -> None:
 
 def test_an_added_top_level_declaration_keeps_its_own_message() -> None:
     agent = on_def(UB_H).replace(DEF_C, "/*@ predicate ok(UB *p) = \\valid(p); */\n\n" + DEF_C)
-    with pytest.raises(ScopeViolationError, match=r"added top-level ACSL declaration\(s\) outside 'Reset': predicate ok;"):
+    with pytest.raises(
+        ScopeViolationError, match=r"added top-level ACSL declaration\(s\) outside 'Reset': predicate ok;"
+    ):
         splice(UB_H, agent, UB_H)
 
 

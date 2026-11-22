@@ -435,20 +435,24 @@ static size_t fc_copy(unsigned char *dst, const void *p, size_t n) {
     return done;
 }
 
-/* `tok` is a local of the calling wrapper. Only an outermost call is recorded; when the frame stack
-   is full the call is not tracked and counts as nested. */
+/* `tok` is a 2-word local array of the calling wrapper (`tok[0] = v`, `tok[1] = ~v` with a salted
+   sequence number so neither a spilled scalar like 1 from `longjmp(env, 1)` nor an 8-byte stack
+   alignment gap can preserve a dead wrapper's token). Only an outermost call is recorded; when the
+   frame stack is full the call is not tracked and counts as nested. */
 int fc_enter(int fn, volatile unsigned long *tok) {
     int live = 0;
     for (int i = 0; i < fc_nframes; i++) {
         struct fc_frame e = fc_frames[i];
-        if ((uintptr_t)e.at > (uintptr_t)tok && *e.at == e.val) fc_frames[live++] = e;
+        if ((uintptr_t)e.at > (uintptr_t)tok && e.at[0] == e.val && e.at[1] == ~e.val) fc_frames[live++] = e;
     }
     fc_nframes = live;
     int outer = fc_nframes == 0;
-    *tok = ++fc_seq;
+    unsigned long v = (unsigned long)0x5a3c9e17UL ^ (++fc_seq);
+    tok[0] = v;
+    tok[1] = ~v;
     if (fc_nframes < FC_STACK) {
         fc_frames[fc_nframes].at = tok;
-        fc_frames[fc_nframes].val = fc_seq;
+        fc_frames[fc_nframes].val = v;
         fc_nframes++;
     }
     if (!outer || fn < 0 || fn >= FC_FUNCS || fc_total >= FC_TOTAL) return 0;
@@ -459,7 +463,8 @@ int fc_enter(int fn, volatile unsigned long *tok) {
 
 void fc_leave(volatile unsigned long *tok) {
     if (fc_nframes > 0 && fc_frames[fc_nframes - 1].at == tok) fc_nframes--;
-    *tok = 0;
+    tok[0] = 0;
+    tok[1] = 0;
 }
 
 void fc_begin(const char *name) {
@@ -605,14 +610,14 @@ def wrapper_source(plans: list[dict[str, Any]], headers: list[str]) -> str:
         rec += [f"fc_addr({i}, a{i});" for i, p in enumerate(params) if p["kind"] == "ptr"]
         lines.append(f"extern {ret['ctype']} __real_{name}({decl});")
         lines.append(f"{ret['ctype']} __wrap_{name}({decl}) {{")
-        lines.append("    volatile unsigned long fc_tok;")
-        lines.append(f'    if (fc_enter({k}, &fc_tok)) {{ fc_begin("{name}"); {" ".join(rec)} fc_end(); }}')
+        lines.append("    volatile unsigned long fc_tok[2];")
+        lines.append(f'    if (fc_enter({k}, fc_tok)) {{ fc_begin("{name}"); {" ".join(rec)} fc_end(); }}')
         if ret["kind"] == "void":
             lines.append(f"    __real_{name}({call});")
-            lines.append("    fc_leave(&fc_tok);")
+            lines.append("    fc_leave(fc_tok);")
         else:
             lines.append(f"    {ret['ctype']} r = __real_{name}({call});")
-            lines.append("    fc_leave(&fc_tok);")
+            lines.append("    fc_leave(fc_tok);")
             lines.append("    return r;")
         lines.append("}")
     return "\n".join(lines) + "\n"

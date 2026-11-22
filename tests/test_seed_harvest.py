@@ -92,8 +92,8 @@ def test_wrapper_source_records_outermost_calls():
     assert "extern int __real_kv(unsigned int a0, void * a1, unsigned long a2);" in src
     assert "fc_mem(1, 'b', a1, (size_t)a2);" in src
     assert "fc_struct(1, &a1, sizeof a1);" in src
-    assert "if (fc_enter(1, &fc_tok))" in src
-    assert "__real_init(a0, a1);\n    fc_leave(&fc_tok);" in src
+    assert "if (fc_enter(1, fc_tok))" in src
+    assert "__real_init(a0, a1);\n    fc_leave(fc_tok);" in src
     rt = sh.runtime_source(2)
     assert "FC_OUT_DIR" in rt and "__real_" not in rt
 
@@ -510,7 +510,9 @@ def test_record_wraps_api_functions_the_executable_calls_from_a_shared_library(t
 
 
 def test_undefined_functions_reads_the_dynamic_symbol_table(monkeypatch):
-    out = "                 w __gmon_start__\n                 U modbus_receive\n                 U printf@GLIBC_2.2.5\n"
+    out = (
+        "                 w __gmon_start__\n                 U modbus_receive\n                 U printf@GLIBC_2.2.5\n"
+    )
     seen: list[list[str]] = []
 
     def run(argv, cwd, timeout):

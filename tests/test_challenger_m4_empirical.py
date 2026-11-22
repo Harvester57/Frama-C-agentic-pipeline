@@ -349,8 +349,7 @@ class TestA4ErrorLocationParsing:
                 "parse_hdr",
             ),
             (
-                "Assertion failed at line 10 in file src/parser.y.\n"
-                "The failing predicate is:\nx == 0.\n",
+                "Assertion failed at line 10 in file src/parser.y.\nThe failing predicate is:\nx == 0.\n",
                 "src/parser.y",
                 10,
                 "unknown_function",
@@ -436,10 +435,7 @@ class TestA5StackFrameAttribution:
         assert res["line"] == 0
 
     def test_stack_frame_with_hex_address_only(self):
-        log = (
-            "==1==ERROR: AddressSanitizer: SEGV on unknown address 0x0\n"
-            "    #0 0x7fff1234abcd in compute_hash\n"
-        )
+        log = "==1==ERROR: AddressSanitizer: SEGV on unknown address 0x0\n    #0 0x7fff1234abcd in compute_hash\n"
         res = rf.parse_sanitizer_failure(log)
         assert res is not None
         assert res["function"] == "compute_hash"
@@ -565,7 +561,9 @@ class TestD2AccessSizeNormalization:
         assert res1 is not None and res_base is not None
         assert res1["predicate"] == "rte: mem_access: AddressSanitizer: heap-buffer-overflow (READ)"
         fp1 = make_fingerprint(res1["file"], res1["function"], res1["alarm_kind"], res1["predicate"])
-        fp_base = make_fingerprint(res_base["file"], res_base["function"], res_base["alarm_kind"], res_base["predicate"])
+        fp_base = make_fingerprint(
+            res_base["file"], res_base["function"], res_base["alarm_kind"], res_base["predicate"]
+        )
         assert fp1 == fp_base
 
     @pytest.mark.parametrize("size", [1, 2, 4, 8, 16, 32, 64])
@@ -585,7 +583,9 @@ class TestD2AccessSizeNormalization:
         assert res1 is not None and res_base is not None
         assert res1["predicate"] == "rte: mem_access: AddressSanitizer: heap-buffer-overflow (WRITE)"
         fp1 = make_fingerprint(res1["file"], res1["function"], res1["alarm_kind"], res1["predicate"])
-        fp_base = make_fingerprint(res_base["file"], res_base["function"], res_base["alarm_kind"], res_base["predicate"])
+        fp_base = make_fingerprint(
+            res_base["file"], res_base["function"], res_base["alarm_kind"], res_base["predicate"]
+        )
         assert fp1 == fp_base
 
     def test_read_and_write_fingerprints_differ(self):
@@ -620,7 +620,7 @@ class TestD3LldLinkerDiagnostics:
             "ld.lld: error: undefined symbol: custom_init\n"
             ">>> referenced by init.c:12\n"
             "ld.lld: error: undefined symbol: 'single_quoted'\n"
-            "ld.lld: error: undefined symbol: \"double_quoted\"\n"
+            'ld.lld: error: undefined symbol: "double_quoted"\n'
             "ld.lld: error: undefined symbol:   extra_spaces\n"
             "ld.lld: error: undefined symbol:\ttabs_before\n"
             "ld.lld: error: undefined symbol: _my_func\n"
@@ -630,7 +630,7 @@ class TestD3LldLinkerDiagnostics:
             "/usr/bin/ld: foo.o: in function 'main':\n"
             "foo.c:(.text+0x10): undefined reference to 'gnu_ld_sym'\n"
             "foo.c:(.text+0x20): undefined reference to `backtick_sym'\n"
-            "foo.c:(.text+0x30): undefined reference to \"double_ld_sym\"\n"
+            'foo.c:(.text+0x30): undefined reference to "double_ld_sym"\n'
             "ld.lld: error: undefined symbol: custom_init\n"
         )
         refs = rf.parse_undefined_references(log)
@@ -719,13 +719,7 @@ class TestD5StoreBlockSuffixVariations:
         ["0UL", "100ULL", "20U", "30L", "40", "0u", "100ull", "20u", "30l", "0Lu", "0uL", "0LLU"],
     )
     def test_mark_formals_and_readonly_support_all_suffixes(self, suffix):
-        src = (
-            "int f_struct(int k)\n"
-            "{\n"
-            f"  __e_acsl_store_block((void *)(& k),{suffix});\n"
-            "  return k + 1;\n"
-            "}\n"
-        )
+        src = f"int f_struct(int k)\n{{\n  __e_acsl_store_block((void *)(& k),{suffix});\n  return k + 1;\n}}\n"
         patched, n = et.mark_formals_initialized(src)
         assert n == 1
         assert "__e_acsl_full_init((void *)(& k));" in patched
@@ -740,12 +734,7 @@ class TestD5StoreBlockSuffixVariations:
         assert "__e_acsl_mark_readonly((void *)(& kGlobal));" in patched_ro
 
     def test_store_block_unmatched_syntax_triggers_warning(self):
-        bad_src = (
-            "int f(int k) {\n"
-            "  __e_acsl_store_block((void *)(& k), 40xyz);\n"
-            "  return k;\n"
-            "}\n"
-        )
+        bad_src = "int f(int k) {\n  __e_acsl_store_block((void *)(& k), 40xyz);\n  return k;\n}\n"
         with pytest.warns(UserWarning, match="__e_acsl_store_block lines exist in text but none matched"):
             patched_bad, n_bad = et.mark_formals_initialized(bad_src)
         assert n_bad == 0
@@ -820,4 +809,3 @@ class TestD6ApiLifecycleNames:
     def test_dtor_name_boundaries(self, name, is_dtor):
         match = bool(ah._DTOR_NAME_RE.search(name))
         assert match is is_dtor, f"Dtor name match mismatch for {name}: {match} != {is_dtor}"
-

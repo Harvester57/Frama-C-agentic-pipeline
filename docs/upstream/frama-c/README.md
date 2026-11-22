@@ -2,14 +2,19 @@
 
 - **Upstream Directory Index:** [`../README.md`](../README.md)
 - **Master Issue Catalog & Validation History:** [`./frama-c-e-acsl-issues.md`](./frama-c-e-acsl-issues.md)
+- **Dedicated Reporting & Filing Skill:** [`../../../skills/upstream-bug-report/SKILL.md`](../../../skills/upstream-bug-report/SKILL.md) (`/upstream-bug-report`)
+- **Upstream Guidelines:** [Frama-C Guidelines for reporting bugs](https://git.frama-c.com/pub/frama-c/-/wikis/Guidelines-for-reporting-bugs) (enforced by `python tools/upstream_audit/file_upstream.py check`)
 
 This folder holds everything needed to report the Frama-C bugs the pipeline found to
-[`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues): one long analysis draft per bug, and a
+[`pub/frama-c`](https://git.frama-c.com/pub/frama-c/-/issues) (and MetAcsl bugs to
+[`pub/meta`](https://git.frama-c.com/pub/meta/-/issues)): one long analysis draft per bug, and a
 **filing package** per bug:
 
-- [`./filing/`](./filing/README.md): paste-ready GitLab issue and merge-request texts;
+- [`./filing/`](./filing/README.md): paste-ready GitLab issue and merge-request texts (validated against upstream's guidelines by [`../../../tools/upstream_audit/file_upstream.py`](../../../tools/upstream_audit/file_upstream.py) `check`);
 - [`./repro/`](./repro/README.md): standalone reproducers;
 - [`./patches/`](./patches/README.md): `git format-patch` files.
+
+Invoke `/upstream-bug-report` whenever drafting, reviewing, validating, or filing an upstream Frama-C or MetAcsl bug report.
 
 The snapshot `./pub-frama-c_work_items_2026-11-09.csv` lists the 202 upstream items that were open
 on 2026-11-09. It predates Issues 15 to 40, so do not rely on it alone for deduplication.

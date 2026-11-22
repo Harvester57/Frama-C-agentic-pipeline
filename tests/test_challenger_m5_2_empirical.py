@@ -20,12 +20,10 @@ from run_wp_function import classify_unproven_goal
 # 1. Roman Numeral Generator for 1..99
 # ============================================================================
 
+
 def _to_roman(n: int) -> str:
     """Convert integer 1..99 to lowercase Roman numeral."""
-    val = [
-        (90, "xc"), (50, "l"), (40, "xl"), (10, "x"),
-        (9, "ix"), (5, "v"), (4, "iv"), (1, "i")
-    ]
+    val = [(90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]
     roman = ""
     for v, sym in val:
         while n >= v:
@@ -37,6 +35,7 @@ def _to_roman(n: int) -> str:
 # ============================================================================
 # 2. Stress Tests for Roman Numeral Page Footers (_PAGE_NUMBER_RE)
 # ============================================================================
+
 
 class TestRomanNumeralFooters:
     """Adversarial stress testing for _PAGE_NUMBER_RE and clean_page footer dropping."""
@@ -143,22 +142,23 @@ class TestRomanNumeralFooters:
 # 3. Stress Tests for eva_options.py (entry.partition(":"))
 # ============================================================================
 
+
 class TestEvaOptionsPartition:
     """Stress testing option_problem for func_value options."""
 
     @pytest.mark.parametrize(
         "entry",
         [
-            ":foo",       # empty head
-            "foo:",       # empty tail
-            "::",         # empty head and tail
-            "",           # empty string
-            "   ",        # whitespace only
-            " :foo",      # whitespace head
-            "foo :bar",   # trailing whitespace in head
-            " foo:bar",   # leading whitespace in head
-            "123foo:bar", # invalid C identifier in head
-            "-bad:bar",   # dash in C identifier head
+            ":foo",  # empty head
+            "foo:",  # empty tail
+            "::",  # empty head and tail
+            "",  # empty string
+            "   ",  # whitespace only
+            " :foo",  # whitespace head
+            "foo :bar",  # trailing whitespace in head
+            " foo:bar",  # leading whitespace in head
+            "123foo:bar",  # invalid C identifier in head
+            "-bad:bar",  # dash in C identifier head
             "foo\n:bar",  # newline in head
         ],
     )
@@ -172,7 +172,7 @@ class TestEvaOptionsPartition:
             "f:100",
             "my_func:200",
             "_init:0",
-            "f:bar:baz",     # partition splits at first colon: head='f', tail='bar:baz'
+            "f:bar:baz",  # partition splits at first colon: head='f', tail='bar:baz'
             "func_name:1000",
         ],
     )
@@ -221,6 +221,7 @@ class TestEvaOptionsPartition:
 # 4. Stress Tests for frame_skeleton.py (inner.strip() == root)
 # ============================================================================
 
+
 class TestFrameSkeletonRootCheck:
     """Stress testing _offset_expr for pointer dereferences and root matching."""
 
@@ -259,19 +260,33 @@ class TestFrameSkeletonRootCheck:
         """Verify inner.strip() == root matches re.fullmatch(re.escape(root), inner.strip())."""
         roots = ["p", "ptr", "my_var", "arr_1", "buf"]
         candidates = [
-            "p", "  p  ", "p ", " p", "ptr", "my_var", "arr_1", "buf",
-            "p + 1", "p[0]", "p_extra", "prefix_p", "p2", "", "   "
+            "p",
+            "  p  ",
+            "p ",
+            " p",
+            "ptr",
+            "my_var",
+            "arr_1",
+            "buf",
+            "p + 1",
+            "p[0]",
+            "p_extra",
+            "prefix_p",
+            "p2",
+            "",
+            "   ",
         ]
         for r in roots:
             for c in candidates:
                 old_behavior = bool(re.fullmatch(rf"{re.escape(r)}", c.strip()))
-                new_behavior = (c.strip() == r)
+                new_behavior = c.strip() == r
                 assert old_behavior == new_behavior, f"Discrepancy for root={r!r}, candidate={c!r}"
 
 
 # ============================================================================
 # 5. Stress Tests for prover_candidates.py (.lower().endswith(...))
 # ============================================================================
+
 
 class TestProverCandidatesEndswith:
     """Stress testing prover_candidates invalid goal detection via endswith."""
@@ -293,7 +308,7 @@ class TestProverCandidatesEndswith:
             ("loop_invariant_established_extra", False),
             ("loop_invariant_preserved_tail", False),
             ("established", False),  # missing leading underscore
-            ("preserved", False),    # missing leading underscore
+            ("preserved", False),  # missing leading underscore
             ("loop_invariant_establish", False),
             ("loop_invariant_preserve", False),
             ("", False),
@@ -303,11 +318,7 @@ class TestProverCandidatesEndswith:
         ],
     )
     def test_annotation_suffix_matching(self, annot: str, expected_invalid: bool):
-        report = {
-            "unproven_goals": [
-                {"annotation": annot, "kind": "Invariant"}
-            ]
-        }
+        report = {"unproven_goals": [{"annotation": annot, "kind": "Invariant"}]}
         res = _oracle_summary("test_oracle", report)
         invalid_count = res.get("invalid", 0)
         assert (invalid_count == 1) == expected_invalid, (
@@ -333,6 +344,7 @@ class TestProverCandidatesEndswith:
 # ============================================================================
 # 6. Stress Tests for run_wp_function.py (Assigns Buckets)
 # ============================================================================
+
 
 class TestRunWpAssignsBuckets:
     """Stress testing unproven goal bucket classification for assigns clauses."""
@@ -366,6 +378,7 @@ class TestRunWpAssignsBuckets:
 # ============================================================================
 # 7. Stress Tests for resources.py (Cache Allowlist Validation)
 # ============================================================================
+
 
 class TestResourcesCacheAllowlist:
     """Stress testing cache_mount_mode allowlist check without _PLAIN_COMMAND."""

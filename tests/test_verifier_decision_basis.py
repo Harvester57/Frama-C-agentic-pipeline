@@ -224,7 +224,9 @@ def test_ingest_refuses_a_bad_controlled_by(run_dir):
     rec["linked_units"] = [TAG_RTE]
     rec["decision_point"] = decision_point(controlled_by="nobody")
     # The refusal names the field: the generic prefix alone would pass on any other invalid part of the result.
-    with pytest.raises(ledger.LedgerError, match=r"(?s)invalid crash_verifier result:.*\.decision_point\.controlled_by: "):
+    with pytest.raises(
+        ledger.LedgerError, match=r"(?s)invalid crash_verifier result:.*\.decision_point\.controlled_by: "
+    ):
         ledger.cmd_ingest_verifier(_result(run_dir, rec, "needs_validation"))
     assert not (run_dir / "findings.json").exists() or json.loads((run_dir / "findings.json").read_text()) == []
 

@@ -26,7 +26,11 @@ _CAST_WARNINGS = (
 )
 _MEMCPY_UNKNOWN = [
     ("assigns clause", "Unknown", "assigns \\nothing;"),
-    ("precondition of memcpy", "Unknown", "separation: \\separated((char *)dest + (0 .. n - 1), (char *)src + (0 .. n - 1))"),
+    (
+        "precondition of memcpy",
+        "Unknown",
+        "separation: \\separated((char *)dest + (0 .. n - 1), (char *)src + (0 .. n - 1))",
+    ),
     ("precondition of memcpy", "Unknown", "valid_dest: valid_or_empty(dest, n)"),
     ("precondition of memcpy", "Unknown", "valid_src: valid_read_or_empty(src, n)"),
 ]
@@ -153,7 +157,11 @@ def test_a_local_union_that_still_warns_under_bytes_is_not_credited(tmp_path, mo
 @pytest.mark.unit
 def test_a_bytes_run_that_is_not_better_is_dropped(tmp_path, monkeypatch) -> None:
     fake = _ByModel(
-        {"Typed": (_MEMCPY_UNKNOWN, _CAST_WARNINGS), "Typed+cast": (_MEMCPY_UNKNOWN, ""), "Bytes": (_MEMCPY_UNKNOWN, "")}
+        {
+            "Typed": (_MEMCPY_UNKNOWN, _CAST_WARNINGS),
+            "Typed+cast": (_MEMCPY_UNKNOWN, ""),
+            "Bytes": (_MEMCPY_UNKNOWN, ""),
+        }
     )
     res = _run(tmp_path, monkeypatch, fake)
     assert res["wp_model"] == "Typed" and res["unproven_count"] == 4
@@ -198,14 +206,14 @@ def test_no_retry_when_the_prover_budget_is_exhausted(tmp_path, monkeypatch) -> 
     (scratch / ".prover_budget.json").write_text('{"max_wp_invocations": 1, "wp_invocations": 1}', encoding="utf-8")
     fake = _ByModel({"Typed": (_ALL_VALID, _union_warning("Typed")), "Bytes": (_ALL_VALID, "")})
     monkeypatch.setattr(W.subprocess, "run", fake)
-    res = W.run_wp_on_function(
-        _c_file(scratch / "work"), "f", scratch / "wp", cache_dir="off", retry_bytes=True
-    )
+    res = W.run_wp_on_function(_c_file(scratch / "work"), "f", scratch / "wp", cache_dir="off", retry_bytes=True)
     assert res["budget_exhausted"] is True and fake.models == [] and "bytes_retry" not in res
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("extra,retried", [((), True), (("--wp-model", "Typed"), False), (("--no-retry-bytes",), False)])
+@pytest.mark.parametrize(
+    "extra,retried", [((), True), (("--wp-model", "Typed"), False), (("--no-retry-bytes",), False)]
+)
 def test_cli_retries_only_without_an_explicit_model(tmp_path, monkeypatch, extra, retried) -> None:
     fake = _ByModel({"Typed": (_ALL_VALID, _union_warning("Typed")), "Bytes": (_ALL_VALID, "")})
     monkeypatch.setattr(W.subprocess, "run", fake)
