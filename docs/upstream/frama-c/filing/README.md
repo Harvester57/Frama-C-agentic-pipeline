@@ -42,6 +42,10 @@ location, no instance and no warning for a call to a function without specificat
 `pub/meta` has no merge-request template, so their MR texts have no CONTRIBUTING/CLA checkboxes.
 49 cites 47 and 48 as `#ISSUE-47` and `#ISSUE-48`.
 
+50 (E-ACSL `--validate-format-strings` crashing with `Assertion failed` in `functions.ml:156` on
+`enum` arguments and `Options.fatal` on `enum *` pointers; drafted on 2026-11-22) is **not filed**
+either: its MR text holds `#<issue>` and keeps the CONTRIBUTING/CLA checkboxes unticked.
+
 Every other text of this folder is filed (01 to 27 on 2026-11-15, 28 to 42 on 2026-11-18), and
 their placeholders now hold the real numbers. For a new package, write `#<issue>` for its own issue and
 `#ISSUE-NN` for another package's, file the issues in an order that lets each text cite the ones it
