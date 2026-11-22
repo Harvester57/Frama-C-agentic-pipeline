@@ -783,40 +783,164 @@ def verifier_circuit_breaker_lines(candidates: list[dict] | None) -> list[str]:
     return out
 
 
-def fuzz_reach_lines(reports: list[dict]) -> list[str]:
+THREAT_MODEL_COVERAGE_THRESHOLD_PCT = 50.0
+_TM_GAP_SAMPLES_MAX = 3
+
+
+def _format_fn_samples(functions: list[str], total_count: int, max_show: int = _TM_GAP_SAMPLES_MAX) -> str:
+    shown = [f"`{md_escape(fn)}`" for fn in functions[:max_show]]
+    if not shown:
+        return "none"
+    rest = max(total_count, len(functions)) - len(shown)
+    suffix = f" (+{rest} more)" if rest > 0 else ""
+    return ", ".join(shown) + suffix
+
+
+def threat_model_coverage_lines(run_dir: Path | None = None, dynamic_doc: dict | None = None) -> list[str]:
+    """
+    W1-E: render a concise 'Threat-Model Coverage Gaps' summary from `harness_reach_dynamic.json`
+    whenever any module has non-empty `auto_exempt_by_reason` or any untrusted `.c` file with `< 50%`
+    region coverage. Returns `[]` when no module has either gap.
+    """
+    doc = dynamic_doc
+    if doc is None and run_dir is not None:
+        try:
+            doc = load_json_optional(Path(run_dir) / "workspace/reports/harness_reach_dynamic.json", None)
+        except (ArtifactError, OSError, ValueError):
+            return []
+    rows = doc.get("modules") if isinstance(doc, dict) else None
+    if not isinstance(rows, dict):
+        return []
+
+    mod_summaries: list[str] = []
+    low_file_rows: list[tuple[str, dict]] = []
+    auto_reason_rows: list[tuple[str, str, int, list[str]]] = []
+
+    for module, row in sorted(rows.items()):
+        tm = row.get("threat_model_coverage") if isinstance(row, dict) else None
+        if not isinstance(tm, dict):
+            continue
+        raw_auto = tm.get("auto_exempt_by_reason")
+        auto_entries: list[tuple[str, int, list[str]]] = []
+        if isinstance(raw_auto, dict):
+            for reason, info in raw_auto.items():
+                if not isinstance(info, dict):
+                    continue
+                cnt = int(info.get("count") or 0)
+                if cnt <= 0:
+                    continue
+                fns = [str(f) for f in info.get("functions") or [] if isinstance(f, str) and f]
+                auto_entries.append((str(reason), cnt, fns))
+            auto_entries.sort(key=lambda item: (-item[1], item[0]))
+
+        raw_files = tm.get("untrusted_files")
+        low_files: list[dict] = []
+        if isinstance(raw_files, list):
+            for frec in raw_files:
+                if not isinstance(frec, dict):
+                    continue
+                tot = int(frec.get("total") or 0)
+                pct = float(frec.get("pct") or 0.0)
+                if frec.get("below_threshold") is True or (tot > 0 and pct < THREAT_MODEL_COVERAGE_THRESHOLD_PCT):
+                    low_files.append(frec)
+            low_files.sort(key=lambda item: (float(item.get("pct") or 0.0), str(item.get("file") or "")))
+
+        if not auto_entries and not low_files:
+            continue
+
+        total_src = int(tm.get("input_sources_total") or 0)
+        exec_src = int(tm.get("executed") or 0)
+        unexec_src = int(tm.get("unexecuted_total") or 0)
+        if total_src > 0:
+            mod_summaries.append(
+                f"- `{md_escape(str(module))}`: {exec_src} / {total_src} threat-model input sources executed "
+                f"({unexec_src} unexecuted)."
+            )
+        for frec in low_files:
+            low_file_rows.append((str(module), frec))
+        for reason, cnt, fns in auto_entries:
+            auto_reason_rows.append((str(module), reason, cnt, fns))
+
+    if not low_file_rows and not auto_reason_rows:
+        return []
+
+    out = [
+        "### Threat-Model Coverage Gaps",
+        "",
+        "Untrusted surfaces that were auto-exempted from the reach gate or left below 50% region coverage "
+        "(a passing dynamic reach gate does not imply these surfaces were exercised):",
+        "",
+    ]
+    if mod_summaries:
+        out += [*mod_summaries, ""]
+    if low_file_rows:
+        out += [
+            "**Low-coverage untrusted source files (< 50% regions):**",
+            "",
+            "| Module | File | Regions covered | Coverage | Zero-exec functions |",
+            "| :--- | :--- | ---: | ---: | :--- |",
+        ]
+        for mod, frec in low_file_rows:
+            cov_n = int(frec.get("covered") or 0)
+            tot_n = int(frec.get("total") or 0)
+            pct = float(frec.get("pct") or 0.0)
+            z_fns = [str(f) for f in frec.get("zero_exec_functions") or [] if isinstance(f, str) and f]
+            z_cell = f"{len(z_fns)}: {_format_fn_samples(z_fns, len(z_fns))}" if z_fns else "0"
+            out.append(
+                f"| `{md_escape(mod)}` | `{md_escape(str(frec.get('file') or '?'))}` "
+                f"| {cov_n} / {tot_n} | {pct:.1f}% | {z_cell} |"
+            )
+        out.append("")
+    if auto_reason_rows:
+        out += [
+            "**Auto-exempt unexecuted functions by reason:**",
+            "",
+            "| Module | Exemption reason | Count | Sample functions |",
+            "| :--- | :--- | ---: | :--- |",
+        ]
+        for mod, reason, cnt, fns in auto_reason_rows:
+            out.append(f"| `{md_escape(mod)}` | `{md_escape(reason)}` | {cnt} | {_format_fn_samples(fns, cnt)} |")
+        out.append("")
+    return out
+
+
+def fuzz_reach_lines(reports: list[dict], run_dir: Path | None = None) -> list[str]:
     """What each corpus executed: reach only, so a reached function is neither safe nor proven."""
     if not reports:
-        return ["Fuzz reach was not measured (`pipeline_make.py run coverage`).", ""]
-    lines = [
-        "Fuzz reach (what each corpus executes on a plain coverage build; this is not evidence of safety):",
-        "",
-        "| Module | Status | Inputs replayed | Functions reached | Regions covered |",
-        "| :--- | :--- | ---: | ---: | ---: |",
-    ]
-    unreached: list[str] = []
-    for r in reports:
-        inputs = r.get("inputs") or {}
-        totals = r.get("totals") or {}
-        fns = totals.get("functions") or {}
-        regions = totals.get("regions") or {}
-        lines.append(
-            f"| `{md_escape(r['module'])}` | `{md_escape(str(r.get('status')))}` "
-            f"| {inputs.get('replayed', 0)} / {inputs.get('total', 0)} "
-            f"| {fns.get('reached', 0)} / {fns.get('total', 0)} "
-            f"| {regions.get('covered', 0)} / {regions.get('total', 0)} |"
-        )
-        unreached += [
-            f"- `{md_escape(str(f.get('function')))}` at `{md_escape(str(f.get('file')))}:{f.get('line')}` ({md_escape(r['module'])})"
-            for f in r.get("functions") or []
-            if not f.get("executions")
+        lines = ["Fuzz reach was not measured (`pipeline_make.py run coverage`).", ""]
+    else:
+        lines = [
+            "Fuzz reach (what each corpus executes on a plain coverage build; this is not evidence of safety):",
+            "",
+            "| Module | Status | Inputs replayed | Functions reached | Regions covered |",
+            "| :--- | :--- | ---: | ---: | ---: |",
         ]
-    lines.append("")
-    if unreached:
-        lines += [f"Functions no replayed input reached ({len(unreached)}):", ""]
-        lines += unreached[:50]
-        if len(unreached) > 50:
-            lines.append(f"- ... and {len(unreached) - 50} more (see workspace/reports/coverage/)")
+        unreached: list[str] = []
+        for r in reports:
+            inputs = r.get("inputs") or {}
+            totals = r.get("totals") or {}
+            fns = totals.get("functions") or {}
+            regions = totals.get("regions") or {}
+            lines.append(
+                f"| `{md_escape(r['module'])}` | `{md_escape(str(r.get('status')))}` "
+                f"| {inputs.get('replayed', 0)} / {inputs.get('total', 0)} "
+                f"| {fns.get('reached', 0)} / {fns.get('total', 0)} "
+                f"| {regions.get('covered', 0)} / {regions.get('total', 0)} |"
+            )
+            unreached += [
+                f"- `{md_escape(str(f.get('function')))}` at `{md_escape(str(f.get('file')))}:{f.get('line')}` ({md_escape(r['module'])})"
+                for f in r.get("functions") or []
+                if not f.get("executions")
+            ]
         lines.append("")
+        if unreached:
+            lines += [f"Functions no replayed input reached ({len(unreached)}):", ""]
+            lines += unreached[:50]
+            if len(unreached) > 50:
+                lines.append(f"- ... and {len(unreached) - 50} more (see workspace/reports/coverage/)")
+            lines.append("")
+    if run_dir is not None:
+        lines += threat_model_coverage_lines(Path(run_dir))
     return lines
 
 
@@ -2174,7 +2298,10 @@ def render_report(data: dict) -> str:
         out.append("")
     if not blocked and not reasons:
         out += ["No blocked, deferred, or out-of-scope units.", ""]
-    out += fuzz_reach_lines(data.get("coverage") or [])
+    out += fuzz_reach_lines(
+        data.get("coverage") or [],
+        run_dir=Path(data["run_dir"]) if data.get("run_dir") else None,
+    )
     if data.get("run_dir"):
         out += dynamic_gate_lines(Path(data["run_dir"]))
         out += header_api_lines(Path(data["run_dir"]))
