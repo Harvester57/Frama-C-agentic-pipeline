@@ -4271,7 +4271,13 @@ def chains(trace: list[dict]) -> list[list[int]]:
     return [g for g in groups.values() if len(g) > 1]
 
 
-def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], addr: str) -> int:
+def _shared_size(
+    trace: list[dict],
+    chain: list[int],
+    records: dict[str, dict],
+    addr: str,
+    api: ApiInfo | None = None,
+) -> int:
     """
     The size of a buffer shared by the calls of a chain: the largest the model gives any of its uses,
     0 (a spare buffer) when no use has one or a use is the lone output of a variable-length call. The
@@ -4279,7 +4285,8 @@ def _shared_size(trace: list[dict], chain: list[int], records: dict[str, dict], 
     """
     sizes: list[int] = []
     for j in chain:
-        rec = records.get(trace[j]["fn"]) or {}
+        fn = trace[j]["fn"]
+        rec = records.get(fn) or (api.records.get(fn) if api is not None and api.trust_schema else None) or {}
         params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         formals = list(rec.get("formals") or [])
         for i_s, a in (trace[j].get("addrs") or {}).items():
@@ -4312,7 +4319,10 @@ def sequence_case(
     A shared struct object whose first use is not one of its initializers gets the initializer first.
     `trust` gives each function's threat-model roles (by name), bound as in its single case: a trusted
     string is its literal, and a trusted scalar takes one of the values the traces recorded there
-    (`_recorded_scalar_arg`), zero when none was.
+    (`_recorded_scalar_arg`), zero when none was. Under `FRAMAC_API_TRUST_SCHEMA`, optional
+    `no-attacker-data` configurator/setup calls absent from `records` may be resolved from
+    `api.records` (treating their non-shared parameters as trusted) as long as at least one call in
+    `chain` is a real entry point in `records`.
     """
     try:
         return _sequence_case(trace, chain, records, spare, api, trust)
@@ -4333,6 +4343,8 @@ def _sequence_case(
     buffers: dict[str, str] = {}
     calls: list[str] = []
     names: list[str] = []
+    if not any(trace[k]["fn"] in records for k in chain):
+        return None, None, "sequence has no API entry point"
     seen_addr: dict[str, int] = {}
     for call in (trace[k] for k in chain):
         for addr in (call.get("addrs") or {}).values():
@@ -4343,8 +4355,13 @@ def _sequence_case(
         call = trace[k]
         name = call["fn"]
         rec = records.get(name)
+        is_configurator = False
         if rec is None:
-            return None, None, f"{name} is not an API function of this module"
+            if case.api.trust_schema and name in case.api.records:
+                rec = case.api.records[name]
+                is_configurator = True
+            else:
+                return None, None, f"{name} is not an API function of this module"
         params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         if params is None:
             return None, None, f"{name}: {why}"
@@ -4362,7 +4379,7 @@ def _sequence_case(
                 continue
             if addr not in buffers:
                 var = f"s{len(buffers)}"
-                size = _shared_size(trace, chain, records, addr)
+                size = _shared_size(trace, chain, records, addr, case.api)
                 pointee = str(params[idx].get("pointee") or "")
                 is_record = _is_record(pointee)
                 lay = case.api.structs.get(pointee) if is_record else None
@@ -4375,7 +4392,7 @@ def _sequence_case(
                 # Filled from the input when its first use reads it, its size is known, and it holds
                 # no pointer.
                 raw_ok = not is_record or _raw_ok(lay)
-                if size and _is_input(list(rec.get("formals") or []), idx) and raw_ok:
+                if not is_configurator and size and _is_input(list(rec.get("formals") or []), idx) and raw_ok:
                     case.slot(var, size, pos, idx, "bytes", addr=False)
                 buffers[addr] = var
                 own_init = idx == 0 and name in case.api.candidates.get(pointee, set())
@@ -4391,7 +4408,13 @@ def _sequence_case(
                     for note_msg in case.api.init_skip_notes[pointee]:
                         case.note(pos, idx, note_msg)
             shared[idx] = buffers[addr]
-        et = (trust or {}).get(name)
+        if is_configurator:
+            # W2-C: optional no-attacker-data configurator call in a recorded chain — treat all
+            # non-shared parameters as trusted so caller-storage buffers get fixed harness arrays,
+            # trusted C-strings get literals, and trusted scalars take recorded values or zero.
+            et: _EntryTrust | None = _EntryTrust(input_role="entry", attacker_params=[])
+        else:
+            et = (trust or {}).get(name)
         bound = _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared, entry_trust=et)
         calls.append(" ".join([*before, bound]))
         names.append(name)
@@ -4636,6 +4659,7 @@ def stateful_prefixes(
     api: ApiInfo,
     model_functions: dict,
     traces: list[list[dict]] | None = None,
+    configurators: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     The entry points whose single case can only reach an error path on a fresh context, each with the
@@ -4673,6 +4697,7 @@ def stateful_prefixes(
     init_names = set(api.inits.values()) | {
         n for names in api.candidates.values() for n in names if _INIT_NAME_RE.search(n)
     }
+    prefix_allowed = set(records) | (set(configurators) if configurators else set())
     segments = _context_segments(traces, init_names)
 
     def nparams(n: str) -> int:
@@ -4745,7 +4770,7 @@ def stateful_prefixes(
                 for j, c in enumerate(seg):
                     if c.get("fn") != m:
                         continue
-                    pre = [x for x in seg[:j] if x.get("fn") in records]
+                    pre = [x for x in seg[:j] if x.get("fn") in prefix_allowed]
                     if not pre or (opener is not None and not any(_is_opener(_words(str(x["fn"]))) for x in pre)):
                         continue
                     prefix = [str(x["fn"]) for x in _compress_prefix(pre)]
@@ -4767,6 +4792,77 @@ def stateful_prefixes(
 # harness compiles from the header, which the layout probe must have seen declared.
 HEADER_NOT_VISIBLE = "static header function: the layout probe did not see the harness declare it"
 HEADER_VARIADIC = "static header function, variadic: the generator takes no call site for it"
+
+
+def _sequence_configurator_records(
+    dag: dict,
+    model: dict,
+    module: str,
+    mm: Any,
+    records: dict[str, dict],
+    api: ApiInfo,
+    anon_tags: dict[str, str],
+    visible: set[str] | None,
+    tm_active: bool,
+    entry_trust_map: Mapping[str, _EntryTrust],
+    skipped: Mapping[str, str],
+    cluster_budget: _ClusterInitBudget | None = None,
+) -> dict[str, dict]:
+    """
+    W2-C: module-local, non-static, non-variadic, header-visible `no-attacker-data` configurator
+    and setup calls (e.g., `QCBORDecode_SetMemPool`, `QCBOREncode_Init`, `UsefulOutBuf_Init`,
+    `QCBORDecode_CompatibilityV1`) that may remain inside recorded trace segments alongside real
+    entry points in `records`.
+
+    Excludes `main`, static/header-inline functions, variadic functions, path-taking functions,
+    trusted-only (`trusted_caller`) functions, already-skipped attacker-data entry points, freeing
+    destructors, refcount helpers without a producer, and functions outside the module's scope.
+    Disabled when `api.trust_schema` is False (`FRAMAC_API_TRUST_SCHEMA=off` rollback).
+    """
+    if not api.trust_schema:
+        return {}
+    functions = dag.get("functions") or {}
+    scope_keys = list(mm.scope_functions(module))
+    if not scope_keys:
+        scope_keys = list((mm.unit_record(module)).get("functions") or [])
+    scope_key_set = set(scope_keys) | set(mm.scope_entry_points(module))
+    forbidden_dtors = (
+        {n for ns in api.owner_names.values() for n in ns}
+        | set(api.struct_freers.values())
+        | {n for ns in api.dtor_names.values() for n in ns}
+    )
+    out: dict[str, dict] = {}
+    for key in sorted(scope_key_set):
+        drec = functions.get(key) or {}
+        name = str(drec.get("name") or key.split("#")[-1])
+        if not name or name == "main" or name in records or name in out or name in forbidden_dtors:
+            continue
+        if drec.get("is_static"):
+            continue
+        if tm_active:
+            et = entry_trust_map.get(key) or _EntryTrust()
+            if et.trusted_caller or et.input_role is not None:
+                continue
+        elif key in skipped:
+            continue
+        mrec = _model_record(model, drec, key)
+        if not mrec or mrec.get("static"):
+            continue
+        if visible is not None and name not in visible:
+            continue
+        if _unspelled_anon_record(mrec, anon_tags):
+            continue
+        if is_variadic(str(mrec.get("signature") or ""), mrec.get("formals")):
+            continue
+        if path_parameter(mrec):
+            continue
+        if cluster_budget is not None and not cluster_budget.fits(name):
+            continue
+        params, _ = plan_params(str(mrec.get("signature") or ""), mrec.get("formals"))
+        if params is None or _is_refcount_without_producer(name, params, api):
+            continue
+        out[name] = mrec
+    return out
 
 
 def plan(
@@ -5030,17 +5126,50 @@ def plan(
     for v_stmt, v_layout in variadic_made:
         cases.append(v_stmt)
         layouts.append(v_layout)
+    configurators = _sequence_configurator_records(
+        dag,
+        model,
+        module,
+        mm,
+        records,
+        api,
+        anon_tags,
+        visible,
+        tm_active,
+        entry_trust_map,
+        skipped,
+        cluster_budget,
+    )
+    for cname, crec in configurators.items():
+        api.records.setdefault(cname, crec)
+    seq_allowed = set(records) | set(configurators)
     seq_seen: set[tuple[str, ...]] = set()
     for full in traces or []:
         # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
         # produced comes from the input instead, and the rest of the chain stays.
-        trace = [c for c in full if c.get("fn") in records]
+        trace = [c for c in full if c.get("fn") in seq_allowed]
         for chain in chains(trace):
+            if not any(trace[k]["fn"] in records for k in chain):
+                continue
             sig = tuple(trace[k]["fn"] for k in chain)
             if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
                 continue
             seq_stmt, seq_layout, _why = sequence_case(trace, chain, records, spare, api, trust_by_name)
             if seq_stmt is None or seq_layout is None:
+                if any(trace[k]["fn"] not in records for k in chain):
+                    rec_trace = [trace[k] for k in chain if trace[k]["fn"] in records]
+                    for sub_chain in chains(rec_trace):
+                        sub_sig = tuple(rec_trace[k]["fn"] for k in sub_chain)
+                        if sub_sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
+                            continue
+                        sub_stmt, sub_layout, _ = sequence_case(
+                            rec_trace, sub_chain, records, spare, api, trust_by_name
+                        )
+                        if sub_stmt is None or sub_layout is None:
+                            continue
+                        seq_seen.add(sub_sig)
+                        cases.append(sub_stmt)
+                        layouts.append(sub_layout)
                 continue
             seq_seen.add(sig)
             cases.append(seq_stmt)
@@ -5090,7 +5219,9 @@ def plan(
     header_keys = {k for k, _ in header_entries}
     key_of = {str((functions.get(k) or {}).get("name") or k.split("#")[-1]): k for k in names if k not in header_keys}
     n_state = 0
-    for plan_st in stateful_prefixes(records, singles, api, model.get("functions") or {}, traces):
+    for plan_st in stateful_prefixes(
+        records, singles, api, model.get("functions") or {}, traces, configurators=configurators
+    ):
         sig = tuple(plan_st["calls"])
         if n_state >= STATE_MAX_CASES or sig in seq_seen:
             continue
@@ -5099,7 +5230,18 @@ def plan(
             ctx_trace, list(range(len(ctx_trace))), records, spare, api, trust_by_name
         )
         if st_stmt is None or st_layout is None:
-            continue
+            if any(fn not in records for fn in plan_st["calls"]):
+                rec_calls = [fn for fn in plan_st["calls"] if fn in records]
+                rec_sig = tuple(rec_calls)
+                if len(rec_calls) > 1 and rec_sig not in seq_seen:
+                    rec_trace = [{"fn": fn, "args": {}, "addrs": {"0": "fc_ctx"}} for fn in rec_calls]
+                    st_stmt, st_layout, _why = sequence_case(
+                        rec_trace, list(range(len(rec_trace))), records, spare, api, trust_by_name
+                    )
+                    if st_stmt is not None and st_layout is not None:
+                        sig = rec_sig
+            if st_stmt is None or st_layout is None:
+                continue
         seq_seen.add(sig)
         n_state += 1
         st_layout["notes"] = [
