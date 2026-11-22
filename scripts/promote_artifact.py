@@ -312,7 +312,7 @@ def _check_seed_hangs(binary: Path, seed_path: Path, timeout_s: float) -> str | 
                 writable=[tmp_dir],
                 timeout_s=wall_timeout,
                 cwd=tmp_dir,
-                limits=sandbox_exec.Limits(cpu_seconds=max(2, wall_timeout * 2)),
+                limits=sandbox_exec.Limits(cpu_seconds=max(2, wall_timeout * 2), ignore_sigpipe=True),
                 extra_env=SANITIZER_RUNTIME_ENV,
             )
         except (sandbox_exec.SandboxUnavailable, OSError):

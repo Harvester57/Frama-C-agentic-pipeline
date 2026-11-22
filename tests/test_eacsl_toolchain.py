@@ -1110,7 +1110,9 @@ def test_va_list_initialized_checks_are_skipped_and_others_kept():
 
 def test_fuzz_init_sets_the_runtime_ready_flag_after_initialization():
     text = T.resolve_fuzz_init_source().read_text(encoding="utf-8")
-    body = text[text.index("int LLVMFuzzerInitialize(") :]
+    # The preinit entry and LLVMFuzzerInitialize both go through fc_eacsl_runtime_init.
+    body = text[text.index("static void fc_eacsl_runtime_init(") :]
+    assert "fc_eacsl_runtime_init(argc, argv);" in text[text.index("int LLVMFuzzerInitialize(") :]
     assert "int __fc_eacsl_runtime_ready;" in text
     assert body.index("__e_acsl_memory_init(") < body.index("__fc_eacsl_runtime_ready = 1;")
 

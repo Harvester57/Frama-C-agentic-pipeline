@@ -125,7 +125,7 @@ def replay_for_coverage(
             ],
             writable=[scratch, batch_dir],
             timeout_s=wall,
-            limits=Limits(cpu_seconds=wall * 2),
+            limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
             extra_env={"LLVM_PROFILE_FILE": f"{batch_dir.resolve()}/%p.profraw"},
         )
         if res.returncode == 0 and not res.timed_out and _written_profiles(batch_dir):

@@ -61,6 +61,12 @@ class Limits:
     open_files: int = 1024
     processes: int = 256
     address_space_mb: int | None = None
+    # Start the child with SIGPIPE ignored (inherited across exec). For fuzz binaries: a sanitizer or
+    # libFuzzer symbolizes through a child process (llvm-symbolizer); when the target keeps it from
+    # starting (sudo_noexec.c's constructor installs a seccomp filter denying execve), the first write
+    # to its pipe killed the fuzzer with SIGPIPE before the crash input was saved. Ignored, the write
+    # fails, frames stay unsymbolized and the crash is still reported and saved.
+    ignore_sigpipe: bool = False
 
 
 @dataclass
@@ -129,6 +135,8 @@ def _make_preexec(limits: Limits):
         if limits.address_space_mb:
             _set(resource.RLIMIT_AS, limits.address_space_mb * 1024 * 1024)  # type: ignore[attr-defined]
         _set(resource.RLIMIT_CORE, CORE_LIMIT_BYTES)  # type: ignore[attr-defined]
+        if limits.ignore_sigpipe:
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)  # type: ignore[attr-defined]
 
     return _apply
 

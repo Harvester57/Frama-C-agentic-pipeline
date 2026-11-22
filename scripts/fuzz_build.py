@@ -1032,8 +1032,9 @@ def _compile_eacsl_binary_uncached(
     result) unless `libc_checks` is False, which is recorded in `reduced_checks`.
     `-n` matters: without it `e-acsl-gcc` also links the original sources, which fails on a
     main-less fuzz harness. Fuzz builds use full memory tracking and link
-    templates/eacsl_runtime/fuzz_init.c, whose LLVMFuzzerInitialize initializes the runtime that
-    an instrumented main() would. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
+    templates/eacsl_runtime/fuzz_init.c, which initializes the runtime that an instrumented main()
+    would, from the executable's .preinit_array so target constructors and libc functions the target
+    replaces run tracked (`runtime_init`), with LLVMFuzzerInitialize as the fallback. With full tracking the frontend also gets EACSL_FULL_MTRACKING_DEFINES
     (`-Dregister=`, recorded in `full_mtracking_defines`). Between the stages the instrumented file
     is patched for printer and E-ACSL gaps, each counted in the result (`alignas_rewrites`,
     `wrapper_result_inits`, `formal_inits`, `forward_array_sizes`, `misplaced_fallthrough`, ...). A pointer-alignment check on a type the instrumented file
@@ -1445,6 +1446,14 @@ def _compile_eacsl_binary_uncached(
                 return _finish(1, "eacsl_init_hook_conflict")
             init_hook = [resolve_fuzz_init_source().as_posix()]
             result["init_hook"] = init_hook[0]
+            # The hook sets the runtime up from the executable's .preinit_array, before any target
+            # constructor or shared-library constructor can run instrumented code; LLVMFuzzerInitialize
+            # does it when that entry did not run.
+            result["runtime_init"] = {
+                "hook": "preinit_array",
+                "source": init_hook[0],
+                "fallback": "LLVMFuzzerInitialize",
+            }
             env_keep = _build_environ_keep_object(
                 instrumented_text,
                 out_bin.parent / f"{out_bin.name}_env_keep",

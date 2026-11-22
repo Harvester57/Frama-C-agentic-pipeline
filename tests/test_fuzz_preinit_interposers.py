@@ -14,6 +14,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import fuzz_build
 import run_eacsl_fuzz as R
 import sandbox_exec
@@ -23,14 +25,42 @@ from sandbox_exec import SandboxResult
 FPI_REPO = Path(__file__).resolve().parent.parent
 FPI_FUZZ_INIT = FPI_REPO / "templates" / "eacsl_runtime" / "fuzz_init.c"
 FPI_CASES = ["(void)fuzz_buf;", "(void)fuzz_len;", "(void)0;"]
+# `nm --defined-only` of run-1's fuzz_sudo_noexec_so (ASan+UBSan build), launcher lines: the target's own
+# strong definitions, and the sanitizer runtime's interceptors (weak, with `__interceptor_` siblings).
+FPI_NM_NOEXEC = (
+    "00000000000dd940 T ___interceptor_popen\n"
+    "00000000000997d0 T ___interceptor_posix_spawn\n"
+    "0000000000119f14 T ___interceptor_vfork\n"
+    "00000000000dd940 W __interceptor_popen\n"
+    "00000000000997d0 W __interceptor_posix_spawn\n"
+    "0000000000119f14 W __interceptor_vfork\n"
+    "000000000014ade8 T execl\n"
+    "000000000014b108 T execve\n"
+    "000000000014b4c8 T popen\n"
+    "000000000014b2e8 T posix_spawn\n"
+    "000000000014b428 T system\n"
+    "0000000000119f49 W vfork\n"
+    "0000000000001130 T LLVMFuzzerTestOneInput\n"
+)
+# The same lines of run-1's fuzz_cvtsudoers, which replaces no libc function: interceptors only.
+FPI_NM_PLAIN_ASAN = (
+    "000000000018ce60 T ___interceptor_popen\n"
+    "0000000000148cf0 T ___interceptor_posix_spawn\n"
+    "00000000001c9434 T ___interceptor_vfork\n"
+    "000000000018ce60 W __interceptor_popen\n"
+    "0000000000148cf0 W __interceptor_posix_spawn\n"
+    "00000000001c9434 W __interceptor_vfork\n"
+    "000000000013097b W popen\n"
+    "0000000000130372 W posix_spawn\n"
+    "00000000001c9469 W vfork\n"
+)
 FPI_NM_OUTPUT = (
     "0000000000001130 T LLVMFuzzerTestOneInput\n"
-    "0000000000001200 T execve\n"
     "0000000000001250 W system\n"
     "0000000000001290 t popen\n"
-    "00000000000012a0 T execve_checked\n"
-    "0000000000004010 B fork\n"
-    "0000000000001300 i posix_spawn\n"
+    "00000000000012a0 T system_checked\n"
+    "0000000000004010 B popen_mode\n"
+    "0000000000001300 T execve\n"
 )
 # libFuzzer -jobs output when system() cannot start a single worker (sudo_noexec_so, run-1).
 FPI_JOBS_NEVER_STARTED = (
@@ -81,9 +111,14 @@ def _multi_process_flags(cmd: list[str]) -> list[str]:
 # --- Bug A: which link defines the process launchers ----------------------------------------------
 
 
-def test_nm_output_names_the_global_process_launchers_the_link_defines():
-    # Global (T, W, i) definitions only: a static `popen` interposes nothing, a data symbol is no function.
-    assert R.parse_defined_process_launchers(FPI_NM_OUTPUT) == ["execve", "posix_spawn", "system"]
+def test_nm_output_names_the_launchers_libfuzzer_uses_that_the_target_replaced():
+    # libFuzzer starts its processes with system() (and popen); exec*/posix_spawn the target replaces do
+    # not reach it (glibc's system() spawns internally), and the no-input rerun catches anything else.
+    assert R.parse_defined_process_launchers(FPI_NM_NOEXEC) == ["popen", "system"]
+    # A sanitizer build defines popen as a weak interceptor: no replacement, every worker still starts.
+    assert R.parse_defined_process_launchers(FPI_NM_PLAIN_ASAN) == []
+    # A global definition counts (a weak one without interceptor too), a static one or a data symbol does not.
+    assert R.parse_defined_process_launchers(FPI_NM_OUTPUT) == ["system"]
     assert R.parse_defined_process_launchers("") == []
 
 
@@ -95,7 +130,7 @@ def test_defined_process_launchers_runs_nm_on_the_binary_and_is_none_when_nm_fai
         return subprocess.CompletedProcess(cmd, 0, stdout=FPI_NM_OUTPUT, stderr="")
 
     binary = _binary(tmp_path)
-    assert R.defined_process_launchers(binary, runner=runner) == ["execve", "posix_spawn", "system"]
+    assert R.defined_process_launchers(binary, runner=runner) == ["system"]
     assert seen[0][0] == "nm" and "--defined-only" in seen[0] and seen[0][-1] == str(binary)
 
     def broken(cmd, **kwargs):
@@ -119,7 +154,7 @@ def test_libfuzzer_output_says_whether_any_input_ran():
 
 
 def test_a_binary_defining_system_is_fuzzed_single_process_from_the_start(tmp_path, monkeypatch):
-    monkeypatch.setattr(R, "defined_process_launchers", lambda binary, **kw: ["execve", "system"])
+    monkeypatch.setattr(R, "defined_process_launchers", lambda binary, **kw: ["popen", "system"])
     calls = _fake_sandbox(monkeypatch, [(0, FPI_RAN_INPUTS)])
     for fork in (True, False):
         calls.clear()
@@ -128,7 +163,7 @@ def test_a_binary_defining_system_is_fuzzed_single_process_from_the_start(tmp_pa
         # NEW_FUNC lines are symbolized by a child process too (sudo_noexec's seccomp filter denies execve).
         assert "-print_funcs=0" in calls[0]
         assert res["status"] == "clean" and "fork" not in res
-        assert "system" in res["single_process_reason"] and "execve" in res["single_process_reason"]
+        assert "system" in res["single_process_reason"] and "popen" in res["single_process_reason"]
         assert res["workers_used"] == 1
 
 
@@ -178,6 +213,44 @@ def test_a_given_single_process_reason_skips_the_multi_process_attempt(tmp_path,
     )
     assert len(calls) == 1 and _multi_process_flags(calls[0]) == []
     assert res["single_process_reason"] == "earlier round"
+
+
+def test_fuzz_binaries_run_with_sigpipe_ignored_so_a_crash_survives_a_symbolizer_that_cannot_start(
+    tmp_path, monkeypatch
+):
+    # sudo_noexec's seccomp filter denies execve: the symbolizer never starts, and the first write to its
+    # pipe killed the fuzzer (rc -13) before the crash input was saved.
+    import crash_replay
+
+    monkeypatch.setattr(R, "defined_process_launchers", lambda binary, **kw: [])
+    seen: list[object] = []
+
+    def fake(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        seen.append(limits)
+        return SandboxResult(0, "", FPI_RAN_INPUTS, False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", fake)
+    monkeypatch.setattr(R, "enforced_memory_mb", lambda: None)
+    R.run_fuzz_campaign(_binary(tmp_path), tmp_path / "corpus", tmp_path / "arts", 30, workers=4)
+    crash = tmp_path / "crash-1"
+    crash.write_bytes(b"x")
+    crash_replay.replay_artifact(_binary(tmp_path), crash, tmp_path / "scratch")
+    assert len(seen) == 2 and all(getattr(lim, "ignore_sigpipe", False) for lim in seen)
+
+
+def test_the_sandbox_preexec_ignores_sigpipe_only_when_asked(monkeypatch):
+    pytest.importorskip("resource")
+    import signal
+
+    import sandbox_exec as S
+
+    monkeypatch.setattr("resource.setrlimit", lambda which, value: None)
+    calls: list[tuple] = []
+    monkeypatch.setattr(signal, "signal", lambda sig, handler: calls.append((sig, handler)))
+    S._make_preexec(S.Limits())()
+    assert calls == []
+    S._make_preexec(S.Limits(ignore_sigpipe=True))()
+    assert calls == [(signal.SIGPIPE, signal.SIG_IGN)]
 
 
 # --- Bug A: what the keep-going report says ------------------------------------------------------
