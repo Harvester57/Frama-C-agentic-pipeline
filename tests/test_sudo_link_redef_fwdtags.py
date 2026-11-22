@@ -37,7 +37,7 @@ SLR_CVT_UNIT = "plugin/.libs/cvt"
 SLR_FILES = {
     # The unit's files the fuzzer links (sudo's cvtsudoers_merge.c and friends call log_warnx, read filters).
     "plugin/merge.c": "int log_warn(const char *m);\nextern int *filt;\nint merge(void) { return log_warn(0) + *filt; }\n",
-    "plugin/util.c": "int helper(void) { return 0; }\n",
+    "plugin/util.c": "int verbose;\nint helper(void) { return 0; }\n",
     # The unit's file the fuzzer's link leaves out: it defines open_cfg, which the fuzzer defines itself.
     "plugin/main_impl.c": "int open_cfg(const char *p) { return 0; }\n",
     # A program of the target (sudo's cvtsudoers.c): the only definer of log_warn and filt, and its own open_cfg.
@@ -48,7 +48,7 @@ SLR_FILES = {
     # Defines a name the unit's util.c defines too.
     "progs/other.c": "int other_only(void) { return 1; }\nint helper(void) { return 3; }\n",
     # Defines only what nothing in the build defines.
-    "progs/clean.c": "int clean_only(void) { return 1; }\nint main(void) { return clean_only(); }\n",
+    "progs/clean.c": "int verbose;\nint clean_only(void) { return 1; }\nint main(void) { return clean_only(); }\n",
     # sudo's plugins/sudoers/regress/fuzz/fuzz_sudoers_ldif.c: no DAG record (the build does not capture it).
     "plugin/fuzz/fuzz_ldif.c": (
         "int open_cfg(const char *p) { return 9; }\n"
@@ -99,8 +99,13 @@ def _slr_run(tmp_path: Path, excluded_symbols: list[str] | None = None) -> Path:
         },
     }
     (reports / "callgraph_dag.json").write_text(json.dumps(dag), encoding="utf-8")
-    glob = {"name": "filt", "file": "progs/cvt.c", "type": "int *", "units": [SLR_CVT_UNIT], "static": False}
-    model = {"global_variables": {"progs/cvt.c#filt": glob}}
+    globs = [
+        {"name": "filt", "file": "progs/cvt.c", "type": "int *", "units": [SLR_CVT_UNIT]},
+        # An uninitialized global two files define: one object under -fcommon.
+        {"name": "verbose", "file": "plugin/util.c", "type": "int", "units": [SLR_PLUGIN_UNIT]},
+        {"name": "verbose", "file": "progs/clean.c", "type": "int", "units": ["progs/.libs/clean"]},
+    ]
+    model = {"global_variables": {f"{g['file']}#{g['name']}": {**g, "static": False} for g in globs}}
     (reports / "phase0_model.json").write_text(json.dumps(model), encoding="utf-8")
     excluded = [{"source": "plugin/main_impl.c", "symbols": excluded_symbols}] if excluded_symbols else []
     sidecar = {
@@ -186,10 +191,13 @@ def test_a_file_that_redefines_a_linked_files_function_is_not_added(tmp_path, mo
 
 
 def test_a_file_redefining_nothing_the_build_has_is_still_added(tmp_path, monkeypatch):
-    """clean.c defines a main too: no file of the build does, so it links (main is renamed by -Dmain=)."""
+    """
+    clean.c defines a main too: no file of the build does, so it links (main is renamed by -Dmain=). It
+    shares the global verbose with util.c: uninitialized, one object under -fcommon, so no clash either.
+    """
     dag = _slr_run(tmp_path)
     monkeypatch.chdir(tmp_path)
-    sources = ["workspace/work/plugin/merge.c"]
+    sources = ["workspace/work/plugin/merge.c", "workspace/work/plugin/util.c"]
     repaired, info = fuzz_build.repair_sources_for_link(
         sources, _slr_undef("clean_only"), dag, tmp_path, module="plugin_so", stub_dir=_slr_stub_dir("plugin_so")
     )

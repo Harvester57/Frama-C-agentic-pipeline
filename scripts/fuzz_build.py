@@ -2402,25 +2402,26 @@ def _excluded_link_sources(dag_path: Path, module: str | None) -> dict[str, list
     return out
 
 
-def _file_external_definitions(dag_path: Path) -> dict[str, set[str]]:
+def _file_external_definitions(dag_path: Path) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """
-    Source file (tree path) -> the names it defines with external linkage: the DAG's non-static functions
-    (header records left out, `_dag_function_definers`), the functions only the build compiles
-    (`build_only_functions`) and the model's global variables (`_model_global_variables`). What linking that
+    (functions, globals): source file (tree path) -> the names it defines with external linkage. Functions:
+    the DAG's non-static ones (header records left out, `_dag_function_definers`) and those only the build
+    compiles (`build_only_functions`); globals: the model's (`_model_global_variables`). What linking that
     file brings into a build besides the symbol it is added for.
     """
-    out: dict[str, set[str]] = {}
+    fns: dict[str, set[str]] = {}
     for name, recs in _dag_function_definers(dag_path).items():
         for rec in recs:
-            out.setdefault(_dag_tree_path(rec["file"]), set()).add(name)
+            fns.setdefault(_dag_tree_path(rec["file"]), set()).add(name)
     # As `_dag_symbol_tables` reads them: a build-only name the DAG parsed elsewhere is that file's.
     _parsed, build_only = _dag_symbol_tables(dag_path)
     for name, file in build_only.items():
-        out.setdefault(_dag_tree_path(file), set()).add(name)
+        fns.setdefault(_dag_tree_path(file), set()).add(name)
+    globs: dict[str, set[str]] = {}
     for name, recs in _model_global_variables(dag_path).items():
         for rec in recs:
-            out.setdefault(_dag_tree_path(rec["file"]), set()).add(name)
-    return out
+            globs.setdefault(_dag_tree_path(rec["file"]), set()).add(name)
+    return fns, globs
 
 
 def _target_fuzzer_own_definitions(dag_path: Path, module: str | None, run_dir: Path) -> tuple[str, set[str]]:
@@ -2763,7 +2764,9 @@ def repair_sources_for_link(
     linked files, and for a target fuzz module the fuzzer's own, `_target_fuzzer_own_definitions`): linked,
     it fails on "multiple definition" (sudo run-1 tf_fuzz_sudoers_ldif: cvtsudoers.c, the only definer of
     log_warnx and of the global filters, also defines open_sudoers, which the fuzzer defines). The symbol
-    is stubbed the same way, its `reason` naming each clash and its current definer.
+    is stubbed the same way, its `reason` naming each clash and its current definer. A global another
+    linked file defines too is no clash: under the builds' -fcommon two uninitialized ones are one object,
+    and the model does not record which are initialized.
 
     For an address-flow cluster (`module` is a DAG submodule with `build_sources`,
     scripts/unit_split.py), a parsed non-static function defined outside `flow_files` (of the same
@@ -2812,25 +2815,39 @@ def repair_sources_for_link(
     # file this round adds: a file linked for one symbol brings every other one it defines, and one the
     # build already has fails the link on "multiple definition" (sudo run-1 tf_fuzz_sudoers_ldif:
     # cvtsudoers.c, added for log_warnx, also defines open_sudoers, which the target fuzzer defines).
-    file_defs: dict[str, set[str]] = {}
-    built: dict[str, str] | None = None
+    file_fns: dict[str, set[str]] = {}
+    file_globs: dict[str, set[str]] = {}
+    built: dict[str, str] = {}  # the linked files' functions and all the target fuzzer defines
+    built_globs: dict[str, str] = {}  # the linked files' globals
+    built_read = False
+
+    def _note_linked(tree: str) -> None:
+        for name in file_fns.get(tree, ()):
+            built.setdefault(name, tree)
+        for name in file_globs.get(tree, ()):
+            built_globs.setdefault(name, tree)
 
     def _clashes(file: str, sym: str) -> list[tuple[str, str]]:
         """(name, current definer) of each name `file` would define a second time; none for a linked file."""
-        nonlocal built
+        nonlocal built_read
         tree = _dag_tree_path(file)
         if tree in {_dag_tree_path(h) for h in have}:
             return []
-        if built is None:
-            file_defs.update(_file_external_definitions(dp))
-            driver, own = _target_fuzzer_own_definitions(dp, module, Path(run_dir))
-            built = {}
+        if not built_read:
+            built_read = True
+            fns, globs = _file_external_definitions(dp)
+            file_fns.update(fns)
+            file_globs.update(globs)
             for h in sorted({_dag_tree_path(h) for h in have}):
-                for name in file_defs.get(h, ()):
-                    built.setdefault(name, h)
+                _note_linked(h)
+            driver, own = _target_fuzzer_own_definitions(dp, module, Path(run_dir))
             for name in own:
                 built.setdefault(name, f"the target fuzzer {driver}")
-        return sorted((n, built[n]) for n in file_defs.get(tree, ()) if n != sym and n in built)
+        hits = {n: built.get(n) or built_globs[n] for n in file_fns.get(tree, ()) if n in built or n in built_globs}
+        # A global two linked files define is no clash under -fcommon (both builds use it) unless both are
+        # initialized, which the model does not record: a global only clashes with a function or the fuzzer's own.
+        hits.update({n: built[n] for n in file_globs.get(tree, ()) if n in built})
+        return sorted((n, d) for n, d in hits.items() if n != sym)
 
     def _unlinkable_reason(file: str, sym: str) -> str:
         """Why `file` cannot be linked for `sym` (left out of the target fuzzer's link, or a clash), or ""."""
@@ -2969,9 +2986,8 @@ def repair_sources_for_link(
             have.add(norm)
             added.append(norm)
             resolved.append(sym)
-            if built is not None:
-                for name in file_defs.get(_dag_tree_path(norm), ()):
-                    built.setdefault(name, _dag_tree_path(norm))
+            if built_read:
+                _note_linked(_dag_tree_path(norm))
     # A global is defined once: a file this round links in for any symbol defines the globals the
     # model records in it, so neither a stub of this round nor one of an earlier round stays for them
     # (sudo liblogsrv_a: protobuf-c.c added for protobuf_c_message_pack, and protobuf_c_empty_string
