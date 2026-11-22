@@ -25,6 +25,7 @@ from typing import Any
 import cache
 import fc_cpp_wrapper_eacsl
 import include_context
+import resources
 import target_env
 from c_definitions import TYPE_MODIFIERS_AND_PRIMITIVES, extract_functions_from_code
 from eacsl_toolchain import (
@@ -3350,6 +3351,15 @@ def build_module_binary(
     `security_props`. The sanitizer build never does. Without `eacsl` in `meta_engines` nothing changes.
     """
 
+    out_bin = Path(out_bin)
+    dual_prebuilt = resources.fuzz_explore_judge_enabled() and engine == "auto"
+    # e-acsl-gcc already writes the instrumented executable to `<out_bin>.e-acsl` (select_eacsl_binary),
+    # while Clang writes the sanitizer binary directly to `san_out` (`<out_bin>.san` under P7f).
+    eacsl_out = out_bin
+    san_out = (
+        out_bin if (not dual_prebuilt or out_bin.name.endswith(".san")) else out_bin.with_name(f"{out_bin.name}.san")
+    )
+
     seeded_sources, preseeded, pre_fns, pre_globs = _preseed_flow_stubs(sources, dag_path, out_bin, link_module)
     effective_functions = (
         functions if functions is not None else _flow_cluster_functions(dag_path, link_module, seeded_sources)
@@ -3380,12 +3390,12 @@ def build_module_binary(
                 fallback_reason = blocked
                 sticky_fallback.append((None, fallback_reason))
             else:
-                meta = resolve_security_meta(security_props, srcs, Path(out_bin))
+                meta = resolve_security_meta(security_props, srcs, eacsl_out)
                 # Only when the run's properties are on: the call of a run without them is today's.
                 meta_kwargs: dict[str, Any] = {"security_meta": meta} if meta is not None else {}
                 comp = compile_eacsl_binary(
                     srcs,
-                    out_bin,
+                    eacsl_out,
                     machdep,
                     cppflags,
                     rte,
@@ -3413,7 +3423,7 @@ def build_module_binary(
                         sticky_fallback.append((eacsl_attempt, fallback_reason))
                     comp = None
         if comp is None:
-            comp = compile_sanitizer_binary(srcs, out_bin, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
+            comp = compile_sanitizer_binary(srcs, san_out, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache)
         return comp, eacsl_attempt, fallback_reason
 
     attempts: list[dict] = []
@@ -3470,13 +3480,52 @@ def build_module_binary(
         initial_stubbed_globals=pre_globs,
     )
     eacsl_attempt, fallback_reason = last["eacsl_attempt"], last["fallback_reason"]
-    result = {
+    engine_used = comp.get("engine", engine)
+    result: dict[str, Any] = {
         "compile": comp,
-        "engine_used": comp.get("engine", engine),
+        "engine_used": engine_used,
         "engine_fallback_reason": fallback_reason,
         "eacsl_compile_attempt": eacsl_attempt,
         "sources": current,
     }
+    if dual_prebuilt:
+        if comp["returncode"] == 0 and engine_used == "eacsl":
+            # P7f: reuse repaired `current` sources to pre-build and cache the ASan+UBSan twin.
+            def _compile_san(srcs: list[str]) -> dict:
+                return compile_sanitizer_binary(
+                    srcs, san_out, cppflags, True, ldflags_extra=ldflags, use_cache=use_cache
+                )
+
+            san_comp = _compile_san(list(current))
+            if san_comp["returncode"] != 0 and dag_path:
+                san_comp, _san_srcs, _san_repair = repair_link_rounds(
+                    san_comp,
+                    current,
+                    _compile_san,
+                    dag_path,
+                    out_bin,
+                    link_module=link_module,
+                    initial_stubbed_functions=pre_fns,
+                    initial_stubbed_globals=pre_globs,
+                )
+            result["sanitizer_compile"] = san_comp
+            result["binaries"] = {
+                "sanitizers": str(san_comp.get("binary") or san_out) if san_comp["returncode"] == 0 else None,
+                "eacsl": str(comp.get("binary") or eacsl_out),
+            }
+        elif comp["returncode"] == 0 and engine_used == "sanitizers":
+            result["sanitizer_compile"] = comp
+            result["binaries"] = {
+                "sanitizers": str(comp.get("binary") or san_out),
+                "eacsl": None,
+            }
+        else:
+            if engine_used == "sanitizers":
+                result["sanitizer_compile"] = comp
+            result["binaries"] = {
+                "sanitizers": None,
+                "eacsl": None,
+            }
     if preseeded is not None:
         result["preseeded_stubs"] = preseeded
     if len(attempts) > 1:
@@ -3486,6 +3535,91 @@ def build_module_binary(
     if link_repair is not None:
         result["link_repair"] = link_repair
     return result
+
+
+class PrebuiltBinaryError(RuntimeError):
+    """Raised when a prebuilt fuzz/judge binary is missing or unavailable in workspace/build/<mod>.build.json."""
+
+
+_PREBUILT_ENGINES = frozenset({"sanitizers", "eacsl"})
+
+
+def resolve_prebuilt_binary(
+    build_json: dict[str, Any] | Path | str,
+    engine: str,
+    *,
+    require_exists: bool = True,
+) -> Path:
+    """
+    Resolve the pre-built binary path for `engine` ('sanitizers' or 'eacsl') from a module's
+    `workspace/build/<mod>.build.json` path or parsed dict (P7f). Raises PrebuiltBinaryError
+    rather than letting fuzz/judge compile inside a fuzz/replay lease.
+    """
+    eng = (engine or "").strip().lower()
+    if eng not in _PREBUILT_ENGINES:
+        raise ValueError(f"unsupported prebuilt binary engine {engine!r} (expected 'sanitizers' or 'eacsl')")
+
+    if isinstance(build_json, (str, Path)):
+        report_path = Path(build_json)
+        if not report_path.is_file():
+            raise PrebuiltBinaryError(
+                f"prebuilt build report not found: {report_path} (run the build stage before fuzz/judge)"
+            )
+        try:
+            raw = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PrebuiltBinaryError(f"cannot read build report {report_path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise PrebuiltBinaryError(f"invalid build report {report_path}: expected a JSON object")
+        data: dict[str, Any] = raw
+    elif isinstance(build_json, dict):
+        data = build_json
+    else:
+        raise TypeError(f"build_json must be a dict or Path, got {type(build_json).__name__}")
+
+    candidate: Path | None = None
+    binaries = data.get("binaries")
+    explicit_missing = False
+    if isinstance(binaries, dict) and eng in binaries:
+        entry = binaries.get(eng)
+        if isinstance(entry, str) and entry.strip():
+            candidate = Path(entry.strip())
+        else:
+            explicit_missing = True
+
+    if candidate is None and not explicit_missing:
+        comp = data.get("compile") if isinstance(data.get("compile"), dict) else None
+        comp_ok = data.get("status") == "built" or (comp is not None and comp.get("returncode") == 0)
+        if eng == "sanitizers":
+            san_comp = data.get("sanitizer_compile")
+            if isinstance(san_comp, dict) and san_comp.get("returncode") == 0 and san_comp.get("binary"):
+                candidate = Path(str(san_comp["binary"]))
+            elif data.get("engine_used") == "sanitizers" and comp_ok:
+                bin_val = data.get("binary") or (comp.get("binary") if comp else None)
+                if bin_val:
+                    candidate = Path(str(bin_val))
+        elif eng == "eacsl":
+            if data.get("engine_used") == "eacsl" and comp_ok:
+                bin_val = data.get("binary") or (comp.get("binary") if comp else None)
+                if bin_val:
+                    candidate = Path(str(bin_val))
+
+    if candidate is None:
+        mod = data.get("module")
+        mod_note = f" for module {mod!r}" if mod else ""
+        reason = data.get("engine_fallback_reason") if eng == "eacsl" else None
+        reason_note = f" ({reason})" if reason else ""
+        raise PrebuiltBinaryError(
+            f"no prebuilt {eng!r} binary recorded{mod_note}{reason_note}; "
+            "run the build stage instead of compiling inside a fuzz/replay lease"
+        )
+
+    if require_exists and not candidate.is_file():
+        raise PrebuiltBinaryError(
+            f"prebuilt {eng!r} binary does not exist on disk: {candidate}; "
+            "rerun the build stage instead of compiling inside a fuzz/replay lease"
+        )
+    return candidate
 
 
 # A diagnostic Frama-C prints when it stops on its own (`[kernel] User Error`, `[e-acsl] Failure`,
