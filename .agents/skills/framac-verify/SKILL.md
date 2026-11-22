@@ -53,7 +53,7 @@ The upstream WP, Eva, RTE, ACSL and E-ACSL manuals are available as greppable Ma
 - `--profile quick|standard|deep`: Run profile (default `standard`; see `docs/guides/v2-design.md` Section 9). Profiles change breadth, never the evidence bar.
 - `--scope <path>`: Restrict to repository-relative paths (repeatable). Everything else is seeded `out_of_scope`.
 - `--max-agents <N>`: Cap on concurrent LLM subagents: pass it as `wp_scheduler.py step --max-agents <N>`. Default: what `resources.py recommend` derives from the measured machine (`max_agents`), capped at 16, or 32 on 32+ CPUs and 64 on 64+ CPUs; `FRAMAC_MAX_AGENTS` replaces that cap.
-- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's CPU-second budget per harness case (quick 60, standard 120, deep 900), capped per link unit (480 / 1200 / 7200), divided by the workers the machine allows.
+- `--fuzz-time <SEC>`: Wall-clock override per module for the Phase 1 burst: `pipeline_make.py params set --module <mod> --fuzz-max-time <SEC>` for each module. Default: the profile's CPU-second budget per harness case (quick 60, standard 120, deep 900, capped per link unit at 480 / 1200 / 7200; under `FRAMAC_FUZZ_EXPLORE_JUDGE=on`, sublinear budgets 60 / 600 / 3600 per case with sqrt unit cap on base 480 / 7200 / 43200), divided by the clamped worker count.
 - `--run-dir <dir>`: Resume an existing run directory instead of creating a new one.
 
 ## Resources
@@ -120,17 +120,26 @@ Phase 0 is done when `build-check` passes: it records `phase_done = 0` itself, o
 
 ### Phases 1 and 2 — Fuzzing and abstract interpretation (Make, no subagents)
 
-These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/SKILL.md`, `skills/framac-eva/SKILL.md`):
+These per-module runs need no judgment, so Make runs them (`skills/framac-fuzz/SKILL.md`, `skills/framac-eva/SKILL.md`). End-to-end Make stage flow:
+
+`build -> smoke -> fuzz -> judge/coverage -> reach-dynamic/eacsl-fuzz -> eva -> eva-tune -> ingest -> wp-sweep -> report` (with `replay wp-queue` between `ingest` and Phase 3; `smoke` applies under `FRAMAC_HARNESS_SMOKE=on`, `judge` and `deep`-only `eacsl-fuzz` under `FRAMAC_FUZZ_EXPLORE_JUDGE=on`).
+
+**No Fuzz/Eva overlap (P4):** Fuzz stages (`build`, `smoke`, `fuzz`, `judge`, `coverage`, `reach-dynamic`, `eacsl-fuzz`) and Eva stages (`eva`, `eva-tune`) run in strictly separate stages and must never overlap concurrently. Running them sequentially prevents CPU/memory lease contention and gives standalone `eva` and `eva-tune` a writable `rw` `/framac-cache` mount.
+
 1. Regenerate the Makefile in the foreground if harnesses changed since Phase 0: `python3 /opt/framac-pipeline/scripts/pipeline_make.py gen`. `pipeline_make.py run` refuses every target after Phase 0 (exit 2, an error naming `pipeline_make.py gen`) while the inputs `gen` plans modules from are missing: the callgraph DAG has no module, or no harness sidecar (`workspace/harnesses/harness_<mod>.json`) matches one of them. Finish Phase 0 first; do not work around the refusal.
 2. Compile every module: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run build`.
-3. Run `fuzz` and `eva` in the foreground (sequentially gives standalone `eva` a writable `rw` `/framac-cache` mount; if your harness supports concurrent background wrapper calls, you may run `fuzz` and `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva` concurrently with `ro` cache):
+3. Under `FRAMAC_HARNESS_SMOKE=on`, run the standalone harness smoke gate before fuzzing and Eva: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run smoke` (`harness_smoke.py run` + `phase0_gates.py record-smoke`; quarantines unambiguous harness setup faults and blocks `fuzz`/`eva` on startup errors).
+4. Run Phase 1 fuzzing, judgement, coverage, and dynamic reachability in the foreground:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run fuzz`
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run judge coverage` (under `FRAMAC_FUZZ_EXPLORE_JUDGE=on`; otherwise `run coverage`)
+   - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run reach-dynamic` (and under `--profile deep` with `FRAMAC_FUZZ_EXPLORE_JUDGE=on`, `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eacsl-fuzz`)
+   A dynamic gap stops no `fuzz-`/`eva-` target: it holds the module's planned units out of WP (`ledger.py gate-reach`, run by `wp-replay` and `wp-queue`). A static reach failure still stops the module's targets, and `wp-queue` refuses the whole run until every module passes. Repair its harness and re-run the reach gate (`python3 /opt/framac-pipeline/scripts/pipeline_make.py run reach-gate`), or exempt the entry point (`harness_reach.py exempt` re-checks the gate itself; `skills/framac-fuzz/SKILL.md`, Step 3), then re-run the module (`run module-<mod>`, then `run coverage-<mod> reach-dynamic-<mod>`). A module whose coverage could not be measured is listed under `unmeasured` instead: `reach-dynamic` exits non-zero but records no gap (`skills/framac-fuzz/SKILL.md`, Step 3).
+5. Run Phase 2 abstract interpretation in the foreground after Phase 1 finishes:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run eva-tune` (the deterministic Eva ladder, for modules that still have Unknowns; `skills/framac-eva/SKILL.md`, Step 2a). Skip it under `--profile quick`, which allows no extra Eva runs.
 
    Write the `build`, `ingest`, standalone `eva`, `eva-tune` and `wp-sweep` commands as shown, with the full script path `/opt/framac-pipeline/scripts/pipeline_make.py`, so later runs on the same repository reuse their builds, evolved fuzz corpora, Eva results and proofs (`docs/guides/resources-and-caching.md`, Section 5).
-4. Measure what each corpus reached, for the report's coverage gaps, and record the API entry points no input executed as dynamic gaps: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run coverage reach-dynamic`. A dynamic gap stops no `fuzz-`/`eva-` target: it holds the module's planned units out of WP (`ledger.py gate-reach`, run by `wp-replay` and `wp-queue`). A static reach failure still stops the module's targets, and `wp-queue` refuses the whole run until every module passes. Repair its harness and re-run the reach gate (`python3 /opt/framac-pipeline/scripts/pipeline_make.py run reach-gate`), or exempt the entry point (`harness_reach.py exempt` re-checks the gate itself; `skills/framac-fuzz/SKILL.md`, Step 3), then re-run the module (`run module-<mod>`, then `run coverage-<mod> reach-dynamic-<mod>`). A module whose coverage could not be measured is listed under `unmeasured` instead: `reach-dynamic` exits non-zero but records no gap (`skills/framac-fuzz/SKILL.md`, Step 3).
-5. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
+6. Ingest reports (and publish evolved fuzz corpora to `/framac-cache/corpora/<module>`), then prepare Phase 3:
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run ingest`
    - `python3 /opt/framac-pipeline/scripts/pipeline_make.py run replay wp-queue`
    - Optional, when crash reproducers are large or hard to read: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run minimize` (cvise/creduce; each artifact gets a `.min` sibling that verifiers replay first).
@@ -150,7 +159,7 @@ Tune modules with `pipeline_make.py params set` when Eva or fuzzing needs it, th
 Execute `skills/framac-wp/SKILL.md`. Its scheduler loop handles everything:
 - **Gate.** Verifier tasks for every `unverified` candidate (`skills/framac-wp/crash_verifier_brief.md`):
   - `confirmed`: the function's units become `candidate` and are excluded from WP. Optional `remediation.fix_patch` is promoted to `agents/<id>/artifacts/` without touching `workspace/work/`.
-  - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run `pipeline_make.py run reach-gate` (the repaired harness has a new digest, which `build-`/`fuzz-<mod>` refuse until the gate records it), then `pipeline_make.py run module-<mod>` (fuzz, Eva and facts on the repaired harness: do not replace it with fuzz alone), then `wp_scheduler.py refresh --module <mod>`. The repair task lists these actions in this order. A whole-run `reach-gate` exits 1 while another module still has a gap; it still records this module's row. `refresh` closes the repair only when the module's fuzz and Eva reports carry the repaired harness's `harness_digest`; otherwise it exits 1 with `repair: "stale_evidence"` and the `targets` and `actions` still to run. Run them and `refresh` again.
+  - `rejected` as `harness_induced` creates a repair task while `repair_attempts < 2`. Under `FRAMAC_VERIFIER_BREAKER=on`, modules with `> 3` candidates run a small probe batch first and trip a circuit breaker on `>= 2` and `>= 2/3` `harness_induced` verdicts to pause remaining verifiers and open `repair:<mod>` immediately (`skills/framac-wp/SKILL.md`). Record the repair with `generate_harness.py --record-repair`, fix `harness_<mod>.c`, run the task's listed `actions` in order (`pipeline_make.py run reach-gate`, then `pipeline_make.py run module-<mod>`, or fast fuzz-only targets when no Eva report exists yet), then `wp_scheduler.py refresh --module <mod>`. A whole-run `reach-gate` exits 1 while another module still has a gap; it still records this module's row. `refresh` closes the repair only when the module's existing fuzz and Eva reports carry the repaired harness's `harness_digest` (and supersedes stale `paused_by_breaker` candidates via `ledger.py supersede-candidates` without touching `confirmed` findings); otherwise it exits 1 with `repair: "stale_evidence"` and the `targets` and `actions` still to run. Run them and `refresh` again.
   - `rejected` as `toolchain_artifact` (the checking tool's false alarm in correct code) creates no repair task and changes neither the target nor the harness. `complete` returns only the decision; the class and the tool defect are in the record's `rejection_class` and `reason` in `findings.json`, and REPORT.md counts rejections by class. Record the defect as in "Recording pipeline bugs" below, and as an upstream report when the tool is Frama-C.
   - Opposite verdicts at one sink come back from `complete` in `sink_conflicts`. The scheduler re-verifies the rejected side when it can; you do not pick a side, and an unresolved pair is listed in REPORT.md.
   - After two attempts, the candidate's linked units become `blocked` (`harness_repair_exhausted`). Regenerating the harness keeps the recorded attempts.
@@ -165,15 +174,23 @@ Once `wp_scheduler.py status` reports `"done": true`: `python3 /opt/framac-pipel
 3. Set the terminal status:
    - `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status complete` only if no candidate is unverified and no unit is `planned`/`in_progress`;
    - otherwise `python3 /opt/framac-pipeline/scripts/run_metadata.py set-status --status incomplete --reason <exact reason>`.
-4. Export the diff, validate and generate the reports: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run report`. It runs `ledger.py audit-hypotheses` (so no caller shows as unconditionally proven while a callee is not), `export-diff`, `validate_artifacts.py run-dir .`, then `generate_report.py`, which refuses invalid inputs.
+4. Export the diff, validate and generate the reports: `python3 /opt/framac-pipeline/scripts/pipeline_make.py run report`. It runs `ledger.py audit-hypotheses` (so no caller shows as unconditionally proven while a callee is not), `export-diff`, `validate_artifacts.py run-dir .` (also validating smoke, judge, harness-reach, and fuzz/eacsl-fuzz reports when present), then `generate_report.py`, which refuses invalid inputs. When the corresponding artifacts or breaker state exist, `REPORT.md` also includes `### Harness Smoke Gate`, `### Phase 1 Explore / Judge Breakdown` (explore, judge, and `deep` `eacsl_fuzz`), and `### Verifier Circuit Breaker` sections.
 5. Mark the checkpoint complete: `python3 /opt/framac-pipeline/scripts/checkpoint.py complete state`.
 6. `--in-place` is a separate host-side step after the user reviews the report: `python <pipeline>\scripts\workspace_overlay.py apply-in-place --overlay <run-dir>\workspace --target <target-dir>`.
 
-### Kill switches (A/B comparison, troubleshooting)
+### Kill switches and A/B feature flags (A/B comparison, troubleshooting)
 
+Operational kill switches:
 - `FRAMAC_CACHE=off`: no caches at all.
 - `FRAMAC_BROKER=off` (or `-NoBroker`): the wrapper's previous static sizing.
 - `FRAMAC_SCHEDULER=waves`: wave-by-wave dispatch with barriers.
+
+Harness & fuzzing overhaul A/B feature flags (all five are forwarded by `wrappers/framac-docker.ps1`, `wrappers/framac-docker.sh`, and `docker-compose.yml`, and **default to `off`** while A/B evaluation runs):
+- `FRAMAC_HARNESS_SCOPE_V2` (`off` | `on`): P1 unit-visibility scoping (`executable`, `plugin_so`, `internal_convenience`, `public_lib`), first-class `tf_*` reach credit, and sidecar `api_auto_exempt` acceptance (`/framac-slice`).
+- `FRAMAC_API_TRUST_SCHEMA` (`off` | `on`): P2A deterministic `--api` upgrades: threat-model parameter roles (S1), widened by-value and schema-taking builders (S2), `const` schema instances (S3), and `--api` hygiene (`/framac-slice`).
+- `FRAMAC_HARNESS_SMOKE` (`off` | `on`): P3 standalone harness smoke gate (`smoke` / `smoke-%` running `harness_smoke.py run` + `phase0_gates.py record-smoke` before fuzzing and Eva) (`/framac-slice`, `/framac-fuzz`).
+- `FRAMAC_FUZZ_EXPLORE_JUDGE` (`off` | `on`): P4 Explore / Judge split (pre-built `.san` Explore, standalone `.e-acsl` Judge, `deep`-only `eacsl-fuzz`, per-case blinding at `K_case = 16`, sublinear fuzz budgets) (`/framac-fuzz`).
+- `FRAMAC_VERIFIER_BREAKER` (`off` | `on`): P5 crash clustering, small probe-batch dispatch, and verifier circuit breaker pausing pending verifiers to open `repair:<mod>` on harness-induced storms (`/framac-wp`).
 
 ## Recording pipeline bugs
 
