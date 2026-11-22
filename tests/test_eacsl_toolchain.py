@@ -236,7 +236,9 @@ def test_two_stage_compile_routes_flags_and_selects_instrumented_binary(tmp_path
     assert "-C" in stage2 and "-n" not in stage2 and "-E" not in stage2
     assert "-include" not in backend and "-I" not in backend.split()[0]
     assert " -g " not in f" {backend} " and "-gline-tables-only" in backend
-    assert stage2[stage2.index("-l") + 1] == "-fsanitize=fuzzer -lbsd"
+    # Position-dependent (eacsl_toolchain.EACSL_NON_PIE_COMPILE/LINK): library-owned globals are copied in.
+    assert stage2[stage2.index("-l") + 1] == "-fsanitize=fuzzer -lbsd -no-pie"
+    assert backend.split()[-1] == "-fno-pie"
     # The runtime init hook is linked right before the instrumented file.
     assert stage2[-2].endswith("eacsl_runtime/fuzz_init.c") and res["init_hook"] == stage2[-2]
     assert stage2[-1].endswith("fuzz_mod.instrumented.c")
@@ -702,7 +704,7 @@ def test_variadic_fallbacks_are_linked_from_a_separate_object(tmp_path, modern_c
         "{ FC_ERRNO_IN(); int r = open(filename, flags, mode); FC_ERRNO_OUT(); return r; }" in gen
     )
     final_stage2 = fake.calls[-1]
-    assert final_stage2[final_stage2.index("-l") + 1].endswith("eacsl_fallbacks.o")
+    assert final_stage2[final_stage2.index("-l") + 1].split()[-2].endswith("eacsl_fallbacks.o")
     # The instrumented source is never modified (fallback numbering stays stable).
     assert out_bin.with_suffix(".instrumented.c").read_text(encoding="utf-8") == instrumented
 

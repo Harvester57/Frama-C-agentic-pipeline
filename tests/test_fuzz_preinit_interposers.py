@@ -379,14 +379,19 @@ def test_fuzz_init_sets_the_runtime_up_from_the_executables_preinit_array():
 class _FpiFakeEacslGcc:
     """Both e-acsl-gcc stages and the shim compiles, recording each command."""
 
-    def __init__(self) -> None:
+    def __init__(self, stage2_error=None) -> None:
         self.calls: list[list[str]] = []
+        # cmd -> linker stderr that fails this stage 2, or None.
+        self.stage2_error = stage2_error
 
     def __call__(self, cmd, **kwargs):
         self.calls.append(list(cmd))
         if cmd[0] == "clang" and "-c" in cmd:
             Path(cmd[cmd.index("-o") + 1]).write_bytes(b"obj")
         elif "-C" in cmd:
+            error = self.stage2_error(cmd) if self.stage2_error else None
+            if error:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=error)
             out = Path(cmd[cmd.index("-O") + 1])
             out.write_bytes(b"plain build")
             out.with_name(out.name + ".e-acsl").write_bytes(b"\x7fELF...__e_acsl_assert...eacsl_store_block")
@@ -410,3 +415,189 @@ def test_the_eacsl_build_record_says_the_runtime_is_set_up_at_preinit(tmp_path, 
         "source": res["init_hook"],
         "fallback": "LLVMFuzzerInitialize",
     }
+
+
+# Library-owned globals (sudo run-1: tf_fuzz_iolog_json, libsudo_util_so_0_0_0, ... crashed in
+# `__e_acsl_globals_init` on `__e_acsl_store_block((void *)(& __progname),8UL)`): in a PIE that address is
+# libc's, outside every segment the runtime shadows. A position-dependent link copies the data into the
+# executable's own globals (R_X86_64_COPY), decided by the linker for every library-owned object.
+
+# `readelf -rW` of a position-dependent binary referencing environ and __progname (x86_64, glibc 2.39).
+FPI_READELF_NON_PIE = (
+    "\n"
+    "Relocation section '.rela.dyn' at offset 0x6d8 contains 4 entries:\n"
+    "    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend\n"
+    "0000000000403fd8  0000000200000006 R_X86_64_GLOB_DAT      0000000000000000 __libc_start_main@GLIBC_2.34 + 0\n"
+    "0000000000403fe0  0000000400000006 R_X86_64_GLOB_DAT      0000000000000000 __gmon_start__ + 0\n"
+    "0000000000404040  0000000700000005 R_X86_64_COPY          0000000000404040 __progname@GLIBC_2.2.5 + 0\n"
+    "0000000000404048  0000000800000005 R_X86_64_COPY          0000000000404048 environ@GLIBC_2.2.5 + 0\n"
+    "\n"
+    "Relocation section '.rela.plt' at offset 0x738 contains 1 entry:\n"
+    "    Offset             Info             Type               Symbol's Value  Symbol's Name + Addend\n"
+    "0000000000404000  0000000300000007 R_X86_64_JUMP_SLOT     0000000000000000 strlen@GLIBC_2.2.5 + 0\n"
+)
+FPI_PROTECTED_COPY_ERROR = (
+    "/usr/bin/ld: /tmp/fuzz_mod-1a2b.o: copy relocation against non-copyable protected symbol `lib_table' "
+    "in libtable.so\nclang: error: linker command failed with exit code 1 (use -v to see invocation)\n"
+)
+
+
+def _fpi_eacsl_build(tmp_path: Path, monkeypatch, fake: _FpiFakeEacslGcc) -> dict:
+    import eacsl_toolchain as T
+
+    monkeypatch.setattr(fuzz_build, "_resolve_eacsl_gcc", lambda: ("e-acsl-gcc", True))
+    monkeypatch.setattr(T.shutil, "which", lambda name: None)
+    src = tmp_path / "mod.c"
+    src.write_text("extern const char *__progname;\nint entry(void) { return __progname[0]; }\n", encoding="utf-8")
+    return R.compile_eacsl_binary([str(src)], tmp_path / "out" / "fuzz_mod", runner=fake, use_cache=False)
+
+
+def _fpi_stage2(fake: _FpiFakeEacslGcc) -> list[list[str]]:
+    return [c for c in fake.calls if c[0] == "e-acsl-gcc" and "-C" in c]
+
+
+def test_fuzz_init_registers_the_environment_pointer_array_the_runtime_leaves_out():
+    # E-ACSL's argv_alloca registers each environment string, never the array of pointers to them:
+    # walking `environ` in target code failed `\initialized(e)` on its first element.
+    body = _strip_comments(FPI_FUZZ_INIT.read_text(encoding="utf-8"))
+    init = body[body.index("static void fc_eacsl_runtime_init(") : body.index("static void fc_eacsl_preinit(")]
+    memory_init = init.index("__e_acsl_memory_init(argc, argv")
+    store = init.index("__e_acsl_store_block(fc_env, (fc_env_count + 1) * sizeof(char *));")
+    initialize = init.index("__e_acsl_initialize(fc_env, (fc_env_count + 1) * sizeof(char *));")
+    assert memory_init < store < initialize < init.index("__e_acsl_globals_init();")
+
+
+def test_readelf_copy_relocations_name_the_library_globals_the_executable_owns():
+    assert fuzz_build.parse_copy_relocations(FPI_READELF_NON_PIE) == ["__progname", "environ"]
+    # A PIE has no copy relocation: its library data stays in the library.
+    pie = FPI_READELF_NON_PIE.replace("R_X86_64_COPY ", "R_X86_64_GLOB_DAT")
+    assert fuzz_build.parse_copy_relocations(pie) == []
+
+
+def test_the_eacsl_binary_is_linked_position_dependent_so_library_globals_are_copied_in(tmp_path, monkeypatch):
+    monkeypatch.setattr(fuzz_build, "copied_library_globals", lambda binary: ["__progname", "environ"])
+    fake = _FpiFakeEacslGcc()
+    res = _fpi_eacsl_build(tmp_path, monkeypatch, fake)
+    assert res["returncode"] == 0, res
+    (stage2,) = _fpi_stage2(fake)
+    assert "-fno-pie" in stage2[stage2.index("-e") + 1].split()
+    assert stage2[stage2.index("-l") + 1].split()[-1] == "-no-pie"
+    # Nothing is left out of tracking: the record lists what the linker copied into the executable.
+    assert res["position_dependent"] == {
+        "pie": False,
+        "compile": "-fno-pie",
+        "link": "-no-pie",
+        "copied_library_globals": ["__progname", "environ"],
+    }
+
+
+def test_a_link_that_cannot_be_position_dependent_falls_back_to_a_pie_and_says_why(tmp_path, monkeypatch):
+    fake = _FpiFakeEacslGcc(stage2_error=lambda cmd: FPI_PROTECTED_COPY_ERROR if "-no-pie" in " ".join(cmd) else None)
+    res = _fpi_eacsl_build(tmp_path, monkeypatch, fake)
+    assert res["returncode"] == 0, res
+    first, second = _fpi_stage2(fake)
+    assert "-no-pie" in first[first.index("-l") + 1] and "-fno-pie" in first[first.index("-e") + 1]
+    assert "-no-pie" not in " ".join(second) and "-fno-pie" not in " ".join(second)
+    record = res["position_dependent"]
+    assert record["pie"] is True and record["compile"] is None and record["link"] is None
+    assert "non-copyable protected symbol `lib_table'" in record["fallback_reason"]
+    assert "copied_library_globals" not in record
+    assert "linking a PIE" in Path(res["compile_log"]).read_text(encoding="utf-8")
+
+
+def test_an_unrelated_link_error_keeps_the_binary_position_dependent(tmp_path, monkeypatch):
+    error = "/usr/bin/ld: fuzz_mod.o: undefined reference to `missing_fn'\n"
+    fake = _FpiFakeEacslGcc(stage2_error=lambda cmd: error)
+    res = _fpi_eacsl_build(tmp_path, monkeypatch, fake)
+    assert res["returncode"] != 0
+    (stage2,) = _fpi_stage2(fake)
+    assert "-no-pie" in stage2[stage2.index("-l") + 1]
+    assert res["position_dependent"]["pie"] is False and "fallback_reason" not in res["position_dependent"]
+
+
+# Two units: the harness, and a module reading libc's `environ` and `__progname` (a PIE build crashed in
+# __e_acsl_globals_init registering them, before any input ran).
+FPI_LIBC_GLOBALS_HARNESS = """#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+size_t fpi_env_weight(void);
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  unsigned char buf[8];
+  size_t n = size < sizeof buf ? size : sizeof buf;
+  if (n == 0)
+    return 0;
+  memcpy(buf, data, n);
+  return (int)((fpi_env_weight() + buf[0]) & 0u);
+}
+"""
+FPI_LIBC_GLOBALS_MODULE = """#include <stddef.h>
+
+extern char **environ;
+extern const char *__progname;
+
+size_t fpi_env_weight(void) {
+  size_t n = 0;
+  if (__progname != NULL && __progname[0] != '\\0')
+    n++;
+  for (char **e = environ; e != NULL && *e != NULL; e++)
+    n++;
+  return n;
+}
+"""
+FPI_LIBC_GLOBALS_DRIVER = """import json, sys
+from pathlib import Path
+sys.path.insert(0, "/opt/framac-pipeline/scripts")
+import fuzz_build
+res = fuzz_build.compile_eacsl_binary(["harness.c", "module.c"], Path("/w/out/fuzz_fpi"), use_cache=False)
+keep = ("returncode", "binary", "position_dependent", "runtime_init", "compile_log")
+Path("/w/build.json").write_text(json.dumps({k: res.get(k) for k in keep}), encoding="utf-8")
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_an_eacsl_binary_reading_libc_globals_starts_and_runs_inputs(tmp_path):
+    import os
+
+    from conftest import ANALYSIS_IMAGE, require_docker_images
+
+    require_docker_images(ANALYSIS_IMAGE)
+    files = {
+        "harness.c": FPI_LIBC_GLOBALS_HARNESS,
+        "module.c": FPI_LIBC_GLOBALS_MODULE,
+        "driver.py": FPI_LIBC_GLOBALS_DRIVER,
+    }
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8", newline="\n")
+    script = (
+        "cd /w && timeout 900 python3 driver.py > driver.log 2>&1; echo driver=$?; "
+        'B=$(python3 -c \'import json; print(json.load(open("build.json"))["binary"])\'); '
+        'mkdir -p corpus && printf "abc" > corpus/a && '
+        'timeout 120 "$B" -runs=200 -seed=1 corpus > run.log 2>&1; echo run=$?'
+    )
+    proc = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none",
+            "--label", os.environ.get("FPI_DOCKER_LABEL", "framac.test=test_fuzz_preinit_interposers"),
+            "-v", f"{tmp_path}:/w",
+            "-v", f"{FPI_REPO / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+            "-v", f"{FPI_REPO / 'templates'}:/opt/framac-pipeline/templates:ro",
+            "-v", f"{FPI_REPO / 'schemas'}:/opt/framac-pipeline/schemas:ro",
+            "--entrypoint", "bash", ANALYSIS_IMAGE, "-c", script,
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1200, check=False,
+    )  # fmt: skip
+    log = proc.stdout + proc.stderr
+    driver_log = (tmp_path / "driver.log").read_text(encoding="utf-8", errors="replace")
+    assert "driver=0" in log, (log, driver_log)
+    build = json.loads((tmp_path / "build.json").read_text(encoding="utf-8"))
+    assert build["returncode"] == 0, build
+    assert build["position_dependent"]["pie"] is False, build
+    copied = set(build["position_dependent"]["copied_library_globals"])
+    # glibc's `environ` is an alias of `__environ`; readelf names the relocation after either.
+    assert "__progname" in copied and copied & {"environ", "__environ"}, build
+    run_log = (tmp_path / "run.log").read_text(encoding="utf-8", errors="replace")
+    assert "run=0" in log, run_log
+    assert "__e_acsl_globals_init" not in run_log and "Done 200 runs" in run_log, run_log

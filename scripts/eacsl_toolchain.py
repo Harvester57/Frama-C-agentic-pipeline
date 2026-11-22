@@ -295,6 +295,17 @@ _FMT_HUNKS: tuple[tuple[str, str, str], ...] = (
 # global register variable (`register T x asm("reg")`) would change meaning; Frama-C does not parse
 # those anyway.
 EACSL_FULL_MTRACKING_DEFINES = ("-Dregister=",)
+# Stage 2 builds a position-dependent executable. The runtime's segment model tracks the executable's own
+# globals only; a global a shared library owns and the slice uses (`extern char **environ`, sudo's
+# `extern const char *__progname`, `stdin`, `optarg`, `tzname`, ...) is, in a PIE, reached through the GOT
+# at its address in the library, and `__e_acsl_store_block(&environ, 8)` in __e_acsl_globals_init
+# segfaulted in shadow_alloca (nginx; sudo run-1: libsudo_util_so_0_0_0 and the tf_fuzz_* modules). Built
+# -fno-pie and linked -no-pie, every such reference gets a copy relocation into the executable's .bss,
+# libc itself uses that copy, and the runtime tracks it like any other global: the linker decides which
+# symbols, for every library, and no check is dropped. Dropping their registration instead would make
+# every `\initialized(&__progname)` read check fail.
+EACSL_NON_PIE_COMPILE = "-fno-pie"
+EACSL_NON_PIE_LINK = "-no-pie"
 # RTE emits no initialization assertions unless asked, so uninitialized reads would go unchecked.
 # Reads of memory written outside instrumented code (libFuzzer's `data`, external libraries) fail
 # these checks: harnesses must copy the input into their own buffer, as generated harnesses do.

@@ -30,6 +30,8 @@
 
 void __e_acsl_memory_init(int *argc_ref, char ***argv_ref, size_t ptr_size);
 void __e_acsl_globals_init(void) __attribute__((weak));
+void *__e_acsl_store_block(void *ptr, size_t size);
+void __e_acsl_initialize(void *ptr, size_t size);
 extern char **environ;
 
 /*
@@ -58,6 +60,17 @@ static void fc_eacsl_runtime_init(int *argc, char ***argv)
     char **fc_env = environ;
     __e_acsl_memory_init(argc, argv, sizeof(void *));
     environ = fc_env;
+    /* argv_alloca registers each environment string but not the array of
+     * pointers to them, as it does for argv: target code walking `environ`
+     * (or `*environ` read through `__environ`) failed \initialized on the
+     * first element. The array is registered here, terminating NULL included. */
+    if (fc_env) {
+        size_t fc_env_count = 0;
+        while (fc_env[fc_env_count])
+            fc_env_count++;
+        __e_acsl_store_block(fc_env, (fc_env_count + 1) * sizeof(char *));
+        __e_acsl_initialize(fc_env, (fc_env_count + 1) * sizeof(char *));
+    }
     if (__e_acsl_globals_init)
         __e_acsl_globals_init();
     __fc_eacsl_runtime_ready = 1;
