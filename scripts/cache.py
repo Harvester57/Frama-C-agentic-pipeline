@@ -21,8 +21,9 @@ tool versions), a digest of scripts/ and templates/ (bind-mounted, so the image 
 them; without templates/fc_stubs when the key has a dependency manifest, which names the stub headers read)
 and, without a manifest, of the run's stub overlay (workspace/stubs), the effective flags, output paths and cwd, and a dependency manifest: the union of the
 include sets `gcc -M -MG` (with Frama-C-like defines) and `clang -M -MG` report for the effective
-preprocessor flags, each file content-hashed. A build whose manifest cannot be computed is never
-cached.
+preprocessor flags, each file content-hashed; both tools scan the sources in chunks, each call bounded
+by DEPS_TIMEOUT_S. A build whose manifest cannot be computed is never cached, and its record's
+`cache.reason` says why.
 
 Entries are published atomically (temp dir + os.replace), builds of one key are single-flight
 (a thread lock plus the cross-container run lock), and least-recently-used entries are collected
@@ -49,6 +50,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,6 +67,9 @@ DEFAULT_MAX_BYTES = 20 * 1024**3
 DISK_FRACTION = 0.25
 GC_INTERVAL_S = 600
 DEPS_TIMEOUT_S = 120
+# A dependency scan runs in calls of this many sources, each bounded by DEPS_TIMEOUT_S (dependency_manifest).
+DEPS_CHUNK_SOURCES = 8
+DEPS_MAX_WORKERS = 8
 SHARED_DEFAULT_DIR = Path("/framac-cache")
 # Frama-C preprocesses with these defined; headers guarded by them belong in the manifest.
 FRAMAC_DEP_DEFINES = ("-D__FRAMAC__", "-D__FC_MACHDEP_X86_64")
@@ -86,6 +91,8 @@ _GLOBAL_ACSL_DECL_RE = re.compile(
     r"\b(?:predicate|logic|axiomatic|lemma|inductive|type|ghost|model|volatile)\b|\bglobal\s+invariant\b"
 )
 _FN_DECL_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+# Why this thread's last dependency_manifest call failed (builds memoize from several threads).
+_DEPS_SCAN = threading.local()
 _OFF = ("off", "0", "false", "no", "disabled")
 _ON = ("on", "1", "true", "yes", "enabled")
 
@@ -1100,32 +1107,110 @@ def preprocessor_args(tokens: Iterable[str]) -> list[str]:
     return out
 
 
+def deps_scan_workers(n_chunks: int) -> int:
+    """
+    Parallel `-M` calls for `n_chunks` chunks: the job's CPU grant (FRAMAC_JOB_CPUS, which may be
+    fractional, floored to at least 1), else the CPUs this process may run on, capped at
+    DEPS_MAX_WORKERS and at the number of chunks.
+    """
+    cpus: int | None = None
+    raw = (os.environ.get("FRAMAC_JOB_CPUS") or "").strip()
+    try:
+        if raw:
+            cpus = max(1, int(float(raw)))
+    except ValueError:
+        cpus = None
+    if cpus is None:
+        try:
+            cpus = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            cpus = os.cpu_count() or 1
+    return max(1, min(n_chunks, cpus, DEPS_MAX_WORKERS))
+
+
+def dependency_scan_failure() -> str | None:
+    """Why this thread's last `dependency_manifest` call returned None (None after a success)."""
+    return getattr(_DEPS_SCAN, "failure", None)
+
+
+def _scan_chunk(
+    run: Callable, tool: str, extra: Iterable[str], pre: list[str], chunk: list[str], timeout: float
+) -> tuple[list[str] | None, str | None]:
+    """The prerequisites `tool -M -MG` reports for `chunk`, or None and why the call failed."""
+    cmd = [tool, "-M", "-MG", *extra, *pre, *chunk]
+    try:
+        proc = run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {timeout:g} s"
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return None, f"could not run ({type(exc).__name__}: {exc})"
+    if proc.returncode != 0:
+        tail = " ".join((proc.stderr or "").strip().splitlines()[-2:])[-300:]
+        return None, f"exit {proc.returncode}" + (f": {tail}" if tail else "")
+    found = parse_make_deps(proc.stdout or "")
+    if not found:
+        return None, "reported no dependencies"
+    return found, None
+
+
 def dependency_manifest(
     sources: Iterable[str | Path], flags: Iterable[str], runner: Callable | None = None, timeout: float = DEPS_TIMEOUT_S
 ) -> list[list[str]] | None:
     """
     [[path, sha256 | "missing"], ...] for the sources and every file `gcc -M -MG` (with Frama-C's
-    defines) or `clang -M -MG` includes under `flags`. None when either tool fails: an incomplete
-    manifest would make the key unsound, so the caller must not cache.
+    defines) or `clang -M -MG` includes under `flags`. None when any call fails: an incomplete
+    manifest would make the key unsound, so the caller must not cache; `dependency_scan_failure()`
+    then says why.
+
+    Each tool scans the sources in chunks of DEPS_CHUNK_SOURCES, `deps_scan_workers` calls at a
+    time, each call bounded by `timeout`: one call over a module's every source (147 in sudo's
+    sudoers_so, 112 s idle) outgrew a fixed timeout on a loaded machine. Prerequisites are per
+    source, so the union, and the key built from it, is the one a single call reports. The first
+    failing chunk cancels the chunks not yet started, so a hung tool ends after about `timeout`.
     """
+    _DEPS_SCAN.failure = None
     run = runner or subprocess.run
     srcs = [str(s) for s in sources]
     if not srcs:
+        _DEPS_SCAN.failure = "no sources to scan"
         return None
+    started = time.monotonic()
     pre = preprocessor_args(flags)
     deps: set[str] = set(srcs)
+    chunks = [srcs[i : i + DEPS_CHUNK_SOURCES] for i in range(0, len(srcs), DEPS_CHUNK_SOURCES)]
+    workers = deps_scan_workers(len(chunks))
     for tool, extra in (("gcc", FRAMAC_DEP_DEFINES), ("clang", ())):
-        cmd = [tool, "-M", "-MG", *extra, *pre, *srcs]
-        try:
-            proc = run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
-        except (OSError, subprocess.SubprocessError, ValueError):
+        failure: tuple[int, str] | None = None
+        if workers == 1:
+            for idx, chunk in enumerate(chunks):
+                found, why = _scan_chunk(run, tool, extra, pre, chunk, timeout)
+                if found is None:
+                    failure = (idx, why or "failed")
+                    break
+                deps.update(found)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="deps-scan") as pool:
+                pending = {
+                    pool.submit(_scan_chunk, run, tool, extra, pre, chunk, timeout): idx
+                    for idx, chunk in enumerate(chunks)
+                }
+                for fut in as_completed(pending):
+                    found, why = fut.result()
+                    if found is None:
+                        failure = (pending[fut], why or "failed")
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    deps.update(found)
+        if failure is not None:
+            idx, why = failure
+            chunk = chunks[idx]
+            lo = idx * DEPS_CHUNK_SOURCES + 1
+            names = chunk[0] if len(chunk) == 1 else f"{chunk[0]} .. {chunk[-1]}"
+            _DEPS_SCAN.failure = (
+                f"{tool} -M -MG {why} on sources {lo}-{lo + len(chunk) - 1} of {len(srcs)} ({names}); "
+                f"scan stopped after {time.monotonic() - started:.1f} s"
+            )
             return None
-        if proc.returncode != 0:
-            return None
-        found = parse_make_deps(proc.stdout or "")
-        if not found:
-            return None
-        deps.update(found)
     return [[dep, file_digest(dep) or "missing"] for dep in sorted(deps)]
 
 
@@ -1192,22 +1277,25 @@ def memoize(
     """
     Return `build()`'s result, or the cached result of an identical earlier build with its output
     files restored. The result always carries `cache: {"hit": bool, "key": str | None}`; the key
-    is None when caching is off or the dependency manifest is unavailable. When `enable_l2` is
+    is None when caching is off or the dependency manifest is unavailable, and in the latter case
+    `cache.reason` says which scan call failed, how, and after how long. When `enable_l2` is
     True, an L1 miss falls back to a secondary L2 key built from `normalized_dependency_manifest`
     (stripped `#line` directives, blank lines, and unrelated-function ACSL comments). Only results
     for which `ok(result)` holds are published, together with the files `outputs(result)` names.
     """
 
-    def _uncached(key: str | None = None) -> dict:
+    def _uncached(key: str | None = None, reason: str | None = None) -> dict:
         res = build()
-        res["cache"] = {"hit": False, "key": key}
+        res["cache"] = {"hit": False, "key": key, **({"reason": reason} if reason else {})}
         return res
 
     if not enabled():
         return _uncached()
+    _DEPS_SCAN.failure = None
     deps = dependency_manifest(sources, dep_flags, runner=runner)
     if deps is None:
-        return _uncached()
+        why = dependency_scan_failure() or "no reason given"
+        return _uncached(reason=f"not cached: the dependency manifest could not be computed: {why}")
     cwd_posix = Path.cwd().as_posix()
     full = dict(material, cwd=cwd_posix, deps=deps)
     key = make_key(ns, full)
