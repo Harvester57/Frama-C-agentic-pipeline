@@ -1404,9 +1404,7 @@ def _select_v2_entries(
 
     if vis == "executable":
         mains = [
-            k
-            for k in fns
-            if k in fn_set and functions[k].get("name") == "main" and not functions[k].get("is_static")
+            k for k in fns if k in fn_set and functions[k].get("name") == "main" and not functions[k].get("is_static")
         ]
         entries = list(dict.fromkeys([*mains, *tm_entries]))
         if threat_active and tm_entries:
@@ -1568,7 +1566,9 @@ def unit_view(
         fn_set = {k for k in fns if not functions[k].get("model_only")}  # entry points the build defines
         scope_extra: dict = {}
         if v2:
-            unit_tm_status = model_tm_status if model_tm_status is not None else (rec.get("trust") or {}).get("threat_model")
+            unit_tm_status = (
+                model_tm_status if model_tm_status is not None else (rec.get("trust") or {}).get("threat_model")
+            )
             entries, scope_extra = _select_v2_entries(
                 u,
                 rec,
@@ -1597,7 +1597,11 @@ def unit_view(
             "module": name,
             "unit": u,
             "kind": rec.get("kind"),
-            **({"unit_visibility": unit_vis} if isinstance(unit_vis, str) and unit_vis in trust.UNIT_VISIBILITIES else {}),
+            **(
+                {"unit_visibility": unit_vis}
+                if isinstance(unit_vis, str) and unit_vis in trust.UNIT_VISIBILITIES
+                else {}
+            ),
             "concurrent": bool(rec.get("concurrent")),
             **(
                 {"callgraph_fallback": (rec.get("parse") or {}).get("error") or "Frama-C could not parse this unit"}

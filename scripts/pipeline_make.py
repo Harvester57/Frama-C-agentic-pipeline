@@ -2189,7 +2189,9 @@ def run_targets(
         )
     )
     expanded_module_targets: set[str] = set()
-    if not use_legacy_stages and any((sp := _split_module_target(t)) is not None and sp[0] == "module" for t in targets):
+    if not use_legacy_stages and any(
+        (sp := _split_module_target(t)) is not None and sp[0] == "module" for t in targets
+    ):
         expand_plan = build_plan(run_dir, templates_dir)
         expanded: list[str] = []
         for t in targets:

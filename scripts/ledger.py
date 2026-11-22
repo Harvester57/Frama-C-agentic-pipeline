@@ -2505,7 +2505,11 @@ def _ingest_judge_report_into_state(
     # and no module-wide cap/timeout/error gap exists. Check dynamic execution (F7) and
     # per-case blinding/quarantine/failure on each function's reaching cases (P2c).
     executions, unmeasured = _fuzz_coverage_executions(module)
-    reaching_cases = _dispatch_reaching_cases(module, mm.dag) if (blinded_case_ids or smoke_skipped_ids or failed_case_ids or status != "clean") else {}
+    reaching_cases = (
+        _dispatch_reaching_cases(module, mm.dag)
+        if (blinded_case_ids or smoke_skipped_ids or failed_case_ids or status != "clean")
+        else {}
+    )
     has_unattributed_not_judged = not_judged > 0 and not (blinded_case_ids or smoke_skipped_ids)
 
     for u in mod_units:
@@ -2567,7 +2571,12 @@ def _ingest_judge_report_into_state(
                         tool_output,
                         f"E-ACSL judge had blinded case(s) {sorted(blinded_case_ids)} and reaching cases for "
                         f"{u['function']} could not be isolated; E-ACSL fuzz_clean not granted.",
-                        {"module": module, "step": "judge", "engine": "eacsl", "blinded_cases": sorted(blinded_case_ids)},
+                        {
+                            "module": module,
+                            "step": "judge",
+                            "engine": "eacsl",
+                            "blinded_cases": sorted(blinded_case_ids),
+                        },
                     )
                 elif smoke_skipped_ids:
                     add_evidence(
@@ -2579,7 +2588,12 @@ def _ingest_judge_report_into_state(
                         tool_output,
                         f"E-ACSL judge skipped smoke-quarantined case(s) {sorted(smoke_skipped_ids)} and reaching "
                         f"cases for {u['function']} could not be isolated; E-ACSL fuzz_clean not granted.",
-                        {"module": module, "step": "judge", "engine": "eacsl", "quarantined_cases": sorted(smoke_skipped_ids)},
+                        {
+                            "module": module,
+                            "step": "judge",
+                            "engine": "eacsl",
+                            "quarantined_cases": sorted(smoke_skipped_ids),
+                        },
                     )
                 continue
             hit_blinded = sorted(fn_cases & blinded_case_ids)
@@ -2664,7 +2678,9 @@ def cmd_ingest_fuzz(paths: list[Path], judge_reports: list[Path] | None = None) 
         tool_output = rel(str(path))
         module = report.get("module") or path.stem
         status = report.get("status", "unknown")
-        step = str(report.get("discovering_step") or ("eacsl_fuzz" if report.get("mode") == "eacsl-fuzz" else "campaign"))
+        step = str(
+            report.get("discovering_step") or ("eacsl_fuzz" if report.get("mode") == "eacsl-fuzz" else "campaign")
+        )
         # A sub-module's campaign speaks for the functions in its scope, within its link unit.
         mod_units = _module_units(units, *_report_scope(mm, module))
         engine_note = fuzz_engine_note(report)
@@ -2701,7 +2717,13 @@ def cmd_ingest_fuzz(paths: list[Path], judge_reports: list[Path] | None = None) 
         if isinstance(meta_warnings, list) and meta_warnings:
             stats.setdefault("security_props_warnings", {})[module] = [str(w) for w in meta_warnings]
         meta_lost = _fuzz_security_props_lost(report)
-        if meta_lost and status not in ("compile_error", "fuzzer_error", "sandbox_unavailable", "not_run", "startup_error"):
+        if meta_lost and status not in (
+            "compile_error",
+            "fuzzer_error",
+            "sandbox_unavailable",
+            "not_run",
+            "startup_error",
+        ):
             for u in mod_units:
                 if u["obligation_class"] in METACSL_CLASSES:
                     add_evidence(
@@ -3194,9 +3216,8 @@ def cmd_supersede_candidates(
                     continue
 
             resolved_fps = list(cand.get("resolved_fingerprints") or [fp])
-            is_confirmed = (
-                cand.get("status") == "confirmed"
-                or any((findings.get(rfp) or {}).get("verdict") == "confirmed" for rfp in resolved_fps)
+            is_confirmed = cand.get("status") == "confirmed" or any(
+                (findings.get(rfp) or {}).get("verdict") == "confirmed" for rfp in resolved_fps
             )
             if is_confirmed:
                 untouched_confirmed += 1

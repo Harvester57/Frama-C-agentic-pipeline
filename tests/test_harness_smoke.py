@@ -914,4 +914,3 @@ def test_smoke_falls_back_to_eacsl_binary_when_san_intentionally_skipped(tmp_pat
     assert report["startup"]["engines_checked"] == ["eacsl"]
     assert report["counts"] == {"total": 2, "passed": 2, "quarantined": 0, "candidate_warning": 0}
     _assert_valid_smoke_report(report)
-

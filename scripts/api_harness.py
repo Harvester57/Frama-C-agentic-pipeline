@@ -2417,9 +2417,7 @@ def _bind_call(
                         case.rest = _RESERVED_REST
                     try:
                         before.append(
-                            _init_call(
-                                case, pointee, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)
-                            )
+                            _init_call(case, pointee, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i))
                         )
                     finally:
                         if reserved and case.rest is _RESERVED_REST:
@@ -2647,9 +2645,7 @@ def _bind_call(
                         case.rest = _RESERVED_REST
                     try:
                         before.append(
-                            _init_call(
-                                case, ctype, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i)
-                            )
+                            _init_call(case, ctype, f"&{v}", call, i, var=v, schema_inst=builder_schema.get(i))
                         )
                     finally:
                         if reserved and case.rest is _RESERVED_REST:

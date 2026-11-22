@@ -285,9 +285,7 @@ def sidecar_exemptions(
 
 def _module_has_explicit_v2_scope(mod_info: dict[str, Any]) -> bool:
     """True when `mod_info` carries explicit P1 visibility scoping so empty `candidate_entry_points` is intentional."""
-    return any(
-        key in mod_info for key in ("unit_visibility", "harness_scope_note", "deferred_non_attacker_entries")
-    )
+    return any(key in mod_info for key in ("unit_visibility", "harness_scope_note", "deferred_non_attacker_entries"))
 
 
 def _logical_lines(text: str) -> list[str]:
@@ -841,9 +839,7 @@ def check_unit(
     unit_key = unit in module_exempt and (not harness_modules or unit not in mm.lexer_modules)
     sidecar_exempt: dict[str, str] = {}
     for h in harness_modules:
-        for fn, why in sidecar_exemptions(
-            mm.sidecars.get(h), scope_v2=v2, functions=mm.functions, unit=unit
-        ).items():
+        for fn, why in sidecar_exemptions(mm.sidecars.get(h), scope_v2=v2, functions=mm.functions, unit=unit).items():
             sidecar_exempt.setdefault(fn, why)
     match = exemption_matcher(sidecar_exempt, mm.functions)
     exempt: dict[str, str] = {}
@@ -998,8 +994,11 @@ def run_check(
             if not tf:
                 continue
             tf_unit = mm.unit_of(module)
-            if wanted and module not in wanted and tf_unit not in wanted and not any(
-                mm.unit_of(w) == tf_unit for w in wanted
+            if (
+                wanted
+                and module not in wanted
+                and tf_unit not in wanted
+                and not any(mm.unit_of(w) == tf_unit for w in wanted)
             ):
                 continue
             row = _eval_sidecar_row(
@@ -1069,9 +1068,7 @@ def run_check(
                 if static_eps:
                     unit_static_reached = {
                         e: r
-                        for e, r in transitive_only_roots(
-                            static_eps, unit_nonstatic_roots[unit], by_name, unit
-                        ).items()
+                        for e, r in transitive_only_roots(static_eps, unit_nonstatic_roots[unit], by_name, unit).items()
                         if r
                     }
             unit_row = check_unit(
@@ -1962,9 +1959,7 @@ def run_dynamic(
         target_modules = sorted(mm.sidecars)
         if v2 and mm.units_are_link_units:
             regular_units = {
-                mm.unit_of(m)
-                for m, sc in mm.sidecars.items()
-                if not isinstance(sc.get("target_fuzzer"), dict)
+                mm.unit_of(m) for m, sc in mm.sidecars.items() if not isinstance(sc.get("target_fuzzer"), dict)
             }
             for unit in sorted(passing_tf_by_unit):
                 if unit in mm.modules and unit not in regular_units and unit not in target_modules:

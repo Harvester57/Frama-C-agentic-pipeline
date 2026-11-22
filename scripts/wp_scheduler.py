@@ -2249,7 +2249,8 @@ class _View:
         )
         if ok and task["kind"] == "repair":
             ok = all(
-                self.terminal(vtid) for vtid in _repair_verify_deps(self.tasks, task["module"], self.ctx, state=self.state)
+                self.terminal(vtid)
+                for vtid in _repair_verify_deps(self.tasks, task["module"], self.ctx, state=self.state)
             )
         if scc:
             self._group_ready[scc] = ok
@@ -5520,9 +5521,7 @@ def _supersede_after_repair(state: dict, ctx: Ctx, module: str, out: dict[str, A
             if isinstance(old_dig, str) and old_dig and old_dig not in old_digests:
                 old_digests.append(old_dig)
 
-        should_clear = bool(mod_superseded) or (
-            isinstance(tripped_rec, dict) and tripped_old_digest != new_digest
-        )
+        should_clear = bool(mod_superseded) or (isinstance(tripped_rec, dict) and tripped_old_digest != new_digest)
         if not should_clear:
             continue
 

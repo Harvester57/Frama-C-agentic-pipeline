@@ -429,8 +429,7 @@ def test_nanopb_s1_s2_s3_trusted_schema_never_fuzzed_and_capped_at_4(monkeypatch
         assert (
             "c0a0 = pb_istream_from_buffer("
             "(unsigned char *)((fuzz_len > fuzz_off) ? (fuzz_buf + fuzz_off) : c1a0_empty), "
-            "(unsigned long)((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U));"
-            in stmt
+            "(unsigned long)((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U));" in stmt
         )
         # Trusted descriptor is bound to the real const schema instance, NEVER fuzzed!
         assert f"pb_decode(&c0a0, &{inst}, (void *)c0a2);" in stmt
@@ -463,8 +462,7 @@ def test_nanopb_s1_s2_s3_trusted_schema_never_fuzzed_and_capped_at_4(monkeypatch
     assert (
         "c0a0 = pb_istream_from_buffer("
         "(unsigned char *)((fuzz_len > fuzz_off) ? (fuzz_buf + fuzz_off) : c1a0_empty), "
-        "(unsigned long)((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U));"
-        in r_stmt
+        "(unsigned long)((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U));" in r_stmt
     )
     assert r_lay["slots"] == []
     assert r_lay["rest"] == {"call": 1, "param": 0, "kind": "bytes"}

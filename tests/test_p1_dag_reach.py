@@ -80,9 +80,7 @@ def _sudo_shaped_model() -> dict[str, Any]:
         "src/sudo.c#main": _fn("main", "src/sudo.c", units=["build/sudo"], signature="int(int,char **)"),
         "src/parse_args.c#parse_args": _fn("parse_args", "src/parse_args.c", units=["build/sudo"]),
         "src/internal.c#unused_internal": _fn("unused_internal", "src/internal.c", units=["build/sudo"]),
-        "src/net.c#read_net_cmd": _fn(
-            "read_net_cmd", "src/net.c", units=["build/sudo"], external_calls=["recv"]
-        ),
+        "src/net.c#read_net_cmd": _fn("read_net_cmd", "src/net.c", units=["build/sudo"], external_calls=["recv"]),
         # plugin_so: build/sudoers.so
         "plugins/sudoers/policy.c#policy_open": _fn(
             "policy_open", "plugins/sudoers/policy.c", units=["build/sudoers.so"], static=True
@@ -97,25 +95,17 @@ def _sudo_shaped_model() -> dict[str, Any]:
             "sudoers_nonstatic_helper", "plugins/sudoers/util.c", units=["build/sudoers.so"]
         ),
         # internal_convenience: build/libsudo_conv.a
-        "lib/conv/conv.c#conv_helper": _fn(
-            "conv_helper", "lib/conv/conv.c", units=["build/libsudo_conv.a"]
-        ),
-        "lib/conv/conv.c#conv_unused": _fn(
-            "conv_unused", "lib/conv/conv.c", units=["build/libsudo_conv.a"]
-        ),
+        "lib/conv/conv.c#conv_helper": _fn("conv_helper", "lib/conv/conv.c", units=["build/libsudo_conv.a"]),
+        "lib/conv/conv.c#conv_unused": _fn("conv_unused", "lib/conv/conv.c", units=["build/libsudo_conv.a"]),
         # public_lib: build/libsudo_util.so
-        "lib/util/parse.c#util_parse": _fn(
-            "util_parse", "lib/util/parse.c", units=["build/libsudo_util.so"]
-        ),
+        "lib/util/parse.c#util_parse": _fn("util_parse", "lib/util/parse.c", units=["build/libsudo_util.so"]),
         "lib/util/parse.c#util_read_cfg": _fn(
             "util_read_cfg",
             "lib/util/parse.c",
             units=["build/libsudo_util.so"],
             external_calls=["fgets"],
         ),
-        "lib/util/log.c#util_format_log": _fn(
-            "util_format_log", "lib/util/log.c", units=["build/libsudo_util.so"]
-        ),
+        "lib/util/log.c#util_format_log": _fn("util_format_log", "lib/util/log.c", units=["build/libsudo_util.so"]),
         "lib/util/init.c#util_trusted_init": _fn(
             "util_trusted_init", "lib/util/init.c", units=["build/libsudo_util.so"]
         ),
@@ -711,9 +701,7 @@ def _setup_tf_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fuzzer_body: 
     return tmp_path, dag_path, hdir
 
 
-def test_tf_static_reach_credit_off_vs_on_and_schema(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_tf_static_reach_credit_off_vs_on_and_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     With FRAMAC_HARNESS_SCOPE_V2=off: tf_sudoers is additive only; sudoers_so still fails no_harness.
     With FRAMAC_HARNESS_SCOPE_V2=on: passing tf_sudoers credits policy_open and policy_check to
@@ -775,10 +763,7 @@ def test_tf_partial_and_failing_credit(tmp_path: Path, monkeypatch: pytest.Monke
     run_dir, dag_path, hdir = _setup_tf_run(
         tmp_path / "partial",
         monkeypatch,
-        "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) {\n"
-        "  policy_open(d, n);\n"
-        "  return 0;\n"
-        "}\n",
+        "int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) {\n  policy_open(d, n);\n  return 0;\n}\n",
     )
     rep = hr.run_check(dag_path, hdir, ["sudoers_so"], run_dir=run_dir)
     assert rep["passed"] is False
@@ -1139,9 +1124,7 @@ def test_batch_exempt_repeatable_function_runs_regate_once(
     assert len(regate_calls) == 2
 
 
-def test_static_reader_auto_exempt_and_reach_v2_off_vs_on(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_static_reader_auto_exempt_and_reach_v2_off_vs_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Under FRAMAC_HARNESS_SCOPE_V2=on, file-local `static` required roots (like nanopb's `buf_read` and
     `pb_readbyte`) are auto-exempted when:
@@ -1251,9 +1234,7 @@ def test_static_reader_auto_exempt_and_reach_v2_off_vs_on(
     hdir = tmp_path / "workspace" / "harnesses"
     hdir.mkdir(parents=True)
     # Harness calls only `pb_read` (not `pb_decode_tag`, not `buf_read`, not `pb_readbyte`).
-    (hdir / "harness_libprotobuf_nanopb_a.c").write_text(
-        "void drive(void) { pb_read(); }\n", encoding="utf-8"
-    )
+    (hdir / "harness_libprotobuf_nanopb_a.c").write_text("void drive(void) { pb_read(); }\n", encoding="utf-8")
     sidecar = {
         "module": "libprotobuf_nanopb_a",
         "unit": "libprotobuf_nanopb_a",
@@ -1326,9 +1307,7 @@ def test_static_reader_auto_exempt_and_reach_v2_off_vs_on(
     assert dyn["modules"][0]["gaps"] == ["orphan_static", "public_transitive_only"]
 
 
-def test_check_unit_static_reader_from_submodule_harness(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_check_unit_static_reader_from_submodule_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     In `check_unit()` under FRAMAC_HARNESS_SCOPE_V2=on, unharnessed static required roots in a link
     unit are satisfied when reached from a non-static root of a sub-module harness OR recorded as

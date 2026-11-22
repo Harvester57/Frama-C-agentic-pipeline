@@ -480,8 +480,22 @@ def test_ingest_judge_partial_blinded_isolates_healthy_case_and_excludes_batch_s
             "dispatch_cases": ["ber_decode_len(buf, len);", "ber_decode_tag(buf, len);"],
             "api_harness": True,
             "api_cases": [
-                {"selector": 0, "kind": "single", "calls": ["ber_decode_len"], "slots": [], "rest": None, "entry": "ber_decode_len"},
-                {"selector": 1, "kind": "single", "calls": ["ber_decode_tag"], "slots": [], "rest": None, "entry": "ber_decode_tag"},
+                {
+                    "selector": 0,
+                    "kind": "single",
+                    "calls": ["ber_decode_len"],
+                    "slots": [],
+                    "rest": None,
+                    "entry": "ber_decode_len",
+                },
+                {
+                    "selector": 1,
+                    "kind": "single",
+                    "calls": ["ber_decode_tag"],
+                    "slots": [],
+                    "rest": None,
+                    "entry": "ber_decode_tag",
+                },
             ],
         },
     )
@@ -530,19 +544,25 @@ def test_ingest_judge_partial_blinded_isolates_healthy_case_and_excludes_batch_s
     units = units_by_id(run_dir)
     # Case 1 (ber_decode_tag): healthy, dynamically executed -> gets E-ACSL judge fuzz_clean!
     tag_judge = [
-        e for e in units["src/snmp/ber.c#ber_decode_tag::rte"]["evidence"] if e.get("tool_output") == "workspace/reports/judge/snmp.json"
+        e
+        for e in units["src/snmp/ber.c#ber_decode_tag::rte"]["evidence"]
+        if e.get("tool_output") == "workspace/reports/judge/snmp.json"
     ]
     assert [e["result"] for e in tag_judge] == ["fuzz_clean"]
 
     # Case 0 (ber_decode_len): blinded -> gets fuzz_blinded, NEVER E-ACSL fuzz_clean!
     len_judge = [
-        e for e in units["src/snmp/ber.c#ber_decode_len::rte"]["evidence"] if e.get("tool_output") == "workspace/reports/judge/snmp.json"
+        e
+        for e in units["src/snmp/ber.c#ber_decode_len::rte"]["evidence"]
+        if e.get("tool_output") == "workspace/reports/judge/snmp.json"
     ]
     assert [e["result"] for e in len_judge] == ["fuzz_blinded"]
 
     # snmp_parse_pdu (not mapped to any isolated healthy case): fails closed -> fuzz_blinded, NOT fuzz_clean!
     pdu_judge = [
-        e for e in units["src/snmp/pdu.c#snmp_parse_pdu::rte"]["evidence"] if e.get("tool_output") == "workspace/reports/judge/snmp.json"
+        e
+        for e in units["src/snmp/pdu.c#snmp_parse_pdu::rte"]["evidence"]
+        if e.get("tool_output") == "workspace/reports/judge/snmp.json"
     ]
     assert [e["result"] for e in pdu_judge] == ["fuzz_blinded"]
 
@@ -689,10 +709,42 @@ def test_supersede_candidates_preserves_confirmed_and_fresh_digest_and_interops_
         }
 
     cands = [
-        _cand(fp_old_stale, "snmp", "ber_decode_len", "src/snmp/ber.c", "unverified", OLD_DIGEST, ["src/snmp/ber.c#ber_decode_len::rte"]),
-        _cand(fp_old_confirmed, "snmp", "ber_decode_tag", "src/snmp/ber.c", "verified", OLD_DIGEST, ["src/snmp/ber.c#ber_decode_tag::rte"]),
-        _cand(fp_fresh, "snmp", "snmp_parse_pdu", "src/snmp/pdu.c", "unverified", NEW_DIGEST, ["src/snmp/pdu.c#snmp_parse_pdu::rte"]),
-        _cand(fp_other_mod, "glue", "glue_init", "src/glue/init.c", "unverified", OLD_DIGEST, ["src/glue/init.c#glue_init::rte"]),
+        _cand(
+            fp_old_stale,
+            "snmp",
+            "ber_decode_len",
+            "src/snmp/ber.c",
+            "unverified",
+            OLD_DIGEST,
+            ["src/snmp/ber.c#ber_decode_len::rte"],
+        ),
+        _cand(
+            fp_old_confirmed,
+            "snmp",
+            "ber_decode_tag",
+            "src/snmp/ber.c",
+            "verified",
+            OLD_DIGEST,
+            ["src/snmp/ber.c#ber_decode_tag::rte"],
+        ),
+        _cand(
+            fp_fresh,
+            "snmp",
+            "snmp_parse_pdu",
+            "src/snmp/pdu.c",
+            "unverified",
+            NEW_DIGEST,
+            ["src/snmp/pdu.c#snmp_parse_pdu::rte"],
+        ),
+        _cand(
+            fp_other_mod,
+            "glue",
+            "glue_init",
+            "src/glue/init.c",
+            "unverified",
+            OLD_DIGEST,
+            ["src/glue/init.c#glue_init::rte"],
+        ),
     ]
     write_json(run_dir / "candidates.json", sorted(cands, key=lambda c: c["fingerprint"]))
 
@@ -1079,13 +1131,23 @@ def test_multimodule_shared_confirmed_candidate_never_touched_and_legacy_fallbac
             u["status"] = "candidate"
             u["result_fingerprints"] = [fp_confirmed]
             u["evidence"] = [
-                evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/libsudo_iolog_a.json")
+                evidence(
+                    phase="fuzz",
+                    result="fuzz_failure",
+                    discharging=False,
+                    tool_output="workspace/reports/fuzz/libsudo_iolog_a.json",
+                )
             ]
         elif u["coverage_id"] == "lib/iolog/iolog_fileio.c#iolog_write::rte":
             u["status"] = "candidate"
             u["result_fingerprints"] = [fp_legacy]
             u["evidence"] = [
-                evidence(phase="fuzz", result="fuzz_failure", discharging=False, tool_output="workspace/reports/fuzz/sudo_logsrvd.json")
+                evidence(
+                    phase="fuzz",
+                    result="fuzz_failure",
+                    discharging=False,
+                    tool_output="workspace/reports/fuzz/sudo_logsrvd.json",
+                )
             ]
     write_json(run_dir / "coverage-ledger.json", ledger_rows)
 
@@ -1130,7 +1192,15 @@ def _seed_valid_run_dir(run_dir: Path) -> None:
     write_json(run_dir / "run-metadata.json", metadata("complete", None))
     write_json(
         run_dir / "coverage-ledger.json",
-        [unit("src/snmp/ber.c", "ber_decode_len", "rte", "covered", evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")])],
+        [
+            unit(
+                "src/snmp/ber.c",
+                "ber_decode_len",
+                "rte",
+                "covered",
+                evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")],
+            )
+        ],
     )
     write_json(run_dir / "workspace/reports/eva/snmp.json", {})
     write_json(run_dir / "findings.json", [])
@@ -1164,7 +1234,9 @@ def _seed_valid_run_dir(run_dir: Path) -> None:
             "modules": [{"module": "snmp", "passed": True, "gaps": []}],
         },
     )
-    write_json(run_dir / "workspace/reports/smoke/snmp.json", _valid_smoke_report("snmp", status="degraded", quarantined=[1]))
+    write_json(
+        run_dir / "workspace/reports/smoke/snmp.json", _valid_smoke_report("snmp", status="degraded", quarantined=[1])
+    )
     write_json(run_dir / "workspace/reports/fuzz/snmp.json", _valid_explore_report("snmp", status="clean"))
     write_json(run_dir / "workspace/reports/judge/snmp.json", _valid_judge_report("snmp", status="clean", passed=12))
 
@@ -1258,8 +1330,22 @@ def test_ingest_fuzz_clean_refuses_fuzz_clean_for_smoke_quarantined_cases(run_di
             "dispatch_cases": ["ber_decode_len(buf, len);", "ber_decode_tag(buf, len);"],
             "api_harness": True,
             "api_cases": [
-                {"selector": 0, "kind": "single", "calls": ["ber_decode_len"], "slots": [], "rest": None, "entry": "ber_decode_len"},
-                {"selector": 1, "kind": "single", "calls": ["ber_decode_tag"], "slots": [], "rest": None, "entry": "ber_decode_tag"},
+                {
+                    "selector": 0,
+                    "kind": "single",
+                    "calls": ["ber_decode_len"],
+                    "slots": [],
+                    "rest": None,
+                    "entry": "ber_decode_len",
+                },
+                {
+                    "selector": 1,
+                    "kind": "single",
+                    "calls": ["ber_decode_tag"],
+                    "slots": [],
+                    "rest": None,
+                    "entry": "ber_decode_tag",
+                },
             ],
         },
     )
@@ -1351,8 +1437,22 @@ def test_ingest_fuzz_clean_refuses_fuzz_clean_for_deep_eacsl_fuzz_judge_skipped_
             "dispatch_cases": ["ber_decode_len(buf, len);", "ber_decode_tag(buf, len);"],
             "api_harness": True,
             "api_cases": [
-                {"selector": 0, "kind": "single", "calls": ["ber_decode_len"], "slots": [], "rest": None, "entry": "ber_decode_len"},
-                {"selector": 1, "kind": "single", "calls": ["ber_decode_tag"], "slots": [], "rest": None, "entry": "ber_decode_tag"},
+                {
+                    "selector": 0,
+                    "kind": "single",
+                    "calls": ["ber_decode_len"],
+                    "slots": [],
+                    "rest": None,
+                    "entry": "ber_decode_len",
+                },
+                {
+                    "selector": 1,
+                    "kind": "single",
+                    "calls": ["ber_decode_tag"],
+                    "slots": [],
+                    "rest": None,
+                    "entry": "ber_decode_tag",
+                },
             ],
         },
     )
@@ -1390,7 +1490,15 @@ def test_generate_report_renders_new_sections_and_keeps_legacy_clean(tmp_path: P
     write_json(legacy / "run-metadata.json", metadata("complete", None))
     write_json(
         legacy / "coverage-ledger.json",
-        [unit("src/snmp/ber.c", "ber_decode_len", "rte", "covered", evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")])],
+        [
+            unit(
+                "src/snmp/ber.c",
+                "ber_decode_len",
+                "rte",
+                "covered",
+                evidence=[evidence(tool_output="workspace/reports/eva/snmp.json")],
+            )
+        ],
     )
     write_json(legacy / "workspace/reports/eva/snmp.json", {})
     write_json(legacy / "workspace/reports/fuzz/snmp.json", {})

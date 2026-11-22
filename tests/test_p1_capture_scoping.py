@@ -395,9 +395,10 @@ def test_static_lib_visibility_unrelated_installed_header_vs_installed_api(
     assert bc.classify_unit_visibility("build/libpub.a", units["build/libpub.a"], units, pub, warnings=warns) == (
         "public_lib"
     )
-    assert bc.classify_unit_visibility(
-        "build/libstandalone.a", units["build/libstandalone.a"], units, pub, warnings=warns
-    ) == "public_lib"
+    assert (
+        bc.classify_unit_visibility("build/libstandalone.a", units["build/libstandalone.a"], units, pub, warnings=warns)
+        == "public_lib"
+    )
     # Even a 4-arg call without `warnings` keeps liblogsrv.a as internal_convenience (consumer fallback
     # mixed relative paths into public_headers["files"]) and keeps standalone nanopb-style .a as public_lib.
     assert bc.classify_unit_visibility("build/liblogsrv.a", units["build/liblogsrv.a"], units, pub) == (

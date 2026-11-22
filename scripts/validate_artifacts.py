@@ -923,9 +923,7 @@ def validate_harness_smoke(data: Any, module: str | None = None) -> Errors:
     skip_env = str(data.get("skip_cases_env") or "")
     parsed_skip = sorted(int(x) for x in skip_env.split(",") if x) if skip_env else []
     if parsed_skip != quarantined:
-        errors.add(
-            f"$.skip_cases_env: {skip_env!r} does not match quarantined_cases {quarantined}"
-        )
+        errors.add(f"$.skip_cases_env: {skip_env!r} does not match quarantined_cases {quarantined}")
     counts = data.get("counts")
     case_results = data.get("case_results") or []
     if isinstance(counts, dict):
@@ -947,9 +945,7 @@ def validate_judge_report(data: Any, module: str | None = None) -> Errors:
         errors.add(f"$.module: {data['module']!r} does not match the file name ({module}.json)")
     inputs = data["inputs"]
     if inputs["not_judged"] != data["not_judged"]:
-        errors.add(
-            f"$.not_judged: {data['not_judged']} does not match $.inputs.not_judged ({inputs['not_judged']})"
-        )
+        errors.add(f"$.not_judged: {data['not_judged']} does not match $.inputs.not_judged ({inputs['not_judged']})")
     if inputs["judged"] != inputs["passed"] + inputs["failed"]:
         errors.add(
             f"$.inputs.judged: {inputs['judged']} must equal passed ({inputs['passed']}) + failed ({inputs['failed']})"
@@ -957,7 +953,9 @@ def validate_judge_report(data: Any, module: str | None = None) -> Errors:
     bd = inputs["not_judged_breakdown"]
     bd_sum = sum(int(v) for v in bd.values())
     if bd_sum != inputs["not_judged"]:
-        errors.add(f"$.inputs.not_judged_breakdown: sum ({bd_sum}) must equal $.inputs.not_judged ({inputs['not_judged']})")
+        errors.add(
+            f"$.inputs.not_judged_breakdown: sum ({bd_sum}) must equal $.inputs.not_judged ({inputs['not_judged']})"
+        )
     return errors
 
 

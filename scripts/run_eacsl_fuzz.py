@@ -1221,7 +1221,12 @@ def run_campaign_rounds(
             return out
 
         rem_wall = int(max_time - spent1)
-        if probe_budget < max_time and rem_wall >= 1 and (max_time - spent1) * eff_w >= MIN_ROUND_CPU_S and first.get("status") != "insufficient_memory":
+        if (
+            probe_budget < max_time
+            and rem_wall >= 1
+            and (max_time - spent1) * eff_w >= MIN_ROUND_CPU_S
+            and first.get("status") != "insufficient_memory"
+        ):
             t1 = time.monotonic()
             second = campaign(binary, rem_wall, True)
             wall2 = max(0.0, time.monotonic() - t1)
@@ -1835,11 +1840,7 @@ def _run_fuzz_campaign_once(
         )
         fuzz_s = max(0.0, time.monotonic() - fuzz_started)
         oom_after = resources.read_cgroup_oom_kills() if oom_before is not None else None
-        oom_delta = (
-            max(0, oom_after - oom_before)
-            if (oom_before is not None and oom_after is not None)
-            else None
-        )
+        oom_delta = max(0, oom_after - oom_before) if (oom_before is not None and oom_after is not None) else None
         MAX_WORKER_LOG_BYTES = 1024 * 1024
         worker_logs: list[str] = []
         for log_path in sorted(scratch.glob("fuzz-*.log")):
@@ -3510,8 +3511,12 @@ def main(argv: list[str] | None = None) -> int:
     p_camp = sub.add_parser("campaign")
     _add_build_args(p_camp, sources_required=False)
     p_camp.add_argument("--out-bin", type=Path, default=None)
-    p_camp.add_argument("--build-json", type=Path, default=None, help="Pre-built workspace/build/<mod>.build.json (P7f)")
-    p_camp.add_argument("--smoke-report", type=Path, default=None, help="Optional workspace/reports/smoke/<mod>.json (P3)")
+    p_camp.add_argument(
+        "--build-json", type=Path, default=None, help="Pre-built workspace/build/<mod>.build.json (P7f)"
+    )
+    p_camp.add_argument(
+        "--smoke-report", type=Path, default=None, help="Optional workspace/reports/smoke/<mod>.json (P3)"
+    )
     p_camp.add_argument(
         "--profile",
         choices=["quick", "standard", "deep"],
@@ -3571,16 +3576,24 @@ def main(argv: list[str] | None = None) -> int:
     p_judge.add_argument("--module", required=True)
     p_judge.add_argument("--build-json", type=Path, required=True, help="Pre-built workspace/build/<mod>.build.json")
     p_judge.add_argument("--corpus-dir", type=Path, required=True, help="Grown corpus directory")
-    p_judge.add_argument("--extra-corpus", type=Path, nargs="*", default=[], help="Seeds and imported corpus directories")
-    p_judge.add_argument("--explore-report", type=Path, default=None, help="Explorer fuzz report JSON for crashes and D1b linking")
+    p_judge.add_argument(
+        "--extra-corpus", type=Path, nargs="*", default=[], help="Seeds and imported corpus directories"
+    )
+    p_judge.add_argument(
+        "--explore-report", type=Path, default=None, help="Explorer fuzz report JSON for crashes and D1b linking"
+    )
     p_judge.add_argument("--smoke-report", type=Path, default=None, help="Optional workspace/reports/smoke/<mod>.json")
     p_judge.add_argument("--profile", choices=["quick", "standard", "deep"], default="standard")
     p_judge.add_argument("--max-corpus-inputs", type=int, default=None, help="Override profile cap N (512/2048/4096)")
-    p_judge.add_argument("--max-time", type=int, default=JUDGE_DEFAULT_MAX_TIME_S, help="Safety wall-clock stop (seconds)")
+    p_judge.add_argument(
+        "--max-time", type=int, default=JUDGE_DEFAULT_MAX_TIME_S, help="Safety wall-clock stop (seconds)"
+    )
     p_judge.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_judge.add_argument("--batch-size", type=int, default=JUDGE_BATCH_SIZE)
     p_judge.add_argument("--scratch-dir", type=Path, default=None)
-    p_judge.add_argument("--sources", nargs="*", default=None, help="Optional harness/module sources (defaults to build-json)")
+    p_judge.add_argument(
+        "--sources", nargs="*", default=None, help="Optional harness/module sources (defaults to build-json)"
+    )
     p_judge.add_argument("--out-json", type=Path, required=True)
 
     p_efuzz = sub.add_parser("eacsl-fuzz", help="Run the deep-profile 1/5 E-ACSL fuzz share after judge (P2e)")
@@ -4400,7 +4413,9 @@ def run_floor_pass(
             elif case_crashed:
                 c_status = "crashing"
                 skip_for_shared.add(k)
-            elif case_hit_safety or (case_attempts > 0 and case_edges == 0 and merged_files == 0 and restarts >= max_restarts):
+            elif case_hit_safety or (
+                case_attempts > 0 and case_edges == 0 and merged_files == 0 and restarts >= max_restarts
+            ):
                 c_status = "floor_not_reached"
             else:
                 c_status = "ok"
@@ -4449,7 +4464,12 @@ def _judge_input_running_at_exit(output: str, batch: Sequence[Path]) -> int | No
     norm_last = last_running.replace("\\", "/")
     for i, path in enumerate(batch):
         p = Path(path)
-        if str(p.resolve()) == last_running or str(p) == last_running or p.resolve().as_posix() == norm_last or p.as_posix() == norm_last:
+        if (
+            str(p.resolve()) == last_running
+            or str(p) == last_running
+            or p.resolve().as_posix() == norm_last
+            or p.as_posix() == norm_last
+        ):
             return i
     base = Path(last_running).name
     matches = [i for i, path in enumerate(batch) if Path(path).name == base]
@@ -4618,7 +4638,11 @@ def link_cross_engine_findings(
 
     links: list[dict[str, Any]] = []
     seen: set[tuple[str | None, str | None, str]] = set()
-    j_file = normalize_file(str(judge_failure.get("file") or "")) if isinstance(judge_failure, dict) and judge_failure.get("file") else ""
+    j_file = (
+        normalize_file(str(judge_failure.get("file") or ""))
+        if isinstance(judge_failure, dict) and judge_failure.get("file")
+        else ""
+    )
     j_fn = str(judge_failure.get("function") or "") if isinstance(judge_failure, dict) else ""
     j_line = int(judge_failure.get("line") or 0) if isinstance(judge_failure, dict) else 0
 
@@ -4910,9 +4934,7 @@ def run_judge(
 
     seed = derive_seed(eacsl_binary, module)
     eff_batch = max(1, int(batch_size or JUDGE_BATCH_SIZE))
-    pending: deque[list[Path]] = deque(
-        selected[i : i + eff_batch] for i in range(0, len(selected), eff_batch)
-    )
+    pending: deque[list[Path]] = deque(selected[i : i + eff_batch] for i in range(0, len(selected), eff_batch))
     skipped_cases: set[int] = set(smoke_skipped)
     tracker = CaseBlindingTracker(threshold=blinding_threshold)
     confirmed_standalone_fps: set[str] = set()
@@ -5007,9 +5029,7 @@ def run_judge(
 
         eff_stub = (standalone_rep.get("link_stub_abort") if standalone_rep else None) or stub_abort
         eff_failure = (
-            None
-            if eff_stub
-            else ((standalone_rep.get("failure") if standalone_rep else None) or batch_failure)
+            None if eff_stub else ((standalone_rep.get("failure") if standalone_rep else None) or batch_failure)
         )
         eff_fp = (
             make_fingerprint(
@@ -5026,7 +5046,12 @@ def run_judge(
 
         links = link_cross_engine_findings(sha, eff_failure, eff_fp, explore_doc)
         for lk in links:
-            lkey = (lk.get("judge_fingerprint"), lk.get("explore_fingerprint"), str(lk.get("match")), lk.get("artifact_sha256"))
+            lkey = (
+                lk.get("judge_fingerprint"),
+                lk.get("explore_fingerprint"),
+                str(lk.get("match")),
+                lk.get("artifact_sha256"),
+            )
             if lkey not in cross_link_keys:
                 cross_link_keys.add(lkey)
                 cross_links.append(lk)
@@ -5056,7 +5081,9 @@ def run_judge(
         if eff_stub is not None:
             art_entry["link_stub_abort"] = eff_stub
         elif not eff_failure:
-            res_abort = (standalone_rep.get("resource_abort") if standalone_rep else None) or parse_eacsl_resource_abort(batch_output)
+            res_abort = (
+                standalone_rep.get("resource_abort") if standalone_rep else None
+            ) or parse_eacsl_resource_abort(batch_output)
             if res_abort is not None:
                 art_entry["eacsl_resource_abort"] = res_abort
         artifacts.append(art_entry)
@@ -5436,7 +5463,12 @@ def _run_campaign_mode(args) -> dict:
         if (explore_judge and args.fuzz_budget is not None)
         else args.fuzz_budget
     )
-    if explore_judge and str(args.workers).strip().lower() == "auto" and effective_budget is not None and effective_budget > 0:
+    if (
+        explore_judge
+        and str(args.workers).strip().lower() == "auto"
+        and effective_budget is not None
+        and effective_budget > 0
+    ):
         workers = max(1, min(workers, max(1, effective_budget // MIN_FUZZ_WALL_S)))
     jobs = args.jobs if args.jobs else workers
     effective_max_time = args.max_time
@@ -5752,7 +5784,9 @@ def _run_explore_campaign_mode(
         engine_used = build["engine_used"]
         if compile_rec["returncode"] != 0 and args.engine == "auto":
             et0 = time.monotonic()
-            eb = fuzz_build.build_module_binary(eff_sources, args.out_bin, **{**_build_options(args), "engine": "eacsl"})
+            eb = fuzz_build.build_module_binary(
+                eff_sources, args.out_bin, **{**_build_options(args), "engine": "eacsl"}
+            )
             build_s += max(0.0, time.monotonic() - et0)
             if eb["compile"]["returncode"] == 0:
                 compile_rec = eb["compile"]
@@ -5879,9 +5913,7 @@ def _run_explore_campaign_mode(
         opts = {**_build_options(args), "engine": engine_used, "use_cache": False}
         opts["cppflags"] = f"{opts['cppflags'] or ''} {dispatch_skip_cppflags(mask)}".strip()
         skip_bin = (
-            args.out_json.parent
-            / f".skip_{args.out_bin.name}"
-            / f"{args.out_bin.stem}_skip{args.out_bin.suffix}"
+            args.out_json.parent / f".skip_{args.out_bin.name}" / f"{args.out_bin.stem}_skip{args.out_bin.suffix}"
         )
         rebuilt = fuzz_build.build_module_binary(eff_sources, skip_bin, **opts)
         ok = rebuilt["compile"]["returncode"] == 0 and rebuilt["engine_used"] == engine_used

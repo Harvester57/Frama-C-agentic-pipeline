@@ -208,6 +208,7 @@ def plugin_vtable_callbacks(model: dict[str, Any], unit: str) -> list[str]:
                 queue.append(ig)
     return sorted(callbacks)
 
+
 _FENCE_RE = re.compile(
     # `\r` before the line ends: a THREAT_MODEL.md with CRLF line endings (a Windows checkout).
     # As in CommonMark: up to three spaces of indentation, and a closing fence at least as long as the opening.

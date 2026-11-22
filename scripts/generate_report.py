@@ -575,9 +575,11 @@ def load_phase1_fuzz_reports(run_dir: Path) -> list[dict]:
     runs that have no Explore/Judge or telemetry data.
     """
     rdir = Path(run_dir)
-    judge_mods = {
-        path.stem for path in (rdir / "workspace/reports/judge").glob("*.json")
-    } if (rdir / "workspace/reports/judge").is_dir() else set()
+    judge_mods = (
+        {path.stem for path in (rdir / "workspace/reports/judge").glob("*.json")}
+        if (rdir / "workspace/reports/judge").is_dir()
+        else set()
+    )
     reports: list[dict] = []
     for sub in ("workspace/reports/fuzz", "workspace/reports/eacsl-fuzz"):
         d = rdir / sub
@@ -768,7 +770,13 @@ def verifier_circuit_breaker_lines(candidates: list[dict] | None) -> list[str]:
         f"(vs. {len(verified)} verified candidate(s)).",
     ]
     for mod, count in sorted(by_mod.items()):
-        reasons = sorted({str(c.get("superseded_reason")) for c in superseded if str(c.get("module") or "unknown") == mod and c.get("superseded_reason")})
+        reasons = sorted(
+            {
+                str(c.get("superseded_reason"))
+                for c in superseded
+                if str(c.get("module") or "unknown") == mod and c.get("superseded_reason")
+            }
+        )
         suffix = f": {md_escape(reasons[0])}" if reasons else ""
         out.append(f"  - `{md_escape(mod)}`: {count} superseded{suffix}")
     out.append("")

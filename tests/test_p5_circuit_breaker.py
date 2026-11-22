@@ -103,8 +103,7 @@ def _seed_sudo_module(
     with_eva_report: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     fns: dict[str, tuple[str, str, list[str]]] = {
-        f"fn_{i:02d}": (f"src/{module}/fn_{i:02d}.c", module, [])
-        for i in range(max(n_candidates, 2))
+        f"fn_{i:02d}": (f"src/{module}/fn_{i:02d}.c", module, []) for i in range(max(n_candidates, 2))
     }
     sim.build(fns, sidecars={module: {"entry_style": "dispatch", "dispatch_case_count": 4}})
     digest = _write_sudo_harness(sim, module)
@@ -209,9 +208,7 @@ def test_breaker_off_preserves_legacy_fanout(sim: Sim) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_sudo_38_candidates_probe_trip_fast_repair_and_supersede(
-    sim: Sim, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_sudo_38_candidates_probe_trip_fast_repair_and_supersede(sim: Sim, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FRAMAC_VERIFIER_BREAKER", "on")
     old_digest, _cands = _seed_sudo_module(sim, n_candidates=38, with_eva_report=False)
     S.cmd_init()
@@ -324,9 +321,7 @@ def test_sudo_38_candidates_probe_trip_fast_repair_and_supersede(
 # ---------------------------------------------------------------------------
 
 
-def test_describe_repair_fast_fuzz_only_vs_existing_eva_report(
-    sim: Sim, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_describe_repair_fast_fuzz_only_vs_existing_eva_report(sim: Sim, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_sudo_module(sim, n_candidates=4, with_eva_report=False)
     repair_task = {"id": "repair:sudoers", "kind": "repair", "module": "sudoers", "reasons": ["harness_induced: fp1"]}
 
@@ -435,9 +430,7 @@ def test_breaker_waits_only_on_running_verifiers_and_preserves_confirmed_finding
 # ---------------------------------------------------------------------------
 
 
-def test_real_bug_control_2_of_2_confirmed_releases_all_remaining(
-    sim: Sim, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_real_bug_control_2_of_2_confirmed_releases_all_remaining(sim: Sim, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FRAMAC_VERIFIER_BREAKER", "on")
     _seed_sudo_module(sim, n_candidates=38, with_eva_report=False)
     S.cmd_init()
@@ -585,4 +578,3 @@ def test_post_repair_new_candidates_start_with_clean_breaker_generation(
     out_gen2 = _complete_verifier_as(sim, gen2_verify[0], "rejected", rejection_class="harness_induced")
     assert "circuit_breaker" not in out_gen2
     assert not (load("state/wp_schedule.json").get("breaker_tripped") or {}).get("sudoers")
-

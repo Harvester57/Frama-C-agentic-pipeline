@@ -80,7 +80,11 @@ def _make_build_json(
             "sanitizers": str(san_bin) if san_bin else None,
             "eacsl": str(eacsl_bin) if eacsl_bin else None,
         },
-        "compile": {"returncode": 0, "binary": str(eacsl_bin or san_bin), "engine": "eacsl" if with_eacsl else "sanitizers"},
+        "compile": {
+            "returncode": 0,
+            "binary": str(eacsl_bin or san_bin),
+            "engine": "eacsl" if with_eacsl else "sanitizers",
+        },
     }
     if with_san:
         doc["sanitizer_compile"] = {"returncode": 0, "binary": str(san_bin), "engine": "sanitizers"}
@@ -112,7 +116,9 @@ def _asan_failure_log(file_: str = "src/a.c", line: int = 43, fn: str = "parse")
 # --- 1. P1c pure execution timing ------------------------------------------------------------
 
 
-def test_p1c_pure_execution_timing_excludes_replay_and_attribution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_p1c_pure_execution_timing_excludes_replay_and_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Replay + attribution taking 180 s must NOT burn a 60 s fuzz budget (c-ares parsers regression)."""
     clock = FakeClock()
     monkeypatch.setattr(R.time, "monotonic", clock.monotonic)
@@ -241,7 +247,9 @@ def test_p5a_p5d_multi_job_and_fork_telemetry_parsing() -> None:
         "stat::average_exec_per_sec: 1700\n"
         "stat::peak_rss_mb: 71\n"
     )
-    tel = R.parse_libfuzzer_telemetry(["INFO: -jobs=2 -workers=2\n", job0, job1], build_s=3.5, fuzz_s=10.0, replay_s=0.5)
+    tel = R.parse_libfuzzer_telemetry(
+        ["INFO: -jobs=2 -workers=2\n", job0, job1], build_s=3.5, fuzz_s=10.0, replay_s=0.5
+    )
     assert tel["build_s"] == 3.5
     assert tel["fuzz_s"] == 10.0
     assert tel["replay_s"] == 0.5
@@ -274,7 +282,9 @@ def test_p5a_p5d_multi_job_and_fork_telemetry_parsing() -> None:
 # --- 3. P1a / P1b per-case blinding, non-dispatch fork blinding, smoke integration, P6a floor ---
 
 
-def test_p1a_dispatch_per_case_blinding_partial_and_all_blinded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_p1a_dispatch_per_case_blinding_partial_and_all_blinded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "on")
 
     def _make_raw(case_idx: int, fp: str, count: int) -> list[dict[str, Any]]:
@@ -470,7 +480,12 @@ def test_p6a_floor_pass_uses_only_case_normalizes_corpus_and_blinds(tmp_path: Pa
         cp = Path(adir) / f"crash-c1-{case1_attempts}"
         cp.parent.mkdir(parents=True, exist_ok=True)
         cp.write_bytes(b"\x01bad")
-        art = {"artifact": str(cp), "kind": "crash", "sha256": hashlib.sha256(b"\x01bad").hexdigest(), "fingerprint": "fp_c1_blind"}
+        art = {
+            "artifact": str(cp),
+            "kind": "crash",
+            "sha256": hashlib.sha256(b"\x01bad").hexdigest(),
+            "fingerprint": "fp_c1_blind",
+        }
         return {
             "status": "crash_found",
             "returncode": 77,
@@ -478,7 +493,9 @@ def test_p6a_floor_pass_uses_only_case_normalizes_corpus_and_blinds(tmp_path: Pa
             "_raw_crashes": [art],
             "fuzz_s": 0.1,
             "replay_s": 0.05,
-            "telemetry": R.parse_libfuzzer_telemetry("stat::number_of_executed_units: 1\nstat::peak_rss_mb: 72\n", fuzz_s=0.1),
+            "telemetry": R.parse_libfuzzer_telemetry(
+                "stat::number_of_executed_units: 1\nstat::peak_rss_mb: 72\n", fuzz_s=0.1
+            ),
         }
 
     out = R.run_floor_pass(
@@ -523,7 +540,9 @@ def test_p2a_explore_mode_gated_by_flag_and_uses_prebuilt_san(tmp_path: Path, mo
     # 1. With FRAMAC_FUZZ_EXPLORE_JUDGE=on + --engine auto + --build-json:
     #    MUST resolve .san binary without calling build_module_binary, and set discovering_step="explore".
     monkeypatch.setenv("FRAMAC_FUZZ_EXPLORE_JUDGE", "on")
-    monkeypatch.setattr(fuzz_build, "build_module_binary", lambda *a, **kw: pytest.fail("P7f: must not compile in explore"))
+    monkeypatch.setattr(
+        fuzz_build, "build_module_binary", lambda *a, **kw: pytest.fail("P7f: must not compile in explore")
+    )
 
     executed_bins: list[Path] = []
     executed_times: list[int] = []
@@ -538,7 +557,9 @@ def test_p2a_explore_mode_gated_by_flag_and_uses_prebuilt_san(tmp_path: Path, mo
             "artifacts": [],
             "fuzz_s": 1.0,
             "replay_s": 0.0,
-            "telemetry": R.parse_libfuzzer_telemetry("stat::number_of_executed_units: 100\nstat::peak_rss_mb: 60\n", fuzz_s=1.0),
+            "telemetry": R.parse_libfuzzer_telemetry(
+                "stat::number_of_executed_units: 100\nstat::peak_rss_mb: 60\n", fuzz_s=1.0
+            ),
         }
 
     monkeypatch.setattr(R, "run_fuzz_campaign", fake_run_fuzz)
@@ -661,7 +682,9 @@ def test_p2d_judge_case_stratified_sha256_selection_and_mandatory_inputs(tmp_pat
     exp_crash = crashes / "crash-exp"
     exp_crash.write_bytes(bytes([2, 99]))
 
-    explore_report = {"artifacts": [{"artifact": str(exp_crash), "sha256": hashlib.sha256(exp_crash.read_bytes()).hexdigest()}]}
+    explore_report = {
+        "artifacts": [{"artifact": str(exp_crash), "sha256": hashlib.sha256(exp_crash.read_bytes()).hexdigest()}]
+    }
 
     sel1 = R.select_judge_inputs(corpus, [seeds], explore_report, cap=9, n_cases=3, selector="identity")
     sel2 = R.select_judge_inputs(corpus, [seeds], explore_report, cap=9, n_cases=3, selector="identity")
@@ -737,10 +760,14 @@ def test_p2d_judge_on_batch_continuation_culprit_last_and_batch_state_only(
             lines.append(f"Running: {p.resolve()}")
             if p.name == "u1":
                 lines.append(_eacsl_failure_log("src/a.c", 10, "leaky_fn", "\\valid(q)"))
-                return SandboxResult(returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake")
+                return SandboxResult(
+                    returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake"
+                )
             if p.name == "u3":
                 lines.append(_eacsl_failure_log("src/a.c", 42, "parse", "\\valid_read(p)"))
-                return SandboxResult(returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake")
+                return SandboxResult(
+                    returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake"
+                )
             lines.append(f"Executed {p.resolve()} in 1 ms")
         return SandboxResult(returncode=0, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake")
 
@@ -840,9 +867,7 @@ def test_p2d_judge_on_batch_continuation_culprit_last_and_batch_state_only(
     assert minischema.validate(rep, judge_schema) == []
 
 
-def test_p2d_judge_per_case_blinding_and_not_judged_accounting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_p2d_judge_per_case_blinding_and_not_judged_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     harness = _write_dispatch_harness(tmp_path, 2)
     bjson, _san, _eacsl = _make_build_json(tmp_path, module="mod", sources=[str(harness)])
     corpus = tmp_path / "corpus"
@@ -861,7 +886,9 @@ def test_p2d_judge_per_case_blinding_and_not_judged_accounting(
             lines.append(f"Running: {p.resolve()}")
             if p.name.startswith("c0_"):
                 lines.append(_eacsl_failure_log("src/bad.c", 12, "bad_fn", "\\valid(p)"))
-                return SandboxResult(returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake")
+                return SandboxResult(
+                    returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake"
+                )
             lines.append(f"Executed {p.resolve()} in 1 ms")
         return SandboxResult(returncode=0, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake")
 
@@ -925,9 +952,7 @@ def test_p2d_judge_skips_cleanly_when_no_eacsl_binary(tmp_path: Path) -> None:
 # --- 6. P2e `eacsl-fuzz` subcommand ----------------------------------------------------------
 
 
-def test_p2e_eacsl_fuzz_deep_share_skips_judge_and_smoke_cases(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_p2e_eacsl_fuzz_deep_share_skips_judge_and_smoke_cases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     harness = _write_dispatch_harness(tmp_path, 4)
     bjson, _san, eacsl_bin = _make_build_json(tmp_path, module="mod", sources=[str(harness)])
     assert eacsl_bin is not None
@@ -1111,7 +1136,9 @@ def test_p2d_judge_culprit_is_last_no_infinite_loop_and_adjacent_line_link(
             lines.append(f"Running: {p.resolve()}")
             if idx == len(inputs_in_cmd) - 1:
                 lines.append(_eacsl_failure_log("src/a.c", 42, "parse", "\\valid_read(p)"))
-                return SandboxResult(returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake")
+                return SandboxResult(
+                    returncode=134, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake"
+                )
             lines.append(f"Executed {p.resolve()} in 1 ms")
         return SandboxResult(returncode=0, stdout="", stderr="\n".join(lines), timed_out=False, sandbox="fake")
 
@@ -1242,7 +1269,9 @@ def test_run_campaign_rounds_strips_private_keys_on_all_return_paths(tmp_path: P
         "artifacts": [{"artifact": str(art), "kind": "crash", "sha256": hashlib.sha256(b"boom").hexdigest()}],
         "fuzz_s": 1.0,
         "replay_s": 0.1,
-        "telemetry": R.parse_libfuzzer_telemetry("#10\tDONE cov: 5 ft: 6 corp: 1/4b exec/s: 10 rss: 32Mb\n", fuzz_s=1.0),
+        "telemetry": R.parse_libfuzzer_telemetry(
+            "#10\tDONE cov: 5 ft: 6 corp: 1/4b exec/s: 10 rss: 32Mb\n", fuzz_s=1.0
+        ),
         "_raw_crashes": [{"artifact": str(art), "kind": "crash", "fingerprint": "fp1"}],
         "_case_passes": {0: 5},
     }
@@ -1384,5 +1413,3 @@ def test_judge_sandbox_unavailable_emits_schema_valid_judge_error(
     assert cli_rep2["profile"] == "deep"
     assert str(cli_rep2.get("reason") or "").startswith("sandbox_unavailable:")
     assert minischema.validate(cli_rep2, minischema.load_schema(JUDGE_REPORT_SCHEMA)) == []
-
-
