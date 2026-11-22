@@ -69,6 +69,7 @@ from eacsl_toolchain import (
     reset_verdict_on_input_entry,
     resolve_fuzz_init_source,
     rewrite_forward_array_sizes,
+    rewrite_forward_tag_declarations,
     rewrite_incomplete_alignof,
     rewrite_misplaced_fallthrough,
     rewrite_sound_verdict_resets,
@@ -1312,6 +1313,20 @@ def _compile_eacsl_binary_uncached(
                     "(Frama-C's gcc_builtins.json overloads are not linker symbols).\n"
                 )
 
+            # Without this, clang rejects a struct the kernel names in a parameter list before its definition:
+            # the forward declaration the sources had is gone. Before the rewrites that record lines.
+            c_text, forward_tags = rewrite_forward_tag_declarations(c_text)
+            if forward_tags["count"]:
+                c_modified = True
+                result["forward_tag_declarations"] = forward_tags
+                log_parts.append(
+                    f"Declared {forward_tags['count']} struct/union tag(s) at the start of the file "
+                    f"({', '.join(forward_tags['tags'][:20])}{', ...' if forward_tags['count'] > 20 else ''}): "
+                    "the Frama-C printer drops the forward declaration the sources have and first names the "
+                    "tag in a parameter list or a function body, where it declares a type of its own. "
+                    "The declaration only joins those mentions to the definition.\n"
+                )
+
             # Without this, clang rejects an array the kernel declares before the object its size reads.
             c_text, forward_arrays = rewrite_forward_array_sizes(c_text)
             if forward_arrays:
@@ -2387,6 +2402,55 @@ def _excluded_link_sources(dag_path: Path, module: str | None) -> dict[str, list
     return out
 
 
+def _file_external_definitions(dag_path: Path) -> dict[str, set[str]]:
+    """
+    Source file (tree path) -> the names it defines with external linkage: the DAG's non-static functions
+    (header records left out, `_dag_function_definers`), the functions only the build compiles
+    (`build_only_functions`) and the model's global variables (`_model_global_variables`). What linking that
+    file brings into a build besides the symbol it is added for.
+    """
+    out: dict[str, set[str]] = {}
+    for name, recs in _dag_function_definers(dag_path).items():
+        for rec in recs:
+            out.setdefault(_dag_tree_path(rec["file"]), set()).add(name)
+    # As `_dag_symbol_tables` reads them: a build-only name the DAG parsed elsewhere is that file's.
+    _parsed, build_only = _dag_symbol_tables(dag_path)
+    for name, file in build_only.items():
+        out.setdefault(_dag_tree_path(file), set()).add(name)
+    for name, recs in _model_global_variables(dag_path).items():
+        for rec in recs:
+            out.setdefault(_dag_tree_path(rec["file"]), set()).add(name)
+    return out
+
+
+def _target_fuzzer_own_definitions(dag_path: Path, module: str | None, run_dir: Path) -> tuple[str, set[str]]:
+    """
+    (driver tree path, names) the target fuzzer of target fuzz module `module` defines with external linkage:
+    the symbols its sidecar `target_fuzzer.link.excluded_sources` records (those another file of the unit
+    defines too), and its driver's own definitions (`generate_harness.target_fuzzer_definitions`, the driver
+    `target_fuzzer.source` resolved against `run_dir`). The DAG has no record of a driver the build does not
+    capture (sudo's plugins/sudoers/regress/fuzz/*.c), so the build's own definitions cannot show them.
+    ("", empty) for any other module.
+    """
+    if not module:
+        return "", set()
+    sidecar = load_json_optional(Path(dag_path).parent.parent / "harnesses" / f"harness_{module}.json", None)
+    tf = sidecar.get("target_fuzzer") if isinstance(sidecar, dict) else None
+    if not isinstance(tf, dict) or not isinstance(tf.get("source"), str) or not tf["source"].strip():
+        return "", set()
+    names = {s for syms in _excluded_link_sources(Path(dag_path), module).values() for s in syms}
+    driver = Path(tf["source"])
+    for cand in (driver, Path(run_dir) / driver, Path(run_dir) / "workspace" / "work" / driver):
+        if cand.is_file():
+            import generate_harness  # lazy: generate_harness imports this module
+
+            cppflags = sidecar.get("cppflags") if isinstance(sidecar, dict) else ""
+            own, _method = generate_harness.target_fuzzer_definitions(cand.as_posix(), str(cppflags or ""))
+            names |= own
+            break
+    return _dag_tree_path(tf["source"]), names
+
+
 def _place_function(records: list[dict], ctx: dict, linked: set[str]) -> tuple[str, dict, str]:
     """
     Which of several files defining an undefined function to link, as (action, record, reason). Each
@@ -2694,7 +2758,12 @@ def repair_sources_for_link(
 
     A file a target fuzz module's link leaves out (sidecar `target_fuzzer.link.excluded_sources`,
     `_excluded_link_sources`) is never added back: a function or global it defines is stubbed instead
-    (`link_stubs.c` / `link_globals.c`), or recorded unresolved without `stub_dir`.
+    (`link_stubs.c` / `link_globals.c`), or recorded unresolved without `stub_dir`. Nor is a file that
+    defines, besides the symbol, a name the build already defines (`_file_external_definitions` of the
+    linked files, and for a target fuzz module the fuzzer's own, `_target_fuzzer_own_definitions`): linked,
+    it fails on "multiple definition" (sudo run-1 tf_fuzz_sudoers_ldif: cvtsudoers.c, the only definer of
+    log_warnx and of the global filters, also defines open_sudoers, which the fuzzer defines). The symbol
+    is stubbed the same way, its `reason` naming each clash and its current definer.
 
     For an address-flow cluster (`module` is a DAG submodule with `build_sources`,
     scripts/unit_split.py), a parsed non-static function defined outside `flow_files` (of the same
@@ -2739,6 +2808,40 @@ def repair_sources_for_link(
             "itself (sidecar target_fuzzer.link.excluded_sources)"
         )
 
+    # What the build already defines (name -> the file defining it), read on first need and grown with each
+    # file this round adds: a file linked for one symbol brings every other one it defines, and one the
+    # build already has fails the link on "multiple definition" (sudo run-1 tf_fuzz_sudoers_ldif:
+    # cvtsudoers.c, added for log_warnx, also defines open_sudoers, which the target fuzzer defines).
+    file_defs: dict[str, set[str]] = {}
+    built: dict[str, str] | None = None
+
+    def _clashes(file: str, sym: str) -> list[tuple[str, str]]:
+        """(name, current definer) of each name `file` would define a second time; none for a linked file."""
+        nonlocal built
+        tree = _dag_tree_path(file)
+        if tree in {_dag_tree_path(h) for h in have}:
+            return []
+        if built is None:
+            file_defs.update(_file_external_definitions(dp))
+            driver, own = _target_fuzzer_own_definitions(dp, module, Path(run_dir))
+            built = {}
+            for h in sorted({_dag_tree_path(h) for h in have}):
+                for name in file_defs.get(h, ()):
+                    built.setdefault(name, h)
+            for name in own:
+                built.setdefault(name, f"the target fuzzer {driver}")
+        return sorted((n, built[n]) for n in file_defs.get(tree, ()) if n != sym and n in built)
+
+    def _unlinkable_reason(file: str, sym: str) -> str:
+        """Why `file` cannot be linked for `sym` (left out of the target fuzzer's link, or a clash), or ""."""
+        if _dag_tree_path(file) in excluded:
+            return _excluded_reason(file)
+        clashes = _clashes(file, sym)
+        if not clashes:
+            return ""
+        named = ", ".join(f"{n} (defined in {d})" for n, d in clashes[:6]) + (", ..." if len(clashes) > 6 else "")
+        return f"linking {_dag_tree_path(file)} would define a second time what the build already defines: {named}"
+
     def _stub_function(sym: str, file: str, reason: str, recs: list[dict]) -> None:
         """Define `sym` in link_stubs.c instead of linking `file`; without `stub_dir`, record it unresolved."""
         stub = {
@@ -2772,9 +2875,9 @@ def repair_sources_for_link(
             if definers is None:
                 definers = _dag_function_definers(dp)
             recs = definers.get(sym) or [{"file": f, "module": fn_mod, "units": []}]
-            kept = [r for r in recs if _dag_tree_path(r["file"]) not in excluded]
+            kept = [r for r in recs if not _unlinkable_reason(r["file"], sym)]
             if not kept:
-                _stub_function(sym, recs[0]["file"], _excluded_reason(recs[0]["file"]), recs)
+                _stub_function(sym, recs[0]["file"], _unlinkable_reason(recs[0]["file"], sym), recs)
                 continue
             if len(recs) > 1:
                 # Several programs define it: link the one of this module's unit, never the first listed
@@ -2790,10 +2893,11 @@ def repair_sources_for_link(
                 f = kept[0]["file"]
         elif sym in build_only_syms:
             # B8: build_only_functions (hidden from Frama-C by compiler macros) are never stubbed,
-            # unless the target fuzzer's link leaves their file out.
+            # unless the target fuzzer's link leaves their file out or it defines what the build has.
             f = build_only_syms[sym]
-            if _dag_tree_path(f) in excluded:
-                _stub_function(sym, f, _excluded_reason(f), [{"file": f}])
+            why_not = _unlinkable_reason(f, sym)
+            if why_not:
+                _stub_function(sym, f, why_not, [{"file": f}])
                 continue
         else:
             f = ""
@@ -2803,17 +2907,18 @@ def repair_sources_for_link(
             if sym not in global_vars or sym in known_stubs:
                 continue
             ctx = ctx or _link_unit_context(dp, module, sources=sources)
-            # A file the target fuzzer's link leaves out is never linked back: its global is stubbed.
-            linkable = [r for r in global_vars[sym] if _dag_tree_path(r["file"]) not in excluded]
+            # A file the target fuzzer's link leaves out is never linked back, nor one defining what the
+            # build already defines: its global is stubbed.
+            linkable = [r for r in global_vars[sym] if not _unlinkable_reason(r["file"], sym)]
             if linkable:
                 action, rec, reason = _place_global(linkable, ctx)
             else:
                 action, rec, reason = "stub", global_vars[sym][0], ""
-            why = {} if linkable else {"reason": _excluded_reason(rec["file"])}
+            why = {} if linkable else {"reason": _unlinkable_reason(rec["file"], sym)}
             if action == "stub" and stub_dir is None:
                 action, reason = "unresolved", "another link unit defines it and no build directory was given"
                 if not linkable:
-                    reason = f"{_excluded_reason(rec['file'])}, and no build directory was given"
+                    reason = f"{why['reason']}, and no build directory was given"
             elif action == "stub" and stub_dir is not None and flow_files is not None:
                 raw_sz = rec.get("size")
                 size = int(raw_sz) if isinstance(raw_sz, int) and raw_sz > 0 else DEFAULT_BSS_GLOBAL_SIZE
@@ -2864,6 +2969,9 @@ def repair_sources_for_link(
             have.add(norm)
             added.append(norm)
             resolved.append(sym)
+            if built is not None:
+                for name in file_defs.get(_dag_tree_path(norm), ()):
+                    built.setdefault(name, _dag_tree_path(norm))
     # A global is defined once: a file this round links in for any symbol defines the globals the
     # model records in it, so neither a stub of this round nor one of an earlier round stays for them
     # (sudo liblogsrv_a: protobuf-c.c added for protobuf_c_message_pack, and protobuf_c_empty_string
