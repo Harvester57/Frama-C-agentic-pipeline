@@ -1,0 +1,258 @@
+{
+  "$comment": "Contract for workspace/reports/judge/<module>.json, written by scripts/run_eacsl_fuzz.py judge (P2d standalone E-ACSL judge): records case-stratified SHA-256 input selection, O(N) batched execution, fresh-process witness confirmation (standalone candidates vs batch_state_only), per-case blinding, D1b cross-engine linking, not_judged accounting, and replay telemetry.",
+  "type": "object",
+  "definitions": {
+    "blinded_case": {
+      "type": "object",
+      "properties": {
+        "case": {"type": "integer", "minimum": 0},
+        "fingerprint": {"type": ["string", "null"]},
+        "crashes": {"type": "integer", "minimum": 1},
+        "remedies": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      },
+      "required": ["case", "fingerprint", "crashes"],
+      "additionalProperties": false
+    },
+    "cross_engine_link": {
+      "type": "object",
+      "properties": {
+        "judge_fingerprint": {"type": ["string", "null"]},
+        "explore_fingerprint": {"type": ["string", "null"]},
+        "explore_engine": {"type": ["string", "null"]},
+        "match": {
+          "type": "string",
+          "enum": ["same_artifact", "same_site", "adjacent_line"]
+        },
+        "artifact_sha256": {"type": ["string", "null"]},
+        "explore_artifact": {"type": ["string", "null"]},
+        "line_delta": {"type": ["integer", "null"], "minimum": 0}
+      },
+      "required": ["judge_fingerprint", "explore_fingerprint", "match"],
+      "additionalProperties": false
+    },
+    "judge_artifact": {
+      "type": "object",
+      "properties": {
+        "artifact": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "case": {"type": ["integer", "null"], "minimum": 0},
+        "engine": {"const": "eacsl"},
+        "discovering_step": {"const": "judge"},
+        "reproducible": {"type": "boolean"},
+        "standalone_confirmed": {"type": "boolean"},
+        "returncode": {"type": ["integer", "null"]},
+        "timed_out": {"type": "boolean"},
+        "failure": {"type": ["object", "null"]},
+        "failure_source": {"type": ["string", "null"]},
+        "fingerprint": {"type": ["string", "null"]},
+        "frames": {
+          "type": "array",
+          "items": {"type": "object"}
+        },
+        "replay_log_tail": {"type": "string"},
+        "link_stub_abort": {"type": ["object", "null"]},
+        "eacsl_resource_abort": {"type": ["object", "null"]},
+        "cross_engine_links": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/cross_engine_link"}
+        },
+        "harness_digest": {"type": ["string", "null"]},
+        "dispatch_case_count": {"type": ["integer", "null"], "minimum": 0},
+        "dispatch_selector": {"type": ["string", "null"]}
+      },
+      "required": [
+        "artifact",
+        "kind",
+        "sha256",
+        "size_bytes",
+        "engine",
+        "discovering_step",
+        "reproducible",
+        "standalone_confirmed",
+        "failure",
+        "fingerprint"
+      ],
+      "additionalProperties": false
+    },
+    "batch_state_only_entry": {
+      "type": "object",
+      "properties": {
+        "input": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "case": {"type": ["integer", "null"], "minimum": 0},
+        "batch_returncode": {"type": ["integer", "null"]},
+        "batch_timed_out": {"type": "boolean"},
+        "batch_failure": {"type": ["object", "null"]},
+        "batch_fingerprint": {"type": ["string", "null"]},
+        "standalone_returncode": {"type": ["integer", "null"]},
+        "standalone_timed_out": {"type": "boolean"}
+      },
+      "required": [
+        "input",
+        "sha256",
+        "batch_failure",
+        "batch_fingerprint",
+        "standalone_returncode",
+        "standalone_timed_out"
+      ],
+      "additionalProperties": false
+    },
+    "not_judged_breakdown": {
+      "type": "object",
+      "properties": {
+        "cap": {"type": "integer", "minimum": 0},
+        "timeout": {"type": "integer", "minimum": 0},
+        "blinded": {"type": "integer", "minimum": 0},
+        "smoke_skipped": {"type": "integer", "minimum": 0},
+        "error": {"type": "integer", "minimum": 0}
+      },
+      "required": ["cap", "timeout", "blinded", "smoke_skipped", "error"],
+      "additionalProperties": false
+    },
+    "inputs_summary": {
+      "type": "object",
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "mandatory": {"type": "integer", "minimum": 0},
+        "grown_total": {"type": "integer", "minimum": 0},
+        "grown_selected": {"type": "integer", "minimum": 0},
+        "selected": {"type": "integer", "minimum": 0},
+        "judged": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "not_judged": {"type": "integer", "minimum": 0},
+        "not_judged_breakdown": {"$ref": "#/definitions/not_judged_breakdown"}
+      },
+      "required": [
+        "total",
+        "mandatory",
+        "grown_total",
+        "grown_selected",
+        "selected",
+        "judged",
+        "passed",
+        "failed",
+        "not_judged",
+        "not_judged_breakdown"
+      ],
+      "additionalProperties": false
+    },
+    "judge_telemetry": {
+      "type": "object",
+      "properties": {
+        "judge_s": {"type": "number", "minimum": 0},
+        "batch_s": {"type": "number", "minimum": 0},
+        "confirm_s": {"type": "number", "minimum": 0},
+        "inputs_per_s": {"type": "number", "minimum": 0},
+        "batches_run": {"type": "integer", "minimum": 0},
+        "fresh_confirmations": {"type": "integer", "minimum": 0}
+      },
+      "required": [
+        "judge_s",
+        "batch_s",
+        "confirm_s",
+        "inputs_per_s",
+        "batches_run",
+        "fresh_confirmations"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "mode": {"const": "judge"},
+    "module": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "minLength": 1},
+    "discovering_step": {"const": "judge"},
+    "engine_used": {"type": ["string", "null"], "enum": ["eacsl", null]},
+    "profile": {"type": "string", "enum": ["quick", "standard", "deep"]},
+    "status": {
+      "type": "string",
+      "enum": [
+        "clean",
+        "crash_found",
+        "partial_blinded",
+        "blinded",
+        "partial",
+        "startup_error",
+        "skipped",
+        "judge_error"
+      ]
+    },
+    "binary": {"type": ["string", "null"]},
+    "corpus_cap": {"type": "integer", "minimum": 0},
+    "inputs": {"$ref": "#/definitions/inputs_summary"},
+    "not_judged": {"type": "integer", "minimum": 0},
+    "artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/judge_artifact"}
+    },
+    "batch_state_only": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/batch_state_only_entry"}
+    },
+    "cross_engine_links": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/cross_engine_link"}
+    },
+    "smoke_skipped_cases": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 0},
+      "uniqueItems": true
+    },
+    "blinded_cases": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/blinded_case"}
+    },
+    "partial_blinded": {"type": "boolean"},
+    "blinded_fingerprint": {"type": ["string", "null"]},
+    "blinded_remedies": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "telemetry": {"$ref": "#/definitions/judge_telemetry"},
+    "harness_digest": {"type": ["string", "null"]},
+    "dispatch_case_count": {"type": ["integer", "null"], "minimum": 0},
+    "dispatch_selector": {"type": ["string", "null"]},
+    "artifacts_omitted": {
+      "type": ["object", "null"],
+      "properties": {
+        "duplicates": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "reason": {"type": ["string", "null"]},
+    "startup_error": {"type": ["string", "null"]},
+    "diagnostic_hints": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": [
+    "schema_version",
+    "mode",
+    "module",
+    "generated_at",
+    "discovering_step",
+    "engine_used",
+    "profile",
+    "status",
+    "binary",
+    "corpus_cap",
+    "inputs",
+    "not_judged",
+    "artifacts",
+    "batch_state_only",
+    "cross_engine_links",
+    "smoke_skipped_cases",
+    "blinded_cases",
+    "partial_blinded",
+    "telemetry"
+  ],
+  "additionalProperties": false
+}
