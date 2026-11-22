@@ -82,6 +82,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import benchmark  # noqa: E402
+import harness_smoke  # noqa: E402
+import resources  # noqa: E402
 from patterns import KERNEL_RENAME_RE  # noqa: E402
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -107,7 +109,8 @@ _RENAMED_RE = KERNEL_RENAME_RE
 
 # Host-side stages after Phase 0, as `benchmark.py run` runs them (no replay, gate or queue: the seeded
 # set has no manifest reproducers and stops at Phase 2). `coverage reach-dynamic` runs before ingest, as
-# /framac-verify does.
+# /framac-verify does. `POST_STAGES` is the default (flags-off) sequence; `post_stages()` inserts
+# `smoke` and `judge` when FRAMAC_HARNESS_SMOKE / FRAMAC_FUZZ_EXPLORE_JUDGE are enabled.
 POST_STAGES = (
     ("build", f"{PM} build-check"),
     ("fuzz", f"{PM} run fuzz"),
@@ -115,6 +118,20 @@ POST_STAGES = (
     ("coverage", f"{PM} run coverage reach-dynamic"),
     ("ingest", f"{PM} run ingest"),
 )
+
+
+def post_stages() -> list[tuple[str, str]]:
+    """Host-side stages after Phase 0; inserts `smoke` and `judge` when their A/B flags are enabled."""
+    out: list[tuple[str, str]] = [("build", f"{PM} build-check")]
+    if harness_smoke.harness_smoke_enabled():
+        out.append(("smoke", f"{PM} run smoke"))
+    out.append(("fuzz", f"{PM} run fuzz"))
+    if resources.fuzz_explore_judge_enabled():
+        out.append(("judge", f"{PM} run judge"))
+    out.append(("eva", f"{PM} run eva"))
+    out.append(("coverage", f"{PM} run coverage reach-dynamic"))
+    out.append(("ingest", f"{PM} run ingest"))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -608,20 +625,22 @@ def collect_findings(run_dir: Path) -> dict[str, Any]:
     reports = run_dir / "workspace" / "reports"
     fuzz_hits: list[dict] = []
     fuzz_status: dict[str, str] = {}
-    for f in sorted((reports / "fuzz").glob("*.json")):
-        rep = benchmark.read_json(f, {}) or {}
-        fuzz_status[f.stem] = rep.get("status", "?")
-        for art in rep.get("artifacts") or []:
-            fail = art.get("failure") or {}
-            file_fn = str(art.get("fingerprint") or "").split("::", 1)[0]
-            fuzz_hits.append(
-                {
-                    "file": fail.get("file") or file_fn.split("#")[0],
-                    "function": fail.get("function") or (file_fn.split("#")[1] if "#" in file_fn else ""),
-                    "line": fail.get("line"),
-                    "kind": fail.get("kind"),
-                }
-            )
+    for kind_dir in ("fuzz", "judge"):
+        for f in sorted((reports / kind_dir).glob("*.json")):
+            rep = benchmark.read_json(f, {}) or {}
+            if kind_dir == "fuzz":
+                fuzz_status[f.stem] = rep.get("status", "?")
+            for art in rep.get("artifacts") or []:
+                fail = art.get("failure") or {}
+                file_fn = str(art.get("fingerprint") or "").split("::", 1)[0]
+                fuzz_hits.append(
+                    {
+                        "file": fail.get("file") or file_fn.split("#")[0],
+                        "function": fail.get("function") or (file_fn.split("#")[1] if "#" in file_fn else ""),
+                        "line": fail.get("line"),
+                        "kind": fail.get("kind"),
+                    }
+                )
     eva_invalid: list[dict] = []
     eva_unknown: list[dict] = []
     eva_status: dict[str, str] = {}
@@ -840,7 +859,7 @@ def stage_plan(proj: Path, fuzz_budget: int) -> list[tuple[str, str, str | None]
     """(stage, container command, class) after the capture, in order."""
     return [
         ("phase0", f"python3 {CONTAINER_SELF} inner --repo {repo_name(proj)} --fuzz-budget {fuzz_budget}", "eva"),
-        *((name, cmd, None) for name, cmd in POST_STAGES),
+        *((name, cmd, None) for name, cmd in post_stages()),
     ]
 
 
