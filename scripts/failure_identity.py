@@ -1438,6 +1438,21 @@ def _is_fuzz_init_file(file_path: str | None) -> bool:
     return norm == "fuzz_init.c" or norm.endswith("/fuzz_init.c")
 
 
+def _has_non_startup_target_site(failure: dict | None) -> bool:
+    """True when `failure` identifies a concrete, non-startup, non-runtime function or source file."""
+    if not isinstance(failure, dict):
+        return False
+    fn = str(failure.get("function") or "").strip()
+    file_ = str(failure.get("file") or "").strip()
+    if _is_startup_function(fn) or _is_fuzz_init_file(file_):
+        return False
+    if is_runtime_function(fn, file_):
+        return False
+    has_fn = bool(fn) and fn not in ("unknown", "unknown_function")
+    has_file = bool(file_) and file_ not in ("unknown", "<unknown>")
+    return has_fn or has_file
+
+
 def is_startup_failure(failure: dict | None, log_text: str = "") -> tuple[bool, str | None]:
     """
     Detect a crash or abort occurring during binary/runtime startup before `LLVMFuzzerTestOneInput`
@@ -1521,7 +1536,9 @@ def is_startup_failure(failure: dict | None, log_text: str = "") -> tuple[bool, 
             if re.search(rf"\b{re.escape(sfn)}\b", log_text):
                 return True, f"startup failure referencing {sfn}"
         if _LIBFUZZER_BANNER_RE.search(log_text):
-            return True, "crash/abort before LLVMFuzzerTestOneInput was entered"
+            eff_failure = failure if isinstance(failure, dict) else parse_runtime_failure(log_text)
+            if not _has_non_startup_target_site(eff_failure):
+                return True, "crash/abort before LLVMFuzzerTestOneInput was entered"
 
     return False, None
 

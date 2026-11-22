@@ -22,7 +22,7 @@ DEFAULT_MIN_HARNESS_INDUCED = 2
 DEFAULT_MIN_RATIO = 2 / 3
 TINY_INPUT_THRESHOLD_BYTES = 4
 
-_TRUTHY_FLAG_VALUES = frozenset({"on", "1", "true"})
+_TRUTHY_FLAG_VALUES = frozenset({"on", "1", "true", "yes"})
 _RATIO_EPS = 1e-9
 
 # Known RTE / E-ACSL alarm kinds (aligned with scripts/fingerprint.py).
@@ -101,7 +101,7 @@ _SIGNAL_RE = re.compile(r"\b(SIG(?:SEGV|ABRT|FPE|BUS|ILL|TRAP|SYS))\b", re.IGNOR
 
 
 def verifier_breaker_enabled() -> bool:
-    """Return True iff ``FRAMAC_VERIFIER_BREAKER`` is ``on``, ``1``, or ``true`` (default ``off``)."""
+    """Return True iff ``FRAMAC_VERIFIER_BREAKER`` is ``on``, ``1``, ``true``, or ``yes`` (default ``off``)."""
     raw = (os.environ.get(VERIFIER_BREAKER_ENV) or "").strip().lower()
     return raw in _TRUTHY_FLAG_VALUES
 

@@ -1227,3 +1227,162 @@ def test_p2d_judge_non_dispatch_blinding_and_p8a_clean_mid_batch_exit(
     assert rep_blind["inputs"]["not_judged_breakdown"]["blinded"] == 20 - R.BLINDING_CASE_THRESHOLD
     assert minischema.validate(rep_blind, minischema.load_schema(JUDGE_REPORT_SCHEMA)) == []
 
+
+def test_run_campaign_rounds_strips_private_keys_on_all_return_paths(tmp_path: Path) -> None:
+    # MINOR-2 regression: `_raw_crashes` and `_case_passes` must never leak on `not keep_going`
+    # or `not n_cases` (legacy, blinded, multi-round, and single-round fallback) paths.
+    binary = tmp_path / "fuzz_mod"
+    binary.write_bytes(b"bin")
+    art = tmp_path / "crash-1"
+    art.write_bytes(b"boom")
+    base_res: dict[str, Any] = {
+        "status": "crash_found",
+        "returncode": 77,
+        "timed_out": False,
+        "artifacts": [{"artifact": str(art), "kind": "crash", "sha256": hashlib.sha256(b"boom").hexdigest()}],
+        "fuzz_s": 1.0,
+        "replay_s": 0.1,
+        "telemetry": R.parse_libfuzzer_telemetry("#10\tDONE cov: 5 ft: 6 corp: 1/4b exec/s: 10 rss: 32Mb\n", fuzz_s=1.0),
+        "_raw_crashes": [{"artifact": str(art), "kind": "crash", "fingerprint": "fp1"}],
+        "_case_passes": {0: 5},
+    }
+
+    # 1. keep_going=False
+    r1 = R.run_campaign_rounds(
+        binary,
+        30,
+        campaign=lambda *_a, **_kw: dict(base_res),
+        rebuild=lambda _m: (None, {}),
+        n_cases=2,
+        keep_going=False,
+    )
+    assert "_raw_crashes" not in r1 and "_case_passes" not in r1
+
+    # 2. n_cases=None, explore_judge=False
+    r2 = R.run_campaign_rounds(
+        binary,
+        30,
+        campaign=lambda *_a, **_kw: dict(base_res),
+        rebuild=lambda _m: (None, {}),
+        n_cases=None,
+        keep_going=True,
+        explore_judge=False,
+    )
+    assert "_raw_crashes" not in r2 and "_case_passes" not in r2
+
+    # 3. n_cases=None, explore_judge=True, single-round fallback (max_time <= FORK_BLIND_PROBE_S)
+    r3 = R.run_campaign_rounds(
+        binary,
+        10,
+        campaign=lambda *_a, **_kw: dict(base_res),
+        rebuild=lambda _m: (None, {}),
+        n_cases=None,
+        keep_going=True,
+        explore_judge=True,
+    )
+    assert "_raw_crashes" not in r3 and "_case_passes" not in r3
+
+    # 4. n_cases=None, explore_judge=True, two-round continuation (max_time > FORK_BLIND_PROBE_S)
+    r4 = R.run_campaign_rounds(
+        binary,
+        120,
+        campaign=lambda *_a, **_kw: dict(base_res),
+        rebuild=lambda _m: (None, {}),
+        n_cases=None,
+        keep_going=True,
+        explore_judge=True,
+    )
+    assert "_raw_crashes" not in r4 and "_case_passes" not in r4
+
+    # 5. n_cases=None, explore_judge=True, blinded early stop
+    blind_res = dict(base_res)
+    blind_res["telemetry"] = R.parse_libfuzzer_telemetry(
+        "#0: cov: 0 ft: 0 corp: 0 exec/s: 0 oom/timeout/crash: 0/0/64 time: 2s job: 64 dft_time: 0\n",
+        fuzz_s=2.0,
+    )
+    r5 = R.run_campaign_rounds(
+        binary,
+        120,
+        campaign=lambda *_a, **_kw: dict(blind_res),
+        rebuild=lambda _m: (None, {}),
+        n_cases=None,
+        keep_going=True,
+        explore_judge=True,
+    )
+    assert r5["status"] == "blinded"
+    assert "_raw_crashes" not in r5 and "_case_passes" not in r5
+
+
+def test_judge_sandbox_unavailable_emits_schema_valid_judge_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # MINOR-4 regression: SandboxUnavailable during `judge` must emit a full judge_report.schema.json-valid
+    # report with `status: "judge_error"` and exit code 3 from CLI `main(["judge", ...])`.
+    bjson, _san, _eacsl = _make_build_json(tmp_path, module="sbx_mod")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(3):
+        (corpus / f"in_{i}").write_bytes(f"seed-{i}".encode())
+
+    def raise_sandbox(*_a, **_kw):
+        raise sandbox_exec.SandboxUnavailable("bwrap unavailable in test")
+
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", raise_sandbox)
+
+    rep = R.run_judge("sbx_mod", bjson, corpus, profile="standard")
+    assert rep["status"] == "judge_error"
+    assert str(rep.get("reason") or "").startswith("sandbox_unavailable:")
+    assert rep["inputs"]["selected"] == 3
+    assert rep["inputs"]["judged"] == 0
+    assert rep["inputs"]["not_judged_breakdown"]["error"] == 3
+    assert minischema.validate(rep, minischema.load_schema(JUDGE_REPORT_SCHEMA)) == []
+
+    # End-to-end CLI invocation returns exit code 3 and writes a schema-valid judge_error report.
+    out_json = tmp_path / "judge_sbx.json"
+    rc = R.main(
+        [
+            "judge",
+            "--module",
+            "sbx_mod",
+            "--build-json",
+            str(bjson),
+            "--corpus-dir",
+            str(corpus),
+            "--out-json",
+            str(out_json),
+            "--profile",
+            "standard",
+        ]
+    )
+    assert rc == 3
+    cli_rep = json.loads(out_json.read_text(encoding="utf-8"))
+    assert cli_rep["status"] == "judge_error"
+    assert str(cli_rep.get("reason") or "").startswith("sandbox_unavailable:")
+    assert minischema.validate(cli_rep, minischema.load_schema(JUDGE_REPORT_SCHEMA)) == []
+
+    # Also verify `main()`'s top-level `except SandboxUnavailable` fallback produces a schema-valid report.
+    out_json2 = tmp_path / "judge_sbx_top.json"
+    monkeypatch.setattr(R, "_run_judge_mode", raise_sandbox)
+    rc2 = R.main(
+        [
+            "judge",
+            "--module",
+            "sbx_mod",
+            "--build-json",
+            str(bjson),
+            "--corpus-dir",
+            str(corpus),
+            "--out-json",
+            str(out_json2),
+            "--profile",
+            "deep",
+        ]
+    )
+    assert rc2 == 3
+    cli_rep2 = json.loads(out_json2.read_text(encoding="utf-8"))
+    assert cli_rep2["status"] == "judge_error"
+    assert cli_rep2["profile"] == "deep"
+    assert str(cli_rep2.get("reason") or "").startswith("sandbox_unavailable:")
+    assert minischema.validate(cli_rep2, minischema.load_schema(JUDGE_REPORT_SCHEMA)) == []
+
+
