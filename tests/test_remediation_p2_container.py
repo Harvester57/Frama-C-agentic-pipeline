@@ -40,8 +40,9 @@ NOT_FORWARDED = {
     "FRAMAC_SHARED_CACHE_DIR",
     "FRAMAC_SUBLEASE_ID",
     "FRAMAC_SHARE",
-    # C macros of generated harnesses, not environment variables
+    # C macros and per-process harness filters, not host-forwarded environment variables
     "FRAMAC_FUZZ_SKIP_CASES",
+    "FRAMAC_FUZZ_ONLY_CASE",  # runtime per-process harness case filter (same category as FRAMAC_FUZZ_SKIP_CASES)
     "FRAMAC_EVA_SHARD",
     # the message a link stub prints when called (fuzz_build.LINK_STUB_MARKER), not an environment variable
     "FRAMAC_LINK_STUB_CALLED",
@@ -85,6 +86,11 @@ AB_SWITCHES = (
     "FRAMAC_LOOP_SEEDS",
     "FRAMAC_REJECTION_REOPEN",
     "FRAMAC_WP_GOAL_COSTS",
+    "FRAMAC_HARNESS_SCOPE_V2",
+    "FRAMAC_API_TRUST_SCHEMA",
+    "FRAMAC_HARNESS_SMOKE",
+    "FRAMAC_FUZZ_EXPLORE_JUDGE",
+    "FRAMAC_VERIFIER_BREAKER",
 )
 # The value that turns each switch to its baseline side.
 AB_BASELINE = {name: "off" for name in AB_SWITCHES} | {"FRAMAC_CANDIDATE_RANK": "legacy"}
