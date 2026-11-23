@@ -1,0 +1,18 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/58-kernel-acsl-string-sizeof-escaped.patch
+# Upstream ref: unfiled-58
+# Summary: kernel: unescape ACSL string literals before computing their array type/sizeof (soundness)
+
+diff --git a/src/kernel/services/ast_queries/logic_typing.ml b/src/kernel/services/ast_queries/logic_typing.ml
+index 0c4e2734c9..d134beadda 100644
+--- a/src/kernel/services/ast_queries/logic_typing.ml
++++ b/src/kernel/services/ast_queries/logic_typing.ml
+@@ -2682,7 +2682,8 @@ struct
+       let t = Logic_utils.parse_float ~loc s in
+       t.term_node , t.term_type
+     | PLconstant (StringConstant s) ->
+-      TConst (LStr (unescape s)), typeOf_string_literal loc s
++      let s = unescape s in
++      TConst (LStr s), typeOf_string_literal loc s
+     | PLconstant (WStringConstant s) ->
+       let l = wcharlist_of_string s in
+       TConst (LWStr l), typeOf_wstring_literal loc l

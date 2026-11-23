@@ -1,0 +1,57 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/25-kernel-offsetof-non-constant-index.patch
+# Upstream ref: pub/frama-c#2813, pub/frama-c!44
+# Summary: kernel: accept non-constant array index in offsetof
+
+diff --git a/src/kernel/internals/typing/cabs2cil.ml b/src/kernel/internals/typing/cabs2cil.ml
+index 23929aaca3..c6601b9859 100644
+--- a/src/kernel/internals/typing/cabs2cil.ml
++++ b/src/kernel/internals/typing/cabs2cil.ml
+@@ -6965,14 +6965,45 @@ and doExp local_env
+                 | [{ enode = CastE (_, {enode = AddrOf (host, offset)}) } as e] ->
+                   begin
+                     piscall := false;
+-                    prestype := Machine.sizeof_type ();
++                    let size_t = Machine.sizeof_type () in
++                    prestype := size_t;
+                     let typ = Cil.typeOfLhost host in
++                    (* GCC extension: the designator may contain array
++                       indexes that are not constant ([offsetof(t, a[i])]).
++                       Each of them is replaced by 0 in the designator, which
++                       has then a constant offset, and contributes
++                       [(size_t)i * sizeof(elt)] to the result. *)
++                    let rec split typ = function
++                      | NoOffset -> NoOffset, []
++                      | Field (fi, off) ->
++                        let off, idx = split fi.ftype off in
++                        Field (fi, off), idx
++                      | Index (i, off) ->
++                        let elt = Ast_types.C.direct_array_element typ in
++                        let off, idx = split elt off in
++                        match Cil.constFoldToInt i with
++                        | Some _ -> Index (i, off), idx
++                        | None ->
++                          Index (Cil.zero ~loc:i.eloc, off), (i, elt) :: idx
++                    in
+                     try
+-                      let start, _width = Cil.bitsOffset typ offset in
++                      let cst_offset, indexes = split typ offset in
++                      let start, _width = Cil.bitsOffset typ cst_offset in
+                       if start mod 8 <> 0 then
+                         Kernel.error ~current:true "Using offset of bitfield";
+                       let kind = Machine.sizeof_kind () in
+-                      pres := Cil.kinteger ~loc:e.eloc kind (start / 8);
++                      let loc = e.eloc in
++                      let add acc (i, elt) =
++                        let size =
++                          Cil.kinteger ~loc kind (Cil.bytesSizeOf elt) in
++                        let i = Cil.mkCast ~newt:size_t i in
++                        let i =
++                          Cil.new_exp ~loc (BinOp (Mult, i, size, size_t)) in
++                        Cil.new_exp ~loc (BinOp (PlusA, acc, i, size_t))
++                      in
++                      pres :=
++                        List.fold_left add
++                          (Cil.kinteger ~loc kind (start / 8)) indexes
+                     with Cil.SizeOfError (s, _) ->
+                       pres := e;
+                       Kernel.error ~once:true ~current:true

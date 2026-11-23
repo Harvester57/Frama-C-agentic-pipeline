@@ -1,0 +1,24 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/73-libc-sigaction-oldact-contract.patch
+# Upstream ref: unfiled-73
+# Summary: libc: fix sigaction oldact assigns and \old postcondition so Eva does not mark post-call code dead
+
+diff --git a/share/libc/signal.h b/share/libc/signal.h
+index 0773ba4cea..e116f738db 100644
+--- a/share/libc/signal.h
++++ b/share/libc/signal.h
+@@ -244,13 +244,13 @@ __FC_EXTERN struct sigaction __fc_sigaction[SIGRTMAX+1];
+   requires valid_oldact_or_null: oldact == \null || \valid(oldact);
+   requires valid_read_act_or_null: act == \null || \valid_read(act);
+   requires separation:separated_acts: \separated(act, oldact);
+-  assigns *oldact \from &__fc_sigaction;
++  assigns *oldact \from __fc_sigaction[signum], indirect:signum;
+   assigns __fc_sigaction[signum] \from *act;
+   assigns \result \from indirect:signum, indirect:act, indirect:*act,
+                         indirect:oldact, indirect:*oldact;
+   ensures act_changed: act == \null || \subset(__fc_sigaction[signum], *act);
+   ensures oldact_assigned: oldact == \null ||
+-                           \subset({*oldact}, __fc_sigaction[signum]);
++                           \subset({*oldact}, \old(__fc_sigaction[signum]));
+   ensures result_ok_or_error: \result == 0 || \result == -1;
+  */
+ extern int sigaction(int signum, const struct sigaction *restrict act,

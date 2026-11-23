@@ -1,0 +1,56 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/36-eacsl-heap-zone-size-overflow.patch
+# Upstream ref: pub/frama-c#2825, pub/frama-c!53
+# Summary: e-acsl: prevent 32-bit int overflow in large heap/stack zone sizes
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+index 3176a965ec..603e999227 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+@@ -321,7 +321,7 @@ void do_eacsl_memory_init(int *argc_ref, char ***argv_ref, size_t ptr_size) {
+   /* Initialize report file with debug logs (only in debug mode). */
+   initialize_report_file(argc_ref, argv_ref);
+   /* Lift stack limit to account for extra stack memory overhead.  */
+-  increase_stack_limit(E_ACSL_STACK_SIZE * MB);
++  increase_stack_limit((size_t)E_ACSL_STACK_SIZE * MB);
+   /* Allocate and log shadow memory layout of the execution. Case of the
+        segments available after main. */
+   init_shadow_layout_main(argc_ref, argv_ref);
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c
+index 97a4875897..00d067be05 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c
+@@ -334,10 +334,10 @@ int eacsl_pthread_create(pthread_t *restrict thread,
+   // already greater than the default value of E-ACSL
+   size_t original_stack_size;
+   pthread_attr_getstacksize(pattr, &original_stack_size);
+-  if (original_stack_size >= E_ACSL_THREAD_STACK_SIZE * MB) {
++  if (original_stack_size >= (size_t)E_ACSL_THREAD_STACK_SIZE * MB) {
+     wrapped->stack_size = original_stack_size * 2;
+   } else {
+-    wrapped->stack_size = E_ACSL_THREAD_STACK_SIZE * MB;
++    wrapped->stack_size = (size_t)E_ACSL_THREAD_STACK_SIZE * MB;
+   }
+   pthread_attr_setstacksize(pattr, wrapped->stack_size);
+ 
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
+index 216139be96..0beefa3364 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h
+@@ -56,7 +56,7 @@
+ 
+ /** Hardcoded sizes of tracked program segments {{{ */
+ /*! \brief Size of a program's heap */
+-#define PGM_HEAP_SIZE (E_ACSL_HEAP_SIZE * MB)
++#define PGM_HEAP_SIZE ((size_t)(E_ACSL_HEAP_SIZE) * MB)
+ 
+ /*! \brief Size of a program's Thread-local storage (TLS).
+   Standard streams stdin, stdout and stderr are put here.
+@@ -66,7 +66,7 @@
+   However since the TLS is next to the VDSO segment in the program layout, the
+   default size is small enough so that both segments do not overlap. */
+ #ifndef PGM_TLS_SIZE
+-#  define PGM_TLS_SIZE (E_ACSL_TLS_SIZE * MB)
++#  define PGM_TLS_SIZE ((size_t)(E_ACSL_TLS_SIZE) * MB)
+ #endif
+ 
+ /*! \brief Mspace padding used by shadow segments. This is to make sure that

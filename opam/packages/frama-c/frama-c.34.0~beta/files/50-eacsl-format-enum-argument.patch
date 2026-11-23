@@ -1,0 +1,35 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/50-eacsl-format-enum-argument.patch
+# Upstream ref: unfiled-50
+# Summary: e-acsl: handle enum arguments and enum pointers in --validate-format-strings
+
+diff --git a/plugins/e-acsl/src/libraries/functions.ml b/plugins/e-acsl/src/libraries/functions.ml
+index 953d8969cb..e7315d0a6f 100644
+--- a/plugins/e-acsl/src/libraries/functions.ml
++++ b/plugins/e-acsl/src/libraries/functions.ml
+@@ -128,7 +128,7 @@ module Libc = struct
+       | FLongDouble -> "E" (* [long double] *)
+     in
+     (* get a character representing a pointer type *)
+-    let get_pkind_str a ty = match ty.tnode with
++    let rec get_pkind_str a ty = match ty.tnode with
+       | TInt IChar | TInt ISChar -> "s" (* [char*] *)
+       | TInt IUChar -> "S" (* [unsigned char*] *)
+       | TInt IShort -> "q" (* [short*] *)
+@@ -139,6 +139,7 @@ module Libc = struct
+       | TInt IULong -> "Z" (* [unsigned long int*] *)
+       | TInt ILongLong -> "w" (* [long int*] *)
+       | TInt IULongLong -> "W" (* [unsigned long int*] *)
++      | TEnum { ekind } -> get_pkind_str a (Cil_const.mk_tint ekind)
+       | TVoid -> "p" (* [void*] *)
+       | _ ->
+         Options.fatal "unexpected argument type in printf: type %a of arg %a@."
+@@ -179,7 +180,8 @@ module Libc = struct
+              str ^ acc
+            | TFloat k -> get_fkind_str k ^ acc
+            | TPtr ty -> get_pkind_str exp (Ast_types.C.unroll ty) ^ acc
+-           | TVoid | TArray _ | TFun _ | TNamed _ | TComp _ | TEnum _
++           | TEnum { ekind } -> get_ikind_str ekind ^ acc
++           | TVoid | TArray _ | TFun _ | TNamed _ | TComp _
+            | TBuiltin_va_list -> assert false)
+         exps
+         ""

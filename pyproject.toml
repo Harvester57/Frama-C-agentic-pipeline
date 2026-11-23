@@ -96,6 +96,7 @@ known-first-party = [
     "spec_kb",
     "stub_check",
     "stub_gen",
+    "sync_opam_patches",
     "target_env",
     "tiers",
     "trust",

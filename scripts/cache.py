@@ -644,6 +644,26 @@ def toolchain_id(runner: Callable | None = None) -> str:
     return f"{base}+snapshot:{snap}" if snap else base
 
 
+def _patch_manifest_digest() -> str | None:
+    """Return the pipeline patch-stack digest from `$FRAMAC_SHARE/pipeline-patches.json`, if present."""
+    share = (os.environ.get("FRAMAC_SHARE") or "/home/opam/.opam/5.5/share/frama-c").strip()
+    if not share:
+        return None
+    manifest = Path(share) / "pipeline-patches.json"
+    if not manifest.is_file():
+        return None
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        digest = data.get("digest")
+        if isinstance(digest, str) and digest:
+            return digest
+    except (OSError, ValueError):
+        pass
+    with contextlib.suppress(OSError):
+        return _sha256_path(manifest)
+    return None
+
+
 def _image_or_tools_id(runner: Callable | None = None) -> str:
     """FRAMAC_IMAGE_ID when set, else a digest of the tool versions (memoized per process)."""
     image = (os.environ.get("FRAMAC_IMAGE_ID") or "").strip()
@@ -662,6 +682,9 @@ def _image_or_tools_id(runner: Callable | None = None) -> str:
             parts.append(f"{cmd[0]}:{proc.returncode}:{text[0] if text else ''}")
         except (OSError, subprocess.SubprocessError, ValueError):
             parts.append(f"{cmd[0]}:missing")
+    patch_digest = _patch_manifest_digest()
+    if patch_digest:
+        parts.append(f"patches:{patch_digest}")
     value = "tools:" + hashlib.sha256("\n".join(parts).encode()).hexdigest()
     with _memo_guard:
         _toolchain_memo = value

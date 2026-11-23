@@ -1,0 +1,69 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/45-metacsl-result-in-postcond.patch
+# Upstream ref: unfiled-45
+# Summary: metacsl: allow \result in \postcond properties
+
+diff --git a/meta_parse.ml b/meta_parse.ml
+index 7740483..d5d0da7 100644
+--- a/meta_parse.ml
++++ b/meta_parse.ml
+@@ -177,7 +177,7 @@ let meta_type_term termassoc quantifiers kf loc orig_ctxt meta_ctxt env expr =
+ (* Given an association table, combine the previous functions to type
+  * a full custom predicate
+  *)
+-let process_meta_termassoc typing_context loc kf termassoc expr =
++let process_meta_termassoc ?(with_result=false) typing_context loc kf termassoc expr =
+   let quantifiers = Str_Hashtbl.create 5 in
+   let meta_tc =
+     {typing_context with
+@@ -188,7 +188,21 @@ let process_meta_termassoc typing_context loc kf termassoc expr =
+   let fenv = Logic_typing.append_here_label meta_tc.pre_state in
+   let fenv2 = Logic_typing.append_pre_label fenv in
+   let fenv3 = Logic_typing.append_old_and_post_labels fenv2 in
+-  let pred = meta_tc.type_predicate meta_tc fenv3 expr in
++  (* \result only has a meaning in a \postcond property, which becomes an
++     ensures clause of [kf]. Guard on [is_fun] because [Meta_deduce.dummy_unpack]
++     types properties with [Cil_datatype.Kf.dummy], whose type is [Typ.dummy]
++     rather than a function type. [add_result] leaves the environment unchanged
++     when [kf] returns void. *)
++  let fenv4 =
++    if with_result && Ast_types.C.is_fun (Kernel_function.get_type kf) then
++      let rt = Kernel_function.get_return_type kf in
++      let rt =
++        if Kernel_function.is_ghost kf then Ast_types.C.add_ghost rt else rt
++      in
++      Logic_typing.add_result fenv3 (Ctype rt)
++    else fenv3
++  in
++  let pred = meta_tc.type_predicate meta_tc fenv4 expr in
+   Meta_bindings.after_parse meta_tc pred quantifiers
+ 
+ (* Check that a given lexpr refer to a C function and return its varinfo *)
+@@ -251,7 +265,7 @@ let typing_error hloc mp_name kf_name metavars (loc, error_msg) =
+     error_msg
+     metav_msg
+ 
+-let delay_prop tc name lexpr kf aslist =
++let delay_prop ?(with_result=false) tc name lexpr kf aslist =
+   let dfind_var ?label:_ var =
+     (* Tweak find_var so it can find things after link *)
+     try tc.find_var var
+@@ -274,7 +288,7 @@ let delay_prop tc name lexpr kf aslist =
+                             find_type = dft} in
+   let loc = lexpr.lexpr_loc in
+   delayed_tc.on_error
+-    (process_meta_termassoc delayed_tc loc kf aslist)
++    (process_meta_termassoc ~with_result delayed_tc loc kf aslist)
+     (typing_error loc name (Kernel_function.get_name kf) aslist)
+     lexpr
+ 
+@@ -544,7 +558,9 @@ let process_property tc loc = function
+     (* Execute macros in property *)
+     let expanded = expand_macros tc loc eproperty in
+     (* Delegate typing of property *)
+-    let mp_property = delay_prop tc mp_name expanded in
++    let mp_property =
++      delay_prop ~with_result:(mp_context = Postcond) tc mp_name expanded
++    in
+     let mp_used_meta_vars = extract_meta_vars expanded in
+     gathered_props :=
+       {mp_name; mp_target; mp_context; mp_proof_method; mp_translation;

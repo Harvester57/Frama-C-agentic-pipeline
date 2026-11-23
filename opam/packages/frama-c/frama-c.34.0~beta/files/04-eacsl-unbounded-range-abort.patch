@@ -1,0 +1,56 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/04-eacsl-unbounded-range-abort.patch
+# Upstream ref: pub/frama-c#2798, pub/frama-c!29
+# Summary: e-acsl: do not abort whole instrumentation on unbounded ranges
+
+diff --git a/plugins/e-acsl/src/analyses/interval.ml b/plugins/e-acsl/src/analyses/interval.ml
+index d65eb9ae8a..1a9af96279 100644
+--- a/plugins/e-acsl/src/analyses/interval.ml
++++ b/plugins/e-acsl/src/analyses/interval.ml
+@@ -517,7 +517,7 @@ let rec infer ~force ~logic_env t =
+       let i2 = recurse n2 in
+       Error.map2 join i1 i2
+     | Trange(None, _) | Trange(_, None) ->
+-      Options.abort ~current:true "unbounded ranges are not part of E-ACSl"
++      Error.untypable "unbounded range"
+ 
+     | Tlet (li,t) ->
+       let li_t = Terms.of_li li in
+diff --git a/plugins/e-acsl/src/analyses/memory_tracking.ml b/plugins/e-acsl/src/analyses/memory_tracking.ml
+index f44418b66f..d0b0bc0e40 100644
+--- a/plugins/e-acsl/src/analyses/memory_tracking.ml
++++ b/plugins/e-acsl/src/analyses/memory_tracking.ml
+@@ -387,7 +387,7 @@ module rec Transfer
+       let varinfos = register_term kf varinfos t1 in
+       register_term kf varinfos t2
+     | Trange(None, _) | Trange(_, None) ->
+-      Options.abort "unbounded ranges are not part of E-ACSL"
++      Error.untypable "unbounded range"
+ 
+   and register_body kf varinfos = function
+     | LBnone | LBreads _ -> varinfos
+diff --git a/plugins/e-acsl/src/analyses/typing.ml b/plugins/e-acsl/src/analyses/typing.ml
+index 6263c8243b..c0bfcc5757 100644
+--- a/plugins/e-acsl/src/analyses/typing.ml
++++ b/plugins/e-acsl/src/analyses/typing.ml
+@@ -663,7 +663,7 @@ let rec type_term
+     | Tcomprehension (_,_,_) -> Error.not_yet "tset comprehension"
+ 
+     | Trange(None, _) | Trange(_, None) ->
+-      Options.abort ~current:true "unbounded ranges are not part of E-ACSl"
++      Error.untypable "unbounded range"
+     | Trange(Some n1, Some n2) ->
+       ignore (type_term ~use_gmp_opt ~profile n1);
+       ignore (type_term ~use_gmp_opt ~profile n2);
+diff --git a/plugins/e-acsl/src/code_generator/memory_translate.ml b/plugins/e-acsl/src/code_generator/memory_translate.ml
+index cfad697df9..93f279d402 100644
+--- a/plugins/e-acsl/src/code_generator/memory_translate.ml
++++ b/plugins/e-acsl/src/code_generator/memory_translate.ml
+@@ -177,7 +177,7 @@ let range_to_ptr_and_size ~adata ~loc kf env ptr r p =
+     | Trange(Some n1, Some n2) ->
+       n1, n2
+     | Trange(None, _) | Trange(_, None) ->
+-      Options.abort ~current:true "unbounded ranges are not part of E-ACSL"
++      Error.untypable "unbounded range"
+     | _ ->
+       assert false
+   in

@@ -1,0 +1,107 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/30-eacsl-format-promoted-argument-signedness.patch
+# Upstream ref: pub/frama-c#2819, pub/frama-c!48
+# Summary: e-acsl: accept promoted unsigned char/short/_Bool in format checks
+
+diff --git a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+index f4876abc80..552c9e5689 100644
+--- a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
++++ b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+@@ -692,6 +692,29 @@ static abbrev_t infer_n_abbr(format_directive *dir) {
+   return '\0';
+ }
+ 
++/** \brief Return a true value if an argument of abbreviated type `actual_t`
++   is accepted by a directive that expects an argument of abbreviated type
++   `expected_t`.
++
++   Arguments of integer types smaller than `int` are promoted to `int`. The
++   instrumentation describes the signed ones as `int` ('d'), and the unsigned
++   ones by their type before promotion: 'C' for `unsigned char`, `_Bool` and
++   `char` where it is unsigned, 'H' for `unsigned short`. Besides the expected
++   type itself, such an unsigned argument is accepted for `int` and
++   `unsigned int`: each of its values is representable in both types, so
++   reading it as either type gives its value (C11 7.16.1.1p2). */
++static int compatible_abbr(abbrev_t expected_t, abbrev_t actual_t) {
++  if (actual_t == expected_t)
++    return 1;
++  switch (actual_t) {
++  case IUChar:
++  case IUShort:
++    return expected_t == IInt || expected_t == IUInt;
++  default:
++    return 0;
++  }
++}
++
+ /** \brief Check that a given abbreviated type (`expected_t`) matches the
+    abbreviated type in the format description (`fmtdesc`) and abort the
+    execution if it is not so.
+@@ -702,7 +725,7 @@ static abbrev_t infer_n_abbr(format_directive *dir) {
+ static void validate_format_type(abbrev_t expected_t, const char *fmtdesc,
+                                  format_directive *dir, const char *func) {
+   abbrev_t actual_t = fmtdesc[dir->arg.index];
+-  if (actual_t != expected_t) {
++  if (!compatible_abbr(expected_t, actual_t)) {
+     private_abort("%s: directive %d ('%s') expects argument of type '%s'"
+                   " but the corresponding argument has type '%s'\n",
+                   func, dir->arg.index + 1, dir->directive,
+diff --git a/plugins/e-acsl/src/libraries/functions.ml b/plugins/e-acsl/src/libraries/functions.ml
+index 953d8969cb..943b1cf656 100644
+--- a/plugins/e-acsl/src/libraries/functions.ml
++++ b/plugins/e-acsl/src/libraries/functions.ml
+@@ -105,8 +105,20 @@ module Libc = struct
+       else
+         l
+     in
++    (* get a character representing an unsigned integer type smaller than
++       [int], if [k] is one. An argument of such a type is promoted to [int],
++       and each of its values is representable in both [int] and
++       [unsigned int]: the runtime accepts it for directives expecting either
++       type. *)
++    let get_small_unsigned_ikind_str = function
++      | IUChar -> Some "C" (* [unsigned char] *)
++      | IBool -> Some "C" (* [_Bool], checked as [unsigned char] *)
++      | IChar when Machine.char_is_unsigned () -> Some "C" (* [char] *)
++      | IUShort -> Some "H" (* [unsigned short] *)
++      | _ -> None
++    in
+     (* get a character representing an integer type *)
+-    let get_ikind_str = function
++    let get_ikind_str k = match k with
+       | IInt -> "d" (* [int] *)
+       | IUInt -> "D" (* [unsigned int] *)
+       | ILong -> "l" (* [long] *)
+@@ -116,7 +128,18 @@ module Libc = struct
+       | IInt128 | IUInt128 -> Error.not_yet "functions.ml: 128-bit integers"
+       (* _Bool, char and short (either signed or unsigned are promoted to
+          int) *)
+-      | IBool | IChar | ISChar | IUChar | IShort | IUShort -> "d"
++      | IBool | IChar | ISChar | IUChar | IShort | IUShort ->
++        Option.value ~default:"d" (get_small_unsigned_ikind_str k)
++    in
++    (* the default argument promotions cast an argument of an unsigned type
++       smaller than [int] to [int]: look through that cast to get its type *)
++    let get_promoted_ikind_str exp = match exp.enode with
++      | CastE (ty, e) ->
++        (match Ast_types.C.unroll_node ty,
++               Ast_types.C.unroll_node (Cil.typeOf e) with
++        | TInt IInt, TInt k -> get_small_unsigned_ikind_str k
++        | _ -> None)
++      | _ -> None
+     in
+     (* get a character representing a floating point type *)
+     let get_fkind_str = function
+@@ -149,7 +172,12 @@ module Libc = struct
+     let param_str =
+       List.fold_right
+         (fun exp acc -> match Cil.(Ast_types.C.unroll_node (typeOf exp)) with
+-           | TInt k -> get_ikind_str k ^ acc
++           | TInt k ->
++             let str =
++               Option.value ~default:(get_ikind_str k)
++                 (get_promoted_ikind_str exp)
++             in
++             str ^ acc
+            | TFloat k -> get_fkind_str k ^ acc
+            | TPtr ty -> get_pkind_str exp (Ast_types.C.unroll ty) ^ acc
+            | TVoid | TArray _ | TFun _ | TNamed _ | TComp _ | TEnum _

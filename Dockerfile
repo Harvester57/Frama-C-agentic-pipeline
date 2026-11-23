@@ -15,7 +15,8 @@
 # CI's toolchain check (image_toolchain.py compare) fails when the release, gcc or glibc drift apart.
 #
 # Frama-C and MetAcsl come from the local opam repository in opam/ (opam files of their pending
-# opam-repository releases, ocaml/opam-repository#31236 and #31235, each with its source checksum).
+# opam-repository releases, ocaml/opam-repository#31236 and #31235, each with its source checksum
+# and a curated source-only patch queue managed by tools/sync_opam_patches.py).
 # Every other package comes from the opam-repository checkout inside OPAM_BASE, so the digest pins it.
 #
 # Both images create /framac-scratch and /framac-cache, mode 1777: a new named scratch volume (or a named
@@ -104,6 +105,8 @@ COPY --chown=opam:opam opam/ /home/opam/framac-opam-repo/
 RUN opam repo add --this-switch framac-local /home/opam/framac-opam-repo \
     && opam install "frama-c.${FRAMAC_VERSION}" "frama-c-metacsl.${METACSL_VERSION}" \
         why3.1.8.2 alt-ergo-free.2.4.3 ocamlfind \
+    && cp /home/opam/framac-opam-repo/patches-manifest.json \
+        /home/opam/.opam/5.5/share/frama-c/pipeline-patches.json \
     && opam exec -- frama-c -version \
     && opam exec -- frama-c -plugins | grep -q MetAcsl \
     && opam clean --all-switches --download-cache --logs --repo-cache \
@@ -159,8 +162,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && cp -f /home/opam/.why3.conf /root/.why3.conf \
     && chmod 644 /home/opam/.why3.conf /root/.why3.conf
 
-# MetAcsl (program-wide ACSL properties, Layers 4-6) comes with the switch.
-RUN frama-c -plugins | grep -q MetAcsl
+# MetAcsl (program-wide ACSL properties, Layers 4-6) and the curated patch manifest come with the switch.
+RUN frama-c -plugins | grep -q MetAcsl \
+    && python3 -c "import json, pathlib; m = json.loads(pathlib.Path('/home/opam/.opam/5.5/share/frama-c/pipeline-patches.json').read_text()); assert m['frama_c'] and m['metacsl'] and m['digest']"
 
 COPY scripts/ /opt/framac-pipeline/scripts/
 COPY templates/ /opt/framac-pipeline/templates/

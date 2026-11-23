@@ -1,0 +1,43 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/72-libc-pclose-pipe-status-soundness.patch
+# Upstream ref: unfiled-72
+# Summary: libc: track pipe state via ghost __fc_pipe_status so pclose does not prove \false in WP (soundness)
+
+diff --git a/share/libc/stdio.h b/share/libc/stdio.h
+index f8e11588b6..ed4b196a56 100644
+--- a/share/libc/stdio.h
++++ b/share/libc/stdio.h
+@@ -604,20 +604,19 @@ extern int fputs_unlocked(const char *s, FILE *stream);
+ 
+ extern int dprintf(int fd, const char *restrict format, ...);
+ 
++/*@ ghost __FC_EXTERN int __fc_pipe_status; */
+ /*@ axiomatic pipe_streams {
+-  predicate is_open_pipe{L}(FILE *stream); // is stream an open pipe?
+-  // Logic label L is not used, but must be present because the
+-  // predicate depends on the memory state
+-  }
+-*/
++  predicate is_open_pipe{L}(FILE *stream) reads __fc_pipe_status;
++} */
+ 
+ /*@
+   requires valid_command: valid_read_string(command);
+   requires valid_mode: valid_read_string(mode);
+-  assigns \result \from indirect:*command, indirect:*mode,
+-    &__fc_fopen;
++  assigns \result \from indirect:*command, indirect:*mode, &__fc_fopen;
+   assigns __fc_fopen[0..] \from indirect:*command, indirect:*mode,
+     __fc_fopen[0..];
++  assigns __fc_pipe_status \from indirect:*command, indirect:*mode,
++    __fc_pipe_status;
+   ensures result_error_or_valid_open_pipe:
+     \result == \null ||
+     (\subset(\result,&__fc_fopen[0 .. __FC_FOPEN_MAX-1]) &&
+@@ -629,6 +628,7 @@ extern FILE *popen(const char *command, const char *mode);
+   requires valid_stream: \valid(stream);
+   requires open_pipe: is_open_pipe(stream);
+   assigns \result \from indirect:*stream;
++  assigns __fc_pipe_status \from indirect:*stream, __fc_pipe_status;
+   ensures closed_stream: !is_open_pipe(stream);
+ */
+ extern int pclose(FILE *stream);

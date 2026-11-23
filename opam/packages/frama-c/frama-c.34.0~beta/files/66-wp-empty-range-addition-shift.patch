@@ -1,0 +1,93 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/66-wp-empty-range-addition-shift.patch
+# Upstream ref: unfiled-66
+# Summary: wp: guard range addition/subtraction and pointer shifts on range non-emptiness (soundness)
+
+diff --git a/plugins/wp/src/Cvalues.ml b/plugins/wp/src/Cvalues.ml
+index 571045eac2..2a8a64e832 100644
+--- a/plugins/wp/src/Cvalues.ml
++++ b/plugins/wp/src/Cvalues.ml
+@@ -805,7 +805,15 @@ struct
+         when Ctypes.equal obj0 obj ->
+         let a = Vset.bound_add a0 a1 in
+         let b = Vset.bound_add b0 b1 in
+-        srange l obj0 size a b
++        if Vset.is_non_empty_range a0 b0 && Vset.is_non_empty_range a1 b1 then
++          srange l obj0 size a b
++        else
++          let k = Lang.freshvar ~basename:"k" Logic.Int in
++          let tk = e_var k in
++          Sdescr([k], M.shift l obj0 tk,
++                 p_conj [ Vset.non_empty_range a0 b0 ;
++                          Vset.non_empty_range a1 b1 ;
++                          Vset.in_range tk a b ])
+       | _ ->
+         let xs,l,p = rdescr sloc in
+         let ys,k,q = Vset.descr kset in
+diff --git a/plugins/wp/src/Vset.ml b/plugins/wp/src/Vset.ml
+index d2935143f6..608ee6b737 100644
+--- a/plugins/wp/src/Vset.ml
++++ b/plugins/wp/src/Vset.ml
+@@ -352,6 +352,32 @@ let bound_sub a b =
+   | None,_ | _,None -> None
+   | Some x , Some y -> Some (e_sub x y)
+ 
++let non_empty_range a b =
++  match a,b with
++  | Some x , Some y -> p_leq x y
++  | _ -> p_true
++
++let is_non_empty_range a b =
++  F.is_ptrue (non_empty_range a b) = Qed.Logic.Yes
++
++let is_empty_range a b =
++  F.is_ptrue (non_empty_range a b) = Qed.Logic.No
++
++let empty_range = Range(Some e_one, Some e_zero)
++
++let range_comb a b c d lo hi =
++  if is_empty_range a b || is_empty_range c d then
++    empty_range
++  else if is_non_empty_range a b && is_non_empty_range c d then
++    Range(lo, hi)
++  else
++    let k = Lang.freshvar ~basename:"k" Logic.Int in
++    let tk = e_var k in
++    Descr([k], tk,
++          p_conj [ non_empty_range a b ;
++                   non_empty_range c d ;
++                   in_range tk lo hi ])
++
+ let lift_add xs ys =
+   cartesian
+     (fun x y ->
+@@ -360,7 +386,7 @@ let lift_add xs ys =
+        | Singleton u , Range(a,b) | Range(a,b) , Singleton u ->
+          Range(map_opt (e_add u) a, map_opt (e_add u) b)
+        | Range(a,b) , Range(c,d) ->
+-         Range(bound_add a c,bound_add b d)
++         range_comb a b c d (bound_add a c) (bound_add b d)
+        | _ -> lift_vset e_add x y
+     ) xs ys
+ 
+@@ -374,7 +400,7 @@ let lift_sub xs ys =
+        | Range(a,b) , Singleton u ->
+          Range(bound_sub a (Some u) , bound_sub b (Some u))
+        | Range(a,b) , Range(c,d) ->
+-         Range(bound_sub a d , bound_sub b c)
++         range_comb a b c d (bound_sub a d) (bound_sub b c)
+        | _ -> lift_vset e_sub x y
+     ) xs ys
+ 
+diff --git a/plugins/wp/src/Vset.mli b/plugins/wp/src/Vset.mli
+index beddd2571a..7cb1b86dee 100644
+--- a/plugins/wp/src/Vset.mli
++++ b/plugins/wp/src/Vset.mli
+@@ -46,6 +46,8 @@ val concretize : set -> term
+ val bound_shift : term option -> term -> term option
+ val bound_add : term option -> term option -> term option
+ val bound_sub : term option -> term option -> term option
++val is_non_empty_range : term option -> term option -> bool
++val non_empty_range : term option -> term option -> pred
+ 
+ (** {3 Pretty} *)
+ 

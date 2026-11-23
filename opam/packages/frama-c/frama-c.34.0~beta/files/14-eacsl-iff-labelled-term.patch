@@ -1,0 +1,35 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/14-eacsl-iff-labelled-term.patch
+# Upstream ref: pub/frama-c#2800, pub/frama-c!31
+# Summary: e-acsl: support <==> over labelled terms
+
+diff --git a/plugins/e-acsl/src/code_generator/translate_predicates.ml b/plugins/e-acsl/src/code_generator/translate_predicates.ml
+index b093ed27c1..d20248a515 100644
+--- a/plugins/e-acsl/src/code_generator/translate_predicates.ml
++++ b/plugins/e-acsl/src/code_generator/translate_predicates.ml
+@@ -175,17 +175,15 @@ let rec predicate_content_to_exp_old ?(inplace=false) ?name ~loc ~adata ~env ~kf
+     Typing.preprocess_predicate ~logic_env rewritten;
+     to_exp ~adata ~name:"implies" kf env rewritten
+   | Piff(p1, p2) ->
+-    let rewritten = (* (p1 <==> p2) <==> (p1 ==> p2 && p2 ==> p1) *)
+-      let p1' = Terms.Id.deep_copy_predicate p1 in
+-      let p2' = Terms.Id.deep_copy_predicate p2 in
+-      Rte_analysis.preprocess_predicate ~kf p1';
+-      Rte_analysis.preprocess_predicate ~kf p2';
+-      Logic_const.pand ~loc
+-        (Logic_const.pimplies ~loc (p1, p2),
+-         Logic_const.pimplies ~loc (p2', p1'))
+-    in
+-    Typing.preprocess_predicate ~logic_env rewritten;
+-    to_exp ~adata ~name:"equiv" kf env rewritten
++    (* (p1 <==> p2) <==> (!p1 == !p2). Both operands are always evaluated, so
++       translate each of them once, as the interlang translation does. Do not
++       rewrite the predicate with copies of [p1] and [p2]: the labels
++       pre-analysis does not know the labelled terms of the copies. *)
++    let e1, adata, env = to_exp ~adata kf env p1 in
++    let e2, adata, env = to_exp ~adata kf env p2 in
++    Misc.make_binop ~loc Eq (Smart_exp.lnot ~loc e1) (Smart_exp.lnot ~loc e2),
++    adata,
++    env
+   | Pnot p ->
+     let e, adata, env = to_exp ~adata kf env p in
+     Smart_exp.lnot ~loc e, adata, env

@@ -1,0 +1,53 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/68-wp-non-finite-float-constant.patch
+# Upstream ref: unfiled-68
+# Summary: wp: guard non-finite floating-point constants from becoming infinite reals or crashing Why3 export
+
+diff --git a/plugins/wp/src/Cfloat.ml b/plugins/wp/src/Cfloat.ml
+index d87f66ff5d..adf9ec6685 100644
+--- a/plugins/wp/src/Cfloat.ml
++++ b/plugins/wp/src/Cfloat.ml
+@@ -124,9 +124,15 @@ let () = Context.register
+ 
+ let rfloat = Floating_point.round_to_single_precision
+ 
+-let fmake ulp value = match ulp with
+-  | Float32 -> F.e_fun !@fq32 [F.e_float (rfloat value)]
+-  | Float64 -> F.e_fun !@fq64 [F.e_float value]
++let fmake ulp value =
++  let v = match ulp with
++    | Float32 -> rfloat value
++    | Float64 -> value
++  in
++  if not (Float.is_finite v) then raise Not_found ;
++  match ulp with
++  | Float32 -> F.e_fun !@fq32 [F.e_float v]
++  | Float64 -> F.e_fun !@fq64 [F.e_float v]
+ 
+ let qmake ulp q = fmake ulp (Q.to_float q)
+ 
+@@ -176,13 +182,21 @@ let parse_literal ~model v r =
+ 
+ let acsl_lit l =
+   let open Cil_types in
+-  F.e_real (parse_literal ~model:(Context.get model) l.r_nearest l.r_literal)
++  let q = parse_literal ~model:(Context.get model) l.r_nearest l.r_literal in
++  if Q.is_real q then F.e_real q
++  else Warning.error "Unexpected constant literal %S" l.r_literal
+ 
+ let code_lit ulp value original =
+   match Context.get model , ulp , original with
+-  | Float , Float32 , _ -> F.e_fun ~result:!@f32 !@fq32 [F.e_float value]
+-  | Float , Float64 , _ -> F.e_fun ~result:!@f64 !@fq64 [F.e_float value]
+-  | Real , _ , None -> F.e_float value
++  | Float , Float32 , _ when Float.is_finite value ->
++    F.e_fun ~result:!@f32 !@fq32 [F.e_float value]
++  | Float , Float64 , _ when Float.is_finite value ->
++    F.e_fun ~result:!@f64 !@fq64 [F.e_float value]
++  | Float , _ , _ ->
++    Warning.error "Non-finite floating-point constant"
++  | Real , _ , None when Float.is_finite value -> F.e_float value
++  | Real , _ , None ->
++    Warning.error "Non-finite floating-point constant"
+   | Real , _ , Some r -> F.e_real (parse_literal ~model:Real value r)
+ 
+ (* -------------------------------------------------------------------------- *)

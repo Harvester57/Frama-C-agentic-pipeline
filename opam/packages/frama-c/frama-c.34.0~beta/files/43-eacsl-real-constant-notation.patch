@@ -1,0 +1,87 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/43-eacsl-real-constant-notation.patch
+# Upstream ref: unfiled-43
+# Summary: e-acsl: parse exponent/hex real constants and reject silent 0.1L -> 0 (soundness)
+
+diff --git a/plugins/e-acsl/src/code_generator/gmp.ml b/plugins/e-acsl/src/code_generator/gmp.ml
+index c832a335c3..93f875cfbd 100644
+--- a/plugins/e-acsl/src/code_generator/gmp.ml
++++ b/plugins/e-acsl/src/code_generator/gmp.ml
+@@ -232,11 +232,6 @@ module Q = struct
+         Printer.pp_binop bop
+ 
+   exception Not_a_decimal of string
+-  exception Is_a_float
+-
+-  (* The possible float suffixes (ISO C 6.4.4.2) are lLfF.
+-     dD is a GNU extension accepted by Frama-C (only!) in the logic *)
+-  let float_suffixes = [ 'f'; 'F'; 'l'; 'L'; 'd'; 'D' ]
+ 
+   (* Computes the fractional representation of a decimal number.
+      Does NOT perform reduction.
+@@ -265,10 +260,6 @@ module Q = struct
+           Bytes.unsafe_set buf (i - 1) c;
+           Bytes.unsafe_set buf len' '0';
+           post str len buf (len' + 1) (i + 1)
+-        | c when List.mem c float_suffixes ->
+-          (* [JS] a suffix denoting a C type is possible *)
+-          assert (i = len - 1);
+-          raise Is_a_float
+         | _ ->
+           raise (Not_a_decimal str)
+     in
+@@ -290,10 +281,6 @@ module Q = struct
+         | c when '0' <= c && c <= '9' ->
+           Bytes.unsafe_set buf i c;
+           pre str len buf (i + 1)
+-        | c when List.mem c float_suffixes ->
+-          (* [JS] a suffix denoting a C type is possible *)
+-          assert (i = len - 1);
+-          raise Is_a_float
+         | _ ->
+           raise (Not_a_decimal str)
+     in
+@@ -303,17 +290,24 @@ module Q = struct
+          as the decimal one. *)
+       2 * strlen
+     in
+-    try pre str strlen (Bytes.create buflen) 0
+-    with Is_a_float -> str (* just left it unchanged *)
++    pre str strlen (Bytes.create buflen) 0
+ 
+   (* ACSL considers strings written in decimal expansion to be reals.
+      Yet GMPQ considers them to be double:
+      they MUST be converted into fractional representation. *)
+   let normalize_str str =
+-    try
+-      decimal_to_fractional str
+-    with Invalid_argument _ ->
+-      Error.not_yet "number not written in decimal expansion"
++    match Floating_point.extract_suffix str with
++    | Some (_, "", _) ->
++      begin
++        try decimal_to_fractional str
++        with Not_a_decimal _ ->
++          (* exponent or hexadecimal notation: Zarith's [Q] reads both *)
++          Q.to_string (Q.of_string str)
++      end
++    | Some _ | None ->
++      (* A suffixed constant only comes here when it is not exactly a double:
++         in practice a long double, whose value depends on the target. *)
++      Error.not_yet "suffixed floating-point constant that is not a double"
+ 
+   let create ~loc ?name t_opt env kf e =
+     let ty = Cil.typeOf e in
+diff --git a/plugins/e-acsl/src/code_generator/gmp.mli b/plugins/e-acsl/src/code_generator/gmp.mli
+index 695127c89d..33685caf71 100644
+--- a/plugins/e-acsl/src/code_generator/gmp.mli
++++ b/plugins/e-acsl/src/code_generator/gmp.mli
+@@ -77,7 +77,8 @@ module Q : sig
+       underlying real library. For example, "0.1" is a real number in ACSL
+       whereas it is considered as a double by [libgmp] because it is written in
+       decimal expansion. In order to make [libgmp] consider it to be a rational,
+-      it must be converted into "1/10". *)
++      it must be converted into "1/10". A constant with an exponent or in
++      hexadecimal notation is converted as well. *)
+ 
+   val create:
+     loc:Fileloc.t -> ?name:string -> term option ->  Env.t -> kernel_function ->

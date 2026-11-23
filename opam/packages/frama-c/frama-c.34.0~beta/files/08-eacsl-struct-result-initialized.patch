@@ -1,0 +1,20 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/08-eacsl-struct-result-initialized.patch
+# Upstream ref: pub/frama-c#2801, pub/frama-c!32
+# Summary: e-acsl: avoid false \initialized(&\result.f) checks
+
+diff --git a/plugins/e-acsl/src/analyses/rte_analysis.ml b/plugins/e-acsl/src/analyses/rte_analysis.ml
+index a9ec43c3a5..ffcd3b9d94 100644
+--- a/plugins/e-acsl/src/analyses/rte_analysis.ml
++++ b/plugins/e-acsl/src/analyses/rte_analysis.ml
+@@ -496,8 +496,9 @@ let rte_visitor =
+         | TVar { lv_origin = Some vi }, TNoOffset ->
+           not (vi.vglob || vi.vformal || vi.vtemp) &&
+           not (Ast_types.C.is_struct_or_union typ)
+-        (* Frama-C kernel ensures that '__retres' is always initialized. *)
+-        | TResult _, TNoOffset -> false
++        (* Frama-C kernel ensures that '__retres' is always initialized,
++           and so are its fields. *)
++        | TResult _, _ -> false
+         | _ -> not Ast_types.C.(is_fun typ || is_struct_or_union typ)
+       in
+       if Flags.needs_initialized self#current_kf && needs_guard lv then

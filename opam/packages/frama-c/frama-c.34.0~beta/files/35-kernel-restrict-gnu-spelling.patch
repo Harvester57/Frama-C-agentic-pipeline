@@ -1,0 +1,16 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/35-kernel-restrict-gnu-spelling.patch
+# Upstream ref: pub/frama-c#2824, pub/frama-c!52
+# Summary: kernel: accept GNU __restrict__ spelling in C lexer
+
+diff --git a/src/kernel/internals/parsing/clexer.mll b/src/kernel/internals/parsing/clexer.mll
+index c2907f78ce..ef38faf08a 100644
+--- a/src/kernel/internals/parsing/clexer.mll
++++ b/src/kernel/internals/parsing/clexer.mll
+@@ -179,6 +179,7 @@ let init_lexicon () =
+   valid "__PRETTY_FUNCTION__" (fun loc -> PRETTY_FUNCTION__ loc) ;
+   valid "__label__" (fun _ -> LABEL__) ;
+   valid "__restrict" (fun loc -> RESTRICT loc) ;
++  valid "__restrict__" (fun loc -> RESTRICT loc) ;
+   valid "restrict" (fun loc -> RESTRICT loc) ;
+   valid "_Thread_local" (fun loc -> THREAD_LOCAL loc) ;
+   (*** GCC ***)

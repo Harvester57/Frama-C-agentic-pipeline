@@ -1,0 +1,75 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/48-metacsl-fold-annotation-location.patch
+# Upstream ref: unfiled-48
+# Summary: metacsl: preserve property source locations under -meta-fold
+
+diff --git a/meta_annotate.ml b/meta_annotate.ml
+index 03447cf..45c59ef 100644
+--- a/meta_annotate.ml
++++ b/meta_annotate.ml
+@@ -115,7 +115,7 @@ type instance_kind = Trivial | Folded of logic_info
+ 
+ let dummy_type () = Ast_types.Acsl.make_set (Ctype Cil_const.voidType)
+ 
+-let create_call li instance_types =
++let create_call ~loc li instance_types =
+   let replace_one lab =
+     match lab with
+       | FormalLabel ("Before" | "After" | "ForceAfter") -> lab
+@@ -128,7 +128,7 @@ let create_call li instance_types =
+       ~none:(Logic_const.term Tempty_set (dummy_type())) ~some:(fun (_,_,t) -> t)
+   in
+   let args = List.map make_arg instance_types in
+-  Logic_const.papp (li,labels,args)
++  Logic_const.papp ~loc (li,labels,args)
+ 
+ let create_formals instance_types assoc_list =
+   let nb_unused = ref 0 in
+@@ -316,7 +316,11 @@ class context_visitor flags all_mp table = object(self)
+         | Folded li ->
+           let inst = create_predicate_body post kf stmt assoc_list ump in
+           if Logic_utils.is_trivially_true inst then Logic_const.ptrue
+-          else apply_opt post_fold (create_call li instance_types)
++          else
++            (* The call stands for this instance: give it the instance's
++               location, as an unfolded instance has. *)
++            let loc = inst.pred_loc in
++            apply_opt post_fold (create_call ~loc li instance_types)
+         | Trivial -> Logic_const.ptrue
+     end else begin
+       let pred = ump.ump_property kf ~stmt assoc_list in
+@@ -657,14 +661,15 @@ class writing_visitor flags all_mp table = object(self)
+             | TLval t ->
+               let post prop =
+                 List.fold_left
+-                  (fun prop prec -> Logic_const.pimplies (prec, prop))
++                  (fun prop prec ->
++                     Logic_const.pimplies ~loc:prop.pred_loc (prec, prop))
+                   prop preconds
+               in
+               let post_fold prop =
+                 List.fold_left
+                   (fun prop (v, l, u) ->
+                      Logic_const.(
+-                       pforall
++                       pforall ~loc:prop.pred_loc
+                          ([v],
+                           pimplies
+                             (pand (prel (Rle,l,tvar v), prel(Rle, tvar v, u)),
+@@ -794,14 +799,15 @@ class reading_visitor flags all_mp table = object (self)
+               | TLval t ->
+                 let post property =
+                   List.fold_left
+-                    (fun prop prec -> Logic_const.pimplies (prec, prop))
++                    (fun prop prec ->
++                       Logic_const.pimplies ~loc:prop.pred_loc (prec, prop))
+                     property preconds
+                 in
+                 let post_fold prop =
+                   List.fold_left
+                     (fun prop (v,l,u) ->
+                        Logic_const.(
+-                         pforall
++                         pforall ~loc:prop.pred_loc
+                            ([v],
+                             pimplies
+                               (pand (prel (Rle,l,tvar v),prel (Rle,tvar v,u)),

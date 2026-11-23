@@ -1,0 +1,61 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/74-libc-reentrant-result-pointer-assigns.patch
+# Upstream ref: unfiled-74
+# Summary: libc: fix getpwnam_r/getpwuid_r/getut*_r result pointer assigns so Eva reaches success branches
+
+diff --git a/share/libc/pwd.h b/share/libc/pwd.h
+index 5ff889c5a7..f537f969d7 100644
+--- a/share/libc/pwd.h
++++ b/share/libc/pwd.h
+@@ -65,7 +65,8 @@ extern struct passwd *getpwuid(uid_t uid);
+   requires valid_result: \valid(result);
+   assigns \result \from indirect:&__fc_pwd, indirect:name[0..];
+   assigns __fc_pwd \from indirect:name[0..];
+-  assigns *pwd, *result \from &__fc_pwd;
++  assigns *pwd \from __fc_pwd, buf, indirect:buflen;
++  assigns *result \from pwd, indirect:__fc_pwd;
+   assigns buf[0 .. buflen-1] \from indirect:__fc_pwd;
+   ensures result_null_or_assigned:
+     *result == \null || *result == pwd;
+@@ -82,7 +83,8 @@ extern int getpwnam_r(const char *name, struct passwd *pwd,
+   requires valid_result: \valid(result);
+   assigns \result \from indirect:&__fc_pwd;
+   assigns __fc_pwd \from indirect:uid;
+-  assigns *pwd, *result \from &__fc_pwd;
++  assigns *pwd \from __fc_pwd, buf, indirect:buflen;
++  assigns *result \from pwd, indirect:__fc_pwd;
+   assigns buf[0 .. buflen-1] \from indirect:__fc_pwd;
+   ensures result_null_or_assigned:
+     *result == \null || *result == pwd;
+diff --git a/share/libc/utmp.h b/share/libc/utmp.h
+index b4a8b889ce..d3efbf6ed8 100644
+--- a/share/libc/utmp.h
++++ b/share/libc/utmp.h
+@@ -121,14 +121,16 @@ extern struct utmp *pututline (const struct utmp *utmp_ptr);
+ /*@
+   assigns \result \from indirect:__fc_utmp;
+   assigns *ubuf \from __fc_utmp;
+-  assigns *ubufp \from &__fc_utmp;
++  assigns *ubufp \from ubuf;
++  ensures result_null_or_ubuf: *ubufp == \null || *ubufp == ubuf;
+ */
+ extern int getutent_r (struct utmp *ubuf, struct utmp **ubufp);
+ 
+ /*@
+   assigns \result \from indirect:*ut, indirect:__fc_utmp;
+   assigns *ubuf \from indirect:*ut, __fc_utmp;
+-  assigns *ubufp \from indirect:*ut, &__fc_utmp;
++  assigns *ubufp \from ubuf, indirect:*ut;
++  ensures result_null_or_ubuf: *ubufp == \null || *ubufp == ubuf;
+ */
+ extern int getutid_r (const struct utmp *ut, struct utmp *ubuf,
+                       struct utmp **ubufp);
+@@ -136,7 +138,8 @@ extern int getutid_r (const struct utmp *ut, struct utmp *ubuf,
+ /*@
+   assigns \result \from indirect:*ut, indirect:__fc_utmp;
+   assigns *ubuf \from indirect:*ut, __fc_utmp;
+-  assigns *ubufp \from indirect:*ut, &__fc_utmp;
++  assigns *ubufp \from ubuf, indirect:*ut;
++  ensures result_null_or_ubuf: *ubufp == \null || *ubufp == ubuf;
+ */
+ extern int getutline_r (const struct utmp *ut,
+                         struct utmp *ubuf, struct utmp **ubufp);

@@ -1,0 +1,99 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/20-kernel-alignas-member-printed-after-declarator.patch
+# Upstream ref: pub/frama-c#2812, pub/frama-c!43
+# Summary: kernel: print _Alignas before struct/union member declarators
+
+diff --git a/src/kernel/services/ast_printing/cil_printer.ml b/src/kernel/services/ast_printing/cil_printer.ml
+index ab38658129..af5f2a7fdb 100644
+--- a/src/kernel/services/ast_printing/cil_printer.ml
++++ b/src/kernel/services/ast_printing/cil_printer.ml
+@@ -1893,13 +1893,12 @@ class cil_printer () = object (self)
+           fprintf fmt "%s@\n" s
+ 
+   method fieldinfo fmt fi =
+-    fprintf fmt "%a%a %s%a;"
+-      (self#typ
++    fprintf fmt "%a %s%a;"
++      (self#typ ?alignas:fi.falignas
+          (Some (fun fmt ->
+               if fi.fname <> Cil.missingFieldName then
+                 self#varname fmt fi.fname)))
+       fi.ftype
+-      (self#alignas ~space:true) fi.falignas
+       (match fi.fbitfield with
+        | None -> ""
+        | Some i -> ": " ^ string_of_int i ^ " ")
+@@ -2068,11 +2067,7 @@ class cil_printer () = object (self)
+       in
+       let name' =
+         fun fmt ->
+-        let attr = t.tattr <> [] in
+-        fprintf fmt "*%a%a%a"
+-          printAttributes t.tattr
+-          palignas attr
+-          pname (attr || alignas <> None)
++        fprintf fmt "*%a%a" printAttributes t.tattr pname (t.tattr <> [])
+       in
+       let name'' =
+         fun fmt ->
+@@ -2081,7 +2076,9 @@ class cil_printer () = object (self)
+         | Some p -> fprintf fmt "%t%t)" p name'
+         | None -> fprintf fmt "%t" name'
+       in
+-      self#typ (Some name'') fmt bt'
++      (* _Alignas is a declaration specifier: it cannot appear inside the
++         declarator, it is printed with the base type. *)
++      self#typ ?alignas (Some name'') fmt bt'
+ 
+     | TArray (elemt, lo) ->
+       let atts_elem, a = Ast_attributes.split_array_attributes t.tattr in
+@@ -2110,14 +2107,12 @@ class cil_printer () = object (self)
+         | _ -> ()
+       in
+       let name' fmt =
+-        if filter_printing_attributes a = [] then
+-          fprintf fmt "%a%a" palignas true pname false
+-        else if nameOpt = None then
+-          fprintf fmt "%a%a" printAttributes a palignas true
+-        else
+-          fprintf fmt "(%a%a%a)" printAttributes a palignas true pname true
++        if filter_printing_attributes a = [] then pname fmt false
++        else if nameOpt = None then printAttributes fmt a
++        else fprintf fmt "(%a%a)" printAttributes a pname true
+       in
+-      self#typ
++      (* As for pointers, _Alignas is printed with the base type. *)
++      self#typ ?alignas
+         (Some (fun fmt ->
+              fprintf fmt "%t[%t]"
+                name'
+@@ -2130,7 +2125,8 @@ class cil_printer () = object (self)
+         elemt
+ 
+     | TFun (restyp, args, isvararg) ->
+-      (* Note: no printing of _Alignas here, since it does not make sense. *)
++      (* Note: a function cannot have an _Alignas. If [alignas] is given, we are
++         printing a pointer to a function: it goes with the return type. *)
+       let name' fmt =
+         if filter_printing_attributes t.tattr = [] then pname fmt false
+         else if nameOpt = None then printAttributes fmt t.tattr
+@@ -2181,7 +2177,7 @@ class cil_printer () = object (self)
+           let p = partition_ghosts Cil.isGhostFormalVarinfo args in
+           pp_params fmt p self#vdecl
+       in
+-      self#typ (Some pp_params) fmt restyp
++      self#typ ?alignas (Some pp_params) fmt restyp
+ 
+     | TNamed ti ->
+       fprintf fmt "%a%a%a%a"
+@@ -2191,9 +2187,9 @@ class cil_printer () = object (self)
+         pname true
+ 
+     | TBuiltin_va_list ->
+-      (* Note: no printing of _Alignas here, since it does not make sense. *)
+-      fprintf fmt "__builtin_va_list%a%a"
++      fprintf fmt "__builtin_va_list%a%a%a"
+         self#attributes t.tattr
++        palignas true
+         pname true
+ 
+   (**** PRINTING ATTRIBUTES *********)

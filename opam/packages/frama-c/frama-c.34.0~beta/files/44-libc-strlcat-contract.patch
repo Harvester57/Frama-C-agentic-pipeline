@@ -1,0 +1,25 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/44-libc-strlcat-contract.patch
+# Upstream ref: unfiled-44
+# Summary: libc: fix strlcat ensures/assigns/separation contract (soundness)
+
+diff --git a/share/libc/string.h b/share/libc/string.h
+index a82a6c85ce..f74cb8ea06 100644
+--- a/share/libc/string.h
++++ b/share/libc/string.h
+@@ -543,10 +543,12 @@ extern char *strncat(char *restrict dest, const char *restrict src, size_t n);
+   @ requires room_nstring: \valid(dest+(0..n-1));
+   @ requires separation:
+   @   \separated(dest+(0..\min(n-1, strlen(dest)+strlen(src))),
+-  @              src+(0..strnlen(src, n-1)));
+-  @ assigns dest[strlen(dest)..n] \from indirect:n, src[0..strlen(src)];
+-  @ assigns \result \from indirect:src, indirect:src[0..n-1], indirect:n;
+-  @ ensures bounded_result: \result == strlen(dest) + strlen(src);
++  @              src+(0..strlen(src)));
++  @ assigns dest[strlen(dest)..\min(n-1, strlen(dest)+strlen(src))]
++  @   \from indirect:n, src[0..strlen(src)];
++  @ assigns \result \from indirect:dest[0..], indirect:src[0..], indirect:n;
++  @ ensures bounded_result:
++  @   \result == \old(\min(strlen(dest), n) + strlen(src));
+   @*/
+ extern size_t strlcat(char *restrict dest, const char *restrict src, size_t n);
+ 

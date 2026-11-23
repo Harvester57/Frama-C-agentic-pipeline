@@ -1,0 +1,95 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/57-kernel-bool-cast-dropped-logic.patch
+# Upstream ref: unfiled-57
+# Summary: kernel: fix Cil.fitsInInt and truncateInteger64 for IBool so (_Bool) casts are not dropped (soundness)
+
+diff --git a/src/kernel/services/ast_queries/cil.ml b/src/kernel/services/ast_queries/cil.ml
+index c9d63222f2..887c13527d 100644
+--- a/src/kernel/services/ast_queries/cil.ml
++++ b/src/kernel/services/ast_queries/cil.ml
+@@ -2417,21 +2417,26 @@ let debugTruncation = false
+ 
+ (* True if the integer fits within the kind's range *)
+ let fitsInInt k i =
+-  let signed = isSigned k in
+-  let nrBits =
+-    let unsignedbits = 8 * (bytesSizeOfInt k) in
+-    if signed then
+-      unsignedbits-1
+-    else
+-      unsignedbits
+-  in
+-  let max_strict_bound =
+-    Z.(shift_left one nrBits)
+-  in
+-  let min_bound = if signed then Z.neg max_strict_bound
+-    else Z.zero
++  let fits =
++    match k with
++    | IBool -> Z.(equal zero i || equal one i)
++    | _ ->
++      let signed = isSigned k in
++      let nrBits =
++        let unsignedbits = 8 * (bytesSizeOfInt k) in
++        if signed then
++          unsignedbits-1
++        else
++          unsignedbits
++      in
++      let max_strict_bound =
++        Z.(shift_left one nrBits)
++      in
++      let min_bound = if signed then Z.neg max_strict_bound
++        else Z.zero
++      in
++      Z.leq min_bound i && Z.lt i max_strict_bound
+   in
+-  let fits = Z.leq min_bound i && Z.lt i max_strict_bound in
+   if debugTruncation then
+     Kernel.debug "Fits in %a %a : %b@."
+       !pp_ikind_ref k Z.pretty i fits;
+@@ -2445,24 +2450,27 @@ let truncateInteger64 (k: ikind) i =
+     i, false
+   else
+     let i' =
+-      let nrBits = 8 * (bytesSizeOfInt k) in
+-      let max_strict_bound = Z.(shift_left one nrBits) in
+-      let modulo = Z.erem i max_strict_bound in
+-      let signed = isSigned k in
+-      if signed then
+-        let max_signed_strict_bound =
+-          Z.shift_right max_strict_bound 1
+-        in
+-        if Z.geq modulo max_signed_strict_bound then
+-          Z.sub modulo max_strict_bound
+-        else if Z.lt modulo (Z.neg max_signed_strict_bound)
+-        then Z.add modulo max_strict_bound
+-        else modulo
+-      else
+-      if Z.lt modulo Z.zero then
+-        Z.add modulo max_strict_bound
+-      else
+-        modulo
++      match k with
++      | IBool -> Z.one
++      | _ ->
++        let nrBits = 8 * (bytesSizeOfInt k) in
++        let max_strict_bound = Z.(shift_left one nrBits) in
++        let modulo = Z.erem i max_strict_bound in
++        let signed = isSigned k in
++        if signed then
++          let max_signed_strict_bound =
++            Z.shift_right max_strict_bound 1
++          in
++          if Z.geq modulo max_signed_strict_bound then
++            Z.sub modulo max_strict_bound
++          else if Z.lt modulo (Z.neg max_signed_strict_bound)
++          then Z.add modulo max_strict_bound
++          else modulo
++        else
++        if Z.lt modulo Z.zero then
++          Z.add modulo max_strict_bound
++        else
++          modulo
+     in
+     if debugTruncation then
+       Kernel.debug ~level:3 "Truncate %a to %a: %a"

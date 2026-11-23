@@ -1,0 +1,101 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/28-eacsl-full-mtracking-tail-merged-literals.patch
+# Upstream ref: pub/frama-c#2817, pub/frama-c!46
+# Summary: e-acsl: demote string literals to avoid clang tail-merging overlap
+
+diff --git a/plugins/e-acsl/src/code_generator/injector.ml b/plugins/e-acsl/src/code_generator/injector.ml
+index 8a6c712fc5..64d5466e19 100644
+--- a/plugins/e-acsl/src/code_generator/injector.ml
++++ b/plugins/e-acsl/src/code_generator/injector.ml
+@@ -847,7 +847,26 @@ let inject_mtracking_handler main =
+     Option.iter handle_main main
+   end
+ 
++(* With -e-acsl-full-mtracking, every global is registered as a block,
++   including the variables that represent string literals. A registered
++   literal must be printed as a variable of its own, not as a literal: two
++   literals may share their storage (a linker may store a literal at the end
++   of a longer one), and their registered blocks would then overlap. Without
++   full tracking, the memory tracking analysis demotes the literals that it
++   monitors. *)
++let demote_monitored_string_literals file =
++  if Options.Full_mtracking.get () then
++    Demote_string_literal.demote_list
++      (List.filter_map
++         (function
++           | GVar (vi, _, _)
++             when Ast_info.is_string_literal vi
++               && Memory_tracking.must_monitor_vi vi -> Some vi
++           | _ -> None)
++         file.globals)
++
+ let inject_in_file file =
++  demote_monitored_string_literals file;
+   let main =
+     List.fold_left inject_in_global None file.globals
+   in
+diff --git a/src/kernel/services/ast_transformations/demote_string_literal.ml b/src/kernel/services/ast_transformations/demote_string_literal.ml
+index 6c8f99999b..cfc0a3eb7b 100644
+--- a/src/kernel/services/ast_transformations/demote_string_literal.ml
++++ b/src/kernel/services/ast_transformations/demote_string_literal.ml
+@@ -55,24 +55,34 @@ let mk_array_init loc dest src =
+   let l = Seq.map2 (init_idx loc) idx elts in
+   CompoundInit (dest.vtype,List.of_seq l)
+ 
+-class demote vi =
++class demote vis =
+   object
+     inherit Visitor.frama_c_inplace
+ 
++    val mutable changed = false
++    method changed = changed
++
+     method! vinst i =
+       match i with
+       | Local_init(
+           dest,AssignInit(SingleInit { enode = Lval(Var src,NoOffset) }),loc)
+-        when Cil_datatype.Varinfo.equal vi src ->
++        when Cil_datatype.Varinfo.Set.mem src vis ->
+         let new_init = mk_array_init loc dest src in
+-        Ast.mark_as_changed();
++        changed <- true;
+         Cil.ChangeTo [Local_init(dest,AssignInit new_init,loc)]
+       | _ -> Cil.SkipChildren
+   end
+ 
+-let demote vi =
+-  if Ast_info.is_string_literal vi then begin
+-    let vis = new demote vi in
+-    Visitor.visitFramacFileSameGlobals vis (Ast.get());
+-    vi.vattr <- Ast_attributes.(drop fc_literal vi.vattr)
++let demote_list vis =
++  let vis = List.filter Ast_info.is_string_literal vis in
++  if vis <> [] then begin
++    let vis' = new demote (Cil_datatype.Varinfo.Set.of_list vis) in
++    Visitor.visitFramacFileSameGlobals
++      (vis' :> Visitor.frama_c_visitor) (Ast.get());
++    if vis'#changed then Ast.mark_as_changed ();
++    List.iter
++      (fun vi -> vi.vattr <- Ast_attributes.(drop fc_literal vi.vattr))
++      vis
+   end
++
++let demote vi = demote_list [vi]
+diff --git a/src/kernel/services/ast_transformations/demote_string_literal.mli b/src/kernel/services/ast_transformations/demote_string_literal.mli
+index b0bb7011e2..16c955d8ca 100644
+--- a/src/kernel/services/ast_transformations/demote_string_literal.mli
++++ b/src/kernel/services/ast_transformations/demote_string_literal.mli
+@@ -16,3 +16,11 @@
+    @since 32.0-Germanium
+ *)
+ val demote : Cil_types.varinfo -> unit
++
++(**
++   same as {!demote} on each variable of the list, in a single traversal of
++   the AST.
++
++   @since Frama-C+dev
++*)
++val demote_list : Cil_types.varinfo list -> unit
+-- 
+2.56.0.windows.4
+

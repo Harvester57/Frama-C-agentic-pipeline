@@ -1,0 +1,29 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/41-libc-ioctl-modem-bits.patch
+# Upstream ref: pub/frama-c#2830, pub/frama-c!58
+# Summary: libc: add TIOCM_* modem-line bits to <sys/ioctl.h>
+
+diff --git a/share/libc/sys/ioctl.h b/share/libc/sys/ioctl.h
+index 5b72f77779..7187883440 100644
+--- a/share/libc/sys/ioctl.h
++++ b/share/libc/sys/ioctl.h
+@@ -196,6 +196,20 @@ struct winsize
+ 
+ #define TIOCSER_TEMT 0x01
+ 
++// Modem lines, read and written by TIOCMGET, TIOCMBIS, TIOCMBIC and TIOCMSET
++// (definitions from ioctl-types.h)
++#define TIOCM_LE 0x001
++#define TIOCM_DTR 0x002
++#define TIOCM_RTS 0x004
++#define TIOCM_ST 0x008
++#define TIOCM_SR 0x010
++#define TIOCM_CTS 0x020
++#define TIOCM_CAR 0x040
++#define TIOCM_RNG 0x080
++#define TIOCM_DSR 0x100
++#define TIOCM_CD TIOCM_CAR
++#define TIOCM_RI TIOCM_RNG
++
+ __END_DECLS
+ __POP_FC_STDLIB
+ 

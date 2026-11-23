@@ -1,0 +1,17 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/12-eacsl-gcc-default-source.patch
+# Upstream ref: pub/frama-c#2809, pub/frama-c!40
+# Summary: e-acsl-gcc: pass -D_DEFAULT_SOURCE when compiling generated C
+
+diff --git a/plugins/e-acsl/scripts/e-acsl-gcc b/plugins/e-acsl/scripts/e-acsl-gcc
+index 81e8f8ae7a..4e51de1d14 100755
+--- a/plugins/e-acsl/scripts/e-acsl-gcc
++++ b/plugins/e-acsl/scripts/e-acsl-gcc
+@@ -890,7 +890,7 @@ fi
+ # Gcc and related flags
+ CC="$OPTION_CC"
+ CFLAGS="$OPTION_CFLAGS
+-  -std=c99 $GCCMACHDEP $OPT_CFLAGS
++  -std=c99 -D_DEFAULT_SOURCE $GCCMACHDEP $OPT_CFLAGS
+   -fno-builtin -fno-merge-constants
+   -Wall \
+   -Wno-long-long \

@@ -94,8 +94,33 @@ def source_ref(target: str) -> dict:
     return {"vcs": "none", "commit": None, "dirty": None}
 
 
+def patch_manifest() -> dict | None:
+    """Compact summary of `$FRAMAC_SHARE/pipeline-patches.json`, if baked into the analysis image."""
+    share = (os.environ.get("FRAMAC_SHARE") or "/home/opam/.opam/5.5/share/frama-c").strip()
+    if not share:
+        return None
+    path = Path(share) / "pipeline-patches.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    fc = [e["filename"] for e in (data.get("frama_c") or []) if isinstance(e, dict) and isinstance(e.get("filename"), str)]
+    meta = [e["filename"] for e in (data.get("metacsl") or []) if isinstance(e, dict) and isinstance(e.get("filename"), str)]
+    return {
+        "digest": data.get("digest"),
+        "frama_c_count": len(fc),
+        "metacsl_count": len(meta),
+        "frama_c": fc,
+        "metacsl": meta,
+    }
+
+
 def toolchain() -> dict:
-    versions = {}
+    versions: dict[str, object] = {}
     for name, cmd in (
         ("frama-c", ["frama-c", "-version"]),
         ("alt-ergo", ["alt-ergo", "--version"]),
@@ -105,6 +130,9 @@ def toolchain() -> dict:
     ):
         out = _run(cmd)
         versions[name] = out.splitlines()[0] if out else None
+    patches = patch_manifest()
+    if patches is not None:
+        versions["frama-c-patches"] = patches
     return versions
 
 

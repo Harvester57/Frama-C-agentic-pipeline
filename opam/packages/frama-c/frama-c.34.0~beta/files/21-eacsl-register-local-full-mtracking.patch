@@ -1,0 +1,24 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/21-eacsl-register-local-full-mtracking.patch
+# Upstream ref: pub/frama-c#2804, pub/frama-c!35
+# Summary: e-acsl: handle register locals under --full-mtracking
+
+diff --git a/plugins/e-acsl/src/code_generator/injector.ml b/plugins/e-acsl/src/code_generator/injector.ml
+index 8a6c712fc5..307d587de9 100644
+--- a/plugins/e-acsl/src/code_generator/injector.ml
++++ b/plugins/e-acsl/src/code_generator/injector.ml
+@@ -623,6 +623,15 @@ let inject_in_fundec main fundec =
+     vi.vattr <- Ast_attributes.(drop frama_c_ghost_formal vi.vattr)
+   in
+   List.iter unghost_formal fundec.sformals;
++  (* E-ACSL observes variables through their address ([__e_acsl_store_block],
++     [__e_acsl_full_init], [\initialized(&x)], ...), which C forbids for a
++     [register] variable. This storage class has no other effect on the
++     program, so drop it. *)
++  let unregister vi =
++    if vi.vstorage = Register then vi.vstorage <- NoStorage
++  in
++  List.iter unregister fundec.slocals;
++  List.iter unregister fundec.sformals;
+   (* update environments *)
+   (* TODO: do it only for built-ins *)
+   Builtins.update vi.vname vi;

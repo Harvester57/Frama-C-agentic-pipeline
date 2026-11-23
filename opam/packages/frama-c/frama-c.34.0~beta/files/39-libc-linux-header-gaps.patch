@@ -1,0 +1,273 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/39-libc-linux-header-gaps.patch
+# Upstream ref: pub/frama-c#2828, pub/frama-c!56
+# Summary: libc: add Linux <sys/epoll.h> and <sys/inotify.h> headers and specs
+
+diff --git a/share/libc/__fc_libc.h b/share/libc/__fc_libc.h
+index 6cc3b0e54e..6bb667917f 100644
+--- a/share/libc/__fc_libc.h
++++ b/share/libc/__fc_libc.h
+@@ -80,7 +80,9 @@
+ #include "string.h"
+ #include "strings.h"
+ #include "stropts.h"
++#include "sys/epoll.h"
+ #include "sys/file.h"
++#include "sys/inotify.h"
+ #include "sys/ioctl.h"
+ #include "sys/ipc.h"
+ #include "syslog.h"
+diff --git a/share/libc/sys/epoll.h b/share/libc/sys/epoll.h
+new file mode 100644
+index 0000000000..faea968067
+--- /dev/null
++++ b/share/libc/sys/epoll.h
+@@ -0,0 +1,147 @@
++/**************************************************************************/
++/*                                                                        */
++/*  SPDX-License-Identifier LGPL-2.1                                      */
++/*  Copyright (C)                                                         */
++/*  CEA (Commissariat à l'énergie atomique et aux énergies alternatives)  */
++/*                                                                        */
++/**************************************************************************/
++
++// Non-POSIX; Linux-specific
++
++#ifndef __FC_SYS_EPOLL_H
++#define __FC_SYS_EPOLL_H
++#include "../features.h"
++#include <stdint.h>
++__PUSH_FC_STDLIB
++__BEGIN_DECLS
++
++#include "../__fc_define_max_open_files.h"
++#include "../__fc_define_sigset_t.h"
++#include <errno.h>
++
++extern volatile int Frama_C_entropy_source;
++
++// The values used below are based on Linux.
++#define EPOLLIN 0x001
++#define EPOLLPRI 0x002
++#define EPOLLOUT 0x004
++#define EPOLLERR 0x008
++#define EPOLLHUP 0x010
++#define EPOLLRDNORM 0x040
++#define EPOLLRDBAND 0x080
++#define EPOLLWRNORM 0x100
++#define EPOLLWRBAND 0x200
++#define EPOLLMSG 0x400
++#define EPOLLRDHUP 0x2000
++#define EPOLLEXCLUSIVE (1u << 28)
++#define EPOLLWAKEUP (1u << 29)
++#define EPOLLONESHOT (1u << 30)
++#define EPOLLET (1u << 31)
++
++// Same value as O_CLOEXEC
++#define EPOLL_CLOEXEC 0x80000
++
++#define EPOLL_CTL_ADD 1
++#define EPOLL_CTL_DEL 2
++#define EPOLL_CTL_MOD 3
++
++typedef union epoll_data {
++  void *ptr;
++  int fd;
++  uint32_t u32;
++  uint64_t u64;
++} epoll_data_t;
++
++// On x86_64, Linux packs this structure (12 bytes instead of 16).
++struct epoll_event {
++  uint32_t events;
++  epoll_data_t data;
++}
++#ifdef __x86_64__
++  __attribute__((__packed__))
++#endif
++  ;
++
++/*@
++  requires valid_size: size > 0;
++  assigns \result, errno \from indirect:size;
++  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
++*/
++extern int epoll_create(int size);
++
++/*@
++  assigns \result, errno \from indirect:flags;
++  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
++*/
++extern int epoll_create1(int flags);
++
++/*@
++  requires valid_epfd: 0 <= epfd < __FC_MAX_OPEN_FILES;
++  requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
++  requires valid_op:
++    op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL || op == EPOLL_CTL_MOD;
++  requires valid_event: op == EPOLL_CTL_DEL || \valid_read(event);
++  //missing: assigns 'interest list of epfd' \from fd, op, event->events, event->data;
++  assigns \result, errno \from indirect:epfd, indirect:op, indirect:fd,
++                               indirect:event, indirect:event->events,
++                               indirect:Frama_C_entropy_source;
++  ensures result_ok_or_error: \result == 0 || \result == -1;
++*/
++extern int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
++
++/*@
++  requires valid_epfd: 0 <= epfd < __FC_MAX_OPEN_FILES;
++  requires valid_maxevents: maxevents > 0;
++  requires valid_events: \valid(events + (0 .. maxevents - 1));
++  assigns \result, errno \from indirect:epfd, indirect:maxevents,
++                               indirect:timeout,
++                               indirect:Frama_C_entropy_source;
++  assigns events[0 .. maxevents - 1]
++    \from indirect:epfd, indirect:maxevents, indirect:timeout,
++          indirect:Frama_C_entropy_source;
++  behavior full:
++    assumes nondet_full: Frama_C_entropy_source != 0;
++    ensures result_full: \result == maxevents;
++    ensures initialization:events: \initialized(events + (0 .. maxevents - 1));
++  behavior partial_timeout_or_error:
++    assumes nondet_partial: Frama_C_entropy_source == 0;
++    ensures error_timeout_or_bounded: -1 <= \result < maxevents;
++    ensures initialization:events: \initialized(events + (0 .. \result - 1));
++    //note: for \result <= 0, the above range is empty, as intended
++  disjoint behaviors;
++  complete behaviors;
++*/
++extern int epoll_wait(int epfd, struct epoll_event *events,
++                      int maxevents, int timeout);
++
++/*@
++  requires valid_epfd: 0 <= epfd < __FC_MAX_OPEN_FILES;
++  requires valid_maxevents: maxevents > 0;
++  requires valid_events: \valid(events + (0 .. maxevents - 1));
++  requires valid_sigmask_or_null: sigmask == \null || \valid_read(sigmask);
++  requires initialization:sigmask: sigmask == \null || \initialized(sigmask);
++  assigns \result, errno \from indirect:epfd, indirect:maxevents,
++                               indirect:timeout, indirect:sigmask,
++                               indirect:*sigmask,
++                               indirect:Frama_C_entropy_source;
++  assigns events[0 .. maxevents - 1]
++    \from indirect:epfd, indirect:maxevents, indirect:timeout,
++          indirect:sigmask, indirect:*sigmask,
++          indirect:Frama_C_entropy_source;
++  behavior full:
++    assumes nondet_full: Frama_C_entropy_source != 0;
++    ensures result_full: \result == maxevents;
++    ensures initialization:events: \initialized(events + (0 .. maxevents - 1));
++  behavior partial_timeout_or_error:
++    assumes nondet_partial: Frama_C_entropy_source == 0;
++    ensures error_timeout_or_bounded: -1 <= \result < maxevents;
++    ensures initialization:events: \initialized(events + (0 .. \result - 1));
++  disjoint behaviors;
++  complete behaviors;
++*/
++extern int epoll_pwait(int epfd, struct epoll_event *events,
++                       int maxevents, int timeout, const sigset_t *sigmask);
++
++__END_DECLS
++__POP_FC_STDLIB
++#endif
+diff --git a/share/libc/sys/inotify.h b/share/libc/sys/inotify.h
+new file mode 100644
+index 0000000000..8604c34ea8
+--- /dev/null
++++ b/share/libc/sys/inotify.h
+@@ -0,0 +1,96 @@
++/**************************************************************************/
++/*                                                                        */
++/*  SPDX-License-Identifier LGPL-2.1                                      */
++/*  Copyright (C)                                                         */
++/*  CEA (Commissariat à l'énergie atomique et aux énergies alternatives)  */
++/*                                                                        */
++/**************************************************************************/
++
++// Non-POSIX; Linux-specific
++
++#ifndef __FC_SYS_INOTIFY_H
++#define __FC_SYS_INOTIFY_H
++#include "../features.h"
++#include <stdint.h>
++__PUSH_FC_STDLIB
++__BEGIN_DECLS
++
++#include "../__fc_define_max_open_files.h"
++#include "../__fc_string_axiomatic.h"
++#include <errno.h>
++
++struct inotify_event {
++  int wd;
++  uint32_t mask;
++  uint32_t cookie;
++  uint32_t len; // size of name, including the terminating null bytes
++  char name[];
++};
++
++// The values used below are based on Linux.
++#define IN_ACCESS 0x00000001
++#define IN_MODIFY 0x00000002
++#define IN_ATTRIB 0x00000004
++#define IN_CLOSE_WRITE 0x00000008
++#define IN_CLOSE_NOWRITE 0x00000010
++#define IN_CLOSE (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)
++#define IN_OPEN 0x00000020
++#define IN_MOVED_FROM 0x00000040
++#define IN_MOVED_TO 0x00000080
++#define IN_MOVE (IN_MOVED_FROM | IN_MOVED_TO)
++#define IN_CREATE 0x00000100
++#define IN_DELETE 0x00000200
++#define IN_DELETE_SELF 0x00000400
++#define IN_MOVE_SELF 0x00000800
++#define IN_UNMOUNT 0x00002000
++#define IN_Q_OVERFLOW 0x00004000
++#define IN_IGNORED 0x00008000
++#define IN_ONLYDIR 0x01000000
++#define IN_DONT_FOLLOW 0x02000000
++#define IN_EXCL_UNLINK 0x04000000
++#define IN_MASK_CREATE 0x10000000
++#define IN_MASK_ADD 0x20000000
++#define IN_ISDIR 0x40000000
++#define IN_ONESHOT 0x80000000
++#define IN_ALL_EVENTS                                                    \
++  (IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE \
++   | IN_OPEN | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE       \
++   | IN_DELETE_SELF | IN_MOVE_SELF)
++
++// Flags for inotify_init1; same values as O_CLOEXEC and O_NONBLOCK
++#define IN_CLOEXEC 0x80000
++#define IN_NONBLOCK 0x800
++
++/*@
++  assigns \result, errno \from \nothing;
++  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
++*/
++extern int inotify_init(void);
++
++/*@
++  assigns \result, errno \from indirect:flags;
++  ensures valid_fd_or_error: \result == -1 || 0 <= \result < __FC_MAX_OPEN_FILES;
++*/
++extern int inotify_init1(int flags);
++
++/*@
++  requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
++  requires valid_pathname: valid_read_string(pathname);
++  //missing: assigns 'watch list of fd' \from pathname[0 ..], mask;
++  assigns \result, errno \from indirect:fd, indirect:pathname[0 ..],
++                               indirect:mask;
++  ensures watch_descriptor_or_error: \result == -1 || \result >= 0;
++*/
++extern int inotify_add_watch(int fd, const char *pathname, uint32_t mask);
++
++/*@
++  requires valid_fd: 0 <= fd < __FC_MAX_OPEN_FILES;
++  //missing: assigns 'watch list of fd' \from wd;
++  assigns \result, errno \from indirect:fd, indirect:wd;
++  ensures result_ok_or_error: \result == 0 || \result == -1;
++*/
++extern int inotify_rm_watch(int fd, int wd);
++
++__END_DECLS
++__POP_FC_STDLIB
++#endif

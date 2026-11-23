@@ -1,0 +1,35 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/65-wp-floor-ceil-truncate-float-cast.patch
+# Upstream ref: unfiled-65
+# Summary: wp: compute \floor/\ceil/\truncate and float-to-int constant casts with exact Zarith (soundness)
+
+diff --git a/plugins/wp/src/Cmath.ml b/plugins/wp/src/Cmath.ml
+index 6398f2f612..cb2d4bdfe4 100644
+--- a/plugins/wp/src/Cmath.ml
++++ b/plugins/wp/src/Cmath.ml
+@@ -44,19 +44,13 @@ let builtin_truncate f e =
+   match F.repr e with
+   | Kint _ -> e
+   | Kreal r when Q.(equal r zero) -> e_zero
+-  | Kreal r ->
+-    begin
+-      try
+-        (* Waiting for Z-Arith to have truncation to big-int *)
+-        let truncated = int_of_float (Q.to_float r) in
+-        let reversed = Q.of_int truncated in
+-        let base = F.e_int truncated in
+-        if Q.equal r reversed then base else
+-        if f == f_ceil && Q.(lt zero r) then F.(e_add base e_one) else
+-        if f == f_floor && Q.(lt r zero) then F.(e_sub base e_one) else
+-          base
+-      with _ -> raise Not_found
+-    end
++  | Kreal r when Q.is_real r ->
++    let z =
++      if f == f_floor then Z.fdiv r.Q.num r.Q.den
++      else if f == f_ceil then Z.cdiv r.Q.num r.Q.den
++      else Q.to_bigint r
++    in
++    F.e_zint z
+   | Fun( f , [e] ) when f_real_of_int @= f -> e
+   | _ -> raise Not_found
+ 

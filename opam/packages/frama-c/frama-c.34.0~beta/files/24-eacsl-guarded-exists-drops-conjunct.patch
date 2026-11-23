@@ -1,0 +1,106 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/24-eacsl-guarded-exists-drops-conjunct.patch
+# Upstream ref: pub/frama-c#2793, pub/frama-c!25
+# Summary: e-acsl: keep guarded quantifier conjuncts (soundness)
+
+diff --git a/plugins/e-acsl/src/analyses/bound_variables.ml b/plugins/e-acsl/src/analyses/bound_variables.ml
+index 8cca06fd5d..72e1bb1df1 100644
+--- a/plugins/e-acsl/src/analyses/bound_variables.ml
++++ b/plugins/e-acsl/src/analyses/bound_variables.ml
+@@ -561,13 +561,17 @@ let extract_constraint ctxt t1 r t2 =
+     in
+     Constraints.raise_error msg ctxt
+ 
+-(** [visit_quantif_relations ~is_forall ctxt p] traverses the predicate [p] of
+-    the quantification being analyzed in the context [ctxt] from left to right
+-    as long as the predicate is [Pimplies], [Pand] or [Prel(Rlt | Rle)], and
+-    calls [extract_constraint] on each relation [Rlt] or [Rle] it encounters
++(** [visit_quantif_relations ~is_forall ?in_lhs ctxt p] traverses the predicate
++    [p] of the quantification being analyzed in the context [ctxt] from left to
++    right as long as the predicate is [Pimplies], [Pand] or [Prel(Rlt | Rle)],
++    and calls [extract_constraint] on each relation [Rlt] or [Rle] it encounters
+     until all the guards of the quantification have been found or the predicate
+     is finished. If [is_forall] is [true] then the predicate being traversed is
+     a universal quantification, otherwise it is an existential quantification.
++    If [in_lhs] is [true] then [p] is inside the hypothesis of an implication in
++    a universal quantification, where conjunctions of guards are expected and
++    nested implications are rejected; otherwise, in a universal quantification,
++    only right-nested implications may guard the variables.
+     The function returns a tuple [ctxt, goal_opt] where [ctxt] is the
+     quantification context and [goal_opt] is either [None] if the goal of the
+     quantification has not been found yet or [Some goal] if [goal] is the
+@@ -575,11 +579,22 @@ let extract_constraint ctxt t1 r t2 =
+     @raises Typing_error if the predicate contains something other than
+     [Pimplies], [Pand] or [Prel] with a relation that is neither [Rlt] nor
+     [Rle]. *)
+-let rec visit_quantif_relations ~is_forall ctxt p =
++let rec visit_quantif_relations ~is_forall ?(in_lhs=false) ctxt p =
+   match p.pred_content with
+   | Pimplies(lhs, rhs) ->
+-    let ctxt, _ = visit_quantif_relations ~is_forall ctxt lhs in
+-    if is_forall then begin
++    if in_lhs then begin
++      (* An implication inside the hypothesis of an implication, as in
++         [(0 <= i < n ==> p) ==> q] or [(0 <= i < n ==> 0 <= j < m) ==> q],
++         does not guard the whole quantification. *)
++      let msg =
++        Format.asprintf
++          "@[invalid quantification guard, found '%t'@ \
++           inside the hypothesis of an implication@]"
++          Unicode.pp_implies
++      in
++      Constraints.raise_error msg ctxt
++    end else if is_forall then begin
++      let ctxt, _ = visit_quantif_relations ~is_forall ~in_lhs:true ctxt lhs in
+       if Constraints.has_unguarded_bounded_vars ctxt then
+         visit_quantif_relations ~is_forall ctxt rhs
+       else
+@@ -593,19 +608,42 @@ let rec visit_quantif_relations ~is_forall ctxt p =
+       in
+       Constraints.raise_error msg ctxt
+   | Pand(lhs, rhs) ->
+-    let ctxt, _ = visit_quantif_relations ~is_forall ctxt lhs in
+-    if Constraints.has_unguarded_bounded_vars ctxt then
+-      visit_quantif_relations ~is_forall ctxt rhs
+-    else if not is_forall then
+-      ctxt, Some rhs
+-    else
++    if is_forall && not in_lhs then
++      (* A conjunction outside the hypothesis of an implication in a universal
++         quantification, as in
++         [\forall integer i, j; 0 <= i < n ==> 0 <= j && (j < m ==> q)],
++         does not guard the quantification. *)
+       let msg =
+         Format.asprintf
+-          "@[invalid quantification predicate, expecting '%t' to@ \
++          "@[invalid quantification guard, expecting '%t' to@ \
+            separate the hypotheses from the goal, found '%t'@]"
+           Unicode.pp_implies Unicode.pp_and
+       in
+       Constraints.raise_error msg ctxt
++    else begin
++      let ctxt, lhs_goal =
++        visit_quantif_relations ~is_forall ~in_lhs ctxt lhs
++      in
++      if Constraints.has_unguarded_bounded_vars ctxt then
++        visit_quantif_relations ~is_forall ~in_lhs ctxt rhs
++      else if not is_forall then
++        (* The parser associates conjunctions to the left:
++           [0 <= i < n && p && q] is [((0 <= i < n) && p) && q]. If the goal
++           started inside [lhs] ([p] here), [rhs] is its last conjunct. *)
++        let goal = match lhs_goal with
++          | None -> rhs
++          | Some lhs_goal -> Logic_const.pand ~loc:p.pred_loc (lhs_goal, rhs)
++        in
++        ctxt, Some goal
++      else
++        let msg =
++          Format.asprintf
++            "@[invalid quantification predicate, expecting '%t' to@ \
++             separate the hypotheses from the goal, found '%t'@]"
++            Unicode.pp_implies Unicode.pp_and
++        in
++        Constraints.raise_error msg ctxt
++    end
+   | Prel((Rlt | Rle) as r, t1, t2) ->
+     let ctxt = extract_constraint ctxt t1 r t2 in
+     ctxt, None

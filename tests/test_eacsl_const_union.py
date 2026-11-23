@@ -107,21 +107,25 @@ def _preprocess(tmp_path: Path, monkeypatch, const_unions: bool | None) -> tuple
     return rc, out.read_text(encoding="utf-8")
 
 
-def test_wrapper_rewrites_by_default_and_not_with_the_switch_off(tmp_path, monkeypatch):
-    assert W.REWRITE_STATIC_CONST_UNIONS is True
+def test_wrapper_is_off_by_default_and_rewrites_when_enabled(tmp_path, monkeypatch):
+    assert W.REWRITE_STATIC_CONST_UNIONS is False
+    rc, text = _preprocess(tmp_path, monkeypatch, None)
+    assert rc == 0 and text == CONST_UNION_PP
+    assert not W.const_union_rewrite_active(f"-wrapper /s/{Path(W.__file__).name}")
+    rc, text = _preprocess(tmp_path, monkeypatch, True)
+    assert rc == 0 and "static const union u file_zero" not in text
+    monkeypatch.setattr(W, "REWRITE_STATIC_CONST_UNIONS", True)
     rc, text = _preprocess(tmp_path, monkeypatch, None)
     assert rc == 0 and "static const union u file_zero" not in text
     rc, text = _preprocess(tmp_path, monkeypatch, False)
     assert rc == 0 and text == CONST_UNION_PP
-    monkeypatch.setattr(W, "REWRITE_STATIC_CONST_UNIONS", False)
-    rc, text = _preprocess(tmp_path, monkeypatch, None)
-    assert rc == 0 and text == CONST_UNION_PP
-    assert not W.const_union_rewrite_active(f"-wrapper /s/{Path(W.__file__).name}")
 
 
 def test_rewrite_is_active_only_through_the_eacsl_wrapper(monkeypatch):
     monkeypatch.delenv(W.DISABLE_ENV, raising=False)
     flags = f"-DE_ACSL -wrapper /opt/scripts/{Path(W.__file__).name} -I."
+    assert not W.const_union_rewrite_active(flags)
+    monkeypatch.setattr(W, "REWRITE_STATIC_CONST_UNIONS", True)
     assert W.const_union_rewrite_active(flags)
     assert not W.const_union_rewrite_active("-DE_ACSL -I.")  # no wrapper (a host without POSIX gcc)
     monkeypatch.setenv(W.DISABLE_ENV, "off")
@@ -285,39 +289,27 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 }
 """
 
-# Two script trees: the repository's (rewrite on) and a copy with the switch turned off.
+# The repository's scripts (rewrite off by default; patched image carries pub/frama-c#2795 / !26).
 CONST_UNION_DOCKER_SCRIPT = r"""set -e
 cp -r /fixture /tmp/w && cd /tmp/w
-cp -r /repo/scripts /tmp/scripts_off
 python3 - <<'EOF'
+import json, sys
 from pathlib import Path
-p = Path("/tmp/scripts_off/fc_cpp_wrapper_eacsl.py")
-text = p.read_text()
-assert "REWRITE_STATIC_CONST_UNIONS = True" in text
-p.write_text(text.replace("REWRITE_STATIC_CONST_UNIONS = True", "REWRITE_STATIC_CONST_UNIONS = False"))
-EOF
-for side in on off; do
-  if [ "$side" = on ]; then scripts=/repo/scripts; else scripts=/tmp/scripts_off; fi
-  SCRIPTS="$scripts" SIDE="$side" python3 - <<'EOF'
-import json, os, sys
-from pathlib import Path
-sys.path.insert(0, os.environ["SCRIPTS"])
+sys.path.insert(0, "/repo/scripts")
 import run_eacsl_fuzz as R
-side = os.environ["SIDE"]
-res = R.compile_eacsl_binary(["mod.c"], Path(f"out_{side}/fuzz_mod"), cppflags="-I.", use_cache=False)
+res = R.compile_eacsl_binary(["mod.c"], Path("out_off/fuzz_mod"), cppflags="-I.", use_cache=False)
 log = Path(res["compile_log"]).read_text(errors="replace")
 keys = ("returncode", "reason", "binary", "const_union_rewrite", "const_union_rewrites")
 out = {k: res.get(k) for k in keys}
 out["implicit_cast"] = "implicit cast: cast from union blk to void *" in log
-print(f"RESULT_{side} " + json.dumps(out))
+print("RESULT_off " + json.dumps(out))
 EOF
-done
-./out_on/fuzz_mod.e-acsl -runs=200 > run.log 2>&1 && echo RUN_OK || tail -20 run.log
+./out_off/fuzz_mod.e-acsl -runs=200 > run.log 2>&1 && echo RUN_OK || tail -20 run.log
 """
 
 
 @pytest.mark.integration
-def test_static_const_union_builds_and_runs_under_eacsl_only_with_the_rewrite(tmp_path):
+def test_static_const_union_builds_and_runs_under_eacsl_without_the_rewrite(tmp_path):
     from conftest import ANALYSIS_IMAGE, require_docker_images
 
     require_docker_images(ANALYSIS_IMAGE)
@@ -331,19 +323,11 @@ def test_static_const_union_builds_and_runs_under_eacsl_only_with_the_rewrite(tm
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
         raise
     out = proc.stdout + proc.stderr
-    results = {
-        side: json.loads(line.split(" ", 1)[1])
-        for line in proc.stdout.splitlines()
-        for side in ("on", "off")
-        if line.startswith(f"RESULT_{side} ")
-    }
-    assert set(results) == {"on", "off"}, out[-4000:]
-    on, off = results["on"], results["off"]
-    # With the rewrite: both declarations (file scope, local initialized) rewritten, E-ACSL binary, runs.
-    assert on["returncode"] == 0, out[-4000:]
-    assert on["const_union_rewrite"] is True and on["const_union_rewrites"] == 2
-    assert on["binary"].endswith(".e-acsl") and not on["implicit_cast"]
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT_off ")), None)
+    assert line, out[-4000:]
+    off = json.loads(line.split(" ", 1)[1])
+    # With pub/frama-c#2795 (!26) patched in the image and the rewrite off, both const unions build and run cleanly.
+    assert off["returncode"] == 0, out[-4000:]
+    assert off["const_union_rewrite"] is False and off["const_union_rewrites"] is None
+    assert off["binary"].endswith(".e-acsl") and not off["implicit_cast"]
     assert "RUN_OK" in proc.stdout, out[-4000:]
-    # Without it, the same file hits the E-ACSL bug: the test tests something.
-    assert off["returncode"] != 0 and off["const_union_rewrite"] is False
-    assert off["const_union_rewrites"] is None and off["implicit_cast"] is True, out[-4000:]

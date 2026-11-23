@@ -1,0 +1,29 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/33-eacsl-format-literal-without-full-mtracking.patch
+# Upstream ref: pub/frama-c#2821, pub/frama-c!51
+# Summary: e-acsl: track format-string literals without --full-mtracking
+
+diff --git a/plugins/e-acsl/src/analyses/memory_tracking.ml b/plugins/e-acsl/src/analyses/memory_tracking.ml
+index f44418b66f..6aa3b8a9fc 100644
+--- a/plugins/e-acsl/src/analyses/memory_tracking.ml
++++ b/plugins/e-acsl/src/analyses/memory_tracking.ml
+@@ -629,6 +629,20 @@ module rec Transfer
+              | _ -> state
+           )
+           state args
++      else if Options.Validate_format_strings.get ()
++           && Functions.Libc.is_printf_name (Kernel_function.get_name kf) then
++        (* format functions are replaced by RTL functions which check that
++           the format string and the pointers passed for "%s", "%p" and "%n"
++           point to monitored memory: monitor the blocks of every pointer
++           argument, string literals included. *)
++        List.fold_left
++          (fun state arg ->
++             if is_ptr_or_array_exp arg then
++               match base_addr arg with
++               | Some vi -> Varinfos.add vi state
++               | None -> state
++             else state)
++          state args
+       else
+         state
+     in

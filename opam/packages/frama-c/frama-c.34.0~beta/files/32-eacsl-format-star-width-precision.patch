@@ -1,0 +1,139 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/32-eacsl-format-star-width-precision.patch
+# Upstream ref: pub/frama-c#2822, pub/frama-c!50
+# Summary: e-acsl: account for * width/precision arguments in format validation
+
+diff --git a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+index f4876abc80..bf0d27452a 100644
+--- a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
++++ b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+@@ -756,6 +756,88 @@ static void validate_overlapping_buffer(char *buffer, size_t buf_sz, void *arg,
+   }
+ }
+ 
++/** \brief Read the variadic arguments described by `fmtdesc` from `ap`, each
++   with its own type, and store the value of each argument promoted to `int`
++   in `ints` (0 for the other arguments). A field width or a precision given
++   as '*' is such an argument. */
++static void fetch_int_arguments(const char *fmtdesc, va_list ap, int *ints) {
++  for (int i = 0; fmtdesc[i] != '\0'; i++) {
++    ints[i] = 0;
++    switch (fmtdesc[i]) {
++    case FFloat: /* promoted to double */
++    case FDouble:
++      (void)va_arg(ap, double);
++      break;
++    case FLongDouble:
++      (void)va_arg(ap, long double);
++      break;
++    case ILong:
++    case IULong:
++      (void)va_arg(ap, long);
++      break;
++    case ILongLong:
++    case IULongLong:
++      (void)va_arg(ap, long long);
++      break;
++    case PChar:
++    case PUChar:
++    case PShort:
++    case PUShort:
++    case PInt:
++    case PUInt:
++    case PLong:
++    case PULong:
++    case PLongLong:
++    case PULongLong:
++    case PVoid:
++      (void)va_arg(ap, void *);
++      break;
++    default: /* int, unsigned int and the types promoted to int */
++      ints[i] = va_arg(ap, int);
++    }
++  }
++}
++
++/** \brief A field width or a precision given as '*' takes an `int` argument
++   before the argument of the directive itself. Check the type of these
++   arguments, take the value of a '*' precision into account, and count them
++   in `*stars`, the number of such arguments taken by the directives before
++   (and now including) `dir`. The argument of a directive that is not
++   numbered is then the one at index `dir->arg.index + *stars`.
++
++   `ordinal` is the index of `dir` among the directives of the format. */
++static void fetch_star_arguments(format_directive *dir, int ordinal, int *stars,
++                                 const char *fmtdesc, const int *ints,
++                                 int arglen, const char *func) {
++  if (dir->arg.expl) {
++    /* Numbered '*' arguments ('*m$') are not supported */
++    if (dir->field_width == -1 || dir->precision == -1)
++      private_abort(FMT_ERROR "\"%s\": numbered and non-numbered arguments "
++                              "cannot be mixed\n",
++                    dir->format);
++    return;
++  }
++  /* A directive starting with the flag '0' is not given an index when it is
++     parsed (see ::fetch_format_argno) */
++  dir->arg.index = ordinal;
++  int is_star[2] = {dir->field_width == -1, dir->precision == -1};
++  for (int k = 0; k < 2; k++) {
++    if (is_star[k]) {
++      if (ordinal + *stars >= arglen)
++        private_abort("%s: directive %d (%s) in format \"%s\" has no argument "
++                      "for '*'\n",
++                      func, ordinal + 1, dir->directive, dir->format);
++      validate_format_type(IInt, fmtdesc + *stars, dir, func);
++      if (k == 1) {
++        /* A negative precision is taken as if it were omitted */
++        int precision = ints[ordinal + *stars];
++        dir->precision = precision >= 0 ? precision : INT_MIN;
++      }
++      (*stars)++;
++    }
++  }
++}
++
+ /** \brief Main format validation function that parses the format string and
+    validates each format directive against the provided format description.
+    If any of the requirements are violated the the program is aborted.
+@@ -770,6 +852,8 @@ static void validate_overlapping_buffer(char *buffer, size_t buf_sz, void *arg,
+    @param buffer - buffer limit */
+ static void validate_format(const char *fmtdesc, const char *fmt, va_list ap,
+                             const char *func, char *buffer, size_t buf_size) {
++  va_list ap_ints; /* to read the values of '*' field widths and precisions */
++  va_copy(ap_ints, ap);
+ 
+   /* Check that format string is valid first */
+   if (valid_string((char *)fmt, 0) < 0)
+@@ -789,22 +873,29 @@ static void validate_format(const char *fmtdesc, const char *fmt, va_list ap,
+   va_end(ap);
+ 
+   /* Validate each generated directive */
++  int ints[arglen]; /* values of the `int` arguments, for '*' */
++  fetch_int_arguments(fmtdesc, ap_ints, ints);
++  va_end(ap_ints);
++  int ordinal = 0; /* index of the directive */
++  int stars = 0;   /* number of arguments taken by '*' so far */
+   while (*dirs) {
+     format_directive *dir = *dirs;
+     validate_applications(dir); /* Check that the directive is well formed */
++    fetch_star_arguments(dir, ordinal++, &stars, fmtdesc, ints, arglen, func);
+     int argno = dir->arg.index;
+ 
+     /* Make sure there is a sufficient number of arguments provided: for each
+        format directive in the format string there should be a corresponding
+        argument except for literal directive `%%` */
+-    if (argno >= arglen)
++    if (argno + stars >= arglen)
+       private_abort("%s: directive %d (%s) in format \"%s\" has no argument\n",
+                     func, dir->arg.index + 1, dir->directive, dir->format);
+ 
+ /* Shortcut for `validate_format_type` function */
+-#  define validate_type(_t) validate_format_type(_t, fmtdesc, dir, func)
++#  define validate_type(_t) validate_format_type(_t, fmtdesc + stars, dir, func)
+ 
+-    uintptr_t addr = (uintptr_t)args[argno]; /* Address of the argument */
++    /* Address of the argument */
++    uintptr_t addr = (uintptr_t)args[argno + stars];
+     char expected_t; /* Placeholder for the type expected by the directive */
+ 
+     switch (dir->specifier) {

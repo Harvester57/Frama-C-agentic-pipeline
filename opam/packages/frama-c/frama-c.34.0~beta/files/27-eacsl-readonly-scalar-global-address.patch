@@ -1,0 +1,36 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/27-eacsl-readonly-scalar-global-address.patch
+# Upstream ref: pub/frama-c#2794/#2795, pub/frama-c!26
+# Summary: e-acsl: pass address of const globals (scalars, unions, structs) to mark_readonly
+
+diff --git a/plugins/e-acsl/src/code_generator/global_observer.ml b/plugins/e-acsl/src/code_generator/global_observer.ml
+index 6ecf11fe8d..7c2b05629a 100644
+--- a/plugins/e-acsl/src/code_generator/global_observer.ml
++++ b/plugins/e-acsl/src/code_generator/global_observer.ml
+@@ -120,19 +120,18 @@ let mk_init_function () =
+            let loc = vi.vdecl in
+            let rec mark_readonly ty = match ty.tnode with
+              | TNamed {ttype} -> mark_readonly ttype
+-             | TComp {cstruct = true; cfields = Some fields} ->
+-               List.map
+-                 (fun field ->
+-                    let lval = Var vi, Field (field, NoOffset) in
+-                    Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOf ~loc lval)
+-
+-                 fields
+-             | _ -> [Smart_stmt.mark_readonly ~loc @@ Cil.evar ~loc vi]
++             | TArray _ ->
++               (* the array decays to its address *)
++               Smart_stmt.mark_readonly ~loc @@ Cil.evar ~loc vi
++             | _ ->
++               (* scalars, pointers, unions and structs: the runtime expects
++                  the base address of the global block *)
++               Smart_stmt.mark_readonly ~loc @@ Cil.mkAddrOfVi vi
+            in
+            let stmts =
+              if Ast_types.C.is_const vi.vtype then
+                (* a const global can't be modified after initialization. *)
+-               mark_readonly vi.vtype @ stmts
++               mark_readonly vi.vtype :: stmts
+              else stmts
+            in
+            (* a global is both allocated and initialized *)

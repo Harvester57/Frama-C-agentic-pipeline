@@ -1,0 +1,214 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/52-eacsl-rational-cast-double-rounding.patch
+# Upstream ref: unfiled-52
+# Summary: e-acsl: round rational casts to double/float to nearest-even instead of mpq_get_d truncation (soundness)
+
+diff --git a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c
+index e2e224c0f9..2f893a591c 100644
+--- a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c
++++ b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c
+@@ -13,6 +13,7 @@
+ #include "../internals/e_acsl_rtl_io.h"
+ 
+ #include "e_acsl_floating_point.h"
++#include "e_acsl_gmp_api.h"
+ 
+ // Initialization
+ double eacsl_math_HUGE_VAL = 0.0;
+@@ -52,3 +53,116 @@ void eacsl_floating_point_exception(const char *exp) {
+   }
+   feclearexcept(FE_ALL_EXCEPT);
+ }
++
++extern void __gmpz_add_ui(eacsl_mpz_t rop, const eacsl_mpz_t op1,
++                          unsigned long int op2);
++extern double __gmpz_get_d(const eacsl_mpz_t op);
++extern size_t __gmpz_sizeinbase(const eacsl_mpz_t op, int base);
++extern void __gmpz_tdiv_qr(eacsl_mpz_t q, eacsl_mpz_t r, const eacsl_mpz_t n,
++                           const eacsl_mpz_t d);
++extern int __gmpz_tstbit(const eacsl_mpz_t op, eacsl_mp_bitcnt_t bit_index);
++
++/* Convert a GMP rational q = num / den to an IEEE 754 binary floating-point
++   value with `prec` significand bits and exponent range [emin, emax], using
++   round-to-nearest, ties-to-even. Because prec <= 53, the returned double is
++   already exact in the target format (so casting to float for prec == 24
++   performs no second rounding). */
++static double eacsl_mpq_get_ieee(const eacsl_mpq_t q, int prec, int emin,
++                                 int emax) {
++  int sgn = q->_mp_num._mp_size;
++  if (sgn == 0)
++    return 0.0;
++  int neg = sgn < 0;
++  if (q->_mp_den._mp_size < 0)
++    neg = !neg;
++
++  eacsl_mpz_t a, b;
++  __gmpz_init_set(a, &q->_mp_num);
++  __gmpz_init_set(b, &q->_mp_den);
++  if (a->_mp_size < 0)
++    __gmpz_neg(a, a);
++  if (b->_mp_size < 0)
++    __gmpz_neg(b, b);
++
++  /* sizeinbase(x, 2) gives k >= 1 with 2^(k-1) <= x < 2^k,
++     so 2^(na - nb - 1) < a / b < 2^(na - nb + 1). */
++  size_t na = __gmpz_sizeinbase(a, 2);
++  size_t nb = __gmpz_sizeinbase(b, 2);
++  int esub = emin - (prec - 1);
++
++  if (na > nb && (na - nb - 1) > (size_t)emax) {
++    __gmpz_clear(a);
++    __gmpz_clear(b);
++    return neg ? -INFINITY : INFINITY;
++  }
++  if (nb > na && (nb - na) > (size_t)(2 - esub)) {
++    __gmpz_clear(a);
++    __gmpz_clear(b);
++    return neg ? -0.0 : 0.0;
++  }
++
++  int e = (na >= nb) ? (int)(na - nb) : -(int)(nb - na);
++  eacsl_mpz_t tmp;
++  __gmpz_init(tmp);
++  if (e >= 0) {
++    __gmpz_mul_2exp(tmp, b, (eacsl_mp_bitcnt_t)e);
++    if (__gmpz_cmp(a, tmp) < 0)
++      e--;
++  } else {
++    __gmpz_mul_2exp(tmp, a, (eacsl_mp_bitcnt_t)(-e));
++    if (__gmpz_cmp(tmp, b) < 0)
++      e--;
++  }
++
++  if (e > emax) {
++    __gmpz_clear(tmp);
++    __gmpz_clear(a);
++    __gmpz_clear(b);
++    return neg ? -INFINITY : INFINITY;
++  }
++
++  int shift = (e >= emin) ? (e - (prec - 1)) : esub;
++  eacsl_mpz_t quot, rem;
++  __gmpz_init(quot);
++  __gmpz_init(rem);
++  if (shift >= 0) {
++    __gmpz_mul_2exp(tmp, b, (eacsl_mp_bitcnt_t)shift);
++    __gmpz_tdiv_qr(quot, rem, a, tmp);
++    __gmpz_mul_2exp(rem, rem, 1);
++    int cmp = __gmpz_cmp(rem, tmp);
++    if (cmp > 0 || (cmp == 0 && __gmpz_tstbit(quot, 0)))
++      __gmpz_add_ui(quot, quot, 1UL);
++  } else {
++    __gmpz_mul_2exp(tmp, a, (eacsl_mp_bitcnt_t)(-shift));
++    __gmpz_tdiv_qr(quot, rem, tmp, b);
++    __gmpz_mul_2exp(rem, rem, 1);
++    int cmp = __gmpz_cmp(rem, b);
++    if (cmp > 0 || (cmp == 0 && __gmpz_tstbit(quot, 0)))
++      __gmpz_add_ui(quot, quot, 1UL);
++  }
++
++  double res;
++  if (e >= emin && __gmpz_tstbit(quot, (eacsl_mp_bitcnt_t)prec)) {
++    if (e + 1 > emax)
++      res = INFINITY;
++    else
++      res = ldexp(1.0, e + 1);
++  } else {
++    res = ldexp(__gmpz_get_d(quot), shift);
++  }
++
++  __gmpz_clear(quot);
++  __gmpz_clear(rem);
++  __gmpz_clear(tmp);
++  __gmpz_clear(a);
++  __gmpz_clear(b);
++  return neg ? -res : res;
++}
++
++double eacsl_mpq_get_d(const eacsl_mpq_t q) {
++  return eacsl_mpq_get_ieee(q, 53, -1022, 1023);
++}
++
++float eacsl_mpq_get_f(const eacsl_mpq_t q) {
++  return (float)eacsl_mpq_get_ieee(q, 24, -126, 127);
++}
+diff --git a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h
+index 340e49530a..bf89337986 100644
+--- a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h
++++ b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h
+@@ -28,6 +28,8 @@
+ #define eacsl_mpq_struct  export_alias(mpq_struct)
+ #define eacsl_mpq_t       export_alias(mpq_t)
+ #define eacsl_mp_bitcnt_t export_alias(mp_bitcnt_t)
++#define eacsl_mpq_get_d   export_alias(mpq_get_d)
++#define eacsl_mpq_get_f   export_alias(mpq_get_f)
+ 
+ struct eacsl_mpz_struct {
+   int _mp_alloc;
+@@ -374,6 +376,16 @@ extern long __gmpz_get_si(const eacsl_mpz_t z) __attribute__((FC_BUILTIN));
+   @ assigns \result \from *q; */
+ extern double __gmpq_get_d(const eacsl_mpq_t q) __attribute__((FC_BUILTIN));
+ 
++/** Convert rational q to double with IEEE 754 round-to-nearest-even */
++/*@ requires \valid_read(q);
++  @ assigns \result \from *q; */
++extern double eacsl_mpq_get_d(const eacsl_mpq_t q) __attribute__((FC_BUILTIN));
++
++/** Convert rational q to float with IEEE 754 round-to-nearest-even */
++/*@ requires \valid_read(q);
++  @ assigns \result \from *q; */
++extern float eacsl_mpq_get_f(const eacsl_mpq_t q) __attribute__((FC_BUILTIN));
++
+ /*@ requires \valid_read(z);
+   @ assigns \result \from *z; */
+ extern unsigned long __gmpz_get_ui(const eacsl_mpz_t z)
+diff --git a/plugins/e-acsl/src/code_generator/gmp.ml b/plugins/e-acsl/src/code_generator/gmp.ml
+index c832a335c3..1c971b2379 100644
+--- a/plugins/e-acsl/src/code_generator/gmp.ml
++++ b/plugins/e-acsl/src/code_generator/gmp.ml
+@@ -337,11 +337,8 @@ module Q = struct
+     Error.not_yet "reals: cast from R to Z"
+ 
+   let add_cast ~loc ?name env kf ty e =
+-    (* TODO: The best solution would actually be to directly write all the
+-       needed functions as C builtins then just call them here depending on the
+-       situation at hand. *)
+     assert (Gmp_types.Q.is_t (Cil.typeOf e));
+-    let get_double e env =
++    let get_float fname fty e env =
+       let _, e, env =
+         Env.new_var
+           ~loc
+@@ -349,12 +346,11 @@ module Q = struct
+           env
+           kf
+           None
+-          Cil_const.doubleType
++          fty
+           (fun v _ ->
+              [ Smart_stmt.rtl_call ~loc
+                  ~result:(Cil.var v)
+-                 ~prefix:""
+-                 "__gmpq_get_d"
++                 fname
+                  [ e ] ])
+       in
+       e, env
+@@ -364,16 +360,9 @@ module Q = struct
+       (* The biggest floating-point type we can extract from GMPQ is double *)
+       Error.not_yet "R to long double"
+     | TFloat FDouble ->
+-      get_double e env
++      get_float "mpq_get_d" Cil_const.doubleType e env
+     | TFloat FFloat ->
+-      (* No "get_float" in GMPQ, but fortunately, [float] \subset [double].
+-         HOWEVER: going through double as intermediate step might be unsound
+-         since it could cause double rounding. See: [Boldo2013, Sec 2.2]
+-         https://hal.inria.fr/hal-00777639/document *)
+-      let e, env = get_double e env in
+-      Options.warning
+-        ~once:true "R to float: double rounding might cause unsoundness";
+-      Cil.mkCastT ~force:false ~oldt:Cil_const.doubleType ~newt:ty e, env
++      get_float "mpq_get_f" Cil_const.floatType e env
+     | TInt IULongLong ->
+       (* The biggest C integer type we can extract from GMP is ulong *)
+       Error.not_yet "R to unsigned long long"

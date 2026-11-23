@@ -1,0 +1,16 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/75-libc-syslog-string-axiomatic.patch
+# Upstream ref: unfiled-75
+# Summary: libc: include __fc_string_axiomatic.h in <syslog.h> so variadic syslog checks string preconditions
+
+diff --git a/share/libc/syslog.h b/share/libc/syslog.h
+index 54191cb99f..cc86ca4474 100644
+--- a/share/libc/syslog.h
++++ b/share/libc/syslog.h
+@@ -11,6 +11,7 @@
+ #include "features.h"
+ __PUSH_FC_STDLIB
+ #include "__fc_define_null.h"
++#include "__fc_string_axiomatic.h"
+ #include <stdarg.h>
+ 
+ __BEGIN_DECLS

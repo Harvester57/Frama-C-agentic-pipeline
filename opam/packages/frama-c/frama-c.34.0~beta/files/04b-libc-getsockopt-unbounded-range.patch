@@ -1,0 +1,28 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/04b-libc-getsockopt-unbounded-range.patch
+# Upstream ref: pub/frama-c#2799, pub/frama-c!30
+# Summary: libc: bound getsockopt optval range
+
+diff --git a/share/libc/sys/socket.h b/share/libc/sys/socket.h
+index f3c1bbcd22..aad242f04f 100644
+--- a/share/libc/sys/socket.h
++++ b/share/libc/sys/socket.h
+@@ -377,7 +377,7 @@ extern int getsockname(int socket, struct sockaddr *restrict address,
+ /*@
+   requires valid_sockfd: 0 <= sockfd < __FC_MAX_OPEN_SOCKETS;
+   requires valid_optlen: \valid(optlen);
+-  assigns ((char*)optval)[0..], \result
++  assigns ((char*)optval)[0 .. *optlen-1], \result
+           \from indirect:sockfd, indirect:level, indirect:optname,
+                 indirect:*optlen, indirect:optval,
+                 indirect:__fc_sockfds[sockfd];
+@@ -395,8 +395,8 @@ extern int getsockname(int socket, struct sockaddr *restrict address,
+   behavior other_options:
+     assumes optname_not_error: !(level == SOL_SOCKET && optname == SO_ERROR);
+     requires optval_null_or_valid:
+-      optval == \null || \valid(((char*)optval)+(0..));
+-    assigns ((char*)optval)[0..], \result
++      optval == \null || \valid(((char*)optval)+(0 .. *optlen-1));
++    assigns ((char*)optval)[0 .. *optlen-1], \result
+             \from indirect:sockfd, indirect:level, indirect:optname,
+                   indirect:*optlen, indirect:optval,
+                   indirect:__fc_sockfds[sockfd];

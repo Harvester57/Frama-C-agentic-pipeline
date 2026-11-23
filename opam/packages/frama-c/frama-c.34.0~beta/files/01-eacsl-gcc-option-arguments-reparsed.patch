@@ -1,0 +1,42 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/01-eacsl-gcc-option-arguments-reparsed.patch
+# Upstream ref: pub/frama-c#2807, pub/frama-c!38
+# Summary: e-acsl-gcc: do not re-parse option arguments as flags
+
+diff --git a/plugins/e-acsl/scripts/e-acsl-gcc b/plugins/e-acsl/scripts/e-acsl-gcc
+index 81e8f8ae7a..828147f694 100755
+--- a/plugins/e-acsl/scripts/e-acsl-gcc
++++ b/plugins/e-acsl/scripts/e-acsl-gcc
+@@ -438,10 +438,12 @@ fi
+ # Set all options in $@ before -- and other after
+ eval set -- "$ARGS"
+ 
+-# Switch statements for other options
+-for i in $@
++# Switch statements for other options. Loop on the positional parameters
++# themselves: each branch shifts its option (and its argument), so the words
++# of an option argument are never read again as options.
++while [ $# -gt 0 ]
+ do
+-  case "$i" in
++  case "$1" in
+     # Do compile instrumented code
+     --help|-h)
+       shift;
+@@ -809,9 +811,16 @@ $zone_help_msg"
+       OPTION_MBITS="$1"
+       shift;
+     ;;
++    # End of the options normalized by getopt: the input files follow
++    --)
++      shift;
++      break;
++    ;;
++    *)
++      error "unexpected argument '$1'";
++    ;;
+   esac
+ done
+-shift;
+ 
+ # Bail if no files to translate are given and we're not trying to only compile
+ # dlmalloc

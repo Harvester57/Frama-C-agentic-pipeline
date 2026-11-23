@@ -1,0 +1,330 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/54-eacsl-typing-not-performed-guard.patch
+# Upstream ref: unfiled-54
+# Summary: e-acsl: type sibling subterms and quantifier goals before re-raising Not_yet
+
+diff --git a/plugins/e-acsl/src/analyses/typing.ml b/plugins/e-acsl/src/analyses/typing.ml
+index 749e68ad9e..d3e03b57e5 100644
+--- a/plugins/e-acsl/src/analyses/typing.ml
++++ b/plugins/e-acsl/src/analyses/typing.ml
+@@ -325,6 +325,37 @@ let type_offset ~profile t =
+ 
+ (* type the term [t] in a context [ctx] by taking --e-acsl-O-gmp-only into account
+    iff [use_gmp_opt] is true. *)
++(* Run [f] and [g] so that an E-ACSL typing/unsupported error in [f] still
++   allows [g] to run, re-raising the first exception. *)
++let do_both f g =
++  match f () with
++  | () -> g ()
++  | exception ((Error.Not_yet _ | Error.Typing_error _) as exn) ->
++    (try g () with Error.Not_yet _ | Error.Typing_error _ -> ());
++    raise exn
++
++let do_all f xs =
++  let exn_o = ref None in
++  List.iter
++    (fun x ->
++       try f x
++       with (Error.Not_yet _ | Error.Typing_error _) as exn ->
++         if Option.is_none !exn_o then exn_o := Some exn)
++    xs;
++  Option.iter raise !exn_o
++
++(* Compute a typing context [mk_ctx ()], catching E-ACSL typing/unsupported
++   errors so that [type_children] still types every subterm before the error is
++   re-raised. *)
++let with_opt_ctx mk_ctx type_children =
++  match mk_ctx () with
++  | ctx ->
++    type_children (Some ctx);
++    ctx
++  | exception ((Error.Not_yet _ | Error.Typing_error _) as exn) ->
++    (try type_children None with Error.Not_yet _ | Error.Typing_error _ -> ());
++    raise exn
++
+ let rec type_term
+     ~use_gmp_opt
+     ?(under_lambda=false)
+@@ -393,22 +424,17 @@ let rec type_term
+       c_int (* converted into [t == 0] in case of GMP *)
+ 
+     | TUnOp ((Neg | BNot), t') ->
+-      let ctx =
+-        mk_ctx ~use_gmp_opt:true @@
+-        ty_of_interv @@
+-        Interval.joins_from_profile ~profile [t'; t]
+-      in
+-      ignore (type_term ~use_gmp_opt:true ~arith_operand:true ~ctx ~profile t');
+-      ctx
++      with_opt_ctx
++        (fun () ->
++           mk_ctx ~use_gmp_opt:true @@
++           ty_of_interv @@
++           Interval.joins_from_profile ~profile [t'; t])
++        (fun ctx ->
++           ignore (type_term ~use_gmp_opt:true ~arith_operand:true ?ctx ~profile t'))
+ 
+     | TBinOp ((PlusA | MinusA | Mult | Div | Mod | Shiftrt | BAnd
+               | BOr | BXor), t1, t2)
+       ->
+-      let ctx =
+-        mk_ctx ~use_gmp_opt:true @@
+-        ty_of_interv @@
+-        Interval.joins_from_profile ~profile [t2; t1; t]
+-      in
+       (* it is enough to explicitly coerce when required one operand to [ctx]
+          (through [arith_operand]) in order to force the type of the
+          operation.  Heuristic: coerce the operand which is not a lval in
+@@ -419,71 +445,90 @@ let rec type_term
+         | _ -> true
+       in
+       let cast_first = cast_first t1 t2 in
+-      ignore
+-        (type_term ~use_gmp_opt:true ~arith_operand:cast_first ~ctx ~profile t1);
+-      ignore
+-        (type_term ~use_gmp_opt:true ~arith_operand:(not cast_first) ~ctx ~profile t2);
+-      ctx
++      with_opt_ctx
++        (fun () ->
++           mk_ctx ~use_gmp_opt:true @@
++           ty_of_interv @@
++           Interval.joins_from_profile ~profile [t2; t1; t])
++        (fun ctx ->
++           do_both
++             (fun () ->
++                ignore
++                  (type_term ~use_gmp_opt:true ~arith_operand:cast_first ?ctx ~profile t1))
++             (fun () ->
++                ignore
++                  (type_term ~use_gmp_opt:true ~arith_operand:(not cast_first) ?ctx ~profile t2)))
+ 
+     | TBinOp(Shiftlt, t1, t2) ->
+-      let ctx =
+-        mk_ctx ~use_gmp_opt:true @@
+-        ty_of_interv @@
+-        Interval.joins_from_profile ~profile [t2; t1; t]
+-      in
+       (* For left-shift, the first operand must always be coerced to the largest
+          type, Frama-C issue #1800 (case e-acsl-shift-left-narrow) *)
+-      ignore (type_term ~use_gmp_opt:true ~arith_operand:true ~ctx ~profile t1);
+-      ignore
+-        (type_term ~use_gmp_opt:true ~arith_operand:false ~ctx ~profile t2);
+-      ctx
+-
++      with_opt_ctx
++        (fun () ->
++           mk_ctx ~use_gmp_opt:true @@
++           ty_of_interv @@
++           Interval.joins_from_profile ~profile [t2; t1; t])
++        (fun ctx ->
++           do_both
++             (fun () ->
++                ignore (type_term ~use_gmp_opt:true ~arith_operand:true ?ctx ~profile t1))
++             (fun () ->
++                ignore (type_term ~use_gmp_opt:true ~arith_operand:false ?ctx ~profile t2)))
+ 
+     | TBinOp ((Lt | Gt | Le | Ge | Eq | Ne), t1, t2) ->
+       assert
+         (match ctx with
+          | None -> true
+          | Some c -> Number_ty.compare c c_int >= 0);
+-      let ctx = ctx_relation ~profile t1 t2 in
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t1);
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t2);
++      ignore
++        (with_opt_ctx
++           (fun () -> ctx_relation ~profile t1 t2)
++           (fun ctx ->
++              do_both
++                (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t1))
++                (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t2))));
+       c_int
+ 
+     | TBinOp ((LAnd | LOr), t1, t2) ->
+-      let
+-        ty = ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1])
+-      in
+       (* both operands fit in an int. *)
+-      ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t1);
+-      ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t2);
+-      ty
++      with_opt_ctx
++        (fun () ->
++           ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1]))
++        (fun _ ->
++           do_both
++             (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t1))
++             (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t2)))
+ 
+     | TCast (false, Ctype _, t') ->
+       (* compute the smallest interval from the whole term [t] *)
+-      let i = Interval.get_from_profile ~profile t in
+       (* nothing more to do: [i] is already more precise than what we could
+          infer from the arguments of the cast. *)
+-      let ctx = ty_of_interv ?ctx i in
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t');
+-      ctx
++      with_opt_ctx
++        (fun () -> ty_of_interv ?ctx (Interval.get_from_profile ~profile t))
++        (fun ctx -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t'))
+ 
+     | TCast (true, _, t') ->
+-      let i = Interval.get_from_profile ~profile t in
+-      ignore (type_term ~use_gmp_opt ~arith_operand ?ctx ~profile t');
+-      ty_of_interv ~use_gmp_opt i
++      with_opt_ctx
++        (fun () -> ty_of_interv ~use_gmp_opt (Interval.get_from_profile ~profile t))
++        (fun _ -> ignore (type_term ~use_gmp_opt ~arith_operand ?ctx ~profile t'))
+     (* TODO (NB) : Maybe can be merged ? *)
+ 
+     | TCast (false, _,_) -> assert false
+ 
+     | Tif (cond, t1, t2) ->
+-      ignore (type_predicate ~profile cond);
+-      let ctx =
+-        ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1; t])
+-      in
+-      let ctx = mk_ctx ~use_gmp_opt:true ctx in
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t1);
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t2);
+-      ctx
++      let res = ref None in
++      do_both
++        (fun () -> type_predicate ~profile cond)
++        (fun () ->
++           res := Some
++               (with_opt_ctx
++                  (fun () ->
++                     mk_ctx ~use_gmp_opt:true @@
++                     ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1; t]))
++                  (fun ctx ->
++                     do_both
++                       (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t1))
++                       (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t2)))));
++      Option.get !res
+ 
+     | Tat (t, _) ->
+       (type_term ~use_gmp_opt ~arith_operand ?ctx ~profile t).ty
+@@ -501,9 +546,13 @@ let rec type_term
+ 
+     | TBinOp ((PlusPI | MinusPI), t1, t2) ->
+       (* both [t1] and [t2] must be typed. *)
+-      ignore (type_term ~use_gmp_opt:true ~ctx:Nan ~profile t1);
+-      let ctx = type_offset ~profile t2 in
+-      ignore (type_term ~use_gmp_opt:false ~ctx ~profile t2);
++      do_both
++        (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:Nan ~profile t1))
++        (fun () ->
++           ignore
++             (with_opt_ctx
++                (fun () -> type_offset ~profile t2)
++                (fun ctx -> ignore (type_term ~use_gmp_opt:false ?ctx ~profile t2))));
+       Nan
+ 
+     | Tapp(li, _, args) ->
+@@ -667,15 +716,19 @@ let rec type_term
+     | Trange(None, _) | Trange(_, None) ->
+       Error.untypable "unbounded range"
+     | Trange(Some n1, Some n2) ->
+-      ignore (type_term ~use_gmp_opt ~profile n1);
+-      ignore (type_term ~use_gmp_opt ~profile n2);
++      do_both
++        (fun () -> ignore (type_term ~use_gmp_opt ~profile n1))
++        (fun () -> ignore (type_term ~use_gmp_opt ~profile n2));
+       let i = Interval.get_from_profile ~profile t in
+       ty_of_interv ?ctx i
+ 
+     | Tlet(li, t) ->
+       let li_t = Terms.of_li li in
+-      ignore (type_term ~use_gmp_opt:true ~profile li_t);
+-      (type_term ~use_gmp_opt:true ?ctx ~profile t).ty
++      let res = ref None in
++      do_both
++        (fun () -> ignore (type_term ~use_gmp_opt:true ~profile li_t))
++        (fun () -> res := Some (type_term ~use_gmp_opt:true ?ctx ~profile t).ty);
++      Option.get !res
+     | Tlambda ([ _ ],lt) ->
+       (type_term ~use_gmp_opt:true ~under_lambda:true ?ctx ~profile lt).ty
+     | Tlambda (_,_) -> Error.not_yet "lambda"
+@@ -772,17 +825,18 @@ and number_ty_bound_variable ~profile (t1, lv, t2) =
+       Printer.pp_logic_var lv
+ 
+ and type_bound_variables ~profile (t1, lv, t2) =
+-  let ctx = number_ty_bound_variable ~profile (t1, lv, t2) in
+-  (* forcing when typing bounds prevents to generate an extra useless
+-     GMP variable when --e-acsl-O-gmp-only *)
+-  ignore(type_term ~use_gmp_opt:false ~ctx ~profile t1);
+-  ignore(type_term ~use_gmp_opt:false ~ctx ~profile t2)
++  ignore
++    (with_opt_ctx
++       (fun () -> number_ty_bound_variable ~profile (t1, lv, t2))
++       (fun ctx ->
++          (* forcing when typing bounds prevents to generate an extra useless
++             GMP variable when --e-acsl-O-gmp-only *)
++          do_both
++            (fun () -> ignore (type_term ~use_gmp_opt:false ?ctx ~profile t1))
++            (fun () -> ignore (type_term ~use_gmp_opt:false ?ctx ~profile t2))))
+ 
+ and type_predicate ~profile p =
+   Options.debug ~dkey ~level:3 "typing predicate: %a" Printer.pp_predicate p;
+-  let
+-    do_both f g = (try f() with e -> try g(); raise e with | _ -> raise e); g()
+-  in
+   let p = Logic_normalizer.get_pred p in
+   let open Current_loc.Operators in
+   let<> UpdatedCurrentLoc = p.pred_loc in
+@@ -791,7 +845,7 @@ and type_predicate ~profile p =
+   | Pfalse | Ptrue -> ()
+   | Papp(li, _, args) ->
+     begin
+-      List.iter
++      do_all
+         (fun x -> ignore (type_term ~use_gmp_opt: true ~profile x))
+         args;
+       match li.l_body with
+@@ -835,22 +889,24 @@ and type_predicate ~profile p =
+   | Pnot p ->
+     type_predicate ~profile p
+   | Pif(c, p1, p2) ->
+-    ignore (type_predicate ~profile c);
+-    let on p  () = type_predicate ~profile p in
+-    do_both (on p1) (on p2)
++    let on p () = type_predicate ~profile p in
++    do_both (on c) (fun () -> do_both (on p1) (on p2))
+   | Plet(li, p) ->
+     let li_t = Terms.of_li li in
+-    ignore (type_term ~use_gmp_opt:true ~profile li_t);
+-    type_predicate ~profile p
++    do_both
++      (fun () -> ignore (type_term ~use_gmp_opt:true ~profile li_t))
++      (fun () -> type_predicate ~profile p)
+   | Pforall _
+   | Pexists _ ->
+     let guards, goal = Bound_variables.get_preprocessed_quantifier p in
+-    List.iter
+-      (fun (t1, x, t2) -> type_bound_variables ~profile (t1, x, t2))
+-      guards;
+-    type_predicate ~profile goal
++    do_both
++      (fun () ->
++         do_all
++           (fun (t1, x, t2) -> type_bound_variables ~profile (t1, x, t2))
++           guards)
++      (fun () -> type_predicate ~profile goal)
+   | Pseparated tlist ->
+-    List.iter
++    do_all
+       (fun t -> ignore (type_term ~use_gmp_opt:false ~ctx:Nan ~profile t))
+       tlist
+   | Pinitialized(_, t)
+@@ -864,8 +920,9 @@ and type_predicate ~profile p =
+   | Paligned (t, n) ->
+     let sizet_kind = Machine.sizeof_kind () in
+     let size_t = C_integer sizet_kind in
+-    ignore (type_term ~use_gmp_opt:false ~ctx:Nan ~profile t);
+-    ignore (type_term ~use_gmp_opt:true ~ctx:size_t ~profile n)
++    do_both
++      (fun () -> ignore (type_term ~use_gmp_opt:false ~ctx:Nan ~profile t))
++      (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:size_t ~profile n))
+   | Pat(p, _) -> type_predicate ~profile p
+   | Pfresh _ -> Error.not_yet "\\fresh"
+ 

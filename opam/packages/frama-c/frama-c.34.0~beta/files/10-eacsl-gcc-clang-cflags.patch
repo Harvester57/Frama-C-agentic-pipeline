@@ -1,0 +1,20 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/10-eacsl-gcc-clang-cflags.patch
+# Upstream ref: pub/frama-c#2810, pub/frama-c!41
+# Summary: e-acsl-gcc: preserve CFLAGS under -G clang
+
+diff --git a/plugins/e-acsl/scripts/e-acsl-gcc b/plugins/e-acsl/scripts/e-acsl-gcc
+index 4e51de1d14..15d35dd4ca 100755
+--- a/plugins/e-acsl/scripts/e-acsl-gcc
++++ b/plugins/e-acsl/scripts/e-acsl-gcc
+@@ -909,7 +909,7 @@ CFLAGS="$OPTION_CFLAGS
+ 
+ # Disable extra warning for clang
+ if [ "`basename $CC`" = 'clang' ]; then
+-  CFLAGS="-Wno-unknown-warning-option \
++  CFLAGS="$CFLAGS -Wno-unknown-warning-option \
+     -Wno-extra-semi \
+     -Wno-tautological-compare \
+     -Wno-gnu-empty-struct \
+-- 
+2.56.0.windows.4
+

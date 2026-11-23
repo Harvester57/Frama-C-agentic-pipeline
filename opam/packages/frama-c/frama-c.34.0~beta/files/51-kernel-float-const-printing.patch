@@ -1,0 +1,72 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/51-kernel-float-const-printing.patch
+# Upstream ref: unfiled-51
+# Summary: kernel: print CReal without source text at exact precision and valid C non-finite expressions
+
+diff --git a/src/kernel/services/ast_printing/cil_printer.ml b/src/kernel/services/ast_printing/cil_printer.ml
+index 1fa68a0a41..ddd543b5fe 100644
+--- a/src/kernel/services/ast_printing/cil_printer.ml
++++ b/src/kernel/services/ast_printing/cil_printer.ml
+@@ -144,6 +144,46 @@ let print_std_includes fmt globs =
+     Datatype.String.Set.iter print_one_include includes
+   end
+ 
++let pretty_c_real fmt f fsize =
++  let suffix = match fsize with
++    | FFloat -> "f"
++    | FFloat32 -> "f32"
++    | FFloat64 -> "f64"
++    | FDouble -> ""
++    | FLongDouble -> "L"
++  in
++  if Floating_point.is_infinite f then
++    Format.fprintf fmt "(%s1.0%s / 0.0%s)"
++      (if f < 0. then "-" else "") suffix suffix
++  else if Floating_point.is_nan f then
++    Format.fprintf fmt "(0.0%s / 0.0%s)" suffix suffix
++  else
++    match Kernel.FloatPrint.get () with
++    | Floating_point.Default ->
++      let old_mode = Floating_point.get_rounding_mode () in
++      let finally () = Floating_point.set_rounding_mode old_mode in
++      let work () =
++        Floating_point.set_rounding_mode Floating_point.Nearest_even;
++        let round = Floating_point.round_if_single_precision fsize in
++        let target = Int64.bits_of_float (round f) in
++        let rec find_prec p =
++          let s = Format.sprintf "%.*g" p f in
++          if p >= 17 ||
++             Int64.equal (Int64.bits_of_float (round (float_of_string s))) target
++          then s
++          else find_prec (p + 1)
++        in
++        let r = find_prec 12 in
++        let is_not_integer =
++          String.contains r '.' || String.contains r 'e' || String.contains r 'E'
++        in
++        let dot = if is_not_integer then "" else "." in
++        Format.fprintf fmt "%s%s%s" r dot suffix
++      in
++      Fun.protect ~finally work
++    | Floating_point.NormDec | Floating_point.NormHex ->
++      Format.fprintf fmt "%a%s" Floating_point.pretty f suffix
++
+ let pretty_C_constant suffix k fmt i =
+   let nb_signed_bits =
+     Z.pred (Z.of_int (8 * (Cil.bytesSizeOfInt k)))
+@@ -637,15 +677,7 @@ class cil_printer () = object (self)
+ 
+     | CChr(c) -> fprintf fmt "'%s'" (Escape.escape_char c)
+     | CReal(_, _, Some s) -> fprintf fmt "%s" s
+-    | CReal(f, fsize, None) ->
+-      fprintf fmt "%a%s"
+-        Floating_point.pretty f
+-        (match fsize with
+-         | FFloat   -> "f"
+-         | FFloat32 -> "f32"
+-         | FFloat64 -> "f64"
+-         | FDouble  -> ""
+-         | FLongDouble -> "L")
++    | CReal(f, fsize, None) -> pretty_c_real fmt f fsize
+     | CEnum {einame = s} -> self#varname fmt s
+ 
+   (*** VARIABLES ***)

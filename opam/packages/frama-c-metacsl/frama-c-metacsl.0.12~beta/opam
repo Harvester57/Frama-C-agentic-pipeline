@@ -60,3 +60,18 @@ url {
 x-maintenance-intent: [
   "(latest)" "(latest-1)" "(latest-2)" "(latest-3)" "(latest-4)"
 ]
+
+# BEGIN pipeline-patches (managed by tools/sync_opam_patches.py)
+patches: [
+  "45-metacsl-result-in-postcond.patch"
+  "47-metacsl-callee-old-label-in-written.patch"
+  "48-metacsl-fold-annotation-location.patch"
+  "49-metacsl-eacsl-libc-instances.patch"
+]
+extra-files: [
+  ["45-metacsl-result-in-postcond.patch" "sha256=1b6f0fb8427c55b47dd83d0baa333bab9b524ba55b95fc3d3d2f50c21e1c9bf5"]
+  ["47-metacsl-callee-old-label-in-written.patch" "sha256=fae7184e2d85c2c9c06d77e69cbc98521a2cf4406e90659f05c0bb937455b73f"]
+  ["48-metacsl-fold-annotation-location.patch" "sha256=a6979eb61b0c9e874bc28bda49126487a01663c52b0b473e161aa63d6531ae74"]
+  ["49-metacsl-eacsl-libc-instances.patch" "sha256=9f094054e7fbf09430ccc97cef8b892d077b07c5782c677065f6b488a192c152"]
+]
+# END pipeline-patches

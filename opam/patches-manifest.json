@@ -1,0 +1,600 @@
+{
+  "schema_version": 1,
+  "frama_c_version": "34.0~beta",
+  "metacsl_version": "0.12~beta",
+  "digest": "4d7ca78adb6755256b290711d488bceb03ca742779706b81fe4ea5653d0e56cb",
+  "frama_c": [
+    {
+      "filename": "01-eacsl-gcc-option-arguments-reparsed.patch",
+      "issue": "pub/frama-c#2807",
+      "mr": "pub/frama-c!38",
+      "summary": "e-acsl-gcc: do not re-parse option arguments as flags",
+      "files": [
+        "plugins/e-acsl/scripts/e-acsl-gcc"
+      ],
+      "sha256": "1873c270edf29907e6419d3622a9565a759de55327ee5db91429a87f6d30a345"
+    },
+    {
+      "filename": "03-variadic-fallback-local-init.patch",
+      "issue": "pub/frama-c#2796",
+      "mr": "pub/frama-c!27",
+      "summary": "kernel/variadic: preserve local initializer symbol name on fallback",
+      "files": [
+        "src/kernel/services/ast_transformations/variadic/variadic.ml"
+      ],
+      "sha256": "e6ccc0830a8b7f961604a13bc1c12d7efc2999c954af0f324127184b6f0d3298"
+    },
+    {
+      "filename": "04-eacsl-unbounded-range-abort.patch",
+      "issue": "pub/frama-c#2798",
+      "mr": "pub/frama-c!29",
+      "summary": "e-acsl: do not abort whole instrumentation on unbounded ranges",
+      "files": [
+        "plugins/e-acsl/src/analyses/interval.ml",
+        "plugins/e-acsl/src/analyses/memory_tracking.ml",
+        "plugins/e-acsl/src/analyses/typing.ml",
+        "plugins/e-acsl/src/code_generator/memory_translate.ml"
+      ],
+      "sha256": "b7d5d6413711accdebb555bf81a45c6541ee94af198d27e01cbba34450f4f4f3"
+    },
+    {
+      "filename": "04b-libc-getsockopt-unbounded-range.patch",
+      "issue": "pub/frama-c#2799",
+      "mr": "pub/frama-c!30",
+      "summary": "libc: bound getsockopt optval range",
+      "files": [
+        "share/libc/sys/socket.h"
+      ],
+      "sha256": "ddc910603e78feabafbf548a56860ba1eeaeb936d4f46bbb629b7c4c9e33a68e"
+    },
+    {
+      "filename": "05-eacsl-incomplete-type-sizeof.patch",
+      "issue": "pub/frama-c#2805",
+      "mr": "pub/frama-c!36",
+      "summary": "e-acsl: reject sizeof/alignof of incomplete types cleanly",
+      "files": [
+        "plugins/e-acsl/src/analyses/typing.ml",
+        "plugins/e-acsl/src/code_generator/memory_translate.ml"
+      ],
+      "sha256": "dd773a8aa8a4d66c91c2327e42ad4ce2a93ba753fd49fe0faf53ca41f5dcb1a3"
+    },
+    {
+      "filename": "08-eacsl-struct-result-initialized.patch",
+      "issue": "pub/frama-c#2801",
+      "mr": "pub/frama-c!32",
+      "summary": "e-acsl: avoid false \\initialized(&\\result.f) checks",
+      "files": [
+        "plugins/e-acsl/src/analyses/rte_analysis.ml"
+      ],
+      "sha256": "40cd19fcd140ff146e1a6c5b2ecdf48fdf44c3c59a27c7595e41f25cc55d0d0a"
+    },
+    {
+      "filename": "12-eacsl-gcc-default-source.patch",
+      "issue": "pub/frama-c#2809",
+      "mr": "pub/frama-c!40",
+      "summary": "e-acsl-gcc: pass -D_DEFAULT_SOURCE when compiling generated C",
+      "files": [
+        "plugins/e-acsl/scripts/e-acsl-gcc"
+      ],
+      "sha256": "9a4f0dc5294e07b34ea3d342fa939db9ee17b6735bbc99256ccafe2e58c513ab"
+    },
+    {
+      "filename": "10-eacsl-gcc-clang-cflags.patch",
+      "issue": "pub/frama-c#2810",
+      "mr": "pub/frama-c!41",
+      "summary": "e-acsl-gcc: preserve CFLAGS under -G clang",
+      "files": [
+        "plugins/e-acsl/scripts/e-acsl-gcc"
+      ],
+      "sha256": "4c94aaf15ba07cc70b4548d261878607e5a8890401ad706c56b9e19dc984dbe0"
+    },
+    {
+      "filename": "13-eacsl-formal-params-initialized.patch",
+      "issue": "pub/frama-c#2797",
+      "mr": "pub/frama-c!28",
+      "summary": "e-acsl: mark formal parameters and argc/argv initialized",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c",
+        "plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c",
+        "plugins/e-acsl/src/code_generator/injector.ml",
+        "plugins/e-acsl/src/code_generator/memory_observer.ml",
+        "plugins/e-acsl/src/code_generator/memory_observer.mli"
+      ],
+      "sha256": "2c3c843c933140f4bd19c000867171158cd262926ae913b093617745031a8356"
+    },
+    {
+      "filename": "14-eacsl-iff-labelled-term.patch",
+      "issue": "pub/frama-c#2800",
+      "mr": "pub/frama-c!31",
+      "summary": "e-acsl: support <==> over labelled terms",
+      "files": [
+        "plugins/e-acsl/src/code_generator/translate_predicates.ml"
+      ],
+      "sha256": "73a9d155ae269bb9073e0b1400601d0afd09b1519ac24210925afb90de8b7d2d"
+    },
+    {
+      "filename": "16-eacsl-loop-variant-logic-function-application.patch",
+      "issue": "pub/frama-c#2806",
+      "mr": "pub/frama-c!37",
+      "summary": "e-acsl: type logic function applications in loop variants",
+      "files": [
+        "plugins/e-acsl/src/analyses/typing.ml"
+      ],
+      "sha256": "3942c9448fbcc83abf40c36136c3a704ea81c41e94e288eccf6263306ab3fc3c"
+    },
+    {
+      "filename": "17-eacsl-memcmp-overlapping-buffers.patch",
+      "issue": "pub/frama-c#2803",
+      "mr": "pub/frama-c!34",
+      "summary": "e-acsl: allow overlapping buffers in memcmp replacement",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_string.c"
+      ],
+      "sha256": "b4f1723e47ad7e35517eb39d832b7244fb56791a556f1cbe980ae9077080b266"
+    },
+    {
+      "filename": "18-eacsl-memory-init-clobbers-environ.patch",
+      "issue": "pub/frama-c#2802",
+      "mr": "pub/frama-c!33",
+      "summary": "e-acsl: preserve environ during runtime memory initialization",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c",
+        "plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c"
+      ],
+      "sha256": "96da1ebce9cefce31424677579f3c4cf7404e88532d1a5ca3e9e38e6b3c99ae0"
+    },
+    {
+      "filename": "19-wp-counter-examples-drops-frame.patch",
+      "issue": "pub/frama-c#2811",
+      "mr": "pub/frama-c!42",
+      "summary": "wp: keep frame conditions when probes are present",
+      "files": [
+        "plugins/wp/src/cfgWP.ml"
+      ],
+      "sha256": "2703465a4da99a37af9e8cf0fbe46fc62c23fccd0704e3ebb554632c75c42289"
+    },
+    {
+      "filename": "20-kernel-alignas-member-printed-after-declarator.patch",
+      "issue": "pub/frama-c#2812",
+      "mr": "pub/frama-c!43",
+      "summary": "kernel: print _Alignas before struct/union member declarators",
+      "files": [
+        "src/kernel/services/ast_printing/cil_printer.ml"
+      ],
+      "sha256": "d1892b87d77f661f4614699b5a1e327529b5f228595a7203f8ab6b6a49d25c59"
+    },
+    {
+      "filename": "21-eacsl-register-local-full-mtracking.patch",
+      "issue": "pub/frama-c#2804",
+      "mr": "pub/frama-c!35",
+      "summary": "e-acsl: handle register locals under --full-mtracking",
+      "files": [
+        "plugins/e-acsl/src/code_generator/injector.ml"
+      ],
+      "sha256": "ed7ae9f6390dbe3745bd103bbe4aec5b0ab2fdca66e7481dbc57aefb2256de92"
+    },
+    {
+      "filename": "24-eacsl-guarded-exists-drops-conjunct.patch",
+      "issue": "pub/frama-c#2793",
+      "mr": "pub/frama-c!25",
+      "summary": "e-acsl: keep guarded quantifier conjuncts (soundness)",
+      "files": [
+        "plugins/e-acsl/src/analyses/bound_variables.ml"
+      ],
+      "sha256": "54ba043b459ae2a93bb52ea7e16483fa26a44808efc7a5755a62a70610fcdc7c"
+    },
+    {
+      "filename": "25-kernel-offsetof-non-constant-index.patch",
+      "issue": "pub/frama-c#2813",
+      "mr": "pub/frama-c!44",
+      "summary": "kernel: accept non-constant array index in offsetof",
+      "files": [
+        "src/kernel/internals/typing/cabs2cil.ml"
+      ],
+      "sha256": "401c7c127685229bf31cd4d6ae3e01b8fa77295256a564c4fec6fdaaf9067726"
+    },
+    {
+      "filename": "26-libc-socket-header-gaps.patch",
+      "issue": "pub/frama-c#2814",
+      "mr": "pub/frama-c!45",
+      "summary": "libc: fix sockaddr_in sin_zero padding, ip_mreq, fd_set",
+      "files": [
+        "share/libc/__fc_inet.h",
+        "share/libc/sys/socket.h",
+        "share/libc/sys/types.h"
+      ],
+      "sha256": "b7d2d34c4db196ffae71481e9fa4672993d9d49a90fba64e38cb4224408af74f"
+    },
+    {
+      "filename": "27-eacsl-readonly-scalar-global-address.patch",
+      "issue": "pub/frama-c#2794/#2795",
+      "mr": "pub/frama-c!26",
+      "summary": "e-acsl: pass address of const globals (scalars, unions, structs) to mark_readonly",
+      "files": [
+        "plugins/e-acsl/src/code_generator/global_observer.ml"
+      ],
+      "sha256": "ca697a7c3b8e0e5db394aaf38ef5d1e5d3e0de4e2d6fcac5efac051ff40c04b1"
+    },
+    {
+      "filename": "28-eacsl-full-mtracking-tail-merged-literals.patch",
+      "issue": "pub/frama-c#2817",
+      "mr": "pub/frama-c!46",
+      "summary": "e-acsl: demote string literals to avoid clang tail-merging overlap",
+      "files": [
+        "plugins/e-acsl/src/code_generator/injector.ml",
+        "src/kernel/services/ast_transformations/demote_string_literal.ml",
+        "src/kernel/services/ast_transformations/demote_string_literal.mli"
+      ],
+      "sha256": "cb1da919662ed3c2c306bc7726e4506ebc5bfbff5bf4a669611bd2b583bbefb6"
+    },
+    {
+      "filename": "29-eacsl-object-pointer-readonly-static.patch",
+      "issue": "pub/frama-c#2818",
+      "mr": "pub/frama-c!47",
+      "summary": "e-acsl: recognize read-only static blocks in \\object_pointer",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c",
+        "plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h"
+      ],
+      "sha256": "879913aee55117df7a6e2979cfe0f434f5c46373c8fd23e6574048a8d982aea9"
+    },
+    {
+      "filename": "30-eacsl-format-promoted-argument-signedness.patch",
+      "issue": "pub/frama-c#2819",
+      "mr": "pub/frama-c!48",
+      "summary": "e-acsl: accept promoted unsigned char/short/_Bool in format checks",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c",
+        "plugins/e-acsl/src/libraries/functions.ml"
+      ],
+      "sha256": "27711682b132bcc20f9780d2a586294aa2569aa836cd1b2dcdcf4cb1e07d338e"
+    },
+    {
+      "filename": "31-eacsl-format-fp-argument-slots.patch",
+      "issue": "pub/frama-c#2820",
+      "mr": "pub/frama-c!49",
+      "summary": "e-acsl: read floating-point arguments with their own va_arg types",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c"
+      ],
+      "sha256": "21c80bafa70be5b3b33320336fa61530c4c4485fb9c03e08bc5666da0d35e94a"
+    },
+    {
+      "filename": "32-eacsl-format-star-width-precision.patch",
+      "issue": "pub/frama-c#2822",
+      "mr": "pub/frama-c!50",
+      "summary": "e-acsl: account for * width/precision arguments in format validation",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c"
+      ],
+      "sha256": "d578931645e340cc82064cf220093ea9adb9811325496733f778ddadd634ea80"
+    },
+    {
+      "filename": "33-eacsl-format-literal-without-full-mtracking.patch",
+      "issue": "pub/frama-c#2821",
+      "mr": "pub/frama-c!51",
+      "summary": "e-acsl: track format-string literals without --full-mtracking",
+      "files": [
+        "plugins/e-acsl/src/analyses/memory_tracking.ml"
+      ],
+      "sha256": "cf0d455df462ed5fc8ec7be7eab031cd2ae9bc1cb436d10677f14e6dce2f88f2"
+    },
+    {
+      "filename": "35-kernel-restrict-gnu-spelling.patch",
+      "issue": "pub/frama-c#2824",
+      "mr": "pub/frama-c!52",
+      "summary": "kernel: accept GNU __restrict__ spelling in C lexer",
+      "files": [
+        "src/kernel/internals/parsing/clexer.mll"
+      ],
+      "sha256": "c2aa70e2ba73f054f260e80cff68a9aabb0153464444231bb36ad3278c41e576"
+    },
+    {
+      "filename": "36-eacsl-heap-zone-size-overflow.patch",
+      "issue": "pub/frama-c#2825",
+      "mr": "pub/frama-c!53",
+      "summary": "e-acsl: prevent 32-bit int overflow in large heap/stack zone sizes",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c",
+        "plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_concurrency.c",
+        "plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_shadow_layout.h"
+      ],
+      "sha256": "44940ca41920c4218ae636116e3724b4362d6e121f545f32318c652afff6afd8"
+    },
+    {
+      "filename": "39-libc-linux-header-gaps.patch",
+      "issue": "pub/frama-c#2828",
+      "mr": "pub/frama-c!56",
+      "summary": "libc: add Linux <sys/epoll.h> and <sys/inotify.h> headers and specs",
+      "files": [
+        "share/libc/__fc_libc.h",
+        "share/libc/sys/epoll.h",
+        "share/libc/sys/inotify.h"
+      ],
+      "sha256": "d0d95e8bde3a3ac617c8867ccb7c327eb672b29d4d1183d745e34170aa3eb7ab"
+    },
+    {
+      "filename": "41-libc-ioctl-modem-bits.patch",
+      "issue": "pub/frama-c#2830",
+      "mr": "pub/frama-c!58",
+      "summary": "libc: add TIOCM_* modem-line bits to <sys/ioctl.h>",
+      "files": [
+        "share/libc/sys/ioctl.h"
+      ],
+      "sha256": "ced627b01e713e8be7c0d34949fdccb734de7c881405b92e5a48be54476a8bc2"
+    },
+    {
+      "filename": "42-wp-hexadecimal-float-literals.patch",
+      "issue": "pub/frama-c#2831",
+      "mr": "pub/frama-c!59",
+      "summary": "wp: parse hexadecimal and f32/f64 float literals (soundness)",
+      "files": [
+        "plugins/wp/src/Cfloat.ml"
+      ],
+      "sha256": "789dbba155aa371506910589b2d776a7adbc2417c2c53df1ee57052ea90e6636"
+    },
+    {
+      "filename": "43-eacsl-real-constant-notation.patch",
+      "issue": "unfiled-43",
+      "mr": null,
+      "summary": "e-acsl: parse exponent/hex real constants and reject silent 0.1L -> 0 (soundness)",
+      "files": [
+        "plugins/e-acsl/src/code_generator/gmp.ml",
+        "plugins/e-acsl/src/code_generator/gmp.mli"
+      ],
+      "sha256": "847ff18979c43105b2a6f430fd62c5e0168521aca346ebb5542c1e37cf3b5470"
+    },
+    {
+      "filename": "44-libc-strlcat-contract.patch",
+      "issue": "unfiled-44",
+      "mr": null,
+      "summary": "libc: fix strlcat ensures/assigns/separation contract (soundness)",
+      "files": [
+        "share/libc/string.h"
+      ],
+      "sha256": "840e701ae9f3192f8e4c1f4ed4f4a3d7fe9888e57e48207f6f383dfb64ad8cf7"
+    },
+    {
+      "filename": "46-libc-sched-cpu-set.patch",
+      "issue": "unfiled-46",
+      "mr": null,
+      "summary": "libc: add cpu_set_t, CPU_* macros, sched_setaffinity/sched_getaffinity to <sched.h>",
+      "files": [
+        "share/libc/sched.h"
+      ],
+      "sha256": "7f4057f4cfd2f13d0c7e96386f7663605c3484b7a2fcc0cf50d67ab0517575a2"
+    },
+    {
+      "filename": "50-eacsl-format-enum-argument.patch",
+      "issue": "unfiled-50",
+      "mr": null,
+      "summary": "e-acsl: handle enum arguments and enum pointers in --validate-format-strings",
+      "files": [
+        "plugins/e-acsl/src/libraries/functions.ml"
+      ],
+      "sha256": "4187b67154fbdbe541471db8b230138aaa93ccd1eb003a17cae41bb161408fa7"
+    },
+    {
+      "filename": "51-kernel-float-const-printing.patch",
+      "issue": "unfiled-51",
+      "mr": null,
+      "summary": "kernel: print CReal without source text at exact precision and valid C non-finite expressions",
+      "files": [
+        "src/kernel/services/ast_printing/cil_printer.ml"
+      ],
+      "sha256": "680afc13333cdd99c3dc71f5377133c680624e4cd93439bf37756e414032848e"
+    },
+    {
+      "filename": "52-eacsl-rational-cast-double-rounding.patch",
+      "issue": "unfiled-52",
+      "mr": null,
+      "summary": "e-acsl: round rational casts to double/float to nearest-even instead of mpq_get_d truncation (soundness)",
+      "files": [
+        "plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c",
+        "plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h",
+        "plugins/e-acsl/src/code_generator/gmp.ml"
+      ],
+      "sha256": "ded17c744bb1f2484ba32aa07b5e2dd09508a97955707807d2ccc8d4da9b3a7a"
+    },
+    {
+      "filename": "53-eacsl-non-finite-real-constant.patch",
+      "issue": "unfiled-53",
+      "mr": null,
+      "summary": "e-acsl: reject non-finite suffixed real constants cleanly instead of emitting inf or SIGFPE",
+      "files": [
+        "plugins/e-acsl/src/analyses/interval.ml",
+        "plugins/e-acsl/src/code_generator/translate_terms.ml"
+      ],
+      "sha256": "772154c3dc00cc87ad60d1ae3217f65fde126c4572ade7a206e602293e96b934"
+    },
+    {
+      "filename": "54-eacsl-typing-not-performed-guard.patch",
+      "issue": "unfiled-54",
+      "mr": null,
+      "summary": "e-acsl: type sibling subterms and quantifier goals before re-raising Not_yet",
+      "files": [
+        "plugins/e-acsl/src/analyses/typing.ml"
+      ],
+      "sha256": "b2e6f01afd29a44fcbfde3da8362319a0f350de48dd58b881028f70663409abe"
+    },
+    {
+      "filename": "56-kernel-float-cast-dropped-exact.patch",
+      "issue": "unfiled-56",
+      "mr": null,
+      "summary": "kernel: check single-precision exactness in Cil.isExactFloat before dropping (float) cast (soundness)",
+      "files": [
+        "src/kernel/services/ast_queries/cil.ml"
+      ],
+      "sha256": "327d1b9677e73fc836cf0ed8a2fdb09108a6a4b548c275543ec1564c31c06ef7"
+    },
+    {
+      "filename": "57-kernel-bool-cast-dropped-logic.patch",
+      "issue": "unfiled-57",
+      "mr": null,
+      "summary": "kernel: fix Cil.fitsInInt and truncateInteger64 for IBool so (_Bool) casts are not dropped (soundness)",
+      "files": [
+        "src/kernel/services/ast_queries/cil.ml"
+      ],
+      "sha256": "307d09922bd3b7049cc92b0a66c7937e99b740cb843c1a9f5099440c697ce7ea"
+    },
+    {
+      "filename": "58-kernel-acsl-string-sizeof-escaped.patch",
+      "issue": "unfiled-58",
+      "mr": null,
+      "summary": "kernel: unescape ACSL string literals before computing their array type/sizeof (soundness)",
+      "files": [
+        "src/kernel/services/ast_queries/logic_typing.ml"
+      ],
+      "sha256": "171b7fdf75236acbff5dd46903b49f2244283f4a93868566993ca08b326a251b"
+    },
+    {
+      "filename": "59-kernel-acsl-hex-octal-escapes.patch",
+      "issue": "unfiled-59",
+      "mr": null,
+      "summary": "kernel: fix ACSL hex/octal escapes and wide-character truncation (soundness)",
+      "files": [
+        "src/kernel/internals/parsing/logic_lexer.mli",
+        "src/kernel/internals/parsing/logic_lexer.mll",
+        "src/kernel/services/ast_queries/logic_typing.ml"
+      ],
+      "sha256": "95e9f48ab0179f7ef6375262851d0d4332e67533058545a35e2f1347309fbaa7"
+    },
+    {
+      "filename": "64-wp-void-object-size.patch",
+      "issue": "unfiled-64",
+      "mr": null,
+      "summary": "wp: size TVoid objects as char rather than int (soundness)",
+      "files": [
+        "plugins/wp/src/ctypes.ml"
+      ],
+      "sha256": "bb53d2c7e898988af913ec51f614fcc4494aa2d24bd723a8dd3a16bde9015171"
+    },
+    {
+      "filename": "65-wp-floor-ceil-truncate-float-cast.patch",
+      "issue": "unfiled-65",
+      "mr": null,
+      "summary": "wp: compute \\floor/\\ceil/\\truncate and float-to-int constant casts with exact Zarith (soundness)",
+      "files": [
+        "plugins/wp/src/Cmath.ml"
+      ],
+      "sha256": "ec9a418978f80c2cb627a5b2da922400be9ca6e0968f8bc0048a5bcb0069dbe3"
+    },
+    {
+      "filename": "66-wp-empty-range-addition-shift.patch",
+      "issue": "unfiled-66",
+      "mr": null,
+      "summary": "wp: guard range addition/subtraction and pointer shifts on range non-emptiness (soundness)",
+      "files": [
+        "plugins/wp/src/Cvalues.ml",
+        "plugins/wp/src/Vset.ml",
+        "plugins/wp/src/Vset.mli"
+      ],
+      "sha256": "e1f99f69e8cc882c73799142c3300963c718e80aa6e95c8d8fc590a85708f22b"
+    },
+    {
+      "filename": "68-wp-non-finite-float-constant.patch",
+      "issue": "unfiled-68",
+      "mr": null,
+      "summary": "wp: guard non-finite floating-point constants from becoming infinite reals or crashing Why3 export",
+      "files": [
+        "plugins/wp/src/Cfloat.ml"
+      ],
+      "sha256": "331d65dd7770a8880cdcbf7ff1a51f9904e587a6f2c39f4de08a8816a3bdf8e8"
+    },
+    {
+      "filename": "72-libc-pclose-pipe-status-soundness.patch",
+      "issue": "unfiled-72",
+      "mr": null,
+      "summary": "libc: track pipe state via ghost __fc_pipe_status so pclose does not prove \\false in WP (soundness)",
+      "files": [
+        "share/libc/stdio.h"
+      ],
+      "sha256": "436e758f89cd453626bbbce267c2319c1f88691652f55b90f38cd8e00e369506"
+    },
+    {
+      "filename": "73-libc-sigaction-oldact-contract.patch",
+      "issue": "unfiled-73",
+      "mr": null,
+      "summary": "libc: fix sigaction oldact assigns and \\old postcondition so Eva does not mark post-call code dead",
+      "files": [
+        "share/libc/signal.h"
+      ],
+      "sha256": "5b4dfda718e839fd55b36e9f935e5d95f0d9f122bbd9e4cb3f60d8effc4ad959"
+    },
+    {
+      "filename": "74-libc-reentrant-result-pointer-assigns.patch",
+      "issue": "unfiled-74",
+      "mr": null,
+      "summary": "libc: fix getpwnam_r/getpwuid_r/getut*_r result pointer assigns so Eva reaches success branches",
+      "files": [
+        "share/libc/pwd.h",
+        "share/libc/utmp.h"
+      ],
+      "sha256": "7a80fef7a3a52cbcdbd5a9b3bf17e49cd7024a611ae7c1cc0c9a41d2bdbc0714"
+    },
+    {
+      "filename": "75-libc-syslog-string-axiomatic.patch",
+      "issue": "unfiled-75",
+      "mr": null,
+      "summary": "libc: include __fc_string_axiomatic.h in <syslog.h> so variadic syslog checks string preconditions",
+      "files": [
+        "share/libc/syslog.h"
+      ],
+      "sha256": "86fede9b380b979e680891c37a8c92be987b5b04e60c2c501c3a68e42b9e9905"
+    },
+    {
+      "filename": "80-kernel-hex-float-double-rounding.patch",
+      "issue": "unfiled-80",
+      "mr": null,
+      "summary": "kernel: single-round hexadecimal floating-point literals with exact Z arithmetic (soundness)",
+      "files": [
+        "src/lib/floating_point/typed_float.ml"
+      ],
+      "sha256": "ba105fac26ea06897f245293b8abc97479ab3344f820f334abbffb6ce91eaeb6"
+    }
+  ],
+  "metacsl": [
+    {
+      "filename": "45-metacsl-result-in-postcond.patch",
+      "issue": "unfiled-45",
+      "mr": null,
+      "summary": "metacsl: allow \\result in \\postcond properties",
+      "files": [
+        "meta_parse.ml"
+      ],
+      "sha256": "1b6f0fb8427c55b47dd83d0baa333bab9b524ba55b95fc3d3d2f50c21e1c9bf5"
+    },
+    {
+      "filename": "47-metacsl-callee-old-label-in-written.patch",
+      "issue": "unfiled-47",
+      "mr": null,
+      "summary": "metacsl: map callee Old/Pre/Here labels to Before in \\written/\\read (soundness)",
+      "files": [
+        "meta_annotate.ml"
+      ],
+      "sha256": "fae7184e2d85c2c9c06d77e69cbc98521a2cf4406e90659f05c0bb937455b73f"
+    },
+    {
+      "filename": "48-metacsl-fold-annotation-location.patch",
+      "issue": "unfiled-48",
+      "mr": null,
+      "summary": "metacsl: preserve property source locations under -meta-fold",
+      "files": [
+        "meta_annotate.ml"
+      ],
+      "sha256": "a6979eb61b0c9e874bc28bda49126487a01663c52b0b473e161aa63d6531ae74"
+    },
+    {
+      "filename": "49-metacsl-eacsl-libc-instances.patch",
+      "issue": "unfiled-49",
+      "mr": null,
+      "summary": "metacsl: warn with call-site locations under category no-footprint",
+      "files": [
+        "meta_annotate.ml",
+        "meta_options.ml",
+        "meta_options.mli"
+      ],
+      "sha256": "9f094054e7fbf09430ccc97cef8b892d077b07c5782c677065f6b488a192c152"
+    }
+  ]
+}

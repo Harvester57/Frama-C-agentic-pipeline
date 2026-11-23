@@ -1,0 +1,39 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/53-eacsl-non-finite-real-constant.patch
+# Upstream ref: unfiled-53
+# Summary: e-acsl: reject non-finite suffixed real constants cleanly instead of emitting inf or SIGFPE
+
+diff --git a/plugins/e-acsl/src/analyses/interval.ml b/plugins/e-acsl/src/analyses/interval.ml
+index d325b1c864..01311ecde3 100644
+--- a/plugins/e-acsl/src/analyses/interval.ml
++++ b/plugins/e-acsl/src/analyses/interval.ml
+@@ -528,7 +528,11 @@ let rec infer ~force ~logic_env t =
+       in
+       get_res (recurse ~logic_env t)
+     | TConst (LReal lr) ->
+-      if lr.r_lower = lr.r_upper then Float(FDouble, Some lr.r_nearest)
++      if lr.r_lower = lr.r_upper then
++        if Floating_point.is_finite lr.r_nearest then
++          Float(FDouble, Some lr.r_nearest)
++        else
++          Error.not_yet "non-finite floating-point constant"
+       else Rational
+     | Tlambda ([ _ ],lt) ->
+       get_res (recurse lt)
+diff --git a/plugins/e-acsl/src/code_generator/translate_terms.ml b/plugins/e-acsl/src/code_generator/translate_terms.ml
+index 73a5f52039..0909b83796 100644
+--- a/plugins/e-acsl/src/code_generator/translate_terms.ml
++++ b/plugins/e-acsl/src/code_generator/translate_terms.ml
+@@ -126,8 +126,11 @@ let constant_to_exp_old ~loc env t c =
+   | LStr _ | LWStr _ -> Options.not_yet_implemented "ACSL String literals"
+   | LChr c -> Cil.new_exp ~loc (Const (CChr c)), Analyses_types.C_number
+   | LReal lr ->
+-    if lr.r_lower = lr.r_upper
+-    then Cil.kfloat ~loc FDouble lr.r_nearest, Analyses_types.C_number
++    if lr.r_lower = lr.r_upper then
++      if Floating_point.is_finite lr.r_nearest then
++        Cil.kfloat ~loc FDouble lr.r_nearest, Analyses_types.C_number
++      else
++        Error.not_yet "non-finite floating-point constant"
+     else mk_real lr.r_literal
+   | LEnum e -> Cil.new_exp ~loc (Const (CEnum e)), Analyses_types.C_number
+ 

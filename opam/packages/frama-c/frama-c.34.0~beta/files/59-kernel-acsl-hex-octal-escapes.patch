@@ -1,0 +1,171 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/59-kernel-acsl-hex-octal-escapes.patch
+# Upstream ref: unfiled-59
+# Summary: kernel: fix ACSL hex/octal escapes and wide-character truncation (soundness)
+
+diff --git a/src/kernel/internals/parsing/logic_lexer.mli b/src/kernel/internals/parsing/logic_lexer.mli
+index b07acd1896..f3936fa9fd 100644
+--- a/src/kernel/internals/parsing/logic_lexer.mli
++++ b/src/kernel/internals/parsing/logic_lexer.mli
+@@ -15,6 +15,7 @@ val token : Lexing.lexbuf -> Logic_parser.token
+ (** For plugins that need to call functions of [Logic_parser] themselves *)
+ 
+ val chr : Lexing.lexbuf -> string
++val chr_codes : Lexing.lexbuf -> int64 list
+ val is_acsl_keyword : string -> bool
+ 
+ 
+diff --git a/src/kernel/internals/parsing/logic_lexer.mll b/src/kernel/internals/parsing/logic_lexer.mll
+index 8b198bcbbc..e47a665fc8 100644
+--- a/src/kernel/internals/parsing/logic_lexer.mll
++++ b/src/kernel/internals/parsing/logic_lexer.mll
+@@ -437,12 +437,9 @@ rule token = parse
+   | '0' rD+ rIS?            { INT_CONSTANT (lexeme lexbuf) }
+   | rD+                     { INT_CONSTANT (lexeme lexbuf) }
+   | rD+ rIS                 { INT_CONSTANT (lexeme lexbuf) }
+-  | ('L'? "'" as prelude) (([^ '\\' '\'' '\n']|("\\"[^ '\n']))+ as content) "'"
++  | 'L'? "'" ([^ '\\' '\'' '\n']|("\\"[^ '\n']))+ "'"
+       {
+-        let b = Buffer.create 5 in
+-        Buffer.add_string b prelude;
+-        let lbf = Lexing.from_string content in
+-        INT_CONSTANT (chr b lbf ^ "'")
++        INT_CONSTANT (lexeme lexbuf)
+       }
+ (* floating-point literals, both decimal and hexadecimal *)
+   | rD+ rE rFS?
+@@ -526,28 +523,19 @@ and chr buffer = parse
+   | hex_escape
+       { let s = lexeme lexbuf in
+         let real_s = String.sub s 2 (String.length s - 2) in
+-        let rec add_one_char s =
+-          let l = String.length s in
+-          if l = 0 then ()
+-          else
+-          let h = int_of_digit s.[0] in
+-          let c,s =
+-            if l = 1 then (h,"")
+-            else
+-              (16*h + int_of_digit s.[1],
+-               String.sub s 2 (String.length s - 2))
+-          in
+-          Buffer.add_char buffer (Char.chr c); add_one_char s
+-        in add_one_char real_s; chr buffer lexbuf
++        let v = Z.of_string_base 16 real_s in
++        if Z.gt v (Z.of_int 255) then
++          lex_error lexbuf
++            (Format.asprintf "hexadecimal escape sequence out of range: %s" s);
++        Buffer.add_char buffer (Char.chr (Z.to_int v)); chr buffer lexbuf
+       }
+   | oct_escape
+       { let s = lexeme lexbuf in
+         let real_s = String.sub s 1 (String.length s - 1) in
+-        let rec value i s =
+-          if s = "" then i
+-          else value (8*i+int_of_digit s.[0])
+-            (String.sub s 1 (String.length s -1))
+-        in let c = value 0 real_s in
++        let c = int_of_string ("0o" ^ real_s) in
++        if c > 255 then
++          lex_error lexbuf
++            (Format.asprintf "octal escape sequence out of range: %s" s);
+         Buffer.add_char buffer (Char.chr c); chr buffer lexbuf
+       }
+   | escape
+@@ -617,6 +605,45 @@ and comment = parse
+   | eof  { lex_error lexbuf "non-terminating block-comment" }
+   | _    { comment lexbuf}
+ 
++and chr_codes = parse
++  | hex_escape
++      { let s = lexeme lexbuf in
++        let real_s = String.sub s 2 (String.length s - 2) in
++        let v = Z.of_string_base 16 real_s in
++        if Z.gt v (Z.of_int64 Int64.max_int) then
++          lex_error lexbuf
++            (Format.asprintf "hexadecimal escape sequence out of range: %s" s);
++        let code = Z.to_int64 v in
++        code :: chr_codes lexbuf
++      }
++  | oct_escape
++      { let s = lexeme lexbuf in
++        let real_s = String.sub s 1 (String.length s - 1) in
++        let code = Int64.of_int (int_of_string ("0o" ^ real_s)) in
++        code :: chr_codes lexbuf
++      }
++  | escape
++      { let c =
++          match (lexeme lexbuf).[1] with
++          | 'a' -> '\007'
++          | 'b' -> '\b'
++          | 'f' -> '\012'
++          | 'n' -> '\n'
++          | 'r' -> '\r'
++          | 't' -> '\t'
++          | 'v' -> '\011'
++          | '\'' -> '\''
++          | '"' -> '"'
++          | '?' -> '?'
++          | '\\' -> '\\'
++          | _ -> assert false
++        in
++        let code = Int64.of_int (Char.code c) in
++        code :: chr_codes lexbuf
++      }
++  | eof { [] }
++  | _ as c { let code = Int64.of_int (Char.code c) in code :: chr_codes lexbuf }
++
+ {
+   (* When Ocaml 4.11+ becomes mandatory, we can probably replace this with
+      Lexing.set_position. *)
+diff --git a/src/kernel/services/ast_queries/logic_typing.ml b/src/kernel/services/ast_queries/logic_typing.ml
+index 0c4e2734c9..7680d26e3a 100644
+--- a/src/kernel/services/ast_queries/logic_typing.ml
++++ b/src/kernel/services/ast_queries/logic_typing.ml
+@@ -1153,21 +1153,27 @@ struct
+       C.error loc "not a C type"
+ 
+   let parseInt loc s =
+-    let explode s =
+-      let l = ref [] in
+-      String.iter (fun c -> l:=Int64.of_int (Char.code c) :: !l) s;
+-      List.rev !l
++    let decode content =
++      try Logic_lexer.chr_codes (Lexing.from_string content)
++      with Logic_lexer.Error (_, msg) -> C.error loc "%s" msg
+     in
+     match String.get s 0 with
+     | 'L' -> (* L'wide_char' *)
+       let content = String.sub s 2 (String.length s - 3) in
+-      let tokens = explode content in
+-      let value = Cil.reduce_multichar (Machine.wchar_type ()) tokens
++      let tokens = decode content in
++      let value = Cil.reduce_multichar (Machine.wchar_type ()) tokens in
++      let value, _ =
++        Cil.truncateInteger64 (Machine.wchar_kind ()) (Z.of_int64 value)
+       in
+-      tinteger_s64 ~loc value
++      term ~loc (TConst (Integer (value, None))) Linteger
+     | '\'' -> (* 'char' *)
+       let content = String.sub s 1 (String.length s - 2) in
+-      let tokens = explode content in
++      let tokens = decode content in
++      List.iter
++        (fun v ->
++           if Int64.compare v 0L < 0 || Int64.compare v 255L > 0 then
++             C.error loc "escape sequence out of range: 0x%Lx" v)
++        tokens;
+       let value,_= Cil.interpret_character_constant tokens in
+       term ~loc (TConst (constant_to_lconstant value)) Linteger
+     | _ -> Cil.parseIntLogic ~loc s
+@@ -3453,7 +3459,10 @@ struct
+       let t = ctxt.type_term ctxt env t in
+       { t with term_name = name :: t.term_name }
+     | _ ->
+-      let t', ty = term_node ctxt env t.lexpr_loc t.lexpr_node in
++      let t', ty =
++        try term_node ctxt env t.lexpr_loc t.lexpr_node
++        with Logic_lexer.Error (_, msg) -> ctxt.error t.lexpr_loc "%s" msg
++      in
+       { term_node = t'; term_loc=t.lexpr_loc; term_type=ty; term_name = [] }
+ 
+   let predicate ctxt env p0 =

@@ -1,0 +1,26 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/47-metacsl-callee-old-label-in-written.patch
+# Upstream ref: unfiled-47
+# Summary: metacsl: map callee Old/Pre/Here labels to Before in \written/\read (soundness)
+
+diff --git a/meta_annotate.ml b/meta_annotate.ml
+index 03447cf..1f34319 100644
+--- a/meta_annotate.ml
++++ b/meta_annotate.ml
+@@ -563,6 +563,17 @@ let inspect_contract process stmt ckf args =
+           (Option.get oargs) args ;
+       h
+ 
++    (* In the contract of the callee, Old, Pre and Here in assumes and assigns
++       clauses denote its pre-state, that is the state just before the call.
++       The instance is a statement annotation, where Old is not allowed, Pre
++       denotes the pre-state of the caller, and Here under an After property
++       denotes the post-state after the call. Use the meta label Before
++       instead: replace_after_before turns it into Here when the annotation
++       precedes the call, and into a label on the call when it follows it. *)
++    method! vlogic_label = function
++      | BuiltinLabel (Old | Pre | Here) -> Cil.ChangeTo (FormalLabel "Before")
++      | _ -> Cil.DoChildren
++
+     method! vterm _ =
+       Cil.DoChildrenPost (fun term -> match term.term_node with
+           | TLval (host, _) | TAddrOf (host, _) | TStartOf (host, _) ->

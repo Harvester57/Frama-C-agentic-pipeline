@@ -37,8 +37,9 @@ from collections.abc import Callable, Sequence
 
 from fc_cpp_wrapper import DISABLE_ENV, LOG_PREFIX, _locator, is_preprocessing, output_path, run
 
-# The switch: False once the image's E-ACSL has the fix of pub/frama-c#2795 (merge request pub/frama-c!26).
-REWRITE_STATIC_CONST_UNIONS = True
+# The switch: False now that the analysis image carries the fix of pub/frama-c#2795 (merge request pub/frama-c!26)
+# via opam/packages/frama-c/frama-c.34.0~beta/files/27-eacsl-readonly-scalar-global-address.patch.
+REWRITE_STATIC_CONST_UNIONS = False
 CONST_UNION_KIND = "static const union"
 
 # Comments, string and character literals and directive lines are matched whole (and so skipped); group 1 is

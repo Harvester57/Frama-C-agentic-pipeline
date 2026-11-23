@@ -1,0 +1,127 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/80-kernel-hex-float-double-rounding.patch
+# Upstream ref: unfiled-80
+# Summary: kernel: single-round hexadecimal floating-point literals with exact Z arithmetic (soundness)
+
+diff --git a/src/lib/floating_point/typed_float.ml b/src/lib/floating_point/typed_float.ml
+index 7f9fc35d91..7f9a23c427 100644
+--- a/src/lib/floating_point/typed_float.ml
++++ b/src/lib/floating_point/typed_float.ml
+@@ -418,23 +418,51 @@ let normalize integral fractional exponent format =
+ 
+ 
+ 
+-let is_hexadecimal s =
+-  Stdlib.(String.length s >= 2 && s.[0] = '0' && (s.[1] = 'X' || s.[1] = 'x'))
+-
+-let parse_hexadecimal (type f) ~(format : f format) s =
+-  let open Option.Operators in
+-  let current  = get_rounding_mode () in
+-  set_rounding_mode Nearest_even ;
+-  let* nearest = float_of_string_opt s in
+-  let  nearest = represents ~float:nearest ~in_format:format in
+-  set_rounding_mode Downward ;
+-  let* lower   = float_of_string_opt s in
+-  let  lower   = represents ~float:lower   ~in_format:format in
+-  set_rounding_mode Upward ;
+-  let* upper   = float_of_string_opt s in
+-  let  upper   = represents ~float:upper   ~in_format:format in
+-  set_rounding_mode current ;
+-  Some { lower ; nearest ; upper ; format }
++let normalize_hexadecimal integral fractional exponent format =
++  let concat = Z.of_string_base 16 (integral ^ fractional) in
++  let* numerator = normalize_zero_in_numerator ~format concat in
++  let fractional_bits = Z.of_int Stdlib.(4 * String.length fractional) in
++  let raw_exp = Z.sub (Z.of_string exponent) fractional_bits in
++  let sig_size = sig_size format in
++  let maximal_exponent = maximal_exponent_of ~format in
++  let minimal_exponent = Stdlib.(minimal_exponent_of ~format - sig_size + 1) in
++  let msb_exp = Z.add raw_exp (Z.of_int (Z.log2 numerator)) in
++  let* () =
++    if Z.Compare.(msb_exp > Z.of_int maximal_exponent)
++    then pos_inf_shortcut ~format
++    else Normalized ()
++  in
++  let* () =
++    if Z.Compare.(msb_exp < Z.of_int Stdlib.(minimal_exponent - 1))
++    then zero_shortcut ~format
++    else Normalized ()
++  in
++  let msb_exp_int = Z.to_int msb_exp in
++  let target_exp = Stdlib.max minimal_exponent Stdlib.(msb_exp_int - sig_size + 1) in
++  let shift = Z.to_int (Z.sub (Z.of_int target_exp) raw_exp) in
++  if Stdlib.(shift <= 0) then
++    let significant = Z.shift_left numerator Stdlib.(-shift) in
++    let exact = Float.ldexp (Z.to_float significant) target_exp in
++    let bound = represents ~float:exact ~in_format:format in
++    Normalized { lower = bound ; nearest = bound ; upper = bound ; format }
++  else
++    let significant = Z.shift_right numerator shift in
++    let tz = Z.trailing_zeros numerator in
++    let is_zero = Stdlib.(tz >= shift) in
++    let half_bit = Z.testbit numerator Stdlib.(shift - 1) in
++    let is_half = half_bit && Stdlib.(tz = shift - 1) in
++    let less_than_half = not half_bit in
++    let is_last_bit_zero = Z.(equal (logand significant one) zero) in
++    let tie_to_even = is_half && is_last_bit_zero in
++    let nearest_is_down = is_zero || less_than_half || tie_to_even in
++    let lower_bound = Float.ldexp (Z.to_float significant) target_exp in
++    let upper_bound = Float.ldexp Z.(succ significant |> to_float) target_exp in
++    let lower = represents ~float:lower_bound ~in_format:format in
++    let upper =
++      if is_zero then lower else represents ~float:upper_bound ~in_format:format
++    in
++    let nearest = if nearest_is_down then lower else upper in
++    Normalized { lower ; nearest ; upper ; format }
+ 
+ 
+ 
+@@ -470,8 +498,15 @@ module Regexp = struct
+   let dot  = "[.]"
+   let num  = "\\([0-9]*\\)"
+   let exp  = "[eE]\\([+-]?[0-9]+\\)"
++  let hex_prefix = "0[xX]"
++  let hex_num = "\\([0-9a-fA-F]*\\)"
++  let hex_exp = "[pP]\\([+-]?[0-9]+\\)"
+ end
+ 
++let hex_dot_frac_exp =
++  Str.regexp Regexp.(sign ^ hex_prefix ^ hex_num ^ dot ^ hex_num ^ hex_exp ^ "$")
++let hex_exp =
++  Str.regexp Regexp.(sign ^ hex_prefix ^ hex_num ^ hex_exp ^ "$")
+ let num_dot_frac_exp = Str.regexp Regexp.(sign ^ num ^ dot ^ num ^ exp)
+ let num_dot_frac     = Str.regexp Regexp.(sign ^ num ^ dot ^ num)
+ let num_exp          = Str.regexp Regexp.(sign ^ num ^ exp)
+@@ -487,10 +522,29 @@ let parse str =
+     in
+     if String.length str == 0 then empty_string ()
+     else try
+-        if is_hexadecimal str then
+-          match parse_hexadecimal ~format str with
+-          | None -> unparsable_error ()
+-          | Some result -> Ok (Parsed (supported, result))
++        if Str.string_match hex_dot_frac_exp str 0 then
++          let sign       = Str.matched_group 1 str in
++          let integral   = Str.matched_group 2 str in
++          let fractional = Str.matched_group 3 str in
++          let exponent   = Str.matched_group 4 str in
++          if Stdlib.(String.length integral = 0 && String.length fractional = 0) then
++            unparsable_error ()
++          else
++            let normalizing =
++              normalize_hexadecimal integral fractional exponent format
++            in
++            Ok (Parsed (supported, apply_sign sign normalizing))
++        else if Str.string_match hex_exp str 0 then
++          let sign       = Str.matched_group 1 str in
++          let integral   = Str.matched_group 2 str in
++          let exponent   = Str.matched_group 3 str in
++          if Stdlib.(String.length integral = 0) then
++            unparsable_error ()
++          else
++            let normalizing =
++              normalize_hexadecimal integral "" exponent format
++            in
++            Ok (Parsed (supported, apply_sign sign normalizing))
+         else if Str.string_match num_dot_frac_exp str 0 then
+           let sign       = Str.matched_group 1 str in
+           let integral   = Str.matched_group 2 str in

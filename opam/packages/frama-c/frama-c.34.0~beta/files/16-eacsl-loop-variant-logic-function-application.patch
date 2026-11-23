@@ -1,0 +1,47 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/16-eacsl-loop-variant-logic-function-application.patch
+# Upstream ref: pub/frama-c#2806, pub/frama-c!37
+# Summary: e-acsl: type logic function applications in loop variants
+
+diff --git a/plugins/e-acsl/src/analyses/typing.ml b/plugins/e-acsl/src/analyses/typing.ml
+index 6263c8243b..e9406ee599 100644
+--- a/plugins/e-acsl/src/analyses/typing.ml
++++ b/plugins/e-acsl/src/analyses/typing.ml
+@@ -908,9 +908,15 @@ let unsafe_set t ?ctx ~logic_env ty =
+ (** {2 Getters} *)
+ (******************************************************************************)
+ 
+-let get_number_ty ~logic_env t =
++(* [type_term] memoizes the information of the normalized form of a term (see
++   {!Logic_normalizer.get_term}), so look it up under the same key, as
++   {!Interval.get_from_profile} does. *)
++let get_info ~logic_env t =
++  let t = Logic_normalizer.get_term t in
+   let profile = Logic_env.get_profile logic_env in
+-  (Error.retrieve_preprocessing "typing" (Memo.get ~profile) t Printer.pp_term).ty
++  Error.retrieve_preprocessing "typing" (Memo.get ~profile) t Printer.pp_term
++
++let get_number_ty ~logic_env t = (get_info ~logic_env t).ty
+ 
+ (* {!typ_of_integer}, but handle the not-integer cases. *)
+ let extract_typ t ty =
+@@ -928,18 +934,12 @@ let get_typ ~logic_env t =
+   extract_typ t (get_number_ty ~logic_env t)
+ 
+ let get_cast ~logic_env t =
+-  let profile = Logic_env.get_profile logic_env in
+-  let info =
+-    Error.retrieve_preprocessing "typing" (Memo.get ~profile) t Printer.pp_term
+-  in
++  let info = get_info ~logic_env t in
+   try Option.map typ_of_number_ty info.cast
+   with Not_a_number -> None
+ 
+ let get_effective_ty ~logic_env t =
+-  let profile = Logic_env.get_profile logic_env in
+-  let info =
+-    Error.retrieve_preprocessing "typing" (Memo.get ~profile) t Printer.pp_term
+-  in
++  let info = get_info ~logic_env t in
+   match info.cast with
+   | Some ty -> ty
+   | None -> info.ty

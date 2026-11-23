@@ -1,0 +1,57 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/18-eacsl-memory-init-clobbers-environ.patch
+# Upstream ref: pub/frama-c#2802, pub/frama-c!33
+# Summary: e-acsl: preserve environ during runtime memory initialization
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+index af459ec298..322376b9b4 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+@@ -570,11 +570,14 @@ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+     eacsl_temporal_store_nblock(argv + i, *(argv + i));
+ #endif
+ 
+-  while (*environ) {
+-    size_t envlen = strlen(*environ) + 1;
+-    eacsl_store_block(*environ, envlen);
+-    eacsl_initialize(*environ, envlen);
+-    environ++;
++  /* Track environment strings. Iterate with a local cursor: `environ` itself
++     must not be modified. */
++  char **env = environ;
++  while (*env) {
++    size_t envlen = strlen(*env) + 1;
++    eacsl_store_block(*env, envlen);
++    eacsl_initialize(*env, envlen);
++    env++;
+   }
+ }
+ 
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+index 3176a965ec..b050fab259 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+@@ -281,15 +281,18 @@ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+     eacsl_temporal_store_nblock(argv + i, *(argv + i));
+ #endif
+ 
+-  while (*environ) {
+-    size_t envlen = strlen(*environ) + 1;
++  /* Track environment strings. Iterate with a local cursor: `environ` itself
++     must not be modified. */
++  char **env = environ;
++  while (*env) {
++    size_t envlen = strlen(*env) + 1;
+ #ifdef E_ACSL_TEMPORAL
+-    *environ = shadow_copy(*environ, envlen, 1);
++    *env = shadow_copy(*env, envlen, 1);
+ #else
+-    shadow_alloca(*environ, envlen);
+-    initialize_static_region((uintptr_t)*environ, envlen);
++    shadow_alloca(*env, envlen);
++    initialize_static_region((uintptr_t)*env, envlen);
+ #endif
+-    environ++;
++    env++;
+   }
+ }
+ /* }}} */

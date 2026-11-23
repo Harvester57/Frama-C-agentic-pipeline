@@ -1,0 +1,56 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/42-wp-hexadecimal-float-literals.patch
+# Upstream ref: pub/frama-c#2831, pub/frama-c!59
+# Summary: wp: parse hexadecimal and f32/f64 float literals (soundness)
+
+diff --git a/plugins/wp/src/Cfloat.ml b/plugins/wp/src/Cfloat.ml
+index d87f66ff5d..35c4ad4524 100644
+--- a/plugins/wp/src/Cfloat.ml
++++ b/plugins/wp/src/Cfloat.ml
+@@ -130,14 +130,35 @@ let fmake ulp value = match ulp with
+ 
+ let qmake ulp q = fmake ulp (Q.to_float q)
+ 
+-let re_float = Str.regexp ".*[fldFLD]$"
+ let re_mantissa = Str.regexp "[-+]?[0-9]*"
+ let re_decimal = Str.regexp "\\.[0-9]*"
+ let re_exponent = Str.regexp "[eE][-+]?[0-9]*"
++let re_hexadecimal = Str.regexp
++    "\\([-+]?\\)0[xX]\\([0-9a-fA-F]*\\)\\.?\\([0-9a-fA-F]*\\)[pP]\\([-+]?[0-9]+\\)$"
++
++(* Exact value of the literal last matched by [re_hexadecimal] *)
++let parse_hexadecimal r =
++  let sign = Str.matched_group 1 r in
++  let integer = Str.matched_group 2 r in
++  let fraction = Str.matched_group 3 r in
++  if integer = "" && fraction = "" then raise Not_found ;
++  let digits = Z.of_string_base 16 (sign ^ integer ^ fraction) in
++  (* each digit of the fractional part weighs four bits *)
++  let exponent =
++    int_of_string (Str.matched_group 4 r) - 4 * String.length fraction in
++  if exponent < 0 then
++    Q.make digits (Z.shift_left Z.one (-exponent))
++  else
++    Q.of_bigint (Z.shift_left digits exponent)
+ 
+ let parse_literal ~model v r =
+   try
+-    if model = Float && Str.string_match re_float r 0 then Q.of_float v
++    (* from here on, [r] is the literal without its suffix *)
++    let r, suffix = match Floating_point.extract_suffix r with
++      | Some (r, suffix, _) -> r, suffix
++      | None -> raise Not_found in
++    if model = Float && suffix <> "" then Q.of_float v
++    else if Str.string_match re_hexadecimal r 0 then parse_hexadecimal r
+     else
+       begin
+         if not @@ Str.string_match re_mantissa r 0 then
+@@ -156,8 +177,7 @@ let parse_literal ~model v r =
+             n, String.sub r (q + 1) (n - q - 1)
+           else
+             q, "0" in
+-        if n <> String.length r && not @@ Str.string_match re_float r n then
+-          raise Not_found ;
++        if n <> String.length r then raise Not_found ;
+         let digits = Z.of_string @@ mantissa ^ decimal in
+         let decades = int_of_string exponent - String.length decimal in
+         let power n =

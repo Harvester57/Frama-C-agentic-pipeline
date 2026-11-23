@@ -1,0 +1,85 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/13-eacsl-formal-params-initialized.patch
+# Upstream ref: pub/frama-c#2797, pub/frama-c!28
+# Summary: e-acsl: mark formal parameters and argc/argv initialized
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+index af459ec298..61934eb147 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/bittree_model/e_acsl_bittree_observation_model.c
+@@ -546,7 +546,9 @@ extern char **environ;
+ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+   /* Track a top-level containers */
+   eacsl_store_block((void *)argc_ref, sizeof(int));
++  eacsl_initialize((void *)argc_ref, sizeof(int));
+   eacsl_store_block((void *)argv_ref, sizeof(char **));
++  eacsl_initialize((void *)argv_ref, sizeof(char **));
+   int argc = *argc_ref;
+   char **argv = *argv_ref;
+   /* Track argv */
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+index 3176a965ec..569018afcc 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/segment_model/e_acsl_segment_observation_model.c
+@@ -242,7 +242,9 @@ extern char **environ;
+ static void argv_alloca(int *argc_ref, char ***argv_ref) {
+   /* Track a top-level containers */
+   shadow_alloca((void *)argc_ref, sizeof(int));
++  initialize_static_region((uintptr_t)argc_ref, sizeof(int));
+   shadow_alloca((void *)argv_ref, sizeof(char **));
++  initialize_static_region((uintptr_t)argv_ref, sizeof(char **));
+   int argc = *argc_ref;
+   char **argv = *argv_ref;
+   /* Track argv */
+diff --git a/plugins/e-acsl/src/code_generator/injector.ml b/plugins/e-acsl/src/code_generator/injector.ml
+index 8a6c712fc5..6d91a49ad0 100644
+--- a/plugins/e-acsl/src/code_generator/injector.ml
++++ b/plugins/e-acsl/src/code_generator/injector.ml
+@@ -467,7 +467,8 @@ and inject_in_stmt env kf stmt =
+           env
+         else
+           let env =
+-            Memory_observer.store env kf (Kernel_function.get_formals kf)
++            Memory_observer.store_formals
++              env kf (Kernel_function.get_formals kf)
+           in
+           Temporal.handle_function_parameters kf env
+       in
+diff --git a/plugins/e-acsl/src/code_generator/memory_observer.ml b/plugins/e-acsl/src/code_generator/memory_observer.ml
+index 7bb49c542e..1b37c48061 100644
+--- a/plugins/e-acsl/src/code_generator/memory_observer.ml
++++ b/plugins/e-acsl/src/code_generator/memory_observer.ml
+@@ -29,6 +29,19 @@ let store env kf vars =
+     kf
+     vars
+ 
++let store_formals env kf formals =
++  tracking_stmt
++    List.fold_right (* small list *)
++    (fun vi ->
++       (* on function entry, a formal is both allocated and initialized (with
++          the value of the corresponding argument) *)
++       Smart_stmt.block_from_stmts
++         [ Smart_stmt.store_stmt vi;
++           Smart_stmt.initialize ~loc:vi.vdecl (Cil.var vi) ])
++    env
++    kf
++    formals
++
+ let duplicate_store env kf vars =
+   tracking_stmt
+     Varinfo.Set.fold
+diff --git a/plugins/e-acsl/src/code_generator/memory_observer.mli b/plugins/e-acsl/src/code_generator/memory_observer.mli
+index bcd8bb7de3..ef4cb44dfd 100644
+--- a/plugins/e-acsl/src/code_generator/memory_observer.mli
++++ b/plugins/e-acsl/src/code_generator/memory_observer.mli
+@@ -16,6 +16,10 @@ val store: Env.t -> kernel_function -> varinfo list -> Env.t
+ (** For each variable of the given list, if necessary according to the mtracking
+     analysis, add a call to [__e_acsl_store_block] in the given environment. *)
+ 
++val store_formals: Env.t -> kernel_function -> varinfo list -> Env.t
++(** Same as [store] for the formals of a function, which are also marked as
++    initialized with a call to [__e_acsl_full_init]. *)
++
+ val duplicate_store: Env.t -> kernel_function -> Varinfo.Set.t -> Env.t
+ (** Same as [store], with a call to [__e_acsl_duplicate_store_block]. *)
+ 

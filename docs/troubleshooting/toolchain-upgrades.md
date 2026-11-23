@@ -4,6 +4,17 @@ Behavior changes across Frama-C releases and deprecated wrapper flags. See [`./R
 
 ---
 
+## Curated local opam patch queue on Frama-C 34.0~beta & MetAcsl 0.12~beta (2026-11-23)
+
+The local opam repository under [`../../opam/`](../../opam/patches-manifest.json) now applies a curated, source-only patch queue managed by [`../../tools/sync_opam_patches.py`](../../tools/sync_opam_patches.py): 52 validated patches on `frama-c.34.0~beta` and 4 validated patches on `frama-c-metacsl.0.12~beta` (excluding deprecated alias `09`, open-design `22`, bittree `37`/`38`, and manual-only `40`).
+
+- **Provenance and cache keys:** `Dockerfile` installs `opam/patches-manifest.json` as `$FRAMAC_SHARE/pipeline-patches.json`. [`../../scripts/run_metadata.py`](../../scripts/run_metadata.py) records it under `toolchain["frama-c-patches"]`, and [`../../scripts/cache.py`](../../scripts/cache.py) mixes its digest into the fallback toolchain identity when `FRAMAC_IMAGE_ID` is unset.
+- **Retired workaround:** `REWRITE_STATIC_CONST_UNIONS` in [`../../scripts/fc_cpp_wrapper_eacsl.py`](../../scripts/fc_cpp_wrapper_eacsl.py) is now `False` because patch `27` (`pub/frama-c#2795` / `!26`) is baked into `framac-analysis:latest`.
+- **Format-runtime interaction:** With upstream patches `30`, `31`, and `32` baked into `e_acsl_stdio.c`, [`../../scripts/eacsl_toolchain.py`](../../scripts/eacsl_toolchain.py) `patch_format_runtime` reports `status: "not_applied"` (missing stock `args`/`validate_type` anchors) and falls back cleanly to the image's patched runtime. Promoted `unsigned char`/`unsigned short`/`_Bool`, floating-point slots, and `*` width/precision now work natively; plain `int` vs `unsigned int` stays strict unless `patch_format_runtime` is updated for the post-patch-32 anchors.
+- **Upstream reproduction:** Keep an unpatched tag (e.g. `framac-analysis:34.0-beta-stock`) and the stock [`../../tools/upstream_audit/Dockerfile`](../../tools/upstream_audit/Dockerfile) image for verifying upstream bug reports; never reproduce upstream bugs against the patched `framac-analysis:latest`.
+
+---
+
 ## Frama-C 34.0~beta (Selenium), built from source (2026-11-13)
 
 The analysis image no longer starts from `framac/frama-c:dev`. A `framac-opam` stage on `ocaml/opam:debian-13-ocaml-5.5` (pinned digest) installs Frama-C 34.0~beta and MetAcsl 0.12~beta from the local opam repository in `opam/`, plus `why3.1.8.2`, `alt-ergo-free.2.4.3` and `ocamlfind`. `framac-analysis` starts from the build image's own `DEBIAN_BASE` and copies only the switch. The image went from 6.79 GB to 3.55 GB. Image tag while it was being validated: `framac-analysis:fc34`.

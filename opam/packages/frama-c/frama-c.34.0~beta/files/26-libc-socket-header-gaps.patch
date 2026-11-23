@@ -1,0 +1,65 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/26-libc-socket-header-gaps.patch
+# Upstream ref: pub/frama-c#2814, pub/frama-c!45
+# Summary: libc: fix sockaddr_in sin_zero padding, ip_mreq, fd_set
+
+diff --git a/share/libc/__fc_inet.h b/share/libc/__fc_inet.h
+index dfe70de65c..4bb2ec11d4 100644
+--- a/share/libc/__fc_inet.h
++++ b/share/libc/__fc_inet.h
+@@ -40,6 +40,8 @@ struct sockaddr_in {
+   sa_family_t     sin_family;
+   in_port_t       sin_port;
+   struct in_addr  sin_addr;
++  // Non-POSIX: padding to the size of struct sockaddr, as in glibc
++  unsigned char   sin_zero[8];
+ };
+ 
+ struct in6_addr {
+@@ -76,6 +78,19 @@ struct ipv6_mreq {
+   unsigned         ipv6mr_interface;
+ };
+ 
++// Non-POSIX: IPv4 multicast requests (IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP
++// and the *_SOURCE_MEMBERSHIP / *_BLOCK_SOURCE options below)
++struct ip_mreq {
++  struct in_addr imr_multiaddr; /* IP multicast address of group */
++  struct in_addr imr_interface; /* local IP address of interface */
++};
++
++struct ip_mreq_source {
++  struct in_addr imr_multiaddr; /* IP multicast address of group */
++  struct in_addr imr_interface; /* IP address of interface */
++  struct in_addr imr_sourceaddr; /* IP address of source */
++};
++
+ 
+ struct in6_pktinfo
+   {
+diff --git a/share/libc/sys/socket.h b/share/libc/sys/socket.h
+index f3c1bbcd22..dbadd95e5b 100644
+--- a/share/libc/sys/socket.h
++++ b/share/libc/sys/socket.h
+@@ -13,6 +13,8 @@ __PUSH_FC_STDLIB
+ __BEGIN_DECLS
+ 
+ #include <errno.h>
++// Non-POSIX: as in glibc, <sys/socket.h> includes <sys/types.h>
++#include <sys/types.h>
+ 
+ // Note: most constants used here are based on Linux, independently of the
+ // chosen machdep. If using other OSs (e.g. MacOS), consider redefining them.
+diff --git a/share/libc/sys/types.h b/share/libc/sys/types.h
+index c4e36093b1..a1270bc151 100644
+--- a/share/libc/sys/types.h
++++ b/share/libc/sys/types.h
+@@ -48,6 +48,10 @@ typedef unsigned char u_char;
+ typedef char *caddr_t;
+ #endif
+ 
++// Non-POSIX: in its default mode, glibc makes fd_set and select() visible
++// from <sys/types.h>
++#include <sys/select.h>
++
+ __END_DECLS
+ __POP_FC_STDLIB
+ #endif

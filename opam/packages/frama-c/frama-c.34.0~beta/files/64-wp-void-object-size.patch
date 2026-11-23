@@ -1,0 +1,17 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/64-wp-void-object-size.patch
+# Upstream ref: unfiled-64
+# Summary: wp: size TVoid objects as char rather than int (soundness)
+
+diff --git a/plugins/wp/src/ctypes.ml b/plugins/wp/src/ctypes.ml
+index 7a7442a796..9f07449fd8 100644
+--- a/plugins/wp/src/ctypes.ml
++++ b/plugins/wp/src/ctypes.ml
+@@ -315,7 +315,7 @@ let rec object_of typ =
+     C_pointer (Cil_const.voidType)
+   | TVoid ->
+     WpLog.warning ~current:true "void object" ;
+-    C_int (c_int IInt)
++    C_int (c_char ())
+   | TNamed r -> object_of r.ttype
+ 
+ (* ------------------------------------------------------------------------ *)

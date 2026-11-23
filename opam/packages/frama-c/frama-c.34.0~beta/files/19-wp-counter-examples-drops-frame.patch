@@ -1,0 +1,17 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/19-wp-counter-examples-drops-frame.patch
+# Upstream ref: pub/frama-c#2811, pub/frama-c!42
+# Summary: wp: keep frame conditions when probes are present
+
+diff --git a/plugins/wp/src/cfgWP.ml b/plugins/wp/src/cfgWP.ml
+index dc169d6daa..6d0152008d 100644
+--- a/plugins/wp/src/cfgWP.ml
++++ b/plugins/wp/src/cfgWP.ml
+@@ -288,7 +288,7 @@ struct
+       }
+ 
+   let probe_vc ~loc ?descr ?stmt ?warn ~name term vc =
+-    let vars = F.vars term in
++    let vars = V.union (F.vars term) vc.vars in
+     let hyps = Conditions.probe ~loc ?descr ?stmt ~name term vc.hyps in
+     let wrns = match warn with
+       | None -> vc.warn

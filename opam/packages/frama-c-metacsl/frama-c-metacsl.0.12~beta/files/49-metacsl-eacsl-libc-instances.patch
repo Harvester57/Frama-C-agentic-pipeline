@@ -1,0 +1,84 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/49-metacsl-eacsl-libc-instances.patch
+# Upstream ref: unfiled-49
+# Summary: metacsl: warn with call-site locations under category no-footprint
+
+diff --git a/meta_annotate.ml b/meta_annotate.ml
+index 03447cf..4aa4dee 100644
+--- a/meta_annotate.ml
++++ b/meta_annotate.ml
+@@ -577,7 +577,16 @@ let inspect_contract process stmt ckf args =
+           | _ -> term
+         )
+   end in
++  let no_footprint () =
++    Self.warning ~once:true ~loc:(Cil_datatype.Stmt.loc stmt)
++      ~wkey:Meta_options.no_footprint_wkey
++      "Cannot analyze footprint of function %a: no assigns \
++       clause. Assuming meta-properties with reading/writing contexts are \
++       valid in this function." Kernel_function.pretty ckf
++  in
++  let has_behavior = ref false in
+   let f b =
++    has_behavior := true ;
+     let ass =
+       Annotations.fold_assumes
+         (fun _ p old ->
+@@ -587,13 +596,14 @@ let inspect_contract process stmt ckf args =
+         ckf b.b_name []
+     in
+     match b.b_assigns with
+-      | WritesAny ->
+-        Self.warning "Cannot analyze footprint of function %a: no assigns \
+-                      clause. Assuming meta-properties with reading/writing contexts are \
+-                      valid in this function." Kernel_function.pretty ckf
++      | WritesAny -> no_footprint ()
+       | Writes l -> process ckf stmt vis l ass
+   in
+-  Annotations.iter_behaviors f ckf
++  Annotations.iter_behaviors f ckf ;
++  (* A function declared without any specification (e.g. a libc function
++     parsed with the system headers) has no behavior at all: it is assumed to
++     respect the properties as well, so say it. *)
++  if not !has_behavior then no_footprint ()
+ 
+ let quantify_ranges t =
+   let quant = ref [] in
+@@ -778,7 +788,8 @@ class reading_visitor flags all_mp table = object (self)
+   method passthrough_from kf stmt vis l preconds =
+     List.iter (fun (_, deps) -> match deps with
+         | FromAny ->
+-          Self.warning ~once:true
++          Self.warning ~once:true ~loc:(Cil_datatype.Stmt.loc stmt)
++            ~wkey:Meta_options.no_footprint_wkey
+             "Cannot fully analyze read footprint of function %a: no \\from \
+              part in some assigns clauses."
+             Kernel_function.pretty kf
+diff --git a/meta_options.ml b/meta_options.ml
+index fe4cf11..e901b6a 100644
+--- a/meta_options.ml
++++ b/meta_options.ml
+@@ -110,6 +110,8 @@ module Fold_instances = Self.False (struct
+ let unknown_func_wkey = Self.register_warn_category "unknown-func"
+ let () = Self.set_warn_status unknown_func_wkey Log.Wabort
+ 
++let no_footprint_wkey = Self.register_warn_category "no-footprint"
++
+ type meta_flags = {
+   check_external : bool;
+   check_callee_assigns: Kernel_function.Set.t;
+diff --git a/meta_options.mli b/meta_options.mli
+index a4a6565..aa1d9fe 100644
+--- a/meta_options.mli
++++ b/meta_options.mli
+@@ -54,6 +54,11 @@ module Fold_instances: Parameter_sig.Bool
+ 
+ val unknown_func_wkey: Self.warn_category
+ 
++(** a callee whose footprint is unknown (no specification, a behavior without
++    assigns, or an assigns clause without \from) is assumed to respect
++    reading/writing properties. *)
++val no_footprint_wkey: Self.warn_category
++
+ (** record with all the options as set at the start
+     of the analysis. *)
+ type meta_flags =  {

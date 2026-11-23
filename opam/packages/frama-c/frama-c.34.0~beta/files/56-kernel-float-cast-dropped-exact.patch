@@ -1,0 +1,19 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/56-kernel-float-cast-dropped-exact.patch
+# Upstream ref: unfiled-56
+# Summary: kernel: check single-precision exactness in Cil.isExactFloat before dropping (float) cast (soundness)
+
+diff --git a/src/kernel/services/ast_queries/cil.ml b/src/kernel/services/ast_queries/cil.ml
+index c9d63222f2..2f6ae69c99 100644
+--- a/src/kernel/services/ast_queries/cil.ml
++++ b/src/kernel/services/ast_queries/cil.ml
+@@ -2492,7 +2492,9 @@ let isFiniteFloat fk f =
+   Floating_point.is_finite f
+ 
+ let isExactFloat fk r =
+-  r.r_upper = r.r_lower && isFiniteFloat fk r.r_nearest
++  r.r_upper = r.r_lower &&
++  let f = Floating_point.round_if_single_precision fk r.r_nearest in
++  Floating_point.is_finite f && Float.equal f r.r_nearest
+ 
+ (* Construct an integer constant with possible truncation if the kind is not
+    specified  *)

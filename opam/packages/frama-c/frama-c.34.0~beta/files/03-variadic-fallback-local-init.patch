@@ -1,0 +1,24 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/03-variadic-fallback-local-init.patch
+# Upstream ref: pub/frama-c#2796, pub/frama-c!27
+# Summary: kernel/variadic: preserve local initializer symbol name on fallback
+
+diff --git a/src/kernel/services/ast_transformations/variadic/variadic.ml b/src/kernel/services/ast_transformations/variadic/variadic.ml
+index 51b0d4e3f6..a781139a0c 100644
+--- a/src/kernel/services/ast_transformations/variadic/variadic.ml
++++ b/src/kernel/services/ast_transformations/variadic/variadic.ml
+@@ -35,6 +35,15 @@ let change_printer =
+                 Call(res, Var old_vi, args, loc)
+               in
+               Format.fprintf fmt "%a /* %s */" super#instr old_instr vi.vname
++            (* Same for a call initializing a local variable. *)
++            | Local_init(v, ConsInit(vi, args, kind), loc)
++              when Replacements.mem vi ->
++              let old_vi = Replacements.find vi in
++              let old_vi = { vi with vname = old_vi.vname } in
++              let old_instr =
++                Local_init(v, ConsInit(old_vi, args, kind), loc)
++              in
++              Format.fprintf fmt "%a /* %s */" super#instr old_instr vi.vname
+             (* Otherwise keep the instruction. *)
+             | _ ->
+               super#instr fmt i

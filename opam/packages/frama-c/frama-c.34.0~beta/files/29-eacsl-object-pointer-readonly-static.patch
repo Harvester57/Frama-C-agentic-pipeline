@@ -1,0 +1,59 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/29-eacsl-object-pointer-readonly-static.patch
+# Upstream ref: pub/frama-c#2818, pub/frama-c!47
+# Summary: e-acsl: recognize read-only static blocks in \object_pointer
+
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c
+index a3fde368a9..a5e7bee8b8 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c
++++ b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.c
+@@ -102,8 +102,8 @@ int eacsl_separated(size_t count, ...) {
+ 
+ int eacsl_object_pointer(void *ptr, size_t size, void *ptr_base,
+                          void *addrof_base) {
+-  return eacsl_valid(ptr, size, ptr_base, addrof_base)
+-         || eacsl_valid(ptr - size, size, ptr_base, addrof_base);
++  return eacsl_valid_read(ptr, size, ptr_base, addrof_base)
++         || eacsl_valid_read(ptr - size, size, ptr_base, addrof_base);
+ }
+ 
+ int eacsl_aligned(void *ptr, size_t alignment) {
+diff --git a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h
+index c4bb566f5f..fcbed26de2 100644
+--- a/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h
++++ b/plugins/e-acsl/share/e-acsl/observation_model/e_acsl_observation_model.h
+@@ -322,25 +322,30 @@ int eacsl_valid(void *ptr, size_t size, void *base, void *addrof_base)
+   @ */
+ int eacsl_aligned(void *ptr, size_t alignment) __attribute__((FC_BUILTIN));
+ 
++/*! \brief Implementation of the \b \\object_pointer predicate of E-ACSL.
++ *
++ * Returns `true` if the `size` bytes from `ptr`, or the `size` bytes before
++ * `ptr` (one past the end of an object), are allocated, as in
++ * ::eacsl_valid_read: the object does not need to be writable. */
+ /*@ assigns \result \from *(((char*)ptr)+(-size..size-1)), ptr, size;
+   @ behavior valid:
+-  @   assumes \valid(((char *)ptr)+(0..size-1));
++  @   assumes \valid_read(((char *)ptr)+(0..size-1));
+   @   assumes
+   @     size <= 0 ||
+   @     ! \separated(((char *)ptr)+(0..size-1),
+   @                  ((char *)\base_addr(base))+(0..\block_length(base)-1));
+   @   ensures \result == 1;
+   @ behavior minus_one:
+-  @   assumes \valid(((char *)ptr)+(-size..-1));
+-  @   assumes ! \valid(((char *)ptr)+(0..size-1));
++  @   assumes \valid_read(((char *)ptr)+(-size..-1));
++  @   assumes ! \valid_read(((char *)ptr)+(0..size-1));
+   @   assumes
+   @     size <= 0 ||
+   @     ! \separated(((char *)ptr)+(-size..-1),
+   @                  ((char *)\base_addr(base))+(0..\block_length(base)-1));
+   @   ensures \result == 1;
+   @ behavior invalid_pointer_ptr:
+-  @   assumes ! \valid(((char *)ptr)+(-size..-1));
+-  @   assumes ! \valid(((char *)ptr)+(0..size-1));
++  @   assumes ! \valid_read(((char *)ptr)+(-size..-1));
++  @   assumes ! \valid_read(((char *)ptr)+(0..size-1));
+   @   ensures \result == 0;
+   @ behavior separated_ptr:
+   @   assumes size > 0;

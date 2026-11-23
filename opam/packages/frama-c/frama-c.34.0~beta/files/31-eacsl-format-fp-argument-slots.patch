@@ -1,0 +1,60 @@
+# Source-only opam patch extracted from docs/upstream/frama-c/patches/31-eacsl-format-fp-argument-slots.patch
+# Upstream ref: pub/frama-c#2820, pub/frama-c!49
+# Summary: e-acsl: read floating-point arguments with their own va_arg types
+
+diff --git a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+index f4876abc80..0d54426f5b 100644
+--- a/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
++++ b/plugins/e-acsl/share/e-acsl/libc_replacements/e_acsl_stdio.c
+@@ -780,12 +780,48 @@ static void validate_format(const char *fmtdesc, const char *fmt, va_list ap,
+   format_directive **dirs = get_format_directives((char *)fmt);
+   format_directive **dirs_c = dirs; /* extra alias for passing it to `free` */
+ 
+-  /* Track addresses of variadic arguments */
++  /* Track addresses of variadic arguments. Each argument is read with its own
++     type, given by `fmtdesc`: reading an argument with a type of another size
++     or class (e.g., a `double` as a `void *`) would not consume it, and every
++     argument after it would be read from the wrong place. */
+   int arglen = strlen(fmtdesc); /* number of variadic arguments */
+   void *args[arglen];
+   int i;
+-  for (int i = 0; i < arglen; i++)
+-    args[i] = va_arg(ap, void *);
++  for (int i = 0; i < arglen; i++) {
++    args[i] = NULL;
++    switch (fmtdesc[i]) {
++    case PChar:
++    case PUChar:
++    case PShort:
++    case PUShort:
++    case PInt:
++    case PUInt:
++    case PLong:
++    case PULong:
++    case PLongLong:
++    case PULongLong:
++    case PVoid:
++      args[i] = va_arg(ap, void *);
++      break;
++    case FFloat: /* promoted to double */
++    case FDouble:
++      (void)va_arg(ap, double);
++      break;
++    case FLongDouble:
++      (void)va_arg(ap, long double);
++      break;
++    case ILong:
++    case IULong:
++      (void)va_arg(ap, long);
++      break;
++    case ILongLong:
++    case IULongLong:
++      (void)va_arg(ap, long long);
++      break;
++    default: /* int, unsigned int and the types promoted to int */
++      (void)va_arg(ap, int);
++    }
++  }
+   va_end(ap);
+ 
+   /* Validate each generated directive */

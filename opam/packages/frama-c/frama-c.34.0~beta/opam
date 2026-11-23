@@ -197,3 +197,114 @@ url {
   src: "https://www.frama-c.com/download/frama-c-34.0-beta-Selenium.tar.gz"
   checksum: "sha256=ab9e089c0eee91fb861ca54bbb2f2171775fcbf1afffa6a0bc8cf5e16c7a4fed"
 }
+
+# BEGIN pipeline-patches (managed by tools/sync_opam_patches.py)
+patches: [
+  "01-eacsl-gcc-option-arguments-reparsed.patch"
+  "03-variadic-fallback-local-init.patch"
+  "04-eacsl-unbounded-range-abort.patch"
+  "04b-libc-getsockopt-unbounded-range.patch"
+  "05-eacsl-incomplete-type-sizeof.patch"
+  "08-eacsl-struct-result-initialized.patch"
+  "12-eacsl-gcc-default-source.patch"
+  "10-eacsl-gcc-clang-cflags.patch"
+  "13-eacsl-formal-params-initialized.patch"
+  "14-eacsl-iff-labelled-term.patch"
+  "16-eacsl-loop-variant-logic-function-application.patch"
+  "17-eacsl-memcmp-overlapping-buffers.patch"
+  "18-eacsl-memory-init-clobbers-environ.patch"
+  "19-wp-counter-examples-drops-frame.patch"
+  "20-kernel-alignas-member-printed-after-declarator.patch"
+  "21-eacsl-register-local-full-mtracking.patch"
+  "24-eacsl-guarded-exists-drops-conjunct.patch"
+  "25-kernel-offsetof-non-constant-index.patch"
+  "26-libc-socket-header-gaps.patch"
+  "27-eacsl-readonly-scalar-global-address.patch"
+  "28-eacsl-full-mtracking-tail-merged-literals.patch"
+  "29-eacsl-object-pointer-readonly-static.patch"
+  "30-eacsl-format-promoted-argument-signedness.patch"
+  "31-eacsl-format-fp-argument-slots.patch"
+  "32-eacsl-format-star-width-precision.patch"
+  "33-eacsl-format-literal-without-full-mtracking.patch"
+  "35-kernel-restrict-gnu-spelling.patch"
+  "36-eacsl-heap-zone-size-overflow.patch"
+  "39-libc-linux-header-gaps.patch"
+  "41-libc-ioctl-modem-bits.patch"
+  "42-wp-hexadecimal-float-literals.patch"
+  "43-eacsl-real-constant-notation.patch"
+  "44-libc-strlcat-contract.patch"
+  "46-libc-sched-cpu-set.patch"
+  "50-eacsl-format-enum-argument.patch"
+  "51-kernel-float-const-printing.patch"
+  "52-eacsl-rational-cast-double-rounding.patch"
+  "53-eacsl-non-finite-real-constant.patch"
+  "54-eacsl-typing-not-performed-guard.patch"
+  "56-kernel-float-cast-dropped-exact.patch"
+  "57-kernel-bool-cast-dropped-logic.patch"
+  "58-kernel-acsl-string-sizeof-escaped.patch"
+  "59-kernel-acsl-hex-octal-escapes.patch"
+  "64-wp-void-object-size.patch"
+  "65-wp-floor-ceil-truncate-float-cast.patch"
+  "66-wp-empty-range-addition-shift.patch"
+  "68-wp-non-finite-float-constant.patch"
+  "72-libc-pclose-pipe-status-soundness.patch"
+  "73-libc-sigaction-oldact-contract.patch"
+  "74-libc-reentrant-result-pointer-assigns.patch"
+  "75-libc-syslog-string-axiomatic.patch"
+  "80-kernel-hex-float-double-rounding.patch"
+]
+extra-files: [
+  ["01-eacsl-gcc-option-arguments-reparsed.patch" "sha256=1873c270edf29907e6419d3622a9565a759de55327ee5db91429a87f6d30a345"]
+  ["03-variadic-fallback-local-init.patch" "sha256=e6ccc0830a8b7f961604a13bc1c12d7efc2999c954af0f324127184b6f0d3298"]
+  ["04-eacsl-unbounded-range-abort.patch" "sha256=b7d5d6413711accdebb555bf81a45c6541ee94af198d27e01cbba34450f4f4f3"]
+  ["04b-libc-getsockopt-unbounded-range.patch" "sha256=ddc910603e78feabafbf548a56860ba1eeaeb936d4f46bbb629b7c4c9e33a68e"]
+  ["05-eacsl-incomplete-type-sizeof.patch" "sha256=dd773a8aa8a4d66c91c2327e42ad4ce2a93ba753fd49fe0faf53ca41f5dcb1a3"]
+  ["08-eacsl-struct-result-initialized.patch" "sha256=40cd19fcd140ff146e1a6c5b2ecdf48fdf44c3c59a27c7595e41f25cc55d0d0a"]
+  ["12-eacsl-gcc-default-source.patch" "sha256=9a4f0dc5294e07b34ea3d342fa939db9ee17b6735bbc99256ccafe2e58c513ab"]
+  ["10-eacsl-gcc-clang-cflags.patch" "sha256=4c94aaf15ba07cc70b4548d261878607e5a8890401ad706c56b9e19dc984dbe0"]
+  ["13-eacsl-formal-params-initialized.patch" "sha256=2c3c843c933140f4bd19c000867171158cd262926ae913b093617745031a8356"]
+  ["14-eacsl-iff-labelled-term.patch" "sha256=73a9d155ae269bb9073e0b1400601d0afd09b1519ac24210925afb90de8b7d2d"]
+  ["16-eacsl-loop-variant-logic-function-application.patch" "sha256=3942c9448fbcc83abf40c36136c3a704ea81c41e94e288eccf6263306ab3fc3c"]
+  ["17-eacsl-memcmp-overlapping-buffers.patch" "sha256=b4f1723e47ad7e35517eb39d832b7244fb56791a556f1cbe980ae9077080b266"]
+  ["18-eacsl-memory-init-clobbers-environ.patch" "sha256=96da1ebce9cefce31424677579f3c4cf7404e88532d1a5ca3e9e38e6b3c99ae0"]
+  ["19-wp-counter-examples-drops-frame.patch" "sha256=2703465a4da99a37af9e8cf0fbe46fc62c23fccd0704e3ebb554632c75c42289"]
+  ["20-kernel-alignas-member-printed-after-declarator.patch" "sha256=d1892b87d77f661f4614699b5a1e327529b5f228595a7203f8ab6b6a49d25c59"]
+  ["21-eacsl-register-local-full-mtracking.patch" "sha256=ed7ae9f6390dbe3745bd103bbe4aec5b0ab2fdca66e7481dbc57aefb2256de92"]
+  ["24-eacsl-guarded-exists-drops-conjunct.patch" "sha256=54ba043b459ae2a93bb52ea7e16483fa26a44808efc7a5755a62a70610fcdc7c"]
+  ["25-kernel-offsetof-non-constant-index.patch" "sha256=401c7c127685229bf31cd4d6ae3e01b8fa77295256a564c4fec6fdaaf9067726"]
+  ["26-libc-socket-header-gaps.patch" "sha256=b7d2d34c4db196ffae71481e9fa4672993d9d49a90fba64e38cb4224408af74f"]
+  ["27-eacsl-readonly-scalar-global-address.patch" "sha256=ca697a7c3b8e0e5db394aaf38ef5d1e5d3e0de4e2d6fcac5efac051ff40c04b1"]
+  ["28-eacsl-full-mtracking-tail-merged-literals.patch" "sha256=cb1da919662ed3c2c306bc7726e4506ebc5bfbff5bf4a669611bd2b583bbefb6"]
+  ["29-eacsl-object-pointer-readonly-static.patch" "sha256=879913aee55117df7a6e2979cfe0f434f5c46373c8fd23e6574048a8d982aea9"]
+  ["30-eacsl-format-promoted-argument-signedness.patch" "sha256=27711682b132bcc20f9780d2a586294aa2569aa836cd1b2dcdcf4cb1e07d338e"]
+  ["31-eacsl-format-fp-argument-slots.patch" "sha256=21c80bafa70be5b3b33320336fa61530c4c4485fb9c03e08bc5666da0d35e94a"]
+  ["32-eacsl-format-star-width-precision.patch" "sha256=d578931645e340cc82064cf220093ea9adb9811325496733f778ddadd634ea80"]
+  ["33-eacsl-format-literal-without-full-mtracking.patch" "sha256=cf0d455df462ed5fc8ec7be7eab031cd2ae9bc1cb436d10677f14e6dce2f88f2"]
+  ["35-kernel-restrict-gnu-spelling.patch" "sha256=c2aa70e2ba73f054f260e80cff68a9aabb0153464444231bb36ad3278c41e576"]
+  ["36-eacsl-heap-zone-size-overflow.patch" "sha256=44940ca41920c4218ae636116e3724b4362d6e121f545f32318c652afff6afd8"]
+  ["39-libc-linux-header-gaps.patch" "sha256=d0d95e8bde3a3ac617c8867ccb7c327eb672b29d4d1183d745e34170aa3eb7ab"]
+  ["41-libc-ioctl-modem-bits.patch" "sha256=ced627b01e713e8be7c0d34949fdccb734de7c881405b92e5a48be54476a8bc2"]
+  ["42-wp-hexadecimal-float-literals.patch" "sha256=789dbba155aa371506910589b2d776a7adbc2417c2c53df1ee57052ea90e6636"]
+  ["43-eacsl-real-constant-notation.patch" "sha256=847ff18979c43105b2a6f430fd62c5e0168521aca346ebb5542c1e37cf3b5470"]
+  ["44-libc-strlcat-contract.patch" "sha256=840e701ae9f3192f8e4c1f4ed4f4a3d7fe9888e57e48207f6f383dfb64ad8cf7"]
+  ["46-libc-sched-cpu-set.patch" "sha256=7f4057f4cfd2f13d0c7e96386f7663605c3484b7a2fcc0cf50d67ab0517575a2"]
+  ["50-eacsl-format-enum-argument.patch" "sha256=4187b67154fbdbe541471db8b230138aaa93ccd1eb003a17cae41bb161408fa7"]
+  ["51-kernel-float-const-printing.patch" "sha256=680afc13333cdd99c3dc71f5377133c680624e4cd93439bf37756e414032848e"]
+  ["52-eacsl-rational-cast-double-rounding.patch" "sha256=ded17c744bb1f2484ba32aa07b5e2dd09508a97955707807d2ccc8d4da9b3a7a"]
+  ["53-eacsl-non-finite-real-constant.patch" "sha256=772154c3dc00cc87ad60d1ae3217f65fde126c4572ade7a206e602293e96b934"]
+  ["54-eacsl-typing-not-performed-guard.patch" "sha256=b2e6f01afd29a44fcbfde3da8362319a0f350de48dd58b881028f70663409abe"]
+  ["56-kernel-float-cast-dropped-exact.patch" "sha256=327d1b9677e73fc836cf0ed8a2fdb09108a6a4b548c275543ec1564c31c06ef7"]
+  ["57-kernel-bool-cast-dropped-logic.patch" "sha256=307d09922bd3b7049cc92b0a66c7937e99b740cb843c1a9f5099440c697ce7ea"]
+  ["58-kernel-acsl-string-sizeof-escaped.patch" "sha256=171b7fdf75236acbff5dd46903b49f2244283f4a93868566993ca08b326a251b"]
+  ["59-kernel-acsl-hex-octal-escapes.patch" "sha256=95e9f48ab0179f7ef6375262851d0d4332e67533058545a35e2f1347309fbaa7"]
+  ["64-wp-void-object-size.patch" "sha256=bb53d2c7e898988af913ec51f614fcc4494aa2d24bd723a8dd3a16bde9015171"]
+  ["65-wp-floor-ceil-truncate-float-cast.patch" "sha256=ec9a418978f80c2cb627a5b2da922400be9ca6e0968f8bc0048a5bcb0069dbe3"]
+  ["66-wp-empty-range-addition-shift.patch" "sha256=e1f99f69e8cc882c73799142c3300963c718e80aa6e95c8d8fc590a85708f22b"]
+  ["68-wp-non-finite-float-constant.patch" "sha256=331d65dd7770a8880cdcbf7ff1a51f9904e587a6f2c39f4de08a8816a3bdf8e8"]
+  ["72-libc-pclose-pipe-status-soundness.patch" "sha256=436e758f89cd453626bbbce267c2319c1f88691652f55b90f38cd8e00e369506"]
+  ["73-libc-sigaction-oldact-contract.patch" "sha256=5b4dfda718e839fd55b36e9f935e5d95f0d9f122bbd9e4cb3f60d8effc4ad959"]
+  ["74-libc-reentrant-result-pointer-assigns.patch" "sha256=7a80fef7a3a52cbcdbd5a9b3bf17e49cd7024a611ae7c1cc0c9a41d2bdbc0714"]
+  ["75-libc-syslog-string-axiomatic.patch" "sha256=86fede9b380b979e680891c37a8c92be987b5b04e60c2c501c3a68e42b9e9905"]
+  ["80-kernel-hex-float-double-rounding.patch" "sha256=ba105fac26ea06897f245293b8abc97479ab3344f820f334abbffb6ce91eaeb6"]
+]
+# END pipeline-patches
