@@ -607,3 +607,88 @@ class TestCli:
         out = tmp_path / "diff.json"
         assert main([good, good, "--json", str(out)]) == 0
         assert json.loads(out.read_text(encoding="utf-8"))["recall_regression"] is False
+
+
+@pytest.mark.unit
+class TestPhase0OnlyAndStageTimings:
+    def test_phase0_only_vs_full_baseline_marks_post_phase0_not_compared_and_succeeds(self):
+        base = make_run()
+        base["targets"]["t"]["stages"] = {
+            "capture": {"wall_s": 10.0, "cpu_s": 20.0},
+            "model": {"wall_s": 5.0, "cpu_s": 6.0},
+            "phase0": {"wall_s": 15.0, "cpu_s": 18.0},
+            "eva": {"wall_s": 60.0, "cpu_s": 120.0},
+        }
+        base["targets"]["t"]["api_reach"] = {"entry_points": 20, "reached": 18, "exempt": 0, "seeds": 10, "modules": {}}
+
+        cur = copy.deepcopy(base)
+        cur["selection"] = {"phase0_only": True}
+        cur["recall"] = {"bugs": {}}
+        cur["targets"]["t"]["modules"]["m"] = {
+            "build": {"status": "not_run"},
+            "fuzz": {"status": "not_run"},
+            "eva": None,
+        }
+        cur["targets"]["t"]["functions_with_unknown"] = []
+        cur["targets"]["t"]["prover_tasks"] = {"count": 0}
+        cur["targets"]["t"]["units"] = {"covered": [], "candidate": [], "by_wave": {}}
+        cur["targets"]["t"]["wall_s"] = 25.0
+        cur["targets"]["t"]["cpu_s"] = 35.0
+        cur["targets"]["t"]["stages"] = {
+            "capture": {"wall_s": 9.0, "cpu_s": 18.0},
+            "model": {"wall_s": 4.0, "cpu_s": 5.0},
+            "phase0": {"wall_s": 12.0, "cpu_s": 12.0},
+        }
+        cur["targets"]["t"]["api_reach"] = {"entry_points": 20, "reached": 20, "exempt": 0, "seeds": 12, "modules": {}}
+
+        result = compare_runs(base, cur)
+        assert not result.failed()
+        assert rows(result, "regression") == []
+        assert rows(result, "warning") == []
+        assert rows(result, "improvement", "api_reach")
+        not_comp_areas = {d.area for d in rows(result, "not_compared")}
+        assert {
+            "eva",
+            "functions_with_unknown",
+            "prover_tasks",
+            "units",
+            "candidates",
+            "time",
+            "recall",
+        } <= not_comp_areas
+        stage_subjects = [d.subject for d in rows(result, "info", "stage_time")]
+        assert stage_subjects == ["t/capture", "t/model", "t/phase0"]
+
+    def test_both_phase0_only_compares_api_reach_and_total_and_stage_times(self):
+        base = make_run()
+        base["selection"] = {"phase0_only": True}
+        base["recall"] = {"bugs": {}}
+        base["targets"]["t"]["stages"] = {
+            "capture": {"wall_s": 10.0, "cpu_s": 12.0},
+            "phase0": {"wall_s": 20.0, "cpu_s": 25.0},
+        }
+        base["targets"]["t"]["api_reach"] = {"entry_points": 20, "reached": 18, "exempt": 0, "seeds": 10, "modules": {}}
+        cur = copy.deepcopy(base)
+        cur["targets"]["t"]["api_reach"]["reached"] = 16
+        result = compare_runs(base, cur)
+        assert result.failed()
+        assert rows(result, "regression", "api_reach")
+        assert [d.subject for d in rows(result, "info", "stage_time")] == ["t/capture", "t/phase0"]
+
+    def test_full_runs_emit_per_stage_time_info_rows(self):
+        base = make_run()
+        base["targets"]["t"]["stages"] = {
+            "capture": {"wall_s": 12.0, "cpu_s": 24.0},
+            "eva": {"wall_s": 50.0, "cpu_s": 100.0},
+        }
+        cur = copy.deepcopy(base)
+        cur["targets"]["t"]["stages"] = {
+            "capture": {"wall_s": 10.0, "cpu_s": 20.0},
+            "eva": {"wall_s": 40.0, "cpu_s": 80.0},
+        }
+        result = compare_runs(base, cur)
+        assert not result.failed()
+        stage_rows = rows(result, "info", "stage_time")
+        assert [d.subject for d in stage_rows] == ["t/capture", "t/eva"]
+        assert "wall 12.0s -> 10.0s" in stage_rows[0].message
+        assert "[stage_time]" in render_text(result, verbose=True)

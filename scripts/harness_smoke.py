@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -393,21 +394,29 @@ def _run_probe_files(
     env = dict(SANITIZER_RUNTIME_ENV)
     if extra_env:
         env.update(extra_env)
+    scratch = Path(scratch)
+    scratch.mkdir(parents=True, exist_ok=True)
+    art_dir = replay_artifact_dir(scratch)
     argv = [
         str(binary.resolve()),
         f"-timeout={per_input_timeout}",
         f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
         f"-seed={seed}",
-        f"-artifact_prefix={replay_artifact_dir(scratch)}/",
+        f"-artifact_prefix={art_dir}/",
         *[str(Path(p).resolve()) for p in probe_files],
     ]
-    return sandbox_exec.run_sandboxed(
-        argv,
-        writable=[scratch],
-        timeout_s=wall,
-        limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
-        extra_env=env,
-    )
+    probe_cwd = Path(tempfile.mkdtemp(prefix="smoke_cwd_", dir=scratch))
+    try:
+        return sandbox_exec.run_sandboxed(
+            argv,
+            writable=[probe_cwd, art_dir],
+            cwd=probe_cwd,
+            timeout_s=wall,
+            limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
+            extra_env=env,
+        )
+    finally:
+        shutil.rmtree(probe_cwd, ignore_errors=True)
 
 
 def _input_running_at_exit(output: str, probes: Sequence[_Probe]) -> int | None:

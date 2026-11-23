@@ -497,6 +497,177 @@ def test_record_layouts_marks_packed_bitfield_typedef_enum_struct_pointer_free()
     assert "struct packed_with_ptr" not in declared.pointer_free_records
 
 
+@pytest.mark.unit
+def test_global_pointer_ownership_heap_freed_static_retained_and_stack_copied() -> None:
+    """
+    A global setup function taking non-const record pointers must allocate each pointer according
+    to the target's global-variable ownership:
+    - pointer matching a pointer global freed by the global teardown -> heap `calloc` + OOM guard
+      + teardown call + `else { free(...); }` (avoids stack-use-after-scope / bad-free on next call);
+    - pointer matching a pointer global NOT freed by any teardown -> `static` storage (never dangles);
+    - pointer whose matching globals are value structs or arrays -> stack storage, still paired with
+      global teardown because the global types are known.
+    """
+    model_fns: dict[str, dict[str, Any]] = {
+        "src/cfg.c#lib_init_with_cfgs": {
+            "name": "lib_init_with_cfgs",
+            "file": "src/cfg.c",
+            "signature": "int(struct val_cfg_s *,struct arr_cfg_s *,struct owned_cfg_s *)",
+            "formals": [
+                {"name": "val_p", "kind": "pointer"},
+                {"name": "arr_p", "kind": "pointer"},
+                {"name": "owned_p", "kind": "pointer"},
+            ],
+            "static": False,
+            "writes": {"pointer": 0, "params": [], "globals": ["g_val", "g_arr", "g_owned"]},
+            "global_refs": ["src/cfg.c#g_val", "src/cfg.c#g_arr", "src/cfg.c#g_owned"],
+            "call_sites": [],
+        },
+        "src/cfg.c#lib_register_ext": {
+            "name": "lib_register_ext",
+            "file": "src/cfg.c",
+            "signature": "int(struct retained_cfg_s *)",
+            "formals": [{"name": "ret_p", "kind": "pointer"}],
+            "static": False,
+            "writes": {"pointer": 0, "params": [], "globals": ["g_retained"]},
+            "global_refs": ["src/cfg.c#g_retained"],
+            "call_sites": [],
+        },
+        "src/cfg.c#lib_shutdown": {
+            "name": "lib_shutdown",
+            "file": "src/cfg.c",
+            "signature": "int()",
+            "formals": [],
+            "static": False,
+            "writes": {"pointer": 0, "params": [], "globals": ["g_val", "g_owned"]},
+            "global_refs": ["src/cfg.c#g_val", "src/cfg.c#g_owned"],
+            "call_sites": [{"callee": "free", "line": 10, "literals": {}, "initializer": False}],
+        },
+        "src/cfg.c#lib_process": {
+            "name": "lib_process",
+            "file": "src/cfg.c",
+            "signature": "int(const unsigned char *,unsigned long)",
+            "formals": [{"name": "buf", "kind": "const_pointer"}, {"name": "len", "kind": "scalar"}],
+            "static": False,
+            "writes": {"pointer": 0, "params": [], "globals": []},
+            "global_refs": ["src/cfg.c#g_val", "src/cfg.c#g_owned"],
+            "call_sites": [],
+        },
+    }
+    dag_fns = {
+        fid: {"name": rec["name"], "file": rec["file"], "is_static": False, "module": "libown", "unit": "libown.so"}
+        for fid, rec in model_fns.items()
+    }
+    entry_ids = list(dag_fns)
+    dag = {
+        "functions": dag_fns,
+        "modules": {
+            "libown": {
+                "unit": "libown.so",
+                "files": ["src/cfg.c"],
+                "functions": entry_ids,
+                "candidate_entry_points": entry_ids,
+            }
+        },
+        "units": {"libown.so": {"kind": "shared_lib", "functions": entry_ids, "entry_points": entry_ids}},
+    }
+    model = {
+        "status": "ok",
+        "functions": model_fns,
+        "entry_points": entry_ids,
+        "global_variables": {
+            "src/cfg.c#g_val": {"name": "g_val", "type": "struct val_cfg_s", "raw_type": "struct val_cfg_s"},
+            "src/cfg.c#g_arr": {"name": "g_arr", "type": "struct arr_cfg_s [8]", "raw_type": "struct arr_cfg_s [8]"},
+            "src/cfg.c#g_owned": {
+                "name": "g_owned",
+                "type": "struct owned_cfg_s *",
+                "raw_type": "struct owned_cfg_s *",
+            },
+            "src/cfg.c#g_retained": {
+                "name": "g_retained",
+                "type": "struct retained_cfg_s *",
+                "raw_type": "struct retained_cfg_s *",
+            },
+        },
+    }
+    structs = {
+        "struct val_cfg_s": {"size": 4, "pointers": False, "bools": False},
+        "struct arr_cfg_s": {"size": 4, "pointers": False, "bools": False},
+        "struct owned_cfg_s": {"size": 8, "pointers": False, "bools": False},
+        "struct retained_cfg_s": {"size": 8, "pointers": False, "bools": False},
+    }
+    traces = [[{"fn": "lib_shutdown", "args": {}, "addrs": {}}]]
+    res = ah.plan(dag, model, "libown", "libown.so", 256, traces=traces, struct_layouts=structs)
+    by_fn = {
+        lay["calls"][0]: (lay, res["cases"][idx])
+        for idx, lay in enumerate(res["layouts"])
+        if lay.get("kind") == "single"
+    }
+
+    _, init_stmt = by_fn["lib_init_with_cfgs"]
+    # `val_cfg_s` and `arr_cfg_s` are value/array globals -> stack storage; `owned_cfg_s` -> heap calloc + teardown.
+    assert "struct val_cfg_s c0a0; memset(&c0a0, 0, sizeof(c0a0));" in init_stmt
+    assert "struct arr_cfg_s c0a1; memset(&c0a1, 0, sizeof(c0a1));" in init_stmt
+    assert "struct owned_cfg_s *c0a2 = (struct owned_cfg_s *)calloc(1, sizeof(struct owned_cfg_s));" in init_stmt
+    assert "if (c0a2 != 0) {" in init_stmt
+    assert "(void)lib_init_with_cfgs(&c0a0, &c0a1, c0a2);" in init_stmt
+    assert "(void)lib_shutdown();" in init_stmt
+    assert "} else { free(c0a2); }" in init_stmt
+
+    _, ret_stmt = by_fn["lib_register_ext"]
+    # `g_retained` is a pointer global not freed by teardown -> `static` storage so it never dangles.
+    assert "static struct retained_cfg_s c0a0; memset(&c0a0, 0, sizeof(c0a0));" in ret_stmt
+    assert "calloc(" not in ret_stmt
+    assert "lib_shutdown();" not in ret_stmt
+
+    # Even without any recorded traces, retained non-freed pointer globals still get `static` storage
+    # and freeing-teardown pointer globals still get `calloc` + teardown to prevent bad-free.
+    res_notrace = ah.plan(dag, model, "libown", "libown.so", 256, struct_layouts=structs)
+    by_fn_nt = {
+        lay["calls"][0]: res_notrace["cases"][idx]
+        for idx, lay in enumerate(res_notrace["layouts"])
+        if lay.get("kind") == "single"
+    }
+    assert "static struct retained_cfg_s c0a0; memset(&c0a0, 0, sizeof(c0a0));" in by_fn_nt["lib_register_ext"]
+    assert "calloc(1, sizeof(struct owned_cfg_s))" in by_fn_nt["lib_init_with_cfgs"]
+    assert "(void)lib_shutdown();" in by_fn_nt["lib_init_with_cfgs"]
+
+
+@pytest.mark.unit
+def test_sequence_layout_records_setup_calls_and_passes_harness_sidecar_schema() -> None:
+    from validate_artifacts import schema_problems
+
+    dag, model = _global_lib_fixture()
+    traces = [
+        [
+            {"fn": "lib_config", "args": {"0": [["i", 0, "02"]], "1": [["i", 0, "01"]]}, "addrs": {}},
+            {"fn": "lib_init", "args": {}, "addrs": {}},
+            {
+                "fn": "lib_process",
+                "args": {"0": [["b", 0, "deadbeef"]], "1": [["i", 0, "0400000000000000"]]},
+                "addrs": {"0": "2000"},
+            },
+            {"fn": "lib_shutdown", "args": {}, "addrs": {}},
+        ]
+    ]
+    res = ah.plan(dag, model, "libdemo", "libdemo.so", 256, traces=traces)
+    seqs = [lay for lay in res["layouts"] if lay.get("kind") == "sequence"]
+    assert len(seqs) == 1
+    assert seqs[0]["setup_calls"] == ["lib_config", "lib_init"]
+    sidecar = {
+        "module": "libdemo",
+        "harness_file": "workspace/harnesses/harness_libdemo.c",
+        "sources": ["src/cfg.c", "src/proc.c"],
+        "cppflags": "",
+        "entry_fn": "lib_process",
+        "entry_style": "dispatch",
+        "api_harness": True,
+        "api_cases": [{**lay, "selector": i} for i, lay in enumerate(res["layouts"])],
+        "dispatch_cases": res["cases"],
+    }
+    assert schema_problems("harness_sidecar", sidecar) == []
+
+
 # ---------------------------------------------------------------------------------------------------
 # Docker: packed bitfield setup struct + global init + ASan/LSan execution + Frama-C Eva parse
 # ---------------------------------------------------------------------------------------------------
@@ -719,5 +890,189 @@ def test_docker_global_setup_packed_struct_executes_configured_path_without_leak
     assert res["pf"] is True, res
     assert res["calls"] == ["glib_config", "glib_add_param", "glib_init", "glib_process", "glib_shutdown"], res
     assert res["slots"] == [] and res["rest"] == {"call": 3, "param": 0, "kind": "bytes"}, res
+    assert res["run_rc"] == 0, res
+    assert res["fc_rc"] == 0, res
+
+
+OWN_LIB_H = """\
+#ifndef OWN_LIB_H
+#define OWN_LIB_H
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct { int x; } val_cfg_t;
+typedef struct { int y; } owned_cfg_t;
+
+int own_init_with_cfgs(val_cfg_t *v, owned_cfg_t *o);
+int own_shutdown(void);
+#endif
+"""
+
+OWN_LIB_C = """\
+#include "own_lib.h"
+#include <stdlib.h>
+
+val_cfg_t g_val;
+owned_cfg_t *g_owned = NULL;
+int g_hidden_hits = 0;
+
+int own_init_with_cfgs(val_cfg_t *v, owned_cfg_t *o) {
+    if (v) g_val = *v;
+    if (g_owned && g_owned != o) free(g_owned);
+    g_owned = o;
+    return 0;
+}
+
+int own_shutdown(void) {
+    if (g_owned) {
+        free(g_owned);
+        g_owned = NULL;
+    }
+    return 0;
+}
+
+/* Exported in object file, intentionally omitted from own_lib.h. */
+int own_hidden_api(const unsigned char *buf, unsigned long len) {
+    g_hidden_hits += (buf && len > 0) ? 1 : 0;
+    return g_hidden_hits;
+}
+"""
+
+DOCKER_OWN_DRIVE_PY = """\
+import json, os, shutil, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, "/opt/framac-pipeline/scripts")
+W = "/tmp/gown_w"
+shutil.rmtree(W, ignore_errors=True)
+shutil.copytree("/w", W)
+os.chdir(W)
+
+import api_harness as ah
+
+model_fns = {
+    "own_lib.c#own_init_with_cfgs": {
+        "name": "own_init_with_cfgs", "file": "own_lib.c",
+        "signature": "int(struct __anonstruct_val_cfg_t_1 *,struct __anonstruct_owned_cfg_t_2 *)",
+        "formals": [{"name": "v", "kind": "pointer"}, {"name": "o", "kind": "pointer"}],
+        "static": False,
+        "writes": {"pointer": 0, "params": [], "globals": ["g_val", "g_owned"]},
+        "global_refs": ["own_lib.c#g_val", "own_lib.c#g_owned"], "call_sites": [],
+    },
+    "own_lib.c#own_shutdown": {
+        "name": "own_shutdown", "file": "own_lib.c", "signature": "int()", "formals": [],
+        "static": False,
+        "writes": {"pointer": 0, "params": [], "globals": ["g_owned"]},
+        "global_refs": ["own_lib.c#g_owned"],
+        "call_sites": [{"callee": "free", "line": 17, "literals": {}, "initializer": False}],
+    },
+    "own_lib.c#own_hidden_api": {
+        "name": "own_hidden_api", "file": "own_lib.c",
+        "signature": "int(unsigned char *,unsigned long)",
+        "formals": [{"name": "buf", "kind": "const_pointer"}, {"name": "len", "kind": "scalar"}],
+        "static": False,
+        "writes": {"pointer": 0, "params": [], "globals": []},
+        "global_refs": [], "call_sites": [],
+    },
+}
+dag_fns = {
+    k: {"name": v["name"], "file": v["file"], "is_static": False, "module": "own", "unit": "libown.so"}
+    for k, v in model_fns.items()
+}
+dag = {
+    "module_kind": "link_unit",
+    "functions": dag_fns,
+    "modules": {"own": {"unit": "libown.so", "files": ["own_lib.c"], "functions": list(dag_fns), "candidate_entry_points": list(dag_fns)}},
+    "units": {"libown.so": {"kind": "shared_lib", "functions": list(dag_fns), "entry_points": list(dag_fns)}},
+}
+model = {
+    "status": "ok",
+    "functions": model_fns,
+    "entry_points": list(dag_fns),
+    "global_variables": {
+        "own_lib.c#g_val": {"name": "g_val", "type": "struct __anonstruct_val_cfg_t_1", "raw_type": "val_cfg_t"},
+        "own_lib.c#g_owned": {"name": "g_owned", "type": "struct __anonstruct_owned_cfg_t_2 *", "raw_type": "owned_cfg_t *"},
+    },
+}
+Path("dag.json").write_text(json.dumps(dag), encoding="utf-8")
+Path("model.json").write_text(json.dumps(model), encoding="utf-8")
+Path("traces.jsonl").write_text(
+    json.dumps({"calls": [{"fn": "own_shutdown", "args": {}, "addrs": {}}]}) + "\\n", encoding="utf-8"
+)
+out_dir = Path("out_h")
+out_dir.mkdir(exist_ok=True)
+res = ah.generate(
+    "own", "own_lib.h", 64, "-I.", out_dir,
+    unit="own", dag_path=Path("dag.json"), model_path=Path("model.json"),
+    traces_path=Path("traces.jsonl"), variadic={},
+)
+sidecar = json.loads((out_dir / "harness_own.json").read_text(encoding="utf-8"))
+harness_c = out_dir / "harness_own.c"
+
+driver = '''
+#include <stddef.h>
+#include <stdint.h>
+extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
+extern int g_hidden_hits;
+int main(void) {
+    for (int round = 0; round < 5; round++) {
+        for (uint8_t sel = 0; sel < 8; sel++) {
+            uint8_t buf[16] = {sel, 1, 2, 3, 4, 5, 6, 7};
+            LLVMFuzzerTestOneInput(buf, sizeof(buf));
+        }
+    }
+    return g_hidden_hits > 0 ? 0 : 2;
+}
+'''
+Path("driver.c").write_text(driver, encoding="utf-8")
+c_proc = subprocess.run(
+    ["clang", "-O1", "-g", "-fsanitize=address,undefined", "-I.", "driver.c", str(harness_c), "own_lib.c", "-o", "run_own"],
+    capture_output=True, text=True, check=False,
+)
+env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=1:halt_on_error=1"}
+r_proc = subprocess.run(["./run_own"], capture_output=True, text=True, env=env, timeout=60) if c_proc.returncode == 0 else None
+fc_proc = subprocess.run(
+    ["frama-c", "-machdep", "gcc_x86_64", "-cpp-extra-args=-I. -DFRAMAC_EVA_MODE", "-main", "eva_main", str(harness_c), "own_lib.c"],
+    capture_output=True, text=True, timeout=120,
+)
+print("RESULT " + json.dumps({
+    "api_cases": res["api_cases"],
+    "api_skipped": res["api_skipped"],
+    "synth": (sidecar.get("api_headers") or {}).get("synthesized_prototypes"),
+    "compile_rc": c_proc.returncode,
+    "compile_err": c_proc.stderr[-500:],
+    "run_rc": r_proc.returncode if r_proc else -1,
+    "run_err": r_proc.stderr[-500:] if r_proc else "",
+    "fc_rc": fc_proc.returncode,
+    "fc_err": (fc_proc.stdout + fc_proc.stderr)[-500:],
+}))
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_docker_global_pointer_ownership_and_synth_proto_asan_and_framac(tmp_path: Path) -> None:
+    require_docker_images(ANALYSIS_IMAGE)
+    for rel, text in {
+        "own_lib.h": OWN_LIB_H,
+        "own_lib.c": OWN_LIB_C,
+        "drive.py": DOCKER_OWN_DRIVE_PY,
+    }.items():
+        (tmp_path / rel).write_text(text, encoding="utf-8", newline="\n")
+    tag = os.environ.get("FRAMAC_RUN_TAG", "pytest-api-harness-own-synth")
+    proc = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "--label", f"framac.run={tag}",
+         "-v", f"{tmp_path}:/w:ro",
+         "-v", f"{ROOT / 'scripts'}:/opt/framac-pipeline/scripts:ro",
+         "--entrypoint", "sh", ANALYSIS_IMAGE, "-c", "timeout 300 python3 /w/drive.py"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=400, check=False,
+    )  # fmt: skip
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
+    assert line is not None, out
+    res = json.loads(line[len("RESULT ") :])
+    assert res["api_cases"] == 3 and res["api_skipped"] == {}, res
+    assert res["synth"] == {"own_hidden_api": "extern int own_hidden_api(unsigned char const *, unsigned long);"}, res
+    assert res["compile_rc"] == 0, res
     assert res["run_rc"] == 0, res
     assert res["fc_rc"] == 0, res

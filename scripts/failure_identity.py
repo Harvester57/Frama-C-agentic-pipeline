@@ -484,6 +484,19 @@ _LIBC_TEMPLATES: tuple[tuple[re.Pattern[str], str | None, str, str], ...] = tupl
             "{func}: output buffer is unallocated or has insufficient length",
         ),
         (r"(?P<func>)Format error: (?P<msg>.+?)", None, "eacsl_format_error", "Format error: {msg}"),
+        # E-ACSL observation-model allocator checks (`e_acsl_segment_tracking.c`, `e_acsl_bittree_observation_model.c`).
+        (
+            r"Not a start of block \([^)]+\) in (?P<func>free|realloc)",
+            "freeable",
+            "eacsl_libc_error",
+            "{func}: not a start of block",
+        ),
+        (
+            r"NULL pointer in (?P<func>free)",
+            "freeable",
+            "eacsl_libc_error",
+            "{func}: NULL pointer",
+        ),
     )
 )
 

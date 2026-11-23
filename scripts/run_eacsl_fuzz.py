@@ -1402,6 +1402,8 @@ class CaseBlindingTracker:
                 "blinded": False,
                 "blinded_fingerprint": None,
                 "blinded_crashes": 0,
+                "blinded_reason": None,
+                "setup_function": None,
             },
         )
 
@@ -1432,11 +1434,25 @@ class CaseBlindingTracker:
             return True
         return False
 
-    def mark_blinded(self, case: int, fingerprint: str | None, crashes: int | None = None) -> None:
+    def mark_blinded(
+        self,
+        case: int,
+        fingerprint: str | None,
+        crashes: int | None = None,
+        *,
+        reason: str | None = None,
+        setup_function: str | None = None,
+    ) -> None:
         st = self._entry(case)
         st["blinded"] = True
         st["blinded_fingerprint"] = fingerprint
-        st["blinded_crashes"] = max(self.threshold, int(crashes or self.threshold))
+        if reason is not None:
+            st["blinded_crashes"] = max(1, int(crashes or 1))
+            st["blinded_reason"] = reason
+        else:
+            st["blinded_crashes"] = max(self.threshold, int(crashes or self.threshold))
+        if setup_function:
+            st["setup_function"] = setup_function
 
     def is_blinded(self, case: int) -> bool:
         return bool(self._state.get(int(case), {}).get("blinded"))
@@ -1451,14 +1467,17 @@ class CaseBlindingTracker:
         out: list[dict[str, Any]] = []
         for c in self.blinded_case_ids():
             st = self._state[c]
-            out.append(
-                {
-                    "case": c,
-                    "fingerprint": st.get("blinded_fingerprint"),
-                    "crashes": int(st.get("blinded_crashes") or self.threshold),
-                    "remedies": list(BLINDING_REMEDIES),
-                }
-            )
+            row: dict[str, Any] = {
+                "case": c,
+                "fingerprint": st.get("blinded_fingerprint"),
+                "crashes": int(st.get("blinded_crashes") or self.threshold),
+                "remedies": list(BLINDING_REMEDIES),
+            }
+            if st.get("blinded_reason"):
+                row["reason"] = str(st["blinded_reason"])
+            if st.get("setup_function"):
+                row["setup_function"] = str(st["setup_function"])
+            out.append(row)
         return out
 
 
@@ -1967,6 +1986,8 @@ def run_campaign_rounds(
         for rec in crash_records:
             if not isinstance(rec, dict) or rec.get("pre_existing"):
                 continue
+            if rec.get("reproducible") is False:
+                continue
             if rec.get("kind") not in ("crash", "leak", "timeout", "oom"):
                 continue
             c = rec.get("case")
@@ -2014,6 +2035,8 @@ def run_campaign_rounds(
                 out_empty["blinded_remedies"] = list(BLINDING_REMEDIES)
         return out_empty
 
+    consecutive_non_reproducing = 0
+    max_non_reproducing_rounds = 3
     while True:
         # A round never runs longer than the wall time the campaign has left. The first round always runs.
         budget = max(1, int(max_time - spent)) if not rounds else int(max_time - spent)
@@ -2054,9 +2077,22 @@ def run_campaign_rounds(
             {
                 c
                 for a in arts
-                if a.get("kind") in ("crash", "leak", "timeout", "oom") and not a.get("pre_existing")
+                if a.get("kind") in ("crash", "leak", "timeout", "oom")
+                and not a.get("pre_existing")
+                and a.get("reproducible") is not False
                 for c in [artifact_dispatch_case(a, n_cases, selector)]
                 if c is not None
+            }
+        )
+        non_reproducing_cases = sorted(
+            {
+                c
+                for a in arts
+                if a.get("kind") in ("crash", "leak", "timeout", "oom")
+                and not a.get("pre_existing")
+                and a.get("reproducible") is False
+                for c in [artifact_dispatch_case(a, n_cases, selector)]
+                if c is not None and c not in crashed
             }
         )
         rnd: dict[str, Any] = {
@@ -2067,6 +2103,8 @@ def run_campaign_rounds(
             "artifacts": len(arts),
             "crashed_cases": crashed,
         }
+        if non_reproducing_cases:
+            rnd["non_reproducing_cases"] = non_reproducing_cases
         if last.get("crash_stopped"):
             rnd["crash_stopped"] = True
         if round_budget_s < round_fuzz_s - 0.5:
@@ -2093,8 +2131,19 @@ def run_campaign_rounds(
             rnd["stopped"] = "insufficient_memory"
             break
         if not fresh:
+            if non_reproducing_cases:
+                if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S or int(max_time - spent) < 1:
+                    rnd["stopped"] = "time_budget_spent"
+                    break
+                consecutive_non_reproducing += 1
+                if consecutive_non_reproducing < max_non_reproducing_rounds:
+                    rnd["retried_non_reproducing"] = True
+                    continue
+                rnd["stopped"] = "non_reproducing_crashes"
+                break
             rnd["stopped"] = "plateau" if last.get("stopped_reason") == "plateau" else "no_new_case"
             break
+        consecutive_non_reproducing = 0
         # The next round needs the CPU floor and at least one whole second of wall time left.
         if (max_time - spent) * max(1, workers) < MIN_ROUND_CPU_S or int(max_time - spent) < 1:
             rnd["stopped"] = "time_budget_spent"
@@ -2752,6 +2801,7 @@ def _run_fuzz_campaign_once(
                 "kind": a.get("kind"),
                 "fingerprint": a.get("fingerprint"),
                 "pre_existing": bool(a.get("pre_existing")),
+                "reproducible": a.get("reproducible"),
             }
             for a in artifacts
         ]
@@ -6135,6 +6185,127 @@ def _judge_error_report(
     }
 
 
+def _load_dispatch_case_setup_info(sources: Sequence[str | Path]) -> dict[int, dict[str, Any]]:
+    """
+    Per dispatch case selector, extract deterministic setup metadata from the harness sidecar's
+    `api_cases` (if present):
+      - `setup_calls`: deterministic 0-fuzz-slot global setup calls executed before the target entry
+        in a sequence case (from explicit `setup_calls` or legacy `"global setup call:"` notes).
+      - `target_calls`: calls after `setup_calls` in a sequence case.
+      - `zero_input_setup`: True for a 0-fuzz-byte single setup case (`slots == []`, `rest is None`,
+        and either a global setup reset note or calling a function that appears in `setup_calls`).
+      - `entry_fn`: first call name of the case (if any).
+    """
+    sidecar: dict[str, Any] | None = None
+    for src in sources or ():
+        sc_path = _dispatch_sidecar_path(src)
+        doc = _load_json_dict_optional(sc_path)
+        if isinstance(doc, dict) and isinstance(doc.get("api_cases"), list):
+            sidecar = doc
+            break
+    if sidecar is None:
+        return {}
+    raw_cases = sidecar.get("api_cases") or []
+    all_setup_fns: set[str] = set()
+    parsed: dict[int, dict[str, Any]] = {}
+    for lay in raw_cases:
+        if not isinstance(lay, dict):
+            continue
+        sel = lay.get("selector")
+        if not isinstance(sel, int) or isinstance(sel, bool) or sel < 0:
+            continue
+        calls = [str(c) for c in (lay.get("calls") or []) if isinstance(c, str) and c]
+        notes = [str(n) for n in (lay.get("notes") or []) if isinstance(n, str)]
+        slots = lay.get("slots") or []
+        rest = lay.get("rest")
+        kind = str(lay.get("kind") or "")
+        setup_calls: list[str] = []
+        target_calls: list[str] = []
+        if kind == "sequence" and calls:
+            raw_setup = lay.get("setup_calls")
+            if isinstance(raw_setup, list) and raw_setup:
+                setup_calls = [str(c) for c in raw_setup if isinstance(c, str) and c]
+                target_calls = calls[len(setup_calls) :]
+            else:
+                fuzz_call_indices: list[int] = []
+                for sl in slots:
+                    if isinstance(sl, dict) and isinstance(sl.get("call"), int):
+                        fuzz_call_indices.append(sl["call"])
+                if isinstance(rest, dict) and isinstance(rest.get("call"), int):
+                    fuzz_call_indices.append(rest["call"])
+                first_fuzz = min(fuzz_call_indices) if fuzz_call_indices else 0
+                if first_fuzz > 0 and any("global setup call:" in n for n in notes):
+                    setup_calls = calls[:first_fuzz]
+                    target_calls = calls[first_fuzz:]
+            all_setup_fns.update(setup_calls)
+        has_global_reset = any("global state reset after setup" in n for n in notes)
+        parsed[sel] = {
+            "kind": kind,
+            "setup_calls": setup_calls,
+            "target_calls": target_calls,
+            "zero_input": kind in ("single", "sequence") and not slots and rest is None,
+            "has_global_reset": has_global_reset,
+            "entry_fn": calls[0] if calls else None,
+        }
+    for info in parsed.values():
+        entry_fn = info.get("entry_fn")
+        info["zero_input_setup"] = bool(
+            info["zero_input"]
+            and info["kind"] == "single"
+            and (info["has_global_reset"] or (entry_fn and entry_fn in all_setup_fns))
+        )
+    return parsed
+
+
+def _deterministic_setup_blinding(
+    case_idx: int | None,
+    failure: dict[str, Any] | None,
+    frames: Sequence[dict[str, Any]] | None,
+    case_setup_info: Mapping[int, dict[str, Any]],
+) -> tuple[str, str | None] | None:
+    """
+    When a confirmed standalone failure on `case_idx` occurred inside a deterministic 0-fuzz-slot
+    setup prefix (before reaching the case's target entry call) or inside a 0-fuzz-byte global
+    setup case, return `(reason, setup_function)` so `run_judge` marks the case blinded on the
+    first abort instead of repeating identical setup aborts across the rest of the case's inputs.
+    """
+    if case_idx is None:
+        return None
+    info = case_setup_info.get(case_idx)
+    if not info:
+        return None
+    setup_calls = info.get("setup_calls") or []
+    target_calls = info.get("target_calls") or []
+    if setup_calls:
+        setup_set = set(setup_calls)
+        target_set = set(target_calls)
+        cleaned_frames: list[str] = []
+        for fr in frames or ():
+            fn = str(fr.get("function") or "") if isinstance(fr, dict) else ""
+            if fn:
+                cleaned_frames.append(fn.removeprefix(_EACSL_GEN_PREFIX))
+        harness_pos = next((i for i, fn in enumerate(cleaned_frames) if is_harness_fuzz_function(fn)), None)
+        if harness_pos is not None:
+            for fn in reversed(cleaned_frames[:harness_pos]):
+                if fn in target_set and fn not in setup_set:
+                    return None
+                if fn in setup_set:
+                    return "deterministic_setup_abort", fn
+        else:
+            if cleaned_frames:
+                if any(fn in target_set and fn not in setup_set for fn in cleaned_frames):
+                    return None
+                for fn in reversed(cleaned_frames):
+                    if fn in setup_set:
+                        return "deterministic_setup_abort", fn
+            fail_fn = str((failure or {}).get("function") or "").removeprefix(_EACSL_GEN_PREFIX)
+            if fail_fn and fail_fn in setup_set and fail_fn not in target_set:
+                return "deterministic_setup_abort", fail_fn
+    if info.get("zero_input_setup"):
+        return "deterministic_setup_abort", info.get("entry_fn")
+    return None
+
+
 def run_judge(
     module: str,
     build_json: dict[str, Any] | Path | str,
@@ -6346,6 +6517,8 @@ def run_judge(
         reason: str | None = None,
         startup_error: str | None = None,
         omitted_dups: int = 0,
+        cwd_side_effects_list: list[str] | None = None,
+        cwd_isolated_count: int = 0,
     ) -> dict[str, Any]:
         judged = passed + failed
         nj_cap = int(not_judged_cap)
@@ -6353,6 +6526,17 @@ def run_judge(
         nj_total = nj_cap + nj_smoke + not_judged_timeout + not_judged_blinded + not_judged_error
         nj_by_case = _format_not_judged_by_case(not_judged_by_case)
         ips = round(judged / judge_s, 2) if judge_s > 0.0 and judged > 0 else 0.0
+        tel_block: dict[str, Any] = {
+            "judge_s": round(max(0.0, judge_s), 3),
+            "batch_s": round(max(0.0, batch_s), 3),
+            "confirm_s": round(max(0.0, confirm_s), 3),
+            "inputs_per_s": ips,
+            "batches_run": batches_run,
+            "fresh_confirmations": fresh_confirmations,
+        }
+        if cwd_side_effects_list:
+            tel_block["cwd_side_effects"] = list(cwd_side_effects_list)
+            tel_block["cwd_isolated_inputs"] = int(cwd_isolated_count)
         report: dict[str, Any] = {
             "schema_version": JUDGE_SCHEMA_VERSION,
             "mode": "judge",
@@ -6396,14 +6580,7 @@ def run_judge(
             "smoke_skipped_cases": list(smoke_skipped),
             "blinded_cases": list(blinded_cases or []),
             "partial_blinded": bool(partial_blinded),
-            "telemetry": {
-                "judge_s": round(max(0.0, judge_s), 3),
-                "batch_s": round(max(0.0, batch_s), 3),
-                "confirm_s": round(max(0.0, confirm_s), 3),
-                "inputs_per_s": ips,
-                "batches_run": batches_run,
-                "fresh_confirmations": fresh_confirmations,
-            },
+            "telemetry": tel_block,
             "harness_digest": harness_digest,
             "dispatch_case_count": n_cases,
             "dispatch_selector": selector if n_cases is not None else None,
@@ -6445,6 +6622,7 @@ def run_judge(
         )
 
     seed = derive_seed(eacsl_binary, module)
+    case_setup_info = _load_dispatch_case_setup_info(eff_sources) if (n_cases and n_cases > 0) else {}
     eff_batch = max(1, int(batch_size or JUDGE_BATCH_SIZE))
     pending: deque[list[Path]] = deque(selected[i : i + eff_batch] for i in range(0, len(selected), eff_batch))
     skipped_cases: set[int] = set(smoke_skipped)
@@ -6454,6 +6632,10 @@ def run_judge(
     batch_state_only: list[dict[str, Any]] = []
     cross_links: list[dict[str, Any]] = []
     cross_link_keys: set[tuple[str | None, str | None, str, str | None]] = set()
+    cwd_side_effects: set[str] = set()
+    cwd_isolated_inputs = 0
+    isolate_per_input = False
+    cwd_hint_recorded = False
 
     passed = 0
     failed = 0
@@ -6647,13 +6829,24 @@ def run_judge(
 
         # Update per-case (or single-entry) blinding tracker.
         if n_cases and n_cases > 0:
-            if c_idx is not None and tracker.record_crash(c_idx, eff_fp):
-                skipped_cases.add(c_idx)
+            if c_idx is not None:
+                det_blind = (
+                    _deterministic_setup_blinding(c_idx, eff_failure, art_frames, case_setup_info)
+                    if tracker.passes_of(c_idx) == 0
+                    else None
+                )
+                if det_blind is not None:
+                    b_reason, setup_fn = det_blind
+                    tracker.mark_blinded(c_idx, eff_fp, crashes=1, reason=b_reason, setup_function=setup_fn)
+                    skipped_cases.add(c_idx)
+                elif tracker.record_crash(c_idx, eff_fp):
+                    skipped_cases.add(c_idx)
         else:
             if tracker.record_crash(0, eff_fp):
                 module_blinded_non_dispatch = True
                 non_dispatch_blind_fp = eff_fp
 
+    art_dir = replay_artifact_dir(scratch)
     current_batch: list[Path] = []
     try:
         while pending:
@@ -6686,6 +6879,11 @@ def run_judge(
             else:
                 batch = raw_batch
 
+            if isolate_per_input and len(batch) > 1:
+                for extra_item in reversed(batch[1:]):
+                    pending.appendleft([extra_item])
+                batch = [batch[0]]
+
             batches_run += 1
             wall = min(int(per_input_timeout) * len(batch) + 30, max(int(remaining), min_wall))
             run_env = dict(SANITIZER_RUNTIME_ENV)
@@ -6693,25 +6891,56 @@ def run_judge(
                 run_env[DISPATCH_SKIP_MACRO] = format_skip_cases_env(skipped_cases)
             current_batch = batch
             bt0 = time.monotonic()
-            res = sandbox_exec.run_sandboxed(
-                [
-                    str(eacsl_binary.resolve()),
-                    f"-timeout={per_input_timeout}",
-                    f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
-                    f"-seed={seed}",
-                    f"-artifact_prefix={replay_artifact_dir(scratch)}/",
-                    *[str(Path(f).resolve()) for f in batch],
-                ],
-                writable=[scratch],
-                timeout_s=wall,
-                limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
-                extra_env=run_env,
-            )
+            batch_cwd = Path(tempfile.mkdtemp(prefix=f"judge_cwd_{batches_run}_", dir=scratch))
+            created_in_cwd: list[str] = []
+            try:
+                res = sandbox_exec.run_sandboxed(
+                    [
+                        str(eacsl_binary.resolve()),
+                        f"-timeout={per_input_timeout}",
+                        f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+                        f"-seed={seed}",
+                        f"-artifact_prefix={art_dir}/",
+                        *[str(Path(f).resolve()) for f in batch],
+                    ],
+                    writable=[batch_cwd, art_dir],
+                    cwd=batch_cwd,
+                    timeout_s=wall,
+                    limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
+                    extra_env=run_env,
+                )
+                with contextlib.suppress(OSError):
+                    created_in_cwd = sorted(p.name for p in batch_cwd.iterdir())
+            finally:
+                shutil.rmtree(batch_cwd, ignore_errors=True)
             current_batch = []
             batch_s += max(0.0, time.monotonic() - bt0)
             out_text = f"{res.stdout}\n{res.stderr}"
 
+            if created_in_cwd:
+                cwd_side_effects.update(created_in_cwd)
+                if not isolate_per_input:
+                    isolate_per_input = True
+                if not cwd_hint_recorded:
+                    cwd_hint_recorded = True
+                    names_s = ", ".join(sorted(cwd_side_effects)[:5])
+                    diagnostic_hints.append(
+                        f"target wrote working-directory file(s) ({names_s}); switched to per-input "
+                        f"isolated working directories so judge results do not depend on input order"
+                    )
+            if isolate_per_input and len(batch) == 1:
+                cwd_isolated_inputs += 1
+
+            dirty_multi = bool(created_in_cwd) and len(batch) > 1
+
             if res.returncode == 0 and not res.timed_out:
+                if dirty_multi:
+                    # Only batch[0] ran in a clean empty directory; re-run batch[1:] one per directory.
+                    _record_passes([batch[0]])
+                    for extra_item in reversed(batch[1:]):
+                        pending.appendleft([extra_item])
+                    _maybe_expand_tier2()
+                    continue
                 # P8a: handle clean _Exit(0) mid-batch as a pass for batch[:idx+1], then continue with batch[idx+1:].
                 exited_idx = _judge_input_running_at_exit(out_text, batch)
                 if exited_idx is not None:
@@ -6743,6 +6972,13 @@ def run_judge(
 
             culprit = _judge_input_running_at_exit(out_text, batch)
             if culprit is not None:
+                if dirty_multi and culprit > 0:
+                    # batch[0] ran clean; batch[1:] may have seen files written into cwd by an earlier input.
+                    _record_passes([batch[0]])
+                    for extra_item in reversed(batch[1:]):
+                        pending.appendleft([extra_item])
+                    _maybe_expand_tier2()
+                    continue
                 if culprit > 0:
                     _record_passes(batch[:culprit])
                 _handle_failure(batch[culprit], out_text, res.returncode, res.timed_out)
@@ -6750,7 +6986,11 @@ def run_judge(
                 # `rest` is empty so we never re-enqueue or loop.
                 rest = batch[culprit + 1 :]
                 if rest:
-                    pending.appendleft(rest)
+                    if isolate_per_input:
+                        for extra_item in reversed(rest):
+                            pending.appendleft([extra_item])
+                    else:
+                        pending.appendleft(rest)
                 _maybe_expand_tier2()
                 continue
 
@@ -6818,6 +7058,8 @@ def run_judge(
         reason=sandbox_err,
         startup_error=startup_err,
         omitted_dups=omitted_dups,
+        cwd_side_effects_list=sorted(cwd_side_effects) if cwd_side_effects else None,
+        cwd_isolated_count=cwd_isolated_inputs,
     )
 
 

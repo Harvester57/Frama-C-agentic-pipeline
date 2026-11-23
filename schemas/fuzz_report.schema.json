@@ -27,7 +27,9 @@
         "remedies": {
           "type": "array",
           "items": {"type": "string", "minLength": 1}
-        }
+        },
+        "reason": {"type": "string", "minLength": 1},
+        "setup_function": {"type": "string", "minLength": 1}
       },
       "required": ["case", "fingerprint", "crashes"],
       "additionalProperties": false

@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -72,23 +73,31 @@ def replay_artifact(
     and a deterministic `-seed` (derive_seed); report the parsed failure and whether it reproduced.
     """
     binary = Path(binary)
+    scratch = Path(scratch)
+    scratch.mkdir(parents=True, exist_ok=True)
     seed = derive_seed(binary, module) if seed is None else seed
     wall = max(int(timeout_s), 2 * int(per_input_timeout) + 10)
-    res = sandbox_exec.run_sandboxed(
-        [
-            str(binary.resolve()),
-            "-runs=1",
-            f"-timeout={per_input_timeout}",
-            f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
-            f"-seed={seed}",
-            f"-artifact_prefix={replay_artifact_dir(scratch)}/",
-            str(Path(artifact).resolve()),
-        ],
-        writable=[scratch],
-        timeout_s=wall,
-        limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
-        extra_env=SANITIZER_RUNTIME_ENV,
-    )
+    art_dir = replay_artifact_dir(scratch)
+    run_cwd = Path(tempfile.mkdtemp(prefix="replay_cwd_", dir=scratch))
+    try:
+        res = sandbox_exec.run_sandboxed(
+            [
+                str(binary.resolve()),
+                "-runs=1",
+                f"-timeout={per_input_timeout}",
+                f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+                f"-seed={seed}",
+                f"-artifact_prefix={art_dir}/",
+                str(Path(artifact).resolve()),
+            ],
+            writable=[run_cwd, art_dir],
+            cwd=run_cwd,
+            timeout_s=wall,
+            limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
+            extra_env=SANITIZER_RUNTIME_ENV,
+        )
+    finally:
+        shutil.rmtree(run_cwd, ignore_errors=True)
     out = res.stdout + "\n" + res.stderr
     # The binary: a MetAcsl violation is mapped to its file through the sidecar its build wrote next to it.
     link_stub_abort = parse_link_stub_abort(out)

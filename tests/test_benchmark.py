@@ -4,6 +4,7 @@ import copy
 import json
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1084,3 +1085,225 @@ def test_migrate_units_records_each_harness_modules_unit(tmp_path: Path):
 @pytest.mark.unit
 def test_wave_with_only_excluded_units_has_no_row():
     assert summarize_units([unit(status="deferred", wave=7)])["by_wave"] == {}
+
+
+@pytest.mark.unit
+def test_validate_manifest_accepts_per_function_reach_gaps_map_and_api_replay_fields(tmp_path: Path):
+    payload = b"\xa6\x00\x03\x00\x04\x24"
+    digest = benchmark.sha256_hex(payload)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "targets": [
+            {
+                "id": "demo",
+                "set": "recall",
+                "repo_name": "demo",
+                "url": "https://example.invalid/demo.git",
+                "revision": "a" * 40,
+                "modules": [
+                    {
+                        "name": "libdemo",
+                        "harness": {"generate": "api", "sources": ["src/a.c"]},
+                        "reach_gaps_accepted": {
+                            "hidden_fn": "internal helper not declared in public headers",
+                        },
+                    }
+                ],
+            }
+        ],
+        "bugs": [
+            {
+                "id": "DEMO-01",
+                "title": "oob",
+                "file": "src/a.c",
+                "function": "decode",
+                "alarm_kind": "mem_access",
+                "fingerprint": "src/a.c#decode::mem_access::0123456789",
+                "input_hex": payload.hex(),
+                "input_sha256": digest,
+                "reachability": "direct",
+                "severity": "high",
+                "verdict": {
+                    "description": "d",
+                    "root_cause": "r",
+                    "intended_behavior": "i",
+                    "severity_rationale": "s",
+                    "remediation_summary": "rs",
+                    "remediation_invariant": "ri",
+                },
+                "replays": [
+                    {
+                        "target": "demo",
+                        "module": "libdemo",
+                        "engine": "sanitizers",
+                        "required": True,
+                        "lines": [10],
+                        "api_entry": "demo_decode",
+                        "case_kind": "sequence",
+                    }
+                ],
+            }
+        ],
+    }
+    assert benchmark.validate_manifest(manifest, assets_dir=tmp_path) == []
+
+    # Invalid map entries and invalid replay fields are rejected.
+    bad = copy.deepcopy(manifest)
+    bad["targets"][0]["modules"][0]["reach_gaps_accepted"] = {"hidden_fn": "   "}
+    bad["bugs"][0]["replays"][0]["case_kind"] = "bogus"
+    bad["bugs"][0]["replays"][0]["input_hex"] = "deadbeef"
+    bad["bugs"][0]["replays"][0]["input_sha256"] = "0" * 64
+    problems = benchmark.validate_manifest(bad, assets_dir=tmp_path)
+    assert any("reach_gaps_accepted map" in p for p in problems)
+    assert any("case_kind" in p for p in problems)
+    assert any("input_sha256" in p for p in problems)
+
+
+@pytest.mark.unit
+def test_apply_reach_exemptions_supports_per_function_map(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import harness_reach
+
+    recorded: list[tuple[str, str | None, str]] = []
+    monkeypatch.setattr(
+        harness_reach,
+        "run_check",
+        lambda _dag, _hdir, _mods: {
+            "modules": [
+                {
+                    "module": "libdemo",
+                    "gaps": ["src/a.c#expected_gap", "src/a.c#surprise_gap"],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        harness_reach,
+        "record_exempt",
+        lambda _hdir, mod, fn, reason: recorded.append((mod, fn, reason)),
+    )
+
+    spec: dict[str, Any] = {
+        "modules": [
+            {
+                "name": "libdemo",
+                "reach_gaps_accepted": {
+                    "expected_gap": "intentionally unconfigured",
+                    "stale_fn": "no longer a gap",
+                },
+            }
+        ]
+    }
+    # Only the listed gap is exempted; `surprise_gap` is left unexempted so the gate still fails on regressions.
+    out = benchmark.apply_reach_exemptions(spec, harness_dir=tmp_path)
+    assert out["functions_exempted"] == 1
+    assert out["unlisted_gaps"] == {"libdemo": ["src/a.c#surprise_gap"]}
+    assert out["unused_exemptions"] == {"libdemo": ["stale_fn"]}
+    assert recorded == [("libdemo", "src/a.c#expected_gap", "intentionally unconfigured")]
+
+    # When every gap is named (either bare name or file#fn), both are exempted and no unlisted gap remains.
+    recorded.clear()
+    spec["modules"][0]["reach_gaps_accepted"]["src/a.c#surprise_gap"] = "documented gap"
+    out_ok = benchmark.apply_reach_exemptions(spec, harness_dir=tmp_path)
+    assert out_ok["functions_exempted"] == 2
+    assert "unlisted_gaps" not in out_ok
+    assert out_ok["unused_exemptions"] == {"libdemo": ["stale_fn"]}
+    assert recorded == [
+        ("libdemo", "src/a.c#expected_gap", "intentionally unconfigured"),
+        ("libdemo", "src/a.c#surprise_gap", "documented gap"),
+    ]
+
+
+@pytest.mark.unit
+def test_collect_target_metrics_phase0_only_does_not_flag_missing_eva(tmp_path: Path):
+    target = {"id": "demo", "modules": [{"name": "libdemo"}]}
+    metrics_full = benchmark.collect_target_metrics(tmp_path, target, phase0_only=False)
+    assert "eva libdemo: no report" in metrics_full["problems"]
+
+    metrics_p0 = benchmark.collect_target_metrics(tmp_path, target, phase0_only=True)
+    assert metrics_p0["problems"] == []
+
+
+@pytest.mark.unit
+def test_resolve_api_replay_bytes_and_verifier_result_for_api_dispatch(tmp_path: Path):
+    harnesses = tmp_path / "harnesses"
+    harnesses.mkdir()
+    payload = b"\xde\xad\xbe\xef"
+    sidecar: dict[str, Any] = {
+        "module": "libdemo",
+        "api_harness": True,
+        "dispatch_selector": "identity",
+        "api_cases": [
+            {"selector": 5, "kind": "single", "calls": ["api_decode"], "rest": {"call": 0, "param": 0}},
+            {
+                "selector": 166,
+                "kind": "sequence",
+                "calls": ["api_init", "api_decode", "api_shutdown"],
+                "setup_calls": ["api_init"],
+                "rest": {"call": 1, "param": 0},
+            },
+        ],
+    }
+    (harnesses / "harness_libdemo.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    item = {
+        "bug": "DEMO-01",
+        "module": "libdemo",
+        "function": "api_decode",
+        "api_entry": "api_decode",
+        "input_hex": payload.hex(),
+        "input_sha256": benchmark.sha256_hex(payload),
+    }
+
+    # Prefers configured sequence case 166 over unconfigured single case 5 (1-byte identity selector).
+    resolved = benchmark.resolve_api_replay_bytes(item, "libdemo", harnesses)
+    assert resolved == bytes([166]) + payload
+
+    # Explicit case_kind="single" selects case 5 instead.
+    resolved_single = benchmark.resolve_api_replay_bytes({**item, "case_kind": "single"}, "libdemo", harnesses)
+    assert resolved_single == bytes([5]) + payload
+
+    # 2-byte identity16 selector encoding.
+    sidecar["dispatch_selector"] = "identity16"
+    sidecar["api_cases"][1]["selector"] = 300
+    (harnesses / "harness_libdemo.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    resolved16 = benchmark.resolve_api_replay_bytes(item, "libdemo", harnesses)
+    assert resolved16 == (300).to_bytes(2, "little") + payload
+
+    # verifier_result tolerates `generate: api` harness specs with no `entry_fn` and uses `harness_module`.
+    inp = tmp_path / "crash-1"
+    inp.write_bytes(resolved16)
+    vres = benchmark.verifier_result(
+        {
+            **item,
+            "title": "oob",
+            "alarm_kind": "mem_access",
+            "reachability": "direct",
+            "severity": "high",
+            "verdict": {
+                "description": "d",
+                "root_cause": "r",
+                "intended_behavior": "i",
+                "severity_rationale": "s",
+                "remediation_summary": "rs",
+                "remediation_invariant": "ri",
+            },
+        },
+        {
+            "engine": "sanitizers",
+            "harness_module": "libdemo_sub",
+            "observed": {
+                "file": "src/a.c",
+                "line": 12,
+                "function": "api_decode",
+                "alarm_kind": "mem_access",
+                "predicate": "oob",
+                "fingerprint": "src/a.c#api_decode::mem_access::0123456789",
+            },
+        },
+        {"linked_units": ["src/a.c#api_decode::rte"]},
+        {"generate": "api", "sources": ["src/a.c"]},
+        "workspace/reports/fuzz/bench-replay-libdemo_sub-sanitizers.json",
+        inp,
+    )
+    assert vres["record"]["harness"]["file"] == "workspace/harnesses/harness_libdemo_sub.c"
+    assert vres["record"]["harness"]["entry_function"] == "api_decode"
+    assert vres["record"]["reproducers"][0]["sha256"] == benchmark.sha256_hex(resolved16)

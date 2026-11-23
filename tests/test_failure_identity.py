@@ -218,3 +218,57 @@ def test_parse_sanitizer_failure_recognizes_ubsan_segv_and_deadly_signals(tmp_pa
     assert f_sum is not None
     assert (f_sum["file"], f_sum["line"], f_sum["function"]) == ("src/attr.c", 42, "mnl_attr_ok")
     assert f_sum["kind"] == "ubsan_segv"
+
+
+def test_parse_eacsl_allocator_observation_aborts() -> None:
+    """E-ACSL observation-model `private_abort` messages in free/realloc parse as `freeable` failures."""
+    free_stderr = (
+        "Not a start of block (0x12b-d190) in free\n"
+        "==42== ERROR: libFuzzer: deadly signal\n"
+        "    #0 0x555555510000 in __sanitizer_print_stack_trace (/w/fuzz_m+0x10000)\n"
+        "    #1 0x555555520000 in private_abort_fail (/w/fuzz_m+0x20000)\n"
+        "    #2 0x555555530000 in __e_acsl_free (/w/fuzz_m+0x30000)\n"
+        "    #3 0x555555540000 in __gen_e_acsl_target_free /w/src/mem.c:88:5\n"
+        "    #4 0x555555550000 in LLVMFuzzerTestOneInput /w/workspace/harnesses/harness_m.c:40:3\n"
+    )
+    f_free = failure_identity.parse_eacsl_failure(free_stderr)
+    assert f_free is not None
+    assert f_free["kind"] == "eacsl_libc_error"
+    assert f_free["alarm_kind"] == "freeable"
+    assert f_free["function"] == "target_free"
+    assert f_free["predicate"] == "free: not a start of block"
+    assert f_free["is_rte"] is True
+    assert not f_free.get("harness_self_fault")
+    assert failure_identity.parse_runtime_failure(free_stderr) == f_free
+
+    # Different block address in the message hashes to the exact same fingerprint.
+    free_other = free_stderr.replace("0x12b-d190", "0x7fff-0040")
+    f_free_other = failure_identity.parse_eacsl_failure(free_other)
+    assert f_free_other is not None
+    assert failure_identity.failure_fingerprint(f_free) == failure_identity.failure_fingerprint(f_free_other)
+
+    # realloc variant and NULL-pointer free variant.
+    realloc_stderr = free_stderr.replace("in free", "in realloc")
+    f_realloc = failure_identity.parse_eacsl_failure(realloc_stderr)
+    assert f_realloc is not None
+    assert f_realloc["alarm_kind"] == "freeable"
+    assert f_realloc["predicate"] == "realloc: not a start of block"
+
+    null_free_stderr = free_stderr.replace("Not a start of block (0x12b-d190) in free", "NULL pointer in free")
+    f_null = failure_identity.parse_eacsl_failure(null_free_stderr)
+    assert f_null is not None
+    assert f_null["alarm_kind"] == "freeable"
+    assert f_null["predicate"] == "free: NULL pointer"
+
+    # When called directly from the harness with no target frame, flag `harness_self_fault`.
+    harness_free_stderr = (
+        "Not a start of block (0x12b-d190) in free\n"
+        "==43== ERROR: libFuzzer: deadly signal\n"
+        "    #0 0x555555520000 in private_abort_fail (/w/fuzz_m+0x20000)\n"
+        "    #1 0x555555530000 in __e_acsl_free (/w/fuzz_m+0x30000)\n"
+        "    #2 0x555555550000 in LLVMFuzzerTestOneInput /w/workspace/harnesses/harness_m.c:40:3\n"
+    )
+    f_harness = failure_identity.parse_eacsl_failure(harness_free_stderr)
+    assert f_harness is not None
+    assert f_harness["function"] == "LLVMFuzzerTestOneInput"
+    assert f_harness.get("harness_self_fault") is True

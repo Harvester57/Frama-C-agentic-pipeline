@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from collections import Counter, deque
 from pathlib import Path
@@ -106,6 +107,10 @@ def replay_for_coverage(
                 }
             )
 
+    scratch = Path(scratch)
+    scratch.mkdir(parents=True, exist_ok=True)
+    art_dir = replay_artifact_dir(scratch)
+
     while pending:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -114,20 +119,25 @@ def replay_for_coverage(
         batch_no += 1
         batch_dir = profile_dir / f"batch-{batch_no}"
         wall = min(int(per_input_timeout) * len(batch) + 30, max(int(remaining), min_wall))
-        res = sandbox_exec.run_sandboxed(
-            [
-                str(Path(binary).resolve()),
-                f"-timeout={per_input_timeout}",
-                f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
-                f"-seed={seed}",
-                f"-artifact_prefix={replay_artifact_dir(scratch)}/",
-                *[str(Path(f).resolve()) for f in batch],
-            ],
-            writable=[scratch, batch_dir],
-            timeout_s=wall,
-            limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
-            extra_env={"LLVM_PROFILE_FILE": f"{batch_dir.resolve()}/%p.profraw"},
-        )
+        batch_cwd = Path(tempfile.mkdtemp(prefix=f"cov_cwd_{batch_no}_", dir=scratch))
+        try:
+            res = sandbox_exec.run_sandboxed(
+                [
+                    str(Path(binary).resolve()),
+                    f"-timeout={per_input_timeout}",
+                    f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+                    f"-seed={seed}",
+                    f"-artifact_prefix={art_dir}/",
+                    *[str(Path(f).resolve()) for f in batch],
+                ],
+                writable=[batch_cwd, batch_dir, art_dir],
+                cwd=batch_cwd,
+                timeout_s=wall,
+                limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
+                extra_env={"LLVM_PROFILE_FILE": f"{batch_dir.resolve()}/%p.profraw"},
+            )
+        finally:
+            shutil.rmtree(batch_cwd, ignore_errors=True)
         if res.returncode == 0 and not res.timed_out and _written_profiles(batch_dir):
             replayed += len(batch)
             continue

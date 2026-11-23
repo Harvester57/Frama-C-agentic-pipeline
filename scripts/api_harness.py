@@ -681,6 +681,14 @@ class ApiInfo:
     # Per global-state setup function, the trace-observed 0-arg global teardown function (`Crypto_Shutdown`)
     # that releases its global allocations/state after a single case or teardown-less sequence.
     global_teardown: dict[str, str] = field(default_factory=dict)
+    # Per function, canonical/raw record pointee types whose non-const pointer parameter may be
+    # stored in a non-const global pointer that its global teardown frees (allocate with calloc)
+    # vs retains without a freeing teardown (allocate static so it never dangles past return).
+    global_freed_ptrs: dict[str, set[str]] = field(default_factory=dict)
+    global_retained_ptrs: dict[str, set[str]] = field(default_factory=dict)
+    # Functions whose global_variables type metadata is known, allowing safe single-case global
+    # teardown even when the function takes non-const record pointer parameters.
+    global_types_known: set[str] = field(default_factory=set)
 
 
 class _Case:
@@ -2824,6 +2832,7 @@ def _bind_call(
     scalars: dict[int, str] = {}
     pairs: list[tuple[int, str, bool]] = []
     owned_outs: list[str] = []
+    global_heap_vars: list[str] = []
     realloc = _realloc_like(name, params, formals, rec, api) if allow_init and 0 not in shared else None
     realloc_old: str | None = None
     # `_index_rules`: the element counts of the buffers the harness made with no length beside them,
@@ -3492,20 +3501,55 @@ def _bind_call(
                 bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
             else:
-                case.decls.append(f"{elem} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
-                if is_input and pointee == "_Bool":
-                    case.bool_slot(v, call, i, "pointee")
-                elif is_input and raw_ok:
-                    case.slot(v, SCALAR_BYTES.get(pointee) or (lay or {}).get("size"), call, i, "pointee")
-                elif is_input and lay is not None and lay.get("what") == "struct":
-                    _fill_fields(case, call, i, v, lay, 0)
-                elif api.trust_schema and not is_input and lay is not None and lay.get("what") == "struct":
-                    _init_bsd_queues(case, v, lay)
-                elif _owned_out_param(name, params, formals, i, api):
-                    # Rule F: a heap object the call hands to its caller through `char **`.
-                    owned_outs.append(v)
-                    case.note(call, i, "heap output the caller owns: freed after the call and its object's release")
-                args.append(f"&{v}")
+                pt_keys = (
+                    {_spelled(pointee), _spelled(elem), _spelled(api.anon_tags.get(pointee, ""))} - {""}
+                    if _is_record(pointee) and not is_input
+                    else set()
+                )
+                if allow_init and case.ncalls == 1 and pt_keys and (pt_keys & api.global_freed_ptrs.get(name, set())):
+                    case.decls.append(f"{elem} *{case.declare(v)} = ({elem} *)calloc(1, sizeof({elem}));")
+                    if api.trust_schema and lay is not None and lay.get("what") == "struct":
+                        n_before = len(case.decls)
+                        _init_bsd_queues(case, f"(*{v})", lay)
+                        if len(case.decls) > n_before:
+                            q_inits = case.decls[n_before:]
+                            del case.decls[n_before:]
+                            case.decls.append(f"if ({v} != 0) {{ {' '.join(q_inits)} }}")
+                    guards.append(f"{v} != 0")
+                    global_heap_vars.append(v)
+                    case.note(
+                        call,
+                        i,
+                        f"heap-allocated with calloc: stored in a global pointer released by "
+                        f"{api.global_teardown.get(name, 'teardown')}",
+                    )
+                    args.append(v)
+                elif (
+                    allow_init
+                    and case.ncalls == 1
+                    and pt_keys
+                    and (pt_keys & api.global_retained_ptrs.get(name, set()))
+                ):
+                    case.decls.append(f"static {elem} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                    if api.trust_schema and lay is not None and lay.get("what") == "struct":
+                        _init_bsd_queues(case, v, lay)
+                    case.note(call, i, "static storage: pointer may be retained in a global variable")
+                    args.append(f"&{v}")
+                else:
+                    case.decls.append(f"{elem} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+                    if is_input and pointee == "_Bool":
+                        case.bool_slot(v, call, i, "pointee")
+                    elif is_input and raw_ok:
+                        case.slot(v, SCALAR_BYTES.get(pointee) or (lay or {}).get("size"), call, i, "pointee")
+                    elif is_input and lay is not None and lay.get("what") == "struct":
+                        _fill_fields(case, call, i, v, lay, 0)
+                    elif api.trust_schema and not is_input and lay is not None and lay.get("what") == "struct":
+                        _init_bsd_queues(case, v, lay)
+                    elif _owned_out_param(name, params, formals, i, api):
+                        # Rule F: a heap object the call hands to its caller through `char **`.
+                        owned_outs.append(v)
+                        case.note(call, i, "heap output the caller owns: freed after the call and its object's release")
+                    args.append(f"&{v}")
             i += 1
             continue
         if p["kind"] == "struct":
@@ -3633,22 +3677,31 @@ def _bind_call(
         # Those of an initializer or a constructor run first wait for the call under test's.
         after += [*(f"free({v});" for v in owned_outs), *case.owned_frees]
         case.owned_frees = []
+        has_nonconst_record_ptr = any(
+            p["kind"] == "ptr" and _is_record(str(p.get("pointee") or "")) and not _is_input(formals, k)
+            for k, p in enumerate(params)
+        )
         if (
             case.ncalls == 1
             and name in api.global_teardown
-            and not any(
-                p["kind"] == "ptr" and _is_record(str(p.get("pointee") or "")) and not _is_input(formals, k)
-                for k, p in enumerate(params)
-            )
+            and (not has_nonconst_record_ptr or name in api.global_types_known)
         ):
             gtd = api.global_teardown[name]
-            after.append(f"(void){gtd}();")
+            if global_heap_vars:
+                own = f"{own} (void){gtd}();"
+            else:
+                after.append(f"(void){gtd}();")
             case.notes.append(f"call {call}: global state reset after setup with {gtd}")
     else:
         case.owned_frees += [f"free({v});" for v in owned_outs]
     if guards:
-        # Only on handles an out-parameter constructor built: one that failed wrote nothing.
-        own = f"if ({' && '.join(guards)}) {{ {own} }}"
+        # Only on handles an out-parameter constructor built or calloc'd global-pointer args:
+        # on partial allocation failure, free every heap-allocated global-pointer argument.
+        if global_heap_vars:
+            oom_free = " ".join(f"free({v});" for v in global_heap_vars)
+            own = f"if ({' && '.join(guards)}) {{ {own} }} else {{ {oom_free} }}"
+        else:
+            own = f"if ({' && '.join(guards)}) {{ {own} }}"
     return " ".join([*before, own, *after])
 
 
@@ -3795,6 +3848,28 @@ def anon_record_tags(model_functions: dict, visible: set[str] | None) -> dict[st
     for tag, names in seen.items():
         if len({anon[n].get("id") for n in names}) == 1:
             out[tag] = min(names)
+    # Fallback for anonymous typedef structs/unions that appear only in undeclared functions (never
+    # in a declared header prototype): CIL names them `struct __anonstruct_<Typedef>_<digits>` /
+    # `union __anonunion_<Typedef>_<digits>`. Accept only when `<Typedef>` is an anonymous record
+    # of the same kind (`struct`/`union`) observed by the layout probe in the included headers.
+    if anon:
+        for rec in model_functions.values():
+            if not isinstance(rec, dict):
+                continue
+            sig = str(rec.get("signature") or "")
+            for m in _ANON_RECORD_RE.finditer(sig):
+                tag = " ".join(m.group(0).split())
+                if tag in out:
+                    continue
+                what = m.group(1)
+                prefix = f"__anon{what}_"
+                raw_name = tag.split()[-1]
+                if not raw_name.startswith(prefix):
+                    continue
+                tail = raw_name[len(prefix) :]
+                head, sep, digits = tail.rpartition("_")
+                if sep and digits.isdigit() and head in anon and anon[head].get("what") == what:
+                    out[tag] = head
     return out
 
 
@@ -4960,6 +5035,146 @@ def _global_teardowns(
     return out
 
 
+def _single_record_pointee(ctype: str) -> str | None:
+    """For a single-level pointer-to-record type (`T *`, not `T **` / array / fn-ptr), return normalized `T`."""
+    s = _spelled(ctype)
+    if not s or "[" in s or "(" in s or s.count("*") != 1 or not s.endswith("*"):
+        return None
+    inner = _spelled(s[:-1])
+    if not inner:
+        return None
+    # Reject primitive/void pointers; accept named `struct`/`union` tags and record typedefs.
+    if inner in SCALAR_BYTES or inner in ("void", "char", "signed char", "unsigned char", "_Bool"):
+        return None
+    return inner
+
+
+def _freeing_global_teardowns(
+    callable_recs: Mapping[str, dict[str, Any]],
+    merged_globals: Mapping[str, dict[str, Any]],
+    trans_writes: Mapping[str, set[str]],
+    freeing: Collection[str],
+) -> dict[str, str]:
+    """
+    Fallback global teardown pairing when traces did not record a teardown: if a non-`const`
+    pointer-to-record global is written by both a setup function `fn` and a 0-arg callable teardown
+    `td` that reaches `free()`, pair `fn -> td` so `fn` heap-allocates the matching pointer argument
+    and releases it through `td()` instead of leaving a dangling stack pointer for `td()` to free.
+    """
+    if not merged_globals or not trans_writes or not freeing:
+        return {}
+    ptr_gnames: set[str] = set()
+    for gid, g in merged_globals.items():
+        if not isinstance(g, dict) or g.get("const") is True:
+            continue
+        gname = str(g.get("name") or gid.split("#")[-1])
+        if gname and any(_single_record_pointee(str(g.get(k) or "")) for k in ("type", "raw_type")):
+            ptr_gnames.add(gname)
+    if not ptr_gnames:
+        return {}
+    freeing_set = set(freeing)
+    zero_arg_tds: list[str] = []
+    for td, rec in sorted(callable_recs.items()):
+        if td not in freeing_set or not _is_global_teardown_name(td):
+            continue
+        if not (trans_writes.get(td, set()) & ptr_gnames) or path_parameter(rec):
+            continue
+        params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+        if params == []:
+            zero_arg_tds.append(td)
+    if not zero_arg_tds:
+        return {}
+    out: dict[str, str] = {}
+    for fn in sorted(callable_recs):
+        if _is_global_teardown_name(fn):
+            continue
+        sw = trans_writes.get(fn, set()) & ptr_gnames
+        if not sw:
+            continue
+        cands = [td for td in zero_arg_tds if td != fn and (trans_writes.get(td, set()) & sw)]
+        if cands:
+            out[fn] = min(cands, key=lambda td: (-len(trans_writes[td] & sw), td))
+    return out
+
+
+def _global_pointer_ownership(
+    merged_globals: Mapping[str, dict[str, Any]],
+    trans_writes: Mapping[str, set[str]],
+    global_td: Mapping[str, str],
+    freeing: Collection[str],
+    anon_tags: Mapping[str, str] | None = None,
+) -> tuple[dict[str, set[str]], dict[str, set[str]], set[str]]:
+    """
+    Classify global pointer ownership for functions that write non-`const` global variables:
+      - `freed_ptrs[fn]`: record pointee types of non-`const` pointer globals written by `fn` AND
+        written by its global teardown `gtd = global_td[fn]` where `gtd in freeing`. Single cases
+        allocate matching non-`const` record-pointer arguments with `calloc` so `gtd()` frees valid
+        heap memory rather than a stack object (preventing both bad-free and cross-input
+        stack-use-after-scope).
+      - `retained_ptrs[fn]`: record pointee types of non-`const` pointer globals written by `fn`
+        that are NOT cleared by `gtd` and NOT written by any freeing function; single cases use
+        `static` storage so a stored pointer never dangles past function return.
+      - `types_known`: functions in `global_td` for which `merged_globals` provides global variable
+        type metadata, making single-case global teardown safe even with non-`const` record pointer
+        parameters (because every retained freed pointer has been heap-allocated).
+    """
+    if not merged_globals or not trans_writes:
+        return {}, {}, set()
+    typedef_to_tags: dict[str, list[str]] = {}
+    for tag, tdef in (anon_tags or {}).items():
+        typedef_to_tags.setdefault(_spelled(tdef), []).append(_spelled(tag))
+    all_global_names: set[str] = set()
+    ptr_globals: dict[str, set[str]] = {}
+    for gid, g in merged_globals.items():
+        if not isinstance(g, dict):
+            continue
+        gname = str(g.get("name") or gid.split("#")[-1])
+        if not gname:
+            continue
+        all_global_names.add(gname)
+        if g.get("const") is True:
+            continue
+        keys: set[str] = set()
+        for raw_t in (str(g.get("type") or ""), str(g.get("raw_type") or "")):
+            pt = _single_record_pointee(raw_t)
+            if not pt:
+                continue
+            keys.add(pt)
+            if pt in (anon_tags or {}):
+                keys.add(_spelled((anon_tags or {})[pt]))
+            for tag in typedef_to_tags.get(pt, ()):
+                keys.add(tag)
+        if keys:
+            ptr_globals.setdefault(gname, set()).update(keys)
+    freeing_set = set(freeing)
+    globals_written_by_freer: set[str] = set()
+    for ffn, gset in trans_writes.items():
+        if ffn in freeing_set:
+            globals_written_by_freer.update(gset)
+    freed_ptrs: dict[str, set[str]] = {}
+    retained_ptrs: dict[str, set[str]] = {}
+    types_known: set[str] = set()
+    for fn, written in trans_writes.items():
+        if not written:
+            continue
+        gtd = global_td.get(fn)
+        if gtd is not None and (written & all_global_names):
+            types_known.add(fn)
+        td_writes = trans_writes.get(gtd, set()) if gtd else set()
+        for gname in written:
+            pt_types = ptr_globals.get(gname)
+            if not pt_types:
+                continue
+            if gtd is not None and gname in td_writes and gtd in freeing_set:
+                freed_ptrs.setdefault(fn, set()).update(pt_types)
+            elif gtd is not None and gname in td_writes:
+                # Teardown clears the global before the case returns without calling free(): stack is safe.
+                continue
+            elif gname not in globals_written_by_freer:
+                retained_ptrs.setdefault(fn, set()).update(pt_types)
+    return freed_ptrs, retained_ptrs, types_known
+
+
 def _global_state_flow(model_functions: Mapping[str, Any]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """
     Per function name in the Phase 0 model, the global variable names it transitively writes
@@ -5442,7 +5657,11 @@ def _sequence_case(
         calls.append(f"(void){trailing_teardown}();")
         names.append(trailing_teardown)
         case.notes.append(f"call {len(names) - 1}: global state reset after setup with {trailing_teardown}")
-    return case.statements(calls), case.layout("sequence", names), None
+    layout = case.layout("sequence", names)
+    first_non_setup = next((pos for pos in range(len(chain)) if pos not in setup_pos), len(chain))
+    if first_non_setup > 0:
+        layout["setup_calls"] = list(names[:first_non_setup])
+    return case.statements(calls), layout, None
 
 
 def lifecycle_methods(htype: str, records: dict[str, dict], api: ApiInfo) -> list[str]:
@@ -5990,6 +6209,7 @@ def plan(
     tm_active = False
     entry_trust_map: dict[str, _EntryTrust] = {}
     schema_globals: dict[str, list[dict[str, Any]]] = {}
+    merged_globals: dict[str, dict[str, Any]] = {}
     if effective_trust_schema:
         tm_active, entry_trust_map = _resolve_threat_model(dag, model, trust=trust, unit=resolved_unit)
         merged_globals = _merge_global_variables(model, dag, global_variables)
@@ -6038,10 +6258,19 @@ def plan(
     model_fns = model.get("functions") or {}
     trans_writes: dict[str, set[str]] = {}
     trans_refs: dict[str, set[str]] = {}
-    if effective_trust_schema and traces:
+    if effective_trust_schema and (traces or merged_globals):
         trans_writes, trans_refs = _global_state_flow(model_fns)
     global_td = (
         _global_teardowns(callable_recs, traces, trans_writes) if (effective_trust_schema and trans_writes) else {}
+    )
+    freeing_fns = _reaching(model_fns, frozenset({"free"}))
+    if effective_trust_schema and trans_writes and merged_globals:
+        for fn, td in _freeing_global_teardowns(callable_recs, merged_globals, trans_writes, freeing_fns).items():
+            global_td.setdefault(fn, td)
+    global_freed_ptrs, global_retained_ptrs, global_types_known = (
+        _global_pointer_ownership(merged_globals, trans_writes, global_td, freeing_fns, anon_tags)
+        if (effective_trust_schema and trans_writes)
+        else ({}, {}, set())
     )
     helper_pool |= set(global_td.values()) - entry_names
     api = ApiInfo(
@@ -6096,8 +6325,11 @@ def plan(
         trusted_scalars=recorded_scalars(traces) if effective_trust_schema else {},
         recorded_input_buffers=recorded_input_buffers(traces),
         heap_buffer_fns=_reaching(model_fns, _HEAP_SIZE_PROBERS),
-        freeing=_reaching(model_fns, frozenset({"free"})),
+        freeing=freeing_fns,
         global_teardown=global_td,
+        global_freed_ptrs=global_freed_ptrs,
+        global_retained_ptrs=global_retained_ptrs,
+        global_types_known=global_types_known,
     )
     # Each function's threat-model roles by name, for the sequence cases (bound as in its single case).
     trust_by_name: dict[str, _EntryTrust] = {}
@@ -6403,6 +6635,121 @@ def schema_externs_used(cases: list[str], externs: dict[str, str]) -> list[str]:
     if not externs:
         return []
     return [externs[g] for g in sorted(externs) if any(re.search(rf"\b{re.escape(g)}\b", c) for c in cases)]
+
+
+SYNTH_PROTO_MARKER = "framac-api-synth-proto:"
+_SYNTH_PROTO_LINE_RE = re.compile(r"/\*\s*framac-api-synth-proto:\s*([A-Za-z_]\w*)\s*\*/")
+_UNDECLARED_FN_RE = re.compile(
+    r"(?:call to undeclared function|implicit declaration of function)\s+['`\u2018]([A-Za-z_]\w*)['`\u2019]"
+)
+_TAG_USE_RE = re.compile(r"\b(struct|union)\s+([A-Za-z_]\w*)\b")
+
+
+def _apply_const_pointee(ctype: str) -> str:
+    """Restore `const` on the direct pointee of a CIL-canonical pointer type (`T *` -> `T const *`)."""
+    s = _spelled(ctype)
+    if "(" in s or "*" not in s:
+        return s
+    idx = s.rfind("*")
+    head, tail = s[:idx].rstrip(), s[idx:]
+    if re.search(r"\bconst\s*$", head):
+        return s
+    return f"{head} const {tail}"
+
+
+def synthesize_extern_prototype(
+    name: str,
+    rec: Mapping[str, Any],
+    anon_tags: Mapping[str, str] | None = None,
+    known_structs: Collection[str] | None = None,
+) -> tuple[str, str] | None:
+    """
+    Build a C `extern` prototype for an exported (non-`static`, non-variadic) function from its
+    Phase 0 model signature when no included header declares it. Returns `(marked_line, clean_decl)`
+    or `None` when the signature cannot be spelled safely in the harness's header scope (e.g.
+    variadic, function-pointer return, or unresolved anonymous struct/union/enum tag).
+    """
+    if not _IDENT_RE.fullmatch(name) or rec.get("static"):
+        return None
+    sig = str(rec.get("signature") or "")
+    formals = list(rec.get("formals") or [])
+    if not sig or is_variadic(sig, formals):
+        return None
+    parts = split_signature(sig)
+    if parts is None:
+        return None
+    ret_raw, param_raws, _ = parts
+    if not ret_raw or "(" in ret_raw or "[" in ret_raw:
+        return None
+    tags = anon_tags or {}
+
+    def _spell_type(t: str) -> str | None:
+        def _rep(m: re.Match[str]) -> str:
+            tag = " ".join(m.group(0).split())
+            return tags.get(tag, m.group(0))
+
+        spelled = _ANON_RECORD_RE.sub(_rep, _spelled(t))
+        if _ANON_TAG_RE.search(spelled):
+            return None
+        return spelled
+
+    ret = _spell_type(ret_raw)
+    if ret is None:
+        return None
+    spelled_params: list[str] = []
+    for k, raw_p in enumerate(param_raws):
+        sp = _spell_type(raw_p)
+        if sp is None:
+            return None
+        if k < len(formals) and isinstance(formals[k], Mapping) and formals[k].get("kind") == "const_pointer":
+            sp = _apply_const_pointee(sp)
+        spelled_params.append(sp)
+    params_c = ", ".join(spelled_params) if spelled_params else "void"
+    clean_decl = f"extern {ret} {name}({params_c});"
+    known = set(known_structs or ())
+    fwd_tags: set[tuple[str, str]] = set()
+    for t in (ret, *spelled_params):
+        if "*" not in t:
+            continue
+        for m in _TAG_USE_RE.finditer(t):
+            kw, tag = m.group(1), m.group(2)
+            if f"{kw} {tag}" not in known:
+                fwd_tags.add((kw, tag))
+    fwd_prefix = " ".join(f"{kw} {tag};" for kw, tag in sorted(fwd_tags))
+    decl_line = f"{fwd_prefix} {clean_decl}" if fwd_prefix else clean_decl
+    marked_line = f"{decl_line} /* {SYNTH_PROTO_MARKER} {name} */"
+    return marked_line, clean_decl
+
+
+def synth_protos_used(cases: Sequence[str], protos: Mapping[str, str]) -> list[str]:
+    """The synthesized `extern` prototypes referenced by `cases`, in name order."""
+    if not protos:
+        return []
+    return [protos[fn] for fn in sorted(protos) if any(re.search(rf"\b{re.escape(fn)}\s*\(", c) for c in cases)]
+
+
+def _synth_proto_errors(harness_c: Path, errors: Sequence[str]) -> set[str] | None:
+    """
+    When every compile error outside the cases (`probe_cases`) lands on a synthesized `extern`
+    prototype line, return the set of function names whose synthesized prototypes errored; else None.
+    """
+    try:
+        lines = harness_c.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    bad_fns: set[str] = set()
+    for err in errors:
+        m = _ERR_LINE_RE.match(err)
+        if not m or Path(m.group("file")).name != harness_c.name:
+            return None
+        no = int(m.group("line"))
+        if not (0 < no <= len(lines)):
+            return None
+        pm = _SYNTH_PROTO_LINE_RE.search(lines[no - 1])
+        if not pm:
+            return None
+        bad_fns.add(pm.group(1))
+    return bad_fns or None
 
 
 def _dropped_variadic(layout: dict, why: str) -> dict[str, Any]:
@@ -7483,7 +7830,8 @@ def probe_layouts(
 # --- the compile probe ------------------------------------------------------------------------------
 
 _ERR_LINE_RE = re.compile(
-    r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s+(?:fatal\s+)?error:\s*(?P<msg>[^\n]*)$", re.MULTILINE
+    r"^(?P<file>(?:[A-Za-z]:)?[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s+(?:fatal\s+)?error:\s*(?P<msg>[^\n]*)$",
+    re.MULTILINE,
 )
 
 
@@ -7761,12 +8109,19 @@ def generate(
     )
     first = str((functions.get(p["entries"][0]) or {}).get("name") or p["entries"][0].split("#")[-1])
     planned = copy.deepcopy(p)  # header-free: every attempt at the headers starts from it
+    exported_model_recs: dict[str, dict[str, Any]] = {}
+    for _mk, _mrec in (model.get("functions") or {}).items():
+        if not isinstance(_mrec, dict) or _mrec.get("static"):
+            continue
+        _mname = str(_mrec.get("name") or _mk.split("#")[-1])
+        if _mname and _mname not in exported_model_recs:
+            exported_model_recs[_mname] = _mrec
 
     def attempt(header: str | None, extra_includes: list[str] | None, more: bool) -> tuple[Any, ...]:
         """
-        One harness with these headers: (p, cases, layouts, skipped, dropped, result). With `more`
-        (an automatic header choice that has a next step), a harness that does not compile outside
-        its cases, or whose cases none compiles, raises `_HeadersBroken` instead of failing.
+        One harness with these headers: (p, cases, layouts, skipped, dropped, result, refused, synth_clean).
+        With `more` (an automatic header choice that has a next step), a harness that does not compile
+        outside its cases, or whose cases none compiles, raises `_HeadersBroken` instead of failing.
         """
         p = copy.deepcopy(planned)
         cases, layouts, skipped = with_custom(p)
@@ -7775,6 +8130,10 @@ def generate(
         # its single case, and a recorded chain names none, so `api_skipped` would never show them.
         refused: list[dict[str, Any]] = []
         result: dict[str, Any] = {}
+        # Synthesized `extern` prototypes for exported functions declared in no included header.
+        synth_protos: dict[str, str] = {}
+        synth_clean: dict[str, str] = {}
+        synth_tried: set[str] = set()
         # Struct layouts come from the first harness written (its headers and prelude): the cases are
         # planned again with them before the compile probe. Each later round drops at least one case, so
         # the loop ends; the harness is written again after every drop, so the one left on disk is the one
@@ -7789,6 +8148,7 @@ def generate(
             # probe, generate_module_harness fails on it itself.
             cur_sources = sorted(set(sources) | {str(s) for s in (p.get("schema_sources") or []) if s})
             file_scope_decls = [
+                *synth_protos_used(cases, synth_protos),
                 *schema_externs_used(cases, p.get("schema_externs") or {}),
                 *stubs_used(cases, p.get("stubs") or {}),
             ]
@@ -7840,6 +8200,13 @@ def generate(
             if probed is None:
                 break  # no compiler: the cases stay unchecked
             bad, other = probed
+            if other and synth_protos:
+                bad_protos = _synth_proto_errors(Path(result["harness_file"]), other)
+                if bad_protos:
+                    for fn in bad_protos:
+                        synth_protos.pop(fn, None)
+                        synth_clean.pop(fn, None)
+                    continue
             if other and layouts_probed is not None and _stub_errors_only(Path(result["harness_file"]), other):
                 # A callback stub the headers cannot spell after all: plan again with NULL callbacks
                 # (each case's notes say so), never fail the harness for a stub.
@@ -7872,6 +8239,30 @@ def generate(
                 )
             if not bad:
                 break
+            added_proto = False
+            cur_visible = layouts_probed[1] if layouts_probed is not None else visible
+            cur_structs = layouts_probed[0] if layouts_probed is not None else (struct_layouts or {})
+            cur_anon_tags: dict[str, str] | None = None
+            for i, diag in sorted(bad.items()):
+                if layouts[i]["kind"] == CUSTOM_KIND:
+                    continue
+                um = _UNDECLARED_FN_RE.search(diag)
+                if not um:
+                    continue
+                ufn = um.group(1)
+                if ufn in synth_tried or ufn not in exported_model_recs:
+                    continue
+                synth_tried.add(ufn)
+                if cur_anon_tags is None:
+                    cur_anon_tags = anon_record_tags(model.get("functions") or {}, cur_visible)
+                built = synthesize_extern_prototype(
+                    ufn, exported_model_recs[ufn], cur_anon_tags, known_structs=cur_structs
+                )
+                if built is not None:
+                    synth_protos[ufn], synth_clean[ufn] = built
+                    added_proto = True
+            if added_proto:
+                continue
             keep = [i for i in range(len(cases)) if i not in bad]
             for i, diag in sorted(bad.items()):
                 if layouts[i]["kind"] == CUSTOM_KIND:
@@ -7903,11 +8294,17 @@ def generate(
             layouts = [layouts[i] for i in keep]
             for sel, lay in enumerate(layouts):
                 lay["selector"] = sel
-        return p, cases, layouts, skipped, dropped, result, refused
+        used_synth = {
+            fn: synth_clean[fn]
+            for fn in sorted(synth_clean)
+            if any(re.search(rf"\b{re.escape(fn)}\s*\(", c) for c in cases)
+        }
+        return p, cases, layouts, skipped, dropped, result, refused, used_synth
 
     # An automatic header choice degrades in steps and never fails the module for its own headers:
     # each abandoned attempt leaves the harness files as they were before it, and is recorded.
     fallbacks: list[dict[str, list[str]]] = []
+    synthesized_protos: dict[str, str] = {}
     with harness_files_kept_on_failure(out_dir, module):
         for n, (hdr, extra, _, included) in enumerate(attempts):
             if hdr is None:
@@ -7917,7 +8314,9 @@ def generate(
                 print(f"api_harness: warning: {warnings[-1]}", file=sys.stderr)
             try:
                 with harness_files_kept_on_failure(out_dir, module):
-                    p, cases, layouts, skipped, dropped, result, refused = attempt(hdr, extra, n + 1 < len(attempts))
+                    p, cases, layouts, skipped, dropped, result, refused, synthesized_protos = attempt(
+                        hdr, extra, n + 1 < len(attempts)
+                    )
                 api_headers = attempts[n][2]
                 break
             except _HeadersBroken as exc:
@@ -7930,6 +8329,8 @@ def generate(
                 )
         if fallbacks:
             api_headers = {**api_headers, "fallbacks": fallbacks}
+        if synthesized_protos:
+            api_headers = {**api_headers, "synthesized_prototypes": synthesized_protos}
         sidecar_path = Path(result["harness_meta"])
         sidecar = load_json_optional(sidecar_path, {}) or {}
         sidecar["api_harness"] = True

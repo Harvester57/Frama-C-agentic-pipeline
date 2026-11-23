@@ -481,8 +481,8 @@ def test_fuzz_campaign_scratch_dir_in_tmp_and_cleaned_up(tmp_path, monkeypatch):
 
     created_scratch = []
 
-    def fake_run(cmd, writable, timeout_s, limits=None, extra_env=None):
-        scratch_dir = writable[0]
+    def fake_run(cmd, writable, timeout_s, cwd=None, limits=None, extra_env=None):
+        scratch_dir = Path(cwd) if cwd is not None else writable[0]
         created_scratch.append(scratch_dir)
         # Scratch must be under tempfile.gettempdir()
         assert str(scratch_dir).startswith(tempfile.gettempdir())
@@ -514,10 +514,12 @@ def test_fuzz_campaign_scratch_dir_in_tmp_and_cleaned_up(tmp_path, monkeypatch):
         workers=2,
     )
 
-    # The campaign and any artifact replays share the unified scratch directory under tempdir
-    assert len(set(created_scratch)) == 1
-    # Scratch directory must be cleaned up in finally block
-    assert not created_scratch[0].exists()
+    # The campaign uses one scratch directory under tempdir and each artifact replay uses an
+    # isolated working directory inside that same scratch directory.
+    campaign_scratch = created_scratch[0]
+    assert all(p == campaign_scratch or p.parent == campaign_scratch for p in created_scratch)
+    # Scratch directory and every replay subdirectory must be cleaned up in finally blocks
+    assert all(not p.exists() for p in created_scratch)
     assert "crash-1" in res["log_tail"] or len(res["artifacts"]) >= 1
 
 

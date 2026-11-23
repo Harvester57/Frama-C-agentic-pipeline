@@ -482,6 +482,73 @@ def _compare_api_reach(tid: str, base: dict, cur: dict, out: Comparison) -> None
         out.add("info", "api_reach", tid, f"seed inputs {_fmt_delta(old_seeds, new_seeds)}")
 
 
+_STAGE_ORDER: tuple[str, ...] = (
+    "capture",
+    "model",
+    "seeds",
+    "phase0",
+    "build",
+    "smoke",
+    "fuzz",
+    "judge",
+    "eva",
+    "coverage",
+    "replay",
+    "ingest",
+    "gate",
+    "queue",
+)
+_PHASE0_STAGES = frozenset({"capture", "model", "seeds", "phase0"})
+
+
+def _compare_stage_times(
+    tid: str,
+    base: dict,
+    cur: dict,
+    out: Comparison,
+    same_machine: bool,
+    *,
+    only_stages: set[str] | frozenset[str] | None = None,
+) -> None:
+    """Per-stage wall and CPU time comparison (`info` rows under area `stage_time`)."""
+    raw_base_stages = base.get("stages")
+    raw_cur_stages = cur.get("stages")
+    base_stages: dict[str, Any] = raw_base_stages if isinstance(raw_base_stages, dict) else {}
+    cur_stages: dict[str, Any] = raw_cur_stages if isinstance(raw_cur_stages, dict) else {}
+    all_names = set(base_stages) | set(cur_stages)
+    if only_stages is not None:
+        all_names &= set(only_stages)
+    if not all_names:
+        return
+    ordered = [s for s in _STAGE_ORDER if s in all_names] + sorted(all_names - set(_STAGE_ORDER))
+    suffix = "" if same_machine else ", machines differ"
+    for stage in ordered:
+        old = base_stages.get(stage)
+        new = cur_stages.get(stage)
+        subject = f"{tid}/{stage}"
+        if isinstance(old, dict) and isinstance(new, dict):
+            parts: list[str] = []
+            for key, label in (("wall_s", "wall"), ("cpu_s", "CPU")):
+                ov, nv = old.get(key), new.get(key)
+                if isinstance(ov, (int, float)) and isinstance(nv, (int, float)):
+                    if ov > 0:
+                        parts.append(f"{label} {ov:.1f}s -> {nv:.1f}s (x{nv / ov:.2f})")
+                    elif nv > 0:
+                        parts.append(f"{label} 0.0s -> {nv:.1f}s")
+            if parts:
+                out.add("info", "stage_time", subject, ", ".join(parts) + suffix)
+        elif isinstance(new, dict):
+            w = new.get("wall_s")
+            c = new.get("cpu_s")
+            if isinstance(w, (int, float)) and isinstance(c, (int, float)):
+                out.add("info", "stage_time", subject, f"only in current run: wall {w:.1f}s, CPU {c:.1f}s")
+        elif isinstance(old, dict):
+            w = old.get("wall_s")
+            c = old.get("cpu_s")
+            if isinstance(w, (int, float)) and isinstance(c, (int, float)):
+                out.add("info", "stage_time", subject, f"only in baseline: wall {w:.1f}s, CPU {c:.1f}s")
+
+
 def _compare_time(tid: str, base: dict, cur: dict, out: Comparison, tol: Tolerances, same_machine: bool) -> None:
     for key, label in (("wall_s", "wall-clock"), ("cpu_s", "CPU")):
         old, new = base.get(key), cur.get(key)
@@ -494,10 +561,20 @@ def _compare_time(tid: str, base: dict, cur: dict, out: Comparison, tol: Toleran
             out.add("warning", "time", tid, message)
         elif ratio != 1.0 and (slower or ratio < 1 / tol.time_ratio):
             out.add("info", "time", tid, message + ("" if same_machine else ", machines differ"))
+    _compare_stage_times(tid, base, cur, out, same_machine)
 
 
 def _compare_target(
-    tid: str, base: dict, cur: dict, out: Comparison, tol: Tolerances, same_machine: bool, fuzz_comparable: bool = True
+    tid: str,
+    base: dict,
+    cur: dict,
+    out: Comparison,
+    tol: Tolerances,
+    same_machine: bool,
+    fuzz_comparable: bool = True,
+    *,
+    phase0_only: bool = False,
+    both_phase0_only: bool = False,
 ) -> None:
     if base.get("revision") != cur.get("revision"):
         out.add("not_compared", "target", tid, f"revision differs: {base.get('revision')} vs {cur.get('revision')}")
@@ -514,6 +591,16 @@ def _compare_target(
     for key in ("functions", "waves", "name_collisions", "recursion_cycles"):
         if base_dag.get(key) != cur_dag.get(key):
             out.add("warning", "dag", tid, f"{key} {base_dag.get(key)} -> {cur_dag.get(key)}")
+    if phase0_only:
+        _compare_api_reach(tid, base, cur, out)
+        for area in ("eva", "functions_with_unknown", "prover_tasks", "units", "candidates"):
+            out.add("not_compared", area, tid, "Phase 0 only run: post-Phase-0 stages were skipped")
+        if both_phase0_only:
+            _compare_time(tid, base, cur, out, tol, same_machine)
+        else:
+            out.add("not_compared", "time", tid, "one run was --phase0-only")
+            _compare_stage_times(tid, base, cur, out, same_machine, only_stages=_PHASE0_STAGES)
+        return
     _compare_tooling(tid, base, cur, out, fuzz_comparable)
     suspect = _target_suspect(base, cur)
     _compare_functions_with_unknown(tid, base, cur, out, suspect)
@@ -607,6 +694,10 @@ def compare_runs(base: dict, cur: dict, tol: Tolerances | None = None, require_a
         (cur.get("selection") or {}).get("fuzz", True),
     )
     fuzz_comparable = base_fuzz == cur_fuzz
+    base_p0 = bool((base.get("selection") or {}).get("phase0_only"))
+    cur_p0 = bool((cur.get("selection") or {}).get("phase0_only"))
+    either_p0 = base_p0 or cur_p0
+    both_p0 = base_p0 and cur_p0
     base_targets, cur_targets = base.get("targets") or {}, cur.get("targets") or {}
     for tid in sorted(set(base_targets) | set(cur_targets)):
         if tid not in cur_targets:
@@ -614,7 +705,17 @@ def compare_runs(base: dict, cur: dict, tol: Tolerances | None = None, require_a
         elif tid not in base_targets:
             out.add("not_compared", "target", tid, "not in the baseline")
         else:
-            _compare_target(tid, base_targets[tid], cur_targets[tid], out, tol, same_machine, fuzz_comparable)
+            _compare_target(
+                tid,
+                base_targets[tid],
+                cur_targets[tid],
+                out,
+                tol,
+                same_machine,
+                fuzz_comparable,
+                phase0_only=either_p0,
+                both_phase0_only=both_p0,
+            )
     _compare_briefs(base, cur, out)
     return out
 

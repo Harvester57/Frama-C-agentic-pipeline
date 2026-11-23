@@ -11,7 +11,9 @@
         "remedies": {
           "type": "array",
           "items": {"type": "string", "minLength": 1}
-        }
+        },
+        "reason": {"type": "string", "minLength": 1},
+        "setup_function": {"type": "string", "minLength": 1}
       },
       "required": ["case", "fingerprint", "crashes"],
       "additionalProperties": false
@@ -157,7 +159,12 @@
         "confirm_s": {"type": "number", "minimum": 0},
         "inputs_per_s": {"type": "number", "minimum": 0},
         "batches_run": {"type": "integer", "minimum": 0},
-        "fresh_confirmations": {"type": "integer", "minimum": 0}
+        "fresh_confirmations": {"type": "integer", "minimum": 0},
+        "cwd_side_effects": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "cwd_isolated_inputs": {"type": "integer", "minimum": 0}
       },
       "required": [
         "judge_s",

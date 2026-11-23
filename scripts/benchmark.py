@@ -149,6 +149,23 @@ def validate_manifest(manifest: dict, assets_dir: Path = ASSETS_DIR) -> list[str
             problems.append(f"{tid}: no modules")
         if len(names) != len(set(names)):
             problems.append(f"{tid}: duplicate module")
+        for mod in target.get("modules", []):
+            rga = mod.get("reach_gaps_accepted")
+            if rga is None:
+                continue
+            if isinstance(rga, str):
+                if not rga.strip():
+                    problems.append(f"{tid}/{mod['name']}: reach_gaps_accepted string must be non-empty")
+            elif isinstance(rga, dict):
+                if not rga or any(
+                    not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip()
+                    for k, v in rga.items()
+                ):
+                    problems.append(
+                        f"{tid}/{mod['name']}: reach_gaps_accepted map must map non-empty function names to non-empty reasons"
+                    )
+            else:
+                problems.append(f"{tid}/{mod['name']}: reach_gaps_accepted must be a string or function->reason map")
         for asset in target.get("assets", []):
             if not (assets_dir / asset["path"]).is_file():
                 problems.append(f"{tid}: missing asset {asset['path']}")
@@ -187,6 +204,18 @@ def validate_manifest(manifest: dict, assets_dir: Path = ASSETS_DIR) -> list[str
                 problems.append(f"{bid}: engine must be eacsl or sanitizers")
             if not replay.get("lines"):
                 problems.append(f"{bid}: replay without expected lines")
+            if "input_hex" in replay:
+                try:
+                    rdata = bytes.fromhex(replay["input_hex"])
+                except (TypeError, ValueError):
+                    problems.append(f"{bid}: replay input_hex is not hexadecimal")
+                else:
+                    if sha256_hex(rdata) != replay.get("input_sha256"):
+                        problems.append(f"{bid}: replay input_sha256 does not match input_hex")
+            if "api_entry" in replay and (not isinstance(replay["api_entry"], str) or not replay["api_entry"].strip()):
+                problems.append(f"{bid}: replay api_entry must be a non-empty string")
+            if "case_kind" in replay and replay["case_kind"] not in ("single", "sequence"):
+                problems.append(f"{bid}: replay case_kind must be single or sequence")
     return problems
 
 
@@ -724,7 +753,9 @@ def _profile_deferred_modules(run_dir: Path, names: list[str]) -> dict[str, str]
     return out
 
 
-def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] | None = None) -> dict:
+def collect_target_metrics(
+    run_dir: Path, target: dict, phase_notes: list[str] | None = None, *, phase0_only: bool = False
+) -> dict:
     """Everything the run file records about one target, read back from its run directory."""
     ledger = read_json(run_dir / "coverage-ledger.json", []) or []
     ledger_rte = {f"{u['file']}#{u['function']}" for u in ledger if u.get("obligation_class") == "rte"}
@@ -746,7 +777,7 @@ def collect_target_metrics(run_dir: Path, target: dict, phase_notes: list[str] |
             with_unknown.update(eva_block.get("functions_with_unknown") or [])
             if eva_block["status"] != "ok":
                 problems.append(f"eva {name}: {eva_block['status']}")
-        elif name not in deferred:
+        elif not phase0_only and name not in deferred:
             problems.append(f"eva {name}: no report")
         entry: dict = {
             "eva": eva_block,
@@ -999,6 +1030,7 @@ def target_spec(target: dict, manifest: dict, *, fuzz_budget: int | None, eva_ti
         for replay in bug["replays"]:
             if replay["target"] != target["id"]:
                 continue
+            has_override = "input_hex" in replay
             replays.append(
                 {
                     "bug": bug["id"],
@@ -1010,8 +1042,11 @@ def target_spec(target: dict, manifest: dict, *, fuzz_budget: int | None, eva_ti
                     "alarm_kind": bug["alarm_kind"],
                     "fingerprint": bug["fingerprint"],
                     "lines": replay["lines"],
-                    "input_hex": bug["input_hex"],
-                    "input_sha256": bug["input_sha256"],
+                    "input_hex": replay["input_hex"] if has_override else bug["input_hex"],
+                    "input_sha256": replay["input_sha256"] if has_override else bug["input_sha256"],
+                    "input_override": has_override,
+                    "api_entry": replay.get("api_entry"),
+                    "case_kind": replay.get("case_kind"),
                     "verdict": bug["verdict"],
                     "reachability": bug["reachability"],
                     "severity": bug["severity"],
@@ -1274,7 +1309,11 @@ def run_target(
     if ok and not phase0_only:
         for name, command, cls in post_phase0_stages(run_fuzz=run_fuzz, replays=bool(spec["replays"])):
             stage(name, command, cls)
-    metrics = collect_target_metrics(run_dir, target, notes)
+    metrics = (
+        collect_target_metrics(run_dir, target, notes, phase0_only=True)
+        if phase0_only
+        else collect_target_metrics(run_dir, target, notes)
+    )
     metadata = read_json(run_dir / "run-metadata.json", {}) or {}
     entry = {
         "set": target["set"],
@@ -1480,9 +1519,15 @@ def migrate_units(manifest: dict, dags: dict[str, dict]) -> dict[str, dict[str, 
 def apply_reach_exemptions(spec: dict, harness_dir: Path = Path("workspace/harnesses")) -> dict:
     """
     Record the manifest's reach exemptions before the gate runs: modules it names in
-    `reach_exempt_modules` (example and test programs), and every entry point the gate reports as
-    unreached for a module with `reach_gaps_accepted` (a pinned recall harness drives only the entry
-    points of the known bugs). Each exemption carries the manifest's reason.
+    `reach_exempt_modules` (example and test programs), and gaps for a module with
+    `reach_gaps_accepted`.
+
+    `reach_gaps_accepted` accepts two forms:
+    - a string (pinned recall harnesses): exempts every gap the gate reports for the module with
+      that single reason;
+    - a mapping `{function_name: reason}` (whole-API harnesses): exempts only the gaps named in the
+      mapping (each with its own reason), leaving any unlisted gap unexempted so the reach gate
+      fails on regressions.
     """
     import harness_reach  # container side, like pipeline_make
 
@@ -1490,13 +1535,48 @@ def apply_reach_exemptions(spec: dict, harness_dir: Path = Path("workspace/harne
         harness_reach.record_exempt(harness_dir, module, None, str(reason))
     accepted = {m["name"]: m["reach_gaps_accepted"] for m in spec["modules"] if m.get("reach_gaps_accepted")}
     functions = 0
+    unlisted_gaps: dict[str, list[str]] = {}
+    unused_exemptions: dict[str, list[str]] = {}
     if accepted:
         report = harness_reach.run_check(Path("workspace/reports/callgraph_dag.json"), harness_dir, sorted(accepted))
         for row in report["modules"]:
-            for fn in row.get("gaps") or []:
-                harness_reach.record_exempt(harness_dir, row["module"], fn, str(accepted[row["module"]]))
-                functions += 1
-    return {"modules_exempted": len(spec.get("reach_exempt_modules") or {}), "functions_exempted": functions}
+            mod = row["module"]
+            rule = accepted[mod]
+            gaps = list(row.get("gaps") or [])
+            if isinstance(rule, dict):
+                used_keys: set[str] = set()
+                unlisted: list[str] = []
+                for fn in gaps:
+                    bare = fn.split("#")[-1]
+                    if fn in rule:
+                        reason = rule[fn]
+                        used_keys.add(fn)
+                    elif bare in rule:
+                        reason = rule[bare]
+                        used_keys.add(bare)
+                    else:
+                        unlisted.append(fn)
+                        continue
+                    harness_reach.record_exempt(harness_dir, mod, fn, str(reason))
+                    functions += 1
+                if unlisted:
+                    unlisted_gaps[mod] = sorted(unlisted)
+                unused = sorted(set(rule) - used_keys)
+                if unused:
+                    unused_exemptions[mod] = unused
+            else:
+                for fn in gaps:
+                    harness_reach.record_exempt(harness_dir, mod, fn, str(rule))
+                    functions += 1
+    out: dict[str, Any] = {
+        "modules_exempted": len(spec.get("reach_exempt_modules") or {}),
+        "functions_exempted": functions,
+    }
+    if unlisted_gaps:
+        out["unlisted_gaps"] = unlisted_gaps
+    if unused_exemptions:
+        out["unused_exemptions"] = unused_exemptions
+    return out
 
 
 def inner_phase0() -> int:
@@ -1601,12 +1681,89 @@ def inner_phase0() -> int:
     return 0 if ok else 1
 
 
-def _replay_input(item: dict) -> Path:
-    """The reproducer as a file under workspace/crashes (byte-exact from the manifest, digest checked)."""
+def _encode_api_selector(selector: int, dispatch_selector: str | None) -> bytes:
+    """Encode an `--api` dispatch case index to match `generate_harness.py` (`identity16` or 1-byte)."""
+    if dispatch_selector == "identity16":
+        return int(selector).to_bytes(2, "little")
+    return bytes([int(selector) & 0xFF])
+
+
+def resolve_api_replay_bytes(
+    item: dict,
+    harness_module: str,
+    harness_dir: Path = Path("workspace/harnesses"),
+) -> bytes:
+    """
+    Resolve the exact byte input for a recall replay item:
+    - verifies `input_hex` against `input_sha256`;
+    - when `item` targets an `--api` dispatch harness (either `item["api_entry"]` is given, or the
+      sidecar has `api_harness: true` and no per-replay `input_override` was supplied), finds the
+      best matching dispatch case in `harness_<harness_module>.json` and prepends its selector byte(s).
+    """
     data = bytes.fromhex(item["input_hex"])
     if sha256_hex(data) != item["input_sha256"]:
         raise BenchmarkError(f"{item['bug']}: input digest mismatch")
-    path = Path("workspace/crashes") / item["module"] / f"crash-{item['input_sha256'][:40]}"
+    api_entry = item.get("api_entry")
+    if item.get("input_override") and not api_entry:
+        return data
+    sidecar = read_json(Path(harness_dir) / f"harness_{harness_module}.json")
+    if not isinstance(sidecar, dict) or not sidecar.get("api_harness"):
+        return data
+    cases = sidecar.get("api_cases")
+    if not isinstance(cases, list):
+        return data
+    target_fn = str(api_entry or item.get("function") or "")
+    if not target_fn:
+        return data
+    want_kind = item.get("case_kind")
+    candidates: list[tuple[tuple[int, int, int, int], int]] = []
+    for lay in cases:
+        if not isinstance(lay, dict):
+            continue
+        sel = lay.get("selector")
+        if not isinstance(sel, int) or isinstance(sel, bool) or sel < 0:
+            continue
+        kind = str(lay.get("kind") or "")
+        if want_kind and kind != want_kind:
+            continue
+        calls = [str(c) for c in (lay.get("calls") or []) if isinstance(c, str)]
+        if target_fn not in calls:
+            continue
+        notes = [str(n) for n in (lay.get("notes") or []) if isinstance(n, str)]
+        has_setup = bool(lay.get("setup_calls")) or any("global setup call:" in n for n in notes)
+        rest = lay.get("rest")
+        rest_on_target = (
+            isinstance(rest, dict)
+            and isinstance(rest.get("call"), int)
+            and 0 <= rest["call"] < len(calls)
+            and calls[rest["call"]] == target_fn
+        )
+        # Prefer configured sequence feeding `rest` directly into `target_fn`, then any sequence with `rest`,
+        # then single with `rest`, then remaining matching cases by lowest selector.
+        rank = (
+            0 if (kind == "sequence" and has_setup and rest_on_target) else 1,
+            0 if rest_on_target else 1,
+            0 if kind == "sequence" else 1,
+            sel,
+        )
+        candidates.append((rank, sel))
+    if not candidates:
+        if api_entry:
+            raise BenchmarkError(
+                f"{item['bug']}: no api_cases entry calling {target_fn!r} in harness_{harness_module}.json"
+            )
+        return data
+    _, best_sel = min(candidates, key=lambda pair: pair[0])
+    return _encode_api_selector(best_sel, sidecar.get("dispatch_selector")) + data
+
+
+def _replay_input(
+    item: dict, harness_module: str | None = None, harness_dir: Path = Path("workspace/harnesses")
+) -> Path:
+    """The reproducer as a file under workspace/crashes (byte-exact from the manifest, digest checked)."""
+    data = resolve_api_replay_bytes(item, harness_module or item["module"], harness_dir)
+    digest = sha256_hex(data)
+    path = Path("workspace/crashes") / (harness_module or item["module"]) / f"crash-{digest[:40]}"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return path
@@ -1642,40 +1799,49 @@ def inner_replay() -> int:
     results: list[dict] = []
     for (module, engine), items in sorted(groups.items()):
         started = time.monotonic()
-        inputs = {id(item): _replay_input(item) for item in items}
+        inputs: dict[int, Path] = {}
+        input_errors: dict[int, str] = {}
+        for item in items:
+            try:
+                inputs[id(item)] = _replay_input(item, harness_module=module)
+            except (OSError, ValueError, RuntimeError) as exc:
+                input_errors[id(item)] = f"{type(exc).__name__}: {exc}"
         failure_reason = None
         report: dict = {}
-        try:
-            build = items[0]["_build"]
-            if isinstance(build, str):
-                raise RuntimeError(build)
-            prepared = crash_replay.prepare_replay_binary(
-                module,
-                build["sources"],
-                Path("workspace/harnesses") / (f"fuzz_{module}" if engine == "eacsl" else f"replay_san_{module}"),
-                attribution=False,
-                engine=engine,
-                cppflags=build["cppflags"],
-                ldflags=build["ldflags"],
-                rte_initialized=bool(build.get("rte_initialized", True)),
-                libc_checks=bool(build.get("libc_checks", True)),
-            )
-            report = crash_replay.replay_report(
-                module,
-                sorted(set(inputs.values())),
-                Path(BENCH_SUBDIR) / "scratch" / f"{module}-{engine}",
-                prepared=prepared,
-                per_input_timeout=PER_INPUT_TIMEOUT_S,
-            )
-            if report.get("status") == "error":
-                failure_reason = str(report.get("reason") or "replay failed")
-        except (OSError, ValueError, RuntimeError) as exc:
-            failure_reason = f"{type(exc).__name__}: {exc}"
+        if inputs:
+            try:
+                build = items[0]["_build"]
+                if isinstance(build, str):
+                    raise RuntimeError(build)
+                prepared = crash_replay.prepare_replay_binary(
+                    module,
+                    build["sources"],
+                    Path("workspace/harnesses") / (f"fuzz_{module}" if engine == "eacsl" else f"replay_san_{module}"),
+                    attribution=False,
+                    engine=engine,
+                    cppflags=build["cppflags"],
+                    ldflags=build["ldflags"],
+                    rte_initialized=bool(build.get("rte_initialized", True)),
+                    libc_checks=bool(build.get("libc_checks", True)),
+                )
+                report = crash_replay.replay_report(
+                    module,
+                    sorted(set(inputs.values())),
+                    Path(BENCH_SUBDIR) / "scratch" / f"{module}-{engine}",
+                    prepared=prepared,
+                    per_input_timeout=PER_INPUT_TIMEOUT_S,
+                )
+                if report.get("status") == "error":
+                    failure_reason = str(report.get("reason") or "replay failed")
+            except (OSError, ValueError, RuntimeError) as exc:
+                failure_reason = f"{type(exc).__name__}: {exc}"
         by_path = {Path(a["artifact"]).as_posix(): a for a in report.get("artifacts") or []}
         to_ingest = []
         for item in items:
-            artifact = by_path.get(inputs[id(item)].as_posix())
-            outcome, reason = ("tool_failure", failure_reason) if failure_reason else classify_replay(artifact, item)
+            item_path = inputs.get(id(item))
+            item_err = input_errors.get(id(item)) or failure_reason
+            artifact = by_path.get(item_path.as_posix()) if item_path is not None else None
+            outcome, reason = ("tool_failure", item_err) if item_err else classify_replay(artifact, item)
             failure = (artifact or {}).get("failure") or {}
             observed = {
                 "file": normalize_file(failure.get("file") or "") if failure else None,
@@ -1685,21 +1851,22 @@ def inner_replay() -> int:
                 "predicate": failure.get("predicate"),
                 "fingerprint": (artifact or {}).get("fingerprint"),
             }
-            results.append(
-                {
-                    "bug": item["bug"],
-                    "module": item["module"],
-                    "harness_module": module,
-                    "engine": engine,
-                    "required": item["required"],
-                    "outcome": outcome,
-                    "reason": reason,
-                    "observed": observed,
-                    "fingerprint_as_recorded": observed["fingerprint"] == item["fingerprint"],
-                    "engine_used": report.get("engine_used"),
-                    "wall_s": round(time.monotonic() - started, 1),
-                }
-            )
+            rec: dict[str, Any] = {
+                "bug": item["bug"],
+                "module": item["module"],
+                "harness_module": module,
+                "engine": engine,
+                "required": item["required"],
+                "outcome": outcome,
+                "reason": reason,
+                "observed": observed,
+                "fingerprint_as_recorded": observed["fingerprint"] == item["fingerprint"],
+                "engine_used": report.get("engine_used"),
+                "wall_s": round(time.monotonic() - started, 1),
+            }
+            if item_path is not None:
+                rec["input_path"] = item_path.as_posix()
+            results.append(rec)
             if item["required"] and outcome == "reproduced":
                 to_ingest.append(artifact)
         if to_ingest:
@@ -1748,8 +1915,8 @@ def verifier_result(
         ],
         "reachability": item["reachability"],
         "harness": {
-            "file": f"workspace/harnesses/harness_{item['module']}.c",
-            "entry_function": harness["entry_fn"],
+            "file": f"workspace/harnesses/harness_{replay.get('harness_module') or item['module']}.c",
+            "entry_function": harness.get("entry_fn") or item.get("api_entry") or "LLVMFuzzerTestOneInput",
             "contract_respected": True,
             "notes": "Pinned harness spec from the campaign whose crash verifier confirmed this bug (docs/bugs-found).",
         },
@@ -1809,8 +1976,13 @@ def inner_gate() -> int:
         if not candidate.get("linked_units"):
             results[replay["bug"]] = {"gate": "no_ledger_unit", "detail": str(candidate.get("notes"))}
             continue
-        report_path = f"workspace/reports/fuzz/bench-replay-{replay['module']}-{replay['engine']}.json"
-        input_path = Path("workspace/crashes") / replay["module"] / f"crash-{item['input_sha256'][:40]}"
+        harness_mod = str(replay.get("harness_module") or replay["module"])
+        report_path = f"workspace/reports/fuzz/bench-replay-{harness_mod}-{replay['engine']}.json"
+        input_path = (
+            Path(replay["input_path"])
+            if replay.get("input_path")
+            else (Path("workspace/crashes") / harness_mod / f"crash-{item['input_sha256'][:40]}")
+        )
         result = verifier_result(item, replay, candidate, harnesses[replay["module"]], report_path, input_path)
         result_path = Path("agents") / result["agent_id"] / "scratch" / "result.json"
         write_json(result_path, result)
@@ -2116,6 +2288,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "targets": sorted(results),
         "targets_not_run": not_run,
         "fuzz": not args.no_fuzz,
+        "phase0_only": bool(args.phase0_only),
         "profile": manifest.get("profile", "standard"),
         "left_out": manifest.get("left_out") or {},
     }
