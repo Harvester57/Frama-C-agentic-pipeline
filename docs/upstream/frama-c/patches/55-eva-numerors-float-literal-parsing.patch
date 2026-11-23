@@ -1,0 +1,283 @@
+From 2f087defd51d141e014112843a84ab3ba7d03efd Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:48:59 +0000
+Subject: [PATCH] [eva] numerors: parse hex/suffixed float literals and handle
+ non-finite constants
+
+Rational.of_string only split decimal strings on 'e' and stripped
+f/l/f32/f64 suffixes. In the Eva numerors domain (IEEE754.Make.constant):
+
+- hexadecimal floating-point literals without hex digit 'e' were
+  misparsed (e.g. 0x1.8p1 became 0.048 and DBL_MAX from <float.h> became
+  8.096e+304, dropping a sure out-of-bounds alarm);
+- hexadecimal literals containing 'e' (0x1.ep0, FLT_MAX) crashed with
+  Failure("int_of_string");
+- GCC 'd'-suffixed literals (1.5d) and non-finite constants (INFINITY,
+  NAN, HUGE_VAL) crashed with Invalid_argument("Z.of_substring_base:
+  invalid digit").
+
+Delegate parsing in Rational.of_string to Zarith Q.of_string after
+stripping floating-point suffixes (including d/D, without stripping hex
+digits from integer literals), and return Top in IEEE754.Make.constant
+for any non-finite CReal.
+
+New test: plugins/eva/tests/numerors/float_literals.c.
+---
+ .../values/non_integer_arithmetic/IEEE754.ml  |   1 +
+ plugins/eva/tests/numerors/float_literals.c   |  54 +++++++++
+ .../oracle/float_literals.0.res.oracle        | 103 ++++++++++++++++++
+ src/lib/arithmetic/rational.ml                |  51 ++++-----
+ 4 files changed, 181 insertions(+), 28 deletions(-)
+ create mode 100644 plugins/eva/tests/numerors/float_literals.c
+ create mode 100644 plugins/eva/tests/numerors/oracle/float_literals.0.res.oracle
+
+diff --git a/plugins/eva/src/values/non_integer_arithmetic/IEEE754.ml b/plugins/eva/src/values/non_integer_arithmetic/IEEE754.ml
+index 6f28b6fc25..1c77519f05 100644
+--- a/plugins/eva/src/values/non_integer_arithmetic/IEEE754.ml
++++ b/plugins/eva/src/values/non_integer_arithmetic/IEEE754.ml
+@@ -566,6 +566,7 @@ module Make (Model : Modeling) = struct
+ 
+   let constant _ _ = function
+     | CInt64 _ | CTopInt _ | CChr _ | CEnum _ -> Top
++    | CReal (f, _, _) when not (Float.is_finite f) -> Top
+     | CReal (f, fkind, None) ->
+       let Format format = format_of_fkind fkind in
+       let exact = Scalar.of_float f |> Exact.singleton in
+diff --git a/plugins/eva/tests/numerors/float_literals.c b/plugins/eva/tests/numerors/float_literals.c
+new file mode 100644
+index 0000000000..cec38dc7f1
+--- /dev/null
++++ b/plugins/eva/tests/numerors/float_literals.c
+@@ -0,0 +1,54 @@
++/* run.config*
++   OPT: -machdep gcc_x86_64 -eva -eva-domains numerors -eva-msg-key=d-numerors
++*/
++#include <float.h>
++#include <math.h>
++#include "__fc_builtin.h"
++
++int tab[2];
++
++void test_hex_and_suffixes(void) {
++  double x = Frama_C_double_interval(1.0, 2.0);
++  double h = x * 0x1.8p1;
++  double d = x * 3.0;
++  double he = 0x1.ep0;
++  double ds = 1.5d;
++  float fm = FLT_MAX;
++  double dm = DBL_MAX;
++  Frama_C_domain_show_each_hex(h);
++  Frama_C_domain_show_each_dec(d);
++  Frama_C_domain_show_each_he(he);
++  Frama_C_domain_show_each_ds(ds);
++  Frama_C_domain_show_each_fm(fm);
++  Frama_C_domain_show_each_dm(dm);
++}
++
++void test_dbl_max_alarm(void) {
++  double x = Frama_C_double_interval(1e305, 1e306);
++  double m = DBL_MAX;
++  int i = 0;
++  if (x < m)
++    i = 2;
++  tab[i] = 1;
++}
++
++void test_non_finite(int c) {
++  if (c == 0) {
++    float f = INFINITY;
++    Frama_C_domain_show_each_inf(f);
++  } else if (c == 1) {
++    float n = NAN;
++    Frama_C_domain_show_each_nan(n);
++  } else if (c == 2) {
++    double hv = HUGE_VAL;
++    Frama_C_domain_show_each_hv(hv);
++  }
++}
++
++void main(int c) {
++  test_hex_and_suffixes();
++  if (c == 3)
++    test_dbl_max_alarm();
++  else
++    test_non_finite(c);
++}
+diff --git a/plugins/eva/tests/numerors/oracle/float_literals.0.res.oracle b/plugins/eva/tests/numerors/oracle/float_literals.0.res.oracle
+new file mode 100644
+index 0000000000..a94b3b6553
+--- /dev/null
++++ b/plugins/eva/tests/numerors/oracle/float_literals.0.res.oracle
+@@ -0,0 +1,103 @@
++[kernel] Parsing float_literals.c (with preprocessing)
++[kernel:parser:decimal-float] float_literals.c:27: Warning: 
++  Floating-point constant 1e306 is not represented exactly. Will use 0x1.6c8e5ca239029p1016.
++  (warn-once: no further messages from category 'parser:decimal-float' will be emitted)
++[eva:experimental] Warning: The numerors domain is experimental.
++[eva] Analyzing a complete application starting at main
++[eva:initial-state] Values of globals at initialization
++  tab[0..1] ∈ {0}
++[eva] using specification for function Frama_C_double_interval
++[eva:show] float_literals.c:18: 
++  Frama_C_domain_show_each_hex:
++  h : # cvalue: [3. .. 6.]
++      # numerors: Real     : [3. .. 6.]
++                  Absolute : [-4.4408920985e-16 .. 4.4408920985e-16]
++                  Relative : [-1.11022302463e-16 .. 1.11022302463e-16]
++                  Format : Binary64
++[eva:show] float_literals.c:19: 
++  Frama_C_domain_show_each_dec:
++  d : # cvalue: [3. .. 6.]
++      # numerors: Real     : [3. .. 6.]
++                  Absolute : [-4.4408920985e-16 .. 4.4408920985e-16]
++                  Relative : [-1.11022302463e-16 .. 1.11022302463e-16]
++                  Format : Binary64
++[eva:show] float_literals.c:20: 
++  Frama_C_domain_show_each_he:
++  he : # cvalue: {1.875}
++       # numerors: Real     : [1.875 .. 1.875]
++                   Absolute : [0. .. 0.]
++                   Relative : [0. .. 0.]
++                   Format : Binary64
++[eva:show] float_literals.c:21: 
++  Frama_C_domain_show_each_ds:
++  ds : # cvalue: {1.5}
++       # numerors: Real     : [1.5 .. 1.5]
++                   Absolute : [0. .. 0.]
++                   Relative : [0. .. 0.]
++                   Format : Binary64
++[eva:show] float_literals.c:22: 
++  Frama_C_domain_show_each_fm:
++  fm : # cvalue: {3.40282346639e+38}
++       # numerors: Real     : [3.40282346639e+38 .. 3.40282346639e+38]
++                   Absolute : [0. .. 0.]
++                   Relative : [0. .. 0.]
++                   Format : Binary32
++[eva:show] float_literals.c:23: 
++  Frama_C_domain_show_each_dm:
++  dm : # cvalue: {1.79769313486e+308}
++       # numerors: Real     : [1.79769313486e+308 .. 1.79769313486e+308]
++                   Absolute : [0. .. 0.]
++                   Relative : [0. .. 0.]
++                   Format : Binary64
++[eva:alarm] float_literals.c:32: Warning: 
++  accessing out of bounds index. assert i < 2;
++[eva] float_literals.c:32: Warning: 
++  all target addresses were invalid. This path is assumed to be dead.
++[eva:alarm] float_literals.c:37: Warning: 
++  non-finite float value. assert \is_finite((float)INFINITY);
++[eva:alarm] float_literals.c:40: Warning: 
++  non-finite float value. assert \is_finite((float)NAN);
++[eva:alarm] float_literals.c:43: Warning: 
++  non-finite float value. assert \is_finite((float)INFINITY);
++[eva] float_literals.c:32: assertion 'Eva,index_bound' got final status invalid.
++[eva] float_literals.c:37: 
++  assertion 'Eva,is_nan_or_infinite' got final status invalid.
++[eva] float_literals.c:40: 
++  assertion 'Eva,is_nan_or_infinite' got final status invalid.
++[eva] float_literals.c:43: 
++  assertion 'Eva,is_nan_or_infinite' got final status invalid.
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function test_dbl_max_alarm:
++  NON TERMINATING FUNCTION
++[eva:final-states] Values at end of function test_hex_and_suffixes:
++  Frama_C_entropy_source ∈ [--..--]
++  x ∈ [1. .. 2.]
++  h ∈ [3. .. 6.]
++  d ∈ [3. .. 6.]
++  he ∈ {1.875}
++  ds ∈ {1.5}
++  fm ∈ {3.40282346639e+38}
++  dm ∈ {1.79769313486e+308}
++[eva:final-states] Values at end of function test_non_finite:
++  
++[eva:final-states] Values at end of function main:
++  Frama_C_entropy_source ∈ [--..--]
++[eva:summary] ====== ANALYSIS SUMMARY ======
++  ----------------------------------------------------------------------------
++  4 functions analyzed (out of 4): 100% coverage.
++  In these functions, 32 statements reached (out of 36): 89% coverage.
++  ----------------------------------------------------------------------------
++  Some errors and warnings have been raised during the analysis:
++    by the Eva analyzer:      0 errors    2 warnings
++    by the Frama-C kernel:    0 errors    1 warning
++  ----------------------------------------------------------------------------
++  4 alarms generated by the analysis:
++       3 nan or infinite floating-point values
++       1 access out of bounds index
++  4 of them are sure alarms (invalid status).
++  ----------------------------------------------------------------------------
++  Evaluation of the logical properties reached by the analysis:
++    Assertions        0 valid     0 unknown     0 invalid      0 total
++    Preconditions     4 valid     0 unknown     0 invalid      4 total
++  100% of the logical properties reached have been proven.
++  ----------------------------------------------------------------------------
+diff --git a/src/lib/arithmetic/rational.ml b/src/lib/arithmetic/rational.ml
+index c1495fac50..9d05e94de1 100644
+--- a/src/lib/arithmetic/rational.ml
++++ b/src/lib/arithmetic/rational.ml
+@@ -28,38 +28,33 @@ let is_valid q =
+   | Q.UNDEF -> false
+   | _ -> true
+ 
+-let pow10 e = Z.(pow ten e) |> Q.of_bigint
+-
+-let split_significant_exponent s =
+-  match String.split_on_char 'e' s with
+-  | [] | _ :: _ :: _ :: _ -> assert false
+-  | [ s ] -> s, 0
+-  | [ m ; e ] -> m, int_of_string e
+-
+-let significant_of_string significant =
+-  match String.split_on_char '.' significant with
+-  | [] | _ :: _ :: _ :: _ -> assert false
+-  | [ m ] -> Q.of_string m
+-  | [ integer ; fractional ] ->
+-    let shift = pow10 (String.length fractional) in
+-    Q.(of_string (integer ^ fractional) / shift)
+-
+-let remove_float_suffix str len =
+-  if String.ends_with ~suffix:"f" str
+-  || String.ends_with ~suffix:"l" str then String.sub str 0 (len - 1)
+-  else if String.ends_with ~suffix:"f32" str
+-       || String.ends_with ~suffix:"f64" str then
++let remove_float_suffix str =
++  let len = String.length str in
++  let is_digit_or_dot c = (c >= '0' && c <= '9') || c = '.' in
++  let has_hex_prefix =
++    String.starts_with ~prefix:"0x" str
++    || String.starts_with ~prefix:"+0x" str
++    || String.starts_with ~prefix:"-0x" str
++  in
++  let is_float_literal =
++    not has_hex_prefix || String.contains str 'p'
++  in
++  if not is_float_literal then str
++  else if len >= 4
++       && is_digit_or_dot str.[len - 4]
++       && (String.ends_with ~suffix:"f32" str
++           || String.ends_with ~suffix:"f64" str) then
+     String.sub str 0 (len - 3)
++  else if len >= 2
++       && is_digit_or_dot str.[len - 2]
++       && (String.ends_with ~suffix:"f" str
++           || String.ends_with ~suffix:"d" str
++           || String.ends_with ~suffix:"l" str) then
++    String.sub str 0 (len - 1)
+   else str
+ 
+ let of_string str =
+-  let str = String.lowercase_ascii str in
+-  let length = String.length str in
+-  let str = remove_float_suffix str length in
+-  let significant, e = split_significant_exponent str in
+-  let significant = significant_of_string significant in
+-  let shift = if e >= 0 then pow10 e else Q.inv (pow10 ~-e) in
+-  Q.(significant * shift)
++  str |> String.lowercase_ascii |> remove_float_suffix |> Q.of_string
+ 
+ let pow2 e =
+   let scaling = Q.(mul_2exp one (Stdlib.abs e)) in
+-- 
+2.47.3
+

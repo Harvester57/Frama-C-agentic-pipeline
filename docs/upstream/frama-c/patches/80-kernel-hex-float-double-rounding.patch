@@ -1,0 +1,258 @@
+From c3b2e961166d229960a072c6a476b95753cc0d71 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:54:05 +0000
+Subject: [PATCH] [kernel] avoid double rounding when parsing hexadecimal float
+ constants
+
+---
+ src/lib/floating_point/typed_float.ml         | 96 +++++++++++++++----
+ tests/misc/hex_float_rounding.c               | 45 +++++++++
+ .../oracle/hex_float_rounding.0.err.oracle    |  0
+ .../oracle/hex_float_rounding.0.res.oracle    | 57 +++++++++++
+ 4 files changed, 177 insertions(+), 21 deletions(-)
+ create mode 100644 tests/misc/hex_float_rounding.c
+ create mode 100644 tests/misc/oracle/hex_float_rounding.0.err.oracle
+ create mode 100644 tests/misc/oracle/hex_float_rounding.0.res.oracle
+
+diff --git a/src/lib/floating_point/typed_float.ml b/src/lib/floating_point/typed_float.ml
+index 7f9fc35d91..7f9a23c427 100644
+--- a/src/lib/floating_point/typed_float.ml
++++ b/src/lib/floating_point/typed_float.ml
+@@ -418,23 +418,51 @@ let normalize integral fractional exponent format =
+ 
+ 
+ 
+-let is_hexadecimal s =
+-  Stdlib.(String.length s >= 2 && s.[0] = '0' && (s.[1] = 'X' || s.[1] = 'x'))
+-
+-let parse_hexadecimal (type f) ~(format : f format) s =
+-  let open Option.Operators in
+-  let current  = get_rounding_mode () in
+-  set_rounding_mode Nearest_even ;
+-  let* nearest = float_of_string_opt s in
+-  let  nearest = represents ~float:nearest ~in_format:format in
+-  set_rounding_mode Downward ;
+-  let* lower   = float_of_string_opt s in
+-  let  lower   = represents ~float:lower   ~in_format:format in
+-  set_rounding_mode Upward ;
+-  let* upper   = float_of_string_opt s in
+-  let  upper   = represents ~float:upper   ~in_format:format in
+-  set_rounding_mode current ;
+-  Some { lower ; nearest ; upper ; format }
++let normalize_hexadecimal integral fractional exponent format =
++  let concat = Z.of_string_base 16 (integral ^ fractional) in
++  let* numerator = normalize_zero_in_numerator ~format concat in
++  let fractional_bits = Z.of_int Stdlib.(4 * String.length fractional) in
++  let raw_exp = Z.sub (Z.of_string exponent) fractional_bits in
++  let sig_size = sig_size format in
++  let maximal_exponent = maximal_exponent_of ~format in
++  let minimal_exponent = Stdlib.(minimal_exponent_of ~format - sig_size + 1) in
++  let msb_exp = Z.add raw_exp (Z.of_int (Z.log2 numerator)) in
++  let* () =
++    if Z.Compare.(msb_exp > Z.of_int maximal_exponent)
++    then pos_inf_shortcut ~format
++    else Normalized ()
++  in
++  let* () =
++    if Z.Compare.(msb_exp < Z.of_int Stdlib.(minimal_exponent - 1))
++    then zero_shortcut ~format
++    else Normalized ()
++  in
++  let msb_exp_int = Z.to_int msb_exp in
++  let target_exp = Stdlib.max minimal_exponent Stdlib.(msb_exp_int - sig_size + 1) in
++  let shift = Z.to_int (Z.sub (Z.of_int target_exp) raw_exp) in
++  if Stdlib.(shift <= 0) then
++    let significant = Z.shift_left numerator Stdlib.(-shift) in
++    let exact = Float.ldexp (Z.to_float significant) target_exp in
++    let bound = represents ~float:exact ~in_format:format in
++    Normalized { lower = bound ; nearest = bound ; upper = bound ; format }
++  else
++    let significant = Z.shift_right numerator shift in
++    let tz = Z.trailing_zeros numerator in
++    let is_zero = Stdlib.(tz >= shift) in
++    let half_bit = Z.testbit numerator Stdlib.(shift - 1) in
++    let is_half = half_bit && Stdlib.(tz = shift - 1) in
++    let less_than_half = not half_bit in
++    let is_last_bit_zero = Z.(equal (logand significant one) zero) in
++    let tie_to_even = is_half && is_last_bit_zero in
++    let nearest_is_down = is_zero || less_than_half || tie_to_even in
++    let lower_bound = Float.ldexp (Z.to_float significant) target_exp in
++    let upper_bound = Float.ldexp Z.(succ significant |> to_float) target_exp in
++    let lower = represents ~float:lower_bound ~in_format:format in
++    let upper =
++      if is_zero then lower else represents ~float:upper_bound ~in_format:format
++    in
++    let nearest = if nearest_is_down then lower else upper in
++    Normalized { lower ; nearest ; upper ; format }
+ 
+ 
+ 
+@@ -470,8 +498,15 @@ module Regexp = struct
+   let dot  = "[.]"
+   let num  = "\\([0-9]*\\)"
+   let exp  = "[eE]\\([+-]?[0-9]+\\)"
++  let hex_prefix = "0[xX]"
++  let hex_num = "\\([0-9a-fA-F]*\\)"
++  let hex_exp = "[pP]\\([+-]?[0-9]+\\)"
+ end
+ 
++let hex_dot_frac_exp =
++  Str.regexp Regexp.(sign ^ hex_prefix ^ hex_num ^ dot ^ hex_num ^ hex_exp ^ "$")
++let hex_exp =
++  Str.regexp Regexp.(sign ^ hex_prefix ^ hex_num ^ hex_exp ^ "$")
+ let num_dot_frac_exp = Str.regexp Regexp.(sign ^ num ^ dot ^ num ^ exp)
+ let num_dot_frac     = Str.regexp Regexp.(sign ^ num ^ dot ^ num)
+ let num_exp          = Str.regexp Regexp.(sign ^ num ^ exp)
+@@ -487,10 +522,29 @@ let parse str =
+     in
+     if String.length str == 0 then empty_string ()
+     else try
+-        if is_hexadecimal str then
+-          match parse_hexadecimal ~format str with
+-          | None -> unparsable_error ()
+-          | Some result -> Ok (Parsed (supported, result))
++        if Str.string_match hex_dot_frac_exp str 0 then
++          let sign       = Str.matched_group 1 str in
++          let integral   = Str.matched_group 2 str in
++          let fractional = Str.matched_group 3 str in
++          let exponent   = Str.matched_group 4 str in
++          if Stdlib.(String.length integral = 0 && String.length fractional = 0) then
++            unparsable_error ()
++          else
++            let normalizing =
++              normalize_hexadecimal integral fractional exponent format
++            in
++            Ok (Parsed (supported, apply_sign sign normalizing))
++        else if Str.string_match hex_exp str 0 then
++          let sign       = Str.matched_group 1 str in
++          let integral   = Str.matched_group 2 str in
++          let exponent   = Str.matched_group 3 str in
++          if Stdlib.(String.length integral = 0) then
++            unparsable_error ()
++          else
++            let normalizing =
++              normalize_hexadecimal integral "" exponent format
++            in
++            Ok (Parsed (supported, apply_sign sign normalizing))
+         else if Str.string_match num_dot_frac_exp str 0 then
+           let sign       = Str.matched_group 1 str in
+           let integral   = Str.matched_group 2 str in
+diff --git a/tests/misc/hex_float_rounding.c b/tests/misc/hex_float_rounding.c
+new file mode 100644
+index 0000000000..f62ef9a925
+--- /dev/null
++++ b/tests/misc/hex_float_rounding.c
+@@ -0,0 +1,45 @@
++/* run.config
++  PLUGIN: @EVA_PLUGINS@
++  OPT: -eva -kernel-warn-key parser:decimal-float=active
++ */
++
++void main(void) {
++  /* Single-precision normal double-rounding (rounds up to 0x1.000002p0f). */
++  float f_up = 0x1.0000010000000001p0f;
++  float f_neg = -0x1.0000010000000001p0f;
++  _Float32 f32_up = 0x1.0000010000000001p0f32;
++  /*@ check f_up == 0x1.000002p0f; */
++  /*@ check f_neg == -0x1.000002p0f; */
++  /*@ check f32_up == 0x1.000002p0f32; */
++
++  /* Exact single-precision ties to even. */
++  float f_tie_even = 0x1.000001p0f;
++  float f_tie_odd = 0x1.000003p0f;
++  /*@ check f_tie_even == 0x1.000000p0f; */
++  /*@ check f_tie_odd == 0x1.000004p0f; */
++
++  /* Subnormal double-rounding and ties. */
++  float f_sub_up = 0x1.0000000000000001p-150f;
++  float f_sub_tie_zero = 0x1p-150f;
++  float f_sub_tie_odd = 0x1.8p-149f;
++  /*@ check f_sub_up == 0x1p-149f; */
++  /*@ check f_sub_tie_zero == 0.0f; */
++  /*@ check f_sub_tie_odd == 0x1p-148f; */
++
++  /* Overflow boundary for single precision: rounds to FLT_MAX, not +inf. */
++  float f_max = 0x1.fffffeffffffffffffp127f;
++  /*@ check f_max == 0x1.fffffep127f; */
++
++  /* Double-precision tie+ulp rounding (rounds up to 0x1.0000000000001p0). */
++  double d_up = 0x1.0000000000000800000000000001p0;
++  /*@ check d_up == 0x1.0000000000001p0; */
++
++  /* Exact forms including no dot, leading dot, and zero. */
++  float f_exact = 0x1.000002p0f;
++  float f_nodot = 0x1p0f;
++  float f_leaddot = 0x.8p0f;
++  float f_zero = 0x0p0f;
++  float f_huge_zero = 0x0p99999999999999999999f;
++  /*@ check f_exact == 0x1.000002p0f && f_nodot == 1.0f && f_leaddot == 0.5f; */
++  /*@ check f_zero == 0.0f && f_huge_zero == 0.0f; */
++}
+diff --git a/tests/misc/oracle/hex_float_rounding.0.err.oracle b/tests/misc/oracle/hex_float_rounding.0.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/misc/oracle/hex_float_rounding.0.res.oracle b/tests/misc/oracle/hex_float_rounding.0.res.oracle
+new file mode 100644
+index 0000000000..ffac1640f1
+--- /dev/null
++++ b/tests/misc/oracle/hex_float_rounding.0.res.oracle
+@@ -0,0 +1,57 @@
++[kernel] Parsing hex_float_rounding.c (with preprocessing)
++[kernel:parser:decimal-float] hex_float_rounding.c:8: Warning: 
++  Floating-point constant 0x1.0000010000000001p0f is not represented exactly. Will use 0x1.0000020000000p0.
++[kernel:parser:decimal-float] hex_float_rounding.c:9: Warning: 
++  Floating-point constant 0x1.0000010000000001p0f is not represented exactly. Will use 0x1.0000020000000p0.
++[kernel:parser:decimal-float] hex_float_rounding.c:10: Warning: 
++  Floating-point constant 0x1.0000010000000001p0f32 is not represented exactly. Will use 0x1.0000020000000p0.
++[kernel:parser:decimal-float] hex_float_rounding.c:16: Warning: 
++  Floating-point constant 0x1.000001p0f is not represented exactly. Will use 0x1.0000000000000p0.
++[kernel:parser:decimal-float] hex_float_rounding.c:17: Warning: 
++  Floating-point constant 0x1.000003p0f is not represented exactly. Will use 0x1.0000040000000p0.
++[kernel:parser:decimal-float] hex_float_rounding.c:22: Warning: 
++  Floating-point constant 0x1.0000000000000001p-150f is not represented exactly. Will use 0x1.0000000000000p-149.
++[kernel:parser:decimal-float] hex_float_rounding.c:23: Warning: 
++  Floating-point constant 0x1p-150f is not represented exactly. Will use 0x0.0000000000000p0.
++[kernel:parser:decimal-float] hex_float_rounding.c:24: Warning: 
++  Floating-point constant 0x1.8p-149f is not represented exactly. Will use 0x1.0000000000000p-148.
++[kernel:parser:decimal-float] hex_float_rounding.c:30: Warning: 
++  Floating-point constant 0x1.fffffeffffffffffffp127f is not represented exactly. Will use 0x1.fffffe0000000p127.
++[kernel:parser:decimal-float] hex_float_rounding.c:34: Warning: 
++  Floating-point constant 0x1.0000000000000800000000000001p0 is not represented exactly. Will use 0x1.0000000000001p0.
++[eva] Analyzing a complete application starting at main
++[eva:initial-state] Values of globals at initialization
++  
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  f_up ∈ {1.00000011921}
++  f_neg ∈ {-1.00000011921}
++  f32_up ∈ {1.00000011921}
++  f_tie_even ∈ {1.}
++  f_tie_odd ∈ {1.00000023842}
++  f_sub_up ∈ {1.40129846432e-45}
++  f_sub_tie_zero ∈ {0}
++  f_sub_tie_odd ∈ {2.80259692865e-45}
++  f_max ∈ {3.40282346639e+38}
++  d_up ∈ {1.}
++  f_exact ∈ {1.00000011921}
++  f_nodot ∈ {1.}
++  f_leaddot ∈ {0.5}
++  f_zero ∈ {0}
++  f_huge_zero ∈ {0}
++[eva:summary] ====== ANALYSIS SUMMARY ======
++  ----------------------------------------------------------------------------
++  1 function analyzed (out of 1): 100% coverage.
++  In this function, 28 statements reached (out of 28): 100% coverage.
++  ----------------------------------------------------------------------------
++  Some errors and warnings have been raised during the analysis:
++    by the Eva analyzer:      0 errors    0 warnings
++    by the Frama-C kernel:    0 errors   10 warnings
++  ----------------------------------------------------------------------------
++  0 alarms generated by the analysis.
++  ----------------------------------------------------------------------------
++  Evaluation of the logical properties reached by the analysis:
++    Assertions       12 valid     0 unknown     0 invalid     12 total
++    Preconditions     0 valid     0 unknown     0 invalid      0 total
++  100% of the logical properties reached have been proven.
++  ----------------------------------------------------------------------------
+-- 
+2.47.3

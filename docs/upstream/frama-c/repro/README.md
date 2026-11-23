@@ -53,6 +53,10 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   does not load) and Alt-Ergo, prints one line per case, and exits 1 while `\result` is refused
   in a `\postcond` property (0 once fixed). Its "after" output was taken with a patched MetAcsl
   built in a throwaway container of the same image, as for 47 to 49.
+  46 runs four parse checks (`basic` on `gcc_x86_64` and `x86_32`, `macros` and `dynamic_s` on
+  `gcc_x86_64`) with both `frama-c` and `gcc -fsyntax-only -Wall -Wextra`; it exits 1 while
+  `<sched.h>` lacks `cpu_set_t` / `CPU_*` / `sched_{set,get}affinity` (4 of 4 checks fail on
+  `34.0~beta` and `master` `189053d4a2`) and 0 once patched (`RESULT: fixed`).
   47, 48 and 49 are about MetAcsl too and need `framac-analysis:latest`. Each prints one line per
   case and exits 1 while the defect is present. 47 runs three labels (`Old` through a labelled
   logic function, `\old`, `Pre`) through a kernel reparse, WP and E-ACSL (`Here` under `After` is
@@ -68,6 +72,12 @@ docker run --rm -v "$PWD:/w" -w /w --entrypoint sh framac-analysis:fc34 NN-<slug
   (`RESULT: fixed`) once fixed (8 valid calls exit 0 and 4 mismatched calls abort cleanly at run
   time with exit 134). Its outputs were taken on `framac-master-audit:189053d` and
   `framac-analysis:latest`.
+  51 to 87 (37 reproducers from the 2026-11-18 hunt, validated on 2026-11-23) are POSIX `sh`
+  scripts with LF endings. Each exits 1 (`RESULT: bug present`) on both stock
+  `framac-master-audit:189053d` (`35.0~~dev`, `189053d4a2`) and stock `framac-analysis:latest`
+  (`34.0~beta`), and every patchable package (`51`–`62` and `64`–`87`; `63` is issue-only) flips to
+  exit 0 (`RESULT: fixed`) after applying and installing its patch on `189053d4a2`. Each script's
+  header records exact commands and before/after outputs.
 - Patched images `framac-master-audit:3dff90f-p28` to `-p31` held `master` with one patch each
   (the "after" runs of 28 to 31). In the master image, install a rebuilt tree with
   `dune install --release --prefix /home/opam/.opam/5.5` (plain `dune install` fails with

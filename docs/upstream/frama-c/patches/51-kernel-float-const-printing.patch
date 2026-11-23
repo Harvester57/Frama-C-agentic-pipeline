@@ -1,0 +1,260 @@
+From f2f4875b1aed84b4bb933de229387ba8e9a10733 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:48:36 +0000
+Subject: [PATCH] [kernel] print synthesized CReal constants with exact
+ precision and valid C inf/nan
+
+Cil_printer.constant delegated CReal(f, fsize, None) directly to
+Floating_point.pretty, which formats floats with "%.*g" 12 in default
+mode and emits non-C tokens ("inf", "-inf", "nan", "NaN") for non-finite
+values in all modes.
+
+This caused two defects whenever synthesized CReal constants (from
+-constfold, -scf, or E-ACSL translation) were pretty-printed and compiled
+or re-parsed:
+- double constants lost up to five significant decimal digits, silently
+  changing computed values and failing true E-ACSL assertions (for
+  example under e-acsl-gcc, which passes -constfold by default);
+- non-finite constants were emitted as undeclared identifiers ("inf",
+  "-inf", "-nan", "inff", "-nanf", "NaN", "NaNf"), even with
+  -float-print hex, causing both C compilation and Frama-C re-parsing
+  to fail.
+
+In cil_printer.ml, print non-finite CReal values as parenthesized C
+expressions ((1.0 / 0.0), (-1.0 / 0.0), (0.0 / 0.0) with the matching
+fkind suffix) in all -float-print modes. For finite CReal values in
+Default mode, preserve the 12-digit representation whenever it already
+round-trips bit-identically (keeping existing oracles unchanged) and
+otherwise increase precision up to 17 significant digits (guaranteed
+exact round-trip for IEEE 754 binary64) under Nearest_even rounding.
+
+Add regression test tests/pretty_printing/float_const.c covering both
+default and -float-print hex modes with -constfold and re-parsing.
+---
+ .../services/ast_printing/cil_printer.ml      | 50 +++++++++++++----
+ tests/pretty_printing/float_const.c           | 23 ++++++++
+ .../oracle/float_const.0.res.oracle           | 53 +++++++++++++++++++
+ .../oracle/float_const.1.res.oracle           | 53 +++++++++++++++++++
+ 4 files changed, 170 insertions(+), 9 deletions(-)
+ create mode 100644 tests/pretty_printing/float_const.c
+ create mode 100644 tests/pretty_printing/oracle/float_const.0.res.oracle
+ create mode 100644 tests/pretty_printing/oracle/float_const.1.res.oracle
+
+diff --git a/src/kernel/services/ast_printing/cil_printer.ml b/src/kernel/services/ast_printing/cil_printer.ml
+index 1fa68a0a41..ddd543b5fe 100644
+--- a/src/kernel/services/ast_printing/cil_printer.ml
++++ b/src/kernel/services/ast_printing/cil_printer.ml
+@@ -144,6 +144,46 @@ let print_std_includes fmt globs =
+     Datatype.String.Set.iter print_one_include includes
+   end
+ 
++let pretty_c_real fmt f fsize =
++  let suffix = match fsize with
++    | FFloat -> "f"
++    | FFloat32 -> "f32"
++    | FFloat64 -> "f64"
++    | FDouble -> ""
++    | FLongDouble -> "L"
++  in
++  if Floating_point.is_infinite f then
++    Format.fprintf fmt "(%s1.0%s / 0.0%s)"
++      (if f < 0. then "-" else "") suffix suffix
++  else if Floating_point.is_nan f then
++    Format.fprintf fmt "(0.0%s / 0.0%s)" suffix suffix
++  else
++    match Kernel.FloatPrint.get () with
++    | Floating_point.Default ->
++      let old_mode = Floating_point.get_rounding_mode () in
++      let finally () = Floating_point.set_rounding_mode old_mode in
++      let work () =
++        Floating_point.set_rounding_mode Floating_point.Nearest_even;
++        let round = Floating_point.round_if_single_precision fsize in
++        let target = Int64.bits_of_float (round f) in
++        let rec find_prec p =
++          let s = Format.sprintf "%.*g" p f in
++          if p >= 17 ||
++             Int64.equal (Int64.bits_of_float (round (float_of_string s))) target
++          then s
++          else find_prec (p + 1)
++        in
++        let r = find_prec 12 in
++        let is_not_integer =
++          String.contains r '.' || String.contains r 'e' || String.contains r 'E'
++        in
++        let dot = if is_not_integer then "" else "." in
++        Format.fprintf fmt "%s%s%s" r dot suffix
++      in
++      Fun.protect ~finally work
++    | Floating_point.NormDec | Floating_point.NormHex ->
++      Format.fprintf fmt "%a%s" Floating_point.pretty f suffix
++
+ let pretty_C_constant suffix k fmt i =
+   let nb_signed_bits =
+     Z.pred (Z.of_int (8 * (Cil.bytesSizeOfInt k)))
+@@ -637,15 +677,7 @@ class cil_printer () = object (self)
+ 
+     | CChr(c) -> fprintf fmt "'%s'" (Escape.escape_char c)
+     | CReal(_, _, Some s) -> fprintf fmt "%s" s
+-    | CReal(f, fsize, None) ->
+-      fprintf fmt "%a%s"
+-        Floating_point.pretty f
+-        (match fsize with
+-         | FFloat   -> "f"
+-         | FFloat32 -> "f32"
+-         | FFloat64 -> "f64"
+-         | FDouble  -> ""
+-         | FLongDouble -> "L")
++    | CReal(f, fsize, None) -> pretty_c_real fmt f fsize
+     | CEnum {einame = s} -> self#varname fmt s
+ 
+   (*** VARIABLES ***)
+diff --git a/tests/pretty_printing/float_const.c b/tests/pretty_printing/float_const.c
+new file mode 100644
+index 0000000000..8992a372bb
+--- /dev/null
++++ b/tests/pretty_printing/float_const.c
+@@ -0,0 +1,23 @@
++/* run.config
++   OPT: -machdep gcc_x86_64 -constfold @PTEST_FILE@ -print -then -ocode ./ocode_@PTEST_NAME@_0.c -print -then ./ocode_@PTEST_NAME@_0.c -ocode="" -print
++   OPT: -machdep gcc_x86_64 -constfold -float-print hex @PTEST_FILE@ -print -then -ocode ./ocode_@PTEST_NAME@_1.c -print -then ./ocode_@PTEST_NAME@_1.c -ocode="" -print
++*/
++
++double third = 1.0 / 3.0;
++double inv255 = 1.0 / 255.0;
++double pos_inf = 1.0 / 0.0;
++double neg_inf = -1.0 / 0.0;
++double nan_val = 0.0 / 0.0;
++float finf = 1e38f * 10.0f;
++float fnan = 0.0f / 0.0f;
++
++int main(void) {
++  double h = 2 * 3.141592653589793;
++  double g = 0.1f;
++  double nz = -0.0;
++  _Float32 f32_inf = 1.0f32 / 0.0f32;
++  _Float64 f64_third = 1.0f64 / 3.0f64;
++  return (third > 0.0) + (inv255 > 0.0) + (pos_inf > 0.0) + (neg_inf < 0.0) +
++         (nan_val != nan_val) + (finf > 0.0f) + (fnan != fnan) + (h > 0.0) +
++         (g > 0.0) + (nz == 0.0) + (f32_inf > 0.0f32) + (f64_third > 0.0f64);
++}
+diff --git a/tests/pretty_printing/oracle/float_const.0.res.oracle b/tests/pretty_printing/oracle/float_const.0.res.oracle
+new file mode 100644
+index 0000000000..dc9e9a5638
+--- /dev/null
++++ b/tests/pretty_printing/oracle/float_const.0.res.oracle
+@@ -0,0 +1,53 @@
++[kernel] Parsing float_const.c (with preprocessing)
++[kernel:parser:decimal-float] float_const.c:11: Warning: 
++  Floating-point constant 1e38f is not represented exactly. Will use 0x1.2ced320000000p126.
++  (warn-once: no further messages from category 'parser:decimal-float' will be emitted)
++/* Generated by Frama-C */
++double third = 0.3333333333333333;
++double inv255 = 0.00392156862745098;
++double pos_inf = (1.0 / 0.0);
++double neg_inf = (-1.0 / 0.0);
++double nan_val = (0.0 / 0.0);
++float finf = (1.0f / 0.0f);
++float fnan = (0.0f / 0.0f);
++int main(void)
++{
++  int __retres;
++  double h = 6.283185307179586;
++  double g = 0.10000000149011612;
++  double nz = -0.;
++  _Float32 f32_inf = (1.0f32 / 0.0f32);
++  _Float64 f64_third = 0.3333333333333333f64;
++  __retres = (((((((((((third > 0.0) + (inv255 > 0.0)) + (pos_inf > 0.0)) + (
++                     neg_inf < 0.0)) + (nan_val != nan_val)) + (finf > 0.0f)) + (
++                  fnan != fnan)) + (h > 0.0)) + (g > 0.0)) + (nz == 0.0)) + (
++              f32_inf > 0.0f32)) + (f64_third > 0.0f64);
++  return __retres;
++}
++
++
++[kernel] Parsing ocode_float_const_0.c (with preprocessing)
++/* Generated by Frama-C */
++double third = 0.3333333333333333;
++double inv255 = 0.00392156862745098;
++double pos_inf = (1.0 / 0.0);
++double neg_inf = (-1.0 / 0.0);
++double nan_val = (0.0 / 0.0);
++float finf = (1.0f / 0.0f);
++float fnan = (0.0f / 0.0f);
++int main(void)
++{
++  int __retres;
++  double h = 6.283185307179586;
++  double g = 0.10000000149011612;
++  double nz = -0.;
++  _Float32 f32_inf = (1.0f32 / 0.0f32);
++  _Float64 f64_third = 0.3333333333333333f64;
++  __retres = (((((((((((third > 0.0) + (inv255 > 0.0)) + (pos_inf > 0.0)) + (
++                     neg_inf < 0.0)) + (nan_val != nan_val)) + (finf > 0.0f)) + (
++                  fnan != fnan)) + (h > 0.0)) + (g > 0.0)) + (nz == 0.0)) + (
++              f32_inf > 0.0f32)) + (f64_third > 0.0f64);
++  return __retres;
++}
++
++
+diff --git a/tests/pretty_printing/oracle/float_const.1.res.oracle b/tests/pretty_printing/oracle/float_const.1.res.oracle
+new file mode 100644
+index 0000000000..77f9f2935f
+--- /dev/null
++++ b/tests/pretty_printing/oracle/float_const.1.res.oracle
+@@ -0,0 +1,53 @@
++[kernel] Parsing float_const.c (with preprocessing)
++[kernel:parser:decimal-float] float_const.c:11: Warning: 
++  Floating-point constant 1e38f is not represented exactly. Will use 0x1.2ced320000000p126.
++  (warn-once: no further messages from category 'parser:decimal-float' will be emitted)
++/* Generated by Frama-C */
++double third = 0x1.5555555555555p-2;
++double inv255 = 0x1.0101010101010p-8;
++double pos_inf = (1.0 / 0.0);
++double neg_inf = (-1.0 / 0.0);
++double nan_val = (0.0 / 0.0);
++float finf = (1.0f / 0.0f);
++float fnan = (0.0f / 0.0f);
++int main(void)
++{
++  int __retres;
++  double h = 0x1.921fb54442d18p2;
++  double g = 0x1.99999a0000000p-4;
++  double nz = -0x0.0000000000000p0;
++  _Float32 f32_inf = (1.0f32 / 0.0f32);
++  _Float64 f64_third = 0x1.5555555555555p-2f64;
++  __retres = (((((((((((third > 0.0) + (inv255 > 0.0)) + (pos_inf > 0.0)) + (
++                     neg_inf < 0.0)) + (nan_val != nan_val)) + (finf > 0.0f)) + (
++                  fnan != fnan)) + (h > 0.0)) + (g > 0.0)) + (nz == 0.0)) + (
++              f32_inf > 0.0f32)) + (f64_third > 0.0f64);
++  return __retres;
++}
++
++
++[kernel] Parsing ocode_float_const_1.c (with preprocessing)
++/* Generated by Frama-C */
++double third = 0x1.5555555555555p-2;
++double inv255 = 0x1.0101010101010p-8;
++double pos_inf = (1.0 / 0.0);
++double neg_inf = (-1.0 / 0.0);
++double nan_val = (0.0 / 0.0);
++float finf = (1.0f / 0.0f);
++float fnan = (0.0f / 0.0f);
++int main(void)
++{
++  int __retres;
++  double h = 0x1.921fb54442d18p2;
++  double g = 0x1.99999a0000000p-4;
++  double nz = -0x0.0000000000000p0;
++  _Float32 f32_inf = (1.0f32 / 0.0f32);
++  _Float64 f64_third = 0x1.5555555555555p-2f64;
++  __retres = (((((((((((third > 0.0) + (inv255 > 0.0)) + (pos_inf > 0.0)) + (
++                     neg_inf < 0.0)) + (nan_val != nan_val)) + (finf > 0.0f)) + (
++                  fnan != fnan)) + (h > 0.0)) + (g > 0.0)) + (nz == 0.0)) + (
++              f32_inf > 0.0f32)) + (f64_third > 0.0f64);
++  return __retres;
++}
++
++
+-- 
+2.47.3
+

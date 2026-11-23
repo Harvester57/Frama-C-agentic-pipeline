@@ -1,0 +1,107 @@
+From a1a2f6420e62ec0d44d466c5139b509c8a4c6a21 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:56:10 +0000
+Subject: [PATCH] [wp] catch Failure when parsing strategy prover timeouts
+
+ProofStrategy.parse_provers caught `Invalid_argument _` around
+`int_of_string` and `float_of_string`, both of which raise `Failure _`.
+A timeout with a suffix (`2u`, `2.5f`) or an overflowing integer
+(`99999999999999999999`) therefore aborted Frama-C with an internal
+error (exit 4) instead of reporting `"Invalid timeout"`.
+
+Catch `Failure _` in both branches and reject non-finite floats.
+
+New test: wp_acsl/strategy_timeout.c.
+---
+ plugins/wp/src/ProofStrategy.ml                      |  7 ++++---
+ .../wp_acsl/oracle/strategy_timeout.0.res.oracle     |  6 ++++++
+ .../wp_acsl/oracle/strategy_timeout.1.res.oracle     |  6 ++++++
+ .../wp_acsl/oracle/strategy_timeout.2.res.oracle     |  6 ++++++
+ plugins/wp/tests/wp_acsl/strategy_timeout.c          | 12 ++++++++++++
+ 5 files changed, 34 insertions(+), 3 deletions(-)
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/strategy_timeout.0.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/strategy_timeout.1.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/strategy_timeout.2.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/strategy_timeout.c
+
+diff --git a/plugins/wp/src/ProofStrategy.ml b/plugins/wp/src/ProofStrategy.ml
+index 44e18b4288..fa60d88c96 100644
+--- a/plugins/wp/src/ProofStrategy.ml
++++ b/plugins/wp/src/ProofStrategy.ml
+@@ -156,15 +156,16 @@ let rec parse_provers ctxt provers timeout = function
+     let loc = p.lexpr_loc in
+     match p.lexpr_node with
+     | PLconstant (IntConstant t) ->
+-      let time = try int_of_string t with Invalid_argument _ ->
++      let time = try int_of_string t with Failure _ ->
+         error ctxt loc "Invalid timeout" in
+       if time < 0 then error ctxt loc "Invalid timeout" ;
+       if timeout <> None then error ctxt loc "Duplicate timeout" ;
+       parse_provers ctxt provers (Some (float time)) ps
+     | PLconstant (FloatConstant t) ->
+-      let time = try float_of_string t with Invalid_argument _ ->
++      let time = try float_of_string t with Failure _ ->
+         error ctxt loc "Invalid timeout" in
+-      if time < 0.0 then error ctxt loc "Invalid timeout" ;
++      if not (Float.is_finite time) || time < 0.0 then
++        error ctxt loc "Invalid timeout" ;
+       if timeout <> None then error ctxt loc "Duplicate timeout" ;
+       parse_provers ctxt provers (Some time) ps
+     | PLconstant (StringConstant value) ->
+diff --git a/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.0.res.oracle
+new file mode 100644
+index 0000000000..ab860448be
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.0.res.oracle
+@@ -0,0 +1,6 @@
++# frama-c -wp -wp-timeout 5 [...]
++[kernel] Parsing strategy_timeout.c (with preprocessing)
++[kernel:annot-error] strategy_timeout.c:10: Failure: 
++  Invalid timeout. Ignoring global annotation
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.1.res.oracle b/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.1.res.oracle
+new file mode 100644
+index 0000000000..ab860448be
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.1.res.oracle
+@@ -0,0 +1,6 @@
++# frama-c -wp -wp-timeout 5 [...]
++[kernel] Parsing strategy_timeout.c (with preprocessing)
++[kernel:annot-error] strategy_timeout.c:10: Failure: 
++  Invalid timeout. Ignoring global annotation
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.2.res.oracle b/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.2.res.oracle
+new file mode 100644
+index 0000000000..ab860448be
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/strategy_timeout.2.res.oracle
+@@ -0,0 +1,6 @@
++# frama-c -wp -wp-timeout 5 [...]
++[kernel] Parsing strategy_timeout.c (with preprocessing)
++[kernel:annot-error] strategy_timeout.c:10: Failure: 
++  Invalid timeout. Ignoring global annotation
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/strategy_timeout.c b/plugins/wp/tests/wp_acsl/strategy_timeout.c
+new file mode 100644
+index 0000000000..569f80dd92
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/strategy_timeout.c
+@@ -0,0 +1,12 @@
++/* run.config
++   EXIT: 1
++   OPT: -wp-timeout 5 -cpp-extra-args="-DTIMEOUT=2u"
++   OPT: -wp-timeout 5 -cpp-extra-args="-DTIMEOUT=2.5f"
++   OPT: -wp-timeout 5 -cpp-extra-args="-DTIMEOUT=99999999999999999999"
++*/
++
++/*@ lemma dummy: \forall integer i; i < 0 ==> i < 1; */
++/*@
++  strategy S: \prover("Alt-Ergo", TIMEOUT);
++  proof S: dummy;
++*/
+-- 
+2.47.3
+

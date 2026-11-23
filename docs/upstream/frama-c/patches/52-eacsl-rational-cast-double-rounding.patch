@@ -1,0 +1,1180 @@
+From ae8581711844ac0b65cc0e196b839cc1a228c4df Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 23 Nov 2026 00:03:53 +0000
+Subject: [PATCH] [e-acsl] round rational casts to double and float to
+ nearest-even
+
+Gmp.Q.add_cast (plugins/e-acsl/src/code_generator/gmp.ml) implemented
+ACSL casts (double)r and (float)r on GMP rationals by calling
+__gmpq_get_d (and casting the double result to float for (float)r).
+GMP's mpq_get_d truncates toward zero, violating ACSL 2.2.5 (which
+specifies IEEE 754 round-to-nearest-even):
+
+- true assertions such as `double d = 0.1; assert d == (double)0.1;`
+  failed at run time;
+- false assertions such as `assert (double)0.1 < 0.1;` and
+  `assert 0x1.9999999999999p-4 == (double)0.1;` passed silently;
+- (float) casts suffered from both truncation and double rounding
+  (e.g. `assert 16777218.0f == (float)16777217.0000000001;` failed).
+
+Add exact IEEE 754 round-to-nearest-even runtime conversion helpers
+__e_acsl_mpq_get_d and __e_acsl_mpq_get_f in e_acsl_gmp_api.h and
+e_acsl_floating_point.c (handling ties-to-even, subnormals, signs,
+underflow, and overflow to +-INFINITY directly on mpz_t operands without
+double rounding), call them from Gmp.Q.add_cast, and remove the now
+obsolete "R to float: double rounding" warning.
+
+New test: plugins/e-acsl/tests/arith/rational_cast.c; updated existing
+E-ACSL oracles referencing __gmpq_get_d.
+---
+ .../numerical_model/e_acsl_floating_point.c   | 114 ++++
+ .../e-acsl/numerical_model/e_acsl_gmp_api.h   |  12 +
+ plugins/e-acsl/src/code_generator/gmp.ml      |  21 +-
+ .../e-acsl/tests/acsl-rte/oracle/gen_rte.0.c  |   2 +-
+ .../tests/arith/oracle/gen_rational_cast.0.c  | 639 ++++++++++++++++++
+ .../tests/arith/oracle/gen_rationals.0.c      |  14 +-
+ .../arith/oracle/rational_cast.0.res.oracle   |  71 ++
+ .../tests/arith/oracle/rationals.0.res.oracle |   5 +-
+ plugins/e-acsl/tests/arith/rational_cast.c    |  61 ++
+ .../tests/constructs/oracle/gen_functions.0.c |   4 +-
+ .../tests/constructs/oracle/gen_functions.1.c |   4 +-
+ 11 files changed, 914 insertions(+), 33 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/arith/oracle/gen_rational_cast.0.c
+ create mode 100644 plugins/e-acsl/tests/arith/oracle/rational_cast.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/arith/rational_cast.c
+
+diff --git a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c
+index e2e224c0f9..2f893a591c 100644
+--- a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c
++++ b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_floating_point.c
+@@ -13,6 +13,7 @@
+ #include "../internals/e_acsl_rtl_io.h"
+ 
+ #include "e_acsl_floating_point.h"
++#include "e_acsl_gmp_api.h"
+ 
+ // Initialization
+ double eacsl_math_HUGE_VAL = 0.0;
+@@ -52,3 +53,116 @@ void eacsl_floating_point_exception(const char *exp) {
+   }
+   feclearexcept(FE_ALL_EXCEPT);
+ }
++
++extern void __gmpz_add_ui(eacsl_mpz_t rop, const eacsl_mpz_t op1,
++                          unsigned long int op2);
++extern double __gmpz_get_d(const eacsl_mpz_t op);
++extern size_t __gmpz_sizeinbase(const eacsl_mpz_t op, int base);
++extern void __gmpz_tdiv_qr(eacsl_mpz_t q, eacsl_mpz_t r, const eacsl_mpz_t n,
++                           const eacsl_mpz_t d);
++extern int __gmpz_tstbit(const eacsl_mpz_t op, eacsl_mp_bitcnt_t bit_index);
++
++/* Convert a GMP rational q = num / den to an IEEE 754 binary floating-point
++   value with `prec` significand bits and exponent range [emin, emax], using
++   round-to-nearest, ties-to-even. Because prec <= 53, the returned double is
++   already exact in the target format (so casting to float for prec == 24
++   performs no second rounding). */
++static double eacsl_mpq_get_ieee(const eacsl_mpq_t q, int prec, int emin,
++                                 int emax) {
++  int sgn = q->_mp_num._mp_size;
++  if (sgn == 0)
++    return 0.0;
++  int neg = sgn < 0;
++  if (q->_mp_den._mp_size < 0)
++    neg = !neg;
++
++  eacsl_mpz_t a, b;
++  __gmpz_init_set(a, &q->_mp_num);
++  __gmpz_init_set(b, &q->_mp_den);
++  if (a->_mp_size < 0)
++    __gmpz_neg(a, a);
++  if (b->_mp_size < 0)
++    __gmpz_neg(b, b);
++
++  /* sizeinbase(x, 2) gives k >= 1 with 2^(k-1) <= x < 2^k,
++     so 2^(na - nb - 1) < a / b < 2^(na - nb + 1). */
++  size_t na = __gmpz_sizeinbase(a, 2);
++  size_t nb = __gmpz_sizeinbase(b, 2);
++  int esub = emin - (prec - 1);
++
++  if (na > nb && (na - nb - 1) > (size_t)emax) {
++    __gmpz_clear(a);
++    __gmpz_clear(b);
++    return neg ? -INFINITY : INFINITY;
++  }
++  if (nb > na && (nb - na) > (size_t)(2 - esub)) {
++    __gmpz_clear(a);
++    __gmpz_clear(b);
++    return neg ? -0.0 : 0.0;
++  }
++
++  int e = (na >= nb) ? (int)(na - nb) : -(int)(nb - na);
++  eacsl_mpz_t tmp;
++  __gmpz_init(tmp);
++  if (e >= 0) {
++    __gmpz_mul_2exp(tmp, b, (eacsl_mp_bitcnt_t)e);
++    if (__gmpz_cmp(a, tmp) < 0)
++      e--;
++  } else {
++    __gmpz_mul_2exp(tmp, a, (eacsl_mp_bitcnt_t)(-e));
++    if (__gmpz_cmp(tmp, b) < 0)
++      e--;
++  }
++
++  if (e > emax) {
++    __gmpz_clear(tmp);
++    __gmpz_clear(a);
++    __gmpz_clear(b);
++    return neg ? -INFINITY : INFINITY;
++  }
++
++  int shift = (e >= emin) ? (e - (prec - 1)) : esub;
++  eacsl_mpz_t quot, rem;
++  __gmpz_init(quot);
++  __gmpz_init(rem);
++  if (shift >= 0) {
++    __gmpz_mul_2exp(tmp, b, (eacsl_mp_bitcnt_t)shift);
++    __gmpz_tdiv_qr(quot, rem, a, tmp);
++    __gmpz_mul_2exp(rem, rem, 1);
++    int cmp = __gmpz_cmp(rem, tmp);
++    if (cmp > 0 || (cmp == 0 && __gmpz_tstbit(quot, 0)))
++      __gmpz_add_ui(quot, quot, 1UL);
++  } else {
++    __gmpz_mul_2exp(tmp, a, (eacsl_mp_bitcnt_t)(-shift));
++    __gmpz_tdiv_qr(quot, rem, tmp, b);
++    __gmpz_mul_2exp(rem, rem, 1);
++    int cmp = __gmpz_cmp(rem, b);
++    if (cmp > 0 || (cmp == 0 && __gmpz_tstbit(quot, 0)))
++      __gmpz_add_ui(quot, quot, 1UL);
++  }
++
++  double res;
++  if (e >= emin && __gmpz_tstbit(quot, (eacsl_mp_bitcnt_t)prec)) {
++    if (e + 1 > emax)
++      res = INFINITY;
++    else
++      res = ldexp(1.0, e + 1);
++  } else {
++    res = ldexp(__gmpz_get_d(quot), shift);
++  }
++
++  __gmpz_clear(quot);
++  __gmpz_clear(rem);
++  __gmpz_clear(tmp);
++  __gmpz_clear(a);
++  __gmpz_clear(b);
++  return neg ? -res : res;
++}
++
++double eacsl_mpq_get_d(const eacsl_mpq_t q) {
++  return eacsl_mpq_get_ieee(q, 53, -1022, 1023);
++}
++
++float eacsl_mpq_get_f(const eacsl_mpq_t q) {
++  return (float)eacsl_mpq_get_ieee(q, 24, -126, 127);
++}
+diff --git a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h
+index 340e49530a..bf89337986 100644
+--- a/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h
++++ b/plugins/e-acsl/share/e-acsl/numerical_model/e_acsl_gmp_api.h
+@@ -28,6 +28,8 @@
+ #define eacsl_mpq_struct  export_alias(mpq_struct)
+ #define eacsl_mpq_t       export_alias(mpq_t)
+ #define eacsl_mp_bitcnt_t export_alias(mp_bitcnt_t)
++#define eacsl_mpq_get_d   export_alias(mpq_get_d)
++#define eacsl_mpq_get_f   export_alias(mpq_get_f)
+ 
+ struct eacsl_mpz_struct {
+   int _mp_alloc;
+@@ -374,6 +376,16 @@ extern long __gmpz_get_si(const eacsl_mpz_t z) __attribute__((FC_BUILTIN));
+   @ assigns \result \from *q; */
+ extern double __gmpq_get_d(const eacsl_mpq_t q) __attribute__((FC_BUILTIN));
+ 
++/** Convert rational q to double with IEEE 754 round-to-nearest-even */
++/*@ requires \valid_read(q);
++  @ assigns \result \from *q; */
++extern double eacsl_mpq_get_d(const eacsl_mpq_t q) __attribute__((FC_BUILTIN));
++
++/** Convert rational q to float with IEEE 754 round-to-nearest-even */
++/*@ requires \valid_read(q);
++  @ assigns \result \from *q; */
++extern float eacsl_mpq_get_f(const eacsl_mpq_t q) __attribute__((FC_BUILTIN));
++
+ /*@ requires \valid_read(z);
+   @ assigns \result \from *z; */
+ extern unsigned long __gmpz_get_ui(const eacsl_mpz_t z)
+diff --git a/plugins/e-acsl/src/code_generator/gmp.ml b/plugins/e-acsl/src/code_generator/gmp.ml
+index c832a335c3..1c971b2379 100644
+--- a/plugins/e-acsl/src/code_generator/gmp.ml
++++ b/plugins/e-acsl/src/code_generator/gmp.ml
+@@ -337,11 +337,8 @@ module Q = struct
+     Error.not_yet "reals: cast from R to Z"
+ 
+   let add_cast ~loc ?name env kf ty e =
+-    (* TODO: The best solution would actually be to directly write all the
+-       needed functions as C builtins then just call them here depending on the
+-       situation at hand. *)
+     assert (Gmp_types.Q.is_t (Cil.typeOf e));
+-    let get_double e env =
++    let get_float fname fty e env =
+       let _, e, env =
+         Env.new_var
+           ~loc
+@@ -349,12 +346,11 @@ module Q = struct
+           env
+           kf
+           None
+-          Cil_const.doubleType
++          fty
+           (fun v _ ->
+              [ Smart_stmt.rtl_call ~loc
+                  ~result:(Cil.var v)
+-                 ~prefix:""
+-                 "__gmpq_get_d"
++                 fname
+                  [ e ] ])
+       in
+       e, env
+@@ -364,16 +360,9 @@ module Q = struct
+       (* The biggest floating-point type we can extract from GMPQ is double *)
+       Error.not_yet "R to long double"
+     | TFloat FDouble ->
+-      get_double e env
++      get_float "mpq_get_d" Cil_const.doubleType e env
+     | TFloat FFloat ->
+-      (* No "get_float" in GMPQ, but fortunately, [float] \subset [double].
+-         HOWEVER: going through double as intermediate step might be unsound
+-         since it could cause double rounding. See: [Boldo2013, Sec 2.2]
+-         https://hal.inria.fr/hal-00777639/document *)
+-      let e, env = get_double e env in
+-      Options.warning
+-        ~once:true "R to float: double rounding might cause unsoundness";
+-      Cil.mkCastT ~force:false ~oldt:Cil_const.doubleType ~newt:ty e, env
++      get_float "mpq_get_f" Cil_const.floatType e env
+     | TInt IULongLong ->
+       (* The biggest C integer type we can extract from GMP is ulong *)
+       Error.not_yet "R to unsigned long long"
+diff --git a/plugins/e-acsl/tests/acsl-rte/oracle/gen_rte.0.c b/plugins/e-acsl/tests/acsl-rte/oracle/gen_rte.0.c
+index 76402e6f7f..3d4e55eed6 100644
+--- a/plugins/e-acsl/tests/acsl-rte/oracle/gen_rte.0.c
++++ b/plugins/e-acsl/tests/acsl-rte/oracle/gen_rte.0.c
+@@ -4847,7 +4847,7 @@ double __gen_e_acsl_f2(double x)
+   __gmpq_div(__gen_e_acsl_div_2,
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl__4),
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl_x));
+-  __gen_e_acsl_div_3 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_2));
++  __gen_e_acsl_div_3 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_2));
+   __gmpq_clear(__gen_e_acsl__4);
+   __gmpq_clear(__gen_e_acsl_x);
+   __gmpq_clear(__gen_e_acsl_div_2);
+diff --git a/plugins/e-acsl/tests/arith/oracle/gen_rational_cast.0.c b/plugins/e-acsl/tests/arith/oracle/gen_rational_cast.0.c
+new file mode 100644
+index 0000000000..79f48bce01
+--- /dev/null
++++ b/plugins/e-acsl/tests/arith/oracle/gen_rational_cast.0.c
+@@ -0,0 +1,639 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++int main(void)
++{
++  int __retres;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  double d = 0.1;
++  double d_below = 0x1.9999999999999p-4;
++  {
++    __e_acsl_mpq_t __gen_e_acsl_;
++    double __gen_e_acsl__2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl_);
++    __gmpq_set_str(__gen_e_acsl_,"01/10",10);
++    __gen_e_acsl__2 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data,"d",d);
++    __gen_e_acsl_assert_data.blocking = 1;
++    __gen_e_acsl_assert_data.kind = "Assertion";
++    __gen_e_acsl_assert_data.pred_txt = "d == (double)0.1";
++    __gen_e_acsl_assert_data.file = "rational_cast.c";
++    __gen_e_acsl_assert_data.fct = "main";
++    __gen_e_acsl_assert_data.line = 11;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__2); */
++    __e_acsl_assert(d == __gen_e_acsl__2,& __gen_e_acsl_assert_data);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    __gmpq_clear(__gen_e_acsl_);
++  }
++  /*@ assert d == (double)0.1; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__3;
++    double __gen_e_acsl__4;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__3);
++    __gmpq_set_str(__gen_e_acsl__3,"01/10",10);
++    __gen_e_acsl__4 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__3));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_2,"d_below",
++                                    d_below);
++    __gen_e_acsl_assert_data_2.blocking = 1;
++    __gen_e_acsl_assert_data_2.kind = "Assertion";
++    __gen_e_acsl_assert_data_2.pred_txt = "d_below != (double)0.1";
++    __gen_e_acsl_assert_data_2.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_2.fct = "main";
++    __gen_e_acsl_assert_data_2.line = 12;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__4); */
++    __e_acsl_assert(d_below != __gen_e_acsl__4,& __gen_e_acsl_assert_data_2);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    __gmpq_clear(__gen_e_acsl__3);
++  }
++  /*@ assert d_below != (double)0.1; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__5;
++    double __gen_e_acsl__6;
++    __e_acsl_mpq_t __gen_e_acsl__7;
++    int __gen_e_acsl_gt;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__5);
++    __gmpq_set_str(__gen_e_acsl__5,"01/10",10);
++    __gen_e_acsl__6 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__5));
++    __gmpq_init(__gen_e_acsl__7);
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__6); */
++    __gmpq_set_d(__gen_e_acsl__7,__gen_e_acsl__6);
++    __gen_e_acsl_gt = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl__7),
++                                 (__e_acsl_mpq_struct const *)(__gen_e_acsl__5));
++    __gen_e_acsl_assert_data_3.blocking = 1;
++    __gen_e_acsl_assert_data_3.kind = "Assertion";
++    __gen_e_acsl_assert_data_3.pred_txt = "(double)0.1 > 0.1";
++    __gen_e_acsl_assert_data_3.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_3.fct = "main";
++    __gen_e_acsl_assert_data_3.line = 13;
++    __e_acsl_assert(__gen_e_acsl_gt > 0,& __gen_e_acsl_assert_data_3);
++    __gmpq_clear(__gen_e_acsl__5);
++    __gmpq_clear(__gen_e_acsl__7);
++  }
++  /*@ assert (double)0.1 > 0.1; */ ;
++  double nd = -0.1;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__8;
++    __e_acsl_mpq_t __gen_e_acsl__9;
++    __e_acsl_mpq_t __gen_e_acsl_sub;
++    double __gen_e_acsl__10;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__8);
++    __gmpq_set_str(__gen_e_acsl__8,"0",10);
++    __gmpq_init(__gen_e_acsl__9);
++    __gmpq_set_str(__gen_e_acsl__9,"01/10",10);
++    __gmpq_init(__gen_e_acsl_sub);
++    __gmpq_sub(__gen_e_acsl_sub,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__8),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__9));
++    __gen_e_acsl__10 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_sub));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_4,"nd",nd);
++    __gen_e_acsl_assert_data_4.blocking = 1;
++    __gen_e_acsl_assert_data_4.kind = "Assertion";
++    __gen_e_acsl_assert_data_4.pred_txt = "nd == (double)(0 - 0.1)";
++    __gen_e_acsl_assert_data_4.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_4.fct = "main";
++    __gen_e_acsl_assert_data_4.line = 17;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__10); */
++    __e_acsl_assert(nd == __gen_e_acsl__10,& __gen_e_acsl_assert_data_4);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++    __gmpq_clear(__gen_e_acsl__8);
++    __gmpq_clear(__gen_e_acsl__9);
++    __gmpq_clear(__gen_e_acsl_sub);
++  }
++  /*@ assert nd == (double)(0 - 0.1); */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__11;
++    __e_acsl_mpq_t __gen_e_acsl__12;
++    __e_acsl_mpq_t __gen_e_acsl_sub_2;
++    double __gen_e_acsl__13;
++    __e_acsl_mpq_t __gen_e_acsl__14;
++    int __gen_e_acsl_lt;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__11);
++    __gmpq_set_str(__gen_e_acsl__11,"0",10);
++    __gmpq_init(__gen_e_acsl__12);
++    __gmpq_set_str(__gen_e_acsl__12,"01/10",10);
++    __gmpq_init(__gen_e_acsl_sub_2);
++    __gmpq_sub(__gen_e_acsl_sub_2,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__11),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__12));
++    __gen_e_acsl__13 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_sub_2));
++    __gmpq_init(__gen_e_acsl__14);
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__13); */
++    __gmpq_set_d(__gen_e_acsl__14,__gen_e_acsl__13);
++    __gen_e_acsl_lt = __gmpq_cmp((__e_acsl_mpq_struct const *)(__gen_e_acsl__14),
++                                 (__e_acsl_mpq_struct const *)(__gen_e_acsl_sub_2));
++    __gen_e_acsl_assert_data_5.blocking = 1;
++    __gen_e_acsl_assert_data_5.kind = "Assertion";
++    __gen_e_acsl_assert_data_5.pred_txt = "(double)(0 - 0.1) < 0 - 0.1";
++    __gen_e_acsl_assert_data_5.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_5.fct = "main";
++    __gen_e_acsl_assert_data_5.line = 18;
++    __e_acsl_assert(__gen_e_acsl_lt < 0,& __gen_e_acsl_assert_data_5);
++    __gmpq_clear(__gen_e_acsl__11);
++    __gmpq_clear(__gen_e_acsl__12);
++    __gmpq_clear(__gen_e_acsl_sub_2);
++    __gmpq_clear(__gen_e_acsl__14);
++  }
++  /*@ assert (double)(0 - 0.1) < 0 - 0.1; */ ;
++  double one = 1.0;
++  double half_ulp = 0x1p-53;
++  double one_plus_2ulp = 0x1.0000000000002p0;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__15;
++    __e_acsl_mpq_t __gen_e_acsl_half_ulp;
++    __e_acsl_mpq_t __gen_e_acsl_add;
++    double __gen_e_acsl_add_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__15);
++    __gmpq_set_str(__gen_e_acsl__15,"1",10);
++    __gmpq_init(__gen_e_acsl_half_ulp);
++    __gmpq_set_d(__gen_e_acsl_half_ulp,half_ulp);
++    __gmpq_init(__gen_e_acsl_add);
++    __gmpq_add(__gen_e_acsl_add,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__15),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_half_ulp));
++    __gen_e_acsl_add_2 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_add));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_6,"one",one);
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_6,"half_ulp",
++                                    half_ulp);
++    __gen_e_acsl_assert_data_6.blocking = 1;
++    __gen_e_acsl_assert_data_6.kind = "Assertion";
++    __gen_e_acsl_assert_data_6.pred_txt = "one == (double)(1 + half_ulp)";
++    __gen_e_acsl_assert_data_6.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_6.fct = "main";
++    __gen_e_acsl_assert_data_6.line = 25;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_add_2); */
++    __e_acsl_assert(one == __gen_e_acsl_add_2,& __gen_e_acsl_assert_data_6);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++    __gmpq_clear(__gen_e_acsl__15);
++    __gmpq_clear(__gen_e_acsl_half_ulp);
++    __gmpq_clear(__gen_e_acsl_add);
++  }
++  /*@ assert one == (double)(1 + half_ulp); */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__16;
++    __e_acsl_mpq_t __gen_e_acsl__17;
++    __e_acsl_mpq_t __gen_e_acsl_half_ulp_2;
++    __e_acsl_mpq_t __gen_e_acsl_mul;
++    __e_acsl_mpq_t __gen_e_acsl_add_3;
++    double __gen_e_acsl_add_4;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__16);
++    __gmpq_set_str(__gen_e_acsl__16,"1",10);
++    __gmpq_init(__gen_e_acsl__17);
++    __gmpq_set_str(__gen_e_acsl__17,"3",10);
++    __gmpq_init(__gen_e_acsl_half_ulp_2);
++    __gmpq_set_d(__gen_e_acsl_half_ulp_2,half_ulp);
++    __gmpq_init(__gen_e_acsl_mul);
++    __gmpq_mul(__gen_e_acsl_mul,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__17),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_half_ulp_2));
++    __gmpq_init(__gen_e_acsl_add_3);
++    __gmpq_add(__gen_e_acsl_add_3,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__16),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_mul));
++    __gen_e_acsl_add_4 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_add_3));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_7,
++                                    "one_plus_2ulp",one_plus_2ulp);
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_7,"half_ulp",
++                                    half_ulp);
++    __gen_e_acsl_assert_data_7.blocking = 1;
++    __gen_e_acsl_assert_data_7.kind = "Assertion";
++    __gen_e_acsl_assert_data_7.pred_txt = "one_plus_2ulp == (double)(1 + 3 * half_ulp)";
++    __gen_e_acsl_assert_data_7.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_7.fct = "main";
++    __gen_e_acsl_assert_data_7.line = 26;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_add_4); */
++    __e_acsl_assert(one_plus_2ulp == __gen_e_acsl_add_4,
++                    & __gen_e_acsl_assert_data_7);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_7);
++    __gmpq_clear(__gen_e_acsl__16);
++    __gmpq_clear(__gen_e_acsl__17);
++    __gmpq_clear(__gen_e_acsl_half_ulp_2);
++    __gmpq_clear(__gen_e_acsl_mul);
++    __gmpq_clear(__gen_e_acsl_add_3);
++  }
++  /*@ assert one_plus_2ulp == (double)(1 + 3 * half_ulp); */ ;
++  float f = 16777218.0f;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__18;
++    float __gen_e_acsl__19;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__18);
++    __gmpq_set_str(__gen_e_acsl__18,"167772170000000001/10000000000",10);
++    __gen_e_acsl__19 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl__18));
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_8,"f",f);
++    __gen_e_acsl_assert_data_8.blocking = 1;
++    __gen_e_acsl_assert_data_8.kind = "Assertion";
++    __gen_e_acsl_assert_data_8.pred_txt = "f == (float)16777217.0000000001";
++    __gen_e_acsl_assert_data_8.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_8.fct = "main";
++    __gen_e_acsl_assert_data_8.line = 32;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__19); */
++    __e_acsl_assert(f == __gen_e_acsl__19,& __gen_e_acsl_assert_data_8);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_8);
++    __gmpq_clear(__gen_e_acsl__18);
++  }
++  /*@ assert f == (float)16777217.0000000001; */ ;
++  float f_tenth = 0.1f;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__20;
++    float __gen_e_acsl__21;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_9 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__20);
++    __gmpq_set_str(__gen_e_acsl__20,"01/10",10);
++    __gen_e_acsl__21 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl__20));
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_9,"f_tenth",
++                                   f_tenth);
++    __gen_e_acsl_assert_data_9.blocking = 1;
++    __gen_e_acsl_assert_data_9.kind = "Assertion";
++    __gen_e_acsl_assert_data_9.pred_txt = "f_tenth == (float)0.1";
++    __gen_e_acsl_assert_data_9.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_9.fct = "main";
++    __gen_e_acsl_assert_data_9.line = 34;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__21); */
++    __e_acsl_assert(f_tenth == __gen_e_acsl__21,& __gen_e_acsl_assert_data_9);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_9);
++    __gmpq_clear(__gen_e_acsl__20);
++  }
++  /*@ assert f_tenth == (float)0.1; */ ;
++  double d_sub = 0x1p-1074;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__22;
++    __e_acsl_mpq_t __gen_e_acsl_d_sub;
++    __e_acsl_mpq_t __gen_e_acsl_mul_2;
++    __e_acsl_mpq_t __gen_e_acsl__23;
++    __e_acsl_mpq_t __gen_e_acsl_div;
++    double __gen_e_acsl_div_2;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_10 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__22);
++    __gmpq_set_str(__gen_e_acsl__22,"3",10);
++    __gmpq_init(__gen_e_acsl_d_sub);
++    __gmpq_set_d(__gen_e_acsl_d_sub,d_sub);
++    __gmpq_init(__gen_e_acsl_mul_2);
++    __gmpq_mul(__gen_e_acsl_mul_2,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__22),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_d_sub));
++    __gmpq_init(__gen_e_acsl__23);
++    __gmpq_set_str(__gen_e_acsl__23,"4",10);
++    __gmpq_init(__gen_e_acsl_div);
++    __gmpq_div(__gen_e_acsl_div,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_mul_2),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__23));
++    __gen_e_acsl_div_2 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_10,"d_sub",
++                                    d_sub);
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_10,"d_sub",
++                                    d_sub);
++    __gen_e_acsl_assert_data_10.blocking = 1;
++    __gen_e_acsl_assert_data_10.kind = "Assertion";
++    __gen_e_acsl_assert_data_10.pred_txt = "d_sub == (double)((3 * d_sub) / 4)";
++    __gen_e_acsl_assert_data_10.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_10.fct = "main";
++    __gen_e_acsl_assert_data_10.line = 40;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_div_2); */
++    __e_acsl_assert(d_sub == __gen_e_acsl_div_2,
++                    & __gen_e_acsl_assert_data_10);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_10);
++    __gmpq_clear(__gen_e_acsl__22);
++    __gmpq_clear(__gen_e_acsl_d_sub);
++    __gmpq_clear(__gen_e_acsl_mul_2);
++    __gmpq_clear(__gen_e_acsl__23);
++    __gmpq_clear(__gen_e_acsl_div);
++  }
++  /*@ assert d_sub == (double)((3 * d_sub) / 4); */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl_d_sub_2;
++    __e_acsl_mpq_t __gen_e_acsl__24;
++    __e_acsl_mpq_t __gen_e_acsl_div_3;
++    double __gen_e_acsl_div_4;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_11 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl_d_sub_2);
++    __gmpq_set_d(__gen_e_acsl_d_sub_2,d_sub);
++    __gmpq_init(__gen_e_acsl__24);
++    __gmpq_set_str(__gen_e_acsl__24,"2",10);
++    __gmpq_init(__gen_e_acsl_div_3);
++    __gmpq_div(__gen_e_acsl_div_3,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_d_sub_2),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__24));
++    __gen_e_acsl_div_4 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_3));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_11,"d_sub",
++                                    d_sub);
++    __gen_e_acsl_assert_data_11.blocking = 1;
++    __gen_e_acsl_assert_data_11.kind = "Assertion";
++    __gen_e_acsl_assert_data_11.pred_txt = "0.0 == (double)(d_sub / 2)";
++    __gen_e_acsl_assert_data_11.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_11.fct = "main";
++    __gen_e_acsl_assert_data_11.line = 41;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_div_4); */
++    __e_acsl_assert(0. == __gen_e_acsl_div_4,& __gen_e_acsl_assert_data_11);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_11);
++    __gmpq_clear(__gen_e_acsl_d_sub_2);
++    __gmpq_clear(__gen_e_acsl__24);
++    __gmpq_clear(__gen_e_acsl_div_3);
++  }
++  /*@ assert 0.0 == (double)(d_sub / 2); */ ;
++  float f_sub = 0x1p-149f;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__25;
++    __e_acsl_mpq_t __gen_e_acsl_f_sub;
++    __e_acsl_mpq_t __gen_e_acsl_mul_3;
++    __e_acsl_mpq_t __gen_e_acsl__26;
++    __e_acsl_mpq_t __gen_e_acsl_div_5;
++    float __gen_e_acsl_div_6;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_12 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__25);
++    __gmpq_set_str(__gen_e_acsl__25,"3",10);
++    __gmpq_init(__gen_e_acsl_f_sub);
++    __gmpq_set_d(__gen_e_acsl_f_sub,(double)f_sub);
++    __gmpq_init(__gen_e_acsl_mul_3);
++    __gmpq_mul(__gen_e_acsl_mul_3,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__25),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_f_sub));
++    __gmpq_init(__gen_e_acsl__26);
++    __gmpq_set_str(__gen_e_acsl__26,"4",10);
++    __gmpq_init(__gen_e_acsl_div_5);
++    __gmpq_div(__gen_e_acsl_div_5,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_mul_3),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__26));
++    __gen_e_acsl_div_6 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_5));
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_12,"f_sub",
++                                   f_sub);
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_12,"f_sub",
++                                   f_sub);
++    __gen_e_acsl_assert_data_12.blocking = 1;
++    __gen_e_acsl_assert_data_12.kind = "Assertion";
++    __gen_e_acsl_assert_data_12.pred_txt = "f_sub == (float)((3 * f_sub) / 4)";
++    __gen_e_acsl_assert_data_12.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_12.fct = "main";
++    __gen_e_acsl_assert_data_12.line = 43;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_div_6); */
++    __e_acsl_assert(f_sub == __gen_e_acsl_div_6,
++                    & __gen_e_acsl_assert_data_12);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_12);
++    __gmpq_clear(__gen_e_acsl__25);
++    __gmpq_clear(__gen_e_acsl_f_sub);
++    __gmpq_clear(__gen_e_acsl_mul_3);
++    __gmpq_clear(__gen_e_acsl__26);
++    __gmpq_clear(__gen_e_acsl_div_5);
++  }
++  /*@ assert f_sub == (float)((3 * f_sub) / 4); */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl_f_sub_2;
++    __e_acsl_mpq_t __gen_e_acsl__27;
++    __e_acsl_mpq_t __gen_e_acsl_div_7;
++    float __gen_e_acsl_div_8;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_13 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl_f_sub_2);
++    __gmpq_set_d(__gen_e_acsl_f_sub_2,(double)f_sub);
++    __gmpq_init(__gen_e_acsl__27);
++    __gmpq_set_str(__gen_e_acsl__27,"2",10);
++    __gmpq_init(__gen_e_acsl_div_7);
++    __gmpq_div(__gen_e_acsl_div_7,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_f_sub_2),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__27));
++    __gen_e_acsl_div_8 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_7));
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_13,"f_sub",
++                                   f_sub);
++    __gen_e_acsl_assert_data_13.blocking = 1;
++    __gen_e_acsl_assert_data_13.kind = "Assertion";
++    __gen_e_acsl_assert_data_13.pred_txt = "0.0f == (float)(f_sub / 2)";
++    __gen_e_acsl_assert_data_13.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_13.fct = "main";
++    __gen_e_acsl_assert_data_13.line = 44;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_div_8); */
++    __e_acsl_assert(0. == (double)__gen_e_acsl_div_8,
++                    & __gen_e_acsl_assert_data_13);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_13);
++    __gmpq_clear(__gen_e_acsl_f_sub_2);
++    __gmpq_clear(__gen_e_acsl__27);
++    __gmpq_clear(__gen_e_acsl_div_7);
++  }
++  /*@ assert 0.0f == (float)(f_sub / 2); */ ;
++  double big = 0x1.fffffffffffffp+1023;
++  double nbig = - big;
++  {
++    __e_acsl_mpq_t __gen_e_acsl_big;
++    __e_acsl_mpq_t __gen_e_acsl__28;
++    __e_acsl_mpq_t __gen_e_acsl_mul_4;
++    double __gen_e_acsl_mul_5;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_14 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl_big);
++    __gmpq_set_d(__gen_e_acsl_big,big);
++    __gmpq_init(__gen_e_acsl__28);
++    __gmpq_set_str(__gen_e_acsl__28,"2",10);
++    __gmpq_init(__gen_e_acsl_mul_4);
++    __gmpq_mul(__gen_e_acsl_mul_4,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_big),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__28));
++    __gen_e_acsl_mul_5 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_mul_4));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_14,"big",big);
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_14,"big",big);
++    __gen_e_acsl_assert_data_14.blocking = 1;
++    __gen_e_acsl_assert_data_14.kind = "Assertion";
++    __gen_e_acsl_assert_data_14.pred_txt = "(double)(big * 2) > big";
++    __gen_e_acsl_assert_data_14.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_14.fct = "main";
++    __gen_e_acsl_assert_data_14.line = 49;
++    /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_mul_5); */
++    __e_acsl_assert(__gen_e_acsl_mul_5 > big,& __gen_e_acsl_assert_data_14);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_14);
++    __gmpq_clear(__gen_e_acsl_big);
++    __gmpq_clear(__gen_e_acsl__28);
++    __gmpq_clear(__gen_e_acsl_mul_4);
++  }
++  /*@ assert (double)(big * 2) > big; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__29;
++    __e_acsl_mpq_t __gen_e_acsl_big_2;
++    __e_acsl_mpq_t __gen_e_acsl__30;
++    __e_acsl_mpq_t __gen_e_acsl_mul_6;
++    __e_acsl_mpq_t __gen_e_acsl_sub_3;
++    double __gen_e_acsl_sub_4;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_15 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__29);
++    __gmpq_set_str(__gen_e_acsl__29,"0",10);
++    __gmpq_init(__gen_e_acsl_big_2);
++    __gmpq_set_d(__gen_e_acsl_big_2,big);
++    __gmpq_init(__gen_e_acsl__30);
++    __gmpq_set_str(__gen_e_acsl__30,"2",10);
++    __gmpq_init(__gen_e_acsl_mul_6);
++    __gmpq_mul(__gen_e_acsl_mul_6,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_big_2),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__30));
++    __gmpq_init(__gen_e_acsl_sub_3);
++    __gmpq_sub(__gen_e_acsl_sub_3,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__29),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_mul_6));
++    __gen_e_acsl_sub_4 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_sub_3));
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_15,"big",big);
++    __e_acsl_assert_register_double(& __gen_e_acsl_assert_data_15,"nbig",
++                                    nbig);
++    __gen_e_acsl_assert_data_15.blocking = 1;
++    __gen_e_acsl_assert_data_15.kind = "Assertion";
++    __gen_e_acsl_assert_data_15.pred_txt = "(double)(0 - big * 2) < nbig";
++    __gen_e_acsl_assert_data_15.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_15.fct = "main";
++    __gen_e_acsl_assert_data_15.line = 50;
++    __e_acsl_assert(__gen_e_acsl_sub_4 < nbig,& __gen_e_acsl_assert_data_15);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_15);
++    __gmpq_clear(__gen_e_acsl__29);
++    __gmpq_clear(__gen_e_acsl_big_2);
++    __gmpq_clear(__gen_e_acsl__30);
++    __gmpq_clear(__gen_e_acsl_mul_6);
++    __gmpq_clear(__gen_e_acsl_sub_3);
++  }
++  /*@ assert (double)(0 - big * 2) < nbig; */ ;
++  float fbig = 0x1.fffffep+127f;
++  float nfbig = - fbig;
++  {
++    __e_acsl_mpq_t __gen_e_acsl_fbig;
++    __e_acsl_mpq_t __gen_e_acsl__31;
++    __e_acsl_mpq_t __gen_e_acsl_mul_7;
++    float __gen_e_acsl_mul_8;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_16 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl_fbig);
++    __gmpq_set_d(__gen_e_acsl_fbig,(double)fbig);
++    __gmpq_init(__gen_e_acsl__31);
++    __gmpq_set_str(__gen_e_acsl__31,"2",10);
++    __gmpq_init(__gen_e_acsl_mul_7);
++    __gmpq_mul(__gen_e_acsl_mul_7,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_fbig),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__31));
++    __gen_e_acsl_mul_8 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl_mul_7));
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_16,"fbig",fbig);
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_16,"fbig",fbig);
++    __gen_e_acsl_assert_data_16.blocking = 1;
++    __gen_e_acsl_assert_data_16.kind = "Assertion";
++    __gen_e_acsl_assert_data_16.pred_txt = "(float)(fbig * 2) > fbig";
++    __gen_e_acsl_assert_data_16.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_16.fct = "main";
++    __gen_e_acsl_assert_data_16.line = 53;
++    __e_acsl_assert(__gen_e_acsl_mul_8 > fbig,& __gen_e_acsl_assert_data_16);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_16);
++    __gmpq_clear(__gen_e_acsl_fbig);
++    __gmpq_clear(__gen_e_acsl__31);
++    __gmpq_clear(__gen_e_acsl_mul_7);
++  }
++  /*@ assert (float)(fbig * 2) > fbig; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__32;
++    __e_acsl_mpq_t __gen_e_acsl_fbig_2;
++    __e_acsl_mpq_t __gen_e_acsl__33;
++    __e_acsl_mpq_t __gen_e_acsl_mul_9;
++    __e_acsl_mpq_t __gen_e_acsl_sub_5;
++    float __gen_e_acsl_sub_6;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_17 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__32);
++    __gmpq_set_str(__gen_e_acsl__32,"0",10);
++    __gmpq_init(__gen_e_acsl_fbig_2);
++    __gmpq_set_d(__gen_e_acsl_fbig_2,(double)fbig);
++    __gmpq_init(__gen_e_acsl__33);
++    __gmpq_set_str(__gen_e_acsl__33,"2",10);
++    __gmpq_init(__gen_e_acsl_mul_9);
++    __gmpq_mul(__gen_e_acsl_mul_9,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_fbig_2),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__33));
++    __gmpq_init(__gen_e_acsl_sub_5);
++    __gmpq_sub(__gen_e_acsl_sub_5,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__32),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl_mul_9));
++    __gen_e_acsl_sub_6 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl_sub_5));
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_17,"fbig",fbig);
++    __e_acsl_assert_register_float(& __gen_e_acsl_assert_data_17,"nfbig",
++                                   nfbig);
++    __gen_e_acsl_assert_data_17.blocking = 1;
++    __gen_e_acsl_assert_data_17.kind = "Assertion";
++    __gen_e_acsl_assert_data_17.pred_txt = "(float)(0 - fbig * 2) < nfbig";
++    __gen_e_acsl_assert_data_17.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_17.fct = "main";
++    __gen_e_acsl_assert_data_17.line = 54;
++    __e_acsl_assert(__gen_e_acsl_sub_6 < nfbig,& __gen_e_acsl_assert_data_17);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_17);
++    __gmpq_clear(__gen_e_acsl__32);
++    __gmpq_clear(__gen_e_acsl_fbig_2);
++    __gmpq_clear(__gen_e_acsl__33);
++    __gmpq_clear(__gen_e_acsl_mul_9);
++    __gmpq_clear(__gen_e_acsl_sub_5);
++  }
++  /*@ assert (float)(0 - fbig * 2) < nfbig; */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__34;
++    __e_acsl_mpq_t __gen_e_acsl_sub_7;
++    double __gen_e_acsl__35;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_18 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__34);
++    __gmpq_set_str(__gen_e_acsl__34,"01/10",10);
++    __gmpq_init(__gen_e_acsl_sub_7);
++    __gmpq_sub(__gen_e_acsl_sub_7,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__34),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__34));
++    __gen_e_acsl__35 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_sub_7));
++    __gen_e_acsl_assert_data_18.blocking = 1;
++    __gen_e_acsl_assert_data_18.kind = "Assertion";
++    __gen_e_acsl_assert_data_18.pred_txt = "0.0 == (double)(0.1 - 0.1)";
++    __gen_e_acsl_assert_data_18.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_18.fct = "main";
++    __gen_e_acsl_assert_data_18.line = 57;
++    __e_acsl_assert(0. == __gen_e_acsl__35,& __gen_e_acsl_assert_data_18);
++    __gmpq_clear(__gen_e_acsl__34);
++    __gmpq_clear(__gen_e_acsl_sub_7);
++  }
++  /*@ assert 0.0 == (double)(0.1 - 0.1); */ ;
++  {
++    __e_acsl_mpq_t __gen_e_acsl__36;
++    __e_acsl_mpq_t __gen_e_acsl_sub_8;
++    float __gen_e_acsl__37;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_19 =
++      {.values = (void *)0};
++    __gmpq_init(__gen_e_acsl__36);
++    __gmpq_set_str(__gen_e_acsl__36,"01/10",10);
++    __gmpq_init(__gen_e_acsl_sub_8);
++    __gmpq_sub(__gen_e_acsl_sub_8,
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__36),
++               (__e_acsl_mpq_struct const *)(__gen_e_acsl__36));
++    __gen_e_acsl__37 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl_sub_8));
++    __gen_e_acsl_assert_data_19.blocking = 1;
++    __gen_e_acsl_assert_data_19.kind = "Assertion";
++    __gen_e_acsl_assert_data_19.pred_txt = "0.0f == (float)(0.1 - 0.1)";
++    __gen_e_acsl_assert_data_19.file = "rational_cast.c";
++    __gen_e_acsl_assert_data_19.fct = "main";
++    __gen_e_acsl_assert_data_19.line = 58;
++    __e_acsl_assert(0. == (double)__gen_e_acsl__37,
++                    & __gen_e_acsl_assert_data_19);
++    __gmpq_clear(__gen_e_acsl__36);
++    __gmpq_clear(__gen_e_acsl_sub_8);
++  }
++  /*@ assert 0.0f == (float)(0.1 - 0.1); */ ;
++  __retres = 0;
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/arith/oracle/gen_rationals.0.c b/plugins/e-acsl/tests/arith/oracle/gen_rationals.0.c
+index fd8b639508..13ff94ac70 100644
+--- a/plugins/e-acsl/tests/arith/oracle/gen_rationals.0.c
++++ b/plugins/e-acsl/tests/arith/oracle/gen_rationals.0.c
+@@ -92,7 +92,7 @@ int main(void)
+       {.values = (void *)0};
+     __gmpq_init(__gen_e_acsl__4);
+     __gmpq_set_str(__gen_e_acsl__4,"01/10",10);
+-    __gen_e_acsl__5 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__4));
++    __gen_e_acsl__5 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__4));
+     __gmpq_init(__gen_e_acsl__6);
+     /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__5); */
+     __gmpq_set_d(__gen_e_acsl__6,__gen_e_acsl__5);
+@@ -111,14 +111,14 @@ int main(void)
+   /*@ assert (double)0.1 != 0.1; */ ;
+   {
+     __e_acsl_mpq_t __gen_e_acsl__7;
+-    double __gen_e_acsl__8;
++    float __gen_e_acsl__8;
+     double __gen_e_acsl__9;
+     __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
+       {.values = (void *)0};
+     __gmpq_init(__gen_e_acsl__7);
+     __gmpq_set_str(__gen_e_acsl__7,"01/10",10);
+-    __gen_e_acsl__8 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__7));
+-    __gen_e_acsl__9 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__7));
++    __gen_e_acsl__8 = __e_acsl_mpq_get_f((__e_acsl_mpq_struct const *)(__gen_e_acsl__7));
++    __gen_e_acsl__9 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__7));
+     __gen_e_acsl_assert_data_5.blocking = 1;
+     __gen_e_acsl_assert_data_5.kind = "Assertion";
+     __gen_e_acsl_assert_data_5.pred_txt = "(float)0.1 != (double)0.1";
+@@ -127,9 +127,7 @@ int main(void)
+     __gen_e_acsl_assert_data_5.line = 16;
+     /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__8); */
+     /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__9); */
+-    /*@ assert Eva: is_nan_or_infinite: \is_finite((float)__gen_e_acsl__8);
+-    */
+-    __e_acsl_assert((double)((float)__gen_e_acsl__8) != __gen_e_acsl__9,
++    __e_acsl_assert((double)__gen_e_acsl__8 != __gen_e_acsl__9,
+                     & __gen_e_acsl_assert_data_5);
+     __gmpq_clear(__gen_e_acsl__7);
+   }
+@@ -146,7 +144,7 @@ int main(void)
+       {.values = (void *)0};
+     __gmpq_init(__gen_e_acsl__10);
+     __gmpq_set_str(__gen_e_acsl__10,"11/10",10);
+-    __gen_e_acsl__11 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__10));
++    __gen_e_acsl__11 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl__10));
+     __gmpq_init(__gen_e_acsl__12);
+     /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl__11); */
+     __gmpq_set_d(__gen_e_acsl__12,__gen_e_acsl__11);
+diff --git a/plugins/e-acsl/tests/arith/oracle/rational_cast.0.res.oracle b/plugins/e-acsl/tests/arith/oracle/rational_cast.0.res.oracle
+new file mode 100644
+index 0000000000..8b6bcf598f
+--- /dev/null
++++ b/plugins/e-acsl/tests/arith/oracle/rational_cast.0.res.oracle
+@@ -0,0 +1,71 @@
++[kernel:parser:decimal-float] rational_cast.c:9: Warning: 
++  Floating-point constant 0.1 is not represented exactly. Will use 0x1.999999999999ap-4.
++  (warn-once: no further messages from category 'parser:decimal-float' will be emitted)
++[e-acsl] beginning translation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] rational_cast.c:11: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl__2);
++[eva:alarm] rational_cast.c:11: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:11: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:12: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl__4);
++[eva:alarm] rational_cast.c:12: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:12: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:13: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl__6);
++[eva:alarm] rational_cast.c:13: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:13: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:17: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl__10);
++[eva:alarm] rational_cast.c:17: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:17: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:18: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl__13);
++[eva:alarm] rational_cast.c:18: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:18: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:25: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl_add_2);
++[eva:alarm] rational_cast.c:25: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:25: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:26: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl_add_4);
++[eva:alarm] rational_cast.c:26: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:26: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:32: Warning: 
++  non-finite float value. assert \is_finite(__gen_e_acsl__19);
++[eva:alarm] rational_cast.c:32: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:32: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:34: Warning: 
++  non-finite float value. assert \is_finite(__gen_e_acsl__21);
++[eva:alarm] rational_cast.c:34: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:40: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl_div_2);
++[eva:alarm] rational_cast.c:40: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:40: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:41: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl_div_4);
++[eva:alarm] rational_cast.c:41: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:41: Warning: assertion got status unknown.
++[eva:alarm] rational_cast.c:43: Warning: 
++  non-finite float value. assert \is_finite(__gen_e_acsl_div_6);
++[eva:alarm] rational_cast.c:43: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:44: Warning: 
++  non-finite float value. assert \is_finite(__gen_e_acsl_div_8);
++[eva:alarm] rational_cast.c:44: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] rational_cast.c:49: Warning: 
++  non-finite double value. assert \is_finite(__gen_e_acsl_mul_5);
++[eva:alarm] rational_cast.c:49: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status invalid.
+diff --git a/plugins/e-acsl/tests/arith/oracle/rationals.0.res.oracle b/plugins/e-acsl/tests/arith/oracle/rationals.0.res.oracle
+index 881c80d535..4d3b0a90c4 100644
+--- a/plugins/e-acsl/tests/arith/oracle/rationals.0.res.oracle
++++ b/plugins/e-acsl/tests/arith/oracle/rationals.0.res.oracle
+@@ -2,7 +2,6 @@
+   Floating-point constant 0.2f is not represented exactly. Will use 0x1.99999a0000000p-3.
+   (warn-once: no further messages from category 'parser:decimal-float' will be emitted)
+ [e-acsl] beginning translation.
+-[e-acsl] Warning: R to float: double rounding might cause unsoundness
+ [e-acsl] translation done in project "e-acsl".
+ [eva:alarm] rationals.c:12: Warning: 
+   function __e_acsl_assert, behavior blocking: precondition got status unknown.
+@@ -15,11 +14,9 @@
+   function __e_acsl_assert, behavior blocking: precondition got status unknown.
+ [eva:alarm] rationals.c:15: Warning: assertion got status unknown.
+ [eva:alarm] rationals.c:16: Warning: 
+-  non-finite double value. assert \is_finite(__gen_e_acsl__8);
++  non-finite float value. assert \is_finite(__gen_e_acsl__8);
+ [eva:alarm] rationals.c:16: Warning: 
+   non-finite double value. assert \is_finite(__gen_e_acsl__9);
+-[eva:alarm] rationals.c:16: Warning: 
+-  non-finite float value. assert \is_finite((float)__gen_e_acsl__8);
+ [eva:alarm] rationals.c:16: Warning: 
+   function __e_acsl_assert, behavior blocking: precondition got status unknown.
+ [eva:alarm] rationals.c:17: Warning: 
+diff --git a/plugins/e-acsl/tests/arith/rational_cast.c b/plugins/e-acsl/tests/arith/rational_cast.c
+new file mode 100644
+index 0000000000..9ddfdea7db
+--- /dev/null
++++ b/plugins/e-acsl/tests/arith/rational_cast.c
+@@ -0,0 +1,61 @@
++/* run.config
++   COMMENT: Casting a mathematical real/rational to double or float must use
++   COMMENT: IEEE 754 round-to-nearest-even (not GMP mpq_get_d truncation, and
++   COMMENT: without double rounding for float).
++*/
++
++int main(void) {
++  /* Double: 0.1 rounds up to 0x1.999999999999ap-4 (mpq_get_d truncated down). */
++  double d = 0.1;
++  double d_below = 0x1.9999999999999p-4;
++  /*@ assert d == (double)0.1; */
++  /*@ assert d_below != (double)0.1; */
++  /*@ assert (double)0.1 > 0.1; */
++
++  /* Negative rational: -0.1 rounds down (away from zero). */
++  double nd = -0.1;
++  /*@ assert nd == (double)(0 - 0.1); */
++  /*@ assert (double)(0 - 0.1) < 0 - 0.1; */
++
++  /* Exact midpoint ties-to-even for double (around 1.0, ulp = 2^-52):
++     1 + 2^-53 ties to even -> 1.0; 1 + 3*2^-53 ties to even -> 1 + 2^-51. */
++  double one = 1.0;
++  double half_ulp = 0x1p-53;
++  double one_plus_2ulp = 0x1.0000000000002p0;
++  /*@ assert one == (double)(1 + half_ulp); */
++  /*@ assert one_plus_2ulp == (double)(1 + 3 * half_ulp); */
++
++  /* Float: single rounding avoids double rounding at binary32 midpoints.
++     16777217.0000000001 is strictly above the midpoint 16777217.0 between
++     16777216.0f and 16777218.0f, so it must round to 16777218.0f. */
++  float f = 16777218.0f;
++  /*@ assert f == (float)16777217.0000000001; */
++  float f_tenth = 0.1f;
++  /*@ assert f_tenth == (float)0.1; */
++
++  /* Subnormal double & float rounding (use exact subnormal constants divided
++     in rational arithmetic so the test does not depend on hex-rational literal
++     parsing). */
++  double d_sub = 0x1p-1074;
++  /*@ assert d_sub == (double)(3 * d_sub / 4); */
++  /*@ assert 0.0 == (double)(d_sub / 2); */
++  float f_sub = 0x1p-149f;
++  /*@ assert f_sub == (float)(3 * f_sub / 4); */
++  /*@ assert 0.0f == (float)(f_sub / 2); */
++
++  /* Overflow to +INFINITY / -INFINITY. */
++  double big = 0x1.fffffffffffffp+1023;
++  double nbig = -big;
++  /*@ assert (double)(big * 2) > big; */
++  /*@ assert (double)(0 - big * 2) < nbig; */
++  float fbig = 0x1.fffffep+127f;
++  float nfbig = -fbig;
++  /*@ assert (float)(fbig * 2) > fbig; */
++  /*@ assert (float)(0 - fbig * 2) < nfbig; */
++
++  /* Exact zero. */
++  /*@ assert 0.0 == (double)(0.1 - 0.1); */
++  /*@ assert 0.0f == (float)(0.1 - 0.1); */
++
++  return 0;
++}
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c
+index e3bbcd96aa..2ad3f1cccf 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_functions.0.c
+@@ -1324,7 +1324,7 @@ double __gen_e_acsl_f2(double x)
+   __gmpq_init(__gen_e_acsl_div);
+   __gmpq_div(__gen_e_acsl_div,(__e_acsl_mpq_struct const *)(__gen_e_acsl__8),
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl_x_3));
+-  __gen_e_acsl_div_2 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div));
++  __gen_e_acsl_div_2 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div));
+   __gmpq_clear(__gen_e_acsl__8);
+   __gmpq_clear(__gen_e_acsl_x_3);
+   __gmpq_clear(__gen_e_acsl_div);
+@@ -2070,7 +2070,7 @@ double __gen_e_acsl_f6_here(double *x)
+   __gmpq_div(__gen_e_acsl_div_3,
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl__10),
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl__11));
+-  __gen_e_acsl__12 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_3));
++  __gen_e_acsl__12 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_3));
+   __gmpq_clear(__gen_e_acsl__10);
+   __gmpq_clear(__gen_e_acsl__11);
+   __gmpq_clear(__gen_e_acsl_div_3);
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c b/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c
+index 4a2303904f..b2300e7b4f 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_functions.1.c
+@@ -1591,7 +1591,7 @@ void __gen_e_acsl_f2(__e_acsl_mpq_t *__retres_arg, __e_acsl_mpq_struct * x)
+   __gmpq_div(__gen_e_acsl_div,
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl__15),
+              (__e_acsl_mpq_struct const *)(x));
+-  __gen_e_acsl_cast = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div));
++  __gen_e_acsl_cast = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div));
+   __gmpq_init(*__retres_arg);
+   /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_cast); */
+   __gmpq_set_d(*__retres_arg,__gen_e_acsl_cast);
+@@ -2583,7 +2583,7 @@ void __gen_e_acsl_f6_here(__e_acsl_mpq_t *__retres_arg, double *x)
+   __gmpq_div(__gen_e_acsl_div_2,
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl__19),
+              (__e_acsl_mpq_struct const *)(__gen_e_acsl__22));
+-  __gen_e_acsl_cast_2 = __gmpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_2));
++  __gen_e_acsl_cast_2 = __e_acsl_mpq_get_d((__e_acsl_mpq_struct const *)(__gen_e_acsl_div_2));
+   __gmpq_init(*__retres_arg);
+   /*@ assert Eva: is_nan_or_infinite: \is_finite(__gen_e_acsl_cast_2); */
+   __gmpq_set_d(*__retres_arg,__gen_e_acsl_cast_2);
+-- 
+2.47.3
+

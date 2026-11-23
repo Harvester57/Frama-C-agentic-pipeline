@@ -1,0 +1,1695 @@
+From f310672f09b15475d102b0b66474922f253fec33 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:59:12 +0000
+Subject: [PATCH] [e-acsl] type all sibling subterms and quantifier goals after
+ Not_yet
+
+In Typing (plugins/e-acsl/src/analyses/typing.ml), composite predicates
+such as Pand/Prel and Tapp already ensure all children are typed even
+when an earlier child raises Error.Not_yet, because Labels.preprocess
+registers \at/\old subterms in every branch for Translate_ats.for_stmt
+and Loops.mk_nested_loops translates quantifier goals before bounds.
+
+Other composite cases still short-circuited on the first Error.Not_yet
+(either when computing a typing context or when typing children
+sequentially):
+- Pforall/Pexists and type_bound_variables skipped remaining guards and
+  the quantifier goal (causing "typing was not performed" on quantifiers
+  with an unsupported bound, and on stpncpy's dest_nul_padded
+  postcondition);
+- TBinOp skipped the second operand (causing "typing was not performed
+  on construct 1" when Translate_ats pre-translated \old(src)'s
+  alignment RTE guard in strlcat's bounded_result postcondition);
+- the same pattern affected TUnOp, TCast, Tif, Trange, Tlet, Pif, Plet,
+  Papp, Pseparated, and Paligned.
+
+Use shared do_both, do_all, and with_opt_ctx helpers so every sibling
+subterm, bound, and quantifier goal is typed before re-raising the first
+typing/unsupported error.
+
+New test: plugins/e-acsl/tests/constructs/typing_unsupported_sibling.c.
+---
+ plugins/e-acsl/src/analyses/typing.ml         |  215 +--
+ .../oracle/gen_typing_unsupported_sibling.0.c | 1161 +++++++++++++++++
+ .../typing_unsupported_sibling.0.res.oracle   |  119 ++
+ .../constructs/typing_unsupported_sibling.c   |   28 +
+ 4 files changed, 1444 insertions(+), 79 deletions(-)
+ create mode 100644 plugins/e-acsl/tests/constructs/oracle/gen_typing_unsupported_sibling.0.c
+ create mode 100644 plugins/e-acsl/tests/constructs/oracle/typing_unsupported_sibling.0.res.oracle
+ create mode 100644 plugins/e-acsl/tests/constructs/typing_unsupported_sibling.c
+
+diff --git a/plugins/e-acsl/src/analyses/typing.ml b/plugins/e-acsl/src/analyses/typing.ml
+index 749e68ad9e..d3e03b57e5 100644
+--- a/plugins/e-acsl/src/analyses/typing.ml
++++ b/plugins/e-acsl/src/analyses/typing.ml
+@@ -325,6 +325,37 @@ let type_offset ~profile t =
+ 
+ (* type the term [t] in a context [ctx] by taking --e-acsl-O-gmp-only into account
+    iff [use_gmp_opt] is true. *)
++(* Run [f] and [g] so that an E-ACSL typing/unsupported error in [f] still
++   allows [g] to run, re-raising the first exception. *)
++let do_both f g =
++  match f () with
++  | () -> g ()
++  | exception ((Error.Not_yet _ | Error.Typing_error _) as exn) ->
++    (try g () with Error.Not_yet _ | Error.Typing_error _ -> ());
++    raise exn
++
++let do_all f xs =
++  let exn_o = ref None in
++  List.iter
++    (fun x ->
++       try f x
++       with (Error.Not_yet _ | Error.Typing_error _) as exn ->
++         if Option.is_none !exn_o then exn_o := Some exn)
++    xs;
++  Option.iter raise !exn_o
++
++(* Compute a typing context [mk_ctx ()], catching E-ACSL typing/unsupported
++   errors so that [type_children] still types every subterm before the error is
++   re-raised. *)
++let with_opt_ctx mk_ctx type_children =
++  match mk_ctx () with
++  | ctx ->
++    type_children (Some ctx);
++    ctx
++  | exception ((Error.Not_yet _ | Error.Typing_error _) as exn) ->
++    (try type_children None with Error.Not_yet _ | Error.Typing_error _ -> ());
++    raise exn
++
+ let rec type_term
+     ~use_gmp_opt
+     ?(under_lambda=false)
+@@ -393,22 +424,17 @@ let rec type_term
+       c_int (* converted into [t == 0] in case of GMP *)
+ 
+     | TUnOp ((Neg | BNot), t') ->
+-      let ctx =
+-        mk_ctx ~use_gmp_opt:true @@
+-        ty_of_interv @@
+-        Interval.joins_from_profile ~profile [t'; t]
+-      in
+-      ignore (type_term ~use_gmp_opt:true ~arith_operand:true ~ctx ~profile t');
+-      ctx
++      with_opt_ctx
++        (fun () ->
++           mk_ctx ~use_gmp_opt:true @@
++           ty_of_interv @@
++           Interval.joins_from_profile ~profile [t'; t])
++        (fun ctx ->
++           ignore (type_term ~use_gmp_opt:true ~arith_operand:true ?ctx ~profile t'))
+ 
+     | TBinOp ((PlusA | MinusA | Mult | Div | Mod | Shiftrt | BAnd
+               | BOr | BXor), t1, t2)
+       ->
+-      let ctx =
+-        mk_ctx ~use_gmp_opt:true @@
+-        ty_of_interv @@
+-        Interval.joins_from_profile ~profile [t2; t1; t]
+-      in
+       (* it is enough to explicitly coerce when required one operand to [ctx]
+          (through [arith_operand]) in order to force the type of the
+          operation.  Heuristic: coerce the operand which is not a lval in
+@@ -419,71 +445,90 @@ let rec type_term
+         | _ -> true
+       in
+       let cast_first = cast_first t1 t2 in
+-      ignore
+-        (type_term ~use_gmp_opt:true ~arith_operand:cast_first ~ctx ~profile t1);
+-      ignore
+-        (type_term ~use_gmp_opt:true ~arith_operand:(not cast_first) ~ctx ~profile t2);
+-      ctx
++      with_opt_ctx
++        (fun () ->
++           mk_ctx ~use_gmp_opt:true @@
++           ty_of_interv @@
++           Interval.joins_from_profile ~profile [t2; t1; t])
++        (fun ctx ->
++           do_both
++             (fun () ->
++                ignore
++                  (type_term ~use_gmp_opt:true ~arith_operand:cast_first ?ctx ~profile t1))
++             (fun () ->
++                ignore
++                  (type_term ~use_gmp_opt:true ~arith_operand:(not cast_first) ?ctx ~profile t2)))
+ 
+     | TBinOp(Shiftlt, t1, t2) ->
+-      let ctx =
+-        mk_ctx ~use_gmp_opt:true @@
+-        ty_of_interv @@
+-        Interval.joins_from_profile ~profile [t2; t1; t]
+-      in
+       (* For left-shift, the first operand must always be coerced to the largest
+          type, Frama-C issue #1800 (case e-acsl-shift-left-narrow) *)
+-      ignore (type_term ~use_gmp_opt:true ~arith_operand:true ~ctx ~profile t1);
+-      ignore
+-        (type_term ~use_gmp_opt:true ~arith_operand:false ~ctx ~profile t2);
+-      ctx
+-
++      with_opt_ctx
++        (fun () ->
++           mk_ctx ~use_gmp_opt:true @@
++           ty_of_interv @@
++           Interval.joins_from_profile ~profile [t2; t1; t])
++        (fun ctx ->
++           do_both
++             (fun () ->
++                ignore (type_term ~use_gmp_opt:true ~arith_operand:true ?ctx ~profile t1))
++             (fun () ->
++                ignore (type_term ~use_gmp_opt:true ~arith_operand:false ?ctx ~profile t2)))
+ 
+     | TBinOp ((Lt | Gt | Le | Ge | Eq | Ne), t1, t2) ->
+       assert
+         (match ctx with
+          | None -> true
+          | Some c -> Number_ty.compare c c_int >= 0);
+-      let ctx = ctx_relation ~profile t1 t2 in
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t1);
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t2);
++      ignore
++        (with_opt_ctx
++           (fun () -> ctx_relation ~profile t1 t2)
++           (fun ctx ->
++              do_both
++                (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t1))
++                (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t2))));
+       c_int
+ 
+     | TBinOp ((LAnd | LOr), t1, t2) ->
+-      let
+-        ty = ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1])
+-      in
+       (* both operands fit in an int. *)
+-      ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t1);
+-      ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t2);
+-      ty
++      with_opt_ctx
++        (fun () ->
++           ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1]))
++        (fun _ ->
++           do_both
++             (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t1))
++             (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:c_int ~profile t2)))
+ 
+     | TCast (false, Ctype _, t') ->
+       (* compute the smallest interval from the whole term [t] *)
+-      let i = Interval.get_from_profile ~profile t in
+       (* nothing more to do: [i] is already more precise than what we could
+          infer from the arguments of the cast. *)
+-      let ctx = ty_of_interv ?ctx i in
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t');
+-      ctx
++      with_opt_ctx
++        (fun () -> ty_of_interv ?ctx (Interval.get_from_profile ~profile t))
++        (fun ctx -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t'))
+ 
+     | TCast (true, _, t') ->
+-      let i = Interval.get_from_profile ~profile t in
+-      ignore (type_term ~use_gmp_opt ~arith_operand ?ctx ~profile t');
+-      ty_of_interv ~use_gmp_opt i
++      with_opt_ctx
++        (fun () -> ty_of_interv ~use_gmp_opt (Interval.get_from_profile ~profile t))
++        (fun _ -> ignore (type_term ~use_gmp_opt ~arith_operand ?ctx ~profile t'))
+     (* TODO (NB) : Maybe can be merged ? *)
+ 
+     | TCast (false, _,_) -> assert false
+ 
+     | Tif (cond, t1, t2) ->
+-      ignore (type_predicate ~profile cond);
+-      let ctx =
+-        ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1; t])
+-      in
+-      let ctx = mk_ctx ~use_gmp_opt:true ctx in
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t1);
+-      ignore (type_term ~use_gmp_opt:true ~ctx ~profile t2);
+-      ctx
++      let res = ref None in
++      do_both
++        (fun () -> type_predicate ~profile cond)
++        (fun () ->
++           res := Some
++               (with_opt_ctx
++                  (fun () ->
++                     mk_ctx ~use_gmp_opt:true @@
++                     ty_of_interv ?ctx (Interval.joins_from_profile ~profile [t2; t1; t]))
++                  (fun ctx ->
++                     do_both
++                       (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t1))
++                       (fun () -> ignore (type_term ~use_gmp_opt:true ?ctx ~profile t2)))));
++      Option.get !res
+ 
+     | Tat (t, _) ->
+       (type_term ~use_gmp_opt ~arith_operand ?ctx ~profile t).ty
+@@ -501,9 +546,13 @@ let rec type_term
+ 
+     | TBinOp ((PlusPI | MinusPI), t1, t2) ->
+       (* both [t1] and [t2] must be typed. *)
+-      ignore (type_term ~use_gmp_opt:true ~ctx:Nan ~profile t1);
+-      let ctx = type_offset ~profile t2 in
+-      ignore (type_term ~use_gmp_opt:false ~ctx ~profile t2);
++      do_both
++        (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:Nan ~profile t1))
++        (fun () ->
++           ignore
++             (with_opt_ctx
++                (fun () -> type_offset ~profile t2)
++                (fun ctx -> ignore (type_term ~use_gmp_opt:false ?ctx ~profile t2))));
+       Nan
+ 
+     | Tapp(li, _, args) ->
+@@ -667,15 +716,19 @@ let rec type_term
+     | Trange(None, _) | Trange(_, None) ->
+       Options.abort ~current:true "unbounded ranges are not part of E-ACSl"
+     | Trange(Some n1, Some n2) ->
+-      ignore (type_term ~use_gmp_opt ~profile n1);
+-      ignore (type_term ~use_gmp_opt ~profile n2);
++      do_both
++        (fun () -> ignore (type_term ~use_gmp_opt ~profile n1))
++        (fun () -> ignore (type_term ~use_gmp_opt ~profile n2));
+       let i = Interval.get_from_profile ~profile t in
+       ty_of_interv ?ctx i
+ 
+     | Tlet(li, t) ->
+       let li_t = Terms.of_li li in
+-      ignore (type_term ~use_gmp_opt:true ~profile li_t);
+-      (type_term ~use_gmp_opt:true ?ctx ~profile t).ty
++      let res = ref None in
++      do_both
++        (fun () -> ignore (type_term ~use_gmp_opt:true ~profile li_t))
++        (fun () -> res := Some (type_term ~use_gmp_opt:true ?ctx ~profile t).ty);
++      Option.get !res
+     | Tlambda ([ _ ],lt) ->
+       (type_term ~use_gmp_opt:true ~under_lambda:true ?ctx ~profile lt).ty
+     | Tlambda (_,_) -> Error.not_yet "lambda"
+@@ -772,17 +825,18 @@ and number_ty_bound_variable ~profile (t1, lv, t2) =
+       Printer.pp_logic_var lv
+ 
+ and type_bound_variables ~profile (t1, lv, t2) =
+-  let ctx = number_ty_bound_variable ~profile (t1, lv, t2) in
+-  (* forcing when typing bounds prevents to generate an extra useless
+-     GMP variable when --e-acsl-O-gmp-only *)
+-  ignore(type_term ~use_gmp_opt:false ~ctx ~profile t1);
+-  ignore(type_term ~use_gmp_opt:false ~ctx ~profile t2)
++  ignore
++    (with_opt_ctx
++       (fun () -> number_ty_bound_variable ~profile (t1, lv, t2))
++       (fun ctx ->
++          (* forcing when typing bounds prevents to generate an extra useless
++             GMP variable when --e-acsl-O-gmp-only *)
++          do_both
++            (fun () -> ignore (type_term ~use_gmp_opt:false ?ctx ~profile t1))
++            (fun () -> ignore (type_term ~use_gmp_opt:false ?ctx ~profile t2))))
+ 
+ and type_predicate ~profile p =
+   Options.debug ~dkey ~level:3 "typing predicate: %a" Printer.pp_predicate p;
+-  let
+-    do_both f g = (try f() with e -> try g(); raise e with | _ -> raise e); g()
+-  in
+   let p = Logic_normalizer.get_pred p in
+   let open Current_loc.Operators in
+   let<> UpdatedCurrentLoc = p.pred_loc in
+@@ -791,7 +845,7 @@ and type_predicate ~profile p =
+   | Pfalse | Ptrue -> ()
+   | Papp(li, _, args) ->
+     begin
+-      List.iter
++      do_all
+         (fun x -> ignore (type_term ~use_gmp_opt: true ~profile x))
+         args;
+       match li.l_body with
+@@ -835,22 +889,24 @@ and type_predicate ~profile p =
+   | Pnot p ->
+     type_predicate ~profile p
+   | Pif(c, p1, p2) ->
+-    ignore (type_predicate ~profile c);
+-    let on p  () = type_predicate ~profile p in
+-    do_both (on p1) (on p2)
++    let on p () = type_predicate ~profile p in
++    do_both (on c) (fun () -> do_both (on p1) (on p2))
+   | Plet(li, p) ->
+     let li_t = Terms.of_li li in
+-    ignore (type_term ~use_gmp_opt:true ~profile li_t);
+-    type_predicate ~profile p
++    do_both
++      (fun () -> ignore (type_term ~use_gmp_opt:true ~profile li_t))
++      (fun () -> type_predicate ~profile p)
+   | Pforall _
+   | Pexists _ ->
+     let guards, goal = Bound_variables.get_preprocessed_quantifier p in
+-    List.iter
+-      (fun (t1, x, t2) -> type_bound_variables ~profile (t1, x, t2))
+-      guards;
+-    type_predicate ~profile goal
++    do_both
++      (fun () ->
++         do_all
++           (fun (t1, x, t2) -> type_bound_variables ~profile (t1, x, t2))
++           guards)
++      (fun () -> type_predicate ~profile goal)
+   | Pseparated tlist ->
+-    List.iter
++    do_all
+       (fun t -> ignore (type_term ~use_gmp_opt:false ~ctx:Nan ~profile t))
+       tlist
+   | Pinitialized(_, t)
+@@ -864,8 +920,9 @@ and type_predicate ~profile p =
+   | Paligned (t, n) ->
+     let sizet_kind = Machine.sizeof_kind () in
+     let size_t = C_integer sizet_kind in
+-    ignore (type_term ~use_gmp_opt:false ~ctx:Nan ~profile t);
+-    ignore (type_term ~use_gmp_opt:true ~ctx:size_t ~profile n)
++    do_both
++      (fun () -> ignore (type_term ~use_gmp_opt:false ~ctx:Nan ~profile t))
++      (fun () -> ignore (type_term ~use_gmp_opt:true ~ctx:size_t ~profile n))
+   | Pat(p, _) -> type_predicate ~profile p
+   | Pfresh _ -> Error.not_yet "\\fresh"
+ 
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_typing_unsupported_sibling.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_typing_unsupported_sibling.0.c
+new file mode 100644
+index 0000000000..1e022f1175
+--- /dev/null
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_typing_unsupported_sibling.0.c
+@@ -0,0 +1,1161 @@
++/* Generated by Frama-C */
++#include "pthread.h"
++#include "stddef.h"
++#include "stdint.h"
++#include "stdio.h"
++#include "string.h"
++#include "time.h"
++extern  __attribute__((__FC_BUILTIN__)) int __e_acsl_sound_verdict;
++
++/*@ requires valid_string_src: valid_read_string(src);
++    requires valid_string_dest: valid_string(dest);
++    requires room_nstring: \valid(dest + (0 .. n - 1));
++    requires
++      separation:
++        \separated(
++          dest + (0 .. \min(n - 1, strlen(dest) + strlen(src))),
++          src + (0 .. strnlen(src, n - 1))
++          );
++    ensures
++      bounded_result: \result == strlen(\old(dest)) + strlen(\old(src));
++    assigns *(dest + (strlen{Old}(dest) .. n)), \result;
++    assigns *(dest + (strlen{Old}(dest) .. n))
++      \from (indirect: n), *(src + (0 .. strlen{Old}(src)));
++    assigns \result
++      \from (indirect: src), (indirect: *(src + (0 .. n - 1))), (indirect: n);
++ */
++size_t __gen_e_acsl_strlcat(char * restrict dest, char const * restrict src,
++                            size_t n);
++
++/*@ requires valid_string_src: valid_read_nstring(src, n);
++    requires valid_dest: \valid(dest + (0 .. n - 1));
++    requires separation: \separated(src + (0 .. n - 1), dest + (0 .. n - 1));
++    ensures initialization: \initialized(\old(dest) + (0 .. \old(n) - 1));
++    assigns *(dest + (0 .. n - 1)), \result;
++    assigns *(dest + (0 .. n - 1))
++      \from *(src + (0 .. n - 1)), (indirect: n);
++    assigns \result
++      \from dest, (indirect: *(src + (0 .. n - 1))), (indirect: n);
++    
++    behavior src_is_a_string:
++      assumes src_has_nul: strlen(src) < n;
++      ensures valid_string_dest: valid_read_string(\old(dest));
++      ensures same_contents: strcmp(\old(dest), \old(src)) == 0;
++      ensures
++        dest_nul_padded:
++          \forall integer i;
++            strlen(\old(src)) <= i < \old(n) ==> *(\old(dest) + i) == 0;
++      ensures
++        result_points_to_nul: \result == \old(dest) + strlen(\old(src));
++      assigns *(dest + (0 .. n - 1)), \result;
++      assigns *(dest + (0 .. n - 1))
++        \from *(src + (0 .. n - 1)), (indirect: n);
++      assigns \result
++        \from dest, (indirect: *(src + (0 .. n - 1))), (indirect: n);
++    
++    behavior src_too_long:
++      assumes src_no_nul: \forall integer i; 0 <= i < n ==> *(src + i) != 0;
++      ensures
++        same_partial_contents: strncmp(\old(src), \old(dest), \old(n)) == 0;
++      ensures result_points_to_end: \result == \old(dest) + \old(n);
++      assigns *(dest + (0 .. n - 1)), \result;
++      assigns *(dest + (0 .. n - 1))
++        \from *(src + (0 .. n - 1)), (indirect: n);
++      assigns \result
++        \from dest, (indirect: *(src + (0 .. n - 1))), (indirect: n);
++ */
++char *__gen_e_acsl_stpncpy(char * restrict dest, char const * restrict src,
++                           size_t n);
++
++/*@ logic integer undef_fn(int x) ;
++ */
++/*@ logic integer reads_fn{L}(char *p) 
++      reads \at(*p,L);
++ */
++/*@ logic integer __gen_e_acsl_reads_fn_here(char *p) 
++      reads *p;
++
++*/
++/*@ ensures \result == reads_fn(\old(a)) + reads_fn(\old(b)); */
++int __gen_e_acsl_sum_reads(char *a, char *b);
++
++int sum_reads(char *a, char *b)
++{
++  int __retres;
++  __e_acsl_store_block((void *)(& b),8UL);
++  __e_acsl_store_block((void *)(& a),8UL);
++  __retres = (int)*a + (int)*b;
++  __e_acsl_delete_block((void *)(& b));
++  __e_acsl_delete_block((void *)(& a));
++  return __retres;
++}
++
++char const __fc_lit_string1[2UL] = "a";
++char const __fc_lit_string2[3UL] = "ab";
++char const __fc_lit_string3[3UL] = "cd";
++/*@ ensures \result == reads_fn(\old(a)) + reads_fn(\old(b)); */
++int __gen_e_acsl_sum_reads(char *a, char *b)
++{
++  char *__gen_e_acsl_at_2;
++  char *__gen_e_acsl_at;
++  int __retres;
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_aligned_2;
++    __e_acsl_store_block((void *)(& b),8UL);
++    __e_acsl_store_block((void *)(& a),8UL);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)b,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"b",(void *)b);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\"pointer alignment\": \\aligned(b,1)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(b,1); */
++    {
++      __gen_e_acsl_assert_data.blocking = 1;
++      __gen_e_acsl_assert_data.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data.pred_txt = "\\aligned(b,1)";
++      __gen_e_acsl_assert_data.file = "typing_unsupported_sibling.c";
++      __gen_e_acsl_assert_data.fct = "sum_reads";
++      __gen_e_acsl_assert_data.line = 13;
++      __gen_e_acsl_assert_data.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    }
++    __gen_e_acsl_at = b;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)a,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"a",(void *)a);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(a,1)",0,
++                                 __gen_e_acsl_aligned_2);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(a,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(a,1)";
++      __gen_e_acsl_assert_data_2.file = "typing_unsupported_sibling.c";
++      __gen_e_acsl_assert_data_2.fct = "sum_reads";
++      __gen_e_acsl_assert_data_2.line = 13;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_at_2 = a;
++  }
++  __retres = sum_reads(a,b);
++  __e_acsl_delete_block((void *)(& b));
++  __e_acsl_delete_block((void *)(& a));
++  return __retres;
++}
++
++/*@ requires valid_string_src: valid_read_nstring(src, n);
++    requires valid_dest: \valid(dest + (0 .. n - 1));
++    requires separation: \separated(src + (0 .. n - 1), dest + (0 .. n - 1));
++    ensures initialization: \initialized(\old(dest) + (0 .. \old(n) - 1));
++    assigns *(dest + (0 .. n - 1)), \result;
++    assigns *(dest + (0 .. n - 1))
++      \from *(src + (0 .. n - 1)), (indirect: n);
++    assigns \result
++      \from dest, (indirect: *(src + (0 .. n - 1))), (indirect: n);
++    
++    behavior src_is_a_string:
++      assumes src_has_nul: strlen(src) < n;
++      ensures valid_string_dest: valid_read_string(\old(dest));
++      ensures same_contents: strcmp(\old(dest), \old(src)) == 0;
++      ensures
++        dest_nul_padded:
++          \forall integer i;
++            strlen(\old(src)) <= i < \old(n) ==> *(\old(dest) + i) == 0;
++      ensures
++        result_points_to_nul: \result == \old(dest) + strlen(\old(src));
++      assigns *(dest + (0 .. n - 1)), \result;
++      assigns *(dest + (0 .. n - 1))
++        \from *(src + (0 .. n - 1)), (indirect: n);
++      assigns \result
++        \from dest, (indirect: *(src + (0 .. n - 1))), (indirect: n);
++    
++    behavior src_too_long:
++      assumes src_no_nul: \forall integer i; 0 <= i < n ==> *(src + i) != 0;
++      ensures
++        same_partial_contents: strncmp(\old(src), \old(dest), \old(n)) == 0;
++      ensures result_points_to_end: \result == \old(dest) + \old(n);
++      assigns *(dest + (0 .. n - 1)), \result;
++      assigns *(dest + (0 .. n - 1))
++        \from *(src + (0 .. n - 1)), (indirect: n);
++      assigns \result
++        \from dest, (indirect: *(src + (0 .. n - 1))), (indirect: n);
++ */
++char *__gen_e_acsl_stpncpy(char * restrict dest, char const * restrict src,
++                           size_t n)
++{
++  __e_acsl_contract_t *__gen_e_acsl_contract;
++  char *__gen_e_acsl_at_17;
++  char *__gen_e_acsl_at_16;
++  char *__gen_e_acsl_at_15;
++  char const *__gen_e_acsl_at_14;
++  char const *__gen_e_acsl_at_13;
++  char *__gen_e_acsl_at_12;
++  char *__gen_e_acsl_at_11;
++  char *__gen_e_acsl_at_10;
++  char *__gen_e_acsl_at_9;
++  char const *__gen_e_acsl_at_8;
++  char const *__gen_e_acsl_at_7;
++  char *__gen_e_acsl_at_6;
++  size_t __gen_e_acsl_at_5;
++  char *__gen_e_acsl_at_4;
++  __e_acsl_mpz_t __gen_e_acsl_at_3;
++  size_t __gen_e_acsl_at_2;
++  size_t __gen_e_acsl_at;
++  char *__retres;
++  __e_acsl_store_block((void *)(& __retres),8UL);
++  {
++    __e_acsl_mpz_t __gen_e_acsl_n;
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_aligned_2;
++    int __gen_e_acsl_aligned_3;
++    int __gen_e_acsl_aligned_4;
++    int __gen_e_acsl_aligned_5;
++    int __gen_e_acsl_aligned_6;
++    int __gen_e_acsl_aligned_7;
++    int __gen_e_acsl_aligned_8;
++    int __gen_e_acsl_aligned_9;
++    int __gen_e_acsl_aligned_10;
++    int __gen_e_acsl_aligned_11;
++    int __gen_e_acsl_aligned_13;
++    unsigned long __gen_e_acsl_size;
++    __e_acsl_mpz_t __gen_e_acsl_;
++    __e_acsl_mpz_t __gen_e_acsl_sub;
++    __e_acsl_mpz_t __gen_e_acsl_add;
++    unsigned long __gen_e_acsl_if;
++    int __gen_e_acsl_valid_read;
++    unsigned long __gen_e_acsl_size_2;
++    unsigned long __gen_e_acsl_if_2;
++    int __gen_e_acsl_aligned_14;
++    unsigned long __gen_e_acsl_size_3;
++    __e_acsl_mpz_t __gen_e_acsl_add_2;
++    unsigned long __gen_e_acsl_if_3;
++    int __gen_e_acsl_valid_read_2;
++    unsigned long __gen_e_acsl_size_4;
++    unsigned long __gen_e_acsl_if_4;
++    int __gen_e_acsl_separated;
++    int __gen_e_acsl_forall;
++    unsigned long __gen_e_acsl_i;
++    __e_acsl_store_block((void *)(& n),8UL);
++    __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_store_block((void *)(& dest),8UL);
++    __gen_e_acsl_at = n;
++    __gen_e_acsl_at_2 = n;
++    __gmpz_init_set_ui(__gen_e_acsl_n,n);
++    __gmpz_init_set(__gen_e_acsl_at_3,
++                    (__e_acsl_mpz_struct const *)(__gen_e_acsl_n));
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data.blocking = 1;
++      __gen_e_acsl_assert_data.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data.fct = "stpncpy";
++      __gen_e_acsl_assert_data.line = 643;
++      __gen_e_acsl_assert_data.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    }
++    __gen_e_acsl_at_4 = dest;
++    __gen_e_acsl_at_5 = n;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_2);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_2.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_2.fct = "stpncpy";
++      __gen_e_acsl_assert_data_2.line = 642;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_at_6 = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_3 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_3 = __e_acsl_aligned((void *)src,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_3,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_3,
++                                 "\"pointer alignment\": \\aligned(src,1)",0,
++                                 __gen_e_acsl_aligned_3);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++    {
++      __gen_e_acsl_assert_data_3.blocking = 1;
++      __gen_e_acsl_assert_data_3.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_3.pred_txt = "\\aligned(src,1)";
++      __gen_e_acsl_assert_data_3.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_3.fct = "stpncpy";
++      __gen_e_acsl_assert_data_3.line = 642;
++      __gen_e_acsl_assert_data_3.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_3,& __gen_e_acsl_assert_data_3);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_3);
++    }
++    __gen_e_acsl_at_7 = src;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_4 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_4 = __e_acsl_aligned((void *)src,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_4,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_4,
++                                 "\"pointer alignment\": \\aligned(src,1)",0,
++                                 __gen_e_acsl_aligned_4);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++    {
++      __gen_e_acsl_assert_data_4.blocking = 1;
++      __gen_e_acsl_assert_data_4.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_4.pred_txt = "\\aligned(src,1)";
++      __gen_e_acsl_assert_data_4.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_4.fct = "stpncpy";
++      __gen_e_acsl_assert_data_4.line = 639;
++      __gen_e_acsl_assert_data_4.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_4,& __gen_e_acsl_assert_data_4);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_4);
++    }
++    __gen_e_acsl_at_8 = src;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_5 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_5 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_5,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_5,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_5);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_5.blocking = 1;
++      __gen_e_acsl_assert_data_5.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_5.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_5.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_5.fct = "stpncpy";
++      __gen_e_acsl_assert_data_5.line = 639;
++      __gen_e_acsl_assert_data_5.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_5,& __gen_e_acsl_assert_data_5);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_5);
++    }
++    __gen_e_acsl_at_9 = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_6 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_6 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_6,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_6,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_6);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_6.blocking = 1;
++      __gen_e_acsl_assert_data_6.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_6.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_6.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_6.fct = "stpncpy";
++      __gen_e_acsl_assert_data_6.line = 638;
++      __gen_e_acsl_assert_data_6.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_6,& __gen_e_acsl_assert_data_6);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_6);
++    }
++    __gen_e_acsl_at_10 = dest;
++    __gen_e_acsl_at_11 = dest;
++    __gen_e_acsl_at_12 = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_7 = __e_acsl_aligned((void *)src,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_7,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,
++                                 "\"pointer alignment\": \\aligned(src,1)",0,
++                                 __gen_e_acsl_aligned_7);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++    {
++      __gen_e_acsl_assert_data_7.blocking = 1;
++      __gen_e_acsl_assert_data_7.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_7.pred_txt = "\\aligned(src,1)";
++      __gen_e_acsl_assert_data_7.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_7.fct = "stpncpy";
++      __gen_e_acsl_assert_data_7.line = 638;
++      __gen_e_acsl_assert_data_7.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_7,& __gen_e_acsl_assert_data_7);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_7);
++    }
++    __gen_e_acsl_at_13 = src;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_8 = __e_acsl_aligned((void *)src,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_8,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,
++                                 "\"pointer alignment\": \\aligned(src,1)",0,
++                                 __gen_e_acsl_aligned_8);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++    {
++      __gen_e_acsl_assert_data_8.blocking = 1;
++      __gen_e_acsl_assert_data_8.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_8.pred_txt = "\\aligned(src,1)";
++      __gen_e_acsl_assert_data_8.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_8.fct = "stpncpy";
++      __gen_e_acsl_assert_data_8.line = 636;
++      __gen_e_acsl_assert_data_8.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_8,& __gen_e_acsl_assert_data_8);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_8);
++    }
++    __gen_e_acsl_at_14 = src;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_9 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_9 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_9,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_9,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_9);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_9.blocking = 1;
++      __gen_e_acsl_assert_data_9.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_9.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_9.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_9.fct = "stpncpy";
++      __gen_e_acsl_assert_data_9.line = 636;
++      __gen_e_acsl_assert_data_9.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_9,& __gen_e_acsl_assert_data_9);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_9);
++    }
++    __gen_e_acsl_at_15 = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_10 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_10 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_10,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_10,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_10);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_10.blocking = 1;
++      __gen_e_acsl_assert_data_10.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_10.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_10.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_10.fct = "stpncpy";
++      __gen_e_acsl_assert_data_10.line = 635;
++      __gen_e_acsl_assert_data_10.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_10,& __gen_e_acsl_assert_data_10);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_10);
++    }
++    __gen_e_acsl_at_16 = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_11 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_11 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_11,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_11,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_11);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_11.blocking = 1;
++      __gen_e_acsl_assert_data_11.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_11.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_11.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_11.fct = "stpncpy";
++      __gen_e_acsl_assert_data_11.line = 632;
++      __gen_e_acsl_assert_data_11.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_11,& __gen_e_acsl_assert_data_11);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_11);
++    }
++    __gen_e_acsl_at_17 = dest;
++    __gen_e_acsl_contract = __e_acsl_contract_init(2UL);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_15 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_16 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_13 = __e_acsl_aligned((void *)src,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_16,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_16,
++                                 "\"pointer alignment\": \\aligned(src,1)",0,
++                                 __gen_e_acsl_aligned_13);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++    {
++      __gen_e_acsl_assert_data_16.blocking = 1;
++      __gen_e_acsl_assert_data_16.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_16.pred_txt = "\\aligned(src,1)";
++      __gen_e_acsl_assert_data_16.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_16.fct = "stpncpy";
++      __gen_e_acsl_assert_data_16.line = 629;
++      __gen_e_acsl_assert_data_16.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_13,& __gen_e_acsl_assert_data_16);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_16);
++    }
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_17 =
++      {.values = (void *)0};
++    __gmpz_init_set_si(__gen_e_acsl_,1L);
++    __gmpz_init(__gen_e_acsl_sub);
++    __gmpz_sub(__gen_e_acsl_sub,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_n),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_));
++    __gmpz_init(__gen_e_acsl_add);
++    __gmpz_add(__gen_e_acsl_add,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_sub),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_));
++    __gen_e_acsl_size = __gen_e_acsl_add;
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_17,"size",0,
++                                   __gen_e_acsl_size);
++    if (__gen_e_acsl_size <= 0UL) __gen_e_acsl_if = 0UL;
++    else {
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_17,"size",0,
++                                     __gen_e_acsl_size);
++      __gen_e_acsl_if = __gen_e_acsl_size;
++    }
++    __gen_e_acsl_valid_read = __e_acsl_valid_read((void *)(src + 0),
++                                                  __gen_e_acsl_if,
++                                                  (void *)src,
++                                                  (void *)(& src));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_17,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_17,
++                                 "sizeof(char const) * 0",0,0);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_17,"n",0,n);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_17,
++                                 "\"memory access\": \\valid_read(src + (0 .. n - 1))",
++                                 0,__gen_e_acsl_valid_read);
++    /*@ assert E_ACSL: "memory access": \valid_read(src + (0 .. n - 1)); */
++    {
++      __gen_e_acsl_assert_data_17.blocking = 1;
++      __gen_e_acsl_assert_data_17.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_17.pred_txt = "\\valid_read(src + (0 .. n - 1))";
++      __gen_e_acsl_assert_data_17.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_17.fct = "stpncpy";
++      __gen_e_acsl_assert_data_17.line = 629;
++      __gen_e_acsl_assert_data_17.name = "memory access";
++      __e_acsl_assert(__gen_e_acsl_valid_read,& __gen_e_acsl_assert_data_17);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_17);
++    }
++    __gen_e_acsl_size_2 = __gen_e_acsl_add;
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_15,"size",0,
++                                   __gen_e_acsl_size_2);
++    if (__gen_e_acsl_size_2 <= 0UL) __gen_e_acsl_if_2 = 0UL;
++    else {
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_15,"size",0,
++                                     __gen_e_acsl_size_2);
++      __gen_e_acsl_if_2 = __gen_e_acsl_size_2;
++    }
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_18 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_14 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_18,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_18,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_14);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_18.blocking = 1;
++      __gen_e_acsl_assert_data_18.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_18.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_18.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_18.fct = "stpncpy";
++      __gen_e_acsl_assert_data_18.line = 629;
++      __gen_e_acsl_assert_data_18.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_14,& __gen_e_acsl_assert_data_18);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_18);
++    }
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_19 =
++      {.values = (void *)0};
++    __gmpz_init(__gen_e_acsl_add_2);
++    __gmpz_add(__gen_e_acsl_add_2,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_sub),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_));
++    __gen_e_acsl_size_3 = __gen_e_acsl_add_2;
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_19,"size",0,
++                                   __gen_e_acsl_size_3);
++    if (__gen_e_acsl_size_3 <= 0UL) __gen_e_acsl_if_3 = 0UL;
++    else {
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_19,"size",0,
++                                     __gen_e_acsl_size_3);
++      __gen_e_acsl_if_3 = __gen_e_acsl_size_3;
++    }
++    __gen_e_acsl_valid_read_2 = __e_acsl_valid_read((void *)(dest + 0),
++                                                    __gen_e_acsl_if_3,
++                                                    (void *)dest,
++                                                    (void *)(& dest));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_19,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_19,
++                                 "sizeof(char) * 0",0,0);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_19,"n",0,n);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_19,
++                                 "\"memory access\": \\valid_read(dest + (0 .. n - 1))",
++                                 0,__gen_e_acsl_valid_read_2);
++    /*@ assert E_ACSL: "memory access": \valid_read(dest + (0 .. n - 1)); */
++    {
++      __gen_e_acsl_assert_data_19.blocking = 1;
++      __gen_e_acsl_assert_data_19.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_19.pred_txt = "\\valid_read(dest + (0 .. n - 1))";
++      __gen_e_acsl_assert_data_19.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_19.fct = "stpncpy";
++      __gen_e_acsl_assert_data_19.line = 629;
++      __gen_e_acsl_assert_data_19.name = "memory access";
++      __e_acsl_assert(__gen_e_acsl_valid_read_2,
++                      & __gen_e_acsl_assert_data_19);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_19);
++    }
++    __gen_e_acsl_size_4 = __gen_e_acsl_add_2;
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_15,"size",0,
++                                   __gen_e_acsl_size_4);
++    if (__gen_e_acsl_size_4 <= 0UL) __gen_e_acsl_if_4 = 0UL;
++    else {
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_15,"size",0,
++                                     __gen_e_acsl_size_4);
++      __gen_e_acsl_if_4 = __gen_e_acsl_size_4;
++    }
++    __gen_e_acsl_separated = __e_acsl_separated(2UL,src + 0,
++                                                __gen_e_acsl_if_2,dest + 0,
++                                                __gen_e_acsl_if_4);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_15,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_15,
++                                 "sizeof(char const) * 0",0,0);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_15,"n",0,n);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_15,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_15,
++                                 "sizeof(char) * 0",0,0);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_15,"n",0,n);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_15,
++                                 "separation: \\separated(src + (0 .. n - 1), dest + (0 .. n - 1))",
++                                 0,__gen_e_acsl_separated);
++    __gen_e_acsl_assert_data_15.blocking = 1;
++    __gen_e_acsl_assert_data_15.kind = "Precondition";
++    __gen_e_acsl_assert_data_15.pred_txt = "\\separated(src + (0 .. n - 1), dest + (0 .. n - 1))";
++    __gen_e_acsl_assert_data_15.file = "FRAMAC_SHARE/libc/string.h";
++    __gen_e_acsl_assert_data_15.fct = "stpncpy";
++    __gen_e_acsl_assert_data_15.line = 629;
++    __gen_e_acsl_assert_data_15.name = "separation";
++    __e_acsl_assert(__gen_e_acsl_separated,& __gen_e_acsl_assert_data_15);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_15);
++    __gen_e_acsl_forall = 1;
++    __gen_e_acsl_i = 0UL;
++    while (1) {
++      if (__gen_e_acsl_i < n) ; else break;
++      {
++        int __gen_e_acsl_aligned_15;
++        __e_acsl_mpz_t __gen_e_acsl__2;
++        __e_acsl_mpz_t __gen_e_acsl_i_2;
++        int __gen_e_acsl_le;
++        int __gen_e_acsl_and;
++        int __gen_e_acsl_aligned_16;
++        int __gen_e_acsl_valid_read_3;
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_20 =
++          {.values = (void *)0};
++        __gen_e_acsl_aligned_15 = __e_acsl_aligned((void *)src,1UL);
++        __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_20,"src",
++                                     (void *)src);
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_20,
++                                     "\"pointer alignment\": \\aligned(src,1)",
++                                     0,__gen_e_acsl_aligned_15);
++        /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++        {
++          __gen_e_acsl_assert_data_20.blocking = 1;
++          __gen_e_acsl_assert_data_20.kind = "E-ACSL RTE";
++          __gen_e_acsl_assert_data_20.pred_txt = "\\aligned(src,1)";
++          __gen_e_acsl_assert_data_20.file = "FRAMAC_SHARE/libc/string.h";
++          __gen_e_acsl_assert_data_20.fct = "stpncpy";
++          __gen_e_acsl_assert_data_20.line = 641;
++          __gen_e_acsl_assert_data_20.name = "pointer alignment";
++          __e_acsl_assert(__gen_e_acsl_aligned_15,
++                          & __gen_e_acsl_assert_data_20);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data_20);
++        }
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_21 =
++          {.values = (void *)0};
++        __gmpz_init_set_si(__gen_e_acsl__2,(-9223372036854775807L-1L));
++        __gmpz_init_set_ui(__gen_e_acsl_i_2,__gen_e_acsl_i);
++        __gen_e_acsl_le = __gmpz_cmp((__e_acsl_mpz_struct const *)(__gen_e_acsl__2),
++                                     (__e_acsl_mpz_struct const *)(__gen_e_acsl_i_2));
++        __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_21,"i",0,
++                                       __gen_e_acsl_i);
++        if (__gen_e_acsl_le <= 0) {
++          __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_21,"i",0,
++                                         __gen_e_acsl_i);
++          __gen_e_acsl_and = __gen_e_acsl_i <= 9223372036854775807UL;
++        }
++        else __gen_e_acsl_and = 0;
++        /*@ assert
++              E_ACSL: "signed downcast":
++                -9223372036854775808 <= i <= 9223372036854775807;
++        */
++        {
++          __gen_e_acsl_assert_data_21.blocking = 1;
++          __gen_e_acsl_assert_data_21.kind = "E-ACSL RTE";
++          __gen_e_acsl_assert_data_21.pred_txt = "-9223372036854775808 <= i <= 9223372036854775807";
++          __gen_e_acsl_assert_data_21.file = "FRAMAC_SHARE/libc/string.h";
++          __gen_e_acsl_assert_data_21.fct = "stpncpy";
++          __gen_e_acsl_assert_data_21.line = 641;
++          __gen_e_acsl_assert_data_21.name = "signed downcast";
++          __e_acsl_assert(__gen_e_acsl_and,& __gen_e_acsl_assert_data_21);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data_21);
++        }
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_22 =
++          {.values = (void *)0};
++        __gen_e_acsl_aligned_16 = __e_acsl_aligned((void *)(src + __gen_e_acsl_i),
++                                                   1UL);
++        __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_22,"src",
++                                     (void *)src);
++        __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_22,"i",0,
++                                       __gen_e_acsl_i);
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_22,
++                                     "\"pointer alignment\": \\aligned(src + i,1)",
++                                     0,__gen_e_acsl_aligned_16);
++        /*@ assert E_ACSL: "pointer alignment": \aligned(src + i,1); */
++        {
++          __gen_e_acsl_assert_data_22.blocking = 1;
++          __gen_e_acsl_assert_data_22.kind = "E-ACSL RTE";
++          __gen_e_acsl_assert_data_22.pred_txt = "\\aligned(src + i,1)";
++          __gen_e_acsl_assert_data_22.file = "FRAMAC_SHARE/libc/string.h";
++          __gen_e_acsl_assert_data_22.fct = "stpncpy";
++          __gen_e_acsl_assert_data_22.line = 641;
++          __gen_e_acsl_assert_data_22.name = "pointer alignment";
++          __e_acsl_assert(__gen_e_acsl_aligned_16,
++                          & __gen_e_acsl_assert_data_22);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data_22);
++        }
++        __e_acsl_assert_data_t __gen_e_acsl_assert_data_23 =
++          {.values = (void *)0};
++        __gen_e_acsl_valid_read_3 = __e_acsl_valid_read((void *)(src + __gen_e_acsl_i),
++                                                        sizeof(char const),
++                                                        (void *)src,
++                                                        (void *)(& src));
++        __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_23,"src",
++                                     (void *)src);
++        __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_23,"i",0,
++                                       __gen_e_acsl_i);
++        __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_23,
++                                       "sizeof(char const)",0,
++                                       sizeof(char const));
++        __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_23,
++                                     "\"memory access\": \\valid_read(src + i)",
++                                     0,__gen_e_acsl_valid_read_3);
++        /*@ assert E_ACSL: "memory access": \valid_read(src + i); */
++        {
++          __gen_e_acsl_assert_data_23.blocking = 1;
++          __gen_e_acsl_assert_data_23.kind = "E-ACSL RTE";
++          __gen_e_acsl_assert_data_23.pred_txt = "\\valid_read(src + i)";
++          __gen_e_acsl_assert_data_23.file = "FRAMAC_SHARE/libc/string.h";
++          __gen_e_acsl_assert_data_23.fct = "stpncpy";
++          __gen_e_acsl_assert_data_23.line = 641;
++          __gen_e_acsl_assert_data_23.name = "memory access";
++          __e_acsl_assert(__gen_e_acsl_valid_read_3,
++                          & __gen_e_acsl_assert_data_23);
++          __e_acsl_assert_clean(& __gen_e_acsl_assert_data_23);
++        }
++        __gmpz_clear(__gen_e_acsl__2);
++        __gmpz_clear(__gen_e_acsl_i_2);
++        if ((int)*(src + __gen_e_acsl_i) != 0) ;
++        else {
++          __gen_e_acsl_forall = 0;
++          goto e_acsl_end_loop1;
++        }
++      }
++      __gen_e_acsl_i ++;
++    }
++    e_acsl_end_loop1: ;
++    __e_acsl_contract_set_behavior_assumes(__gen_e_acsl_contract,1UL,
++                                           __gen_e_acsl_forall);
++    __gmpz_clear(__gen_e_acsl_n);
++    __gmpz_clear(__gen_e_acsl_);
++    __gmpz_clear(__gen_e_acsl_sub);
++    __gmpz_clear(__gen_e_acsl_add);
++    __gmpz_clear(__gen_e_acsl_add_2);
++  }
++  __retres = stpncpy(dest,src,n);
++  {
++    unsigned long __gen_e_acsl_size_5;
++    __e_acsl_mpz_t __gen_e_acsl__3;
++    __e_acsl_mpz_t __gen_e_acsl_sub_2;
++    __e_acsl_mpz_t __gen_e_acsl__4;
++    __e_acsl_mpz_t __gen_e_acsl_sub_3;
++    __e_acsl_mpz_t __gen_e_acsl_add_3;
++    unsigned long __gen_e_acsl__5;
++    unsigned long __gen_e_acsl_if_5;
++    int __gen_e_acsl_initialized;
++    int __gen_e_acsl_assumes_value;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_24 =
++      {.values = (void *)0};
++    __gmpz_init_set_si(__gen_e_acsl__3,1L);
++    __gmpz_init(__gen_e_acsl_sub_2);
++    __gmpz_sub(__gen_e_acsl_sub_2,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_at_3),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl__3));
++    __gmpz_init_set_si(__gen_e_acsl__4,0L);
++    __gmpz_init(__gen_e_acsl_sub_3);
++    __gmpz_sub(__gen_e_acsl_sub_3,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_sub_2),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl__4));
++    __gmpz_init(__gen_e_acsl_add_3);
++    __gmpz_add(__gen_e_acsl_add_3,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_sub_3),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl__3));
++    __gen_e_acsl__5 = __gmpz_get_ui((__e_acsl_mpz_struct const *)(__gen_e_acsl_add_3));
++    __gen_e_acsl_size_5 = 1UL * __gen_e_acsl__5;
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_24,"size",0,
++                                   __gen_e_acsl_size_5);
++    if (__gen_e_acsl_size_5 <= 0UL) __gen_e_acsl_if_5 = 0UL;
++    else {
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_24,"size",0,
++                                     __gen_e_acsl_size_5);
++      __gen_e_acsl_if_5 = __gen_e_acsl_size_5;
++    }
++    __gen_e_acsl_initialized = __e_acsl_initialized((void *)(__gen_e_acsl_at_17 + 0),
++                                                    __gen_e_acsl_if_5);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_24,"\\old(dest)",
++                                 (void *)__gen_e_acsl_at_17);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_24,
++                                 "sizeof(char) * 0",0,0);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_24,
++                                 "sizeof(char)",0,1);
++    __e_acsl_assert_register_mpz(& __gen_e_acsl_assert_data_24,"\\old(n)",0,
++                                 (__e_acsl_mpz_struct const *)(__gen_e_acsl_at_3));
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_24,
++                                 "initialization: \\initialized(\\old(dest) + (0 .. \\old(n) - 1))",
++                                 0,__gen_e_acsl_initialized);
++    __gen_e_acsl_assert_data_24.blocking = 1;
++    __gen_e_acsl_assert_data_24.kind = "Postcondition";
++    __gen_e_acsl_assert_data_24.pred_txt = "\\initialized(\\old(dest) + (0 .. \\old(n) - 1))";
++    __gen_e_acsl_assert_data_24.file = "FRAMAC_SHARE/libc/string.h";
++    __gen_e_acsl_assert_data_24.fct = "stpncpy";
++    __gen_e_acsl_assert_data_24.line = 632;
++    __gen_e_acsl_assert_data_24.name = "initialization";
++    __e_acsl_assert(__gen_e_acsl_initialized,& __gen_e_acsl_assert_data_24);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_24);
++    __gen_e_acsl_assumes_value = __e_acsl_contract_get_behavior_assumes
++    ((__e_acsl_contract_t const *)__gen_e_acsl_contract,1UL);
++    if (__gen_e_acsl_assumes_value) {
++      int __gen_e_acsl_aligned_18;
++      __e_acsl_mpz_t __gen_e_acsl__8;
++      int __gen_e_acsl_le_4;
++      int __gen_e_acsl_and_3;
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_33 =
++        {.values = (void *)0};
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_34 =
++        {.values = (void *)0};
++      __gen_e_acsl_aligned_18 = __e_acsl_aligned((void *)__retres,1UL);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_34,"\\result",
++                                   (void *)__retres);
++      __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_34,
++                                   "\"pointer alignment\": \\aligned(\\result,1)",
++                                   0,__gen_e_acsl_aligned_18);
++      /*@ assert E_ACSL: "pointer alignment": \aligned(\result,1); */
++      {
++        __gen_e_acsl_assert_data_34.blocking = 1;
++        __gen_e_acsl_assert_data_34.kind = "E-ACSL RTE";
++        __gen_e_acsl_assert_data_34.pred_txt = "\\aligned(\\result,1)";
++        __gen_e_acsl_assert_data_34.file = "FRAMAC_SHARE/libc/string.h";
++        __gen_e_acsl_assert_data_34.fct = "stpncpy";
++        __gen_e_acsl_assert_data_34.line = 643;
++        __gen_e_acsl_assert_data_34.name = "pointer alignment";
++        __e_acsl_assert(__gen_e_acsl_aligned_18,
++                        & __gen_e_acsl_assert_data_34);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_34);
++      }
++      __e_acsl_assert_data_t __gen_e_acsl_assert_data_35 =
++        {.values = (void *)0};
++      __gmpz_init_set_si(__gen_e_acsl__8,(-9223372036854775807L-1L));
++      __gen_e_acsl_le_4 = __gmpz_cmp((__e_acsl_mpz_struct const *)(__gen_e_acsl__8),
++                                     (__e_acsl_mpz_struct const *)(__gen_e_acsl_at_3));
++      __e_acsl_assert_register_mpz(& __gen_e_acsl_assert_data_35,"\\old(n)",
++                                   0,
++                                   (__e_acsl_mpz_struct const *)(__gen_e_acsl_at_3));
++      if (__gen_e_acsl_le_4 <= 0) {
++        __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_35,
++                                       "\\old(n)",0,__gen_e_acsl_at_2);
++        __gen_e_acsl_and_3 = __gen_e_acsl_at_2 <= 9223372036854775807UL;
++      }
++      else __gen_e_acsl_and_3 = 0;
++      /*@ assert
++            E_ACSL: "signed downcast":
++              -9223372036854775808 <= \old(n) <= 9223372036854775807;
++      */
++      {
++        __gen_e_acsl_assert_data_35.blocking = 1;
++        __gen_e_acsl_assert_data_35.kind = "E-ACSL RTE";
++        __gen_e_acsl_assert_data_35.pred_txt = "-9223372036854775808 <= \\old(n) <= 9223372036854775807";
++        __gen_e_acsl_assert_data_35.file = "FRAMAC_SHARE/libc/string.h";
++        __gen_e_acsl_assert_data_35.fct = "stpncpy";
++        __gen_e_acsl_assert_data_35.line = 643;
++        __gen_e_acsl_assert_data_35.name = "signed downcast";
++        __e_acsl_assert(__gen_e_acsl_and_3,& __gen_e_acsl_assert_data_35);
++        __e_acsl_assert_clean(& __gen_e_acsl_assert_data_35);
++      }
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_33,"\\result",
++                                   (void *)__retres);
++      __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_33,
++                                   "\\old(dest)",(void *)__gen_e_acsl_at_4);
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_33,
++                                     "\\old(n)",0,__gen_e_acsl_at);
++      __gen_e_acsl_assert_data_33.blocking = 1;
++      __gen_e_acsl_assert_data_33.kind = "Postcondition";
++      __gen_e_acsl_assert_data_33.pred_txt = "\\result == \\old(dest) + \\old(n)";
++      __gen_e_acsl_assert_data_33.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_33.fct = "stpncpy";
++      __gen_e_acsl_assert_data_33.line = 643;
++      __gen_e_acsl_assert_data_33.name = "src_too_long/result_points_to_end";
++      __e_acsl_assert(__retres == __gen_e_acsl_at_4 + __gen_e_acsl_at,
++                      & __gen_e_acsl_assert_data_33);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_33);
++      __gmpz_clear(__gen_e_acsl__8);
++    }
++    __e_acsl_contract_clean(__gen_e_acsl_contract);
++    __e_acsl_delete_block((void *)(& n));
++    __e_acsl_delete_block((void *)(& src));
++    __e_acsl_delete_block((void *)(& dest));
++    __gmpz_clear(__gen_e_acsl__3);
++    __gmpz_clear(__gen_e_acsl_sub_2);
++    __gmpz_clear(__gen_e_acsl__4);
++    __gmpz_clear(__gen_e_acsl_sub_3);
++    __gmpz_clear(__gen_e_acsl_add_3);
++    __gmpz_clear(__gen_e_acsl_at_3);
++    __e_acsl_delete_block((void *)(& __retres));
++    return __retres;
++  }
++}
++
++/*@ requires valid_string_src: valid_read_string(src);
++    requires valid_string_dest: valid_string(dest);
++    requires room_nstring: \valid(dest + (0 .. n - 1));
++    requires
++      separation:
++        \separated(
++          dest + (0 .. \min(n - 1, strlen(dest) + strlen(src))),
++          src + (0 .. strnlen(src, n - 1))
++          );
++    ensures
++      bounded_result: \result == strlen(\old(dest)) + strlen(\old(src));
++    assigns *(dest + (strlen{Old}(dest) .. n)), \result;
++    assigns *(dest + (strlen{Old}(dest) .. n))
++      \from (indirect: n), *(src + (0 .. strlen{Old}(src)));
++    assigns \result
++      \from (indirect: src), (indirect: *(src + (0 .. n - 1))), (indirect: n);
++ */
++size_t __gen_e_acsl_strlcat(char * restrict dest, char const * restrict src,
++                            size_t n)
++{
++  char *__gen_e_acsl_at_2;
++  char const *__gen_e_acsl_at;
++  size_t __retres;
++  {
++    int __gen_e_acsl_aligned;
++    int __gen_e_acsl_aligned_2;
++    int __gen_e_acsl_aligned_5;
++    unsigned long __gen_e_acsl_size;
++    __e_acsl_mpz_t __gen_e_acsl_n;
++    __e_acsl_mpz_t __gen_e_acsl_;
++    __e_acsl_mpz_t __gen_e_acsl_sub;
++    __e_acsl_mpz_t __gen_e_acsl_add;
++    unsigned long __gen_e_acsl_if;
++    int __gen_e_acsl_valid;
++    __e_acsl_store_block((void *)(& src),8UL);
++    __e_acsl_store_block((void *)(& dest),8UL);
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data = {.values = (void *)0};
++    __gen_e_acsl_aligned = __e_acsl_aligned((void *)src,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data,"src",
++                                 (void *)src);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data,
++                                 "\"pointer alignment\": \\aligned(src,1)",0,
++                                 __gen_e_acsl_aligned);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(src,1); */
++    {
++      __gen_e_acsl_assert_data.blocking = 1;
++      __gen_e_acsl_assert_data.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data.pred_txt = "\\aligned(src,1)";
++      __gen_e_acsl_assert_data.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data.fct = "strlcat";
++      __gen_e_acsl_assert_data.line = 549;
++      __gen_e_acsl_assert_data.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned,& __gen_e_acsl_assert_data);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data);
++    }
++    __gen_e_acsl_at = src;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_2 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_2,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_2,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_2);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_2.blocking = 1;
++      __gen_e_acsl_assert_data_2.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_2.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_2.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_2.fct = "strlcat";
++      __gen_e_acsl_assert_data_2.line = 549;
++      __gen_e_acsl_assert_data_2.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_2,& __gen_e_acsl_assert_data_2);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++    }
++    __gen_e_acsl_at_2 = dest;
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_7 =
++      {.values = (void *)0};
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_8 =
++      {.values = (void *)0};
++    __gen_e_acsl_aligned_5 = __e_acsl_aligned((void *)dest,1UL);
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_8,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_8,
++                                 "\"pointer alignment\": \\aligned(dest,1)",
++                                 0,__gen_e_acsl_aligned_5);
++    /*@ assert E_ACSL: "pointer alignment": \aligned(dest,1); */
++    {
++      __gen_e_acsl_assert_data_8.blocking = 1;
++      __gen_e_acsl_assert_data_8.kind = "E-ACSL RTE";
++      __gen_e_acsl_assert_data_8.pred_txt = "\\aligned(dest,1)";
++      __gen_e_acsl_assert_data_8.file = "FRAMAC_SHARE/libc/string.h";
++      __gen_e_acsl_assert_data_8.fct = "strlcat";
++      __gen_e_acsl_assert_data_8.line = 543;
++      __gen_e_acsl_assert_data_8.name = "pointer alignment";
++      __e_acsl_assert(__gen_e_acsl_aligned_5,& __gen_e_acsl_assert_data_8);
++      __e_acsl_assert_clean(& __gen_e_acsl_assert_data_8);
++    }
++    __gmpz_init_set_ui(__gen_e_acsl_n,n);
++    __gmpz_init_set_si(__gen_e_acsl_,1L);
++    __gmpz_init(__gen_e_acsl_sub);
++    __gmpz_sub(__gen_e_acsl_sub,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_n),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_));
++    __gmpz_init(__gen_e_acsl_add);
++    __gmpz_add(__gen_e_acsl_add,
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_sub),
++               (__e_acsl_mpz_struct const *)(__gen_e_acsl_));
++    __gen_e_acsl_size = __gen_e_acsl_add;
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_7,"size",0,
++                                   __gen_e_acsl_size);
++    if (__gen_e_acsl_size <= 0UL) __gen_e_acsl_if = 0UL;
++    else {
++      __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_7,"size",0,
++                                     __gen_e_acsl_size);
++      __gen_e_acsl_if = __gen_e_acsl_size;
++    }
++    __gen_e_acsl_valid = __e_acsl_valid((void *)(dest + 0),__gen_e_acsl_if,
++                                        (void *)dest,(void *)(& dest));
++    __e_acsl_assert_register_ptr(& __gen_e_acsl_assert_data_7,"dest",
++                                 (void *)dest);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,
++                                 "sizeof(char) * 0",0,0);
++    __e_acsl_assert_register_ulong(& __gen_e_acsl_assert_data_7,"n",0,n);
++    __e_acsl_assert_register_int(& __gen_e_acsl_assert_data_7,
++                                 "room_nstring: \\valid(dest + (0 .. n - 1))",
++                                 0,__gen_e_acsl_valid);
++    __gen_e_acsl_assert_data_7.blocking = 1;
++    __gen_e_acsl_assert_data_7.kind = "Precondition";
++    __gen_e_acsl_assert_data_7.pred_txt = "\\valid(dest + (0 .. n - 1))";
++    __gen_e_acsl_assert_data_7.file = "FRAMAC_SHARE/libc/string.h";
++    __gen_e_acsl_assert_data_7.fct = "strlcat";
++    __gen_e_acsl_assert_data_7.line = 543;
++    __gen_e_acsl_assert_data_7.name = "room_nstring";
++    __e_acsl_assert(__gen_e_acsl_valid,& __gen_e_acsl_assert_data_7);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_7);
++    __gmpz_clear(__gen_e_acsl_n);
++    __gmpz_clear(__gen_e_acsl_);
++    __gmpz_clear(__gen_e_acsl_sub);
++    __gmpz_clear(__gen_e_acsl_add);
++  }
++  __retres = strlcat(dest,src,n);
++  __e_acsl_delete_block((void *)(& src));
++  __e_acsl_delete_block((void *)(& dest));
++  return __retres;
++}
++
++void __e_acsl_globals_init(void)
++{
++  static char __e_acsl_already_run = 0;
++  if (! __e_acsl_already_run) {
++    __e_acsl_already_run = 1;
++    __e_acsl_store_block((void *)(__fc_lit_string3),3UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string3));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string3));
++    __e_acsl_store_block((void *)(__fc_lit_string2),3UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string2));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string2));
++    __e_acsl_store_block((void *)(__fc_lit_string1),2UL);
++    __e_acsl_full_init((void *)(& __fc_lit_string1));
++    __e_acsl_mark_readonly((void *)(__fc_lit_string1));
++  }
++  return;
++}
++
++void __e_acsl_globals_clean(void)
++{
++  __e_acsl_delete_block((void *)(__fc_lit_string3));
++  __e_acsl_delete_block((void *)(__fc_lit_string2));
++  __e_acsl_delete_block((void *)(__fc_lit_string1));
++  return;
++}
++
++int main(void)
++{
++  int __retres;
++  __e_acsl_memory_init((int *)0,(char ***)0,8UL);
++  __e_acsl_globals_init();
++  int x = 0;
++  __e_acsl_store_block((void *)(& x),4UL);
++  __e_acsl_full_init((void *)(& x));
++  char a = (char)1;
++  __e_acsl_store_block((void *)(& a),1UL);
++  __e_acsl_full_init((void *)(& a));
++  char b = (char)2;
++  __e_acsl_store_block((void *)(& b),1UL);
++  __e_acsl_full_init((void *)(& b));
++  char d[8] = {'a', '\000', '\000', '\000', '\000', '\000', '\000', '\000'};
++  __e_acsl_store_block((void *)(d),8UL);
++  __e_acsl_full_init((void *)(& d));
++  /*@ assert \forall integer i; undef_fn(x) <= i < 3 ==> i >= 0; */ ;
++  __gen_e_acsl_sum_reads(& a,& b);
++  __gen_e_acsl_stpncpy(d,__fc_lit_string2,4UL);
++  __gen_e_acsl_strlcat(d,__fc_lit_string3,8UL);
++  {
++    __e_acsl_assert_data_t __gen_e_acsl_assert_data_2 =
++      {.values = (void *)0};
++    __e_acsl_assert_register_char(& __gen_e_acsl_assert_data_2,"a",0,a);
++    __gen_e_acsl_assert_data_2.blocking = 1;
++    __gen_e_acsl_assert_data_2.kind = "Assertion";
++    __gen_e_acsl_assert_data_2.pred_txt = "a == 1";
++    __gen_e_acsl_assert_data_2.file = "typing_unsupported_sibling.c";
++    __gen_e_acsl_assert_data_2.fct = "main";
++    __gen_e_acsl_assert_data_2.line = 26;
++    __e_acsl_assert((int)a == 1,& __gen_e_acsl_assert_data_2);
++    __e_acsl_assert_clean(& __gen_e_acsl_assert_data_2);
++  }
++  /*@ assert a == 1; */ ;
++  __retres = 0;
++  __e_acsl_delete_block((void *)(d));
++  __e_acsl_delete_block((void *)(& b));
++  __e_acsl_delete_block((void *)(& a));
++  __e_acsl_delete_block((void *)(& x));
++  __e_acsl_globals_clean();
++  __e_acsl_memory_clean();
++  return __retres;
++}
++
++
+diff --git a/plugins/e-acsl/tests/constructs/oracle/typing_unsupported_sibling.0.res.oracle b/plugins/e-acsl/tests/constructs/oracle/typing_unsupported_sibling.0.res.oracle
+new file mode 100644
+index 0000000000..1aa996551d
+--- /dev/null
++++ b/plugins/e-acsl/tests/constructs/oracle/typing_unsupported_sibling.0.res.oracle
+@@ -0,0 +1,119 @@
++[e-acsl] beginning translation.
++[e-acsl] Warning: annotating undefined function `stpncpy':
++  the generated program may miss memory instrumentation
++  if there are memory-related annotations.
++[e-acsl] FRAMAC_SHARE/libc/string.h:24: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:48: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:48: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:51: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] FRAMAC_SHARE/libc/string.h:51: Warning: 
++  cannot create the pointer alignment guard of s because void is an incomplete type
++[e-acsl] typing_unsupported_sibling.c:22: Warning: 
++  E-ACSL construct
++  `logic functions or predicates with no definition nor reads clause'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] typing_unsupported_sibling.c:13: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:627: Warning: 
++  no assigns clause generated for function valid_read_nstring because pointers as arguments is not yet supported
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:305: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:634: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:626: Warning: 
++  Some assumes clauses could not be translated.
++  Ignoring complete and disjoint behaviors annotations.
++[e-acsl] FRAMAC_SHARE/libc/string.h:626: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:626: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:635: Warning: 
++  no assigns clause generated for function valid_read_string because pointers as arguments is not yet supported
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:282: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:636: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:638: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:639: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:626: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:642: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:282: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:542: Warning: 
++  no assigns clause generated for function valid_string because pointers as arguments is not yet supported
++[e-acsl] FRAMAC_SHARE/libc/__fc_string_axiomatic.h:279: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:545: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:539: Warning: 
++  E-ACSL construct `assigns clause' is not yet supported. Ignoring annotation.
++[e-acsl] FRAMAC_SHARE/libc/string.h:549: Warning: 
++  E-ACSL construct `logic functions or predicates performing read accesses'
++  is not yet supported.
++  Ignoring annotation.
++[e-acsl] translation done in project "e-acsl".
++[eva:alarm] typing_unsupported_sibling.c:22: Warning: 
++  assertion got status unknown.
++[eva:alarm] typing_unsupported_sibling.c:13: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] typing_unsupported_sibling.c:13: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] typing_unsupported_sibling.c:13: Warning: 
++  function __gen_e_acsl_sum_reads: postcondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:643: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:642: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:642: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:639: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:639: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:638: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:638: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:636: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:636: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:635: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:632: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:629: Warning: 
++  function __e_acsl_assert, behavior blocking: precondition got status unknown.
++[eva:alarm] FRAMAC_SHARE/libc/string.h:629: Warning: 
++  assertion 'E_ACSL,memory access' got status invalid (stopping propagation).
+diff --git a/plugins/e-acsl/tests/constructs/typing_unsupported_sibling.c b/plugins/e-acsl/tests/constructs/typing_unsupported_sibling.c
+new file mode 100644
+index 0000000000..53f858a5b2
+--- /dev/null
++++ b/plugins/e-acsl/tests/constructs/typing_unsupported_sibling.c
+@@ -0,0 +1,28 @@
++/* run.config
++   COMMENT: When typing an unsupported subterm or quantifier guard raises
++   COMMENT: Error.Not_yet, sibling subterms (such as \old parameters with
++   COMMENT: RTE guards) and the quantifier goal must still be typed so code
++   COMMENT: generation ignores the annotation instead of aborting with
++   COMMENT: "typing was not performed".
++*/
++#include <string.h>
++
++/*@ logic integer undef_fn(int x); */
++/*@ logic integer reads_fn(char *p) reads *p; */
++
++/*@ ensures \result == reads_fn(a) + reads_fn(b); */
++int sum_reads(char *a, char *b) {
++  return (int)*a + (int)*b;
++}
++
++int main(void) {
++  int x = 0;
++  char a = 1, b = 2;
++  char d[8] = "a";
++  /*@ assert \forall integer i; undef_fn(x) <= i < 3 ==> i >= 0; */
++  sum_reads(&a, &b);
++  stpncpy(d, "ab", 4);
++  strlcat(d, "cd", 8);
++  /*@ assert a == 1; */
++  return 0;
++}
+-- 
+2.47.3
+

@@ -1,0 +1,184 @@
+From b505a2211d7dbfc126eae6855765306dbe810c21 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:49:23 +0000
+Subject: [PATCH] [wp] size void objects as char instead of int
+
+Ctypes.object_of already maps `TPtr TVoid` (`void *`) to
+`C_pointer Cil_const.charType` (1-byte `char *`), but its `TVoid` branch
+mapped a `void` object to `C_int (c_int IInt)` (`sizeof(int)`). As a
+result:
+
+- in the default Typed model, `\block_length(p)` on a `void *` pointer
+  was multiplied by `sizeof(int)` (4 on 32/64-bit, 2 on `x86_16`),
+  proving `\block_length(p) == 32` for an 8-byte buffer;
+- in the Bytes model, pointer shifts (`p + k`) and pointer differences
+  (`q - p`) on `void *` stepped by `sizeof(int)` instead of 1 byte,
+  proving `(char *)(p + 4) == buf + 16`, `q - p == 1`, and false
+  postconditions on Frama-C libc functions such as `mempcpy`.
+
+Map `TVoid` to `C_int (c_char ())`, consistent with `TPtr TVoid` and
+GNU C `sizeof(void) == 1`.
+
+New test: wp_acsl/void_object.i.
+---
+ plugins/wp/src/ctypes.ml                      |  2 +-
+ .../wp_acsl/oracle/void_object.0.res.oracle   | 22 +++++++++++
+ .../wp_acsl/oracle/void_object.1.res.oracle   | 36 +++++++++++++++++
+ .../wp_acsl/oracle/void_object.2.res.oracle   | 13 +++++++
+ plugins/wp/tests/wp_acsl/void_object.i        | 39 +++++++++++++++++++
+ 5 files changed, 111 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/void_object.0.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/void_object.1.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/void_object.2.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/void_object.i
+
+diff --git a/plugins/wp/src/ctypes.ml b/plugins/wp/src/ctypes.ml
+index 7a7442a796..9f07449fd8 100644
+--- a/plugins/wp/src/ctypes.ml
++++ b/plugins/wp/src/ctypes.ml
+@@ -315,7 +315,7 @@ let rec object_of typ =
+     C_pointer (Cil_const.voidType)
+   | TVoid ->
+     WpLog.warning ~current:true "void object" ;
+-    C_int (c_int IInt)
++    C_int (c_char ())
+   | TNamed r -> object_of r.ttype
+ 
+ (* ------------------------------------------------------------------------ *)
+diff --git a/plugins/wp/tests/wp_acsl/oracle/void_object.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle/void_object.0.res.oracle
+new file mode 100644
+index 0000000000..c53268316e
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/void_object.0.res.oracle
+@@ -0,0 +1,22 @@
++# frama-c -wp [...]
++[kernel] Parsing void_object.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal bl_true_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal bl_true_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal bl_false_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal bl_false_terminates (Cfg) (Trivial)
++[wp] void_object.i:11: Warning: void object
++[wp] void_object.i:16: Warning: void object
++
++Goal Check ("void_object.i", line 11, characters 13-34):
++Assume { (* Heap *) Type: linked(Malloc_0). }
++Prove: Malloc_0[G_buf_21] = 8.
++
++------------------------------------------------------------
++
++Goal Check ("void_object.i", line 16, characters 13-35):
++Assume { (* Heap *) Type: linked(Malloc_0). }
++Prove: Malloc_0[G_buf_21] = 32.
++
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle/void_object.1.res.oracle b/plugins/wp/tests/wp_acsl/oracle/void_object.1.res.oracle
+new file mode 100644
+index 0000000000..0a5a064f4e
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/void_object.1.res.oracle
+@@ -0,0 +1,36 @@
++# frama-c -wp -wp-model 'Bytes' [...]
++[kernel] Parsing void_object.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal shift_true_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal shift_true_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal shift_false_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal shift_false_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal diff_true_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal diff_true_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal diff_false_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal diff_false_terminates (Cfg) (Trivial)
++[wp] void_object.i:21: Warning: void object
++[wp] void_object.i:26: Warning: void object
++[wp] void_object.i:32: Warning: void object
++[wp] void_object.i:38: Warning: void object
++
++Goal Check ("void_object.i", line 21, characters 13-39):
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check ("void_object.i", line 26, characters 13-40):
++Prove: false.
++
++------------------------------------------------------------
++
++Goal Check ("void_object.i", line 32, characters 13-23):
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check ("void_object.i", line 38, characters 13-23):
++Prove: false.
++
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle/void_object.2.res.oracle b/plugins/wp/tests/wp_acsl/oracle/void_object.2.res.oracle
+new file mode 100644
+index 0000000000..c5e96c1d36
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/void_object.2.res.oracle
+@@ -0,0 +1,13 @@
++# frama-c -wp [...]
++[kernel] Parsing void_object.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal bl_true_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal bl_true_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] void_object.i:11: Warning: void object
++
++Goal Check ("void_object.i", line 11, characters 13-34):
++Assume { (* Heap *) Type: linked(Malloc_0). }
++Prove: Malloc_0[G_buf_21] = 8.
++
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/void_object.i b/plugins/wp/tests/wp_acsl/void_object.i
+new file mode 100644
+index 0000000000..c8d0fcb17a
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/void_object.i
+@@ -0,0 +1,39 @@
++/* run.config
++   OPT: -wp-fct bl_true,bl_false
++   OPT: -wp-model Bytes -wp-fct shift_true,shift_false,diff_true,diff_false
++   OPT: -machdep x86_16 -wp-fct bl_true
++*/
++
++char buf[8];
++
++void bl_true(void) {
++  void *p = buf;
++  //@ check \block_length(p) == 8;
++}
++
++void bl_false(void) {
++  void *p = buf;
++  //@ check \block_length(p) == 32;
++}
++
++void shift_true(void) {
++  void *p = buf;
++  //@ check (char *)(p + 4) == buf + 4;
++}
++
++void shift_false(void) {
++  void *p = buf;
++  //@ check (char *)(p + 4) == buf + 16;
++}
++
++void diff_true(void) {
++  void *p = buf;
++  void *q = buf + 4;
++  //@ check q - p == 4;
++}
++
++void diff_false(void) {
++  void *p = buf;
++  void *q = buf + 4;
++  //@ check q - p == 1;
++}
+-- 
+2.47.3
+

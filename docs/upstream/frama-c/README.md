@@ -21,6 +21,60 @@ on 2026-11-09. It predates Issues 15 to 40, so do not rely on it alone for dedup
 
 ---
 
+## Status update (2026-11-23)
+
+This section is newer than the ones below and wins where they differ.
+
+- **Drafted and validated from the 2026-11-18 hunt, not filed: 51 to 87 plus private `H13`**
+  (2026-11-23). Every unfiled candidate in
+  [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md) underwent
+  independent Stage 1 vetting (reproduced from scratch on stock `framac-master-audit:189053d`
+  `189053d4a2` `35.0~~dev` and stock `framac-analysis:latest` `34.0~beta`, checked against ISO
+  C11/C17, IEEE 754, POSIX, ACSL and upstream manuals, and deduplicated via read-only `glab api`
+  against `pub/frama-c` issues and MRs in all states — 0 duplicates), Stage 2 packaging, and
+  independent Stage 3 validation. Filing remains paused pending `#2832` (no issues, MRs, branches,
+  or `#2832` edits were pushed):
+  - **37 numbered packages (`51`–`87`):** 36 packages with validated single-commit `git
+    format-patch` patches on `189053d4a2bd460c5c557dba8569474ff0419e73` (`51`–`62` and `64`–`87`),
+    plus 1 issue-only report (`63` for `N1`, enumeration constants typed unsigned — deliberate
+    upstream change `#@1682`). All 37 pass `python tools/upstream_audit/file_upstream.py check`
+    with 0 errors and 0 warnings, pass `python tools/check_generated_text.py`, have LF line
+    endings and zero file-mode changes, pass fail-before / pass-after regression tests, full
+    touched upstream ptest suites, `./dev/check-files.sh -p HEAD~1`, and standalone reproducers
+    flipping exit `1` -> `0`.
+  - **1 private internal analysis draft only (`H13`):**
+    [`./frama-c-kernel-compilation-db-quoting.md`](./frama-c-kernel-compilation-db-quoting.md)
+    (compilation-database shell quoting in `json_compilation_database.ml` + `file.ml:430`; no
+    `filing/`, no public repro/patch, not added to `#2832`, awaiting owner disclosure-channel
+    decision).
+  - **Skipped by scope:** `H9` (not a wrong result), `H19` (documented `+real` limit), `L6`
+    (cosmetic), and `N21` (read-only notes).
+  - **Merged pairs:** `H10`+`N4` (`51`), `H6`+`H18` (`59`), `H3`+`N2` (`66`), `N6`+`utmp.h`
+    sibling (`74`), `H12`+`N14` (`77`). `H15` (`53`) is kept separate and complementary to `51`
+    because `0.1 < 1e40f` triggers `mpq_set_d(INFINITY)` `SIGFPE` even if the printer emits valid
+    C `inf`. `L4` (`54`) was proven distinct from `#2806`/`!37` by building and testing on top of
+    patch `16`.
+  - **Stacking verified (`git am --3way --keep-non-patch` in both orders):** `42`+`67`+`68`
+    (`Cfloat.ml`), `70`+`71` (`wp_parameters.ml`), `72`+`76` (`share/libc/stdio.h`), `43`+`52`
+    (`gmp.ml`), `04`+`05`+`16`+`54` (`typing.ml`), `20`+`51`+`78`+`79` (`cil_printer.ml`),
+    `56`+`57`+`61`+`62` (`cil.ml`), `58`+`59`+`60` (`logic_typing.ml`), `58`+`81`, and `59`+`82`
+    (`logic_lexer.mll`, with two semantic interactions documented in `82`'s MR and draft).
+  - **High-value candidates synced to local `opam/` patch queue (2026-11-23, on owner go-ahead):**
+    all 17 recommended patches (`51`, `52`, `53`, `54`, `56`, `57`, `58`, `59`, `64`, `65`, `66`,
+    `68`, `72`, `73`, `74`, `75`, `80`) added to
+    [`../../../tools/sync_opam_patches.py`](../../../tools/sync_opam_patches.py) and synced to
+    `opam/` (52 Frama-C + 4 MetAcsl patches, digest `4d7ca78adb...`; all 52 apply cleanly with
+    `patch -p1 --fuzz=0` and build cleanly on `34.0-beta`).
+  - **Overview issue [#2832](https://git.frama-c.com/pub/frama-c/-/work_items/2832) updated**
+    (2026-11-23, on owner go-ahead, synced from
+    [`./filing/00-reports-overview-issue.md`](./filing/00-reports-overview-issue.md) and read back
+    identical): minimal 23 November edit note reflecting `189053d4a2` re-validation and patch-ready
+    status for `46` and all kept hunt items except `N1`, plus factual corrections in annex rows
+    `N18`, `L4`, `H15`, `N6`, `N12`, `N5`, `N11`, `H12`, and `N20` (`H13` remains excluded). No
+    separate issue or merge request was opened; filing remains paused.
+
+---
+
 ## Status update (2026-11-22)
 
 This section is newer than the ones below and wins where they differ.
@@ -331,17 +385,30 @@ This section is newer than the ones below and wins where they differ.
   - **Not done:** no issue on `pub/meta`, no branch, no merge request.
     [`../../../tools/upstream_audit/file_upstream.py`](../../../tools/upstream_audit/file_upstream.py)
     files on `pub/frama-c` only.
-- **Drafted, not filed: 46** (2026-11-19). The libc's `<sched.h>` has no `cpu_set_t`, no `CPU_*`
-  macros and no `sched_setaffinity`/`sched_getaffinity` under `_GNU_SOURCE`. This stopped
-  nginx-1.31.9 run-1 at Phase 0 (`no_unit_parsed`).
+- **Drafted, not filed: 46** (2026-11-19; full filing package, reproducer, MR text, and validated
+  patch completed on 2026-11-22). The libc's `<sched.h>` has no `cpu_set_t`, no `CPU_*` / `CPU_*_S`
+  macros, and no `sched_setaffinity`/`sched_getaffinity`. This stopped nginx-1.31.9 run-1 at Phase 0
+  (`no_unit_parsed`).
   - **Package:** issue text
-    ([`./filing/46-libc-sched-cpu-set-issue.md`](./filing/46-libc-sched-cpu-set-issue.md)) and a
-    reproducer ([`./repro/46-libc-sched-cpu-set.c`](./repro/46-libc-sched-cpu-set.c)). Frama-C
-    rejects it (rc 1) on `34.0~beta` and on `master` `b80fcac74f`; gcc accepts it (rc 0). The
-    analysis is in [`./frama-c-libc-sched-cpu-set.md`](./frama-c-libc-sched-cpu-set.md).
+    ([`./filing/46-libc-sched-cpu-set-issue.md`](./filing/46-libc-sched-cpu-set-issue.md), passes
+    `file_upstream.py check 46` with 0 errors and 0 warnings), MR text
+    ([`./filing/46-libc-sched-cpu-set-mr.md`](./filing/46-libc-sched-cpu-set-mr.md), holding
+    `#<issue>`), standalone reproducer
+    ([`./repro/46-libc-sched-cpu-set.sh`](./repro/46-libc-sched-cpu-set.sh) and
+    [`./repro/46-libc-sched-cpu-set.c`](./repro/46-libc-sched-cpu-set.c)), and validated patch
+    ([`./patches/46-libc-sched-cpu-set.patch`](./patches/46-libc-sched-cpu-set.patch) on `master`
+    `189053d4a2`). Full analysis in
+    [`./frama-c-libc-sched-cpu-set.md`](./frama-c-libc-sched-cpu-set.md).
+  - **Validation:** `revalidate.sh before 46` and `package 46` on `framac-master-audit:189053d`
+    (all 4 reproducer checks fail before on `34.0~beta` and `189053d4a2`, pass after; `tests/libc`
+    including `fc_libc` and `sched_cpu_set` on `x86_32`/`x86_64`, `plugins/e-acsl`, and
+    `./dev/check-files.sh -p HEAD~1` all pass with zero existing oracle changes; WP spot check
+    proves 81/81 goals on `x86_64` and `x86_32`).
   - **Pipeline workaround:** `templates/fc_stubs/fc_compat_types.h` (`cb78e8b`).
-  - **Duplicates:** live tracker searched on 2026-11-20 (`cpu_set_t`, `sched_setaffinity`, `sched.h`); none.
-  - **Listed in #2832** (annex ref `46`) since 2026-11-20. **Not done:** no patch, no MR text, no issue.
+  - **Duplicates:** live tracker re-checked on 2026-11-22 (`cpu_set_t`, `sched_setaffinity`,
+    `sched.h`, `CPU_SET`); only `#2832`.
+  - **Listed in #2832** (annex ref `46`) since 2026-11-20. **Not done:** no issue filed, no branch
+    pushed, no MR opened (filing remains paused).
 - **Drafted, not filed: 47, 48 and 49** (2026-11-20), three MetAcsl reports for
   [`pub/meta`](https://git.frama-c.com/pub/meta/-/issues) found while adding MetAcsl properties to
   the E-ACSL build (package C of [`../../plans/metacsl-exploitation-plan.md`](../../plans/metacsl-exploitation-plan.md)). Each has an analysis
@@ -617,7 +684,7 @@ All paths below are relative to this folder.
 - **Repro:** `repro/<NN>-<slug>.sh` plus its `.c` files.
 - **Patch:** `patches/<NN>-<slug>.patch`. "Validated" means built, and the reproducer run before and
   after on `master` `3dff90fc70` (01 to 27), `95408044f7` (28 to 40), `b80fcac74f` (41 to 44), or
-  `189053d4a2` (50).
+  `189053d4a2` (46, 50).
 
 | # | Component | Bug | Draft | Issue | MR | Repro | Patch |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -663,14 +730,52 @@ All paths below are relative to this folder.
 | 43 | E-ACSL | Real constants that are not exactly a `double`: unexpected error with an exponent or in hexadecimal (`1e-9`), and a `long double` one (`0.1L`) is 0 at run time | [draft](./frama-c-eacsl-real-constant-notation.md) | [issue](./filing/43-eacsl-real-constant-notation-issue.md), **not filed** | [MR](./filing/43-eacsl-real-constant-notation-mr.md), **not opened** | [sh](./repro/43-eacsl-real-constant-notation.sh) | [validated](./patches/43-eacsl-real-constant-notation.patch) on `b80fcac74f` (one function and a test, 5 files) |
 | 44 | Libc | `strlcat`: the result is stated against `dest` after the call, and `assigns` covers a byte past `n`; Eva gives a wrong result without an alarm, WP proves a false postcondition (**soundness**) | [draft](./frama-c-libc-strlcat-contract.md) | [issue](./filing/44-libc-strlcat-contract-issue.md), **not filed** | [MR](./filing/44-libc-strlcat-contract-mr.md), **not opened** | [sh](./repro/44-libc-strlcat-contract.sh) | [validated](./patches/44-libc-strlcat-contract.patch) on `b80fcac74f` (four clauses and a test, 4 files) |
 | 45 | MetAcsl | `\result` is refused in a `\postcond` property (`\result meaningless`); under `\tguard` it collapses to `\true` | [draft](./frama-c-metacsl-result-in-postcond.md) | [issue](./filing/45-metacsl-result-in-postcond-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/45-metacsl-result-in-postcond-mr.md), **not opened** | [sh](./repro/45-metacsl-result-in-postcond.sh) | [built](./patches/45-metacsl-result-in-postcond.patch) on pub/meta `4f43801390` (`meta_parse.ml`, doc and a test) |
-| 46 | Libc | `<sched.h>`: no `cpu_set_t`, `CPU_*` macros or `sched_setaffinity`/`sched_getaffinity` under `_GNU_SOURCE` | [draft](./frama-c-libc-sched-cpu-set.md) | [issue](./filing/46-libc-sched-cpu-set-issue.md), **not filed** (listed in #2832) | none | [c](./repro/46-libc-sched-cpu-set.c) | none |
+| 46 | Libc | `<sched.h>`: no `cpu_set_t`, `CPU_*` macros or `sched_setaffinity`/`sched_getaffinity` | [draft](./frama-c-libc-sched-cpu-set.md) | [issue](./filing/46-libc-sched-cpu-set-issue.md), **not filed** (listed in #2832) | [MR](./filing/46-libc-sched-cpu-set-mr.md), **not opened** | [sh](./repro/46-libc-sched-cpu-set.sh) | [validated](./patches/46-libc-sched-cpu-set.patch) on `189053d4a2` (`sched.h` + `sched_cpu_set.c`, 4 files) |
 | 47 | MetAcsl | Callee `Old`/`Pre`/`Here` labels copied into `\written`/`\read` instances at a call: `Old` aborts E-ACSL and WP, `Pre` and `Here` (under `After`) let WP prove false properties (**soundness**) | [draft](./frama-c-metacsl-callee-old-label-in-written.md) | [issue](./filing/47-metacsl-callee-old-label-in-written-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/47-metacsl-callee-old-label-in-written-mr.md), **not opened** | [sh](./repro/47-metacsl-callee-old-label-in-written.sh) | [built](./patches/47-metacsl-callee-old-label-in-written.patch) on pub/meta `4f43801390` (one visitor and a test) |
 | 48 | MetAcsl | `-meta-fold`: folded instances have no location (`<unknown>:0` under E-ACSL) | [draft](./frama-c-metacsl-fold-annotation-location.md) | [issue](./filing/48-metacsl-fold-annotation-location-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/48-metacsl-fold-annotation-location-mr.md), **not opened** | [sh](./repro/48-metacsl-fold-annotation-location.sh) | [built](./patches/48-metacsl-fold-annotation-location.patch) on pub/meta `4f43801390` (locations passed, new test + one oracle) |
 | 49 | MetAcsl | Feature: a call to a function without specification gets no `\writing`/`\reading` instance and no warning (libc under `e-acsl-gcc`); `\written`/`\read` terms lack locations (`<unknown>:0` E-ACSL guards) | [draft](./frama-c-metacsl-eacsl-libc-instances.md) | [issue](./filing/49-metacsl-eacsl-libc-instances-issue.md), **not filed** (pub/meta; listed in #2832) | [MR](./filing/49-metacsl-eacsl-libc-instances-mr.md), **not opened** | [sh](./repro/49-metacsl-eacsl-libc-instances.sh) | [built](./patches/49-metacsl-eacsl-libc-instances.patch) on pub/meta `4f43801390` (warning only) |
 | 50 | E-ACSL | `--validate-format-strings`: `Assertion failed` in `functions.ml:156` on `enum` arguments and `Options.fatal` on `enum *` pointers | [draft](./frama-c-eacsl-format-enum-argument.md) | [issue](./filing/50-eacsl-format-enum-argument-issue.md), **not filed** (staged for #2832) | [MR](./filing/50-eacsl-format-enum-argument-mr.md), **not opened** | [sh](./repro/50-eacsl-format-enum-argument.sh) | [validated](./patches/50-eacsl-format-enum-argument.patch) on `189053d4a2` (`functions.ml` + `printf_enum.c`, 5 files; stacks with !48) |
+| 51 | Kernel (printer) | `H10+N4`: `CReal` without text truncated to 12 digits (`double` precision loss) and non-finite `inf`/`-inf`/`nan` printed as undeclared C identifiers under `-constfold` / `e-acsl-gcc` | [draft](./frama-c-kernel-float-const-printing.md) | [issue](./filing/51-kernel-float-const-printing-issue.md), **not filed** | [MR](./filing/51-kernel-float-const-printing-mr.md), **not opened** | [sh](./repro/51-kernel-float-const-printing.sh) | [validated](./patches/51-kernel-float-const-printing.patch) on `189053d4a2` (`cil_printer.ml`; stacks 4-way with 20, 78, 79) |
+| 52 | E-ACSL | `H11`: rational cast to `double`/`float` truncated toward zero by `mpq_get_d` (true assertions abort, false assertions pass; **soundness**) | [draft](./frama-c-eacsl-rational-cast-double-rounding.md) | [issue](./filing/52-eacsl-rational-cast-double-rounding-issue.md), **not filed** | [MR](./filing/52-eacsl-rational-cast-double-rounding-mr.md), **not opened** | [sh](./repro/52-eacsl-rational-cast-double-rounding.sh) | [validated](./patches/52-eacsl-rational-cast-double-rounding.patch) on `189053d4a2` (`gmp.ml` + RTL helpers; stacks with 43) |
+| 53 | E-ACSL | `H15`: non-finite suffixed real constant (`1e40f`) emitted as `inf` (fails to compile) or passed to `__gmpq_set_d` (`SIGFPE`) | [draft](./frama-c-eacsl-non-finite-real-constant.md) | [issue](./filing/53-eacsl-non-finite-real-constant-issue.md), **not filed** | [MR](./filing/53-eacsl-non-finite-real-constant-mr.md), **not opened** | [sh](./repro/53-eacsl-non-finite-real-constant.sh) | [validated](./patches/53-eacsl-non-finite-real-constant.patch) on `189053d4a2` (`interval.ml` + `translate_terms.ml`) |
+| 54 | E-ACSL | `L4`: `typing was not performed` internal error on `stpncpy`/`strlcat` and quantifiers with unsupported sibling terms (distinct from `#2806`/`!37`) | [draft](./frama-c-eacsl-typing-not-performed-guard.md) | [issue](./filing/54-eacsl-typing-not-performed-guard-issue.md), **not filed** | [MR](./filing/54-eacsl-typing-not-performed-guard-mr.md), **not opened** | [sh](./repro/54-eacsl-typing-not-performed-guard.sh) | [validated](./patches/54-eacsl-typing-not-performed-guard.patch) on `189053d4a2` (`typing.ml`; stacks 4-way with 04, 05, 16) |
+| 55 | Eva | `H14`: `numerors` domain decimal-only literal parser loses sure alarm on `DBL_MAX` and crashes on `FLT_MAX`/`INFINITY`/`0x1.ep0`/`1.5d` | [draft](./frama-c-eva-numerors-float-literal-parsing.md) | [issue](./filing/55-eva-numerors-float-literal-parsing-issue.md), **not filed** | [MR](./filing/55-eva-numerors-float-literal-parsing-mr.md), **not opened** | [sh](./repro/55-eva-numerors-float-literal-parsing.sh) | [validated](./patches/55-eva-numerors-float-literal-parsing.patch) on `189053d4a2` (`rational.ml` + `IEEE754.ml`) |
+| 56 | Kernel | `H4`: `(float)` cast of `double`-exact literal dropped in logic (`Cil.isExactFloat`; WP proves false, Eva stops on true assertions; **soundness**) | [draft](./frama-c-kernel-float-cast-dropped-exact.md) | [issue](./filing/56-kernel-float-cast-dropped-exact-issue.md), **not filed** | [MR](./filing/56-kernel-float-cast-dropped-exact-mr.md), **not opened** | [sh](./repro/56-kernel-float-cast-dropped-exact.sh) | [validated](./patches/56-kernel-float-cast-dropped-exact.patch) on `189053d4a2` (`cil.ml`; stacks 4-way with 57, 61, 62) |
+| 57 | Kernel | `N8`: `(_Bool)` cast of integer literal in `2..255` dropped in logic (`Cil.fitsInInt IBool`; proves `1 == 2`; **soundness**) | [draft](./frama-c-kernel-bool-cast-dropped-logic.md) | [issue](./filing/57-kernel-bool-cast-dropped-logic-issue.md), **not filed** | [MR](./filing/57-kernel-bool-cast-dropped-logic-mr.md), **not opened** | [sh](./repro/57-kernel-bool-cast-dropped-logic.sh) | [validated](./patches/57-kernel-bool-cast-dropped-logic.patch) on `189053d4a2` (`cil.ml`; stacks 4-way with 56, 61, 62) |
+| 58 | Kernel | `H7`: ACSL `sizeof` of string literal with escape sized from raw escaped text (`logic_typing.ml`) | [draft](./frama-c-kernel-acsl-string-sizeof-escaped.md) | [issue](./filing/58-kernel-acsl-string-sizeof-escaped-issue.md), **not filed** | [MR](./filing/58-kernel-acsl-string-sizeof-escaped-mr.md), **not opened** | [sh](./repro/58-kernel-acsl-string-sizeof-escaped.sh) | [validated](./patches/58-kernel-acsl-string-sizeof-escaped.patch) on `189053d4a2` (`logic_typing.ml`; stacks with 59, 60, 81) |
+| 59 | Kernel | `H6+H18`: ACSL lexer cuts hex escapes into byte pairs (`L'\x20AC'`) and crashes `Char.chr` on octal escapes above `\377` | [draft](./frama-c-kernel-acsl-hex-octal-escapes.md) | [issue](./filing/59-kernel-acsl-hex-octal-escapes-issue.md), **not filed** | [MR](./filing/59-kernel-acsl-hex-octal-escapes-mr.md), **not opened** | [sh](./repro/59-kernel-acsl-hex-octal-escapes.sh) | [validated](./patches/59-kernel-acsl-hex-octal-escapes.patch) on `189053d4a2` (`logic_lexer.mll` + `logic_typing.ml`; stacks with 58, 60, 82) |
+| 60 | Kernel | `N11`: ACSL wide string treats `8`/`9` as octal digits and omits `\v` (`logic_typing.ml`) | [draft](./frama-c-kernel-acsl-wstring-octal-escapes.md) | [issue](./filing/60-kernel-acsl-wstring-octal-escapes-issue.md), **not filed** | [MR](./filing/60-kernel-acsl-wstring-octal-escapes-mr.md), **not opened** | [sh](./repro/60-kernel-acsl-wstring-octal-escapes.sh) | [validated](./patches/60-kernel-acsl-wstring-octal-escapes.patch) on `189053d4a2` (`logic_typing.ml`; stacks with 58, 59) |
+| 61 | Kernel | `H5`: character constants sign-extended on unsigned-`char` machdeps (`ppc_32`; `Cil.charConstToInt`) | [draft](./frama-c-kernel-char-const-unsigned-machdep.md) | [issue](./filing/61-kernel-char-const-unsigned-machdep-issue.md), **not filed** | [MR](./filing/61-kernel-char-const-unsigned-machdep-mr.md), **not opened** | [sh](./repro/61-kernel-char-const-unsigned-machdep.sh) | [validated](./patches/61-kernel-char-const-unsigned-machdep.patch) on `189053d4a2` (`cil.ml`; stacks 4-way with 56, 57, 62) |
+| 62 | Kernel | `H8`: multi-character constants typed `unsigned long`/`unsigned long long` instead of `int` (`Cil.interpret_character_constant`) | [draft](./frama-c-kernel-multichar-const-type.md) | [issue](./filing/62-kernel-multichar-const-type-issue.md), **not filed** | [MR](./filing/62-kernel-multichar-const-type-mr.md), **not opened** | [sh](./repro/62-kernel-multichar-const-type.sh) | [validated](./patches/62-kernel-multichar-const-type.patch) on `189053d4a2` (`cil.ml`; stacks 4-way with 56, 57, 61) |
+| 63 | Kernel | `N1`: enumeration constants typed as enum's unsigned type instead of `int` (deliberate `#@1682` regression; **soundness**) | [draft](./frama-c-kernel-enum-const-unsigned-type.md) | [issue](./filing/63-kernel-enum-const-unsigned-type-issue.md), **not filed** (issue-only; cites `#2832` and `#@1682`) | none | [sh](./repro/63-kernel-enum-const-unsigned-type.sh) | none (issue-only design discussion) |
+| 64 | WP | `L1`: `TVoid` object sized as `int` (`\block_length(void *)` 4x too large in `Typed`; `void *` shift steps by 4 in `Bytes`; **soundness**) | [draft](./frama-c-wp-void-object-size.md) | [issue](./filing/64-wp-void-object-size-issue.md), **not filed** | [MR](./filing/64-wp-void-object-size-mr.md), **not opened** | [sh](./repro/64-wp-void-object-size.sh) | [validated](./patches/64-wp-void-object-size.patch) on `189053d4a2` (`ctypes.ml`) |
+| 65 | WP | `H1`: `\floor`/`\ceil`/`\truncate` and float-to-int casts of constants use `int_of_float (Q.to_float r)` (**soundness**) | [draft](./frama-c-wp-floor-ceil-truncate-float-cast.md) | [issue](./filing/65-wp-floor-ceil-truncate-float-cast-issue.md), **not filed** | [MR](./filing/65-wp-floor-ceil-truncate-float-cast-mr.md), **not opened** | [sh](./repro/65-wp-floor-ceil-truncate-float-cast.sh) | [validated](./patches/65-wp-floor-ceil-truncate-float-cast.patch) on `189053d4a2` (`Cmath.ml`) |
+| 66 | WP | `H3+N2`: range addition/subtraction and pointer shifts `p + (a..b) + (c..d)` ignore empty ranges (**soundness**) | [draft](./frama-c-wp-empty-range-addition-shift.md) | [issue](./filing/66-wp-empty-range-addition-shift-issue.md), **not filed** | [MR](./filing/66-wp-empty-range-addition-shift-mr.md), **not opened** | [sh](./repro/66-wp-empty-range-addition-shift.sh) | [validated](./patches/66-wp-empty-range-addition-shift.patch) on `189053d4a2` (`Vset.{mli,ml}` + `Cvalues.ml`) |
+| 67 | WP | `H2`: real/integer constant rounded to `float` is double-rounded through `double` (`Cfloat.qmake`) | [draft](./frama-c-wp-float-constant-double-rounding.md) | [issue](./filing/67-wp-float-constant-double-rounding-issue.md), **not filed** | [MR](./filing/67-wp-float-constant-double-rounding-mr.md), **not opened** | [sh](./repro/67-wp-float-constant-double-rounding.sh) | [validated](./patches/67-wp-float-constant-double-rounding.patch) on `189053d4a2` (`Cfloat.ml`; stacks 3-way with 42, 68) |
+| 68 | WP | `N3`: overflowed float constant becomes infinite `Kreal` (false proofs + `Invalid_argument("Wp.Cfloat.const_float")` Why3 crash) | [draft](./frama-c-wp-non-finite-float-constant.md) | [issue](./filing/68-wp-non-finite-float-constant-issue.md), **not filed** | [MR](./filing/68-wp-non-finite-float-constant-mr.md), **not opened** | [sh](./repro/68-wp-non-finite-float-constant.sh) | [validated](./patches/68-wp-non-finite-float-constant.patch) on `189053d4a2` (`Cfloat.ml`; stacks 3-way with 42, 67) |
+| 69 | WP | `H16`: `strategy` timeout with suffix or overflow crashes (`Invalid_argument` caught instead of `Failure`) | [draft](./frama-c-wp-strategy-timeout-exception.md) | [issue](./filing/69-wp-strategy-timeout-exception-issue.md), **not filed** | [MR](./filing/69-wp-strategy-timeout-exception-mr.md), **not opened** | [sh](./repro/69-wp-strategy-timeout-exception.sh) | [validated](./patches/69-wp-strategy-timeout-exception.patch) on `189053d4a2` (`ProofStrategy.ml`) |
+| 70 | WP | `H17`: `-wp-time-margin` unchecked (`float_of_string` crash after proving; accepts `nan`; manual says `5s` vs `0.5`) | [draft](./frama-c-wp-time-margin-validation.md) | [issue](./filing/70-wp-time-margin-validation-issue.md), **not filed** | [MR](./filing/70-wp-time-margin-validation-mr.md), **not opened** | [sh](./repro/70-wp-time-margin-validation.sh) | [validated](./patches/70-wp-time-margin-validation.patch) on `189053d4a2` (`wp_parameters.{ml,mli}` + manual; stacks with 71) |
+| 71 | WP | `N16`: `-wp-par 0` / negative value crashes `Prove_client.set_max_running_provers` | [draft](./frama-c-wp-par-range-check.md) | [issue](./filing/71-wp-par-range-check-issue.md), **not filed** | [MR](./filing/71-wp-par-range-check-mr.md), **not opened** | [sh](./repro/71-wp-par-range-check.sh) | [validated](./patches/71-wp-par-range-check.patch) on `189053d4a2` (`wp_parameters.ml`; stacks with 70) |
+| 72 | Libc | `L2`: `pclose` proves `\false` under WP (`is_open_pipe` lacks `reads`, `pclose` assigns no state; **soundness**) | [draft](./frama-c-libc-pclose-pipe-status-soundness.md) | [issue](./filing/72-libc-pclose-pipe-status-soundness-issue.md), **not filed** | [MR](./filing/72-libc-pclose-pipe-status-soundness-mr.md), **not opened** | [sh](./repro/72-libc-pclose-pipe-status-soundness.sh) | [validated](./patches/72-libc-pclose-pipe-status-soundness.patch) on `189053d4a2` (`share/libc/stdio.h`; stacks with 76) |
+| 73 | Libc | `L3`: `sigaction` `oldact` assigns `&__fc_sigaction` and postcondition lacks `\old` (Eva marks code after call dead) | [draft](./frama-c-libc-sigaction-oldact-contract.md) | [issue](./filing/73-libc-sigaction-oldact-contract-issue.md), **not filed** | [MR](./filing/73-libc-sigaction-oldact-contract-mr.md), **not opened** | [sh](./repro/73-libc-sigaction-oldact-contract.sh) | [validated](./patches/73-libc-sigaction-oldact-contract.patch) on `189053d4a2` (`share/libc/signal.h`) |
+| 74 | Libc | `N6` + `utmp.h`: `getpwnam_r`/`getpwuid_r`/`getut*_r` result pointer assigns `&__fc_*`, making success branch dead in Eva | [draft](./frama-c-libc-reentrant-result-pointer-assigns.md) | [issue](./filing/74-libc-reentrant-result-pointer-assigns-issue.md), **not filed** | [MR](./filing/74-libc-reentrant-result-pointer-assigns-mr.md), **not opened** | [sh](./repro/74-libc-reentrant-result-pointer-assigns.sh) | [validated](./patches/74-libc-reentrant-result-pointer-assigns.patch) on `189053d4a2` (`share/libc/pwd.h` + `utmp.h`) |
+| 75 | Libc | `L5`: `<syslog.h>` omits `__fc_string_axiomatic.h`, dropping `syslog` string preconditions in Eva | [draft](./frama-c-libc-syslog-string-axiomatic.md) | [issue](./filing/75-libc-syslog-string-axiomatic-issue.md), **not filed** | [MR](./filing/75-libc-syslog-string-axiomatic-mr.md), **not opened** | [sh](./repro/75-libc-syslog-string-axiomatic.sh) | [validated](./patches/75-libc-syslog-string-axiomatic.patch) on `189053d4a2` (`share/libc/syslog.h`) |
+| 76 | Libc | `N20`: `<wchar.h>` without `<stdio.h>` cannot locate `__fc_stdout`/`__fc_stdin` for `wprintf`/`wscanf` | [draft](./frama-c-libc-wchar-stdio-streams.md) | [issue](./filing/76-libc-wchar-stdio-streams-issue.md), **not filed** | [MR](./filing/76-libc-wchar-stdio-streams-mr.md), **not opened** | [sh](./repro/76-libc-wchar-stdio-streams.sh) | [validated](./patches/76-libc-wchar-stdio-streams.patch) on `189053d4a2` (`__fc_define_file.h` + `stdio.h`; stacks with 72) |
+| 77 | Kernel (printer) | `H12+N14`: wide-string printer emits invalid `\u` escapes, crashes `>= 2^32`, and resets trigraph state per char (`escape.ml`) | [draft](./frama-c-kernel-wstring-escape-trigraph.md) | [issue](./filing/77-kernel-wstring-escape-trigraph-issue.md), **not filed** | [MR](./filing/77-kernel-wstring-escape-trigraph-mr.md), **not opened** | [sh](./repro/77-kernel-wstring-escape-trigraph.sh) | [validated](./patches/77-kernel-wstring-escape-trigraph.patch) on `189053d4a2` (`escape.ml`) |
+| 78 | Kernel (printer) | `N12`: ACSL wide strings double-escaped by `%S` and empty `L""` printed as unbound `L` (`cil_printer.ml`) | [draft](./frama-c-kernel-acsl-wstring-double-escape.md) | [issue](./filing/78-kernel-acsl-wstring-double-escape-issue.md), **not filed** | [MR](./filing/78-kernel-acsl-wstring-double-escape-mr.md), **not opened** | [sh](./repro/78-kernel-acsl-wstring-double-escape.sh) | [validated](./patches/78-kernel-acsl-wstring-double-escape.patch) on `189053d4a2` (`cil_printer.ml`; stacks 4-way with 20, 51, 79) |
+| 79 | Kernel (printer) | `N5`: `__int128` constants printed with `LL`/`ULL` suffix (silently truncated by gcc, rejected on Frama-C re-parse) | [draft](./frama-c-kernel-int128-const-printing.md) | [issue](./filing/79-kernel-int128-const-printing-issue.md), **not filed** | [MR](./filing/79-kernel-int128-const-printing-mr.md), **not opened** | [sh](./repro/79-kernel-int128-const-printing.sh) | [validated](./patches/79-kernel-int128-const-printing.patch) on `189053d4a2` (`cil_printer.ml`; stacks 4-way with 20, 51, 78) |
+| 80 | Kernel | `N7`: hexadecimal float literal with `f` suffix double-rounded through `double` (`typed_float.ml`) | [draft](./frama-c-kernel-hex-float-double-rounding.md) | [issue](./filing/80-kernel-hex-float-double-rounding-issue.md), **not filed** | [MR](./filing/80-kernel-hex-float-double-rounding-mr.md), **not opened** | [sh](./repro/80-kernel-hex-float-double-rounding.sh) | [validated](./patches/80-kernel-hex-float-double-rounding.patch) on `189053d4a2` (`typed_float.ml`) |
+| 81 | Kernel | `N9`: ACSL adjacent string literals concatenated as raw text (`"\x4" "1"` -> `"A"`; `logic_parser.mly`) | [draft](./frama-c-kernel-acsl-adjacent-string-concat.md) | [issue](./filing/81-kernel-acsl-adjacent-string-concat-issue.md), **not filed** | [MR](./filing/81-kernel-acsl-adjacent-string-concat-mr.md), **not opened** | [sh](./repro/81-kernel-acsl-adjacent-string-concat.sh) | [validated](./patches/81-kernel-acsl-adjacent-string-concat.patch) on `189053d4a2` (`logic_parser.mly`; stacks with 58) |
+| 82 | Kernel | `N10`: ACSL lexer silently keeps unknown escapes (`'\e'`, `'\z'`) as two characters (`logic_lexer.mll`) | [draft](./frama-c-kernel-acsl-unknown-escape-char.md) | [issue](./filing/82-kernel-acsl-unknown-escape-char-issue.md), **not filed** | [MR](./filing/82-kernel-acsl-unknown-escape-char-mr.md), **not opened** | [sh](./repro/82-kernel-acsl-unknown-escape-char.sh) | [validated](./patches/82-kernel-acsl-unknown-escape-char.patch) on `189053d4a2` (`logic_lexer.mll`; stacks with 59) |
+| 83 | Kernel | `N13`: C lexer rejects ISO C99/C11 universal character names `\uXXXX`/`\UXXXXXXXX` (`clexer.mll`) | [draft](./frama-c-kernel-clexer-universal-char-names.md) | [issue](./filing/83-kernel-clexer-universal-char-names-issue.md), **not filed** | [MR](./filing/83-kernel-clexer-universal-char-names-mr.md), **not opened** | [sh](./repro/83-kernel-clexer-universal-char-names.sh) | [validated](./patches/83-kernel-clexer-universal-char-names.patch) on `189053d4a2` (`clexer.mll`) |
+| 84 | Kernel | `N15`: `//@ loop unroll 1/0;` crashes with `Division_by_zero` (`logic_utils.ml:2385`) | [draft](./frama-c-kernel-logic-constfold-div-zero.md) | [issue](./filing/84-kernel-logic-constfold-div-zero-issue.md), **not filed** | [MR](./filing/84-kernel-logic-constfold-div-zero-mr.md), **not opened** | [sh](./repro/84-kernel-logic-constfold-div-zero.sh) | [validated](./patches/84-kernel-logic-constfold-div-zero.patch) on `189053d4a2` (`logic_utils.ml`) |
+| 85 | Kernel | `N17`: custom YAML machdep with `sizeof_int: 0` crashes `Z.shift_left` (`machdep.ml`) | [draft](./frama-c-kernel-machdep-zero-size-crash.md) | [issue](./filing/85-kernel-machdep-zero-size-crash-issue.md), **not filed** | [MR](./filing/85-kernel-machdep-zero-size-crash-mr.md), **not opened** | [sh](./repro/85-kernel-machdep-zero-size-crash.sh) | [validated](./patches/85-kernel-machdep-zero-size-crash.patch) on `189053d4a2` (`machdep.ml`) |
+| 86 | Kernel | `N18`: C narrow character constant with out-of-range escape (`'\777'`, `'\x1ff'`) accepted silently (`cparser.mly`) | [draft](./frama-c-kernel-narrow-char-escape-range.md) | [issue](./filing/86-kernel-narrow-char-escape-range-issue.md), **not filed** | [MR](./filing/86-kernel-narrow-char-escape-range-mr.md), **not opened** | [sh](./repro/86-kernel-narrow-char-escape-range.sh) | [validated](./patches/86-kernel-narrow-char-escape-range.patch) on `189053d4a2` (`cparser.mly`) |
+| 87 | Kernel | `N19`: unbalanced quote or C23 digit separator `1'000` in annotation aborts with internal error (`logic_preprocess.mll`) | [draft](./frama-c-kernel-logic-preprocess-unbalanced-quote.md) | [issue](./filing/87-kernel-logic-preprocess-unbalanced-quote-issue.md), **not filed** | [MR](./filing/87-kernel-logic-preprocess-unbalanced-quote-mr.md), **not opened** | [sh](./repro/87-kernel-logic-preprocess-unbalanced-quote.sh) | [validated](./patches/87-kernel-logic-preprocess-unbalanced-quote.patch) on `189053d4a2` (`logic_preprocess.mll`) |
 
-Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11. 43 to 50 wait for the owner's
-go-ahead.
+Not filed, by decision (see the catalog): Issues 2, 6, 7 and 11. 43 to 87 wait for the owner's
+go-ahead; `H13` ([private draft](./frama-c-kernel-compilation-db-quoting.md)) awaits an explicit
+disclosure-channel decision and has no public filing text.
 
 ## How to file
 
@@ -765,9 +870,10 @@ points the maintainers may raise, and are no longer blocking. 41 and 42 were fil
 | 43 | File it? If so: one issue for the two symptoms (current), or the silent 0 of `0.1L` on its own? Report a suffixed constant as not yet supported (current), or give it the value of the target's `long double`? A `plugins/e-acsl/doc/Changelog` entry? The patch has none. |
 | 44 | File it? Decided on 2026-11-18: the patch also strengthens the `separation` precondition to `src+(0..strlen(src))` (measured: no oracle of `tests/libc` or of the E-ACSL suite changes with it; both texts say it can be dropped). Rename the check `imprecise` of `tests/libc/string_h.c`, which becomes valid? |
 | 45 | File it on `pub/meta` (issue and validated MR are ready, still paused)? Stacks cleanly with 47 to 49 (only `CHANGELOG.md` conflicts). `file_upstream.py` knows project 780 only, so it is filed by hand. |
+| 46 | File it on `pub/frama-c` once the filing pause lifts? Open for maintainers: declare unconditionally (matching `pthread.h`/`unistd.h`, since `features.h` does not define `__USE_GNU` from `_GNU_SOURCE`) or guard under `#ifdef _GNU_SOURCE`? Keep `CPU_ALLOC`/`CPU_FREE` omitted for now? |
 | 47 to 49 | File them on `pub/meta` (issues and MRs)? 49 cites 47 and 48, so file those first and replace `#ISSUE-47` and `#ISSUE-48`. Listed in #2832 since 2026-11-20. `file_upstream.py` knows project 780 only, so they are filed by hand. |
 | 50 | File it on `pub/frama-c` once the filing pause lifts, or fold it into a combined format-validation MR with `!48`, `!49` and `!50` if the maintainers answer question 3 of `#2832` in favour of combining them? Stacks cleanly with `!48` in either order. |
-| hunt | Which of the candidates of [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md) to turn into packages, and in which order? That document ranks them ("Order of criticity"); N1 (enumeration constants), L2 (`pclose`) and L1 (`void` objects under WP) come first. N1 reverts a deliberate upstream change, so it needs the argument from C11 and gcc. |
+| hunt (`51`–`87`, `H13`) | All candidates of [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md) are now vetted and packaged as `51`–`87` (36 validated patches + issue-only `63` for `N1`) plus private internal draft `H13` ([`./frama-c-kernel-compilation-db-quoting.md`](./frama-c-kernel-compilation-db-quoting.md)). Open decisions: (1) which of `51`–`87` to file once `#2832` pause lifts; (2) disclosure channel for `H13`; (3) which of the 16 high-value patches to cherry-pick into `opam/`. |
 
 ## Identified, not filed
 
@@ -809,11 +915,9 @@ Each of these is worked around or documented in the pipeline. None is a defect t
 - **E-ACSL crashes on a real literal with an exponent** (seen on 2026-11-18, looking for siblings
   of 42): now package 43, see the coverage table.
 - **The hunt of 2026-11-18** (siblings of 42 and 43, by four subagents and the parent session,
-  then a second opinion by six reviewers): candidates, none drafted, in
-  [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md). Among
-  them, the three defects that 43's draft names: floating-point constants printed with 12
-  significant digits, a rational cast to `double` by truncation, and `inf` printed as a C
-  constant.
+  then a second opinion by six reviewers): processed on 2026-11-23 into validated packages `51`–`87`
+  plus private internal draft `H13` (see the coverage table above and the annotated ledger in
+  [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md)).
 - **E-ACSL aborts with `labels pre-analysis was not performed on construct \old(idx)` on ranged
   `ensures \initialized(dest + (idx .. idx + n))`** (seen on libmodbus run-1, 2026-11-18,
   [`../../troubleshooting/wp-and-guardrail.md`](../../troubleshooting/wp-and-guardrail.md)).

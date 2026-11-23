@@ -1,0 +1,170 @@
+From 0ebfb112317095ded8742658e8069c40bf0412b4 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 23 Nov 2026 00:02:12 +0000
+Subject: [PATCH] [kernel] print __int128 constants without out-of-range LL/ULL
+ suffixes
+
+Cil_printer.constant printed IInt128 and IUInt128 constants with LL and
+ULL suffixes. Neither ISO C nor GCC/Clang supports 128-bit integer
+literal suffixes; constants outside 64-bit range produced literals such
+as 1267650600228229401496703205381LL and
+340282366920938463463374607431768211455ULL that GCC/Clang silently
+truncated to 64 bits (including in e-acsl-gcc, which enables -constfold
+by default) and that Frama-C itself rejected on re-parse with
+"Cannot represent the integer".
+
+Emit IInt128 and IUInt128 constants that fit in 64 bits with an
+explicit (__int128) or (unsigned __int128) cast on a 64-bit literal,
+and split larger values (including INT128_MIN) into unsigned 64-bit
+high and low halves combined via left shift and bitwise OR, wrapped in
+a (__int128) cast for signed values.
+
+Add regression test tests/pretty_printing/int128_const.c and update the
+two affected lines of
+plugins/e-acsl/tests/constructs/oracle/gen_typedef.0.c.
+---
+ .../tests/constructs/oracle/gen_typedef.0.c   |  4 +-
+ .../services/ast_printing/cil_printer.ml      | 30 ++++++++++++++-
+ tests/pretty_printing/int128_const.c          | 13 +++++++
+ .../oracle/int128_const.0.res.oracle          | 38 +++++++++++++++++++
+ 4 files changed, 81 insertions(+), 4 deletions(-)
+ create mode 100644 tests/pretty_printing/int128_const.c
+ create mode 100644 tests/pretty_printing/oracle/int128_const.0.res.oracle
+
+diff --git a/plugins/e-acsl/tests/constructs/oracle/gen_typedef.0.c b/plugins/e-acsl/tests/constructs/oracle/gen_typedef.0.c
+index 77f9003094..94ef7b8921 100644
+--- a/plugins/e-acsl/tests/constructs/oracle/gen_typedef.0.c
++++ b/plugins/e-acsl/tests/constructs/oracle/gen_typedef.0.c
+@@ -26,8 +26,8 @@ int main(void)
+   }
+   /*@ assert x == 0; */ ;
+   __int128 i = (__int128)((int)x + 1);
+-  unsigned __int128 u2 = (unsigned __int128)(i + 2LL);
+-  unsigned __int128 u3 = u2 + 18446744073709551615ULL;
++  unsigned __int128 u2 = (unsigned __int128)(i + (__int128)2LL);
++  unsigned __int128 u3 = u2 + (unsigned __int128)18446744073709551615ULL;
+   __retres = 0;
+   __e_acsl_memory_clean();
+   return __retres;
+diff --git a/src/kernel/services/ast_printing/cil_printer.ml b/src/kernel/services/ast_printing/cil_printer.ml
+index 1fa68a0a41..56c1731c64 100644
+--- a/src/kernel/services/ast_printing/cil_printer.ml
++++ b/src/kernel/services/ast_printing/cil_printer.ml
+@@ -162,6 +162,29 @@ let pretty_C_constant suffix k fmt i =
+   else
+     Format.fprintf fmt "%a%s" Z.pretty i suffix
+ 
++let pretty_int128_constant fmt ik i =
++  let ll_suffix = if Machine.msvcMode () then "L" else "LL" in
++  let ull_suffix = if Machine.msvcMode () then "UL" else "ULL" in
++  match ik with
++  | IInt128 when Cil.fitsInInt ILongLong i ->
++    Format.fprintf fmt "(__int128)%a" (pretty_C_constant ll_suffix ILongLong) i
++  | IUInt128 when Cil.fitsInInt IULongLong i ->
++    Format.fprintf fmt "(unsigned __int128)%a"
++      (pretty_C_constant ull_suffix IULongLong) i
++  | IInt128 | IUInt128 ->
++    let hi = Z.format "%x" (Z.extract i 64 64) in
++    let lo_z = Z.extract i 0 64 in
++    let unsigned_expr fmt =
++      if Z.equal lo_z Z.zero then
++        Format.fprintf fmt "((unsigned __int128)0x%s%s << 64)" hi ull_suffix
++      else
++        Format.fprintf fmt "(((unsigned __int128)0x%s%s << 64) | 0x%s%s)"
++          hi ull_suffix (Z.format "%x" lo_z) ull_suffix
++    in
++    if ik = IUInt128 then unsigned_expr fmt
++    else Format.fprintf fmt "((__int128)%t)" unsigned_expr
++  | _ -> assert false
++
+ let pred_body = function
+   | LBpred a -> a
+   | LBnone
+@@ -615,6 +638,8 @@ class cil_printer () = object (self)
+     | CInt64(_, _, Some s) when print_as_source s ->
+       fprintf fmt "%s" s (* Always print the text if there is one, unless
+                             we want to print it as hexa *)
++    | CInt64(i, (IInt128 | IUInt128 as ik), _) ->
++      pretty_int128_constant fmt ik i
+     | CInt64(i, ik, _) ->
+       (*fprintf fmt "/* %Lx */" i;*)
+       (* We must make sure to capture the type of the constant. For some
+@@ -624,9 +649,10 @@ class cil_printer () = object (self)
+         | IUInt -> "U"
+         | ILong -> "L"
+         | IULong -> "UL"
+-        | ILongLong | IInt128 -> if Machine.msvcMode () then "L" else "LL"
+-        | IULongLong | IUInt128 -> if Machine.msvcMode () then "UL" else "ULL"
++        | ILongLong -> if Machine.msvcMode () then "L" else "LL"
++        | IULongLong -> if Machine.msvcMode () then "UL" else "ULL"
+         | IInt | IBool | IShort | IUShort | IChar | ISChar | IUChar -> ""
++        | IInt128 | IUInt128 -> assert false
+       in
+       let prefix =
+         if suffix <> "" then ""
+diff --git a/tests/pretty_printing/int128_const.c b/tests/pretty_printing/int128_const.c
+new file mode 100644
+index 0000000000..a3b4d348a5
+--- /dev/null
++++ b/tests/pretty_printing/int128_const.c
+@@ -0,0 +1,13 @@
++/* run.config
++   OPT: -machdep gcc_x86_64 -constfold @PTEST_FILE@ -print -then -ocode ./ocode_@PTEST_NAME@.c -print -then ./ocode_@PTEST_NAME@.c -ocode="" -print
++*/
++
++int main(void) {
++  __int128 v = ((__int128)1 << 100) + 5;
++  unsigned __int128 u = ~(unsigned __int128)0;
++  __int128 m = -((__int128)1 << 126) - ((__int128)1 << 126);
++  __int128 neg = -((__int128)1 << 100) - 5;
++  __int128 small = 42;
++  unsigned __int128 usmall = 42;
++  return (int)(v + (__int128)u + m + neg + small + (__int128)usmall);
++}
+diff --git a/tests/pretty_printing/oracle/int128_const.0.res.oracle b/tests/pretty_printing/oracle/int128_const.0.res.oracle
+new file mode 100644
+index 0000000000..44a4ed4601
+--- /dev/null
++++ b/tests/pretty_printing/oracle/int128_const.0.res.oracle
+@@ -0,0 +1,38 @@
++[kernel] Parsing int128_const.c (with preprocessing)
++/* Generated by Frama-C */
++int main(void)
++{
++  int __retres;
++  __int128 v =
++    ((__int128)(((unsigned __int128)0x1000000000ULL << 64) | 0x5ULL));
++  unsigned __int128 u =
++    (((unsigned __int128)0xffffffffffffffffULL << 64) | 0xffffffffffffffffULL);
++  __int128 m = ((__int128)((unsigned __int128)0x8000000000000000ULL << 64));
++  __int128 neg =
++    ((__int128)(((unsigned __int128)0xffffffefffffffffULL << 64) | 0xfffffffffffffffbULL));
++  __int128 small = (__int128)42LL;
++  unsigned __int128 usmall = (unsigned __int128)42ULL;
++  __retres = (int)(((((v + (__int128)u) + m) + neg) + small) + (__int128)usmall);
++  return __retres;
++}
++
++
++[kernel] Parsing ocode_int128_const.c (with preprocessing)
++/* Generated by Frama-C */
++int main(void)
++{
++  int __retres;
++  __int128 v =
++    ((__int128)(((unsigned __int128)0x1000000000ULL << 64) | 0x5ULL));
++  unsigned __int128 u =
++    (((unsigned __int128)0xffffffffffffffffULL << 64) | 0xffffffffffffffffULL);
++  __int128 m = ((__int128)((unsigned __int128)0x8000000000000000ULL << 64));
++  __int128 neg =
++    ((__int128)(((unsigned __int128)0xffffffefffffffffULL << 64) | 0xfffffffffffffffbULL));
++  __int128 small = (__int128)42LL;
++  unsigned __int128 usmall = (unsigned __int128)42ULL;
++  __retres = (int)(((((v + (__int128)u) + m) + neg) + small) + (__int128)usmall);
++  return __retres;
++}
++
++
+-- 
+2.47.3
+

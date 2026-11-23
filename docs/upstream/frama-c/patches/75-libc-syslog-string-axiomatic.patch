@@ -1,0 +1,108 @@
+From 1008fa4941f13d941357c7c84c31aec6fe083c27 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:56:43 +0000
+Subject: [PATCH] [libc] syslog.h: include __fc_string_axiomatic.h for Variadic
+
+The Variadic translation classifies syslog() as a printf-like function and generates valid_read_string / valid_read_nstring preconditions on its format string and string arguments. Because share/libc/syslog.h did not include __fc_string_axiomatic.h, a file including only <syslog.h> triggered a kernel:libc:frama-c warning and lost all string-validity preconditions on syslog() calls.
+
+Include __fc_string_axiomatic.h in share/libc/syslog.h (matching stdio.h, pwd.h, unistd.h, fcntl.h, wchar.h, and other POSIX headers).
+
+New test: tests/libc/syslog_h.c.
+---
+ share/libc/syslog.h                     |  1 +
+ tests/libc/oracle/syslog_h.0.res.oracle | 41 +++++++++++++++++++++++++
+ tests/libc/syslog_h.c                   | 22 +++++++++++++
+ 3 files changed, 64 insertions(+)
+ create mode 100644 tests/libc/oracle/syslog_h.0.res.oracle
+ create mode 100644 tests/libc/syslog_h.c
+
+diff --git a/share/libc/syslog.h b/share/libc/syslog.h
+index 54191cb99f..cc86ca4474 100644
+--- a/share/libc/syslog.h
++++ b/share/libc/syslog.h
+@@ -11,6 +11,7 @@
+ #include "features.h"
+ __PUSH_FC_STDLIB
+ #include "__fc_define_null.h"
++#include "__fc_string_axiomatic.h"
+ #include <stdarg.h>
+ 
+ __BEGIN_DECLS
+diff --git a/tests/libc/oracle/syslog_h.0.res.oracle b/tests/libc/oracle/syslog_h.0.res.oracle
+new file mode 100644
+index 0000000000..7f07369153
+--- /dev/null
++++ b/tests/libc/oracle/syslog_h.0.res.oracle
+@@ -0,0 +1,41 @@
++[kernel] Parsing syslog_h.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  nondet ∈ [--..--]
++[eva:progress] 
++  computing for function syslog_va_1 <- main.
++  Called from syslog_h.c:10.
++[eva] using specification for function syslog
++[eva:progress] syslog_h.c:10: 
++  function syslog_va_1: precondition valid_read_string(param2) got status valid.
++[eva:progress] syslog_h.c:10: 
++  function syslog_va_1: precondition valid_read_nstring(param3, 2) got status valid.
++[eva:progress] syslog_h.c:10: 
++  function syslog_va_1: precondition valid_read_string(param1) got status valid.
++[eva:progress] Done for function syslog_va_1
++[eva:progress] 
++  computing for function syslog_va_2 <- main.
++  Called from syslog_h.c:13.
++[eva:alarm] syslog_h.c:13: Warning: 
++  function syslog_va_2: precondition valid_read_string(param2) got status invalid.
++[eva:progress] syslog_h.c:13: 
++  function syslog_va_2: no state left, precondition valid_read_string(param1) got status valid.
++[eva:progress] Done for function syslog_va_2
++[eva:progress] 
++  computing for function syslog_va_3 <- main.
++  Called from syslog_h.c:18.
++[eva:alarm] syslog_h.c:18: Warning: 
++  function syslog_va_3: precondition valid_read_nstring(param2, 5) got status invalid.
++[eva:progress] syslog_h.c:18: 
++  function syslog_va_3: no state left, precondition valid_read_string(param1) got status valid.
++[eva:progress] Done for function syslog_va_3
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  ok[0] ∈ {97}
++    [1] ∈ {98}
++    [2] ∈ {0}
++  __retres ∈ {0}
+diff --git a/tests/libc/syslog_h.c b/tests/libc/syslog_h.c
+new file mode 100644
+index 0000000000..e18ffbc573
+--- /dev/null
++++ b/tests/libc/syslog_h.c
+@@ -0,0 +1,22 @@
++/* run.config
++   STDOPT:
++*/
++#include <syslog.h>
++
++volatile int nondet;
++
++int main(void) {
++  char ok[3] = {'a', 'b', '\0'};
++  syslog(LOG_INFO, "%s %.2s", ok, ok);
++  if (nondet) {
++    char bad[2] = {'a', 'b'};
++    syslog(LOG_ERR, "%s", bad); // invalid: not NUL-terminated
++    //@ assert unreachable: \false;
++  }
++  if (nondet) {
++    char short_buf[2] = {'a', 'b'};
++    syslog(LOG_ERR, "%.5s", short_buf); // invalid: shorter than 5 bytes
++    //@ assert unreachable2: \false;
++  }
++  return 0;
++}
+-- 
+2.47.3
+

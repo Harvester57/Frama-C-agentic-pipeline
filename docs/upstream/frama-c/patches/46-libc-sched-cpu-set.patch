@@ -1,0 +1,577 @@
+From d35fd2d7b3082027e0ed75b296c12a4a21e01dd9 Mon Sep 17 00:00:00 2001
+From: Florian Stosse <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 19:39:21 +0000
+Subject: [PATCH] [libc] add cpu_set_t, CPU_* macros and
+ sched_{set,get}affinity to sched.h
+
+Frama-C\x27s share/libc/sched.h declares struct sched_param and the POSIX
+scheduler functions, but none of glibc\x27s CPU-affinity interface
+(cpu_set_t, CPU_SETSIZE, CPU_ZERO/SET/CLR/ISSET/COUNT/EQUAL/AND/OR/XOR
+and their _S variants, CPU_ALLOC_SIZE, sched_setaffinity, and
+sched_getaffinity). Linux code that pins processes or threads to CPUs
+(such as nginx\x27s src/os/unix/ngx_setaffinity.h) therefore fails to parse.
+
+Add the interface to share/libc/sched.h:
+- __cpu_mask, __CPU_SETSIZE, __NCPUBITS, CPU_SETSIZE, and named
+  struct __fc_cpu_set_t (typedef cpu_set_t) matching glibc\x27s layout
+  (128 bytes on both x86_32 and x86_64);
+- CPU_ZERO, CPU_SET, CPU_CLR, CPU_ISSET, CPU_COUNT, CPU_EQUAL, CPU_AND,
+  CPU_OR, CPU_XOR, their _S forms, and CPU_ALLOC_SIZE, avoiding void *
+  casts so WP\x27s Typed model accepts them and using &cpusetp->__bits[0]
+  so dynamically sized sets (> 1024 CPUs) do not trigger out-of-bounds
+  array-index alarms in Eva;
+- __FC_EXTERN_FOR_MACRO(CPU_ZERO_S) __fc_cpu_zero_s for non-default
+  setsize values, __sched_cpucount, sched_setaffinity, and
+  sched_getaffinity with ACSL contracts (assigning errno as the rest of
+  sched.h does, and initializing mask only on success in
+  sched_getaffinity).
+
+CPU_ALLOC / CPU_FREE (__sched_cpualloc / __sched_cpufree) are left out
+for now as they allocate heap memory.
+
+New test: tests/libc/sched_cpu_set.c (default x86_32 and -machdep
+x86_64).
+---
+ share/libc/sched.h                           | 185 +++++++++++++++++++
+ tests/libc/oracle/sched_cpu_set.0.res.oracle | 114 ++++++++++++
+ tests/libc/oracle/sched_cpu_set.1.res.oracle | 114 ++++++++++++
+ tests/libc/sched_cpu_set.c                   |  82 ++++++++
+ 4 files changed, 495 insertions(+)
+ create mode 100644 tests/libc/oracle/sched_cpu_set.0.res.oracle
+ create mode 100644 tests/libc/oracle/sched_cpu_set.1.res.oracle
+ create mode 100644 tests/libc/sched_cpu_set.c
+
+diff --git a/share/libc/sched.h b/share/libc/sched.h
+index 67b6860676..95cda22847 100644
+--- a/share/libc/sched.h
++++ b/share/libc/sched.h
+@@ -13,6 +13,7 @@ __PUSH_FC_STDLIB
+ 
+ #include "__fc_define_timespec.h"
+ #include "__fc_define_pid_t.h"
++#include "__fc_define_size_t.h"
+ #include <errno.h>
+ 
+ __BEGIN_DECLS
+@@ -78,6 +79,190 @@ extern int sched_setscheduler(pid_t pid, int policy,
+ */
+ extern int sched_yield(void);
+ 
++
++// Non-POSIX; GNU extensions (glibc <sched.h> / <bits/cpu-set.h>)
++
++#define __CPU_SETSIZE 1024
++#define __NCPUBITS (8 * sizeof(__cpu_mask))
++
++typedef unsigned long int __cpu_mask;
++
++#define __CPUELT(cpu) ((cpu) / __NCPUBITS)
++#define __CPUMASK(cpu) ((__cpu_mask)1 << ((cpu) % __NCPUBITS))
++#define __FC_CPU_WORD(cpusetp, cpu) ((&(cpusetp)->__bits[0])[__CPUELT(cpu)])
++
++typedef struct __fc_cpu_set_t {
++  __cpu_mask __bits[__CPU_SETSIZE / __NCPUBITS];
++} cpu_set_t;
++
++#define CPU_SETSIZE __CPU_SETSIZE
++
++#if __FC_ULONG_MAX == 18446744073709551615ULL
++#define __FC_CPU_ZERO_INIT {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
++#elif __FC_ULONG_MAX == 4294967295ULL
++#define __FC_CPU_ZERO_INIT                                                     \
++  {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                            \
++    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
++#else
++#define __FC_CPU_ZERO_INIT {{0}}
++#endif
++
++/*@
++  requires whole_words: setsize % sizeof(__cpu_mask) == 0;
++  requires valid_set:
++    \valid(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
++  assigns setp->__bits[0 .. setsize / sizeof(__cpu_mask) - 1] \from \nothing;
++  ensures zeroed:
++    \forall integer k; 0 <= k < setsize / sizeof(__cpu_mask) ==>
++      setp->__bits[k] == 0;
++  ensures zeroed_values:
++    \subset(setp->__bits[0 .. setsize / sizeof(__cpu_mask) - 1], {0});
++  ensures initialization:set:
++    \initialized(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
++*/
++__FC_EXTERN_FOR_MACRO(CPU_ZERO_S)
++void __fc_cpu_zero_s(size_t setsize, cpu_set_t *setp);
++
++/*@
++  requires valid_set:
++    \valid_read(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
++  requires initialization:set:
++    \initialized(setp->__bits + (0 .. setsize / sizeof(__cpu_mask) - 1));
++  assigns \result
++    \from setp->__bits[0 .. setsize / sizeof(__cpu_mask) - 1],
++          indirect:setsize;
++  ensures count_range: 0 <= \result <= 8 * setsize;
++*/
++extern int __sched_cpucount(size_t setsize, const cpu_set_t *setp);
++
++#define __CPU_ZERO_S(setsize, cpusetp)                                         \
++  do {                                                                         \
++    size_t __fc_setsize = (setsize);                                           \
++    cpu_set_t *__fc_cpusetp = (cpusetp);                                       \
++    if (__fc_setsize == sizeof(cpu_set_t))                                     \
++      CPU_ZERO(__fc_cpusetp);                                                  \
++    else                                                                       \
++      __fc_cpu_zero_s(__fc_setsize, __fc_cpusetp);                             \
++  } while (0)
++
++#define __CPU_SET_S(cpu, setsize, cpusetp)                                     \
++  (__extension__({                                                             \
++    size_t __fc_cpu = (cpu);                                                   \
++    __fc_cpu / 8 < (setsize)                                                   \
++      ? (__FC_CPU_WORD(cpusetp, __fc_cpu) |= __CPUMASK(__fc_cpu))              \
++      : 0;                                                                     \
++  }))
++
++#define __CPU_CLR_S(cpu, setsize, cpusetp)                                     \
++  (__extension__({                                                             \
++    size_t __fc_cpu = (cpu);                                                   \
++    __fc_cpu / 8 < (setsize)                                                   \
++      ? (__FC_CPU_WORD(cpusetp, __fc_cpu) &= ~__CPUMASK(__fc_cpu))             \
++      : 0;                                                                     \
++  }))
++
++#define __CPU_ISSET_S(cpu, setsize, cpusetp)                                   \
++  (__extension__({                                                             \
++    size_t __fc_cpu = (cpu);                                                   \
++    __fc_cpu / 8 < (setsize)                                                   \
++      ? (__FC_CPU_WORD(cpusetp, __fc_cpu) & __CPUMASK(__fc_cpu)) != 0          \
++      : 0;                                                                     \
++  }))
++
++#define __CPU_COUNT_S(setsize, cpusetp) __sched_cpucount(setsize, cpusetp)
++
++#define __CPU_EQUAL_S(setsize, cpusetp1, cpusetp2)                             \
++  (__extension__({                                                             \
++    const __cpu_mask *__fc_arr1 = &(cpusetp1)->__bits[0];                      \
++    const __cpu_mask *__fc_arr2 = &(cpusetp2)->__bits[0];                      \
++    size_t __fc_imax = (setsize) / sizeof(__cpu_mask);                         \
++    size_t __fc_i;                                                             \
++    for (__fc_i = 0; __fc_i < __fc_imax; ++__fc_i)                             \
++      if (__fc_arr1[__fc_i] != __fc_arr2[__fc_i])                              \
++        break;                                                                 \
++    __fc_i == __fc_imax;                                                       \
++  }))
++
++#define __CPU_OP_S(setsize, destset, srcset1, srcset2, op)                     \
++  (__extension__({                                                             \
++    cpu_set_t *__fc_dest = (destset);                                          \
++    const __cpu_mask *__fc_arr1 = &(srcset1)->__bits[0];                       \
++    const __cpu_mask *__fc_arr2 = &(srcset2)->__bits[0];                       \
++    size_t __fc_imax = (setsize) / sizeof(__cpu_mask);                         \
++    size_t __fc_i;                                                             \
++    for (__fc_i = 0; __fc_i < __fc_imax; ++__fc_i)                             \
++      (&__fc_dest->__bits[0])[__fc_i] = __fc_arr1[__fc_i] op __fc_arr2[__fc_i];\
++    __fc_dest;                                                                 \
++  }))
++
++#define __CPU_ALLOC_SIZE(count)                                                \
++  ((((count) + __NCPUBITS - 1) / __NCPUBITS) * sizeof(__cpu_mask))
++
++#define CPU_ZERO(cpusetp)                                                      \
++  do {                                                                         \
++    *(cpusetp) = (cpu_set_t)__FC_CPU_ZERO_INIT;                                \
++  } while (0)
++#define CPU_SET(cpu, cpusetp) __CPU_SET_S(cpu, sizeof(cpu_set_t), cpusetp)
++#define CPU_CLR(cpu, cpusetp) __CPU_CLR_S(cpu, sizeof(cpu_set_t), cpusetp)
++#define CPU_ISSET(cpu, cpusetp) __CPU_ISSET_S(cpu, sizeof(cpu_set_t), cpusetp)
++#define CPU_COUNT(cpusetp) __CPU_COUNT_S(sizeof(cpu_set_t), cpusetp)
++
++#define CPU_ZERO_S(setsize, cpusetp) __CPU_ZERO_S(setsize, cpusetp)
++#define CPU_SET_S(cpu, setsize, cpusetp) __CPU_SET_S(cpu, setsize, cpusetp)
++#define CPU_CLR_S(cpu, setsize, cpusetp) __CPU_CLR_S(cpu, setsize, cpusetp)
++#define CPU_ISSET_S(cpu, setsize, cpusetp) __CPU_ISSET_S(cpu, setsize, cpusetp)
++#define CPU_COUNT_S(setsize, cpusetp) __CPU_COUNT_S(setsize, cpusetp)
++
++#define CPU_EQUAL(cpusetp1, cpusetp2)                                          \
++  __CPU_EQUAL_S(sizeof(cpu_set_t), cpusetp1, cpusetp2)
++#define CPU_EQUAL_S(setsize, cpusetp1, cpusetp2)                               \
++  __CPU_EQUAL_S(setsize, cpusetp1, cpusetp2)
++
++#define CPU_AND(destset, srcset1, srcset2)                                     \
++  __CPU_OP_S(sizeof(cpu_set_t), destset, srcset1, srcset2, &)
++#define CPU_OR(destset, srcset1, srcset2)                                      \
++  __CPU_OP_S(sizeof(cpu_set_t), destset, srcset1, srcset2, |)
++#define CPU_XOR(destset, srcset1, srcset2)                                     \
++  __CPU_OP_S(sizeof(cpu_set_t), destset, srcset1, srcset2, ^)
++#define CPU_AND_S(setsize, destset, srcset1, srcset2)                          \
++  __CPU_OP_S(setsize, destset, srcset1, srcset2, &)
++#define CPU_OR_S(setsize, destset, srcset1, srcset2)                           \
++  __CPU_OP_S(setsize, destset, srcset1, srcset2, |)
++#define CPU_XOR_S(setsize, destset, srcset1, srcset2)                          \
++  __CPU_OP_S(setsize, destset, srcset1, srcset2, ^)
++
++#define CPU_ALLOC_SIZE(count) __CPU_ALLOC_SIZE(count)
++
++/*@
++  //missing: assigns 'process cpu affinity'
++  requires valid_mask:
++    \valid_read(mask->__bits +
++                (0 .. (cpusetsize + sizeof(__cpu_mask) - 1) / sizeof(__cpu_mask) - 1));
++  requires initialization:mask:
++    \initialized(mask->__bits +
++                 (0 .. (cpusetsize + sizeof(__cpu_mask) - 1) / sizeof(__cpu_mask) - 1));
++  assigns \result, errno
++    \from indirect:pid, indirect:cpusetsize,
++          indirect:mask->__bits[0 .. (cpusetsize + sizeof(__cpu_mask) - 1) / sizeof(__cpu_mask) - 1];
++  ensures result_ok_or_error: \result == 0 || \result == -1;
++*/
++extern int sched_setaffinity(pid_t pid, size_t cpusetsize,
++                             const cpu_set_t *mask);
++
++/*@
++  //missing: \from 'process cpu affinity'
++  requires valid_mask:
++    \valid(mask->__bits + (0 .. cpusetsize / sizeof(__cpu_mask) - 1));
++  assigns mask->__bits[0 .. cpusetsize / sizeof(__cpu_mask) - 1]
++    \from indirect:pid, indirect:cpusetsize;
++  assigns \result, errno \from indirect:pid, indirect:cpusetsize;
++  ensures result_ok_or_error: \result == 0 || \result == -1;
++  ensures initialization:mask:
++    \result == 0 ==>
++      \initialized(mask->__bits + (0 .. cpusetsize / sizeof(__cpu_mask) - 1));
++*/
++extern int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask);
++
+ __END_DECLS
+ __POP_FC_STDLIB
+ #endif
+diff --git a/tests/libc/oracle/sched_cpu_set.0.res.oracle b/tests/libc/oracle/sched_cpu_set.0.res.oracle
+new file mode 100644
+index 0000000000..f196f9ea72
+--- /dev/null
++++ b/tests/libc/oracle/sched_cpu_set.0.res.oracle
+@@ -0,0 +1,114 @@
++[kernel] Parsing sched_cpu_set.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] sched_cpu_set.c:11: assertion 'cpu_setsize' got status valid.
++[eva:progress] sched_cpu_set.c:12: assertion 'sizeof_cpu_set' got status valid.
++[eva:progress] sched_cpu_set.c:13: assertion 'alloc_size_1024' got status valid.
++[eva:progress] sched_cpu_set.c:14: assertion 'alloc_size_2048' got status valid.
++[eva:progress] sched_cpu_set.c:20: assertion 'zero_bits' got status valid.
++[eva:progress] sched_cpu_set.c:28: assertion 'set_bits' got status valid.
++[eva:progress] sched_cpu_set.c:34: assertion 'oob_ignored' got status valid.
++[eva:progress] sched_cpu_set.c:38: assertion 'cleared_65' got status valid.
++[eva:progress] 
++  computing for function __sched_cpucount <- main.
++  Called from sched_cpu_set.c:40.
++[eva] using specification for function __sched_cpucount
++[eva:progress] sched_cpu_set.c:40: 
++  function __sched_cpucount: precondition 'valid_set' got status valid.
++[eva:progress] sched_cpu_set.c:40: 
++  function __sched_cpucount: precondition 'initialization,set' got status valid.
++[eva:progress] Done for function __sched_cpucount
++[eva:progress] sched_cpu_set.c:41: assertion 'count_bounds' got status valid.
++[eva:partition] sched_cpu_set.c:46: starting to merge loop iterations
++[eva:partition] sched_cpu_set.c:50: starting to merge loop iterations
++[eva:partition] sched_cpu_set.c:51: starting to merge loop iterations
++[eva:partition] sched_cpu_set.c:52: starting to merge loop iterations
++[eva:progress] 
++  computing for function sched_setaffinity <- main.
++  Called from sched_cpu_set.c:55.
++[eva] using specification for function sched_setaffinity
++[eva:progress] sched_cpu_set.c:55: 
++  function sched_setaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] sched_cpu_set.c:55: 
++  function sched_setaffinity: precondition 'initialization,mask' got status valid.
++[eva:progress] Done for function sched_setaffinity
++[eva:progress] sched_cpu_set.c:56: assertion 'setaff_res' got status valid.
++[eva:progress] 
++  computing for function sched_getaffinity <- main.
++  Called from sched_cpu_set.c:60.
++[eva] using specification for function sched_getaffinity
++[eva:progress] sched_cpu_set.c:60: 
++  function sched_getaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] Done for function sched_getaffinity
++[eva:progress] sched_cpu_set.c:61: assertion 'getaff_res' got status valid.
++[eva:progress] sched_cpu_set.c:65: Call to builtin malloc
++[eva:malloc:new] sched_cpu_set.c:65: allocating variable __malloc_main_l65
++[eva:progress] 
++  computing for function CPU_ZERO_S <- main.
++  Called from sched_cpu_set.c:68.
++[eva] using specification for function __fc_cpu_zero_s
++[eva:progress] sched_cpu_set.c:68: 
++  function CPU_ZERO_S: precondition 'whole_words' got status valid.
++[eva:progress] sched_cpu_set.c:68: 
++  function CPU_ZERO_S: precondition 'valid_set' got status valid.
++[eva:progress] Done for function CPU_ZERO_S
++[eva:progress] 
++  computing for function __sched_cpucount <- main.
++  Called from sched_cpu_set.c:73.
++[eva:progress] sched_cpu_set.c:73: 
++  function __sched_cpucount: precondition 'valid_set' got status valid.
++[eva:progress] sched_cpu_set.c:73: 
++  function __sched_cpucount: precondition 'initialization,set' got status valid.
++[eva:progress] Done for function __sched_cpucount
++[eva:progress] 
++  computing for function sched_setaffinity <- main.
++  Called from sched_cpu_set.c:74.
++[eva:progress] sched_cpu_set.c:74: 
++  function sched_setaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] sched_cpu_set.c:74: 
++  function sched_setaffinity: precondition 'initialization,mask' got status valid.
++[eva:progress] Done for function sched_setaffinity
++[eva:progress] 
++  computing for function sched_getaffinity <- main.
++  Called from sched_cpu_set.c:75.
++[eva:progress] sched_cpu_set.c:75: 
++  function sched_getaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] Done for function sched_getaffinity
++[eva:progress] sched_cpu_set.c:76: Call to builtin free
++[eva:progress] sched_cpu_set.c:76: 
++  function free: precondition 'freeable' got status valid.
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  errno ∈ [--..--]
++  __fc_heap_status ∈ [--..--]
++  mask.__bits[0] ∈ {1}
++      .__bits[1..31] ∈ {0}
++  z0 ∈ {0}
++  zlast ∈ {0}
++  cmask ∈ {{ &mask }}
++  has0 ∈ {1}
++  has65 ∈ {1}
++  has1 ∈ {0}
++  ignored_set ∈ {0}
++  ignored_isset ∈ {0}
++  ignored_clr ∈ {0}
++  cleared65 ∈ {0}
++  cnt ∈ [0..1024]
++  other.__bits[0] ∈ {1}
++       .__bits[1..31] ∈ {0}
++  eq ∈ {0; 1}
++  combined.__bits[0..31] ∈ {0; 1}
++  r ∈ {-1; 0}
++  einval ∈ {0; 1}
++  cur ∈ [--..--] or UNINITIALIZED
++  g ∈ {-1; 0}
++  big_sz ∈ {256}
++  big ∈ {0} or ESCAPINGADDR
++  big_cnt ∈ [0..2049]
++  __retres ∈ {0; 1; 2; 3; 4}
++  __malloc_main_l65[0..1] ∈ UNINITIALIZED
+diff --git a/tests/libc/oracle/sched_cpu_set.1.res.oracle b/tests/libc/oracle/sched_cpu_set.1.res.oracle
+new file mode 100644
+index 0000000000..3df1795cf8
+--- /dev/null
++++ b/tests/libc/oracle/sched_cpu_set.1.res.oracle
+@@ -0,0 +1,114 @@
++[kernel] Parsing sched_cpu_set.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] sched_cpu_set.c:11: assertion 'cpu_setsize' got status valid.
++[eva:progress] sched_cpu_set.c:12: assertion 'sizeof_cpu_set' got status valid.
++[eva:progress] sched_cpu_set.c:13: assertion 'alloc_size_1024' got status valid.
++[eva:progress] sched_cpu_set.c:14: assertion 'alloc_size_2048' got status valid.
++[eva:progress] sched_cpu_set.c:20: assertion 'zero_bits' got status valid.
++[eva:progress] sched_cpu_set.c:28: assertion 'set_bits' got status valid.
++[eva:progress] sched_cpu_set.c:34: assertion 'oob_ignored' got status valid.
++[eva:progress] sched_cpu_set.c:38: assertion 'cleared_65' got status valid.
++[eva:progress] 
++  computing for function __sched_cpucount <- main.
++  Called from sched_cpu_set.c:40.
++[eva] using specification for function __sched_cpucount
++[eva:progress] sched_cpu_set.c:40: 
++  function __sched_cpucount: precondition 'valid_set' got status valid.
++[eva:progress] sched_cpu_set.c:40: 
++  function __sched_cpucount: precondition 'initialization,set' got status valid.
++[eva:progress] Done for function __sched_cpucount
++[eva:progress] sched_cpu_set.c:41: assertion 'count_bounds' got status valid.
++[eva:partition] sched_cpu_set.c:46: starting to merge loop iterations
++[eva:partition] sched_cpu_set.c:50: starting to merge loop iterations
++[eva:partition] sched_cpu_set.c:51: starting to merge loop iterations
++[eva:partition] sched_cpu_set.c:52: starting to merge loop iterations
++[eva:progress] 
++  computing for function sched_setaffinity <- main.
++  Called from sched_cpu_set.c:55.
++[eva] using specification for function sched_setaffinity
++[eva:progress] sched_cpu_set.c:55: 
++  function sched_setaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] sched_cpu_set.c:55: 
++  function sched_setaffinity: precondition 'initialization,mask' got status valid.
++[eva:progress] Done for function sched_setaffinity
++[eva:progress] sched_cpu_set.c:56: assertion 'setaff_res' got status valid.
++[eva:progress] 
++  computing for function sched_getaffinity <- main.
++  Called from sched_cpu_set.c:60.
++[eva] using specification for function sched_getaffinity
++[eva:progress] sched_cpu_set.c:60: 
++  function sched_getaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] Done for function sched_getaffinity
++[eva:progress] sched_cpu_set.c:61: assertion 'getaff_res' got status valid.
++[eva:progress] sched_cpu_set.c:65: Call to builtin malloc
++[eva:malloc:new] sched_cpu_set.c:65: allocating variable __malloc_main_l65
++[eva:progress] 
++  computing for function CPU_ZERO_S <- main.
++  Called from sched_cpu_set.c:68.
++[eva] using specification for function __fc_cpu_zero_s
++[eva:progress] sched_cpu_set.c:68: 
++  function CPU_ZERO_S: precondition 'whole_words' got status valid.
++[eva:progress] sched_cpu_set.c:68: 
++  function CPU_ZERO_S: precondition 'valid_set' got status valid.
++[eva:progress] Done for function CPU_ZERO_S
++[eva:progress] 
++  computing for function __sched_cpucount <- main.
++  Called from sched_cpu_set.c:73.
++[eva:progress] sched_cpu_set.c:73: 
++  function __sched_cpucount: precondition 'valid_set' got status valid.
++[eva:progress] sched_cpu_set.c:73: 
++  function __sched_cpucount: precondition 'initialization,set' got status valid.
++[eva:progress] Done for function __sched_cpucount
++[eva:progress] 
++  computing for function sched_setaffinity <- main.
++  Called from sched_cpu_set.c:74.
++[eva:progress] sched_cpu_set.c:74: 
++  function sched_setaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] sched_cpu_set.c:74: 
++  function sched_setaffinity: precondition 'initialization,mask' got status valid.
++[eva:progress] Done for function sched_setaffinity
++[eva:progress] 
++  computing for function sched_getaffinity <- main.
++  Called from sched_cpu_set.c:75.
++[eva:progress] sched_cpu_set.c:75: 
++  function sched_getaffinity: precondition 'valid_mask' got status valid.
++[eva:progress] Done for function sched_getaffinity
++[eva:progress] sched_cpu_set.c:76: Call to builtin free
++[eva:progress] sched_cpu_set.c:76: 
++  function free: precondition 'freeable' got status valid.
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  errno ∈ [--..--]
++  __fc_heap_status ∈ [--..--]
++  mask.__bits[0] ∈ {1}
++      .__bits[1..15] ∈ {0}
++  z0 ∈ {0}
++  zlast ∈ {0}
++  cmask ∈ {{ &mask }}
++  has0 ∈ {1}
++  has65 ∈ {1}
++  has1 ∈ {0}
++  ignored_set ∈ {0}
++  ignored_isset ∈ {0}
++  ignored_clr ∈ {0}
++  cleared65 ∈ {0}
++  cnt ∈ [0..1024]
++  other.__bits[0] ∈ {1}
++       .__bits[1..15] ∈ {0}
++  eq ∈ {0; 1}
++  combined.__bits[0..15] ∈ {0; 1}
++  r ∈ {-1; 0}
++  einval ∈ {0; 1}
++  cur ∈ [--..--] or UNINITIALIZED
++  g ∈ {-1; 0}
++  big_sz ∈ {256}
++  big ∈ {0} or ESCAPINGADDR
++  big_cnt ∈ [0..2049]
++  __retres ∈ {0; 1; 2; 3; 4}
++  __malloc_main_l65[0..1] ∈ UNINITIALIZED
+diff --git a/tests/libc/sched_cpu_set.c b/tests/libc/sched_cpu_set.c
+new file mode 100644
+index 0000000000..85bfb07984
+--- /dev/null
++++ b/tests/libc/sched_cpu_set.c
+@@ -0,0 +1,82 @@
++/* run.config
++   STDOPT:
++   STDOPT: +"-machdep x86_64"
++*/
++#define _GNU_SOURCE
++#include <errno.h>
++#include <sched.h>
++#include <stdlib.h>
++
++int main(void) {
++  //@ assert cpu_setsize: CPU_SETSIZE == 1024;
++  //@ assert sizeof_cpu_set: sizeof(cpu_set_t) == 128;
++  //@ assert alloc_size_1024: CPU_ALLOC_SIZE(1024) == sizeof(cpu_set_t);
++  //@ assert alloc_size_2048: CPU_ALLOC_SIZE(2048) == 2 * sizeof(cpu_set_t);
++
++  cpu_set_t mask;
++  CPU_ZERO(&mask);
++  int z0 = CPU_ISSET(0, &mask);
++  int zlast = CPU_ISSET(CPU_SETSIZE - 1, &mask);
++  //@ assert zero_bits: !z0 && !zlast;
++
++  CPU_SET(0, &mask);
++  CPU_SET(65, &mask);
++  const cpu_set_t *cmask = &mask;
++  int has0 = CPU_ISSET(0, cmask);
++  int has65 = CPU_ISSET(65, cmask);
++  int has1 = CPU_ISSET(1, cmask);
++  //@ assert set_bits: has0 != 0 && has65 != 0 && has1 == 0;
++
++  // Out-of-range CPU numbers are ignored without out-of-bounds access.
++  int ignored_set = CPU_SET(CPU_SETSIZE, &mask) != 0;
++  int ignored_isset = CPU_ISSET(CPU_SETSIZE, cmask);
++  int ignored_clr = CPU_CLR(CPU_SETSIZE, &mask) != 0;
++  //@ assert oob_ignored: !ignored_set && !ignored_isset && !ignored_clr;
++
++  CPU_CLR(65, &mask);
++  int cleared65 = CPU_ISSET(65, cmask);
++  //@ assert cleared_65: cleared65 == 0;
++
++  int cnt = CPU_COUNT(cmask);
++  //@ assert count_bounds: 0 <= cnt <= CPU_SETSIZE;
++
++  cpu_set_t other;
++  CPU_ZERO(&other);
++  CPU_SET(0, &other);
++  int eq = CPU_EQUAL(cmask, &other);
++
++  cpu_set_t combined;
++  CPU_ZERO(&combined);
++  CPU_OR(&combined, cmask, &other);
++  CPU_AND(&combined, cmask, &other);
++  CPU_XOR(&combined, cmask, &other);
++
++  errno = 0;
++  int r = sched_setaffinity(0, sizeof(mask), cmask);
++  //@ assert setaff_res: r == 0 || r == -1;
++  int einval = (r == -1 && errno == EINVAL);
++
++  cpu_set_t cur;
++  int g = sched_getaffinity(0, sizeof(cur), &cur);
++  //@ assert getaff_res: g == 0 || g == -1;
++
++  // Dynamic _S macros on a 2048-CPU set.
++  size_t big_sz = CPU_ALLOC_SIZE(2048);
++  cpu_set_t *big = malloc(big_sz);
++  int big_cnt = 0;
++  if (big != NULL) {
++    CPU_ZERO_S(big_sz, big);
++    CPU_SET_S(1500, big_sz, big);
++    int is_1500 = CPU_ISSET_S(1500, big_sz, big);
++    CPU_CLR_S(1500, big_sz, big);
++    int big_oob = CPU_SET_S(2048, big_sz, big) != 0;
++    big_cnt = CPU_COUNT_S(big_sz, big) + is_1500 + big_oob;
++    sched_setaffinity(0, big_sz, big);
++    sched_getaffinity(0, big_sz, big);
++    free(big);
++  }
++
++  return z0 + zlast + (has0 == 0) + (has65 == 0) + has1 + ignored_set +
++         ignored_isset + ignored_clr + cleared65 + (cnt == 0) + eq + einval +
++         (g < 0) + (big_cnt < 0);
++}
+-- 
+2.47.3
+

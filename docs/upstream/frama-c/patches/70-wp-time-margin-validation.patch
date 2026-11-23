@@ -1,0 +1,191 @@
+From 5384f6330c3625ee3578e0628133e55f93f15a96 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:58:20 +0000
+Subject: [PATCH] [wp] validate -wp-time-margin as a finite non-negative float
+ and fix manual default
+
+Wp_parameters.TimeMargin was a `String` parameter parsed lazily with an
+unguarded `float_of_string` in `VCS.time_fits` and
+`ProofEngine.has_result`. Invalid values such as `-wp-time-margin 1s`
+(invited by the WP manual, which stated `Default is 5s.` despite the
+code defaulting to `0.5`) crashed with
+`Unexpected error (Failure("float_of_string"))` after provers ran,
+while `nan`, `inf`, and negative values were accepted silently.
+
+Switch `TimeMargin` from `String` to `Float` (`default = 0.5`), enforce
+non-negative finite values via `set_range` and a finiteness hook,
+remove `float_of_string` in `VCS.ml` and `ProofEngine.ml`, update
+`plugins/wp/doc/manual/wp_plugin.tex` to state `0.5` seconds, and
+update the `-wp-help` oracle in `tests/misc`.
+
+New test: wp_acsl/time_margin.i.
+---
+ plugins/wp/doc/manual/wp_plugin.tex                |  2 +-
+ plugins/wp/src/ProofEngine.ml                      |  2 +-
+ plugins/wp/src/VCS.ml                              |  2 +-
+ plugins/wp/src/wp_parameters.ml                    | 14 +++++++++++---
+ plugins/wp/src/wp_parameters.mli                   |  2 +-
+ .../tests/wp_acsl/oracle/time_margin.0.res.oracle  |  3 +++
+ .../tests/wp_acsl/oracle/time_margin.1.res.oracle  |  2 ++
+ .../tests/wp_acsl/oracle/time_margin.2.res.oracle  |  2 ++
+ .../tests/wp_acsl/oracle/time_margin.3.res.oracle  |  2 ++
+ plugins/wp/tests/wp_acsl/time_margin.i             | 10 ++++++++++
+ tests/misc/oracle/help-messages.32.res.oracle      |  2 +-
+ 11 files changed, 35 insertions(+), 8 deletions(-)
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/time_margin.0.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/time_margin.1.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/time_margin.2.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/time_margin.3.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/time_margin.i
+
+diff --git a/plugins/wp/doc/manual/wp_plugin.tex b/plugins/wp/doc/manual/wp_plugin.tex
+index 766c23d873..7a24c30b60 100644
+--- a/plugins/wp/doc/manual/wp_plugin.tex
++++ b/plugins/wp/doc/manual/wp_plugin.tex
+@@ -1438,7 +1438,7 @@ See \texttt{-wp-interactive <mode>} option for details.
+   seconds, it is considered fully automatic. Otherwise, a script is created
+   by prover \verb+tip+ to register the proof time. This is used to decrease the
+   impact of machine load when proof time is closed to the timeout.
+-  Default is \verb+5s+.
++  Default is \verb+0.5+ seconds.
+ \item[\tt -wp-steps <$n$>] sets the maximal number of prover
+   steps. This can be used as a machine-independent alternative to timeout.
+ \item[\tt -wp-why3-config=<file>] use the specified \textsf{Why3} configuration
+diff --git a/plugins/wp/src/ProofEngine.ml b/plugins/wp/src/ProofEngine.ml
+index 5a90f44ed1..9759067d22 100644
+--- a/plugins/wp/src/ProofEngine.ml
++++ b/plugins/wp/src/ProofEngine.ml
+@@ -595,7 +595,7 @@ let is_script_result ~margin (prv,res) =
+   res.prover_time > margin
+ 
+ let has_result tree =
+-  let margin = float_of_string @@ Wp_parameters.TimeMargin.get () in
++  let margin = Wp_parameters.TimeMargin.get () in
+   let results = Wpo.get_results tree.main in
+   List.exists (is_script_result ~margin) results
+ 
+diff --git a/plugins/wp/src/VCS.ml b/plugins/wp/src/VCS.ml
+index ee7e845849..8a7a56bdb7 100644
+--- a/plugins/wp/src/VCS.ml
++++ b/plugins/wp/src/VCS.ml
+@@ -129,7 +129,7 @@ let time_fits t =
+   t = 0.0 ||
+   let timeout = float @@ Wp_parameters.Timeout.get () in
+   timeout = 0.0 ||
+-  let margin = float_of_string @@ Wp_parameters.TimeMargin.get () in
++  let margin = Wp_parameters.TimeMargin.get () in
+   t +. margin <= timeout
+ 
+ let step_fits n =
+diff --git a/plugins/wp/src/wp_parameters.ml b/plugins/wp/src/wp_parameters.ml
+index 8b43eb7cee..7a64b45917 100644
+--- a/plugins/wp/src/wp_parameters.ml
++++ b/plugins/wp/src/wp_parameters.ml
+@@ -844,18 +844,26 @@ module TimeExtra =
+ 
+ let () = Parameter_customize.set_group wp_prover
+ module TimeMargin =
+-  String(struct
++  Float(struct
+     let option_name = "-wp-time-margin"
+-    let default = "0.5"
++    let default = 0.5
+     let arg_name = "n"
+     let help =
+       Printf.sprintf
+         "Set margin-time (in seconds) for considering a proof automatic.\n\
+          When using the 'tip' prover, scripts are created or cancelled\n\
+          if the proof time is greater or lower than (timeout - margin).\n\
+-         (default: %s)." default
++         (default: %g)." default
+   end)
+ 
++let () =
++  TimeMargin.set_range ~min:0.0 ~max:infinity ;
++  TimeMargin.add_set_hook
++    (fun _ f ->
++       if not (Stdlib.Float.is_finite f) then
++         abort "argument of %s must be a finite number."
++           TimeMargin.option_name)
++
+ external cores : unit -> int = "caml_cores"
+ 
+ let () = Parameter_customize.set_group wp_prover
+diff --git a/plugins/wp/src/wp_parameters.mli b/plugins/wp/src/wp_parameters.mli
+index d5c3aebb22..f49f854e51 100644
+--- a/plugins/wp/src/wp_parameters.mli
++++ b/plugins/wp/src/wp_parameters.mli
+@@ -113,7 +113,7 @@ module FctTimeout:
+ module SmokeTimeout: Parameter_sig.Int
+ module InteractiveTimeout: Parameter_sig.Int
+ module TimeExtra: Parameter_sig.Int
+-module TimeMargin: Parameter_sig.String
++module TimeMargin: Parameter_sig.Float
+ module Steps: Parameter_sig.Int
+ module Procs: Parameter_sig.Int
+ module ProofTrace: Parameter_sig.Bool
+diff --git a/plugins/wp/tests/wp_acsl/oracle/time_margin.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle/time_margin.0.res.oracle
+new file mode 100644
+index 0000000000..5063f47f1d
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/time_margin.0.res.oracle
+@@ -0,0 +1,3 @@
++[kernel] User Error: option `-wp-time-margin' requires a decimal number as argument.
++  use `frama-c -help' for more information.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/oracle/time_margin.1.res.oracle b/plugins/wp/tests/wp_acsl/oracle/time_margin.1.res.oracle
+new file mode 100644
+index 0000000000..9b75d9e4af
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/time_margin.1.res.oracle
+@@ -0,0 +1,2 @@
++[wp] User Error: argument of -wp-time-margin must be a finite number.
++[kernel] Plug-in wp aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/oracle/time_margin.2.res.oracle b/plugins/wp/tests/wp_acsl/oracle/time_margin.2.res.oracle
+new file mode 100644
+index 0000000000..9b75d9e4af
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/time_margin.2.res.oracle
+@@ -0,0 +1,2 @@
++[wp] User Error: argument of -wp-time-margin must be a finite number.
++[kernel] Plug-in wp aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/oracle/time_margin.3.res.oracle b/plugins/wp/tests/wp_acsl/oracle/time_margin.3.res.oracle
+new file mode 100644
+index 0000000000..609cd60859
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/time_margin.3.res.oracle
+@@ -0,0 +1,2 @@
++[wp] User Error: argument of -wp-time-margin must be at least 0.000000.
++[kernel] Plug-in wp aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/time_margin.i b/plugins/wp/tests/wp_acsl/time_margin.i
+new file mode 100644
+index 0000000000..887d66f017
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/time_margin.i
+@@ -0,0 +1,10 @@
++/* run.config
++   EXIT: 1
++   OPT: -wp-time-margin 1s
++   OPT: -wp-time-margin nan
++   OPT: -wp-time-margin inf
++   OPT: -wp-time-margin -1
++*/
++
++/*@ ensures \result == x; */
++int id(int x) { return x; }
+diff --git a/tests/misc/oracle/help-messages.32.res.oracle b/tests/misc/oracle/help-messages.32.res.oracle
+index 8e67d43f32..9fd2f486a3 100644
+--- a/tests/misc/oracle/help-messages.32.res.oracle
++++ b/tests/misc/oracle/help-messages.32.res.oracle
+@@ -311,7 +311,7 @@ Options taking a string as argument should preferably be written
+                     cancelled
+                     if the proof time is greater or lower than (timeout -
+                     margin).
+-                    (default: 0.5). (preferably use -wp-time-margin="n")
++                    (default: 0.5).
+ -wp-timeout <t>     Set the timeout (in seconds) for provers (default: 2).
+ 
+ *** QED SIMPLIFICATIONS
+-- 
+2.47.3
+

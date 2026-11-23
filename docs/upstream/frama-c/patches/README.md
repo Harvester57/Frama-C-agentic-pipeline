@@ -75,6 +75,17 @@ updates `tests/libc/oracle/string_h.0.res.oracle` (an unknown check and two unkn
 become valid; two line numbers move). `fc_libc.0.res.oracle` does not change. It was run with
 `revalidate.sh package 44` in a container of `framac-master-audit:b80fcac`.
 
+**`46-*` (2026-11-22, not filed)** is one commit on `master` `189053d4a2`, authored and committed
+with the GitLab noreply address. It adds `cpu_set_t` (`struct __fc_cpu_set_t`), `__cpu_mask`,
+`CPU_SETSIZE`, the `CPU_*` and `CPU_*_S` macros (`CPU_ZERO`, `CPU_SET`, `CPU_CLR`, `CPU_ISSET`,
+`CPU_COUNT`, `CPU_EQUAL`, `CPU_AND`, `CPU_OR`, `CPU_XOR`, `CPU_ALLOC_SIZE`),
+`__FC_EXTERN_FOR_MACRO(CPU_ZERO_S) void __fc_cpu_zero_s`, `__sched_cpucount`, `sched_setaffinity`,
+and `sched_getaffinity` to `share/libc/sched.h`, and adds `tests/libc/sched_cpu_set.c` with two
+oracles (`x86_32` and `x86_64`). No existing oracle changes (`fc_libc` and `sched_h` are
+untouched). Validated with `revalidate.sh package 46` in `framac-master-audit:189053d` (`tests/libc`,
+`plugins/e-acsl`, `./dev/check-files.sh -p HEAD~1`, and reproducer before/after), plus WP spot
+checks (`81 / 81` proved on both `x86_64` and `x86_32`).
+
 **`45-*`, `47-*`, `48-*` and `49-*` (2026-11-20, not filed)** are patches for MetAcsl (`pub/meta`),
 not `pub/frama-c`, one commit each on `pub/meta` `master` `4f43801390`, authored with the GitLab
 noreply address. Apply them to a clone of `pub/meta` with `git am --keep-non-patch` (subjects
@@ -120,3 +131,56 @@ pass-after in default and `dev`, full `plugins/e-acsl` default suite, `./dev/che
 HEAD~1`, and installed 12-case reproducer), plus the full `plugins/e-acsl/tests/format` `dev` suite
 and `revalidate.sh combined 30 50` / `combined 50 30` (auto-merges `functions.ml` cleanly with `!48`
 in either order and passes both `printf_promoted.c` and `printf_enum.c` in `dev`).
+
+**`51-*` to `87-*` (2026-11-23, not filed; 36 patches, no patch for issue-only `63`)** are each
+one clean `git format-patch` commit on upstream `master` `189053d4a2bd460c5c557dba8569474ff0419e73`,
+authored and committed with the GitLab noreply address (`1315-Harvester57@users.noreply.git.frama-c.com`),
+with zero file-mode changes (`mode change` / `create mode 100755`). Every patch includes its fix, a
+regression test and oracles that fail on unpatched `master` and pass patched, passes the full
+touched upstream ptest suites with zero unintended existing oracle diffs, passes
+`./dev/check-files.sh -p HEAD~1`, and flips its standalone reproducer from exit 1 to exit 0 inside
+`framac-master-audit:189053d`:
+
+- **Kernel printer (`51`, `77`, `78`, `79`):** `51` (`H10+N4`, `cil_printer.ml` exact finite float
+  round-trip + C expressions for non-finite `CReal`), `77` (`H12+N14`, `escape.ml` wide-string
+  escapes and trigraph state; updates 1 line in `tests/spec/oracle/string.0.res.oracle`), `78`
+  (`N12`, `cil_printer.ml` `LWStr` double-escape + empty `L""`), `79` (`N5`, `cil_printer.ml`
+  `__int128` printing; updates 2 lines in `plugins/e-acsl/tests/constructs/oracle/gen_typedef.0.c`).
+  4-way stacking on `cil_printer.ml` (`20`/`!43` + `51` + `78` + `79`, forward and reverse) applies
+  cleanly via `git am --3way --keep-non-patch` and passes `tests/pretty_printing` and
+  `plugins/e-acsl`.
+- **E-ACSL & Eva (`52`, `53`, `54`, `55`):** `52` (`H11`, exact IEEE 754 round-to-nearest-even RTL
+  helpers `__e_acsl_mpq_get_d`/`__e_acsl_mpq_get_f` + `gmp.ml`; updates 5 E-ACSL oracles), `53`
+  (`H15`, `interval.ml` + `translate_terms.ml` non-finite real constant guard), `54` (`L4`,
+  `typing.ml` `do_both`/`do_all`/`with_opt_ctx` sibling typing before re-raising `Not_yet`;
+  verified distinct from `16`/`!37`), `55` (`H14`, `rational.ml` + `IEEE754.ml` Eva `numerors`
+  float literal parsing). Stacking verified clean: `43` + `52` and `52` + `43` on `gmp.ml`; 4-way
+  `04` + `05` + `16` + `54` on `typing.ml`.
+- **Kernel front-end (`56`–`62`, `80`–`87`; `63` `N1` is issue-only):** `56` (`H4`,
+  `Cil.isExactFloat`), `57` (`N8`, `Cil.fitsInInt`/`truncateInteger64` for `IBool`), `58` (`H7`,
+  `logic_typing.ml` `unescape` before `typeOf_string_literal`), `59` (`H6+H18`, `logic_lexer.mll` +
+  `logic_typing.ml` hex/octal escapes and `wchar_t` truncation), `60` (`N11`, `logic_typing.ml`
+  wide-string octal digits `'0'..'7'` + `\v`), `61` (`H5`, `Cil.charConstToInt` unsigned `char`),
+  `62` (`H8`, `Cil.interpret_character_constant` `int` type; updates 1 line in
+  `tests/syntax/oracle/define_string_logic_pp_bts2101.0.res.oracle`), `80` (`N7`, `typed_float.ml`
+  exact hex float single rounding), `81` (`N9`, `logic_parser.mly` adjacent string literal escape
+  normalization), `82` (`N10`, `logic_lexer.mll` `\e`/`\E` + unknown escape error), `83` (`N13`,
+  `clexer.mll` C99/C11 UCNs in literals), `84` (`N15`, `logic_utils.ml` `Div` zero guard), `85`
+  (`N17`, `machdep.ml` YAML positive size/alignment check), `86` (`N18`, `cparser.mly` narrow char
+  escape range `0..255`), `87` (`N19`, `logic_preprocess.mll` clean fallback on unbalanced quotes).
+  Stacking verified clean (both orders): 4-way `56` + `57` + `61` + `62` (`cil.ml`), 3-way `58` +
+  `59` + `60` (`logic_typing.ml`), `58` + `81`, and `59` + `82` (`logic_lexer.mll`, with the two
+  semantic interactions documented in `82`'s MR and draft).
+- **WP (`64`–`71`):** `64` (`L1`, `ctypes.ml` `TVoid` -> `c_char ()`), `65` (`H1`, `Cmath.ml` exact
+  Zarith `Z.fdiv`/`Z.cdiv`/`Q.to_bigint`), `66` (`H3+N2`, `Vset.{mli,ml}` + `Cvalues.ml`
+  non-emptiness guards), `67` (`H2`, `Cfloat.ml` exact `q_to_float32`), `68` (`N3`, `Cfloat.ml`
+  non-finite guards), `69` (`H16`, `ProofStrategy.ml` `Failure _` + finite timeout), `70` (`H17`,
+  `wp_parameters.{ml,mli}` `TimeMargin` `Float` + `VCS.ml`/`ProofEngine.ml`/`wp_plugin.tex`/help
+  oracle), `71` (`N16`, `wp_parameters.ml` `Procs.set_range ~min:1`). Stacking verified clean (both
+  orders): 3-way `42` (`!59`) + `67` + `68` (`Cfloat.ml`) and 2-way `70` + `71` (`wp_parameters.ml`).
+- **Libc (`72`–`76`):** `72` (`L2`, `share/libc/stdio.h` ghost `__fc_pipe_status` for `popen`/`pclose`),
+  `73` (`L3`, `share/libc/signal.h` `sigaction` `oldact` assigns + `\old`; cleans 2 `signal_c_h`
+  oracles), `74` (`N6` + `utmp.h`, `pwd.h` + `utmp.h` reentrant result-pointer `assigns`), `75`
+  (`L5`, `syslog.h` includes `__fc_string_axiomatic.h`), `76` (`N20`, `__fc_define_file.h` +
+  `stdio.h` moves `__fc_{stdin,stdout,stderr}` for `<wchar.h>`). Stacking verified clean (both
+  orders): `72` + `76` (`share/libc/stdio.h`).

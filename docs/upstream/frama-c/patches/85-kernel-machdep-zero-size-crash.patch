@@ -1,0 +1,77 @@
+From 11e49ed1fddd61aa62564cc0075a7cc740843bc6 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:56:48 +0000
+Subject: [PATCH] [kernel] validate positive type sizes and alignments in YAML
+ machdeps
+
+---
+ src/kernel/internals/runtime/machdep.ml | 26 +++++++++++++++++++++++++
+ tests/misc/machdep.t/run.t              | 19 ++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/src/kernel/internals/runtime/machdep.ml b/src/kernel/internals/runtime/machdep.ml
+index 43125583f3..2b1db6d243 100644
+--- a/src/kernel/internals/runtime/machdep.ml
++++ b/src/kernel/internals/runtime/machdep.ml
+@@ -101,6 +101,32 @@ type mach = {
+   custom_defs: (string * string) list [@of_yaml yaml_dict_to_list];
+ } [@@deriving yaml]
+ 
++let validate_mach m =
++  let positive_fields = [
++    "sizeof_short", m.sizeof_short;
++    "sizeof_int", m.sizeof_int;
++    "sizeof_long", m.sizeof_long;
++    "sizeof_longlong", m.sizeof_longlong;
++    "sizeof_ptr", m.sizeof_ptr;
++    "sizeof_float", m.sizeof_float;
++    "sizeof_double", m.sizeof_double;
++    "sizeof_longdouble", m.sizeof_longdouble;
++    "alignof_short", m.alignof_short;
++    "alignof_int", m.alignof_int;
++    "alignof_long", m.alignof_long;
++    "alignof_longlong", m.alignof_longlong;
++    "alignof_ptr", m.alignof_ptr;
++    "alignof_float", m.alignof_float;
++    "alignof_double", m.alignof_double;
++    "alignof_longdouble", m.alignof_longdouble;
++  ] in
++  match List.find_opt (fun (_, v) -> v <= 0) positive_fields with
++  | Some (name, v) ->
++    Error (`Msg (Format.sprintf "Field %s must be strictly positive (got %d)" name v))
++  | None -> Ok m
++
++let mach_of_yaml y = Result.bind (mach_of_yaml y) validate_mach
++
+ let dummy = {
+   sizeof_short = 2;
+   sizeof_int = 4;
+diff --git a/tests/misc/machdep.t/run.t b/tests/misc/machdep.t/run.t
+index ff16ac8e58..888bd5a753 100644
+--- a/tests/misc/machdep.t/run.t
++++ b/tests/misc/machdep.t/run.t
+@@ -94,3 +94,22 @@ Test that an invalid argument to machdep does not cause a crash with stacktrace
+     gcc_x86_32 gcc_x86_64 macos_arm msvc_x86_64 ppc_32 x86_16 x86_32 x86_64
+   [kernel] Frama-C aborted: invalid user input.
+   [1]
++
++Test that a YAML machdep with non-positive type size or alignment produces a clean error
++  $ sed 's/^sizeof_int: .*/sizeof_int: 0/' custom_machdep.yaml > zero_int.yaml
++  $ frama-c -no-autoload-plugins -machdep zero_int.yaml custom_machdep.c
++  [kernel] User Error: Error during machdep parsing: Field sizeof_int must be strictly positive (got 0)
++  [kernel] Frama-C aborted: invalid user input.
++  [1]
++
++  $ sed 's/^sizeof_long: .*/sizeof_long: -1/' custom_machdep.yaml > neg_long.yaml
++  $ frama-c -no-autoload-plugins -machdep neg_long.yaml custom_machdep.c
++  [kernel] User Error: Error during machdep parsing: Field sizeof_long must be strictly positive (got -1)
++  [kernel] Frama-C aborted: invalid user input.
++  [1]
++
++  $ sed 's/^alignof_ptr: .*/alignof_ptr: 0/' custom_machdep.yaml > zero_align_ptr.yaml
++  $ frama-c -no-autoload-plugins -machdep zero_align_ptr.yaml custom_machdep.c
++  [kernel] User Error: Error during machdep parsing: Field alignof_ptr must be strictly positive (got 0)
++  [kernel] Frama-C aborted: invalid user input.
++  [1]
+-- 
+2.47.3

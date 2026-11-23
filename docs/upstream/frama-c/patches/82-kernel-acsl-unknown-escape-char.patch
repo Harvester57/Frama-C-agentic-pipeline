@@ -1,0 +1,176 @@
+From 7a0614dc132019d5b374f2e2ccb9056834d8cc19 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 23 Nov 2026 00:13:55 +0000
+Subject: [PATCH] [kernel] handle \e/\E and reject unknown escapes in ACSL
+ lexer
+
+---
+ src/kernel/internals/parsing/logic_lexer.mll  |  9 ++++-
+ tests/spec/acsl_escape_char.c                 | 28 ++++++++++++++
+ .../spec/oracle/acsl_escape_char.0.err.oracle |  0
+ .../spec/oracle/acsl_escape_char.0.res.oracle | 38 +++++++++++++++++++
+ .../spec/oracle/acsl_escape_char.1.err.oracle |  0
+ .../spec/oracle/acsl_escape_char.1.res.oracle |  5 +++
+ .../spec/oracle/acsl_escape_char.2.err.oracle |  0
+ .../spec/oracle/acsl_escape_char.2.res.oracle |  5 +++
+ 8 files changed, 83 insertions(+), 2 deletions(-)
+ create mode 100644 tests/spec/acsl_escape_char.c
+ create mode 100644 tests/spec/oracle/acsl_escape_char.0.err.oracle
+ create mode 100644 tests/spec/oracle/acsl_escape_char.0.res.oracle
+ create mode 100644 tests/spec/oracle/acsl_escape_char.1.err.oracle
+ create mode 100644 tests/spec/oracle/acsl_escape_char.1.res.oracle
+ create mode 100644 tests/spec/oracle/acsl_escape_char.2.err.oracle
+ create mode 100644 tests/spec/oracle/acsl_escape_char.2.res.oracle
+
+diff --git a/src/kernel/internals/parsing/logic_lexer.mll b/src/kernel/internals/parsing/logic_lexer.mll
+index 8b198bcbbc..7f3a1762ee 100644
+--- a/src/kernel/internals/parsing/logic_lexer.mll
++++ b/src/kernel/internals/parsing/logic_lexer.mll
+@@ -384,7 +384,7 @@ let opIdentifier = (rL | rD | rOP)+
+ (* Do not forget to update also the corresponding chr rule if you add
+    a supported escape sequence here. *)
+ let escape = '\\'
+-   ('\'' | '"' | '?' | '\\' | 'a' | 'b' | 'f' | 'n' | 'r'
++   ('\'' | '"' | '?' | '\\' | 'a' | 'b' | 'e' | 'E' | 'f' | 'n' | 'r'
+    | 't' | 'v')
+ 
+ let hex_escape = '\\' ['x' 'X'] rH+
+@@ -458,7 +458,9 @@ rule token = parse
+                               INT_CONSTANT n }
+ 
+   | 'L'? '"' as prelude (([^ '\\' '"' '\n']|("\\"[^ '\n']))* as content) '"'
+-      { STRING_LITERAL (prelude.[0] = 'L',content) }
++      { if prelude.[0] <> 'L' then
++          ignore (chr (Buffer.create (String.length content)) (Lexing.from_string content));
++        STRING_LITERAL (prelude.[0] = 'L',content) }
+   | '#'                     { hash lexbuf }
+   | "==>"                   { IMPLIES }
+   | "<==>"                  { IFF }
+@@ -555,6 +557,7 @@ and chr buffer = parse
+           (match (lexeme lexbuf).[1] with
+                'a' -> '\007'
+              | 'b' -> '\b'
++             | 'e' | 'E' -> '\027' (* ASCII code 27. This is a GCC extension *)
+              | 'f' -> '\012'
+              | 'n' -> '\n'
+              | 'r' -> '\r'
+@@ -566,6 +569,8 @@ and chr buffer = parse
+              | '\\' -> '\\'
+              | _ -> (* escape regex does not allow anything else *) assert false
+           ); chr buffer lexbuf}
++  | '\\' _
++      { lex_error lexbuf ("unrecognized escape sequence: " ^ lexeme lexbuf) }
+   | eof { Buffer.contents buffer }
+   | _  { Buffer.add_string buffer (lexeme lexbuf); chr buffer lexbuf }
+ 
+diff --git a/tests/spec/acsl_escape_char.c b/tests/spec/acsl_escape_char.c
+new file mode 100644
+index 0000000000..fa33be74bc
+--- /dev/null
++++ b/tests/spec/acsl_escape_char.c
+@@ -0,0 +1,28 @@
++/* run.config
++   PLUGIN: @EVA_PLUGINS@
++   EXIT: 0
++   OPT: -eva -print
++
++   EXIT: 1
++   OPT: -kernel-warn-key annot-error=abort -cpp-extra-args="-DUNKNOWN_CHAR"
++   OPT: -kernel-warn-key annot-error=abort -cpp-extra-args="-DUNKNOWN_STR"
++*/
++
++#ifdef UNKNOWN_CHAR
++void main(void) {
++  /*@ check '\z' == 0; */
++}
++#elif defined(UNKNOWN_STR)
++void main(void) {
++  /*@ check sizeof("\z") == 2; */
++}
++#else
++void main(void) {
++  int c_e = '\e';
++  int c_E = '\E';
++  /*@ check c_e == '\e'; */
++  /*@ check c_E == '\E'; */
++  /*@ check '\e' == 27 && '\E' == 27; */
++  /*@ check ("\e")[0] == 27; */
++}
++#endif
+diff --git a/tests/spec/oracle/acsl_escape_char.0.err.oracle b/tests/spec/oracle/acsl_escape_char.0.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/spec/oracle/acsl_escape_char.0.res.oracle b/tests/spec/oracle/acsl_escape_char.0.res.oracle
+new file mode 100644
+index 0000000000..856563661b
+--- /dev/null
++++ b/tests/spec/oracle/acsl_escape_char.0.res.oracle
+@@ -0,0 +1,38 @@
++[kernel] Parsing acsl_escape_char.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:initial-state] Values of globals at initialization
++  
++[eva:acsl:unsupported] acsl_escape_char.c:26: 
++  cannot evaluate ACSL term, unsupported logic var tmp
++[eva:alarm] acsl_escape_char.c:26: Warning: check got status unknown.
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  c_e ∈ {27}
++  c_E ∈ {27}
++[eva:summary] ====== ANALYSIS SUMMARY ======
++  ----------------------------------------------------------------------------
++  1 function analyzed (out of 1): 100% coverage.
++  In this function, 7 statements reached (out of 7): 100% coverage.
++  ----------------------------------------------------------------------------
++  No errors or warnings raised during the analysis.
++  ----------------------------------------------------------------------------
++  0 alarms generated by the analysis.
++  ----------------------------------------------------------------------------
++  Evaluation of the logical properties reached by the analysis:
++    Assertions        3 valid     1 unknown     0 invalid      4 total
++    Preconditions     0 valid     0 unknown     0 invalid      0 total
++  75% of the logical properties reached have been proven.
++  ----------------------------------------------------------------------------
++/* Generated by Frama-C */
++void main(void)
++{
++  int c_e = '\033';
++  int c_E = '\033';
++  /*@ check c_e ≡ '\033'; */ ;
++  /*@ check c_E ≡ '\033'; */ ;
++  /*@ check '\033' ≡ 27 ∧ '\033' ≡ 27; */ ;
++  /*@ check (\let tmp = "\033"; tmp[0]) ≡ 27; */ ;
++  return;
++}
++
++
+diff --git a/tests/spec/oracle/acsl_escape_char.1.err.oracle b/tests/spec/oracle/acsl_escape_char.1.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/spec/oracle/acsl_escape_char.1.res.oracle b/tests/spec/oracle/acsl_escape_char.1.res.oracle
+new file mode 100644
+index 0000000000..b73134b178
+--- /dev/null
++++ b/tests/spec/oracle/acsl_escape_char.1.res.oracle
+@@ -0,0 +1,5 @@
++[kernel] Parsing acsl_escape_char.c (with preprocessing)
++[kernel:annot-error] acsl_escape_char.c:13: Failure: 
++  lexical error, unrecognized escape sequence: \z
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/spec/oracle/acsl_escape_char.2.err.oracle b/tests/spec/oracle/acsl_escape_char.2.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/spec/oracle/acsl_escape_char.2.res.oracle b/tests/spec/oracle/acsl_escape_char.2.res.oracle
+new file mode 100644
+index 0000000000..80f8e20b76
+--- /dev/null
++++ b/tests/spec/oracle/acsl_escape_char.2.res.oracle
+@@ -0,0 +1,5 @@
++[kernel] Parsing acsl_escape_char.c (with preprocessing)
++[kernel:annot-error] acsl_escape_char.c:17: Failure: 
++  lexical error, unrecognized escape sequence: \z
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+-- 
+2.47.3

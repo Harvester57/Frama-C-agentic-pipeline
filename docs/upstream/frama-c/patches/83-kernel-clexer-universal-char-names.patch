@@ -1,0 +1,347 @@
+From b3717852aeef1812d2ed45b4b7a80543e209b133 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 23 Nov 2026 00:17:04 +0000
+Subject: [PATCH] [kernel] support universal character names in C character and
+ string literals
+
+---
+ src/kernel/internals/parsing/clexer.mll       | 58 ++++++++++++++-----
+ tests/syntax/oracle/ucn_literals.0.err.oracle |  0
+ tests/syntax/oracle/ucn_literals.0.res.oracle | 56 ++++++++++++++++++
+ tests/syntax/oracle/ucn_literals.1.err.oracle |  0
+ tests/syntax/oracle/ucn_literals.1.res.oracle | 11 ++++
+ tests/syntax/oracle/ucn_literals.2.err.oracle |  0
+ tests/syntax/oracle/ucn_literals.2.res.oracle | 11 ++++
+ tests/syntax/oracle/ucn_literals.3.err.oracle |  0
+ tests/syntax/oracle/ucn_literals.3.res.oracle | 11 ++++
+ tests/syntax/oracle/ucn_literals.4.err.oracle |  0
+ tests/syntax/oracle/ucn_literals.4.res.oracle | 11 ++++
+ tests/syntax/ucn_literals.c                   | 37 ++++++++++++
+ 12 files changed, 180 insertions(+), 15 deletions(-)
+ create mode 100644 tests/syntax/oracle/ucn_literals.0.err.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.0.res.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.1.err.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.1.res.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.2.err.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.2.res.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.3.err.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.3.res.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.4.err.oracle
+ create mode 100644 tests/syntax/oracle/ucn_literals.4.res.oracle
+ create mode 100644 tests/syntax/ucn_literals.c
+
+diff --git a/src/kernel/internals/parsing/clexer.mll b/src/kernel/internals/parsing/clexer.mll
+index c2907f78ce..8ffb736a5e 100644
+--- a/src/kernel/internals/parsing/clexer.mll
++++ b/src/kernel/internals/parsing/clexer.mll
+@@ -315,6 +315,27 @@ let lex_oct_escape remainder lexbuf =
+   let prefix = scan_oct_escape (Lexing.lexeme lexbuf) in
+   prefix :: remainder lexbuf
+ 
++let scan_ucn ~wide str =
++  let code = ref Int64.zero in
++  for i = 2 to String.length str - 1 do
++    let d = Cabshelper.valueOfDigit (String.get str i) in
++    code := Int64.add (Int64.mul !code 16L) d
++  done ;
++  let cp = !code in
++  if (cp < 0x00A0L && cp <> 0x0024L && cp <> 0x0040L && cp <> 0x0060L)
++     || (0xD800L <= cp && cp <= 0xDFFFL)
++     || cp > 0x10FFFFL
++  then
++    parse_error "Invalid universal character name: %s" str ;
++  if wide then
++    [cp]
++  else begin
++    let buf = Buffer.create 4 in
++    Buffer.add_utf_8_uchar buf (Uchar.of_int (Int64.to_int cp)) ;
++    let s = Buffer.contents buf in
++    List.init (String.length s) (fun i -> int64_of_char s.[i])
++  end
++
+ let lex_simple_escape remainder lexbuf =
+   let lexchar = Lexing.lexeme_char lexbuf 1 in
+   let prefix = scan_escape lexchar in
+@@ -463,6 +484,9 @@ let blank = [' ' '\t' '\012' '\r' '\026']+
+ let escape = '\\' _
+ let hex_escape = '\\' ['x' 'X'] hexdigit+
+ let oct_escape = '\\' octdigit octdigit? octdigit?
++let ucn4 = '\\' 'u' hexdigit hexdigit hexdigit hexdigit
++let ucn8 = '\\' 'U' hexdigit hexdigit hexdigit hexdigit hexdigit hexdigit hexdigit hexdigit
++let bad_ucn = '\\' ['u' 'U']
+ 
+ (* Solaris-style pragmas *)
+ let solaris_pragmas =
+@@ -539,7 +563,7 @@ rule initial = parse
+   | '\''
+     {
+     let start = Lexing.lexeme_start_p lexbuf in
+-    let content = chr lexbuf in
++    let content = chr false lexbuf in
+     let last = Lexing.lexeme_end_p lexbuf in
+     CST_CHAR (content, E.convert_loc (start,last))
+     }
+@@ -547,7 +571,7 @@ rule initial = parse
+   | "L'"
+     {
+     let start = Lexing.lexeme_start_p lexbuf in
+-    let content = chr lexbuf in
++    let content = chr true lexbuf in
+     let last = Lexing.lexeme_end_p lexbuf in
+     CST_WCHAR (content, E.convert_loc (start,last))
+     }
+@@ -555,7 +579,7 @@ rule initial = parse
+   | '"'
+     {
+     let start = Lexing.lexeme_start_p lexbuf in
+-    let content = str lexbuf in
++    let content = str false lexbuf in
+     let last = Lexing.lexeme_end_p lexbuf in
+     CST_STRING (content, E.convert_loc (start,last))
+     }
+@@ -563,7 +587,7 @@ rule initial = parse
+   | "L\""
+     {
+     let start = Lexing.lexeme_start_p lexbuf in
+-    let content = str lexbuf in
++    let content = str true lexbuf in
+     let last = Lexing.lexeme_end_p lexbuf in
+     CST_WSTRING(content, E.convert_loc (start,last))
+     }
+@@ -720,7 +744,7 @@ and matchingpars parsopen = parse
+   | '('   { matchingpars (parsopen + 1) lexbuf }
+   | ')'   { if parsopen > 1 then matchingpars (parsopen - 1) lexbuf }
+   | "/*"  { do_lex_comment comment lexbuf ; matchingpars parsopen lexbuf }
+-  | '"'   { let _ = str lexbuf in matchingpars parsopen lexbuf }
++  | '"'   { let _ = str false lexbuf in matchingpars parsopen lexbuf }
+   | _     { matchingpars parsopen lexbuf }
+ 
+ 
+@@ -797,23 +821,27 @@ and pragma = parse
+   | _     { let cur = Lexing.lexeme lexbuf in cur ^ (pragma lexbuf) }
+ 
+ 
+-and str = parse
++and str wide = parse
+   (* no nul termination in CST_STRING '"' *)
+   | '"'         { [] }
+-  | hex_escape  { lex_hex_escape str lexbuf }
+-  | oct_escape  { lex_oct_escape str lexbuf }
+-  | escape      { lex_simple_escape str lexbuf }
++  | hex_escape  { lex_hex_escape (str wide) lexbuf }
++  | oct_escape  { lex_oct_escape (str wide) lexbuf }
++  | ucn4 | ucn8 { let prefix = scan_ucn ~wide (Lexing.lexeme lexbuf) in prefix @ str wide lexbuf }
++  | bad_ucn     { parse_error "Incomplete universal character name: %s" (Lexing.lexeme lexbuf) }
++  | escape      { lex_simple_escape (str wide) lexbuf }
+   | eof         { parse_error "unterminated string" }
+-  | _           { lex_unescaped str lexbuf }
++  | _           { lex_unescaped (str wide) lexbuf }
+ 
+ 
+-and chr =  parse
++and chr wide =  parse
+   | '\''        { [] }
+-  | hex_escape  { lex_hex_escape chr lexbuf }
+-  | oct_escape  { lex_oct_escape chr lexbuf }
+-  | escape      { lex_simple_escape chr lexbuf }
++  | hex_escape  { lex_hex_escape (chr wide) lexbuf }
++  | oct_escape  { lex_oct_escape (chr wide) lexbuf }
++  | ucn4 | ucn8 { let prefix = scan_ucn ~wide (Lexing.lexeme lexbuf) in prefix @ chr wide lexbuf }
++  | bad_ucn     { parse_error "Incomplete universal character name: %s" (Lexing.lexeme lexbuf) }
++  | escape      { lex_simple_escape (chr wide) lexbuf }
+   | eof         { parse_error "unterminated char" }
+-  | _           { lex_unescaped chr lexbuf }
++  | _           { lex_unescaped (chr wide) lexbuf }
+ 
+ 
+ and annot_first_token = parse
+diff --git a/tests/syntax/oracle/ucn_literals.0.err.oracle b/tests/syntax/oracle/ucn_literals.0.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/syntax/oracle/ucn_literals.0.res.oracle b/tests/syntax/oracle/ucn_literals.0.res.oracle
+new file mode 100644
+index 0000000000..034658c6ed
+--- /dev/null
++++ b/tests/syntax/oracle/ucn_literals.0.res.oracle
+@@ -0,0 +1,56 @@
++[kernel] Parsing ucn_literals.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:initial-state] Values of globals at initialization
++  ws1 ∈ {{ L"\u20ac" }}
++  ws2 ∈ {{ L"\u1f600" }}
++  wc ∈ {8364}
++  s_euro ∈ {{ "\342\202\254" }}
++  s_dollar ∈ {{ "$@`" }}
++  c_dollar ∈ {36}
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  
++[eva:summary] ====== ANALYSIS SUMMARY ======
++  ----------------------------------------------------------------------------
++  1 function analyzed (out of 1): 100% coverage.
++  In this function, 6 statements reached (out of 6): 100% coverage.
++  ----------------------------------------------------------------------------
++  No errors or warnings raised during the analysis.
++  ----------------------------------------------------------------------------
++  0 alarms generated by the analysis.
++  ----------------------------------------------------------------------------
++  Evaluation of the logical properties reached by the analysis:
++    Assertions        5 valid     0 unknown     0 invalid      5 total
++    Preconditions     0 valid     0 unknown     0 invalid      0 total
++  100% of the logical properties reached have been proven.
++  ----------------------------------------------------------------------------
++/* Generated by Frama-C */
++#include "stddef.h"
++wchar_t const *ws1 = L"\u20ac";
++wchar_t const *ws2 = L"\u1f600";
++wchar_t wc = 8364;
++char const *s_euro = "\342\202\254";
++char const *s_dollar = "$@`";
++char c_dollar = (char)'$';
++void main(void)
++{
++  /*@ check *(ws1 + 0) ≡ 0x20AC ∧ *(ws1 + 1) ≡ 0; */ ;
++  /*@ check *(ws2 + 0) ≡ 0x1F600 ∧ *(ws2 + 1) ≡ 0; */ ;
++  /*@ check wc ≡ 0x20AC; */ ;
++  /*@
++  check
++    (unsigned char)*(s_euro + 0) ≡ 0xE2 ∧
++    (unsigned char)*(s_euro + 1) ≡ 0x82 ∧
++    (unsigned char)*(s_euro + 2) ≡ 0xAC ∧ *(s_euro + 3) ≡ 0;
++   */
++  ;
++  /*@
++  check
++    *(s_dollar + 0) ≡ '$' ∧ *(s_dollar + 1) ≡ '@' ∧ *(s_dollar + 2) ≡ '`' ∧
++    c_dollar ≡ '$';
++   */
++  ;
++  return;
++}
++
++
+diff --git a/tests/syntax/oracle/ucn_literals.1.err.oracle b/tests/syntax/oracle/ucn_literals.1.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/syntax/oracle/ucn_literals.1.res.oracle b/tests/syntax/oracle/ucn_literals.1.res.oracle
+new file mode 100644
+index 0000000000..e3cab4068d
+--- /dev/null
++++ b/tests/syntax/oracle/ucn_literals.1.res.oracle
+@@ -0,0 +1,11 @@
++[kernel] Parsing ucn_literals.c (with preprocessing)
++[kernel] ucn_literals.c:15: User Error: 
++  Invalid universal character name: \uD800:
++  Location: "ucn_literals.c", line 15, before or at token: \uD800
++  13    
++  14    #ifdef BAD_SURROGATE
++  15    wchar_t bad = L'\uD800';
++                        ^^^^^^
++  16    #elif defined(BAD_LOW)
++  17    wchar_t bad = L'\u0041';
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/syntax/oracle/ucn_literals.2.err.oracle b/tests/syntax/oracle/ucn_literals.2.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/syntax/oracle/ucn_literals.2.res.oracle b/tests/syntax/oracle/ucn_literals.2.res.oracle
+new file mode 100644
+index 0000000000..9e388d33d4
+--- /dev/null
++++ b/tests/syntax/oracle/ucn_literals.2.res.oracle
+@@ -0,0 +1,11 @@
++[kernel] Parsing ucn_literals.c (with preprocessing)
++[kernel] ucn_literals.c:17: User Error: 
++  Invalid universal character name: \u0041:
++  Location: "ucn_literals.c", line 17, before or at token: \u0041
++  15    wchar_t bad = L'\uD800';
++  16    #elif defined(BAD_LOW)
++  17    wchar_t bad = L'\u0041';
++                        ^^^^^^
++  18    #elif defined(BAD_HIGH)
++  19    wchar_t bad = L'\U00110000';
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/syntax/oracle/ucn_literals.3.err.oracle b/tests/syntax/oracle/ucn_literals.3.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/syntax/oracle/ucn_literals.3.res.oracle b/tests/syntax/oracle/ucn_literals.3.res.oracle
+new file mode 100644
+index 0000000000..8011d20141
+--- /dev/null
++++ b/tests/syntax/oracle/ucn_literals.3.res.oracle
+@@ -0,0 +1,11 @@
++[kernel] Parsing ucn_literals.c (with preprocessing)
++[kernel] ucn_literals.c:19: User Error: 
++  Invalid universal character name: \U00110000:
++  Location: "ucn_literals.c", line 19, before or at token: \U00110000
++  17    wchar_t bad = L'\u0041';
++  18    #elif defined(BAD_HIGH)
++  19    wchar_t bad = L'\U00110000';
++                        ^^^^^^^^^^
++  20    #elif defined(BAD_INCOMPLETE)
++  21    wchar_t bad = L'\u12';
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/syntax/oracle/ucn_literals.4.err.oracle b/tests/syntax/oracle/ucn_literals.4.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/syntax/oracle/ucn_literals.4.res.oracle b/tests/syntax/oracle/ucn_literals.4.res.oracle
+new file mode 100644
+index 0000000000..454217ae41
+--- /dev/null
++++ b/tests/syntax/oracle/ucn_literals.4.res.oracle
+@@ -0,0 +1,11 @@
++[kernel] Parsing ucn_literals.c (with preprocessing)
++[kernel] ucn_literals.c:21: User Error: 
++  Incomplete universal character name: \u:
++  Location: "ucn_literals.c", line 21, before or at token: \u
++  19    wchar_t bad = L'\U00110000';
++  20    #elif defined(BAD_INCOMPLETE)
++  21    wchar_t bad = L'\u12';
++                        ^^
++  22    #else
++  23    const wchar_t *ws1 = L"\u20AC";
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/syntax/ucn_literals.c b/tests/syntax/ucn_literals.c
+new file mode 100644
+index 0000000000..7f77056ab5
+--- /dev/null
++++ b/tests/syntax/ucn_literals.c
+@@ -0,0 +1,37 @@
++/* run.config
++   EXIT: 0
++   PLUGIN: @EVA_PLUGINS@
++   OPT: -eva -print
++
++   EXIT: 1
++   OPT: -cpp-extra-args="-DBAD_SURROGATE"
++   OPT: -cpp-extra-args="-DBAD_LOW"
++   OPT: -cpp-extra-args="-DBAD_HIGH"
++   OPT: -cpp-extra-args="-DBAD_INCOMPLETE"
++*/
++#include <stddef.h>
++
++#ifdef BAD_SURROGATE
++wchar_t bad = L'\uD800';
++#elif defined(BAD_LOW)
++wchar_t bad = L'\u0041';
++#elif defined(BAD_HIGH)
++wchar_t bad = L'\U00110000';
++#elif defined(BAD_INCOMPLETE)
++wchar_t bad = L'\u12';
++#else
++const wchar_t *ws1 = L"\u20AC";
++const wchar_t *ws2 = L"\U0001F600";
++wchar_t wc = L'\u20AC';
++const char *s_euro = "\u20AC";
++const char *s_dollar = "\u0024\u0040\u0060";
++char c_dollar = '\u0024';
++
++void main(void) {
++  /*@ check ws1[0] == 0x20AC && ws1[1] == 0; */
++  /*@ check ws2[0] == 0x1F600 && ws2[1] == 0; */
++  /*@ check wc == 0x20AC; */
++  /*@ check (unsigned char)s_euro[0] == 0xE2 && (unsigned char)s_euro[1] == 0x82 && (unsigned char)s_euro[2] == 0xAC && s_euro[3] == 0; */
++  /*@ check s_dollar[0] == '$' && s_dollar[1] == '@' && s_dollar[2] == '`' && c_dollar == '$'; */
++}
++#endif
+-- 
+2.47.3

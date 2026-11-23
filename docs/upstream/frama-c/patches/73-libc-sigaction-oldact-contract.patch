@@ -1,0 +1,438 @@
+From ba6081af0bf23b3fdd329f936652e2f86d509db6 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:53:09 +0000
+Subject: [PATCH] [libc] sigaction: assign *oldact from __fc_sigaction[signum]
+ and use \old
+
+In share/libc/signal.h, sigaction had two contract defects for oldact:
+- assigns *oldact \from &__fc_sigaction passed the address of the array instead of its entry value, creating a garbled mix of &__fc_sigaction;
+- ensures oldact_assigned read __fc_sigaction[signum] in the post-state instead of \old(__fc_sigaction[signum]).
+
+Together, installing a non-null handler while saving oldact made the postcondition evaluate to false in Eva (stopping propagation with NON TERMINATING FUNCTION), and querying a previously installed handler with act == NULL made old.sa_handler == h1 invalid.
+
+Assign *oldact from __fc_sigaction[signum], indirect:signum and refer to \old(__fc_sigaction[signum]) in oldact_assigned.
+
+New test: tests/libc/sigaction_oldact.c. Updated oracles: tests/libc/oracle/signal_c_h.{0,1}.res.oracle (garbled-mix warning on *oldact disappears).
+---
+ share/libc/signal.h                           |   4 +-
+ .../libc/oracle/sigaction_oldact.0.res.oracle | 195 ++++++++++++++++++
+ tests/libc/oracle/signal_c_h.0.res.oracle     |  32 +--
+ tests/libc/oracle/signal_c_h.1.res.oracle     |  32 +--
+ tests/libc/sigaction_oldact.c                 |  27 +++
+ 5 files changed, 236 insertions(+), 54 deletions(-)
+ create mode 100644 tests/libc/oracle/sigaction_oldact.0.res.oracle
+ create mode 100644 tests/libc/sigaction_oldact.c
+
+diff --git a/share/libc/signal.h b/share/libc/signal.h
+index 0773ba4cea..e116f738db 100644
+--- a/share/libc/signal.h
++++ b/share/libc/signal.h
+@@ -244,13 +244,13 @@ __FC_EXTERN struct sigaction __fc_sigaction[SIGRTMAX+1];
+   requires valid_oldact_or_null: oldact == \null || \valid(oldact);
+   requires valid_read_act_or_null: act == \null || \valid_read(act);
+   requires separation:separated_acts: \separated(act, oldact);
+-  assigns *oldact \from &__fc_sigaction;
++  assigns *oldact \from __fc_sigaction[signum], indirect:signum;
+   assigns __fc_sigaction[signum] \from *act;
+   assigns \result \from indirect:signum, indirect:act, indirect:*act,
+                         indirect:oldact, indirect:*oldact;
+   ensures act_changed: act == \null || \subset(__fc_sigaction[signum], *act);
+   ensures oldact_assigned: oldact == \null ||
+-                           \subset({*oldact}, __fc_sigaction[signum]);
++                           \subset({*oldact}, \old(__fc_sigaction[signum]));
+   ensures result_ok_or_error: \result == 0 || \result == -1;
+  */
+ extern int sigaction(int signum, const struct sigaction *restrict act,
+diff --git a/tests/libc/oracle/sigaction_oldact.0.res.oracle b/tests/libc/oracle/sigaction_oldact.0.res.oracle
+new file mode 100644
+index 0000000000..40b436a4f9
+--- /dev/null
++++ b/tests/libc/oracle/sigaction_oldact.0.res.oracle
+@@ -0,0 +1,195 @@
++[kernel] Parsing sigaction_oldact.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] 
++  computing for function sigaction <- main.
++  Called from sigaction_oldact.c:14.
++[eva] using specification for function sigaction
++[eva:progress] sigaction_oldact.c:14: 
++  function sigaction: precondition 'valid_signal' got status valid.
++[eva:progress] sigaction_oldact.c:14: 
++  function sigaction: precondition 'valid_oldact_or_null' got status valid.
++[eva:progress] sigaction_oldact.c:14: 
++  function sigaction: precondition 'valid_read_act_or_null' got status valid.
++[eva:progress] sigaction_oldact.c:14: 
++  function sigaction: precondition 'separation,separated_acts' got status valid.
++[eva:progress] Done for function sigaction
++[eva:progress] sigaction_oldact.c:16: check 'after_first_call' got status valid.
++[eva:progress] 
++  computing for function sigaction <- main.
++  Called from sigaction_oldact.c:18.
++[eva:progress] sigaction_oldact.c:18: 
++  function sigaction: precondition 'valid_signal' got status valid.
++[eva:progress] sigaction_oldact.c:18: 
++  function sigaction: precondition 'valid_oldact_or_null' got status valid.
++[eva:progress] sigaction_oldact.c:18: 
++  function sigaction: precondition 'valid_read_act_or_null' got status valid.
++[eva:progress] sigaction_oldact.c:18: 
++  function sigaction: precondition 'separation,separated_acts' got status valid.
++[eva:progress] Done for function sigaction
++[eva:alarm] sigaction_oldact.c:20: Warning: 
++  check 'old_was_handler1' got status unknown.
++[eva:progress] 
++  computing for function sigaction <- main.
++  Called from sigaction_oldact.c:22.
++[eva:progress] sigaction_oldact.c:22: 
++  function sigaction: precondition 'valid_signal' got status valid.
++[eva:progress] sigaction_oldact.c:22: 
++  function sigaction: precondition 'valid_oldact_or_null' got status valid.
++[eva:progress] sigaction_oldact.c:22: 
++  function sigaction: precondition 'valid_read_act_or_null' got status valid.
++[eva:progress] sigaction_oldact.c:22: 
++  function sigaction: precondition 'separation,separated_acts' got status valid.
++[eva:progress] Done for function sigaction
++[eva:alarm] sigaction_oldact.c:24: Warning: 
++  check 'queried_was_handler2' got status unknown.
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  __fc_sigaction[0]{.sa_handler; .sa_sigaction} ∈ {0}
++                [0]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[0].sa_restorer; [1]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [1]{.sa_mask; .sa_flags} ∈ [--..--]
++                [1].sa_restorer ∈ {0}
++                [2]{.sa_handler#; .sa_sigaction#; .sa_mask#; .sa_flags#; .sa_restorer#} ∈
++                {{ NULL + [--..--] ; (? *)&handler1 ; (? *)&handler2 }}
++                [3]{.sa_handler; .sa_sigaction} ∈ {0}
++                [3]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[3].sa_restorer; [4]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [4]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[4].sa_restorer; [5]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [5]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[5].sa_restorer; [6]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [6]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[6].sa_restorer; [7]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [7]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[7].sa_restorer; [8]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [8]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[8].sa_restorer; [9]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [9]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[9].sa_restorer; [10]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [10]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[10].sa_restorer; [11]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [11]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[11].sa_restorer; [12]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [12]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[12].sa_restorer; [13]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [13]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[13].sa_restorer; [14]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [14]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[14].sa_restorer; [15]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [15]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[15].sa_restorer; [16]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [16]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[16].sa_restorer; [17]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [17]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[17].sa_restorer; [18]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [18]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[18].sa_restorer; [19]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [19]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[19].sa_restorer; [20]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [20]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[20].sa_restorer; [21]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [21]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[21].sa_restorer; [22]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [22]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[22].sa_restorer; [23]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [23]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[23].sa_restorer; [24]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [24]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[24].sa_restorer; [25]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [25]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[25].sa_restorer; [26]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [26]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[26].sa_restorer; [27]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [27]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[27].sa_restorer; [28]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [28]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[28].sa_restorer; [29]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [29]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[29].sa_restorer; [30]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [30]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[30].sa_restorer; [31]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [31]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[31].sa_restorer; [32]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [32]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[32].sa_restorer; [33]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [33]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[33].sa_restorer; [34]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [34]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[34].sa_restorer; [35]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [35]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[35].sa_restorer; [36]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [36]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[36].sa_restorer; [37]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [37]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[37].sa_restorer; [38]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [38]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[38].sa_restorer; [39]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [39]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[39].sa_restorer; [40]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [40]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[40].sa_restorer; [41]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [41]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[41].sa_restorer; [42]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [42]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[42].sa_restorer; [43]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [43]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[43].sa_restorer; [44]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [44]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[44].sa_restorer; [45]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [45]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[45].sa_restorer; [46]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [46]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[46].sa_restorer; [47]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [47]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[47].sa_restorer; [48]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [48]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[48].sa_restorer; [49]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [49]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[49].sa_restorer; [50]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [50]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[50].sa_restorer; [51]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [51]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[51].sa_restorer; [52]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [52]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[52].sa_restorer; [53]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [53]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[53].sa_restorer; [54]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [54]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[54].sa_restorer; [55]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [55]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[55].sa_restorer; [56]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [56]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[56].sa_restorer; [57]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [57]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[57].sa_restorer; [58]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [58]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[58].sa_restorer; [59]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [59]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[59].sa_restorer; [60]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [60]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[60].sa_restorer; [61]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [61]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[61].sa_restorer; [62]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [62]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[62].sa_restorer; [63]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [63]{.sa_mask; .sa_flags} ∈ [--..--]
++                {[63].sa_restorer; [64]{.sa_handler; .sa_sigaction}} ∈ {0}
++                [64]{.sa_mask; .sa_flags} ∈ [--..--]
++                [64].sa_restorer ∈ {0}
++  a.sa_handler ∈ {{ &handler1 }}
++   {.sa_sigaction; .sa_mask; .sa_flags; .sa_restorer} ∈ {0}
++  b.sa_handler ∈ {{ &handler2 }}
++   {.sa_sigaction; .sa_mask; .sa_flags; .sa_restorer} ∈ {0}
++  old1{.sa_handler#; .sa_sigaction#; .sa_mask#; .sa_flags#; .sa_restorer#} ∈
++      [0..340282366920938463444927863358058659840],0%18446744073709551616
++  old2{.sa_handler#; .sa_sigaction#; .sa_mask#; .sa_flags#; .sa_restorer#} ∈
++      {{ NULL ; (? *)&handler1 }}
++  queried{.sa_handler#; .sa_sigaction#; .sa_mask#; .sa_flags#; .sa_restorer#} ∈
++         {{ NULL ; (? *)&handler2 }}
++  __retres ∈ {0; 1; 2; 3}
+diff --git a/tests/libc/oracle/signal_c_h.0.res.oracle b/tests/libc/oracle/signal_c_h.0.res.oracle
+index f60938c64c..e6010faff2 100644
+--- a/tests/libc/oracle/signal_c_h.0.res.oracle
++++ b/tests/libc/oracle/signal_c_h.0.res.oracle
+@@ -133,9 +133,6 @@
+   function sigaction: precondition 'valid_read_act_or_null' got status valid.
+ [eva:progress] signal_c_h.c:57: 
+   function sigaction: precondition 'separation,separated_acts' got status valid.
+-[eva:garbled-mix:assigns] signal_c_h.c:57: 
+-  The specification of function sigaction
+-  has generated a garbled mix of addresses for assigns clause *oldact.
+ [eva:progress] Done for function sigaction
+ [eva:progress] 
+   computing for function sigaction <- test_sigaction <- main.
+@@ -152,9 +149,6 @@
+   function sigaction: precondition 'valid_read_act_or_null' got status valid.
+ [eva:progress] signal_c_h.c:60: 
+   function sigaction: precondition 'separation,separated_acts' got status valid.
+-[eva:garbled-mix:assigns] signal_c_h.c:60: 
+-  The specification of function sigaction
+-  has generated a garbled mix of addresses for assigns clause *oldact.
+ [eva:progress] Done for function sigaction
+ [eva:progress] 
+   computing for function sigaction <- test_sigaction <- main.
+@@ -245,9 +239,7 @@
+                 {[8].sa_restorer; [9]{.sa_handler; .sa_sigaction}} ∈ {0}
+                 [9]{.sa_mask; .sa_flags} ∈ [--..--]
+                 [9].sa_restorer ∈ {0}
+-                [10] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:60}) }}
++                [10] ∈ [--..--]
+                 [11]{.sa_handler; .sa_sigaction} ∈ {0}
+                 [11]{.sa_mask; .sa_flags} ∈ [--..--]
+                 {[11].sa_restorer; [12]{.sa_handler; .sa_sigaction}} ∈ {0}
+@@ -261,10 +253,7 @@
+                 {[15].sa_restorer; [16]{.sa_handler; .sa_sigaction}} ∈ {0}
+                 [16]{.sa_mask; .sa_flags} ∈ [--..--]
+                 [16].sa_restorer ∈ {0}
+-                [17] ∈ [--..--]
+-                [18] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:57}) }}
++                [17..18] ∈ [--..--]
+                 [19]{.sa_handler; .sa_sigaction} ∈ {0}
+                 [19]{.sa_mask; .sa_flags} ∈ [--..--]
+                 {[19].sa_restorer; [20]{.sa_handler; .sa_sigaction}} ∈ {0}
+@@ -362,12 +351,8 @@
+   uninit ∈ UNINITIALIZED
+   old ∈ [--..--] or UNINITIALIZED
+   kill_res ∈ {-1; 0} or UNINITIALIZED
+-  sa1 ∈
+-     {{ garbled mix of &{__fc_sigaction}
+-      (origin: Library function {signal_c_h.c:57}) }} or UNINITIALIZED
+-  sa2 ∈
+-     {{ garbled mix of &{__fc_sigaction}
+-      (origin: Library function {signal_c_h.c:60}) }} or UNINITIALIZED
++  sa1 ∈ [--..--] or UNINITIALIZED
++  sa2 ∈ [--..--] or UNINITIALIZED
+   __retres ∈ {-1; 0; 1; 2; 3}
+ [eva:final-states] Values at end of function test_sighandler:
+   __fc_signal_handlers[0..1] ∈ {0}
+@@ -402,9 +387,7 @@
+                 {[8].sa_restorer; [9]{.sa_handler; .sa_sigaction}} ∈ {0}
+                 [9]{.sa_mask; .sa_flags} ∈ [--..--]
+                 [9].sa_restorer ∈ {0}
+-                [10] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:60}) }}
++                [10] ∈ [--..--]
+                 [11]{.sa_handler; .sa_sigaction} ∈ {0}
+                 [11]{.sa_mask; .sa_flags} ∈ [--..--]
+                 {[11].sa_restorer; [12]{.sa_handler; .sa_sigaction}} ∈ {0}
+@@ -418,10 +401,7 @@
+                 {[15].sa_restorer; [16]{.sa_handler; .sa_sigaction}} ∈ {0}
+                 [16]{.sa_mask; .sa_flags} ∈ [--..--]
+                 [16].sa_restorer ∈ {0}
+-                [17] ∈ [--..--]
+-                [18] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:57}) }}
++                [17..18] ∈ [--..--]
+                 [19]{.sa_handler; .sa_sigaction} ∈ {0}
+                 [19]{.sa_mask; .sa_flags} ∈ [--..--]
+                 {[19].sa_restorer; [20]{.sa_handler; .sa_sigaction}} ∈ {0}
+diff --git a/tests/libc/oracle/signal_c_h.1.res.oracle b/tests/libc/oracle/signal_c_h.1.res.oracle
+index dd0d2c3701..fea272d2a4 100644
+--- a/tests/libc/oracle/signal_c_h.1.res.oracle
++++ b/tests/libc/oracle/signal_c_h.1.res.oracle
+@@ -133,9 +133,6 @@
+   function sigaction: precondition 'valid_read_act_or_null' got status valid.
+ [eva:progress] signal_c_h.c:57: 
+   function sigaction: precondition 'separation,separated_acts' got status valid.
+-[eva:garbled-mix:assigns] signal_c_h.c:57: 
+-  The specification of function sigaction
+-  has generated a garbled mix of addresses for assigns clause *oldact.
+ [eva:progress] Done for function sigaction
+ [eva:progress] 
+   computing for function sigaction <- test_sigaction <- main.
+@@ -152,9 +149,6 @@
+   function sigaction: precondition 'valid_read_act_or_null' got status valid.
+ [eva:progress] signal_c_h.c:60: 
+   function sigaction: precondition 'separation,separated_acts' got status valid.
+-[eva:garbled-mix:assigns] signal_c_h.c:60: 
+-  The specification of function sigaction
+-  has generated a garbled mix of addresses for assigns clause *oldact.
+ [eva:progress] Done for function sigaction
+ [eva:progress] 
+   computing for function sigaction <- test_sigaction <- main.
+@@ -294,25 +288,16 @@
+ [eva:final-states] Values at end of function test_sigaction:
+   errno ∈ [--..--]
+   __fc_sigaction[0..9] ∈ {0}
+-                [10] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:60}) }}
++                [10] ∈ [--..--]
+                 [11..16] ∈ {0}
+-                [17] ∈ [--..--]
+-                [18] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:57}) }}
++                [17..18] ∈ [--..--]
+                 [19..64] ∈ {0}
+   s ∈ [--..--]
+   uninit ∈ UNINITIALIZED
+   old ∈ [--..--] or UNINITIALIZED
+   kill_res ∈ {-1; 0} or UNINITIALIZED
+-  sa1 ∈
+-     {{ garbled mix of &{__fc_sigaction}
+-      (origin: Library function {signal_c_h.c:57}) }} or UNINITIALIZED
+-  sa2 ∈
+-     {{ garbled mix of &{__fc_sigaction}
+-      (origin: Library function {signal_c_h.c:60}) }} or UNINITIALIZED
++  sa1 ∈ [--..--] or UNINITIALIZED
++  sa2 ∈ [--..--] or UNINITIALIZED
+   __retres ∈ {-1; 0; 1; 2; 3}
+ [eva:final-states] Values at end of function test_sighandler:
+   errno ∈ [--..--]
+@@ -331,14 +316,9 @@
+                       {{ NULL ; &SIG_DFL ; &SIG_IGN ; &signal_handler }}
+                       [3..64] ∈ {0}
+   __fc_sigaction[0..9] ∈ {0}
+-                [10] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:60}) }}
++                [10] ∈ [--..--]
+                 [11..16] ∈ {0}
+-                [17] ∈ [--..--]
+-                [18] ∈
+-                {{ garbled mix of &{__fc_sigaction}
+-                 (origin: Library function {signal_c_h.c:57}) }}
++                [17..18] ∈ [--..--]
+                 [19..64] ∈ {0}
+   signal_status ∈ {0; 2}
+   smin ∈ [--..--]
+diff --git a/tests/libc/sigaction_oldact.c b/tests/libc/sigaction_oldact.c
+new file mode 100644
+index 0000000000..427821745a
+--- /dev/null
++++ b/tests/libc/sigaction_oldact.c
+@@ -0,0 +1,27 @@
++/* run.config
++   STDOPT:
++*/
++#include <signal.h>
++
++void handler1(int s) { (void)s; }
++void handler2(int s) { (void)s; }
++
++int main(void) {
++  struct sigaction a = {0}, b = {0}, old1 = {0}, old2 = {0}, queried = {0};
++  a.sa_handler = handler1;
++  b.sa_handler = handler2;
++
++  if (sigaction(SIGINT, &a, &old1) != 0)
++    return 1;
++  //@ check after_first_call: \true;
++
++  if (sigaction(SIGINT, &b, &old2) != 0)
++    return 2;
++  //@ check old_was_handler1: old2.sa_handler == handler1;
++
++  if (sigaction(SIGINT, 0, &queried) != 0)
++    return 3;
++  //@ check queried_was_handler2: queried.sa_handler == handler2;
++
++  return 0;
++}
+-- 
+2.47.3
+

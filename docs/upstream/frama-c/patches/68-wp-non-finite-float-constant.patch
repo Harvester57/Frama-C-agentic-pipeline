@@ -1,0 +1,315 @@
+From be392e80454e5c3b69bf5d69aba030d11be8c9e7 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 23 Nov 2026 00:02:06 +0000
+Subject: [PATCH] [wp] reject non-finite float constants from Qed real
+ simplification
+
+Cfloat.fmake, Cfloat.code_lit, and Cfloat.parse_literal passed
+non-finite OCaml floats (such as overflowed `1e308 * 10.0`,
+`(float)1e39`, `1e40f`, or constant-folded `1.0 / 0.0`) into `F.e_float`
+and `Q.of_float`, producing infinite `Kreal` constants in Qed. This
+caused Qed to prove false real equalities (`y + 1.0 == z`,
+`(float)1e39 + 1.0 == (float)1e39`), refute true ones
+(`(float)1e39 - (float)1e39 == 0.0`), and crash Why3 export with
+`Invalid_argument("Wp.Cfloat.const_float")` on any remaining goal
+(including the RTE `is_nan_or_infinite` guard itself).
+
+Raise `Not_found` in `fmake` when the rounded float is non-finite (so
+Why3 handles overflow symbolically, matching the existing `DIV` guard),
+reject non-finite suffixed literals in `parse_literal`, and emit a
+`Warning.error` instead of `F.e_float` for non-finite values in
+`code_lit`.
+
+New test: wp_acsl/float_non_finite.i.
+---
+ plugins/wp/src/Cfloat.ml                      |  28 +++--
+ plugins/wp/tests/wp_acsl/float_non_finite.i   |  26 +++++
+ .../oracle/float_non_finite.0.res.oracle      | 104 ++++++++++++++++++
+ .../oracle/float_non_finite.1.res.oracle      |  82 ++++++++++++++
+ 4 files changed, 233 insertions(+), 7 deletions(-)
+ create mode 100644 plugins/wp/tests/wp_acsl/float_non_finite.i
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/float_non_finite.0.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/float_non_finite.1.res.oracle
+
+diff --git a/plugins/wp/src/Cfloat.ml b/plugins/wp/src/Cfloat.ml
+index d87f66ff5d..adf9ec6685 100644
+--- a/plugins/wp/src/Cfloat.ml
++++ b/plugins/wp/src/Cfloat.ml
+@@ -124,9 +124,15 @@ let () = Context.register
+ 
+ let rfloat = Floating_point.round_to_single_precision
+ 
+-let fmake ulp value = match ulp with
+-  | Float32 -> F.e_fun !@fq32 [F.e_float (rfloat value)]
+-  | Float64 -> F.e_fun !@fq64 [F.e_float value]
++let fmake ulp value =
++  let v = match ulp with
++    | Float32 -> rfloat value
++    | Float64 -> value
++  in
++  if not (Float.is_finite v) then raise Not_found ;
++  match ulp with
++  | Float32 -> F.e_fun !@fq32 [F.e_float v]
++  | Float64 -> F.e_fun !@fq64 [F.e_float v]
+ 
+ let qmake ulp q = fmake ulp (Q.to_float q)
+ 
+@@ -176,13 +182,21 @@ let parse_literal ~model v r =
+ 
+ let acsl_lit l =
+   let open Cil_types in
+-  F.e_real (parse_literal ~model:(Context.get model) l.r_nearest l.r_literal)
++  let q = parse_literal ~model:(Context.get model) l.r_nearest l.r_literal in
++  if Q.is_real q then F.e_real q
++  else Warning.error "Unexpected constant literal %S" l.r_literal
+ 
+ let code_lit ulp value original =
+   match Context.get model , ulp , original with
+-  | Float , Float32 , _ -> F.e_fun ~result:!@f32 !@fq32 [F.e_float value]
+-  | Float , Float64 , _ -> F.e_fun ~result:!@f64 !@fq64 [F.e_float value]
+-  | Real , _ , None -> F.e_float value
++  | Float , Float32 , _ when Float.is_finite value ->
++    F.e_fun ~result:!@f32 !@fq32 [F.e_float value]
++  | Float , Float64 , _ when Float.is_finite value ->
++    F.e_fun ~result:!@f64 !@fq64 [F.e_float value]
++  | Float , _ , _ ->
++    Warning.error "Non-finite floating-point constant"
++  | Real , _ , None when Float.is_finite value -> F.e_float value
++  | Real , _ , None ->
++    Warning.error "Non-finite floating-point constant"
+   | Real , _ , Some r -> F.e_real (parse_literal ~model:Real value r)
+ 
+ (* -------------------------------------------------------------------------- *)
+diff --git a/plugins/wp/tests/wp_acsl/float_non_finite.i b/plugins/wp/tests/wp_acsl/float_non_finite.i
+new file mode 100644
+index 0000000000..cfb353307c
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/float_non_finite.i
+@@ -0,0 +1,26 @@
++/* run.config
++   OPT:
++   OPT: -wp-rte -wp-gen -wp-prover alt-ergo -wp-fct ovf_mul,ovf_lit
++*/
++
++/*@ check lemma ovf_f32_plus1_bad: (float)1e39 + 1.0 == (float)1e39;
++    check lemma ovf_f32_sub_ok:    (float)1e39 - (float)1e39 == 0.0; */
++
++double ovf_mul(void) {
++  double x = 1e308;
++  double y = x * 10.0;
++  double z = x * 20.0;
++  //@ check plus1_bad: y + 1.0 == z;
++  //@ check twice_bad: y + y == z + 5.0;
++  return y;
++}
++
++float ovf_lit(void) {
++  float f = 1e40f;
++  //@ check lit_bad: f + 1.0 == f;
++  return f;
++}
++
++void acsl_lit_inf(void) {
++  //@ check acsl_bad: 1e40f + 1.0 == 1e40f;
++}
+diff --git a/plugins/wp/tests/wp_acsl/oracle/float_non_finite.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle/float_non_finite.0.res.oracle
+new file mode 100644
+index 0000000000..b1ce33210d
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/float_non_finite.0.res.oracle
+@@ -0,0 +1,104 @@
++# frama-c -wp [...]
++[kernel] Parsing float_non_finite.i (no preprocessing)
++[kernel:parser:decimal-float] float_non_finite.i:10: Warning: 
++  Floating-point constant 1e308 is not represented exactly. Will use 0x1.1ccf385ebc8a0p1023.
++  (warn-once: no further messages from category 'parser:decimal-float' will be emitted)
++[wp] Running WP plugin...
++[wp] [Valid] Goal acsl_lit_inf_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal acsl_lit_inf_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal ovf_lit_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal ovf_lit_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal ovf_mul_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal ovf_mul_terminates (Cfg) (Trivial)
++[wp] float_non_finite.i:19: Warning: Non-finite floating-point constant
++[wp] float_non_finite.i:25: Warning: Unexpected constant literal "1e40f"
++[wp] float_non_finite.i:25: Warning: Unexpected constant literal "1e40f"
++------------------------------------------------------------
++  Global
++------------------------------------------------------------
++
++Goal Check Lemma 'ovf_f32_plus1_bad':
++Prove: false.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'ovf_f32_sub_ok':
++Prove: true.
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function acsl_lit_inf
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_non_finite.i", lines 24-26) in 'acsl_lit_inf':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_non_finite.i", lines 24-26) in 'acsl_lit_inf':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Check 'acsl_bad' ("float_non_finite.i", line 25, characters 23-43):
++float_non_finite.i:25: warning from wp:
++ - Warning: Hide sub-term definition
++   Reason: Unexpected constant literal "1e40f"
++float_non_finite.i:25: warning from wp:
++ - Warning: Hide sub-term definition
++   Reason: Unexpected constant literal "1e40f"
++Prove: (1.0 + of_f32(to_f32(w))) = of_f32(to_f32(w_1)).
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function ovf_lit
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_non_finite.i", lines 18-22) in 'ovf_lit':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_non_finite.i", lines 18-22) in 'ovf_lit':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Check 'lit_bad' ("float_non_finite.i", line 20, characters 22-34):
++Prove: false.
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function ovf_mul
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_non_finite.i", lines 9-16) in 'ovf_mul':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_non_finite.i", lines 9-16) in 'ovf_mul':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Check 'plus1_bad' ("float_non_finite.i", line 13, characters 24-36):
++Let a = to_fq64(100000000000000001097906362944045541740492309677311846336810682903157585404911491537163328978494688899061249669721172515611590283743140088328307009198146046031271664502933027185697489699588559043338384466165001178426897626212945177628091195786707458122783970171784415105291802893207873272974885715430223118336.0).
++Prove: (1.0 + of_f64(mul_f64(a, to_fq64(10.0))))
++         = of_f64(mul_f64(a, to_fq64(20.0))).
++
++------------------------------------------------------------
++
++Goal Check 'twice_bad' ("float_non_finite.i", line 14, characters 25-41):
++Let a = to_fq64(100000000000000001097906362944045541740492309677311846336810682903157585404911491537163328978494688899061249669721172515611590283743140088328307009198146046031271664502933027185697489699588559043338384466165001178426897626212945177628091195786707458122783970171784415105291802893207873272974885715430223118336.0).
++Prove: (5.0 + of_f64(mul_f64(a, to_fq64(20.0))))
++         = (2 * of_f64(mul_f64(a, to_fq64(10.0)))).
++
++------------------------------------------------------------
+diff --git a/plugins/wp/tests/wp_acsl/oracle/float_non_finite.1.res.oracle b/plugins/wp/tests/wp_acsl/oracle/float_non_finite.1.res.oracle
+new file mode 100644
+index 0000000000..6030aac5c7
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/float_non_finite.1.res.oracle
+@@ -0,0 +1,82 @@
++# frama-c -wp -wp-rte [...]
++[kernel] Parsing float_non_finite.i (no preprocessing)
++[kernel:parser:decimal-float] float_non_finite.i:10: Warning: 
++  Floating-point constant 1e308 is not represented exactly. Will use 0x1.1ccf385ebc8a0p1023.
++  (warn-once: no further messages from category 'parser:decimal-float' will be emitted)
++[wp] Running WP plugin...
++[wp] Warning: Skipped RTE guards: unaligned pointers (\aligned not supported)
++[wp] Warning: Skipped RTE guards: invalid function pointer calls (\valid_function not supported)
++[rte:annot] annotating function ovf_mul
++[rte:annot] annotating function ovf_lit
++[wp] [Valid] Goal ovf_mul_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal ovf_mul_terminates (Cfg) (Trivial)
++[wp] [Valid] Goal ovf_lit_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal ovf_lit_terminates (Cfg) (Trivial)
++[wp] float_non_finite.i:19: Warning: Non-finite floating-point constant
++[wp] float_non_finite.i:19: Warning: Unexpected constant literal "1e40f"
++[wp] 6 goals scheduled
++[wp] 6 goals generated
++
++Goal Assertion 'rte,is_nan_or_infinite' ("float_non_finite.i", line 11, characters 14-22):
++Prove: is_finite_f64(mul_f64(to_fq64(100000000000000001097906362944045541740492309677311846336810682903157585404911491537163328978494688899061249669721172515611590283743140088328307009198146046031271664502933027185697489699588559043338384466165001178426897626212945177628091195786707458122783970171784415105291802893207873272974885715430223118336.0),
++                       to_fq64(10.0))).
++
++------------------------------------------------------------
++
++Goal Assertion 'rte,is_nan_or_infinite' ("float_non_finite.i", line 12, characters 14-22):
++Let a = to_fq64(100000000000000001097906362944045541740492309677311846336810682903157585404911491537163328978494688899061249669721172515611590283743140088328307009198146046031271664502933027185697489699588559043338384466165001178426897626212945177628091195786707458122783970171784415105291802893207873272974885715430223118336.0).
++Assume {
++  (* Assertion 'rte,is_nan_or_infinite' *)
++  Have: is_finite_f64(mul_f64(a, to_fq64(10.0))).
++}
++Prove: is_finite_f64(mul_f64(a, to_fq64(20.0))).
++
++------------------------------------------------------------
++
++Goal Check 'plus1_bad' ("float_non_finite.i", line 13, characters 24-36):
++Let a = to_fq64(100000000000000001097906362944045541740492309677311846336810682903157585404911491537163328978494688899061249669721172515611590283743140088328307009198146046031271664502933027185697489699588559043338384466165001178426897626212945177628091195786707458122783970171784415105291802893207873272974885715430223118336.0).
++Assume {
++  (* Assertion 'rte,is_nan_or_infinite' *)
++  Have: is_finite_f64(mul_f64(a, to_fq64(10.0))).
++  (* Assertion 'rte,is_nan_or_infinite' *)
++  Have: is_finite_f64(mul_f64(a, to_fq64(20.0))).
++}
++Prove: (1.0 + of_f64(mul_f64(a, to_fq64(10.0))))
++         = of_f64(mul_f64(a, to_fq64(20.0))).
++
++------------------------------------------------------------
++
++Goal Check 'twice_bad' ("float_non_finite.i", line 14, characters 25-41):
++Let a = to_fq64(100000000000000001097906362944045541740492309677311846336810682903157585404911491537163328978494688899061249669721172515611590283743140088328307009198146046031271664502933027185697489699588559043338384466165001178426897626212945177628091195786707458122783970171784415105291802893207873272974885715430223118336.0).
++Assume {
++  (* Assertion 'rte,is_nan_or_infinite' *)
++  Have: is_finite_f64(mul_f64(a, to_fq64(10.0))).
++  (* Assertion 'rte,is_nan_or_infinite' *)
++  Have: is_finite_f64(mul_f64(a, to_fq64(20.0))).
++}
++Prove: (5.0 + of_f64(mul_f64(a, to_fq64(20.0))))
++         = (2 * of_f64(mul_f64(a, to_fq64(10.0)))).
++
++------------------------------------------------------------
++
++Goal Assertion 'rte,is_nan_or_infinite' ("float_non_finite.i", line 19, characters 13-18):
++float_non_finite.i:19: warning from wp:
++ - Warning: Hide sub-term definition
++   Reason: Unexpected constant literal "1e40f"
++Prove: is_finite_f32(to_f32(w)).
++
++------------------------------------------------------------
++
++Goal Check 'lit_bad' ("float_non_finite.i", line 20, characters 22-34):
++float_non_finite.i:19: warning from wp:
++ - Warning: Hide sub-term definition
++   Reason: Unexpected constant literal "1e40f"
++Assume {
++  Warning[wp]: Unexpected constant literal "1e40f"
++  (Hide sub-term definition).
++  (* Assertion 'rte,is_nan_or_infinite' *)
++  Have: is_finite_f32(to_f32(w)).
++}
++Prove: false.
++
++------------------------------------------------------------
+-- 
+2.47.3
+

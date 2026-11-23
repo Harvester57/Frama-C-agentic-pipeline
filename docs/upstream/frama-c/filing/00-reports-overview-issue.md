@@ -94,6 +94,11 @@ wrong proof in 47; patches ready, and 45's patch is now built too).*
 pointers in `printf`-family calls (E-ACSL, reference 50 in the annex; validated on `master`
 `189053d4a2` and `34.0~beta`, patch ready).*
 
+*Edit, 23 November: re-validated `46` (`<sched.h>`) and the remaining hunt findings on `master`
+`189053d4a2` and `34.0~beta` (patches ready for `46` and every kept hunt finding except `N1`,
+which stays a design question; `H9`, `L6`, and `N21` dropped/deferred), and corrected factual
+details in annex rows `N18`, `L4`, `H15`, `N6`, `N12`, `N5`, `N11`, `H12`, and `N20`.*
+
 One of them is a question before it is a report, because the behaviour is deliberate.
 
 **Enumeration constants.** Since the change "Fix enumeration typing by making sure all items are
@@ -124,7 +129,7 @@ The others, by component. I listed only those where an analysis gives a wrong an
 | :-- | :-- |
 | Libc | `pclose`: the `requires` and the `ensures` contradict each other, so WP proves `\false` after a call. |
 | Libc | `strlcat`: the `ensures` states the result against `strlen(dest)` after the call, and the `assigns` includes `dest[n]`. For `char f[8] = "abcdef";`, `strlcat(f, "x", 3)` returns 4 and Eva gives `{7}` without an alarm; WP proves `\result == strlen(d) + strlen(s)` after the call for a caller where the result is 4 and the sum is 6. I have a patch for this one. |
-| Libc | `sigaction` with a non-null `oldact`: Eva reports "this postcondition evaluates to false" and the code after the call is dead. `getpwnam_r`, `getpwuid_r`: the success branch is dead for Eva. |
+| Libc | `sigaction` with a non-null `oldact`: Eva reports "this postcondition evaluates to false" and the code after the call is dead. `getpwnam_r`, `getpwuid_r` (and `getut*_r` in `utmp.h`): the success branch is dead for Eva. |
 | Libc | `syslog` in a file that includes only `<syslog.h>`: the string preconditions are not generated, and an unterminated `%s` argument raises no alarm. |
 | WP | After the warning `void object`, a `void` object is sized as an `int`: for `char buf[8]; void *p = buf;`, `\block_length(p) == 32` is proved. Under `-wp-model Bytes`, `(char *)(p + 4) == buf + 16` is proved. |
 | WP | `\floor`, `\ceil`, `\truncate` and float-to-integer casts of a constant go through an OCaml `float` and `int`: `\floor(0.99999999999999999999) == 1` is proved, and so is a false post-condition on `(long long)d` with `d = 5e18`. |
@@ -163,10 +168,11 @@ Thank you for the triage so far, and for opening the fork settings.
 ### Annex: every finding that is not filed
 
 One line each, so that you can say which ones you want. The references are my own labels (the
-gaps are findings I dropped). Each has a reproducer of a few lines, run on `master`
-(`b80fcac74f`, or `189053d4a2` for reference 50) and on `34.0~beta`, except the two marked
-"`master` only" and the four MetAcsl reports (45, 47 to 49), which were run on Frama-C `34.0~beta`
-(MetAcsl `0.12~beta` and `pub/meta` `4f43801390`).
+gaps are findings I dropped). Each has a reproducer of a few lines, validated on `master`
+(`189053d4a2`, initially `b80fcac74f`) and on `34.0~beta`, except `N21` ("`master` only") and the
+four MetAcsl reports (45, 47 to 49), which were run on Frama-C `34.0~beta` (MetAcsl `0.12~beta`
+and `pub/meta` `4f43801390`). Every non-dropped row except `N1` and `old-guard` now has a
+validated patch ready (`H10`+`N4`, `H6`+`H18`, `H3`+`N2`, and `H12`+`N14` are paired).
 
 **Kernel, C front end**
 
@@ -177,8 +183,8 @@ gaps are findings I dropped). Each has a reproducer of a few lines, run on `mast
 | H8 | A multi-character constant is `unsigned long` (`unsigned long long` with four characters), not `int`: `('ab' - 30000) < 0` is 0 and `sizeof('ab')` is 8. | wrong status |
 | N7 | A hexadecimal floating-point literal with an `f` suffix is rounded twice: `0x1.0000010000000001p0f` is read as `0x1p0` (gcc: `0x1.000002p+0`). | wrong value, contrived |
 | N13 | A universal character name in a literal is rejected ("Unrecognized escape sequence"). | valid C99 rejected |
-| N18 | `int c = '\777';` is accepted without a message, as 511 (gcc warns; C11 6.4.4.4p9 is a constraint). `master` only. | minor |
-| H9 | UTF-8 bytes in a wide literal give one `wchar_t` per byte (`L'€'` is 172), silently. Implementation-defined, so only a request for a warning or a sentence in the manual. | documentation |
+| N18 | `int c = '\777';` (and `'\x1ff'`) is accepted without a message, as 511 (gcc warns; C11 6.4.4.4p9 is a constraint). Reproduces on both `master` and `34.0~beta`. | minor |
+| H9 | UTF-8 bytes in a wide literal give one `wchar_t` per byte (`L'€'` is 172), silently. Implementation-defined (dropped as not a bug). | documentation (dropped) |
 
 **Kernel, ACSL front end**
 
@@ -190,10 +196,10 @@ gaps are findings I dropped). Each has a reproducer of a few lines, run on `mast
 | H7 | A string literal is typed from its text before the escapes are read: `sizeof("\n") == 3` is proved, and `sizeof` of a macro such as `"hello\n"` is off by one in a contract. | wrong proof, wrong status |
 | N9 | Adjacent string literals are concatenated before the escapes are read: `"\x4" "1"` is `"A"`. | wrong value, contrived |
 | N10 | An escape that the logic lexer does not list (`'\e'`) is kept as a backslash and a character, without a message. | wrong value, contrived |
-| N11 | In a wide string, `8` and `9` count as octal digits: `L"\18"[0]` is 16. | wrong value, contrived |
+| N11 | In a wide string, `8` and `9` count as octal digits (`L"\18"[0]` is 16) and `\v` is missing. | wrong value, contrived |
 | H18 | `'\777'`, or `L'\777'` (valid C), in an annotation: `Invalid_argument("Char.chr")`. | internal error |
 | N19 | An unbalanced quote in an annotation (or a C23 digit separator): a user error, then "too few annotations in result file while preprocessing annotations". | internal error |
-| N21 | `//@ check 10uu == 10;` aborts Frama-C even with `-kernel-warn-key annot-error=active`. `master` only. | minor |
+| N21 | `//@ check 10uu == 10;` aborts Frama-C even with `-kernel-warn-key annot-error=active`. `master` only (deferred). | minor (deferred) |
 
 **Kernel, printer**
 
@@ -201,9 +207,9 @@ gaps are findings I dropped). Each has a reproducer of a few lines, run on `mast
 | :-- | :-- | :-- |
 | H10 | A `double` constant without source text is printed with 12 significant digits (after `-constfold`, which `e-acsl-gcc` passes by default, after `-scf`, and for constants that E-ACSL builds): `1.0 / 3.0` becomes `0.333333333333`. | the printed program computes other values; wrong run-time check |
 | N4 | A non-finite constant is printed `inf`, `-inf` or `nan`: `double a = 1.0 / 0.0;` does not compile after `-constfold`, so default `e-acsl-gcc` fails on it. | the printed program does not compile |
-| N5 | An `__int128` constant is printed with the suffix `LL`; gcc truncates it with a warning only. | the printed program computes other values |
-| H12 | A wide character of 0x200 or more is printed as a universal character name in the four-digit form, with more digits when the value needs them: above 0xFFFF a compiler reads another value, and Frama-C cannot read any of them back (N13). | the printed program differs |
-| N12 | A wide string in an annotation is escaped twice, so the printed file means something else. | the printed annotation differs |
+| N5 | An `__int128` constant is printed with the suffix `LL`; gcc truncates it with a warning, clang fails to compile, and Frama-C rejects its own output on re-parse (`Cannot represent the integer`). | the printed program computes other values / fails re-parse |
+| H12 | A wide character of 0x200 or more is printed as a universal character name in the four-digit form, with more digits when the value needs them: above 0xFFFF a compiler reads another value, surrogates (`\xD800`) fail gcc, values `>= 2^32` crash (`Invalid_argument("Cprint.escape_string_intlist")`), and Frama-C cannot read any of them back (N13). | the printed program differs / internal error |
+| N12 | A wide string in an annotation is escaped twice, so the printed file means something else, and empty `L""` prints as invalid `L` (`unbound logic variable L`). | the printed annotation differs / fails re-parse |
 | N14 | Trigraphs are not protected in a wide string: `L"a?\?!b"` is printed `L"a??!b"`, and `e-acsl-gcc` compiles with `-std=c99`. | the printed program differs, contrived |
 
 **WP**
@@ -233,10 +239,10 @@ gaps are findings I dropped). Each has a reproducer of a few lines, run on `mast
 | 43 | A real constant with an exponent (`1e-9`) stops Frama-C with `Not_a_decimal`, and `0.1L` is 0 at run time. Patch ready. | unexpected error, wrong run-time check |
 | 50 | `--validate-format-strings`: any `enum` argument to a `printf`-family function crashes Frama-C with `Assertion failed` in `plugins/e-acsl/src/libraries/functions.ml:156` (`get_printf_argument_str`), and a pointer to an `enum` (such as `&s` for `%n`) aborts with `unexpected argument type in printf`. Patch ready (stacks cleanly with !48). | internal error |
 | H11 | `(double)` of a real is truncated (`mpq_get_d`), not rounded: with `double e = 0.1;`, `e == (double)0.1` fails, and it passes for the `double` just below 0.1. | wrong run-time check, both ways |
-| H15 | `x < 1e40f` in an annotation gives `x < inf` in the generated code. | the generated code does not compile |
+| H15 | `x < 1e40f` in an annotation gives `x < inf` in the generated code, and `0.1 < 1e40f` passes infinity to `__gmpq_set_d` (`SIGFPE` at run time, independent of N4). | the generated code does not compile / runtime crash |
 | old-guard | An `\old` or `\at` term is evaluated at its label even when a guard (`\old(p) == \null ==> ...`, disjunction, or `assumes`) makes it unneeded (`Translate_ats.for_stmt`): valid calls abort at run time with default options, including Frama-C's libc `recvfrom(..., NULL, NULL)` under `e-acsl-gcc -L`. | false alarm on valid code |
-| L4 | `typing was not performed on construct 1` on a call to `stpncpy` or `strlcat`, and on a quantifier bounded by a logic function without a definition. Possibly related to #2806. For `strlcat` it comes from the `ensures` clause of 44 (Libc): with that clause rewritten, the translation ends normally. | internal error |
-| L6 | A call to `getaddrinfo` prints lines `Failure: Interval inference was not performed on construct \result`, with exit code 0. | cosmetic |
+| L4 | `typing was not performed on construct 1` on a call to `stpncpy` or `strlcat`, and on a quantifier bounded by a logic function without a definition. Confirmed distinct from #2806 (still aborts on top of !37). For `strlcat` it comes from the `ensures` clause of 44 (Libc): with that clause rewritten, the translation ends normally. | internal error |
+| L6 | A call to `getaddrinfo` prints lines `Failure: Interval inference was not performed on construct \result`, with exit code 0 (dropped as cosmetic). | cosmetic (dropped) |
 
 **Libc**
 
@@ -245,10 +251,10 @@ gaps are findings I dropped). Each has a reproducer of a few lines, run on `mast
 | L2 | `pclose`: the `requires` and the `ensures` contradict each other, so WP proves `\false` after a call. | wrong proof |
 | 44 | `strlcat`: `ensures bounded_result: \result == strlen(dest) + strlen(src);` reads `strlen(dest)` after the call, and `assigns dest[strlen(dest)..n]` includes `dest[n]`. Eva gives `{7}` for a call that returns 4, without an alarm, and considers a structure field that follows the buffer modified; WP proves a false postcondition for a caller. Also, `requires separation` covers only `src+(0..strnlen(src, n-1))`, while the function reads `src` up to its NUL: `strlcat(buf + 16, buf, 8)` on `char buf[32] = "0123456789abcdefghij";` writes over the NUL of `src` with every precondition valid. Patch ready. | wrong value for Eva, wrong proof, lost alarm |
 | L3 | `sigaction` with a non-null `oldact`: Eva reports "this postcondition evaluates to false" and the code after the call is dead. | lost code for Eva |
-| N6 | `getpwnam_r`, `getpwuid_r`: Eva gives `NULL` as the only result, so the success branch is dead. | lost code for Eva |
+| N6 | `getpwnam_r`, `getpwuid_r` (`pwd.h`), and `getutent_r`, `getutid_r`, `getutline_r` (`utmp.h`): Eva gives `NULL` as the only result, so the success branch is dead. | lost code for Eva |
 | L5 | `syslog` in a file that includes only `<syslog.h>`: "Unable to locate ACSL predicate valid_read_string", and an unterminated `%s` argument raises no alarm. | lost alarm |
-| N20 | `wprintf` in a file that includes only `<wchar.h>`: "Unable to locate global __fc_stdout"; the effect on the stream is missing. | minor |
-| 46 | `<sched.h>` lacks glibc's `cpu_set_t`, `CPU_*` macros and `sched_setaffinity`/`sched_getaffinity` under `_GNU_SOURCE`. | header gap |
+| N20 | `wprintf`/`wscanf` in a file that includes only `<wchar.h>`: "Unable to locate global `__fc_stdout`/`__fc_stdin`"; the effect on the stream is missing. | minor |
+| 46 | `<sched.h>` lacks glibc's `cpu_set_t`, `CPU_*` macros and `sched_setaffinity`/`sched_getaffinity` under `_GNU_SOURCE`. Patch ready. | header gap |
 
 **Other**
 

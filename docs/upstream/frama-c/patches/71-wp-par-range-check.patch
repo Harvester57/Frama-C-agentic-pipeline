@@ -1,0 +1,70 @@
+From 74b787cc7bd66a461943b17db88f9f621c694a50 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:59:46 +0000
+Subject: [PATCH] [wp] reject -wp-par values below 1 at option parsing time
+
+Wp_parameters.Procs (`-wp-par`) had no range constraint, so `-wp-par 0`
+and negative values passed CLI parsing and crashed in Why3's
+`Prove_client.set_max_running_provers` with
+`Unexpected error (Invalid_argument("Prove_client.set_max_running_provers"))`.
+
+Add `Procs.set_range ~min:1 ~max:max_int` in
+`plugins/wp/src/wp_parameters.ml`.
+
+New test: wp_acsl/par_range.i.
+---
+ plugins/wp/src/wp_parameters.ml                        | 2 ++
+ plugins/wp/tests/wp_acsl/oracle/par_range.0.res.oracle | 2 ++
+ plugins/wp/tests/wp_acsl/oracle/par_range.1.res.oracle | 2 ++
+ plugins/wp/tests/wp_acsl/par_range.i                   | 8 ++++++++
+ 4 files changed, 14 insertions(+)
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/par_range.0.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/par_range.1.res.oracle
+ create mode 100644 plugins/wp/tests/wp_acsl/par_range.i
+
+diff --git a/plugins/wp/src/wp_parameters.ml b/plugins/wp/src/wp_parameters.ml
+index 8b43eb7cee..e6f5cf31ef 100644
+--- a/plugins/wp/src/wp_parameters.ml
++++ b/plugins/wp/src/wp_parameters.ml
+@@ -869,6 +869,8 @@ module Procs =
+         "Number of parallel proof process (default: %d)" default
+   end)
+ 
++let () = Procs.set_range ~min:1 ~max:max_int
++
+ let () = Parameter_customize.set_group wp_prover
+ module ProofTrace =
+   False
+diff --git a/plugins/wp/tests/wp_acsl/oracle/par_range.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle/par_range.0.res.oracle
+new file mode 100644
+index 0000000000..7fee935263
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/par_range.0.res.oracle
+@@ -0,0 +1,2 @@
++[wp] User Error: argument of -wp-par must be at least 1.
++[kernel] Plug-in wp aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/oracle/par_range.1.res.oracle b/plugins/wp/tests/wp_acsl/oracle/par_range.1.res.oracle
+new file mode 100644
+index 0000000000..7fee935263
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/par_range.1.res.oracle
+@@ -0,0 +1,2 @@
++[wp] User Error: argument of -wp-par must be at least 1.
++[kernel] Plug-in wp aborted: invalid user input.
+diff --git a/plugins/wp/tests/wp_acsl/par_range.i b/plugins/wp/tests/wp_acsl/par_range.i
+new file mode 100644
+index 0000000000..358e6a41bb
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/par_range.i
+@@ -0,0 +1,8 @@
++/* run.config
++   EXIT: 1
++   OPT: -wp-prover alt-ergo -wp-par 0
++   OPT: -wp-prover alt-ergo -wp-par -1
++*/
++
++/*@ ensures \result == x + 1; */
++int inc(int x) { return x + 1; }
+-- 
+2.47.3
+

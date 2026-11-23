@@ -1,0 +1,363 @@
+From f283ac435f60a1f5d73e663cddcc18f47c294b8d Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 23 Nov 2026 00:00:47 +0000
+Subject: [PATCH] [kernel] decode ACSL hex/octal character and string escapes
+ without byte splitting or Char.chr crash
+
+---
+ src/kernel/internals/parsing/logic_lexer.mli  |  1 +
+ src/kernel/internals/parsing/logic_lexer.mll  | 73 +++++++++++++------
+ .../services/ast_queries/logic_typing.ml      | 27 ++++---
+ tests/spec/char_hex_oct_escapes.c             | 20 +++++
+ tests/spec/char_hex_oct_escapes_err.c         | 21 ++++++
+ .../oracle/char_hex_oct_escapes.0.res.oracle  | 21 ++++++
+ .../oracle/char_hex_oct_escapes.1.res.oracle  | 45 ++++++++++++
+ .../char_hex_oct_escapes_err.0.res.oracle     |  6 ++
+ .../char_hex_oct_escapes_err.1.res.oracle     |  6 ++
+ .../char_hex_oct_escapes_err.2.res.oracle     |  6 ++
+ 10 files changed, 194 insertions(+), 32 deletions(-)
+ create mode 100644 tests/spec/char_hex_oct_escapes.c
+ create mode 100644 tests/spec/char_hex_oct_escapes_err.c
+ create mode 100644 tests/spec/oracle/char_hex_oct_escapes.0.res.oracle
+ create mode 100644 tests/spec/oracle/char_hex_oct_escapes.1.res.oracle
+ create mode 100644 tests/spec/oracle/char_hex_oct_escapes_err.0.res.oracle
+ create mode 100644 tests/spec/oracle/char_hex_oct_escapes_err.1.res.oracle
+ create mode 100644 tests/spec/oracle/char_hex_oct_escapes_err.2.res.oracle
+
+diff --git a/src/kernel/internals/parsing/logic_lexer.mli b/src/kernel/internals/parsing/logic_lexer.mli
+index b07acd1896..f3936fa9fd 100644
+--- a/src/kernel/internals/parsing/logic_lexer.mli
++++ b/src/kernel/internals/parsing/logic_lexer.mli
+@@ -15,6 +15,7 @@ val token : Lexing.lexbuf -> Logic_parser.token
+ (** For plugins that need to call functions of [Logic_parser] themselves *)
+ 
+ val chr : Lexing.lexbuf -> string
++val chr_codes : Lexing.lexbuf -> int64 list
+ val is_acsl_keyword : string -> bool
+ 
+ 
+diff --git a/src/kernel/internals/parsing/logic_lexer.mll b/src/kernel/internals/parsing/logic_lexer.mll
+index 8b198bcbbc..e47a665fc8 100644
+--- a/src/kernel/internals/parsing/logic_lexer.mll
++++ b/src/kernel/internals/parsing/logic_lexer.mll
+@@ -437,12 +437,9 @@ rule token = parse
+   | '0' rD+ rIS?            { INT_CONSTANT (lexeme lexbuf) }
+   | rD+                     { INT_CONSTANT (lexeme lexbuf) }
+   | rD+ rIS                 { INT_CONSTANT (lexeme lexbuf) }
+-  | ('L'? "'" as prelude) (([^ '\\' '\'' '\n']|("\\"[^ '\n']))+ as content) "'"
++  | 'L'? "'" ([^ '\\' '\'' '\n']|("\\"[^ '\n']))+ "'"
+       {
+-        let b = Buffer.create 5 in
+-        Buffer.add_string b prelude;
+-        let lbf = Lexing.from_string content in
+-        INT_CONSTANT (chr b lbf ^ "'")
++        INT_CONSTANT (lexeme lexbuf)
+       }
+ (* floating-point literals, both decimal and hexadecimal *)
+   | rD+ rE rFS?
+@@ -526,28 +523,19 @@ and chr buffer = parse
+   | hex_escape
+       { let s = lexeme lexbuf in
+         let real_s = String.sub s 2 (String.length s - 2) in
+-        let rec add_one_char s =
+-          let l = String.length s in
+-          if l = 0 then ()
+-          else
+-          let h = int_of_digit s.[0] in
+-          let c,s =
+-            if l = 1 then (h,"")
+-            else
+-              (16*h + int_of_digit s.[1],
+-               String.sub s 2 (String.length s - 2))
+-          in
+-          Buffer.add_char buffer (Char.chr c); add_one_char s
+-        in add_one_char real_s; chr buffer lexbuf
++        let v = Z.of_string_base 16 real_s in
++        if Z.gt v (Z.of_int 255) then
++          lex_error lexbuf
++            (Format.asprintf "hexadecimal escape sequence out of range: %s" s);
++        Buffer.add_char buffer (Char.chr (Z.to_int v)); chr buffer lexbuf
+       }
+   | oct_escape
+       { let s = lexeme lexbuf in
+         let real_s = String.sub s 1 (String.length s - 1) in
+-        let rec value i s =
+-          if s = "" then i
+-          else value (8*i+int_of_digit s.[0])
+-            (String.sub s 1 (String.length s -1))
+-        in let c = value 0 real_s in
++        let c = int_of_string ("0o" ^ real_s) in
++        if c > 255 then
++          lex_error lexbuf
++            (Format.asprintf "octal escape sequence out of range: %s" s);
+         Buffer.add_char buffer (Char.chr c); chr buffer lexbuf
+       }
+   | escape
+@@ -617,6 +605,45 @@ and comment = parse
+   | eof  { lex_error lexbuf "non-terminating block-comment" }
+   | _    { comment lexbuf}
+ 
++and chr_codes = parse
++  | hex_escape
++      { let s = lexeme lexbuf in
++        let real_s = String.sub s 2 (String.length s - 2) in
++        let v = Z.of_string_base 16 real_s in
++        if Z.gt v (Z.of_int64 Int64.max_int) then
++          lex_error lexbuf
++            (Format.asprintf "hexadecimal escape sequence out of range: %s" s);
++        let code = Z.to_int64 v in
++        code :: chr_codes lexbuf
++      }
++  | oct_escape
++      { let s = lexeme lexbuf in
++        let real_s = String.sub s 1 (String.length s - 1) in
++        let code = Int64.of_int (int_of_string ("0o" ^ real_s)) in
++        code :: chr_codes lexbuf
++      }
++  | escape
++      { let c =
++          match (lexeme lexbuf).[1] with
++          | 'a' -> '\007'
++          | 'b' -> '\b'
++          | 'f' -> '\012'
++          | 'n' -> '\n'
++          | 'r' -> '\r'
++          | 't' -> '\t'
++          | 'v' -> '\011'
++          | '\'' -> '\''
++          | '"' -> '"'
++          | '?' -> '?'
++          | '\\' -> '\\'
++          | _ -> assert false
++        in
++        let code = Int64.of_int (Char.code c) in
++        code :: chr_codes lexbuf
++      }
++  | eof { [] }
++  | _ as c { let code = Int64.of_int (Char.code c) in code :: chr_codes lexbuf }
++
+ {
+   (* When Ocaml 4.11+ becomes mandatory, we can probably replace this with
+      Lexing.set_position. *)
+diff --git a/src/kernel/services/ast_queries/logic_typing.ml b/src/kernel/services/ast_queries/logic_typing.ml
+index 0c4e2734c9..7680d26e3a 100644
+--- a/src/kernel/services/ast_queries/logic_typing.ml
++++ b/src/kernel/services/ast_queries/logic_typing.ml
+@@ -1153,21 +1153,27 @@ struct
+       C.error loc "not a C type"
+ 
+   let parseInt loc s =
+-    let explode s =
+-      let l = ref [] in
+-      String.iter (fun c -> l:=Int64.of_int (Char.code c) :: !l) s;
+-      List.rev !l
++    let decode content =
++      try Logic_lexer.chr_codes (Lexing.from_string content)
++      with Logic_lexer.Error (_, msg) -> C.error loc "%s" msg
+     in
+     match String.get s 0 with
+     | 'L' -> (* L'wide_char' *)
+       let content = String.sub s 2 (String.length s - 3) in
+-      let tokens = explode content in
+-      let value = Cil.reduce_multichar (Machine.wchar_type ()) tokens
++      let tokens = decode content in
++      let value = Cil.reduce_multichar (Machine.wchar_type ()) tokens in
++      let value, _ =
++        Cil.truncateInteger64 (Machine.wchar_kind ()) (Z.of_int64 value)
+       in
+-      tinteger_s64 ~loc value
++      term ~loc (TConst (Integer (value, None))) Linteger
+     | '\'' -> (* 'char' *)
+       let content = String.sub s 1 (String.length s - 2) in
+-      let tokens = explode content in
++      let tokens = decode content in
++      List.iter
++        (fun v ->
++           if Int64.compare v 0L < 0 || Int64.compare v 255L > 0 then
++             C.error loc "escape sequence out of range: 0x%Lx" v)
++        tokens;
+       let value,_= Cil.interpret_character_constant tokens in
+       term ~loc (TConst (constant_to_lconstant value)) Linteger
+     | _ -> Cil.parseIntLogic ~loc s
+@@ -3453,7 +3459,10 @@ struct
+       let t = ctxt.type_term ctxt env t in
+       { t with term_name = name :: t.term_name }
+     | _ ->
+-      let t', ty = term_node ctxt env t.lexpr_loc t.lexpr_node in
++      let t', ty =
++        try term_node ctxt env t.lexpr_loc t.lexpr_node
++        with Logic_lexer.Error (_, msg) -> ctxt.error t.lexpr_loc "%s" msg
++      in
+       { term_node = t'; term_loc=t.lexpr_loc; term_type=ty; term_name = [] }
+ 
+   let predicate ctxt env p0 =
+diff --git a/tests/spec/char_hex_oct_escapes.c b/tests/spec/char_hex_oct_escapes.c
+new file mode 100644
+index 0000000000..d97b2b2be7
+--- /dev/null
++++ b/tests/spec/char_hex_oct_escapes.c
+@@ -0,0 +1,20 @@
++/* run.config
++   STDOPT:
++   STDOPT: +"-eva"
++*/
++
++#include <stddef.h>
++#include <string.h>
++
++int main(void) {
++  char c = '\x041';
++  wchar_t w = L'\x20AC';
++  wchar_t wo = L'\777';
++  wchar_t w2 = L'ab';
++  //@ check c_hex: '\x041' == 'A' && c == '\x041';
++  //@ check w_hex: L'\x20AC' == 0x20AC && w == L'\x20AC';
++  //@ check w_oct: L'\777' == 511 && wo == L'\777';
++  //@ check w_multi: w2 == L'ab';
++  //@ check s_hex: strlen("\x041") == 1;
++  return 0;
++}
+diff --git a/tests/spec/char_hex_oct_escapes_err.c b/tests/spec/char_hex_oct_escapes_err.c
+new file mode 100644
+index 0000000000..b428054b4e
+--- /dev/null
++++ b/tests/spec/char_hex_oct_escapes_err.c
+@@ -0,0 +1,21 @@
++/* run.config
++   EXIT: 1
++   STDOPT: +"-kernel-warn-key annot-error=error -cpp-extra-args=-DCASE_OCT_CHAR"
++   STDOPT: +"-kernel-warn-key annot-error=error -cpp-extra-args=-DCASE_OCT_STR"
++   STDOPT: +"-kernel-warn-key annot-error=error -cpp-extra-args=-DCASE_HEX_STR"
++*/
++
++#include <string.h>
++
++int main(void) {
++#ifdef CASE_OCT_CHAR
++  //@ check bad_oct_char: '\777' == 0;
++#endif
++#ifdef CASE_OCT_STR
++  //@ check bad_oct_str: strlen("\777") == 1;
++#endif
++#ifdef CASE_HEX_STR
++  //@ check bad_hex_str: strlen("\x1ff") == 1;
++#endif
++  return 0;
++}
+diff --git a/tests/spec/oracle/char_hex_oct_escapes.0.res.oracle b/tests/spec/oracle/char_hex_oct_escapes.0.res.oracle
+new file mode 100644
+index 0000000000..78a3ab64e9
+--- /dev/null
++++ b/tests/spec/oracle/char_hex_oct_escapes.0.res.oracle
+@@ -0,0 +1,21 @@
++[kernel] Parsing char_hex_oct_escapes.c (with preprocessing)
++/* Generated by Frama-C */
++#include "stddef.h"
++#include "string.h"
++int main(void)
++{
++  int __retres;
++  char c = (char)'A';
++  wchar_t w = 8364L;
++  wchar_t wo = 511L;
++  wchar_t w2 = 98L;
++  /*@ check c_hex: 'A' ≡ 'A' ∧ c ≡ 'A'; */ ;
++  /*@ check w_hex: 8364 ≡ 0x20AC ∧ w ≡ 8364; */ ;
++  /*@ check w_oct: 511 ≡ 511 ∧ wo ≡ 511; */ ;
++  /*@ check w_multi: w2 ≡ 98; */ ;
++  /*@ check s_hex: strlen((char [])"A") ≡ 1; */ ;
++  __retres = 0;
++  return __retres;
++}
++
++
+diff --git a/tests/spec/oracle/char_hex_oct_escapes.1.res.oracle b/tests/spec/oracle/char_hex_oct_escapes.1.res.oracle
+new file mode 100644
+index 0000000000..c1aab7c0bf
+--- /dev/null
++++ b/tests/spec/oracle/char_hex_oct_escapes.1.res.oracle
+@@ -0,0 +1,45 @@
++[kernel] Parsing char_hex_oct_escapes.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:initial-state] Values of globals at initialization
++  
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  c ∈ {65}
++  w ∈ {8364}
++  wo ∈ {511}
++  w2 ∈ {98}
++  __retres ∈ {0}
++[eva:summary] ====== ANALYSIS SUMMARY ======
++  ----------------------------------------------------------------------------
++  1 function analyzed (out of 1): 100% coverage.
++  In this function, 11 statements reached (out of 11): 100% coverage.
++  ----------------------------------------------------------------------------
++  No errors or warnings raised during the analysis.
++  ----------------------------------------------------------------------------
++  0 alarms generated by the analysis.
++  ----------------------------------------------------------------------------
++  Evaluation of the logical properties reached by the analysis:
++    Assertions        5 valid     0 unknown     0 invalid      5 total
++    Preconditions     0 valid     0 unknown     0 invalid      0 total
++  100% of the logical properties reached have been proven.
++  ----------------------------------------------------------------------------
++/* Generated by Frama-C */
++#include "stddef.h"
++#include "string.h"
++int main(void)
++{
++  int __retres;
++  char c = (char)'A';
++  wchar_t w = 8364L;
++  wchar_t wo = 511L;
++  wchar_t w2 = 98L;
++  /*@ check c_hex: 'A' ≡ 'A' ∧ c ≡ 'A'; */ ;
++  /*@ check w_hex: 8364 ≡ 0x20AC ∧ w ≡ 8364; */ ;
++  /*@ check w_oct: 511 ≡ 511 ∧ wo ≡ 511; */ ;
++  /*@ check w_multi: w2 ≡ 98; */ ;
++  /*@ check s_hex: strlen((char [])"A") ≡ 1; */ ;
++  __retres = 0;
++  return __retres;
++}
++
++
+diff --git a/tests/spec/oracle/char_hex_oct_escapes_err.0.res.oracle b/tests/spec/oracle/char_hex_oct_escapes_err.0.res.oracle
+new file mode 100644
+index 0000000000..74648e28c5
+--- /dev/null
++++ b/tests/spec/oracle/char_hex_oct_escapes_err.0.res.oracle
+@@ -0,0 +1,6 @@
++[kernel] Parsing char_hex_oct_escapes_err.c (with preprocessing)
++[kernel:annot-error] char_hex_oct_escapes_err.c:12: User Error: 
++  escape sequence out of range: 0x1ff. Ignoring code annotation
++[kernel] User Error: stopping on file "char_hex_oct_escapes_err.c" that has errors. Add
++  '-kernel-msg-key pp' for preprocessing command.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/spec/oracle/char_hex_oct_escapes_err.1.res.oracle b/tests/spec/oracle/char_hex_oct_escapes_err.1.res.oracle
+new file mode 100644
+index 0000000000..6468bac4eb
+--- /dev/null
++++ b/tests/spec/oracle/char_hex_oct_escapes_err.1.res.oracle
+@@ -0,0 +1,6 @@
++[kernel] Parsing char_hex_oct_escapes_err.c (with preprocessing)
++[kernel:annot-error] char_hex_oct_escapes_err.c:15: User Error: 
++  lexical error, octal escape sequence out of range: \777. Ignoring code annotation
++[kernel] User Error: stopping on file "char_hex_oct_escapes_err.c" that has errors. Add
++  '-kernel-msg-key pp' for preprocessing command.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/spec/oracle/char_hex_oct_escapes_err.2.res.oracle b/tests/spec/oracle/char_hex_oct_escapes_err.2.res.oracle
+new file mode 100644
+index 0000000000..bae90c6f40
+--- /dev/null
++++ b/tests/spec/oracle/char_hex_oct_escapes_err.2.res.oracle
+@@ -0,0 +1,6 @@
++[kernel] Parsing char_hex_oct_escapes_err.c (with preprocessing)
++[kernel:annot-error] char_hex_oct_escapes_err.c:18: User Error: 
++  lexical error, hexadecimal escape sequence out of range: \x1ff. Ignoring code annotation
++[kernel] User Error: stopping on file "char_hex_oct_escapes_err.c" that has errors. Add
++  '-kernel-msg-key pp' for preprocessing command.
++[kernel] Frama-C aborted: invalid user input.
+-- 
+2.47.3
+

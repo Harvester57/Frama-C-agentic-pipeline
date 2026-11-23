@@ -1,0 +1,219 @@
+From a848f293f215c4e87f5ae607e87508e7927965d2 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:53:37 +0000
+Subject: [PATCH] [wp] avoid double rounding when converting rational constants
+ to float32
+
+Cfloat.qmake rounded rational constants to IEEE 754 binary32 via
+`fmake Float32 (Q.to_float q)`, which first rounds to binary64 and then
+rounds a second time to binary32. Constants close to a binary32
+midpoint or just below the `FLT_MAX` overflow threshold were rounded to
+the wrong `float` (proving
+`(float)1.0000000596046447753906250000000000000001 == 1.0` and
+`(float)1152921573326323713LL == 1152921504606846976.0`, and refuting
+`(float)340282356779733661637539395458142568447.0 == FLT_MAX`).
+
+Round rational constants directly to IEEE 754 binary32 (round to
+nearest even, handling normals, subnormals, and overflow) in
+`Cfloat.qmake` for `Float32`.
+
+New test: wp_acsl/float_double_rounding.i.
+---
+ plugins/wp/src/Cfloat.ml                      | 44 +++++++++-
+ .../wp/tests/wp_acsl/float_double_rounding.i  | 35 ++++++++
+ .../oracle/float_double_rounding.0.res.oracle | 86 +++++++++++++++++++
+ 3 files changed, 164 insertions(+), 1 deletion(-)
+ create mode 100644 plugins/wp/tests/wp_acsl/float_double_rounding.i
+ create mode 100644 plugins/wp/tests/wp_acsl/oracle/float_double_rounding.0.res.oracle
+
+diff --git a/plugins/wp/src/Cfloat.ml b/plugins/wp/src/Cfloat.ml
+index d87f66ff5d..6b5bf589fc 100644
+--- a/plugins/wp/src/Cfloat.ml
++++ b/plugins/wp/src/Cfloat.ml
+@@ -128,7 +128,49 @@ let fmake ulp value = match ulp with
+   | Float32 -> F.e_fun !@fq32 [F.e_float (rfloat value)]
+   | Float64 -> F.e_fun !@fq64 [F.e_float value]
+ 
+-let qmake ulp q = fmake ulp (Q.to_float q)
++(* Exact round-to-nearest-even of a rational [q] directly to IEEE 754 binary32,
++   avoiding double rounding through binary64. *)
++let q_to_float32 q =
++  match Q.classify q with
++  | Q.ZERO -> 0.0
++  | Q.INF -> infinity
++  | Q.MINF -> neg_infinity
++  | Q.UNDEF -> nan
++  | Q.NZERO ->
++    let neg = Q.sign q < 0 in
++    let n = Z.abs q.Q.num in
++    let d = q.Q.den in
++    let e = Z.numbits n - Z.numbits d in
++    let below =
++      if e >= 0 then Z.lt n (Z.shift_left d e)
++      else Z.lt (Z.shift_left n (-e)) d
++    in
++    let e = if below then e - 1 else e in
++    if e > 127 then
++      if neg then neg_infinity else infinity
++    else if e < -150 then
++      0.0
++    else
++      let shift = if e >= -126 then e - 23 else -149 in
++      let num, den =
++        if shift >= 0 then n, Z.shift_left d shift
++        else Z.shift_left n (-shift), d
++      in
++      let quo, rem = Z.ediv_rem num den in
++      let cmp = Z.compare (Z.shift_left rem 1) den in
++      let m =
++        if cmp > 0 || (cmp = 0 && Z.is_odd quo) then Z.succ quo else quo
++      in
++      if e = 127 && Z.equal m (Z.shift_left Z.one 24) then
++        if neg then neg_infinity else infinity
++      else
++        let v = ldexp (Z.to_float m) shift in
++        if neg then -. v else v
++
++let qmake ulp q =
++  match ulp with
++  | Float32 -> fmake Float32 (q_to_float32 q)
++  | Float64 -> fmake Float64 (Q.to_float q)
+ 
+ let re_float = Str.regexp ".*[fldFLD]$"
+ let re_mantissa = Str.regexp "[-+]?[0-9]*"
+diff --git a/plugins/wp/tests/wp_acsl/float_double_rounding.i b/plugins/wp/tests/wp_acsl/float_double_rounding.i
+new file mode 100644
+index 0000000000..fb3c8ea482
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/float_double_rounding.i
+@@ -0,0 +1,35 @@
++/* run.config
++   OPT:
++*/
++
++/*@ check lemma dr_above_mid_ok:
++      (float)1.0000000596046447753906250000000000000001
++      == 1.00000011920928955078125;
++    check lemma dr_above_mid_bad:
++      (float)1.0000000596046447753906250000000000000001 == 1.0;
++    check lemma dr_exact_tie_even_down:
++      (float)(1.0 + 1.0 / 16777216.0) == 1.0;
++    check lemma dr_exact_tie_even_up:
++      (float)(1.0 + 3.0 / 16777216.0) == (1.0 + 1.0 / 4194304.0);
++    check lemma dr_neg_above_mid_ok:
++      (float)(-1.0000000596046447753906250000000000000001)
++      == -1.00000011920928955078125;
++    check lemma dr_fltmax_ok:
++      (float)340282356779733661637539395458142568447.0
++      == 340282346638528859811704183484516925440.0;
++    check lemma dr_subnormal_ok:
++      (float)(1.0 / 1427247692705959881058285969449495136382746624.0 + 1e-65)
++      == (1.0 / 713623846352979940529142984724747568191373312.0); */
++
++/* x = 2^60 + 2^36 + 1; nearest float is 2^60 + 2^37 = 1152921642045800448 */
++/*@ ensures \result == 1152921642045800448.0; */
++float to_float_ok(void) {
++  long long x = 1152921573326323713LL;
++  return (float)x;
++}
++
++/*@ ensures \result == 1152921504606846976.0; */
++float to_float_bad(void) {
++  long long x = 1152921573326323713LL;
++  return (float)x;
++}
+diff --git a/plugins/wp/tests/wp_acsl/oracle/float_double_rounding.0.res.oracle b/plugins/wp/tests/wp_acsl/oracle/float_double_rounding.0.res.oracle
+new file mode 100644
+index 0000000000..aeda08a6e6
+--- /dev/null
++++ b/plugins/wp/tests/wp_acsl/oracle/float_double_rounding.0.res.oracle
+@@ -0,0 +1,86 @@
++# frama-c -wp [...]
++[kernel] Parsing float_double_rounding.i (no preprocessing)
++[wp] Running WP plugin...
++[wp] [Valid] Goal to_float_bad_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal to_float_bad_terminates (Cfg) (Trivial)
++[wp] Warning: Missing RTE guards
++[wp] [Valid] Goal to_float_ok_exits (Cfg) (Unreachable)
++[wp] [Valid] Goal to_float_ok_terminates (Cfg) (Trivial)
++------------------------------------------------------------
++  Global
++------------------------------------------------------------
++
++Goal Check Lemma 'dr_above_mid_bad':
++Prove: false.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'dr_above_mid_ok':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'dr_exact_tie_even_down':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'dr_exact_tie_even_up':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'dr_fltmax_ok':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'dr_neg_above_mid_ok':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Check Lemma 'dr_subnormal_ok':
++Prove: true.
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function to_float_bad
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_double_rounding.i", lines 32-35) in 'to_float_bad':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_double_rounding.i", line 31, characters 13-45) in 'to_float_bad':
++Prove: false.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_double_rounding.i", lines 32-35) in 'to_float_bad':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++------------------------------------------------------------
++  Function to_float_ok
++------------------------------------------------------------
++
++Goal Termination-condition (generated by Frama-C kernel from "float_double_rounding.i", lines 26-29) in 'to_float_ok':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
++
++Goal Post-condition ("float_double_rounding.i", line 25, characters 13-45) in 'to_float_ok':
++Prove: true.
++
++------------------------------------------------------------
++
++Goal Exit-condition (generated by Frama-C kernel from "float_double_rounding.i", lines 26-29) in 'to_float_ok':
++Prove: true.
++Prover CFG returns Valid
++
++------------------------------------------------------------
+-- 
+2.47.3
+

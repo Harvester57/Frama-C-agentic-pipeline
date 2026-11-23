@@ -1,0 +1,228 @@
+From 5ad1241b2677b6beebc4a0c18d8663cac0815d50 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Mon, 23 Nov 2026 00:24:52 +0000
+Subject: [PATCH] [kernel] avoid fatal error when logic preprocessing aborts on
+ malformed input
+
+---
+ .../internals/parsing/logic_preprocess.mll    | 50 ++++++++++++++-----
+ .../oracle/pp_unbalanced_quote.0.err.oracle   |  0
+ .../oracle/pp_unbalanced_quote.0.res.oracle   |  8 +++
+ .../oracle/pp_unbalanced_quote.1.err.oracle   |  0
+ .../oracle/pp_unbalanced_quote.1.res.oracle   |  8 +++
+ .../oracle/pp_unbalanced_quote.2.err.oracle   |  0
+ .../oracle/pp_unbalanced_quote.2.res.oracle   |  8 +++
+ tests/spec/pp_unbalanced_quote.c              | 20 ++++++++
+ 8 files changed, 82 insertions(+), 12 deletions(-)
+ create mode 100644 tests/spec/oracle/pp_unbalanced_quote.0.err.oracle
+ create mode 100644 tests/spec/oracle/pp_unbalanced_quote.0.res.oracle
+ create mode 100644 tests/spec/oracle/pp_unbalanced_quote.1.err.oracle
+ create mode 100644 tests/spec/oracle/pp_unbalanced_quote.1.res.oracle
+ create mode 100644 tests/spec/oracle/pp_unbalanced_quote.2.err.oracle
+ create mode 100644 tests/spec/oracle/pp_unbalanced_quote.2.res.oracle
+ create mode 100644 tests/spec/pp_unbalanced_quote.c
+
+diff --git a/src/kernel/internals/parsing/logic_preprocess.mll b/src/kernel/internals/parsing/logic_preprocess.mll
+index 19c7d224eb..c5cab40b6e 100644
+--- a/src/kernel/internals/parsing/logic_preprocess.mll
++++ b/src/kernel/internals/parsing/logic_preprocess.mll
+@@ -35,6 +35,8 @@
+   let curr_file = ref ""
+   let curr_line = ref 1
+   let has_annot = ref false
++  let in_annot = ref false
++  let aborted = ref false
+ 
+   let reset () =
+     Buffer.clear preprocess_buffer;
+@@ -42,7 +44,9 @@
+     is_newline := CHAR;
+     curr_file := "";
+     curr_line := 1;
+-    has_annot := false
++    has_annot := false;
++    in_annot := false;
++    aborted := false
+ 
+   let backslash = "__ANNOT_BACKSLASH__"
+   let annot_content = "__ANNOT_CONTENT__"
+@@ -88,7 +92,20 @@
+   let annot_end_comment = "////////////////__ANNOT_END_COMMENT__"
+ 
+   let abort_preprocess reason =
+-    let path = Filepath.of_string !curr_file in
++    aborted := true;
++    if !in_annot then begin
++      in_annot := false;
++      Buffer.add_char preprocess_buffer '\n';
++      Buffer.add_string preprocess_buffer annot_end;
++      Buffer.add_char preprocess_buffer '\n'
++    end;
++    let fname =
++      let len = String.length !curr_file in
++      if len >= 2 && !curr_file.[0] = '"' && !curr_file.[len - 1] = '"' then
++        String.sub !curr_file 1 (len - 2)
++      else !curr_file
++    in
++    let path = Filepath.of_string fname in
+     let pos = Filepos.make ~path ~line:!curr_line () in
+     let loc = Fileloc.of_pos pos in
+     Kernel.error ~loc
+@@ -154,17 +171,20 @@
+         let$ ppfile = Filesystem.with_open_out_exn ppname in
+         Buffer.output_buffer ppfile preprocess_buffer;
+       in
+-      let cppname = Temp_files.file ~prefix:"cppannot" ~suffix () in
+-      let pp_cmd = cpp ppname cppname in
+-      Kernel.feedback ~dkey:Kernel.dkey_pp_logic
+-        "logic preprocessing with \"%s\"" pp_cmd;
+-      let res = Sys.command pp_cmd in
+       let result_file =
+-        if res <> 0 then begin
+-          abort_preprocess "Preprocessor call exited with an error";
+-          if not debug then Filesystem.remove_file cppname;
+-          ppname
+-        end else cppname
++        if !aborted then ppname
++        else begin
++          let cppname = Temp_files.file ~prefix:"cppannot" ~suffix () in
++          let pp_cmd = cpp ppname cppname in
++          Kernel.feedback ~dkey:Kernel.dkey_pp_logic
++            "logic preprocessing with \"%s\"" pp_cmd;
++          let res = Sys.command pp_cmd in
++          if res <> 0 then begin
++            abort_preprocess "Preprocessor call exited with an error";
++            if not debug then Filesystem.remove_file cppname;
++            ppname
++          end else cppname
++        end
+       in
+       let$ result = Filesystem.with_open_in_exn result_file in
+       let content =
+@@ -185,6 +205,7 @@
+   let process_annot_start () =
+     is_newline := CHAR;
+     has_annot := true;
++    in_annot := true;
+     Buffer.add_string output_buffer annot_content;
+     Buffer.add_string preprocess_buffer annot_beg;
+     Buffer.add_char preprocess_buffer '\n';
+@@ -363,6 +384,7 @@ and c_char = parse
+ 
+ and annot = parse
+     "*/"  {
++      in_annot := false;
+       if !is_newline = NEWLINE then
+         Buffer.add_string preprocess_buffer annot_end_nl
+       else begin
+@@ -405,6 +427,7 @@ and annot = parse
+      Buffer.add_string preprocess_buffer (encode_utf8 c);
+      annot lexbuf
+     }
++  | eof { abort_preprocess "eof while parsing annotation" }
+   | _ as c { is_newline := CHAR;
+              Buffer.add_char preprocess_buffer c;
+              annot lexbuf }
+@@ -415,6 +438,7 @@ and annot_comment = parse
+            annot lexbuf
+          }
+   | "*/" {
++        in_annot := false;
+         Buffer.add_char preprocess_buffer '\n';
+         Buffer.add_string preprocess_buffer annot_end;
+         Buffer.add_char preprocess_buffer '\n';
+@@ -476,6 +500,7 @@ parse
+ 
+ and oneline_annot = parse
+     "\n"|eof {
++      in_annot := false;
+       incr curr_line;
+       Buffer.add_char preprocess_buffer '\n';
+       Buffer.add_string preprocess_buffer annot_end_nl;
+@@ -494,6 +519,7 @@ and oneline_annot = parse
+ 
+ and oneline_annot_comment = parse
+     "\n"|eof {
++       in_annot := false;
+        incr curr_line;
+        Buffer.add_char preprocess_buffer '\n';
+        Buffer.add_string preprocess_buffer annot_end_comment;
+diff --git a/tests/spec/oracle/pp_unbalanced_quote.0.err.oracle b/tests/spec/oracle/pp_unbalanced_quote.0.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/spec/oracle/pp_unbalanced_quote.0.res.oracle b/tests/spec/oracle/pp_unbalanced_quote.0.res.oracle
+new file mode 100644
+index 0000000000..dd53840f15
+--- /dev/null
++++ b/tests/spec/oracle/pp_unbalanced_quote.0.res.oracle
+@@ -0,0 +1,8 @@
++[kernel] Parsing pp_unbalanced_quote.c (with preprocessing)
++[kernel] pp_unbalanced_quote.c:12: User Error: 
++  Can't preprocess annotation: eof while parsing a string literal
++  Some annotations will be kept as is
++[kernel:annot-error] pp_unbalanced_quote.c:10: Failure: 
++  lexical error, illegal character "
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/spec/oracle/pp_unbalanced_quote.1.err.oracle b/tests/spec/oracle/pp_unbalanced_quote.1.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/spec/oracle/pp_unbalanced_quote.1.res.oracle b/tests/spec/oracle/pp_unbalanced_quote.1.res.oracle
+new file mode 100644
+index 0000000000..a3ec62a94a
+--- /dev/null
++++ b/tests/spec/oracle/pp_unbalanced_quote.1.res.oracle
+@@ -0,0 +1,8 @@
++[kernel] Parsing pp_unbalanced_quote.c (with preprocessing)
++[kernel] pp_unbalanced_quote.c:16: User Error: 
++  Can't preprocess annotation: eof while parsing a char literal
++  Some annotations will be kept as is
++[kernel:annot-error] pp_unbalanced_quote.c:14: Failure: 
++  lexical error, illegal character '
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/spec/oracle/pp_unbalanced_quote.2.err.oracle b/tests/spec/oracle/pp_unbalanced_quote.2.err.oracle
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/tests/spec/oracle/pp_unbalanced_quote.2.res.oracle b/tests/spec/oracle/pp_unbalanced_quote.2.res.oracle
+new file mode 100644
+index 0000000000..aafaf458ab
+--- /dev/null
++++ b/tests/spec/oracle/pp_unbalanced_quote.2.res.oracle
+@@ -0,0 +1,8 @@
++[kernel] Parsing pp_unbalanced_quote.c (with preprocessing)
++[kernel] pp_unbalanced_quote.c:20: User Error: 
++  Can't preprocess annotation: eof while parsing a char literal
++  Some annotations will be kept as is
++[kernel:annot-error] pp_unbalanced_quote.c:18: Failure: 
++  lexical error, illegal character '
++[kernel] User Error: warning annot-error treated as fatal error.
++[kernel] Frama-C aborted: invalid user input.
+diff --git a/tests/spec/pp_unbalanced_quote.c b/tests/spec/pp_unbalanced_quote.c
+new file mode 100644
+index 0000000000..5a029f4e0e
+--- /dev/null
++++ b/tests/spec/pp_unbalanced_quote.c
+@@ -0,0 +1,20 @@
++/* run.config
++   EXIT: 1
++   OPT: -cpp-extra-args="-DUNBALANCED_STR"
++   OPT: -cpp-extra-args="-DC23_SEP"
++   OPT: -cpp-extra-args="-DUNBALANCED_CHAR"
++*/
++
++#ifdef UNBALANCED_STR
++void f(void) {
++  //@ check o5: "abc == 1;
++}
++#elif defined(C23_SEP)
++void f(void) {
++  //@ check c23: 1'000 == 1000;
++}
++#elif defined(UNBALANCED_CHAR)
++void f(void) {
++  //@ check ch: 'a == 1;
++}
++#endif
+-- 
+2.47.3

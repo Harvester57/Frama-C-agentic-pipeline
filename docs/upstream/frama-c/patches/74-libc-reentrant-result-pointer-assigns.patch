@@ -1,0 +1,215 @@
+From 949faf06dbcbd865f508d961f7fa7ca45b6e80c3 Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:54:50 +0000
+Subject: [PATCH] [libc] pwd.h/utmp.h: assign reentrant result pointer from
+ caller struct
+
+In share/libc/pwd.h (getpwnam_r, getpwuid_r) and share/libc/utmp.h (getutent_r, getutid_r, getutline_r), the output pointer parameter (*result / *ubufp) was assigned \from &__fc_pwd / &__fc_utmp instead of the caller-supplied struct pointer (pwd / ubuf).
+
+In Eva, intersecting *result (\from &__fc_pwd) with ensures *result == \null || *result == pwd eliminated pwd and left *result == {0}, making the entire success branch dead code. In utmp.h, *ubufp became a garbled mix of &__fc_utmp, raising spurious pointer-comparison/alignment alarms and making res == &ub dead.
+
+Split *pwd and *result assigns in pwd.h (matching grp.h and dirent.h) and assign *ubufp from ubuf with ensures result_null_or_ubuf in utmp.h.
+
+New test: tests/libc/reentrant_result_ptr.c.
+---
+ share/libc/pwd.h                              |  6 +-
+ share/libc/utmp.h                             |  9 +-
+ .../oracle/reentrant_result_ptr.0.res.oracle  | 90 +++++++++++++++++++
+ tests/libc/reentrant_result_ptr.c             | 31 +++++++
+ 4 files changed, 131 insertions(+), 5 deletions(-)
+ create mode 100644 tests/libc/oracle/reentrant_result_ptr.0.res.oracle
+ create mode 100644 tests/libc/reentrant_result_ptr.c
+
+diff --git a/share/libc/pwd.h b/share/libc/pwd.h
+index 5ff889c5a7..f537f969d7 100644
+--- a/share/libc/pwd.h
++++ b/share/libc/pwd.h
+@@ -65,7 +65,8 @@ extern struct passwd *getpwuid(uid_t uid);
+   requires valid_result: \valid(result);
+   assigns \result \from indirect:&__fc_pwd, indirect:name[0..];
+   assigns __fc_pwd \from indirect:name[0..];
+-  assigns *pwd, *result \from &__fc_pwd;
++  assigns *pwd \from __fc_pwd, buf, indirect:buflen;
++  assigns *result \from pwd, indirect:__fc_pwd;
+   assigns buf[0 .. buflen-1] \from indirect:__fc_pwd;
+   ensures result_null_or_assigned:
+     *result == \null || *result == pwd;
+@@ -82,7 +83,8 @@ extern int getpwnam_r(const char *name, struct passwd *pwd,
+   requires valid_result: \valid(result);
+   assigns \result \from indirect:&__fc_pwd;
+   assigns __fc_pwd \from indirect:uid;
+-  assigns *pwd, *result \from &__fc_pwd;
++  assigns *pwd \from __fc_pwd, buf, indirect:buflen;
++  assigns *result \from pwd, indirect:__fc_pwd;
+   assigns buf[0 .. buflen-1] \from indirect:__fc_pwd;
+   ensures result_null_or_assigned:
+     *result == \null || *result == pwd;
+diff --git a/share/libc/utmp.h b/share/libc/utmp.h
+index b4a8b889ce..d3efbf6ed8 100644
+--- a/share/libc/utmp.h
++++ b/share/libc/utmp.h
+@@ -121,14 +121,16 @@ extern struct utmp *pututline (const struct utmp *utmp_ptr);
+ /*@
+   assigns \result \from indirect:__fc_utmp;
+   assigns *ubuf \from __fc_utmp;
+-  assigns *ubufp \from &__fc_utmp;
++  assigns *ubufp \from ubuf;
++  ensures result_null_or_ubuf: *ubufp == \null || *ubufp == ubuf;
+ */
+ extern int getutent_r (struct utmp *ubuf, struct utmp **ubufp);
+ 
+ /*@
+   assigns \result \from indirect:*ut, indirect:__fc_utmp;
+   assigns *ubuf \from indirect:*ut, __fc_utmp;
+-  assigns *ubufp \from indirect:*ut, &__fc_utmp;
++  assigns *ubufp \from ubuf, indirect:*ut;
++  ensures result_null_or_ubuf: *ubufp == \null || *ubufp == ubuf;
+ */
+ extern int getutid_r (const struct utmp *ut, struct utmp *ubuf,
+                       struct utmp **ubufp);
+@@ -136,7 +138,8 @@ extern int getutid_r (const struct utmp *ut, struct utmp *ubuf,
+ /*@
+   assigns \result \from indirect:*ut, indirect:__fc_utmp;
+   assigns *ubuf \from indirect:*ut, __fc_utmp;
+-  assigns *ubufp \from indirect:*ut, &__fc_utmp;
++  assigns *ubufp \from ubuf, indirect:*ut;
++  ensures result_null_or_ubuf: *ubufp == \null || *ubufp == ubuf;
+ */
+ extern int getutline_r (const struct utmp *ut,
+                         struct utmp *ubuf, struct utmp **ubufp);
+diff --git a/tests/libc/oracle/reentrant_result_ptr.0.res.oracle b/tests/libc/oracle/reentrant_result_ptr.0.res.oracle
+new file mode 100644
+index 0000000000..d949787b51
+--- /dev/null
++++ b/tests/libc/oracle/reentrant_result_ptr.0.res.oracle
+@@ -0,0 +1,90 @@
++[kernel] Parsing reentrant_result_ptr.c (with preprocessing)
++[eva] Analyzing a complete application starting at main
++[eva:progress] Computing initial state
++[eva:progress] Initial state computed
++[eva:initial-state] Values of globals at initialization
++  
++[eva:progress] 
++  computing for function getpwnam_r <- main.
++  Called from reentrant_result_ptr.c:10.
++[eva] using specification for function getpwnam_r
++[eva:libc:unsupported-spec] reentrant_result_ptr.c:10: Warning: 
++  The specification of function 'getpwnam_r' is currently not supported by Eva.
++  Consider adding 'FRAMAC_SHARE/libc/pwd.c' to the analyzed source files.
++[eva:progress] reentrant_result_ptr.c:10: 
++  function getpwnam_r: precondition 'valid_name' got status valid.
++[eva:progress] reentrant_result_ptr.c:10: 
++  function getpwnam_r: precondition 'valid_buf' got status valid.
++[eva:progress] reentrant_result_ptr.c:10: 
++  function getpwnam_r: precondition 'valid_pwd' got status valid.
++[eva:progress] reentrant_result_ptr.c:10: 
++  function getpwnam_r: precondition 'valid_result' got status valid.
++[eva:garbled-mix:assigns] reentrant_result_ptr.c:10: 
++  The specification of function getpwnam_r
++  has generated a garbled mix of addresses for assigns clause *pwd.
++[eva:progress] Done for function getpwnam_r
++[eva:progress] reentrant_result_ptr.c:12: 
++  assertion 'found_nam' got status valid.
++[eva:progress] 
++  computing for function getpwuid_r <- main.
++  Called from reentrant_result_ptr.c:14.
++[eva] using specification for function getpwuid_r
++[eva:libc:unsupported-spec] reentrant_result_ptr.c:14: Warning: 
++  The specification of function 'getpwuid_r' is currently not supported by Eva.
++  Consider adding 'FRAMAC_SHARE/libc/pwd.c' to the analyzed source files.
++[eva:progress] reentrant_result_ptr.c:14: 
++  function getpwuid_r: precondition 'valid_buf' got status valid.
++[eva:progress] reentrant_result_ptr.c:14: 
++  function getpwuid_r: precondition 'valid_pwd' got status valid.
++[eva:progress] reentrant_result_ptr.c:14: 
++  function getpwuid_r: precondition 'valid_result' got status valid.
++[eva:progress] Done for function getpwuid_r
++[eva:progress] reentrant_result_ptr.c:16: 
++  assertion 'found_uid' got status valid.
++[eva:progress] 
++  computing for function getutent_r <- main.
++  Called from reentrant_result_ptr.c:20.
++[eva] using specification for function getutent_r
++[eva:progress] Done for function getutent_r
++[eva:progress] reentrant_result_ptr.c:21: 
++  assertion 'found_utent' got status valid.
++[eva:progress] 
++  computing for function getutid_r <- main.
++  Called from reentrant_result_ptr.c:23.
++[eva] using specification for function getutid_r
++[eva:progress] Done for function getutid_r
++[eva:progress] reentrant_result_ptr.c:24: 
++  assertion 'found_utid' got status valid.
++[eva:progress] 
++  computing for function getutline_r <- main.
++  Called from reentrant_result_ptr.c:26.
++[eva] using specification for function getutline_r
++[eva:progress] Done for function getutline_r
++[eva:progress] reentrant_result_ptr.c:27: 
++  assertion 'found_utline' got status valid.
++[eva:progress] Recording results for main
++[eva:progress] Done for function main
++[eva] ====== VALUES COMPUTED ======
++[eva:final-states] Values at end of function main:
++  __fc_pwd.pw_name ∈ {{ NULL + [--..--] ; &S_pw_name___fc_pwd[0] }}
++          .pw_passwd ∈ {{ NULL + [--..--] ; &S_pw_passwd___fc_pwd[0] }}
++          {.pw_uid; .pw_gid} ∈ [--..--]
++          .pw_gecos ∈ {{ NULL + [--..--] ; &S_pw_gecos___fc_pwd[0] }}
++          .pw_dir ∈ {{ NULL + [--..--] ; &S_pw_dir___fc_pwd[0] }}
++          .pw_shell ∈ {{ NULL + [--..--] ; &S_pw_shell___fc_pwd[0] }}
++  pw ∈
++    {{ garbled mix of &{buf; S_pw_name___fc_pwd; S_pw_passwd___fc_pwd;
++                        S_pw_gecos___fc_pwd; S_pw_dir___fc_pwd;
++                        S_pw_shell___fc_pwd}
++     (origin: Misaligned read {reentrant_result_ptr.c:10}) }} or UNINITIALIZED
++  pw_res1 ∈ {{ NULL ; &pw }}
++  pw_res2 ∈ {{ NULL ; &pw }}
++  buf[0..255] ∈ [--..--] or UNINITIALIZED
++  r1 ∈ {0; 5; 23; 24; 34}
++  r2 ∈ {0; 5; 23; 24; 34}
++  ub ∈ [--..--] or UNINITIALIZED
++  ut_query ∈ {0}
++  ut_res1 ∈ {{ NULL ; &ub }}
++  ut_res2 ∈ {{ NULL ; &ub }}
++  ut_res3 ∈ {{ NULL ; &ub }}
++  __retres ∈ {0}
+diff --git a/tests/libc/reentrant_result_ptr.c b/tests/libc/reentrant_result_ptr.c
+new file mode 100644
+index 0000000000..b62b890330
+--- /dev/null
++++ b/tests/libc/reentrant_result_ptr.c
+@@ -0,0 +1,31 @@
++/* run.config
++   STDOPT:
++*/
++#include <pwd.h>
++#include <utmp.h>
++
++int main(void) {
++  struct passwd pw, *pw_res1 = 0, *pw_res2 = 0;
++  char buf[256];
++  int r1 = getpwnam_r("root", &pw, buf, sizeof(buf), &pw_res1);
++  if (r1 == 0 && pw_res1 != 0) {
++    //@ assert found_nam: pw_res1 == &pw;
++  }
++  int r2 = getpwuid_r(0, &pw, buf, sizeof(buf), &pw_res2);
++  if (r2 == 0 && pw_res2 != 0) {
++    //@ assert found_uid: pw_res2 == &pw;
++  }
++
++  struct utmp ub, ut_query = {0}, *ut_res1 = 0, *ut_res2 = 0, *ut_res3 = 0;
++  if (getutent_r(&ub, &ut_res1) == 0 && ut_res1 == &ub) {
++    //@ assert found_utent: \true;
++  }
++  if (getutid_r(&ut_query, &ub, &ut_res2) == 0 && ut_res2 == &ub) {
++    //@ assert found_utid: \true;
++  }
++  if (getutline_r(&ut_query, &ub, &ut_res3) == 0 && ut_res3 == &ub) {
++    //@ assert found_utline: \true;
++  }
++
++  return 0;
++}
+-- 
+2.47.3
+

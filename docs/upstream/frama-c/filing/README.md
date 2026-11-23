@@ -26,7 +26,7 @@ python tools/upstream_audit/file_upstream.py check            # validate all iss
 python tools/upstream_audit/file_upstream.py check NN         # validate one package
 ```
 
-`file_upstream.py show`, `issue`, and `mr` also run this check automatically and refuse to post any non-compliant draft or any `Tracker: pub/meta` text onto `pub/frama-c`. Note that the unfiled rough draft [`./46-libc-sched-cpu-set-issue.md`](./46-libc-sched-cpu-set-issue.md) predates this gate and must be rewritten to pass `file_upstream.py check 46` before filing.
+`file_upstream.py show`, `issue`, and `mr` also run this check automatically and refuse to post any non-compliant draft or any `Tracker: pub/meta` text onto `pub/frama-c`. All issue drafts in this folder (01 through 87) pass `file_upstream.py check`.
 
 ---
 
@@ -41,7 +41,7 @@ Paste-ready texts for [`pub/frama-c`](https://git.frama-c.com/pub/frama-c):
   - Below the comment is the description, starting with upstream's `external_contribution.md`
     checkboxes, left unticked for the owner.
 
-There is no MR text for 15 or 34 (no patch) or 23 (fixed by 27's MR). 40's MR text corrects two
+There is no MR text for 15, 34, or 63 (no patch) or 23 (fixed by 27's MR). 40's MR text corrects two
 sentences of the WP manual only: it says "Related to", not "Closes", because the feature request of
 its issue stays open. The texts are self-contained: they quote the reproducer and its output, and
 they link nothing in this repository.
@@ -55,7 +55,8 @@ edited on the tracker, edit this file the same way.
 
 The texts of 43 (E-ACSL real constants, drafted on 2026-11-18) are **not filed** either: the MR
 text still holds `#<issue>`. The same goes for the texts of 44 (the contract of `strlcat`,
-drafted the same day).
+drafted the same day) and 46 (`<sched.h>` `cpu_set_t`, `CPU_*`, and `sched_{set,get}affinity`,
+rewritten with an MR text and validated patch on 2026-11-22).
 
 45 (MetAcsl refuses `\result` in a `\postcond` property; issue drafted on 2026-11-18, MR text
 added on 2026-11-20) is **not filed**. Like 47, 48 and 49, it is written for the MetAcsl tracker,
@@ -73,6 +74,13 @@ location, no instance and no warning for a call to a function without specificat
 50 (E-ACSL `--validate-format-strings` crashing with `Assertion failed` in `functions.ml:156` on
 `enum` arguments and `Options.fatal` on `enum *` pointers; drafted on 2026-11-22) is **not filed**
 either: its MR text holds `#<issue>` and keeps the CONTRIBUTING/CLA checkboxes unticked.
+
+51 to 87 (37 packages from the 2026-11-18 Frama-C hunt: 36 with validated patches + MR texts and
+1 issue-only report, 63 for enumeration constant typing `N1`; drafted and validated on 2026-11-23
+against stock `master` `189053d4a2` and stock `34.0~beta`) are **not filed** (filing remains paused
+pending `#2832`): every MR text holds `#<issue>` and leaves the CONTRIBUTING/CLA checkboxes
+unticked. Candidate `H13` (compilation-database shell quoting) has an internal analysis draft only
+and deliberately has no file in this folder pending an owner disclosure-channel decision.
 
 Every other text of this folder is filed (01 to 27 on 2026-11-15, 28 to 42 on 2026-11-18), and
 their placeholders now hold the real numbers. For a new package, write `#<issue>` for its own issue and

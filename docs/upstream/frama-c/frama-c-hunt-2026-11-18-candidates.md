@@ -1,13 +1,70 @@
-# Candidates from the hunt of 2026-11-18 (not drafted, not filed)
+# Candidates from the hunt of 2026-11-18 (processed into packages 51–87 + private H13, not filed)
 
 - **Parent index:** [`./README.md`](./README.md)
+
+> [!NOTE]
+> **Processed on 2026-11-23 (not filed; filing remains paused pending `#2832`).** Every candidate
+> below was independently vetted on stock `framac-master-audit:189053d` (`35.0~~dev`, `189053d4a2`)
+> and stock `framac-analysis:latest` (`34.0~beta`) and processed into 37 validated packages
+> (`51`–`87`: 36 with validated single-commit patches + issue-only `63` for `N1`) plus 1 private
+> internal analysis draft (`H13`, no `filing/` text). See [Processing disposition (2026-11-23)](#processing-disposition-2026-11-23) below.
 
 After 42 (WP reads the text of a floating-point literal with its own, narrower parser), the owner
 asked which related families of bugs could be hunted in Frama-C. This file lists what the hunt
 found. One find became package 43
 ([`./frama-c-eacsl-real-constant-notation.md`](./frama-c-eacsl-real-constant-notation.md)). The
-others are **candidates**: each has a reproducer that was run, and none has an issue text or a
-patch.
+rest are mapped to their 2026-11-23 dispositions below.
+
+## Processing disposition (2026-11-23)
+
+| Candidate | Disposition | Package / Draft | `opam/` queue |
+| :-- | :-- | :-- | :-- |
+| `H1` | Confirmed TP — package + patch | `65`: [`./frama-c-wp-floor-ceil-truncate-float-cast.md`](./frama-c-wp-floor-ceil-truncate-float-cast.md) | **YES** |
+| `H2` | Confirmed TP — package + patch | `67`: [`./frama-c-wp-float-constant-double-rounding.md`](./frama-c-wp-float-constant-double-rounding.md) | NO |
+| `H3` | Confirmed TP — merged with `N2` | `66`: [`./frama-c-wp-empty-range-addition-shift.md`](./frama-c-wp-empty-range-addition-shift.md) | **YES** |
+| `H4` | Confirmed TP — package + patch | `56`: [`./frama-c-kernel-float-cast-dropped-exact.md`](./frama-c-kernel-float-cast-dropped-exact.md) | **YES** |
+| `H5` | Confirmed TP — package + patch | `61`: [`./frama-c-kernel-char-const-unsigned-machdep.md`](./frama-c-kernel-char-const-unsigned-machdep.md) | NO |
+| `H6` | Confirmed TP — merged with `H18` | `59`: [`./frama-c-kernel-acsl-hex-octal-escapes.md`](./frama-c-kernel-acsl-hex-octal-escapes.md) | **YES** |
+| `H7` | Confirmed TP — package + patch | `58`: [`./frama-c-kernel-acsl-string-sizeof-escaped.md`](./frama-c-kernel-acsl-string-sizeof-escaped.md) | **YES** |
+| `H8` | Confirmed TP — package + patch | `62`: [`./frama-c-kernel-multichar-const-type.md`](./frama-c-kernel-multichar-const-type.md) | NO |
+| `H9` | Skipped (not a wrong result) | — | NO |
+| `H10` | Confirmed TP — merged with `N4` | `51`: [`./frama-c-kernel-float-const-printing.md`](./frama-c-kernel-float-const-printing.md) | **YES** |
+| `H11` | Confirmed TP — package + patch | `52`: [`./frama-c-eacsl-rational-cast-double-rounding.md`](./frama-c-eacsl-rational-cast-double-rounding.md) | **YES** |
+| `H12` | Confirmed TP — merged with `N14` | `77`: [`./frama-c-kernel-wstring-escape-trigraph.md`](./frama-c-kernel-wstring-escape-trigraph.md) | NO |
+| `H13` | Confirmed TP — **private internal draft only** | Private: [`./frama-c-kernel-compilation-db-quoting.md`](./frama-c-kernel-compilation-db-quoting.md) | NO |
+| `H14` | Confirmed TP — package + patch | `55`: [`./frama-c-eva-numerors-float-literal-parsing.md`](./frama-c-eva-numerors-float-literal-parsing.md) | NO |
+| `H15` | Confirmed TP — package + patch (separate from `51`) | `53`: [`./frama-c-eacsl-non-finite-real-constant.md`](./frama-c-eacsl-non-finite-real-constant.md) | Optional / low |
+| `H16` | Confirmed TP — package + patch | `69`: [`./frama-c-wp-strategy-timeout-exception.md`](./frama-c-wp-strategy-timeout-exception.md) | NO |
+| `H17` | Confirmed TP — package + patch | `70`: [`./frama-c-wp-time-margin-validation.md`](./frama-c-wp-time-margin-validation.md) | NO |
+| `H18` | Merged into `59` (`H6+H18`) | `59`: [`./frama-c-kernel-acsl-hex-octal-escapes.md`](./frama-c-kernel-acsl-hex-octal-escapes.md) | **YES** |
+| `H19` | Skipped (documented `+real` limit) | — | NO |
+| `L1` | Confirmed TP — package + patch | `64`: [`./frama-c-wp-void-object-size.md`](./frama-c-wp-void-object-size.md) | **YES** |
+| `L2` | Confirmed TP — package + patch | `72`: [`./frama-c-libc-pclose-pipe-status-soundness.md`](./frama-c-libc-pclose-pipe-status-soundness.md) | **YES** |
+| `L3` | Confirmed TP — package + patch | `73`: [`./frama-c-libc-sigaction-oldact-contract.md`](./frama-c-libc-sigaction-oldact-contract.md) | **YES** |
+| `L4` | Confirmed TP — package + patch (distinct from `#2806`/`!37`) | `54`: [`./frama-c-eacsl-typing-not-performed-guard.md`](./frama-c-eacsl-typing-not-performed-guard.md) | **YES** |
+| `L5` | Confirmed TP — package + patch | `75`: [`./frama-c-libc-syslog-string-axiomatic.md`](./frama-c-libc-syslog-string-axiomatic.md) | **YES** |
+| `L6` | Skipped (cosmetic) | — | NO |
+| `N1` | Confirmed TP — **issue-only** (`#@1682` regression) | `63`: [`./frama-c-kernel-enum-const-unsigned-type.md`](./frama-c-kernel-enum-const-unsigned-type.md) | NO |
+| `N2` | Merged into `66` (`H3+N2`) | `66`: [`./frama-c-wp-empty-range-addition-shift.md`](./frama-c-wp-empty-range-addition-shift.md) | **YES** |
+| `N3` | Confirmed TP — package + patch | `68`: [`./frama-c-wp-non-finite-float-constant.md`](./frama-c-wp-non-finite-float-constant.md) | **YES** |
+| `N4` | Merged into `51` (`H10+N4`) | `51`: [`./frama-c-kernel-float-const-printing.md`](./frama-c-kernel-float-const-printing.md) | **YES** |
+| `N5` | Confirmed TP — package + patch | `79`: [`./frama-c-kernel-int128-const-printing.md`](./frama-c-kernel-int128-const-printing.md) | NO |
+| `N6` | Confirmed TP — package + patch (includes `utmp.h` sibling) | `74`: [`./frama-c-libc-reentrant-result-pointer-assigns.md`](./frama-c-libc-reentrant-result-pointer-assigns.md) | **YES** |
+| `N7` | Confirmed TP — package + patch | `80`: [`./frama-c-kernel-hex-float-double-rounding.md`](./frama-c-kernel-hex-float-double-rounding.md) | **YES** |
+| `N8` | Confirmed TP — package + patch | `57`: [`./frama-c-kernel-bool-cast-dropped-logic.md`](./frama-c-kernel-bool-cast-dropped-logic.md) | **YES** |
+| `N9` | Confirmed TP — package + patch | `81`: [`./frama-c-kernel-acsl-adjacent-string-concat.md`](./frama-c-kernel-acsl-adjacent-string-concat.md) | NO |
+| `N10` | Confirmed TP — package + patch | `82`: [`./frama-c-kernel-acsl-unknown-escape-char.md`](./frama-c-kernel-acsl-unknown-escape-char.md) | NO |
+| `N11` | Confirmed TP — package + patch | `60`: [`./frama-c-kernel-acsl-wstring-octal-escapes.md`](./frama-c-kernel-acsl-wstring-octal-escapes.md) | NO |
+| `N12` | Confirmed TP — package + patch | `78`: [`./frama-c-kernel-acsl-wstring-double-escape.md`](./frama-c-kernel-acsl-wstring-double-escape.md) | NO |
+| `N13` | Confirmed TP — package + patch | `83`: [`./frama-c-kernel-clexer-universal-char-names.md`](./frama-c-kernel-clexer-universal-char-names.md) | NO |
+| `N14` | Merged into `77` (`H12+N14`) | `77`: [`./frama-c-kernel-wstring-escape-trigraph.md`](./frama-c-kernel-wstring-escape-trigraph.md) | NO |
+| `N15` | Confirmed TP — package + patch | `84`: [`./frama-c-kernel-logic-constfold-div-zero.md`](./frama-c-kernel-logic-constfold-div-zero.md) | NO |
+| `N16` | Confirmed TP — package + patch | `71`: [`./frama-c-wp-par-range-check.md`](./frama-c-wp-par-range-check.md) | NO |
+| `N17` | Confirmed TP — package + patch | `85`: [`./frama-c-kernel-machdep-zero-size-crash.md`](./frama-c-kernel-machdep-zero-size-crash.md) | NO |
+| `N18` | Confirmed TP — package + patch | `86`: [`./frama-c-kernel-narrow-char-escape-range.md`](./frama-c-kernel-narrow-char-escape-range.md) | NO |
+| `N19` | Confirmed TP — package + patch | `87`: [`./frama-c-kernel-logic-preprocess-unbalanced-quote.md`](./frama-c-kernel-logic-preprocess-unbalanced-quote.md) | NO |
+| `N20` | Confirmed TP — package + patch | `76`: [`./frama-c-libc-wchar-stdio-streams.md`](./frama-c-libc-wchar-stdio-streams.md) | NO |
+| `N21` | Skipped (read-only notes) | — | NO |
 
 ## How to read this file
 

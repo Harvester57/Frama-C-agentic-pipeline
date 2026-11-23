@@ -35,6 +35,11 @@ patches together.
 > [`./README.md`](./README.md). A live search of the tracker on 2026-11-15 (issues and MRs, all
 > states) found no duplicate; #2752, #2787 and #197 are related but distinct, as each issue text
 > says. The `ad24dca` validation below is kept as history.
+>
+> **2026-11-23 update:** Subsequent packages 28–50 (and 37 new packages 51–87 vetted and validated
+> from the 2026-11-18 Frama-C hunt — including E-ACSL packages 52, 53, 54 and Kernel float-printing
+> package 51 affecting `e-acsl-gcc`) are tracked in [`./README.md`](./README.md) and
+> [`./frama-c-hunt-2026-11-18-candidates.md`](./frama-c-hunt-2026-11-18-candidates.md).
 
 ## Filing decision
 

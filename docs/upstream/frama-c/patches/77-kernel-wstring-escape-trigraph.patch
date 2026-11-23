@@ -1,0 +1,181 @@
+From 6eda9d94a0b253930bc45d5ca94e9b43fc8938fd Mon Sep 17 00:00:00 2001
+From: Harvester57 <1315-Harvester57@users.noreply.git.frama-c.com>
+Date: Sun, 22 Nov 2026 23:50:18 +0000
+Subject: [PATCH] [kernel] print wide-string escapes with \x and preserve
+ trigraph state
+
+Escape.escape_wchar and Escape.escape_wstring in src/lib/utils/escape.ml
+had five defects when pretty-printing wide string literals:
+- code points in 0o1000..0xFFFF were emitted as \uXXXX, which Frama-C's
+  own C lexer rejects and which is invalid C11 6.4.3p2 for UTF-16
+  surrogates (0xD800..0xDFFF, rejected by gcc/clang);
+- code points in 0x10000..0xFFFFFFFF were emitted with lowercase \u and
+  5 to 8 hex digits instead of \UXXXXXXXX (violating C11 6.4.3 and
+  causing gcc/clang to silently read 4 digits plus literal trailing
+  characters, and also invalid above 0x10FFFF);
+- code points >= 2^32 (e.g. L"\x100000000") raised an uncaught
+  Invalid_argument("Cprint.escape_string_intlist") (exit 125);
+- limit used Int64.to_float subtraction, which mishandled negative int64;
+- escape_wchar called escape_char with a fresh trigraph ref per
+  character, so L"a?\?!b" was printed as L"a??!b" and silently
+  corrupted under -std=c99 (including e-acsl-gcc).
+
+Thread maybe_trigraph through escape_wstring via escape_wchar_internal,
+emit hexadecimal escapes (\x%Lx) for code points >= 0o1000 (or negative
+int64), and split adjacent wide string literals (" L") whenever a \x
+escape is immediately followed by a hexadecimal digit so it is not
+absorbed.
+
+Update the single affected oracle line in
+tests/spec/oracle/string.0.res.oracle and add regression test
+tests/pretty_printing/wstring_escape.c.
+---
+ src/lib/utils/escape.ml                       | 59 +++++++++++--------
+ .../oracle/wstring_escape.0.res.oracle        | 26 ++++++++
+ tests/pretty_printing/wstring_escape.c        | 15 +++++
+ tests/spec/oracle/string.0.res.oracle         |  2 +-
+ 4 files changed, 78 insertions(+), 24 deletions(-)
+ create mode 100644 tests/pretty_printing/oracle/wstring_escape.0.res.oracle
+ create mode 100644 tests/pretty_printing/wstring_escape.c
+
+diff --git a/src/lib/utils/escape.ml b/src/lib/utils/escape.ml
+index 5ebc983589..6849c1db32 100644
+--- a/src/lib/utils/escape.ml
++++ b/src/lib/utils/escape.ml
+@@ -50,33 +50,46 @@ let escape_string str =
+   done;
+   Buffer.contents buffer
+ 
+-(* a wide char represented as an int64 *)
+-let escape_wchar =
+-  (* limit checks whether upper > probe *)
+-  let limit upper probe = (Int64.to_float (Int64.sub upper probe)) > 0.5 in
+-  let fits_byte = limit (Int64.of_int 0x100) in
+-  let fits_octal_escape = limit (Int64.of_int 0o1000) in
+-  let fits_universal_4 = limit (Int64.of_int 0x10000) in
+-  let fits_universal_8 = limit (Int64.of_string "0x100000000") in
+-  fun charcode ->
+-    if fits_byte charcode then
+-      escape_char (Char.chr (Int64.to_int charcode))
+-    else if fits_octal_escape charcode then
+-      Printf.sprintf "\\%03Lo" charcode
+-    else if fits_universal_4 charcode then
+-      Printf.sprintf "\\u%04Lx" charcode
+-    else if fits_universal_8 charcode then
+-      Printf.sprintf "\\u%04Lx" charcode
+-    else
+-      invalid_arg "Cprint.escape_string_intlist"
++let is_hex_digit charcode =
++  (charcode >= 0x30L && charcode <= 0x39L) ||
++  (charcode >= 0x41L && charcode <= 0x46L) ||
++  (charcode >= 0x61L && charcode <= 0x66L)
++
++(* a wide char represented as an int64; returns the escaped text and whether
++   it ends in a variable-length hexadecimal escape sequence *)
++let escape_wchar_internal maybe_trigraph charcode =
++  if charcode >= 0L && charcode < 0x100L then
++    escape_char_internal maybe_trigraph (Char.chr (Int64.to_int charcode)), false
++  else if charcode >= 0x100L && charcode < 0o1000L then begin
++    maybe_trigraph := false;
++    Printf.sprintf "\\%03Lo" charcode, false
++  end else begin
++    maybe_trigraph := false;
++    Printf.sprintf "\\x%Lx" charcode, true
++  end
++
++let escape_wchar charcode =
++  let r = ref false in
++  fst (escape_wchar_internal r charcode)
+ 
+ (* a wide string represented as a list of int64s *)
+ let escape_wstring (str : int64 list) =
+   let length = List.length str in
+   let buffer = Buffer.create length in
+-  let append charcode =
+-    let addition = escape_wchar charcode in
+-    Buffer.add_string buffer addition
++  let maybe_trigraph = ref false in
++  let rec append = function
++    | [] -> ()
++    | charcode :: rest ->
++      let addition, is_hex = escape_wchar_internal maybe_trigraph charcode in
++      Buffer.add_string buffer addition;
++      begin match rest with
++        | next :: _ when is_hex && is_hex_digit next ->
++          (* Split adjacent wide string literals so a following hexadecimal
++             digit is not absorbed into the \x escape sequence. *)
++          Buffer.add_string buffer "\" L\""
++        | _ -> ()
++      end;
++      append rest
+   in
+-  List.iter append str;
++  append str;
+   Buffer.contents buffer
+diff --git a/tests/pretty_printing/oracle/wstring_escape.0.res.oracle b/tests/pretty_printing/oracle/wstring_escape.0.res.oracle
+new file mode 100644
+index 0000000000..5dfbaf4cac
+--- /dev/null
++++ b/tests/pretty_printing/oracle/wstring_escape.0.res.oracle
+@@ -0,0 +1,26 @@
++[kernel] Parsing wstring_escape.c (with preprocessing)
++/* Generated by Frama-C */
++#include "stddef.h"
++wchar_t euro[2UL] = L"\x20ac";
++wchar_t emoji[2UL] = L"\x1f600";
++wchar_t emoji_hex[3UL] = L"\x1f600" L"A";
++wchar_t emoji_nonhex[3UL] = L"\x1f600z";
++wchar_t surrogate[2UL] = L"\xd800";
++wchar_t beyond_unicode[2UL] = L"\x110000";
++wchar_t huge[2UL] = L"\x100000000";
++wchar_t trigraph[6UL] = L"a?\?!b";
++wchar_t triple_q[5UL] = L"?\?\?!";
++
++[kernel] Parsing ocode_wstring_escape.c (with preprocessing)
++/* Generated by Frama-C */
++#include "stddef.h"
++wchar_t euro[2UL] = L"\x20ac";
++wchar_t emoji[2UL] = L"\x1f600";
++wchar_t emoji_hex[3UL] = L"\x1f600" L"A";
++wchar_t emoji_nonhex[3UL] = L"\x1f600z";
++wchar_t surrogate[2UL] = L"\xd800";
++wchar_t beyond_unicode[2UL] = L"\x110000";
++wchar_t huge[2UL] = L"\x100000000";
++wchar_t trigraph[6UL] = L"a?\?!b";
++wchar_t triple_q[5UL] = L"?\?\?!";
++
+diff --git a/tests/pretty_printing/wstring_escape.c b/tests/pretty_printing/wstring_escape.c
+new file mode 100644
+index 0000000000..6ab4e679ac
+--- /dev/null
++++ b/tests/pretty_printing/wstring_escape.c
+@@ -0,0 +1,15 @@
++/* run.config
++   OPT: @PTEST_FILE@ -print -then -ocode ./ocode_@PTEST_NAME@.c -print -then ./ocode_@PTEST_NAME@.c -ocode="" -print
++*/
++
++#include <stddef.h>
++
++wchar_t euro[] = L"\x20AC";
++wchar_t emoji[] = L"\x1F600";
++wchar_t emoji_hex[] = L"\x1F600" "A";
++wchar_t emoji_nonhex[] = L"\x1F600" "z";
++wchar_t surrogate[] = L"\xD800";
++wchar_t beyond_unicode[] = L"\x110000";
++wchar_t huge[] = L"\x100000000";
++wchar_t trigraph[] = L"a?\?!b";
++wchar_t triple_q[] = L"?\?\?!";
+diff --git a/tests/spec/oracle/string.0.res.oracle b/tests/spec/oracle/string.0.res.oracle
+index 4862910646..e0fbba72a0 100644
+--- a/tests/spec/oracle/string.0.res.oracle
++++ b/tests/spec/oracle/string.0.res.oracle
+@@ -6,5 +6,5 @@
+  */
+ /*@ logic char [] split= (char [])"abcdef";
+  */
+-unsigned long *test = (unsigned long *)L"\uabcdt5ab";
++unsigned long *test = (unsigned long *)L"\xabcdt5ab";
+ 
+-- 
+2.47.3
+
