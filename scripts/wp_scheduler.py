@@ -66,6 +66,7 @@ import prover_candidates  # noqa: E402
 import resources  # noqa: E402
 import spec_kb  # noqa: E402
 import workspace_overlay  # noqa: E402
+from fingerprint import root_cause_sibling_key  # noqa: E402
 from framac_common import (  # noqa: E402
     EVA_REPORT_MAX_BYTES,
     PROVER_WALL_BUDGET_S,
@@ -2397,6 +2398,52 @@ def _probe_allowed_verify_ids(
     return allowed_ids, probe_rank
 
 
+def _verify_sibling_key(task: dict) -> str | None:
+    """`fingerprint.root_cause_sibling_key` of a verify task (module, kind, predicate hash), else None."""
+    if task.get("kind") != "verify":
+        return None
+    return root_cause_sibling_key(str(task.get("module") or ""), str(task.get("fingerprint") or ""))
+
+
+def _hold_verify_siblings(state: dict, ordered: list[dict]) -> list[dict]:
+    """
+    Verify tasks of one module that fail the same normalized predicate in different functions (same
+    `_verify_sibling_key`) are likely one root cause: verify one of them first (QCBOR run-2: twenty such
+    candidates released in parallel got four different verdicts). Per group of two or more tasks:
+      - a member is terminal (a verdict, or blocked/skipped without one; a task superseded by a harness
+        repair does not count): every ready member is released, and their briefs list the verified
+        records (`workspace_overlay._verified_siblings_section`);
+      - else a member is running: every ready member waits;
+      - else the first ready member in `ordered` (already filtered by the verifier breaker's probe batch)
+        is the representative and the others wait. Whatever the probe batch allows, one member of each
+        group it allows is dispatched, so the two filters never stall together.
+    Groups of one, and every other task, pass unchanged.
+    """
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for t in state["tasks"].values():
+        key = _verify_sibling_key(t)
+        if key is not None:
+            groups[key].append(t)
+    released: set[str] = set()
+    held: set[str] = set()
+    for key, members in groups.items():
+        if len(members) < 2:
+            released.add(key)
+        elif any(m["state"] in TERMINAL and m.get("outcome") != "superseded_by_repair" for m in members):
+            released.add(key)
+        elif any(m["state"] in LIVE for m in members):
+            held.add(key)
+    out: list[dict] = []
+    for task in ordered:
+        key = _verify_sibling_key(task)
+        if key is None or key in released:
+            out.append(task)
+        elif key not in held:
+            held.add(key)  # the representative: its siblings wait for its verdict
+            out.append(task)
+    return out
+
+
 def _ready(state: dict, mode: str, ctx: Ctx | None = None) -> list[dict]:
     view = _View(state, ctx=ctx)
     allowed = _waves_filter(state) if mode == "waves" else (lambda _task: True)
@@ -2405,7 +2452,7 @@ def _ready(state: dict, mode: str, ctx: Ctx | None = None) -> list[dict]:
     if allowed_verify is not None:
         ready_tasks = [t for t in ready_tasks if t["kind"] != "verify" or t["id"] in allowed_verify]
     if not probe_rank:
-        return sorted(ready_tasks, key=_priority_key)
+        return _hold_verify_siblings(state, sorted(ready_tasks, key=_priority_key))
 
     def _sort_key(task: dict) -> tuple:
         base = _priority_key(task)
@@ -2413,7 +2460,7 @@ def _ready(state: dict, mode: str, ctx: Ctx | None = None) -> list[dict]:
             return (*base[:-1], probe_rank[task["id"]], base[-1])
         return (*base[:-1], 0, base[-1])
 
-    return sorted(ready_tasks, key=_sort_key)
+    return _hold_verify_siblings(state, sorted(ready_tasks, key=_sort_key))
 
 
 # ---------------------------------------------------------------------------

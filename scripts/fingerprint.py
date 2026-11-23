@@ -247,6 +247,19 @@ def is_valid_fingerprint(value: str) -> bool:
     return isinstance(value, str) and bool(FINGERPRINT_RE.match(value)) and "::" in value and "#" in value
 
 
+def root_cause_sibling_key(module: str, fingerprint: str) -> str | None:
+    """
+    `<module>::<property-kind>::<hash10>` for a canonical fingerprint, else None. Candidates of one module
+    that share it fail the same normalized predicate in different functions (QCBOR run-2: twenty
+    `\\initialized(&uOffset)` candidates, one missing write in a shared callee). They are likely one root
+    cause, so the scheduler verifies one of them first and the others' briefs list its verdict.
+    """
+    if not is_valid_fingerprint(fingerprint):
+        return None
+    _loc, kind, digest = fingerprint.rsplit("::", 2)
+    return f"{(module or '').strip() or 'unknown'}::{kind}::{digest}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compute a stable finding fingerprint.")
     parser.add_argument("--file", required=True)
