@@ -1892,9 +1892,13 @@ def layout_seeds(
                     made.append(seed)
         elif lay.get("kind") == "sequence":
             want = list(lay.get("calls") or [])
+            if not want:
+                continue
+            seen_seq: set[bytes] = set()
             for trace in traces:
                 fns = [c.get("fn") for c in trace]
-                for start in range(len(fns)):
+                start = 0
+                while start < len(fns):
                     picked: list[dict] = []
                     at: list[int] = []
                     k = start
@@ -1906,11 +1910,36 @@ def layout_seeds(
                         picked.append(trace[k].get("args") or {})
                         at.append(k)
                         k += 1
-                    if len(picked) == len(want):
-                        seed = layout_seed(lay, _init_args(lay, picked, trace, at), width)
-                        if seed is not None:
-                            made.append(seed)
+                    if len(picked) != len(want):
                         break
+                    seed = layout_seed(lay, _init_args(lay, picked, trace, at), width)
+                    if seed is not None and seed not in seen_seq:
+                        seen_seq.add(seed)
+                        made.append(seed)
+                    start = at[0] + 1
+            # A sequence whose fuzz slots + rest all belong to a single target call (e.g. a
+            # concrete global-state setup/teardown wrapper around one entry point) can also be
+            # seeded from every recorded call of that target function.
+            if not (lay.get("inits") or []):
+                used_calls = {int(s["call"]) for s in lay.get("slots") or [] if "call" in s}
+                rest = lay.get("rest")
+                if isinstance(rest, dict) and "call" in rest:
+                    used_calls.add(int(rest["call"]))
+                if len(used_calls) == 1:
+                    c_idx = next(iter(used_calls))
+                    if 0 <= c_idx < len(want):
+                        target_fn = want[c_idx]
+                        pool = [
+                            *by_fn.get(target_fn, []),
+                            *(c for tr in traces for c in tr if c.get("fn") == target_fn),
+                        ]
+                        for rec in pool:
+                            call_args: list[dict] = [{} for _ in want]
+                            call_args[c_idx] = rec.get("args") or {}
+                            seed = layout_seed(lay, call_args, width)
+                            if seed is not None and seed not in seen_seq:
+                                seen_seq.add(seed)
+                                made.append(seed)
         else:
             fn = (lay.get("calls") or [""])[0]
             inits = list(lay.get("inits") or [])

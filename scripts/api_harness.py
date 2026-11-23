@@ -192,7 +192,8 @@ from seed_harvest import (  # noqa: E402
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
 TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
 MAX_SEQUENCE_CASES = 16  # recorded chains first, then synthesized lifecycle cases (H2)
-GLOBAL_SETUP_MAX_PREFIX = 6  # max global-state setup calls prepended to one recorded sequence case
+GLOBAL_SETUP_MAX_PREFIX = 12  # max global-state setup calls prepended to one recorded sequence case
+_GLOBAL_ADDITIVE_WORDS = frozenset({"add", "register", "append", "insert", "push", "put"})
 _GLOBAL_SETUP_WORDS = frozenset(
     {
         "init",
@@ -370,7 +371,33 @@ REALLOC_OLD_BYTES = 64
 #    named `*growable*` (`mpack_writer_init_growable`'s `*target_data`), freed after the object's
 #    destructor. A pool or arena slot named `*_alloc` reaches no allocator and is never freed.
 _OWNED_RESULT_WORDS = frozenset({"alloc", "dup", "strdup", "strndup"})
-_OWNED_OUT_WORDS = _OWNED_RESULT_WORDS | {"growable"}
+_OWNED_OUT_WORDS = _OWNED_RESULT_WORDS | {"growable", "copy", "clone"}
+_OWNED_PRODUCER_WORDS = frozenset(
+    {
+        "prepare",
+        "make",
+        "build",
+        "create",
+        "new",
+        "copy",
+        "clone",
+        "encode",
+        "decode",
+        "format",
+        "serialize",
+        "pack",
+        "unpack",
+        "render",
+        "generate",
+        "concat",
+        "join",
+    }
+)
+_BORROWED_OUT_WORDS = frozenset({"get", "peek", "find", "lookup", "search", "query", "view", "slice", "borrow", "ref"})
+_CURSOR_OUT_WORDS = frozenset(
+    {"end", "endptr", "next", "cur", "cursor", "pos", "tail", "rest", "err", "error", "msg", "errmsg"}
+)
+_OWNED_BYTE_RET_TYPES = frozenset({"char *", "unsigned char *", "signed char *", "void *"})
 ALLOCATORS = frozenset({"malloc", "calloc", "realloc", "reallocarray", "strdup", "strndup", "aligned_alloc"})
 # G (sudo run-1, protobuf-c's `liblogsrv_a`). A table of function pointers (`_vtable_layout`: an
 #    allocator `{alloc, free, allocator_data}`, an ops table, a sink `{append}`) is never passed zeroed:
@@ -649,6 +676,11 @@ class ApiInfo:
     # Functions that transitively call `_HEAP_SIZE_PROBERS` (`malloc_usable_size` etc.): their
     # writable byte buffers are heap-allocated (`calloc`/`free`) rather than `static` arrays.
     heap_buffer_fns: set[str] = field(default_factory=set)
+    # Functions that transitively call `free` (used to give `*_free*(byte *)` helpers heap memory).
+    freeing: set[str] = field(default_factory=set)
+    # Per global-state setup function, the trace-observed 0-arg global teardown function (`Crypto_Shutdown`)
+    # that releases its global allocations/state after a single case or teardown-less sequence.
+    global_teardown: dict[str, str] = field(default_factory=dict)
 
 
 class _Case:
@@ -758,6 +790,75 @@ def _len_cap_expr(ctype: str, buf_expr: str) -> str:
     if limit is None:
         return buf_expr
     return f"({buf_expr} < {limit}U ? {buf_expr} : {limit}U)"
+
+
+def _rest_len_post(ln: str, ctype: str) -> str:
+    """Statement setting `ln` to remaining input bytes, clamped to `ctype`'s positive range if narrow."""
+    limit = _SCALAR_MAX_POS.get(ctype)
+    clamp = f"if (rest_n > {limit}U) {{ rest_n = {limit}U; }} " if limit is not None else ""
+    return f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; {clamp}{ln} = ({ctype})rest_n; }}"
+
+
+def _can_copy_sequence_rest(case: _Case, call: int) -> bool:
+    """Whether an earlier call in this sequence already claimed `case.rest` as bytes."""
+    return (
+        isinstance(case.rest, dict)
+        and case.rest is not _RESERVED_REST
+        and case.rest.get("kind") == "bytes"
+        and case.rest.get("call") != call
+    )
+
+
+def _bind_secondary_rest_buf(
+    case: _Case,
+    call: int,
+    i: int,
+    v: str,
+    ln: str,
+    ltype: str,
+    *,
+    heap_capacity: bool,
+    guards: list[str],
+    after: list[str],
+) -> None:
+    """
+    Bind a subsequent call's unsized input buffer in a multi-call sequence by copying up to `ln`
+    bytes of `case.rest` (before any earlier call can mutate `fuzz_buf`). Uses a spare-sized heap
+    capacity buffer for `heap_buffer_fns`, or an exact-size `malloc` allocation (one-past-end for
+    0 bytes) otherwise so ASan and E-ACSL enforce exact right-hand bounds.
+    """
+    limit = _SCALAR_MAX_POS.get(ltype)
+    case.decls.append(f"{ltype} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+    case.slot(ln, SCALAR_BYTES.get(ltype), call, i + 1, "int")
+    if heap_capacity:
+        buf = case.spare
+        case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {buf}U);")
+        guards.append(f"{v} != 0")
+        after.append(f"free({v});")
+        cap = _len_cap_expr(ltype, f"{buf}U")
+        case.post.append(
+            f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+            f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
+            f"if ((unsigned long long){ln} > (unsigned long long)rest_n) {{ {ln} = ({ltype})rest_n; }} "
+            f"if ({v} != 0 && (size_t){ln} > 0U) {{ memcpy({v}, {FUZZ_COPY}, (size_t){ln}); }} }}"
+        )
+        case.note(call, i, "writable capacity input buffer: copied from the rest of the input for subsequent call")
+    else:
+        alloc = case.declare(f"{v}_alloc")
+        case.decls.append(f"unsigned char *{alloc} = 0; unsigned char *{case.declare(v)} = 0;")
+        guards.append(f"{alloc} != 0")
+        after.append(f"free({alloc});")
+        clamp = f"if (rest_n > {limit}U) {{ rest_n = {limit}U; }} " if limit is not None else ""
+        n_var = f"{v}_n"
+        case.post.append(
+            f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; {clamp}"
+            f"if ((unsigned long long){ln} > (unsigned long long)rest_n) {{ {ln} = ({ltype})rest_n; }} "
+            f"size_t {n_var} = (size_t){ln}; "
+            f"{alloc} = (unsigned char *)malloc({n_var} > 0U ? {n_var} : 1U); "
+            f"if ({alloc} != 0) {{ {v} = ({n_var} > 0U) ? {alloc} : ({alloc} + 1); "
+            f"if ({n_var} > 0U) {{ memcpy({v}, {FUZZ_COPY}, {n_var}); }} }} }}"
+        )
+        case.note(call, i, "exact-size input buffer: copied from the rest of the input for subsequent call")
 
 
 def recorded_input_buffers(traces: list[list[dict]] | None) -> dict[str, set[int]]:
@@ -991,6 +1092,7 @@ def _variable_length(
 def _lone_output(params: list[dict], formals: list[dict], i: int) -> bool:
     return (
         params[i]["kind"] == "ptr"
+        and not str(params[i].get("pointee") or "").endswith("*")
         and not _is_pair(params, i, formals)
         and not _is_buf_len_ptr_pair(params, i, formals)
         and not _is_input(formals, i)
@@ -1863,14 +1965,60 @@ def _realloc_like(
     return (used, new) if new else None
 
 
-def _owned_result(name: str, rec: dict, api: ApiInfo) -> bool:
+def _free_byte_ptr_like(name: str, params: list[dict], formals: list[dict], api: ApiInfo) -> bool:
+    """Whether `name` is a single-argument `*_free*(byte */void *)` helper reaching `free` (rule E)."""
+    if len(params) != 1 or name not in api.freeing or not _FREEING_DTOR_RE.search(name):
+        return False
+    p0 = params[0]
+    return p0["kind"] == "ptr" and _charlike(p0) and not _is_input(formals, 0)
+
+
+def _owned_out_param(name: str, params: list[dict], formals: list[dict], i: int, api: ApiInfo) -> bool:
+    """
+    Whether parameter `i` is a writable `byte **` out-parameter through which an allocating
+    function returns a caller-owned heap buffer (rule F): e.g. `mpack_writer_init_growable`,
+    `crypto_deep_copy_string`, or `(uint8_t **out_buf, uint16_t *out_len)` allocating out-pairs
+    such as `Crypto_TC_ApplySecurity` / `ares_dns_write`.
+    """
+    if name not in api.allocating or _is_input(formals, i) or i in (api.qual_ptrs.get(name) or {}):
+        return False
+    pointee = str(params[i].get("pointee") or "")
+    if pointee not in ("char *", "void *", "unsigned char *"):
+        return False
+    if set(_words(_name(formals, i))) & _CURSOR_OUT_WORDS:
+        return False
+    fn_words = set(_words(name))
+    if fn_words & _OWNED_OUT_WORDS:
+        return True
+    if fn_words & _BORROWED_OUT_WORDS:
+        return False
+    return i + 1 < len(params) and is_length_ptr(params[i + 1], _name(formals, i + 1))
+
+
+def _owned_result(name: str, rec: dict, params: list[dict], formals: list[dict], api: ApiInfo) -> bool:
     """Whether the call returns a heap object its caller frees (rule F)."""
-    return (
-        bool(set(_words(name)) & _OWNED_RESULT_WORDS)
-        and name in api.allocating
-        and name not in api.const_returns
-        and _return_type(rec).endswith("*")
-    )
+    ret = _return_type(rec)
+    if name in api.const_returns or not ret.endswith("*"):
+        return False
+    fn_words = set(_words(name))
+    if bool(fn_words & _OWNED_RESULT_WORDS) and name in api.allocating:
+        return True
+    # A producer/builder function returning a non-const byte/void pointer that directly calls an
+    # allocator, writes no globals, and takes no writable pointer parameter (so it cannot alias an
+    # input) returns a freshly allocated buffer the caller owns (e.g. `Crypto_Prepare_TC_AAD`).
+    if ret not in _OWNED_BYTE_RET_TYPES:
+        return False
+    if (rec.get("writes") or {}).get("globals"):
+        return False
+    direct_alloc = any(isinstance(cs, dict) and cs.get("callee") in ALLOCATORS for cs in (rec.get("call_sites") or []))
+    if not direct_alloc:
+        return False
+    ptr_indices = [k for k, p in enumerate(params) if p["kind"] == "ptr"]
+    if not all(_is_input(formals, k) for k in ptr_indices):
+        return False
+    if fn_words & _OWNED_PRODUCER_WORDS:
+        return True
+    return not ptr_indices and not (fn_words & (_BORROWED_OUT_WORDS | {"error", "strerror", "name", "str"}))
 
 
 def _vtable_layout(lay: dict | None) -> bool:
@@ -2905,6 +3053,19 @@ def _bind_call(
             args.append(f"({p['type']}){v}")
             i += 1
             continue
+        if (
+            p["kind"] == "ptr"
+            and i == 0
+            and allow_init
+            and 0 not in shared
+            and _free_byte_ptr_like(name, params, formals, api)
+        ):
+            # Rule E: a single-argument `*_free*(byte *)` helper frees a heap pointer, never a static array.
+            case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {REALLOC_OLD_BYTES}U);")
+            case.note(call, i, f"argument of a freeing helper: a {REALLOC_OLD_BYTES}-byte calloc of the harness")
+            args.append(f"({p['type']}){v}")
+            i += 1
+            continue
         if p["kind"] == "ptr":
             pointee = p.get("pointee") or "void"
             is_input = False if role in ("output", "caller_storage") else _is_input(formals, i)
@@ -3061,31 +3222,49 @@ def _bind_call(
                         args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
                         pairs.append((i, "(fuzz_len - fuzz_off)", True))
                 elif nonconst_in and case.rest is None and size is None:
-                    # Writable (non-`const` / in-place) input buffer: copy rest into a writable zeroed
-                    # buffer so in-place writes never mutate `const uint8_t *fuzz_buf`.
-                    buf = case.spare
-                    heap_buf = name in api.heap_buffer_fns
-                    if heap_buf:
-                        case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {buf}U);")
-                        guards.append(f"{v} != 0")
-                        after.append(f"free({v});")
-                        size_expr = f"{buf}U"
-                        copy_guard = f"{v} != 0 && rest_n > 0"
-                    else:
-                        case.decls.append(_byte_buffer(_storage(None), case.declare(v), buf))
-                        size_expr = f"sizeof({v})"
-                        copy_guard = "rest_n > 0"
                     ln = f"c{call}a{i + 1}"
                     case.decls.append(f"{nxt['ctype']} {case.declare(ln)} = 0;")
                     case.rest = {"call": call, "param": i, "kind": "bytes"}
-                    cap = _len_cap_expr(nxt["ctype"], size_expr)
-                    case.post.append(
-                        f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
-                        f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
-                        f"if ({copy_guard}) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} "
-                        f"{ln} = ({nxt['ctype']})rest_n; }}"
+                    if name in api.heap_buffer_fns:
+                        # Callers querying `malloc_usable_size` require a heap-block base pointer
+                        # (not the interior `fuzz_buf + fuzz_off` after the dispatch selector) with
+                        # capacity for the configured maximum frame size.
+                        buf = case.spare
+                        case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {buf}U);")
+                        guards.append(f"{v} != 0")
+                        after.append(f"free({v});")
+                        cap = _len_cap_expr(nxt["ctype"], f"{buf}U")
+                        case.post.append(
+                            f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                            f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
+                            f"if ({v} != 0 && rest_n > 0) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} "
+                            f"{ln} = ({nxt['ctype']})rest_n; }}"
+                        )
+                        case.note(call, i, "writable heap capacity input buffer: copied from the rest of the input")
+                        args.append(f"({p['type']}){v}")
+                    else:
+                        # `fuzz_buf` in harness_dual.c.template is already a writable exact-size heap
+                        # copy in LLVMFuzzerTestOneInput (and writable input_buf in eva_main), so
+                        # passing `fuzz_buf + fuzz_off` directly preserves exact end bounds for ASan,
+                        # E-ACSL, and Eva without zero-padding past the frame length.
+                        case.post.append(_rest_len_post(ln, nxt["ctype"]))
+                        case.note(call, i, "writable input buffer: the rest of the input (exact bounds)")
+                        args.append(f"({p['type']})(fuzz_buf + fuzz_off)")
+                    args.append(ln)
+                    pairs.append((i, ln, True))
+                elif (is_input or nonconst_in) and size is None and _can_copy_sequence_rest(case, call):
+                    ln = f"c{call}a{i + 1}"
+                    _bind_secondary_rest_buf(
+                        case,
+                        call,
+                        i,
+                        v,
+                        ln,
+                        nxt["ctype"],
+                        heap_capacity=(name in api.heap_buffer_fns and not is_input),
+                        guards=guards,
+                        after=after,
                     )
-                    case.note(call, i, "writable input buffer: copied from the rest of the input")
                     args.append(f"({p['type']}){v}")
                     args.append(ln)
                     pairs.append((i, ln, True))
@@ -3128,26 +3307,67 @@ def _bind_call(
                     buf = size or case.spare
                     lpt = str(nxt.get("pointee") or "int")
                     ln = f"c{call}a{i + 1}"
-                    case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
                     if size is None and case.rest is None:
                         case.decls.append(f"{lpt} {case.declare(ln)} = 0;")
                         case.rest = {"call": call, "param": i, "kind": "bytes"}
-                        cap = _len_cap_expr(lpt, f"sizeof({v})")
-                        case.post.append(
-                            f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
-                            f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
-                            f"if (rest_n > 0) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} "
-                            f"{ln} = ({lpt})rest_n; }}"
-                        )
-                        case.note(
-                            call, i, "writable input buffer with pointer-to-length: copied from the rest of the input"
+                        if name in api.heap_buffer_fns and not is_input:
+                            case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {buf}U);")
+                            guards.append(f"{v} != 0")
+                            after.append(f"free({v});")
+                            cap = _len_cap_expr(lpt, f"{buf}U")
+                            case.post.append(
+                                f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                                f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
+                                f"if ({v} != 0 && rest_n > 0) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} "
+                                f"{ln} = ({lpt})rest_n; }}"
+                            )
+                            case.note(
+                                call,
+                                i,
+                                "writable heap capacity input buffer with pointer-to-length: copied from the rest of the input",
+                            )
+                            args.append(f"({p['type']}){v}")
+                        else:
+                            case.post.append(_rest_len_post(ln, lpt))
+                            case.note(
+                                call,
+                                i,
+                                "writable input buffer with pointer-to-length: the rest of the input (exact bounds)",
+                            )
+                            args.append(f"({p['type']})(fuzz_buf + fuzz_off)")
+                        args.append(f"({nxt['type']})&{ln}")
+                        pairs.append((i, ln, True))
+                    elif size is None and _can_copy_sequence_rest(case, call):
+                        _bind_secondary_rest_buf(
+                            case,
+                            call,
+                            i,
+                            v,
+                            ln,
+                            lpt,
+                            heap_capacity=(name in api.heap_buffer_fns and not is_input),
+                            guards=guards,
+                            after=after,
                         )
                         args.append(f"({p['type']}){v}")
                         args.append(f"({nxt['type']})&{ln}")
                         pairs.append((i, ln, True))
                     else:
-                        if size:
-                            case.slot(v, size, call, i, "bytes", addr=False)
+                        heap_buf = name in api.heap_buffer_fns and not is_input
+                        if heap_buf:
+                            case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {buf}U);")
+                            guards.append(f"{v} != 0")
+                            after.append(f"free({v});")
+                            if size:
+                                case.decls.append(
+                                    f"if ({v} != 0 && fuzz_len >= fuzz_off + {size}U) {{ "
+                                    f"memcpy({v}, {FUZZ_COPY}, {size}U); fuzz_off += {size}U; }}"
+                                )
+                                case.slots.append({"call": call, "param": i, "size": size, "kind": "bytes"})
+                        else:
+                            case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
+                            if size:
+                                case.slot(v, size, call, i, "bytes", addr=False)
                         case.decls.append(f"{lpt} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
                         case.slot(ln, SCALAR_BYTES.get(lpt), call, i + 1, "int")
                         case.decls.append(f"if ((unsigned long long){ln} > {buf}ULL) {{ {ln} = ({lpt}){buf}; }}")
@@ -3236,6 +3456,10 @@ def _bind_call(
                     _fill_fields(case, call, i, f"{v}[0]", lay, 0)
                 elif api.trust_schema and not is_input and lay is not None and lay.get("what") == "struct":
                     _init_bsd_queues(case, f"{v}[0]", lay)
+                elif _owned_out_param(name, params, formals, i, api):
+                    # Rule F: a heap object the call hands to its caller through `char **`.
+                    owned_outs.append(f"{v}[0]")
+                    case.note(call, i, "heap output the caller owns: freed after the call and its object's release")
                 if not _is_record(pointee):
                     bare.append(f"(sizeof({v}) / sizeof({v}[0]))")
                 args.append(f"({p['type']}){v}")
@@ -3277,13 +3501,7 @@ def _bind_call(
                     _fill_fields(case, call, i, v, lay, 0)
                 elif api.trust_schema and not is_input and lay is not None and lay.get("what") == "struct":
                     _init_bsd_queues(case, v, lay)
-                elif (
-                    not is_input
-                    and pointee in ("char *", "void *", "unsigned char *")
-                    and i not in (api.qual_ptrs.get(name) or {})
-                    and set(_words(name)) & _OWNED_OUT_WORDS
-                    and name in api.allocating
-                ):
+                elif _owned_out_param(name, params, formals, i, api):
                     # Rule F: a heap object the call hands to its caller through `char **`.
                     owned_outs.append(v)
                     case.note(call, i, "heap output the caller owns: freed after the call and its object's release")
@@ -3403,7 +3621,7 @@ def _bind_call(
             f"if ({realloc_old} != 0) {{ void *{r} = (void *){name}({', '.join(args)}); "
             f"if ({r} != 0) {{ free({r}); }} else {{ free({realloc_old}); }} }}"
         )
-    elif allow_init and _owned_result(name, rec, api):
+    elif allow_init and _owned_result(name, rec, params, formals, api):
         # Rule F: a heap result the caller owns, freed, or every run of the case leaks it.
         r = f"c{call}r"
         own = f"{{ void *{r} = (void *){name}({', '.join(args)}); free({r}); }}"
@@ -3415,6 +3633,17 @@ def _bind_call(
         # Those of an initializer or a constructor run first wait for the call under test's.
         after += [*(f"free({v});" for v in owned_outs), *case.owned_frees]
         case.owned_frees = []
+        if (
+            case.ncalls == 1
+            and name in api.global_teardown
+            and not any(
+                p["kind"] == "ptr" and _is_record(str(p.get("pointee") or "")) and not _is_input(formals, k)
+                for k, p in enumerate(params)
+            )
+        ):
+            gtd = api.global_teardown[name]
+            after.append(f"(void){gtd}();")
+            case.notes.append(f"call {call}: global state reset after setup with {gtd}")
     else:
         case.owned_frees += [f"free({v});" for v in owned_outs]
     if guards:
@@ -4669,6 +4898,68 @@ def _is_global_init_name(name: str) -> bool:
     return not _is_global_teardown_name(name) and bool(set(_words(name)) & _GLOBAL_INIT_WORDS)
 
 
+def _is_global_additive_name(name: str) -> bool:
+    """Whether a global setup function appends/registers a table entry rather than overwriting a singleton config."""
+    return not _is_global_teardown_name(name) and bool(set(_words(name)) & _GLOBAL_ADDITIVE_WORDS)
+
+
+def _setup_call_arg_key(call: Mapping[str, Any]) -> tuple[tuple[str, tuple[tuple[str, int, str], ...]], ...]:
+    """Canonical hashable key for a setup call's concrete recorded arguments."""
+    args = call.get("args")
+    if not isinstance(args, Mapping):
+        return ()
+    items: list[tuple[str, tuple[tuple[str, int, str], ...]]] = []
+    for k in sorted(args, key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x))):
+        vals = args[k]
+        if not isinstance(vals, list):
+            continue
+        entries = tuple((str(e[0]), int(e[1]), str(e[2])) for e in vals if isinstance(e, list) and len(e) == 3)
+        if entries:
+            items.append((str(k), entries))
+    return tuple(items)
+
+
+def _global_teardowns(
+    callable_recs: Mapping[str, dict[str, Any]],
+    traces: Sequence[Sequence[Mapping[str, Any]]] | None,
+    trans_writes: Mapping[str, set[str]],
+) -> dict[str, str]:
+    """
+    Map each global-state setup function to the best trace-observed 0-arg global teardown function
+    writing overlapping globals (e.g. `Crypto_Config_MariaDB` / `Crypto_Init` -> `Crypto_Shutdown`).
+    Only considers teardowns actually observed in recorded traces and callable in the harness.
+    """
+    if not trans_writes or not traces:
+        return {}
+    td_freq: dict[str, int] = {}
+    for trace in traces:
+        for call in trace:
+            fn = call.get("fn")
+            if not isinstance(fn, str) or fn not in callable_recs:
+                continue
+            if not _is_global_teardown_name(fn) or not trans_writes.get(fn):
+                continue
+            rec = callable_recs[fn]
+            if path_parameter(rec):
+                continue
+            params, _ = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
+            if params == []:
+                td_freq[fn] = td_freq.get(fn, 0) + 1
+    if not td_freq:
+        return {}
+    out: dict[str, str] = {}
+    for fn in sorted(callable_recs):
+        if not _is_global_setup_name(fn):
+            continue
+        sw = trans_writes.get(fn)
+        if not sw:
+            continue
+        cands = [td for td in td_freq if td != fn and (trans_writes.get(td, set()) & sw)]
+        if cands:
+            out[fn] = min(cands, key=lambda td: (-len(trans_writes[td] & sw), -td_freq[td], td))
+    return out
+
+
 def _global_state_flow(model_functions: Mapping[str, Any]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """
     Per function name in the Phase 0 model, the global variable names it transitively writes
@@ -4885,14 +5176,39 @@ def _global_setup_prefix(
     init_pos = [idx for idx, k in enumerate(kept) if _is_global_init_name(str(trace[k]["fn"]))]
     if len(init_pos) >= 2:
         kept = kept[init_pos[-2] + 1 :]
+    # Deduplicate exact duplicate `(fn, args)` setup calls (keeping the first occurrence of additive
+    # table registrations and the last occurrence of overwriting setters) without collapsing distinct
+    # additive registrations (e.g. multiple GVCIDs for vcid 0, 1, 2, 3).
+    exact_keep: dict[tuple[str, Any], int] = {}
+    for k in kept:
+        sfn = str(trace[k]["fn"])
+        ekey = (sfn, _setup_call_arg_key(trace[k]))
+        if _is_global_additive_name(sfn):
+            exact_keep.setdefault(ekey, k)
+        else:
+            exact_keep[ekey] = k
+    kept = [k for k in kept if exact_keep[(str(trace[k]["fn"]), _setup_call_arg_key(trace[k]))] == k]
     if len(kept) > GLOBAL_SETUP_MAX_PREFIX:
-        # Collapse repeated setup calls (e.g. multiple Add_*_Managed_Parameters) before capping so
-        # the earliest required configurator (Crypto_Config_CryptoLib) is not sliced off.
-        last_by_fn: dict[str, int] = {}
+        # Collapse repeated non-additive setters (keeping their last call) before capping.
+        last_non_add: dict[str, int] = {}
         for k in kept:
-            last_by_fn[str(trace[k]["fn"])] = k
-        kept = [k for k in kept if last_by_fn[str(trace[k]["fn"])] == k]
-    kept = kept[-GLOBAL_SETUP_MAX_PREFIX:]
+            sfn = str(trace[k]["fn"])
+            if not _is_global_additive_name(sfn):
+                last_non_add[sfn] = k
+        kept = [
+            k for k in kept if _is_global_additive_name(str(trace[k]["fn"])) or last_non_add[str(trace[k]["fn"])] == k
+        ]
+    if len(kept) > GLOBAL_SETUP_MAX_PREFIX:
+        # Preserve all non-additive calls (e.g. Config_CryptoLib, Config_TC, Init) plus the earliest
+        # distinct additive registrations up to the cap, never slicing off the initial configurator.
+        non_add = [k for k in kept if not _is_global_additive_name(str(trace[k]["fn"]))]
+        if len(non_add) >= GLOBAL_SETUP_MAX_PREFIX:
+            kept = non_add[-GLOBAL_SETUP_MAX_PREFIX:]
+        else:
+            budget = GLOBAL_SETUP_MAX_PREFIX - len(non_add)
+            add_list = [k for k in kept if _is_global_additive_name(str(trace[k]["fn"]))][:budget]
+            keep_set = set(non_add) | set(add_list)
+            kept = [k for k in kept if k in keep_set]
     setup_writes: set[str] = set()
     for k in kept:
         setup_writes.update(trans_writes.get(str(trace[k]["fn"]), ()))
@@ -4922,12 +5238,13 @@ def _global_setup_plan(
 ) -> list[dict[str, Any]]:
     """
     Best recorded global-state setup (+ optional teardown) per distinct non-setup API entry point
-    in `records`, ranked to prefer complete setups with teardown, then most frequent and concise
-    recorded setup, ordered with input-reading entry points first.
+    in `records`, ranked to prefer complete setups with teardown, then most frequent concrete
+    configuration (function names + recorded arguments) and concise recorded setup, ordered with
+    input-reading entry points first.
     """
     if not trans_writes:
         return []
-    freq: dict[tuple[str, tuple[str, ...], str | None], int] = {}
+    freq: dict[tuple[str, tuple[str, ...], tuple[Any, ...], str | None], int] = {}
     total_freq: dict[str, int] = {}
     candidates: dict[str, list[dict[str, Any]]] = {}
     for trace in filtered_traces:
@@ -4939,8 +5256,9 @@ def _global_setup_plan(
             if not prefix:
                 continue
             prefix_sig = tuple(str(trace[k]["fn"]) for k in prefix)
+            prefix_args_sig = tuple(_setup_call_arg_key(trace[k]) for k in prefix)
             td_fn = str(trace[td]["fn"]) if td is not None else None
-            key = (fn, prefix_sig, td_fn)
+            key = (fn, prefix_sig, prefix_args_sig, td_fn)
             freq[key] = freq.get(key, 0) + 1
             total_freq[fn] = total_freq.get(fn, 0) + 1
             if freq[key] == 1:
@@ -4956,6 +5274,7 @@ def _global_setup_plan(
                         "target": j,
                         "teardown": td,
                         "prefix_sig": prefix_sig,
+                        "prefix_args_sig": prefix_args_sig,
                         "td_fn": td_fn,
                         "coverage": coverage,
                     }
@@ -4967,9 +5286,10 @@ def _global_setup_plan(
             key=lambda it: (
                 0 if it["teardown"] is not None else 1,
                 -it["coverage"],
-                -freq[(fn, it["prefix_sig"], it["td_fn"])],
+                -freq[(fn, it["prefix_sig"], it["prefix_args_sig"], it["td_fn"])],
                 len(it["prefix"]),
                 it["prefix_sig"],
+                it["prefix_args_sig"],
                 it["td_fn"] or "",
             ),
         )
@@ -4998,6 +5318,7 @@ def sequence_case(
     api: ApiInfo | None = None,
     trust: Mapping[str, _EntryTrust] | None = None,
     setup_positions: Collection[int] | None = None,
+    trailing_teardown: str | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """
     The case that replays one chain of a trace: one buffer per shared address (the largest size the
@@ -5011,9 +5332,10 @@ def sequence_case(
     `api.records` (treating their non-shared parameters as trusted) as long as at least one call in
     `chain` is a real entry point in `records`. Positions listed in `setup_positions` are global-state
     setup or teardown calls bound strictly to their concrete recorded trace values (zero fuzz slots).
+    `trailing_teardown`, when given, appends a 0-arg global teardown call after the chain.
     """
     try:
-        return _sequence_case(trace, chain, records, spare, api, trust, setup_positions)
+        return _sequence_case(trace, chain, records, spare, api, trust, setup_positions, trailing_teardown)
     except _CaseError as e:
         return None, None, str(e)
 
@@ -5026,6 +5348,7 @@ def _sequence_case(
     api: ApiInfo | None,
     trust: Mapping[str, _EntryTrust] | None = None,
     setup_positions: Collection[int] | None = None,
+    trailing_teardown: str | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     case = _Case(spare, api, calls=len(chain))
     case.recorded_scalars = True
@@ -5115,6 +5438,10 @@ def _sequence_case(
         bound = _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared, entry_trust=et)
         calls.append(" ".join([*before, bound]))
         names.append(name)
+    if trailing_teardown and (not names or names[-1] != trailing_teardown):
+        calls.append(f"(void){trailing_teardown}();")
+        names.append(trailing_teardown)
+        case.notes.append(f"call {len(names) - 1}: global state reset after setup with {trailing_teardown}")
     return case.statements(calls), case.layout("sequence", names), None
 
 
@@ -5708,6 +6035,15 @@ def plan(
     callable_recs = _callable_records(unit_pool, visible)
     g_names = set(owners.values()) | {ns[0] for ns in producers.values()}
     helper_pool |= g_names - entry_names
+    model_fns = model.get("functions") or {}
+    trans_writes: dict[str, set[str]] = {}
+    trans_refs: dict[str, set[str]] = {}
+    if effective_trust_schema and traces:
+        trans_writes, trans_refs = _global_state_flow(model_fns)
+    global_td = (
+        _global_teardowns(callable_recs, traces, trans_writes) if (effective_trust_schema and trans_writes) else {}
+    )
+    helper_pool |= set(global_td.values()) - entry_names
     api = ApiInfo(
         structs=structs,
         probed=struct_layouts is not None,
@@ -5715,6 +6051,7 @@ def plan(
         candidates=candidates,
         records={
             **{n: callable_recs[n] for n in g_names},
+            **{n: callable_recs[n] for n in set(global_td.values()) if n in callable_recs},
             **init_records,
             **all_ctor_records,
             **ctor_records,
@@ -5724,7 +6061,7 @@ def plan(
         ctors=ctors,
         dtors=dtors,
         dtor_names=dtor_names,
-        closers=handle_closers(dtors, dtor_names, model.get("functions") or {}),
+        closers=handle_closers(dtors, dtor_names, model_fns),
         returns=returns,
         outs=outp.outs,
         out_ctors=out_ctors,
@@ -5740,7 +6077,7 @@ def plan(
         enum_params=dict(getattr(visible, "enum_params", None) or {}),
         const_returns=const_rets,
         allocating=allocating,
-        limits=limit_parameters(model.get("functions") or {}),
+        limits=limit_parameters(model_fns),
         init_skip_notes=init_skip_notes,
         bounds=dict(getattr(visible, "bound_forwards", None) or {}),
         null_defaults=set(getattr(visible, "null_defaults", None) or ()),
@@ -5758,7 +6095,9 @@ def plan(
         trusted_strings=recorded_strings(traces) if effective_trust_schema else {},
         trusted_scalars=recorded_scalars(traces) if effective_trust_schema else {},
         recorded_input_buffers=recorded_input_buffers(traces),
-        heap_buffer_fns=_reaching(model.get("functions") or {}, _HEAP_SIZE_PROBERS),
+        heap_buffer_fns=_reaching(model_fns, _HEAP_SIZE_PROBERS),
+        freeing=_reaching(model_fns, frozenset({"free"})),
+        global_teardown=global_td,
     )
     # Each function's threat-model roles by name, for the sequence cases (bound as in its single case).
     trust_by_name: dict[str, _EntryTrust] = {}
@@ -5847,23 +6186,38 @@ def plan(
     # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
     # produced comes from the input instead, and the rest of the chain stays.
     filtered_traces = [[c for c in full if c.get("fn") in seq_allowed] for full in traces or []]
-    trans_writes: dict[str, set[str]] = {}
-    trans_refs: dict[str, set[str]] = {}
     global_setups: list[dict[str, Any]] = []
-    if effective_trust_schema and filtered_traces:
-        trans_writes, trans_refs = _global_state_flow(model.get("functions") or {})
-        if trans_writes:
-            global_setups = _global_setup_plan(filtered_traces, records, singles, api, trans_writes, trans_refs)
+    if effective_trust_schema and filtered_traces and trans_writes:
+        global_setups = _global_setup_plan(filtered_traces, records, singles, api, trans_writes, trans_refs)
 
-    def _emit_sequence(trace: list[dict], chain: list[int], setup_positions: Collection[int] | None = None) -> None:
+    def _fallback_teardown(trace: list[dict], prefix: list[int]) -> str | None:
+        for k in reversed(prefix):
+            gtd = api.global_teardown.get(str(trace[k]["fn"]))
+            if gtd:
+                return gtd
+        return None
+
+    def _emit_sequence(
+        trace: list[dict],
+        chain: list[int],
+        setup_positions: Collection[int] | None = None,
+        trailing_teardown: str | None = None,
+    ) -> None:
         setup_pos = set(setup_positions or ())
         if not any(trace[k]["fn"] in records for pos, k in enumerate(chain) if pos not in setup_pos):
             return
-        sig = tuple(trace[k]["fn"] for k in chain)
+        sig = tuple(trace[k]["fn"] for k in chain) + ((trailing_teardown,) if trailing_teardown else ())
         if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
             return
         seq_stmt, seq_layout, _why = sequence_case(
-            trace, chain, records, spare, api, trust_by_name, setup_positions=setup_pos or None
+            trace,
+            chain,
+            records,
+            spare,
+            api,
+            trust_by_name,
+            setup_positions=setup_pos or None,
+            trailing_teardown=trailing_teardown,
         )
         if seq_stmt is None or seq_layout is None:
             if not setup_pos and any(trace[k]["fn"] not in records for k in chain):
@@ -5889,8 +6243,8 @@ def plan(
                 _emit_sequence(trace, chain)
     else:
         global_targets = {item["fn"] for item in global_setups}
-        multi_fn_chains: list[tuple[list[dict], list[int], set[int]]] = []
-        same_fn_chains: list[tuple[list[dict], list[int], set[int]]] = []
+        multi_fn_chains: list[tuple[list[dict], list[int], set[int], str | None]] = []
+        same_fn_chains: list[tuple[list[dict], list[int], set[int], str | None]] = []
         for trace in filtered_traces:
             for chain in chains(trace):
                 if not any(trace[k]["fn"] in records for k in chain):
@@ -5904,20 +6258,22 @@ def plan(
                 needs_setup = any(trace[k]["fn"] in global_targets for k in chain)
                 if needs_setup and not prefix:
                     continue
+                fb_td = _fallback_teardown(trace, prefix) if (prefix and td is None) else None
                 if len({trace[k]["fn"] for k in chain}) > 1:
-                    multi_fn_chains.append((trace, full_chain, setup_pos))
+                    multi_fn_chains.append((trace, full_chain, setup_pos, fb_td))
                 else:
-                    same_fn_chains.append((trace, full_chain, setup_pos))
+                    same_fn_chains.append((trace, full_chain, setup_pos, fb_td))
         for item in global_setups:
             prefix = list(item["prefix"])
             td = item["teardown"]
             full_chain = [*prefix, int(item["target"]), *([int(td)] if td is not None else [])]
             setup_pos = set(range(len(prefix))) | ({len(full_chain) - 1} if td is not None else set())
-            _emit_sequence(item["trace"], full_chain, setup_pos)
-        for trace, full_chain, setup_pos in multi_fn_chains:
-            _emit_sequence(trace, full_chain, setup_pos)
-        for trace, full_chain, setup_pos in same_fn_chains:
-            _emit_sequence(trace, full_chain, setup_pos)
+            fb_td = _fallback_teardown(item["trace"], prefix) if td is None else None
+            _emit_sequence(item["trace"], full_chain, setup_pos, trailing_teardown=fb_td)
+        for trace, full_chain, setup_pos, fb_td in multi_fn_chains:
+            _emit_sequence(trace, full_chain, setup_pos, trailing_teardown=fb_td)
+        for trace, full_chain, setup_pos, fb_td in same_fn_chains:
+            _emit_sequence(trace, full_chain, setup_pos, trailing_teardown=fb_td)
     # Every handle type with a constructor and a destructor gets one synthesized lifecycle case, within
     # the same cap as the recorded sequences (which come first). A recorded chain does not cover the
     # type: sequence_case passes a shared handle as a zeroed buffer (an incomplete struct does not

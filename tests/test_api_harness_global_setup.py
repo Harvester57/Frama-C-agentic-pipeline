@@ -77,6 +77,14 @@ def _global_lib_fixture() -> tuple[dict[str, Any], dict[str, Any]]:
         ),
         _fn(
             "src/cfg.c",
+            "lib_init_with_cfg",
+            "int(struct param_s *)",
+            [{"name": "cfg_p", "kind": "pointer"}],
+            writes_globals=["g_cfg", "g_state"],
+            global_refs=["src/cfg.c#g_cfg", "src/cfg.c#g_state"],
+        ),
+        _fn(
+            "src/cfg.c",
             "lib_init_unit_test",
             "int()",
             [],
@@ -213,10 +221,11 @@ def test_global_setup_sequence_binds_recorded_args_without_fuzz_bytes_and_feeds_
     assert "(void)lib_shutdown();" in stmt
     assert "FRAMAC_FUZZ_COPY" not in stmt
 
-    # seed_harvest.layout_seeds produces the recorded frame seed for this sequence selector.
+    # seed_harvest.layout_seeds produces the matched trace frame seed first, plus all other recorded calls.
     layouts = [{**x, "selector": idx} for idx, x in enumerate(res["layouts"])]
     seeds = sh.layout_seeds(layouts, [], traces)
-    assert seeds[sel] == [bytes([sel]) + bytes.fromhex("deadbeef")]
+    assert seeds[sel][0] == bytes([sel]) + bytes.fromhex("deadbeef")
+    assert set(seeds[sel]) == {bytes([sel]) + bytes.fromhex(h) for h in ("deadbeef", "aabb", "ccdd")}
 
 
 @pytest.mark.unit
@@ -244,9 +253,114 @@ def test_global_setup_trims_earlier_init_and_dedups_repeated_setup_calls_before_
     seqs = [(lay, res["cases"][i]) for i, lay in enumerate(res["layouts"]) if lay.get("kind") == "sequence"]
     assert len(seqs) == 1
     lay, stmt = seqs[0]
-    # Earlier lib_init_unit_test is trimmed; repeated lib_add_param collapsed so lib_config stays!
-    assert lay["calls"] == ["lib_config", "lib_add_param", "lib_init", "lib_process", "lib_shutdown"]
+    # Earlier lib_init_unit_test is trimmed; exact duplicate lib_add_param(p1) calls collapse while
+    # distinct additive registrations (p1 and p2) are both preserved alongside lib_config.
+    assert lay["calls"] == ["lib_config", "lib_add_param", "lib_add_param", "lib_init", "lib_process", "lib_shutdown"]
+    assert "0x11, 0x00" in stmt
     assert "0x22, 0x00" in stmt
+
+
+@pytest.mark.unit
+def test_global_setup_preserves_multiple_additive_registrations_and_ranks_by_concrete_args() -> None:
+    dag, model = _global_lib_fixture()
+    structs = {"struct param_s": {"size": 8, "pointers": False, "bools": False}}
+    rare_p = "ff00000000000000"
+    good_p = "0300000000000000"
+    traces = [
+        # Rare 1-off negative test appears first in traces.
+        [
+            {"fn": "lib_config", "args": {"0": [["i", 0, "09"]], "1": [["i", 0, "00"]]}, "addrs": {}},
+            {"fn": "lib_add_param", "args": {"0": [["t", 0, rare_p]]}, "addrs": {}},
+            {"fn": "lib_init", "args": {}, "addrs": {}},
+            {"fn": "lib_process", "args": {"0": [["b", 0, "dead"]], "1": [["i", 0, "0200000000000000"]]}, "addrs": {}},
+            {"fn": "lib_shutdown", "args": {}, "addrs": {}},
+        ],
+        # Canonical configuration appears 3 times with the same concrete setup arguments.
+        [
+            {"fn": "lib_config", "args": {"0": [["i", 0, "02"]], "1": [["i", 0, "01"]]}, "addrs": {}},
+            {"fn": "lib_add_param", "args": {"0": [["t", 0, good_p]]}, "addrs": {}},
+            {"fn": "lib_init", "args": {}, "addrs": {}},
+            {"fn": "lib_process", "args": {"0": [["b", 0, "1122"]], "1": [["i", 0, "0200000000000000"]]}, "addrs": {}},
+            {"fn": "lib_process", "args": {"0": [["b", 0, "3344"]], "1": [["i", 0, "0200000000000000"]]}, "addrs": {}},
+            {"fn": "lib_process", "args": {"0": [["b", 0, "5566"]], "1": [["i", 0, "0200000000000000"]]}, "addrs": {}},
+            {"fn": "lib_shutdown", "args": {}, "addrs": {}},
+        ],
+    ]
+    res = ah.plan(dag, model, "libdemo", "libdemo.so", 1024, traces=traces, struct_layouts=structs)
+    seqs = [(i, lay, res["cases"][i]) for i, lay in enumerate(res["layouts"]) if lay.get("kind") == "sequence"]
+    assert len(seqs) == 1
+    sel, lay, stmt = seqs[0]
+    assert lay["calls"] == ["lib_config", "lib_add_param", "lib_init", "lib_process", "lib_shutdown"]
+    assert "(void)lib_config(((unsigned char)2ULL), ((unsigned char)1ULL));" in stmt
+    assert "0x03, 0x00" in stmt
+    assert "0xff, 0x00" not in stmt
+
+    # Multi-registration cap: 14 distinct additive calls keep lib_config + lib_init + earliest 10 adds.
+    many_adds = [
+        {"fn": "lib_add_param", "args": {"0": [["t", 0, f"{k:02x}" + "00" * 7]]}, "addrs": {}} for k in range(1, 15)
+    ]
+    trace_many = [
+        {"fn": "lib_config", "args": {"0": [["i", 0, "02"]], "1": [["i", 0, "01"]]}, "addrs": {}},
+        *many_adds,
+        {"fn": "lib_init", "args": {}, "addrs": {}},
+        {"fn": "lib_process", "args": {"0": [["b", 0, "aa"]], "1": [["i", 0, "0100000000000000"]]}, "addrs": {}},
+        {"fn": "lib_shutdown", "args": {}, "addrs": {}},
+    ]
+    res_many = ah.plan(dag, model, "libdemo", "libdemo.so", 1024, traces=[trace_many], struct_layouts=structs)
+    seqs_many = [
+        (lay, res_many["cases"][i]) for i, lay in enumerate(res_many["layouts"]) if lay.get("kind") == "sequence"
+    ]
+    assert len(seqs_many) == 1
+    m_lay, m_stmt = seqs_many[0]
+    assert m_lay["calls"][0] == "lib_config"
+    assert m_lay["calls"][-3:] == ["lib_init", "lib_process", "lib_shutdown"]
+    assert m_lay["calls"].count("lib_add_param") == ah.GLOBAL_SETUP_MAX_PREFIX - 2
+    assert "0x01, 0x00" in m_stmt
+    assert "0x0a, 0x00" in m_stmt
+    assert "0x0b, 0x00" not in m_stmt
+
+
+@pytest.mark.unit
+def test_global_teardown_resets_single_setup_cases_teardownless_sequences_and_seeds_all_calls() -> None:
+    dag, model = _global_lib_fixture()
+    traces = [
+        # Teardown observed in one trace; a second trace calls lib_process twice without teardown.
+        [
+            {"fn": "lib_config", "args": {"0": [["i", 0, "02"]], "1": [["i", 0, "01"]]}, "addrs": {}},
+            {"fn": "lib_init", "args": {}, "addrs": {}},
+            {"fn": "lib_shutdown", "args": {}, "addrs": {}},
+        ],
+        [
+            {"fn": "lib_config", "args": {"0": [["i", 0, "02"]], "1": [["i", 0, "01"]]}, "addrs": {}},
+            {"fn": "lib_init", "args": {}, "addrs": {}},
+            {"fn": "lib_process", "args": {"0": [["b", 0, "aa11"]], "1": [["i", 0, "0200000000000000"]]}, "addrs": {}},
+            {"fn": "lib_process", "args": {"0": [["b", 0, "bb22"]], "1": [["i", 0, "0200000000000000"]]}, "addrs": {}},
+        ],
+    ]
+    res = ah.plan(dag, model, "libdemo", "libdemo.so", 1024, traces=traces)
+    singles = {lay["calls"][0]: res["cases"][i] for i, lay in enumerate(res["layouts"]) if lay.get("kind") == "single"}
+    assert "(void)lib_shutdown();" in singles["lib_config"]
+    assert "(void)lib_shutdown();" in singles["lib_init"]
+    assert "(void)lib_shutdown();" not in singles["lib_init_with_cfg"]
+    assert "(void)lib_shutdown();" not in singles["lib_process"]
+
+    seqs = [(i, lay, res["cases"][i]) for i, lay in enumerate(res["layouts"]) if lay.get("kind") == "sequence"]
+    assert len(seqs) == 1
+    sel, lay, stmt = seqs[0]
+    assert lay["calls"] == ["lib_config", "lib_init", "lib_process", "lib_shutdown"]
+    assert "(void)lib_shutdown();" in stmt
+
+    # layout_seeds collects every recorded call of lib_process (from traces + calls pool).
+    layouts = [{**x, "selector": idx} for idx, x in enumerate(res["layouts"])]
+    extra_calls = [
+        {"fn": "lib_process", "args": {"0": [["b", 0, "cc33"]], "1": [["i", 0, "0200000000000000"]]}},
+    ]
+    seeds = sh.layout_seeds(layouts, extra_calls, traces)
+    assert set(seeds[sel]) == {
+        bytes([sel]) + bytes.fromhex("aa11"),
+        bytes([sel]) + bytes.fromhex("bb22"),
+        bytes([sel]) + bytes.fromhex("cc33"),
+    }
 
 
 @pytest.mark.unit
