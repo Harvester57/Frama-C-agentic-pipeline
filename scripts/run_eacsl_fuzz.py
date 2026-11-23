@@ -101,7 +101,7 @@ import time
 from collections import Counter, deque
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -394,6 +394,19 @@ PLATEAU_CONFIG_BY_PROFILE: dict[str, tuple[int, int]] = {
     "deep": (10_000_000, 8_000_000),
 }
 
+# Multi-worker `-jobs=N -workers=N` crash stop: libFuzzer does not replace a crashed worker when
+# jobs == workers and lets surviving workers run until -max_total_time, losing the dead worker's
+# budget and leaving the crashed dispatch case live. Ending the round promptly on a fatal worker
+# exit lets `run_campaign_rounds` skip the crashed case and restart all workers with the remaining
+# budget. Set FRAMAC_FUZZ_CRASH_STOP=off to roll back.
+FUZZ_CRASH_STOP_ENV = "FRAMAC_FUZZ_CRASH_STOP"
+CRASH_POLL_INTERVAL_S = 1.0
+_LF_JOB_EXITED_RE = re.compile(
+    r"^=+\s*Job\s+(?P<job>\d+)\s+exited\s+with\s+exit\s+code\s+(?P<rc>-?\d+)\s*=+\s*$",
+    re.MULTILINE,
+)
+_FATAL_ARTIFACT_KINDS = frozenset({"crash", "leak", "timeout", "oom"})
+
 _ORIG_RUN_SANDBOXED = sandbox_exec.run_sandboxed
 
 
@@ -408,6 +421,13 @@ def fuzz_plateau_stop_enabled(env: Mapping[str, str] | None = None) -> bool:
     """True unless FRAMAC_FUZZ_PLATEAU_STOP is explicitly off/0/false/no (default on)."""
     src = os.environ if env is None else env
     raw = (src.get(FUZZ_PLATEAU_STOP_ENV) or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def fuzz_crash_stop_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """True unless FRAMAC_FUZZ_CRASH_STOP is explicitly off/0/false/no (default on)."""
+    src = os.environ if env is None else env
+    raw = (src.get(FUZZ_CRASH_STOP_ENV) or "").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
 
@@ -443,6 +463,11 @@ class ExecutionPlateauDetector:
         self.max_ft_rel_growth = max(0.0, float(max_ft_rel_growth))
         self.expected_workers = max(1, int(expected_workers))
         self._history: dict[str, list[tuple[int, int, int]]] = {}
+        self._exited: set[str] = set()
+
+    def mark_worker_exited(self, worker_id: str) -> None:
+        """Record that `worker_id` has exited so a dead worker does not block plateau detection."""
+        self._exited.add(worker_id)
 
     @classmethod
     def from_profile(
@@ -514,10 +539,14 @@ class ExecutionPlateauDetector:
         return ft_rel < self.max_ft_rel_growth
 
     def is_plateaued(self) -> bool:
-        """True when all active workers (at least `expected_workers`) are simultaneously plateaued."""
-        if len(self._history) < self.expected_workers:
+        """True when all active workers (at least `expected_workers` observed) are simultaneously plateaued."""
+        observed = set(self._history) | self._exited
+        if len(observed) < self.expected_workers:
             return False
-        return all(self.is_worker_plateaued(wid) for wid in self._history)
+        active = [wid for wid in self._history if wid not in self._exited]
+        if not active:
+            return False
+        return all(self.is_worker_plateaued(wid) for wid in active)
 
     def summary(self) -> dict[str, Any]:
         """Diagnostic snapshot of per-worker progress and plateau status."""
@@ -531,6 +560,8 @@ class ExecutionPlateauDetector:
                 "samples": len(hist),
                 "plateaued": self.is_worker_plateaued(wid),
             }
+            if wid in self._exited:
+                per_worker[wid]["exited"] = True
         return {
             "workers_observed": len(self._history),
             "expected_workers": self.expected_workers,
@@ -540,6 +571,163 @@ class ExecutionPlateauDetector:
             "plateaued": self.is_plateaued(),
             "per_worker": per_worker,
         }
+
+
+class _JobExitStream:
+    """Read-through wrapper on libFuzzer stderr that records `Job N exited with exit code RC`."""
+
+    def __init__(self, stream: Any, start_time: float) -> None:
+        self._stream = stream
+        self._start_time = start_time
+        self._lock = threading.Lock()
+        self._buf = ""
+        self._exits: dict[int, tuple[int, float]] = {}
+
+    def read(self, size: int = -1) -> bytes:
+        # Use `read1` on BufferedReader pipes so a short `Job N exited` line is observed as soon
+        # as the OS delivers it rather than blocking until 64 KiB accumulate or stderr hits EOF.
+        read1 = getattr(self._stream, "read1", None)
+        chunk: bytes = read1(size) if (read1 is not None and size > 0) else self._stream.read(size)
+        if chunk:
+            combined = self._buf + chunk.decode("utf-8", errors="replace")
+            if "\n" in combined:
+                complete, self._buf = combined.rsplit("\n", 1)
+                self._scan(complete)
+            else:
+                self._buf = combined
+        elif self._buf:
+            self._scan(self._buf)
+            self._buf = ""
+        return chunk
+
+    def _scan(self, text: str) -> None:
+        for m in _LF_JOB_EXITED_RE.finditer(text):
+            job_id = int(m.group("job"))
+            rc = int(m.group("rc"))
+            elapsed = max(0.0, time.monotonic() - self._start_time)
+            with self._lock:
+                self._exits[job_id] = (rc, elapsed)
+
+    def snapshot(self) -> dict[int, tuple[int, float]]:
+        with self._lock:
+            return dict(self._exits)
+
+
+def effective_worker_fuzz_s(
+    wall_fuzz_s: float,
+    workers: int,
+    job_exits: Mapping[int, tuple[int, float]] | Mapping[str, Mapping[str, Any]] | None,
+) -> float:
+    """
+    Effective worker-equivalent seconds spent by a `-jobs=W -workers=W` round when one or more
+    workers exited abnormally (`rc != 0`) before the round ended.
+
+    If every worker ran to completion (`rc == 0` or no early abnormal exit), returns `wall_fuzz_s`.
+    Otherwise, each worker slot `0 .. workers - 1` that exited with `rc != 0` contributes its actual
+    active duration `elapsed_s` (clamped to `[0, wall_fuzz_s]`), and surviving slots contribute
+    `wall_fuzz_s`; the mean across `workers` is the wall-equivalent budget consumed.
+    """
+    wall = max(0.0, float(wall_fuzz_s))
+    n = int(workers)
+    if n <= 1 or wall <= 0.0 or not job_exits:
+        return wall
+    abnormal_elapsed: dict[int, float] = {}
+    for raw_id, info in job_exits.items():
+        try:
+            jid = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= jid < n):
+            continue
+        if isinstance(info, tuple) and len(info) == 2:
+            rc, elapsed = int(info[0]), float(info[1])
+        elif isinstance(info, Mapping):
+            rc = int(info.get("rc", 0))
+            elapsed = float(info.get("elapsed_s", wall))
+        else:
+            continue
+        if rc != 0:
+            abnormal_elapsed[jid] = min(wall, max(0.0, elapsed))
+    if not abnormal_elapsed:
+        return wall
+    total_worker_s = sum(abnormal_elapsed.get(i, wall) for i in range(n))
+    return min(wall, total_worker_s / float(n))
+
+
+def _worker_crash_triggers_stop(
+    *,
+    job_id: int,
+    scratch: Path,
+    artifacts_dir: Path | None,
+    before_meta: Mapping[str, tuple[int, str]] | None,
+    dispatch_cases: int | None,
+    dispatch_selector: str | None,
+) -> bool:
+    """
+    True when crashed worker `job_id` produced a fatal artifact (`crash-`, `leak-`, `timeout-`,
+    `oom-`) that warrants stopping the remaining `-jobs=N -workers=N` workers immediately so
+    `run_campaign_rounds` can skip the crashed case and restart all workers.
+
+    For a dispatch harness (`dispatch_cases > 0`), requires at least one fatal artifact to select a
+    valid dispatch case (`0 <= c < dispatch_cases`). Artifacts that select no case (such as a 0-byte
+    `oom-` input) or worker exits with no artifact keep the surviving workers running instead of
+    ending the campaign early with `no_new_case`.
+    """
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(p: Path) -> None:
+        if _artifact_kind(p.name) not in _FATAL_ARTIFACT_KINDS:
+            return
+        resolved = p if p.is_file() else (artifacts_dir / p.name if artifacts_dir is not None else p)
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(resolved)
+
+    log_path = scratch / f"fuzz-{job_id}.log"
+    if log_path.is_file():
+        try:
+            tail_limit = 64 * 1024
+            sz = log_path.stat().st_size
+            with log_path.open("rb") as f:
+                if sz > tail_limit:
+                    f.seek(sz - tail_limit)
+                tail_text = f.read(tail_limit).decode("utf-8", errors="replace")
+            for m in _TEST_UNIT_WRITTEN_RE.finditer(tail_text):
+                _add(Path(m.group("path").strip()))
+        except OSError:
+            pass
+
+    if artifacts_dir is not None and artifacts_dir.is_dir():
+        prior = before_meta or {}
+        try:
+            for p in sorted(artifacts_dir.iterdir()):
+                if not p.is_file() or p.is_symlink():
+                    continue
+                if _artifact_kind(p.name) not in _FATAL_ARTIFACT_KINDS:
+                    continue
+                if p.name not in prior:
+                    _add(p)
+                else:
+                    old_mtime, _old_sha = prior[p.name]
+                    with contextlib.suppress(OSError):
+                        if p.stat().st_mtime_ns != old_mtime:
+                            _add(p)
+        except OSError:
+            pass
+
+    if not candidates:
+        return False
+    if dispatch_cases is None or dispatch_cases <= 0:
+        return True
+    eff_selector = dispatch_selector or DISPATCH_SELECTOR_MODULO
+    for art in candidates:
+        if not art.is_file():
+            continue
+        case = artifact_dispatch_case({"artifact": str(art)}, dispatch_cases, eff_selector)
+        if case is not None and 0 <= case < dispatch_cases:
+            return True
+    return False
 
 
 def _poll_worker_logs(
@@ -593,23 +781,96 @@ def _signal_process_group(proc: subprocess.Popen[bytes], sig: int) -> None:
         pass
 
 
+def _live_pgid_pids(pgid: int) -> list[int]:
+    """Non-zombie PIDs belonging to process group `pgid` on Linux `/proc` (empty elsewhere)."""
+    if os.name != "posix" or pgid <= 0:
+        return []
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    live: list[int] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="ascii", errors="replace")
+        except OSError:
+            continue
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            continue
+        fields = stat[rparen + 2 :].split()
+        if len(fields) < 3:
+            continue
+        state = fields[0]
+        try:
+            pgrp = int(fields[2])
+        except ValueError:
+            continue
+        if pgrp == pgid and state != "Z":
+            live.append(int(entry.name))
+    return live
+
+
+def _stop_process_group_gracefully(proc: subprocess.Popen[bytes], sigterm_grace_s: float) -> None:
+    """
+    Send `SIGTERM` to `proc`'s process group and wait up to `sigterm_grace_s` for both the parent
+    and any surviving workers in the group to flush final stats and exit; escalate to `SIGKILL` if
+    anything remains live past the grace window.
+    """
+    grace = max(0.5, float(sigterm_grace_s))
+    grace_deadline = time.monotonic() + grace
+    _signal_process_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    pgid = proc.pid
+    if proc.returncode is not None:
+        while time.monotonic() < grace_deadline and _live_pgid_pids(pgid):
+            time.sleep(0.05)
+    if proc.returncode is None or _live_pgid_pids(pgid):
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        _signal_process_group(proc, sigkill)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _run_sandboxed_with_plateau_monitor(
     argv: Sequence[str],
     writable: Sequence[Path],
     timeout_s: int,
     *,
     scratch: Path,
-    detector: ExecutionPlateauDetector,
+    detector: ExecutionPlateauDetector | None,
     poll_interval_s: float = PLATEAU_POLL_INTERVAL_S,
     sigterm_grace_s: float = PLATEAU_SIGTERM_GRACE_S,
     cwd: Path | None = None,
     limits: Limits | None = None,
     extra_env: dict[str, str] | None = None,
+    stop_on_crash: bool = False,
+    crash_poll_interval_s: float = CRASH_POLL_INTERVAL_S,
+    artifacts_dir: Path | None = None,
+    before_meta: Mapping[str, tuple[int, str]] | None = None,
+    dispatch_cases: int | None = None,
+    dispatch_selector: str | None = None,
+    monitor_stats: dict[str, Any] | None = None,
 ) -> tuple[sandbox_exec.SandboxResult, bool]:
     """
-    Execute `argv` with `sandbox_exec`'s rlimits/env/stream-draining model while polling
-    `scratch/fuzz-*.log` every `poll_interval_s` seconds. When `detector.is_plateaued()`
-    holds, sends `SIGTERM` to the process group so libFuzzer flushes final stats and corpus.
+    Execute `argv` with `sandbox_exec`'s rlimits/env/stream-draining model while monitoring
+    multi-worker libFuzzer progress:
+      - Watches parent stderr for `Job N exited with exit code RC`. When `stop_on_crash` is True
+        and a worker exits abnormally after writing a stop-worthy fatal artifact, sends `SIGTERM`
+        to the process group so surviving workers flush stats and `run_campaign_rounds` can skip
+        the crashed case and restart all workers immediately.
+      - When `detector` is provided, polls `scratch/fuzz-*.log` every `poll_interval_s` seconds
+        (marking exited workers inactive) and sends `SIGTERM` when `detector.is_plateaued()` holds.
     """
     mode = sandbox_exec.sandbox_mode()
     eff_limits = limits or Limits()
@@ -630,9 +891,11 @@ def _run_sandboxed_with_plateau_monitor(
         popen_kwargs["start_new_session"] = True
         popen_kwargs["preexec_fn"] = sandbox_exec._make_preexec(eff_limits)
 
+    started_at = time.monotonic()
     proc = subprocess.Popen(list(argv), **popen_kwargs)
     drainer_out = sandbox_exec.BoundedStreamDrainer(proc.stdout)
-    drainer_err = sandbox_exec.BoundedStreamDrainer(proc.stderr)
+    job_watcher = _JobExitStream(proc.stderr, started_at) if proc.stderr is not None else None
+    drainer_err = sandbox_exec.BoundedStreamDrainer(cast(Any, job_watcher) if job_watcher is not None else proc.stderr)
     t_out = threading.Thread(target=drainer_out.run, daemon=True)
     t_err = threading.Thread(target=drainer_err.run, daemon=True)
     t_out.start()
@@ -640,10 +903,16 @@ def _run_sandboxed_with_plateau_monitor(
 
     timed_out = False
     plateau_stopped = False
+    crash_stopped = False
     offsets: dict[Path, int] = {}
     remainders: dict[Path, str] = {}
+    checked_failed_jobs: set[int] = set()
+    marked_exited_jobs: set[int] = set()
     poll_step = max(0.05, float(poll_interval_s))
-    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    crash_step = max(0.05, float(crash_poll_interval_s))
+    wait_step = min(poll_step, crash_step) if stop_on_crash else poll_step
+    next_plateau_poll = started_at + poll_step
+    deadline = started_at + max(1.0, float(timeout_s))
 
     while True:
         remaining = deadline - time.monotonic()
@@ -657,23 +926,38 @@ def _run_sandboxed_with_plateau_monitor(
                 pass
             break
         try:
-            proc.wait(timeout=min(poll_step, remaining))
+            proc.wait(timeout=min(wait_step, remaining))
             break
         except subprocess.TimeoutExpired:
-            _poll_worker_logs(scratch, detector, offsets, remainders)
-            if detector.is_plateaued():
-                plateau_stopped = True
-                _signal_process_group(proc, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=max(0.5, float(sigterm_grace_s)))
-                except subprocess.TimeoutExpired:
-                    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    _signal_process_group(proc, sigkill)
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        pass
-                break
+            if job_watcher is not None:
+                exits = job_watcher.snapshot()
+                for job_id, (rc, _elapsed_s) in sorted(exits.items()):
+                    if job_id not in marked_exited_jobs:
+                        marked_exited_jobs.add(job_id)
+                        if detector is not None:
+                            detector.mark_worker_exited(f"fuzz-{job_id}.log")
+                    if stop_on_crash and rc != 0 and job_id not in checked_failed_jobs:
+                        checked_failed_jobs.add(job_id)
+                        if _worker_crash_triggers_stop(
+                            job_id=job_id,
+                            scratch=scratch,
+                            artifacts_dir=artifacts_dir,
+                            before_meta=before_meta,
+                            dispatch_cases=dispatch_cases,
+                            dispatch_selector=dispatch_selector,
+                        ):
+                            crash_stopped = True
+                            _stop_process_group_gracefully(proc, sigterm_grace_s)
+                            break
+                if crash_stopped:
+                    break
+            if detector is not None and (poll_step <= wait_step or time.monotonic() >= next_plateau_poll):
+                _poll_worker_logs(scratch, detector, offsets, remainders)
+                next_plateau_poll = time.monotonic() + poll_step
+                if detector.is_plateaued():
+                    plateau_stopped = True
+                    _stop_process_group_gracefully(proc, sigterm_grace_s)
+                    break
 
     t_out.join(timeout=5.0)
     t_err.join(timeout=5.0)
@@ -683,6 +967,13 @@ def _run_sandboxed_with_plateau_monitor(
                 stream.close()
         except OSError:
             pass
+
+    if monitor_stats is not None:
+        final_exits = job_watcher.snapshot() if job_watcher is not None else {}
+        monitor_stats["crash_stopped"] = crash_stopped
+        monitor_stats["job_exits"] = {
+            str(jid): {"rc": rc, "elapsed_s": round(el, 3)} for jid, (rc, el) in sorted(final_exits.items())
+        }
 
     out_bytes = drainer_out.get_bytes()
     err_bytes = drainer_err.get_bytes()
@@ -1629,6 +1920,7 @@ def run_campaign_rounds(
     collected: list[dict] = []
     telemetries: list[dict[str, Any]] = []
     spent = 0.0
+    wall_fuzz_spent = 0.0
     total_replay_s = 0.0
     total_rebuild_s = 0.0
     last: dict = {}
@@ -1710,8 +2002,14 @@ def run_campaign_rounds(
             last = campaign(binary, budget, False)
         wall_elapsed = max(0.0, time.monotonic() - started)
         # P1c: charge ONLY libFuzzer execution time (`fuzz_s`) when reported, never replay/attribution time.
+        # When workers exited early in `-jobs=N -workers=N` mode, `effective_fuzz_s` accounts for the
+        # actual worker-seconds consumed so lost worker time returns to the next round.
         round_fuzz_s = float(last["fuzz_s"]) if isinstance(last.get("fuzz_s"), (int, float)) else wall_elapsed
-        spent += max(0.0, round_fuzz_s)
+        round_budget_s = (
+            float(last["effective_fuzz_s"]) if isinstance(last.get("effective_fuzz_s"), (int, float)) else round_fuzz_s
+        )
+        spent += max(0.0, round_budget_s)
+        wall_fuzz_spent += max(0.0, round_fuzz_s)
         total_replay_s += max(0.0, float(last.get("replay_s") or 0.0))
         if isinstance(last.get("telemetry"), dict):
             telemetries.append(last["telemetry"])
@@ -1746,6 +2044,10 @@ def run_campaign_rounds(
             "artifacts": len(arts),
             "crashed_cases": crashed,
         }
+        if last.get("crash_stopped"):
+            rnd["crash_stopped"] = True
+        if round_budget_s < round_fuzz_s - 0.5:
+            rnd["effective_fuzz_s"] = round(round_budget_s, 3)
         if newly_blinded:
             rnd["blinded_cases"] = newly_blinded
         rounds.append(rnd)
@@ -1808,6 +2110,7 @@ def run_campaign_rounds(
         wall_elapsed = max(0.0, time.monotonic() - started)
         fb_fuzz_s = float(last["fuzz_s"]) if isinstance(last.get("fuzz_s"), (int, float)) else wall_elapsed
         spent += max(0.0, fb_fuzz_s)
+        wall_fuzz_spent += max(0.0, fb_fuzz_s)
         total_replay_s += max(0.0, float(last.get("replay_s") or 0.0))
         if isinstance(last.get("telemetry"), dict):
             telemetries.append(last["telemetry"])
@@ -1863,10 +2166,10 @@ def run_campaign_rounds(
         omitted["duplicates"] = omitted.get("duplicates", 0) + dropped
         out["artifacts_omitted"] = omitted
     merged_tel = merge_telemetry(telemetries, build_s=build_s + total_rebuild_s)
-    merged_tel["fuzz_s"] = round(spent, 3)
+    merged_tel["fuzz_s"] = round(wall_fuzz_spent, 3)
     merged_tel["replay_s"] = round(total_replay_s, 3)
     out["telemetry"] = merged_tel
-    out["fuzz_s"] = round(spent, 3)
+    out["fuzz_s"] = round(wall_fuzz_spent, 3)
     out["replay_s"] = round(total_replay_s, 3)
     out["keep_going"] = {
         "mode": "dispatch_rounds",
@@ -2022,6 +2325,9 @@ def run_fuzz_campaign(
     runs: int | None = None,
     seed: int | None = None,
     profile: str = "standard",
+    dispatch_cases: int | None = None,
+    dispatch_selector: str | None = None,
+    stop_on_crash: bool | None = None,
 ) -> dict:
     """
     `corpus_dir` receives new units (writable); `extra_corpus` directories are read-only
@@ -2060,6 +2366,9 @@ def run_fuzz_campaign(
         "runs": runs,
         "seed": seed,
         "profile": profile,
+        "dispatch_cases": dispatch_cases,
+        "dispatch_selector": dispatch_selector,
+        "stop_on_crash": stop_on_crash,
     }
     multi = fork or max(1, int(workers or 1)) > 1 or max(1, int(jobs or 1)) > 1
     reason = single_process_reason if multi else None
@@ -2127,6 +2436,10 @@ def _run_fuzz_campaign_once(
     profile: str = "standard",
     plateau_poll_interval_s: float = PLATEAU_POLL_INTERVAL_S,
     plateau_enabled: bool | None = None,
+    dispatch_cases: int | None = None,
+    dispatch_selector: str | None = None,
+    stop_on_crash: bool | None = None,
+    crash_poll_interval_s: float = CRASH_POLL_INTERVAL_S,
 ) -> dict:
     """One libFuzzer campaign as run_fuzz_campaign describes; `_executed_inputs` says whether any input ran."""
     req_mem = fuzz_required_memory_mb(workers)
@@ -2205,17 +2518,21 @@ def _run_fuzz_campaign_once(
         cpu_mult = max(2, eff_workers + 1)
         oom_before = resources.read_cgroup_oom_kills() if resources.fuzz_explore_judge_enabled() else None
         eff_plateau = fuzz_plateau_stop_enabled() if plateau_enabled is None else bool(plateau_enabled)
-        use_plateau_monitor = (
-            eff_plateau
+        eff_crash_stop = fuzz_crash_stop_enabled() if stop_on_crash is None else bool(stop_on_crash)
+        use_monitor = (
+            (eff_plateau or eff_crash_stop)
             and not fork
             and runs is None
             and eff_workers > 1
             and sandbox_exec.run_sandboxed is _ORIG_RUN_SANDBOXED
         )
         plateau_stopped = False
+        monitor_stats: dict[str, Any] = {}
         fuzz_started = time.monotonic()
-        if use_plateau_monitor:
-            plateau_detector = ExecutionPlateauDetector.from_profile(profile, expected_workers=eff_workers)
+        if use_monitor:
+            plateau_detector = (
+                ExecutionPlateauDetector.from_profile(profile, expected_workers=eff_workers) if eff_plateau else None
+            )
             res, plateau_stopped = _run_sandboxed_with_plateau_monitor(
                 cmd,
                 writable=[scratch, corpus_dir, artifacts_dir],
@@ -2225,6 +2542,13 @@ def _run_fuzz_campaign_once(
                 poll_interval_s=plateau_poll_interval_s,
                 limits=Limits(cpu_seconds=wall_timeout * cpu_mult, ignore_sigpipe=True),
                 extra_env=run_env,
+                stop_on_crash=eff_crash_stop,
+                crash_poll_interval_s=crash_poll_interval_s,
+                artifacts_dir=artifacts_dir,
+                before_meta=before_meta,
+                dispatch_cases=dispatch_cases,
+                dispatch_selector=dispatch_selector,
+                monitor_stats=monitor_stats,
             )
         else:
             res = sandbox_exec.run_sandboxed(
@@ -2235,6 +2559,13 @@ def _run_fuzz_campaign_once(
                 extra_env=run_env,
             )
         fuzz_s = max(0.0, time.monotonic() - fuzz_started)
+        crash_stopped = bool(monitor_stats.get("crash_stopped"))
+        job_exits = monitor_stats.get("job_exits") if isinstance(monitor_stats.get("job_exits"), dict) else None
+        eff_fuzz_s = (
+            effective_worker_fuzz_s(fuzz_s, eff_workers, job_exits)
+            if (not fork and waves == 1 and eff_workers > 1 and job_exits)
+            else fuzz_s
+        )
         oom_after = resources.read_cgroup_oom_kills() if oom_before is not None else None
         oom_delta = max(0, oom_after - oom_before) if (oom_before is not None and oom_after is not None) else None
         MAX_WORKER_LOG_BYTES = 1024 * 1024
@@ -2454,6 +2785,10 @@ def _run_fuzz_campaign_once(
         }
         if fork:
             out["fork"] = eff_workers
+        if crash_stopped:
+            out["crash_stopped"] = True
+        if eff_fuzz_s < fuzz_s:
+            out["effective_fuzz_s"] = round(eff_fuzz_s, 3)
         if omitted or unreplayed:
             out["artifacts_omitted"] = {"duplicates": omitted, "not_replayed": unreplayed}
         return out
@@ -6176,6 +6511,8 @@ def _run_eacsl_fuzz_mode(args) -> dict:
             extra_env=extra_env,
             single_process_reason=single_process.get("reason"),
             profile=prof,
+            dispatch_cases=n_cases,
+            dispatch_selector=selector,
         )
         if run.get("single_process_reason") and "reason" not in single_process:
             single_process["reason"] = str(run["single_process_reason"])
@@ -6360,6 +6697,8 @@ def _run_campaign_mode(args) -> dict:
                     extra_env=extra_env,
                     single_process_reason=single_process.get("reason"),
                     profile=profile,
+                    dispatch_cases=n_cases,
+                    dispatch_selector=selector,
                 )
                 if run.get("single_process_reason") and "reason" not in single_process:
                     single_process["reason"] = str(run["single_process_reason"])
@@ -6675,6 +7014,8 @@ def _run_explore_campaign_mode(
             extra_env=extra_env,
             single_process_reason=single_process.get("reason"),
             profile=profile,
+            dispatch_cases=n_cases,
+            dispatch_selector=selector,
         )
         if run.get("single_process_reason") and "reason" not in single_process:
             single_process["reason"] = str(run["single_process_reason"])
