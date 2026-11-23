@@ -307,8 +307,8 @@ endif
 # the ladder (or with eva_shards in params.json) runs as EVA_SHARDS_<mod> shards, each keeping only some
 # dispatch cases (-DFRAMAC_EVA_SHARD_CASE_<k>, workspace/reports/eva-shards/<mod>/plan.json). Each shard is
 # the module's plain run otherwise, with its own resource-history key <mod>:shard<i>; until a shard has a
-# peak of its own under the current plan, its lease scales the module's unsharded peak by its shard share
-# (floored at the 2 GiB class base, never inheriting an unscaled whole-module peak). A failed shard never blocks the merge,
+# peak of its own under the current plan, its lease uses completed peer shards of the same plan or scales
+# the module's unsharded peak by max(0.6, shard_share) (never an unscaled whole-module peak). A failed shard never blocks the merge,
 # which then writes an incomplete report naming it. eva-<mod>, evabase-<mod> and evatune-<mod> all merge
 # the shards (cached by content), so the module's report is the same whichever ran last.
 define EVA_SHARD_RULE

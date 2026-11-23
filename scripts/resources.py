@@ -87,6 +87,11 @@ FUZZ_RSS_WORKER_FLOOR_MB = 512
 FUZZ_RSS_SAFETY_MARGIN = 1.5
 FUZZ_SPIKE_CUSHION_MB = 2048
 DEFAULT_PIDS_LIMIT = 4096
+# Minimum share of an unsharded module's Eva memory retained by any shard before a shard of the
+# same plan has been measured. Every shard still parses and annotates the whole program and runs
+# Eva over shared library core functions, so memory does not shrink linearly with 1/k (QCBOR run-2:
+# 1/8 shards reached 2.9-4.2 GiB RSS vs a 4.78 GiB timed-out unsharded run -> ~0.6-0.88x).
+EVA_SHARD_MEM_FLOOR_SHARE = 0.6
 
 PROBE_MEMO_S = 5.0
 ENGINE_INFO_MAX_AGE_S = 30.0
@@ -372,14 +377,21 @@ def parse_mountinfo(root: Path | str = "/") -> list[Mount]:
     return out
 
 
-def _bytes_mb(raw: str | None, ceil: bool = False) -> int | None:
+def _parse_bytes(raw: str | None) -> int | None:
     if raw is None or raw.strip() in ("", "max"):
         return None
     try:
         value = int(raw.split()[0])
     except ValueError:
         return None
-    if value <= 0 or value >= _UNLIMITED_BYTES:
+    if value < 0 or value >= _UNLIMITED_BYTES:
+        return None
+    return value
+
+
+def _bytes_mb(raw: str | None, ceil: bool = False) -> int | None:
+    value = _parse_bytes(raw)
+    if value is None or value <= 0:
         return None
     return -(-value // _MIB) if ceil else value // _MIB
 
@@ -528,12 +540,46 @@ def cgroup_view(root: Path | str = "/") -> CgroupView:
     return view
 
 
+def _cgroup_working_set_mb(view: CgroupView) -> int | None:
+    """
+    Live non-reclaimable memory usage (MiB, ceil) of this process's cgroup:
+    cgroup v2 `max(0, memory.current - inactive_file)`, cgroup v1
+    `max(0, memory.usage_in_bytes - total_inactive_file)` (matching Docker / Kubernetes working set,
+    so clean reclaimable page cache left by finished jobs does not starve waiting leases).
+    """
+    if view.memory_dir is None:
+        return None
+    if view.version == 2:
+        cur = _parse_bytes(_read_file(view.memory_dir / "memory.current"))
+        if cur is None:
+            return None
+        stat = _kv(_read_file(view.memory_dir / "memory.stat"))
+        reclaimable = max(0, stat.get("inactive_file", 0))
+        working = max(0, cur - reclaimable)
+        return -(-working // _MIB) if working > 0 else 0
+    if view.version == 1:
+        cur = _parse_bytes(_read_file(view.memory_dir / "memory.usage_in_bytes"))
+        if cur is None:
+            return None
+        stat = _kv(_read_file(view.memory_dir / "memory.stat"))
+        reclaimable = max(0, stat.get("total_inactive_file", stat.get("inactive_file", 0)))
+        working = max(0, cur - reclaimable)
+        return -(-working // _MIB) if working > 0 else 0
+    return None
+
+
+def cgroup_current_mem_mb(root: Path | str = "/") -> int | None:
+    """Live non-reclaimable cgroup memory usage (MiB), or None when unavailable."""
+    return _cgroup_working_set_mb(cgroup_view(_probe_root(root)))
+
+
 def cgroup_stats(root: Path | str = "/") -> dict:
-    """Usage of this process's cgroup: peak memory (MiB), OOM kills, CPU time (µs), memory limit."""
+    """Usage of this process's cgroup: peak/current memory (MiB), OOM kills, CPU time (µs), memory limit."""
     view = cgroup_view(root)
     out: dict[str, Any] = {
         "version": view.version,
         "peak_mb": None,
+        "current_mb": _cgroup_working_set_mb(view),
         "oom_kill": None,
         "cpu_usec": None,
         "limit_mb": view.mem_limit_mb,
@@ -2059,6 +2105,26 @@ def _history_record_value(rec: dict) -> float | None:
     return float(peak) * (2.0 if rec.get("oom_killed") else 1.25)
 
 
+def _is_peer_eva_shard(plan: dict | None, idx: int, other_idx: int, share: float | None) -> bool:
+    """
+    Whether `other_idx` is a comparable peer of shard `idx` within the same shard plan.
+    Balanced shards (all within 2x of each other's predicted share) share peaks; heavily skewed
+    outliers (e.g. a 95% dominant case vs 1% light shards) do not contaminate each other.
+    """
+    if idx == other_idx:
+        return False
+    if share is None:
+        return True
+    other_share = _eva_shard_share(plan, other_idx)
+    if other_share is None:
+        return True
+    if share <= 0.0 and other_share <= 0.0:
+        return True
+    if share <= 0.0 or other_share <= 0.0:
+        return False
+    return 0.5 * share <= other_share <= 2.0 * share
+
+
 def _eva_history_estimate(
     run_dir: Path,
     key: str | None,
@@ -2069,9 +2135,13 @@ def _eva_history_estimate(
     Eva-specific history lookup:
     - Prefers records matching the module's current `harness_digest` (falling back to the newest
       prior-harness group rather than the max across all runs when the harness changed).
-    - Never lets a shard key (`<mod>:shard<N>`) inherit an unscaled whole-module peak: exact matches
-      require a compatible shard plan digest, and unsharded module fallback scales by the shard's
-      share from `workspace/reports/eva-shards/<mod>/plan.json` (or returns None without a plan).
+    - For `<mod>:shard<N>` keys:
+      1. Exact shard match under the current `shard_plan_digest`.
+      2. Completed or OOM-killed peer sibling shards under the same `shard_plan_digest` (so once the
+         first shard of a plan finishes, the remaining shards size from its real measured peak).
+      3. Unsharded module fallback scaled by `max(EVA_SHARD_MEM_FLOOR_SHARE, share)` from
+         `workspace/reports/eva-shards/<mod>/plan.json` (retaining a fixed program-overhead floor so
+         shards never under-lease at 1/k while still never inheriting an unscaled whole-module peak).
     - Excludes shard records when non-shard Eva keys (`<mod>:<rung>`) fall back to module prefix.
     """
     mod = key.split(":", 1)[0] if key else None
@@ -2142,31 +2212,56 @@ def _eva_history_estimate(
                 return mtime >= plan_mtime - 1e-3
             return True
 
-        cur, stale = _extract_split(lambda rk: rk == key, plan_filter=_matches_current_plan)
+        def _usable_shard_record(rec: dict, is_local: bool, mtime: float | None) -> bool:
+            if not _matches_current_plan(rec, is_local, mtime):
+                return False
+            # Ignore fast non-OOM aborts so a 100 MiB crash never under-sizes this shard or its peers.
+            return rec.get("rc") in (None, 0) or bool(rec.get("oom_killed"))
+
+        cur, stale = _extract_split(lambda rk: rk == key, plan_filter=_usable_shard_record)
         if cur is not None:
             return int(math.ceil(cur))
         if s_rung is not None:
             base_key = f"{s_mod}:shard{s_idx}"
-            base_cur, base_stale = _extract_split(lambda rk: rk == base_key, plan_filter=_matches_current_plan)
+            base_cur, base_stale = _extract_split(lambda rk: rk == base_key, plan_filter=_usable_shard_record)
             if base_cur is not None:
                 return int(math.ceil(base_cur))
             if stale is None:
                 stale = base_stale
 
-        if share is not None and share > 0.0:
+        # Tier 2: completed (or OOM-killed) peer sibling shards of the same shard plan.
+        sib_cur: float | None = None
+        sib_stale: float | None = None
+        if current_plan_digest is not None:
 
-            def _is_unsharded(rk: str | None) -> bool:
-                return bool(rk and (rk == s_mod or (rk.startswith(f"{s_mod}:") and _parse_eva_shard_key(rk) is None)))
+            def _is_peer_sibling_key(rk: str | None) -> bool:
+                parsed = _parse_eva_shard_key(rk)
+                if parsed is None:
+                    return False
+                p_mod, p_idx, p_rung = parsed
+                if p_mod != s_mod or p_rung not in (None, s_rung):
+                    return False
+                return _is_peer_eva_shard(plan, s_idx, p_idx, share)
 
-            un_cur, un_stale = _extract_split(_is_unsharded)
-            if un_cur is not None:
-                return int(math.ceil(un_cur * share))
-            if stale is not None:
-                return int(math.ceil(stale))
-            if un_stale is not None:
-                return int(math.ceil(un_stale * share))
-        elif stale is not None:
+            sib_cur, sib_stale = _extract_split(_is_peer_sibling_key, plan_filter=_usable_shard_record)
+            if sib_cur is not None:
+                return int(math.ceil(sib_cur))
+
+        # Tier 3: unsharded module fallback with fixed-overhead floor `EVA_SHARD_MEM_FLOOR_SHARE`.
+        eff_share = max(EVA_SHARD_MEM_FLOOR_SHARE, share if share is not None else 0.0)
+
+        def _is_unsharded(rk: str | None) -> bool:
+            return bool(rk and (rk == s_mod or (rk.startswith(f"{s_mod}:") and _parse_eva_shard_key(rk) is None)))
+
+        un_cur, un_stale = _extract_split(_is_unsharded)
+        if un_cur is not None:
+            return int(math.ceil(un_cur * eff_share))
+        if stale is not None:
             return int(math.ceil(stale))
+        if sib_stale is not None:
+            return int(math.ceil(sib_stale))
+        if un_stale is not None:
+            return int(math.ceil(un_stale * eff_share))
         return None
 
     # Non-shard Eva key (`<mod>` or `<mod>:<rung>`): Tier 1 exact -> Tier 2 TU -> Tier 3 non-shard module.
@@ -2688,6 +2783,8 @@ def plan_grant(
     pool_cpus: float,
     pool_mem: int,
     placer: Callable[[int, set[int]], list[int] | None] | None = None,
+    *,
+    live_mem_mb: int | None = None,
 ) -> Grant | None:
     """
     Grant for ticket `me` now, or None to keep waiting. CPUs are elastic:
@@ -2697,13 +2794,23 @@ def plan_grant(
     (backfill) only when the head of the queue still fits afterwards.
     A `cache_mode='rw'` ticket and a `runs_target_code=True` ticket on the same `run_dir` are
     mutually exclusive.
+    When `live_mem_mb` is provided (container broker's live cgroup working set) and at least one
+    gated lease is already running, memory admission accounts for `max(leased_mem, live_mem_mb)`
+    so jobs that overrun their lease reservations cannot push additional concurrent jobs into OOM.
+    When no gated lease is running, `live_mem_mb` never blocks the sole next job (no deadlock).
     """
     granted_all = [e for e in entries if e.get("state") == "granted"]
     if any(_run_dir_conflict(me, e) for e in granted_all):
         return None
     granted = [e for e in granted_all if e.get("gated", True)]
     free_cpus = pool_cpus - sum(float(e.get("cpus") or 0) for e in granted)
-    free_mem = int(pool_mem) - sum(int(e.get("mem_mb") or 0) for e in granted)
+    lease_used_mem = sum(int(e.get("mem_mb") or 0) for e in granted)
+    used_mem = (
+        max(lease_used_mem, int(live_mem_mb))
+        if (granted and live_mem_mb is not None and live_mem_mb > 0)
+        else lease_used_mem
+    )
+    free_mem = int(pool_mem) - used_mem
     queue = _queue(entries)
     if not any(e.get("id") == me.get("id") for e in queue):
         queue = _queue([*queue, {**me, "state": "waiting", "gated": True}])
@@ -2861,6 +2968,7 @@ class Broker:
         pool_fn: Callable[[], Any],
         *,
         history_fn: Callable[[str, str | None], int | None] | None = None,
+        live_mem_fn: Callable[[], int | None] | None = None,
         placer: Callable[[int, set[int]], list[int] | None] | None = None,
         container_alive: Callable[[dict], bool | None] | None = None,
         container_kill: Callable[[dict], bool] | None = None,
@@ -2877,6 +2985,7 @@ class Broker:
         self.leases.mkdir(parents=True, exist_ok=True)
         self.pool_fn = pool_fn
         self.history_fn = history_fn
+        self.live_mem_fn = live_mem_fn
         self.placer = placer
         self.container_alive = container_alive
         self.container_kill = container_kill
@@ -2888,6 +2997,14 @@ class Broker:
         self.clock = clock
         self.log = log
         self._fresh_alive: dict[str, bool | None] = {}  # container_alive answers of the current entries() pass
+
+    def _live_mem_mb(self) -> int | None:
+        if self.live_mem_fn is None:
+            return None
+        with contextlib.suppress(Exception):
+            val = self.live_mem_fn()
+            return int(val) if val is not None and val >= 0 else None
+        return None
 
     @contextlib.contextmanager
     def locked(self) -> Iterator[None]:
@@ -3143,7 +3260,21 @@ class Broker:
             self._write_entry(entry)
         deadline = None if timeout is None else time.monotonic() + timeout
         delay, last_pos, last_report, waited = self.poll, None, 0.0, False
+        last_granted_ids: frozenset[str] | None = None
+        need_history_refresh = False
         while True:
+            if need_history_refresh and self.history_fn is not None and not fixed_mem_mb:
+                need_history_refresh = False
+                new_hist = None
+                with contextlib.suppress(Exception):
+                    new_hist = self.history_fn(cls.name, key)
+                new_floor = max(mem_floor_mb or 0, new_hist or 0) or None
+                if new_floor != demand["mem_floor_mb"]:
+                    demand["mem_floor_mb"] = new_floor
+                    entry["demand"] = dict(demand)
+                    with self.locked():
+                        self._write_entry(entry)
+            live_mem: int | None = None
             with self.locked():
                 entries = self.entries()
                 if not any(e.get("id") == lid for e in entries):  # reclaimed by mistake: register again
@@ -3165,7 +3296,25 @@ class Broker:
                         )
                     grant = None
                 else:
-                    grant = plan_grant(entry, entries, pool.cpus, pool.mem_mb, self.placer)
+                    cur_granted_ids = frozenset(
+                        str(e.get("id")) for e in entries if e.get("state") == "granted" and e.get("gated", True)
+                    )
+                    if (
+                        self.history_fn is not None
+                        and not fixed_mem_mb
+                        and last_granted_ids is not None
+                        and cur_granted_ids != last_granted_ids
+                    ):
+                        # A peer lease finished or started; re-check history (e.g. newly measured sibling shard)
+                        # outside broker.lock before admitting this waiting ticket.
+                        last_granted_ids = cur_granted_ids
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError(f"no {cls.name} lease within {timeout:.0f}s")
+                        need_history_refresh = True
+                        continue
+                    last_granted_ids = cur_granted_ids
+                    live_mem = self._live_mem_mb()
+                    grant = plan_grant(entry, entries, pool.cpus, pool.mem_mb, self.placer, live_mem_mb=live_mem)
                     if grant is not None:
                         others = [e for e in entries if e.get("id") != lid and e.get("state") == "granted"]
                         return self._grant(entry, grant, pool, not others, warnings, lock, waited)
@@ -3179,15 +3328,27 @@ class Broker:
             waited = True
             now = time.monotonic()
             if pos != last_pos or now - last_report >= 30.0:
+                mem_status = (
+                    f"{used_mem} MiB leased / {live_mem} MiB live of {pool.mem_mb} MiB"
+                    if live_mem is not None and live_mem > used_mem
+                    else f"{used_mem}/{pool.mem_mb} MiB"
+                )
                 self._report(
                     f"{cls.name} lease {lid} waiting: #{pos} of {total} in queue "
-                    f"(in use {_fmt_cpus(used_cpus)}/{pool.cpus} CPUs, {used_mem}/{pool.mem_mb} MiB)"
+                    f"(in use {_fmt_cpus(used_cpus)}/{pool.cpus} CPUs, {mem_status})"
                 )
                 last_pos, last_report = pos, now
             if deadline is not None and now >= deadline:
                 raise TimeoutError(f"no {cls.name} lease within {timeout:.0f}s")
             time.sleep(delay)
             delay = min(delay * 1.5, self.max_poll)
+
+    def is_single(self, lease: Lease) -> bool:
+        """Whether `lease` has been the only granted lease since it was granted (call before `release`)."""
+        with self.locked():
+            counters = self._counters()
+            others = [e for e in self.entries(reap=False) if e.get("id") != lease.id and e.get("state") == "granted"]
+            return bool(lease.single and counters["grants"] == lease.grant_no and not others)
 
     def release(self, lease: Lease) -> bool:
         """Drop the lease. True when it was the only lease from grant to release (a single job)."""
@@ -3747,6 +3908,7 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
         broker_dir,
         lambda: job_budget(root_p, use_available=False),
         history_fn=estimate,
+        live_mem_fn=lambda: cgroup_current_mem_mb(root_p),
         log=sys.stderr,
     )
     while True:
@@ -3767,17 +3929,19 @@ def cmd_run(argv: list[str], root: Path | str = "/") -> int:
             if lease.wait_s > 0 and (lease.waited or lease.wait_s >= 0.05):
                 _credit_prover_budget_lease_wait(cmd, run_dir, lease.id, lease.wait_s)
             rc, maxrss = _run_child(cmd, env)
+            wall = time.monotonic() - start
+            # Record history before releasing the lease so waiting peer shards immediately see this peak.
+            single = broker.is_single(lease)
+            after = cgroup_stats(root_p)
+            peak, source = maxrss, ("rusage" if maxrss else None)
+            cg_peak, cg_before = after.get("peak_mb"), before.get("peak_mb")
+            if single and cg_peak and (cg_before is None or cg_peak > cg_before) and cg_peak > (peak or 0):
+                peak, source = cg_peak, "cgroup"  # alone in the container: its new memory.peak is this job's
+            oom = oom_evidence(rc, before, after, single=single, peak_mb=peak, lease_mb=lease.mem_mb, gated=lease.gated)
+            kills = oom_kills_during(before, after)
+            _record_run_history(run_dir, cls_name, args.key, lease, rc, oom, kills, peak, source, wall, attempt)
         finally:
-            single = broker.release(lease)
-        wall = time.monotonic() - start
-        after = cgroup_stats(root_p)
-        peak, source = maxrss, ("rusage" if maxrss else None)
-        cg_peak, cg_before = after.get("peak_mb"), before.get("peak_mb")
-        if single and cg_peak and (cg_before is None or cg_peak > cg_before) and cg_peak > (peak or 0):
-            peak, source = cg_peak, "cgroup"  # alone in the container: its new memory.peak is this job's
-        oom = oom_evidence(rc, before, after, single=single, peak_mb=peak, lease_mb=lease.mem_mb, gated=lease.gated)
-        kills = oom_kills_during(before, after)
-        _record_run_history(run_dir, cls_name, args.key, lease, rc, oom, kills, peak, source, wall, attempt)
+            broker.release(lease)
         # A job that still exited 0 (say, a sanitizer build after its E-ACSL attempt was killed) is not
         # re-run in place; its record says oom_killed, so its next lease doubles.
         if oom and rc != 0 and CLASSES[cls_name].idempotent and attempt == 1:
