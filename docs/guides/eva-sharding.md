@@ -250,6 +250,16 @@ the design above:
 - **Profiles and flows.** The shards' `flamegraph.txt` files are concatenated into
   `workspace/eva/<mod>/flamegraph.txt`, so a later re-plan reads the whole module's work. Flows are
   merged as described above.
+- **Shard memory leases and concurrency warning.** [`../../scripts/resources.py`](../../scripts/resources.py)
+  stamps `harness_digest` on `eva` history records and `shard_plan_digest` on `<mod>:shard<i>`
+  records. Before a shard has a measurement under the current plan, `history_estimate` never gives
+  it an unscaled whole-module peak: it scales the current (or newest prior-harness) unsharded
+  module estimate by the shard's share from `plan.json` (`predicted_shard_s[i] / sum(predicted_shard_s)`,
+  falling back to `len(shards[i]) / case_count` for legacy plans, or `None` -> the 2 GiB class
+  floor when no plan exists). [`../../scripts/eva_shards.py`](../../scripts/eva_shards.py)
+  (`memory_concurrency_note`) and [`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py)
+  check the resulting per-shard leases against the `phase-static` pool and warn if memory still
+  forces shards into waves or series, without changing `k`.
 
 **Measured on QCBOR run-4 `libqcbor_a`** (179 cases, harness guarded by hand, one 32-core machine
 with another analysis running). Eva time is from the reports; wall time is the whole `make` target,
@@ -276,5 +286,4 @@ disagree on such a key, and harness code has no ledger units.
 
 **Not done yet:**
 - The ladder per shard, and the per-shard records it needs in `params.json`.
-- A cheaper first-run memory lease for shards.
 - Measurements on QCBOR run-5, the module this was designed for.

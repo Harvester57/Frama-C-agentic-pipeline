@@ -35,7 +35,7 @@ import shutil
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -421,6 +421,145 @@ def imputed_note(record: Any) -> str | None:
         f"{cases} (not reached before the timeout), so their cost is unknown: each is counted at the mean "
         f"sampled case's{f' ({each} s)' if each is not None else ''}, a guess that spreads them over the shards"
     )
+
+
+@dataclass(frozen=True)
+class ShardConcurrency:
+    """How many Eva shards fit concurrently in a container pool under their estimated sub-lease memory."""
+
+    k: int
+    max_concurrent: int
+    total_mem_mb: int
+    min_shard_mem_mb: int
+    max_shard_mem_mb: int
+    clamped_shards: int
+    pool_mem_mb: int
+    pool_cpus: int
+    parallel_makespan_s: float | None
+    scheduled_makespan_s: float | None
+    memory_limited: bool
+
+
+def estimate_shard_concurrency(
+    shard_mem_mb: Sequence[int],
+    pool_mem_mb: int,
+    pool_cpus: int | None = None,
+    predicted_shard_s: Sequence[float] | None = None,
+) -> ShardConcurrency | None:
+    """
+    Simulate FIFO broker admission of `k = len(shard_mem_mb)` single-CPU Eva shards against
+    `(pool_cpus, pool_mem_mb)` (each shard clamped to `pool_mem_mb`, as `resources.Broker` does).
+    Returns None when `shard_mem_mb` is empty or `pool_mem_mb <= 0`.
+    """
+    k = len(shard_mem_mb)
+    if k == 0 or pool_mem_mb <= 0:
+        return None
+    mems = [max(1, int(m)) for m in shard_mem_mb]
+    eff_cpus = max(1, int(pool_cpus)) if pool_cpus is not None and pool_cpus > 0 else k
+    eff_mems = [min(m, pool_mem_mb) for m in mems]
+    clamped = sum(1 for m in mems if m > pool_mem_mb)
+    raw_times = (
+        [_number(t) for t in predicted_shard_s]
+        if predicted_shard_s is not None and len(predicted_shard_s) == k
+        else None
+    )
+    has_times = raw_times is not None and all(t is not None and t >= 0 for t in raw_times)
+    durs = [float(t) for t in raw_times if t is not None] if has_times and raw_times is not None else [1.0] * k
+
+    waiting = list(range(k))
+    running: list[tuple[float, int]] = []
+    now = 0.0
+    used_mem = 0
+    max_concurrent = 0
+    while waiting or running:
+        while waiting:
+            head = waiting[0]
+            if len(running) < eff_cpus and used_mem + eff_mems[head] <= pool_mem_mb:
+                waiting.pop(0)
+                used_mem += eff_mems[head]
+                heapq.heappush(running, (now + durs[head], head))
+                max_concurrent = max(max_concurrent, len(running))
+            else:
+                break
+        if not running:
+            break
+        now = running[0][0]
+        while running and running[0][0] <= now + 1e-12:
+            _, done_idx = heapq.heappop(running)
+            used_mem -= eff_mems[done_idx]
+
+    cpu_cap = min(k, eff_cpus)
+    parallel_s = max(durs) if has_times else None
+    scheduled_s = now if has_times else None
+    memory_limited = max_concurrent < cpu_cap or clamped > 0
+    return ShardConcurrency(
+        k=k,
+        max_concurrent=max_concurrent,
+        total_mem_mb=sum(mems),
+        min_shard_mem_mb=min(mems),
+        max_shard_mem_mb=max(mems),
+        clamped_shards=clamped,
+        pool_mem_mb=int(pool_mem_mb),
+        pool_cpus=eff_cpus,
+        parallel_makespan_s=parallel_s,
+        scheduled_makespan_s=scheduled_s,
+        memory_limited=memory_limited,
+    )
+
+
+def memory_concurrency_note(
+    record: Any,
+    shard_mem_mb: Sequence[int],
+    pool_mem_mb: int,
+    pool_cpus: int | None = None,
+) -> str | None:
+    """
+    What to warn when estimated per-shard sub-lease memory prevents shards from running in parallel
+    (or exceeds the pool), or None when all shards that fit on the pool's CPUs also fit in memory.
+    Never changes `k`: the shard count stays fixed by the plan, independent of the machine.
+    """
+    if not isinstance(record, dict) or not shard_mem_mb or pool_mem_mb <= 0:
+        return None
+    raw_times = record.get("predicted_shard_s")
+    times = raw_times if isinstance(raw_times, list) and len(raw_times) == len(shard_mem_mb) else None
+    sc = estimate_shard_concurrency(shard_mem_mb, pool_mem_mb, pool_cpus=pool_cpus, predicted_shard_s=times)
+    if sc is None or not sc.memory_limited:
+        return None
+    mem_desc = (
+        f"{sc.min_shard_mem_mb} MiB/shard"
+        if sc.min_shard_mem_mb == sc.max_shard_mem_mb
+        else f"{sc.min_shard_mem_mb}-{sc.max_shard_mem_mb} MiB/shard"
+    )
+    cpu_cap = min(sc.k, sc.pool_cpus)
+    if sc.max_concurrent == 1 and sc.k > 1 and sc.max_concurrent < cpu_cap:
+        note = (
+            f"memory concurrency: only 1 of {sc.k} shards fits in the {sc.pool_mem_mb} MiB pool at once "
+            f"({mem_desc}, total {sc.total_mem_mb} MiB), so shards will run in series"
+        )
+    elif sc.max_concurrent < cpu_cap:
+        note = (
+            f"memory concurrency: at most {sc.max_concurrent} of {sc.k} shards fit in the {sc.pool_mem_mb} MiB "
+            f"pool at once ({mem_desc}, total {sc.total_mem_mb} MiB), so shards will run in waves"
+        )
+    else:
+        note = (
+            f"memory concurrency: {sc.clamped_shards} of {sc.k} shards exceed the {sc.pool_mem_mb} MiB pool "
+            f"({mem_desc}) and will be clamped to the pool"
+        )
+    if sc.clamped_shards > 0 and "clamped to the pool" not in note:
+        verb = "exceeds" if sc.clamped_shards == 1 else "exceed"
+        noun = "shard" if sc.clamped_shards == 1 else "shards"
+        note += f"; {sc.clamped_shards} {noun} {verb} {sc.pool_mem_mb} MiB and will be clamped to the pool"
+    if (
+        sc.scheduled_makespan_s is not None
+        and sc.parallel_makespan_s is not None
+        and sc.scheduled_makespan_s > sc.parallel_makespan_s + 0.05
+    ):
+        note += (
+            f" (predicted ~{round(sc.scheduled_makespan_s, 1)} s wall time instead of "
+            f"{round(sc.parallel_makespan_s, 1)} s in parallel)"
+        )
+    return note
 
 
 def plan_problem(record: Any, case_count: int, settings_digest: str, forced: int | None = None) -> str | None:

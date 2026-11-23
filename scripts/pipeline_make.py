@@ -84,6 +84,7 @@ from eva_shards import (  # noqa: E402
     harness_shardable,
     imputed_note,
     make_plan,
+    memory_concurrency_note,
     over_limit_note,
     plan_problem,
     shard_cppflags,
@@ -1085,6 +1086,50 @@ def _shard_basis(plan: Plan, name: str) -> tuple[str, dict, Path | None] | None:
     return None
 
 
+def _eva_shard_pool_budget(run_dir: Path) -> resources.Budget | None:
+    """
+    Effective container pool `(cpus, mem_mb)` that Eva shard sub-leases will compete for, or None
+    when running outside a container without pool metadata (e.g. bare host unit tests).
+    """
+    job_cls = (os.environ.get("FRAMAC_JOB_CLASS") or "").strip()
+    if job_cls == "phase-static" or (job_cls not in ("", "light") and os.environ.get("FRAMAC_JOB_MEM_MB")):
+        return resources.job_budget(use_available=False)
+    if job_cls != "light" and resources.in_container():
+        return resources.job_budget(use_available=False)
+    pool_cpus = resources._env_int("FRAMAC_POOL_CPUS")
+    pool_mem = resources.parse_mem(os.environ.get("FRAMAC_POOL_MEM_MB"))
+    if pool_cpus and pool_mem:
+        grant = resources.nominal_grant(
+            resources.CLASSES["phase-static"], resources.Budget(pool_cpus, pool_mem, "pool-env")
+        )
+        return resources.Budget(cpus=int(grant["cpus"]), mem_mb=int(grant["mem_mb"]), source="phase-static-nominal")
+    try:
+        meta = load_json_optional(run_dir / "run-metadata.json", None)
+    except ArtifactError:
+        meta = None
+    if isinstance(meta, dict):
+        meta_pool = (meta.get("resources") or {}).get("pool") if isinstance(meta.get("resources"), dict) else None
+        if isinstance(meta_pool, dict):
+            mc = meta_pool.get("cpus")
+            mm = meta_pool.get("mem_mb")
+            if (
+                isinstance(mc, (int, float))
+                and not isinstance(mc, bool)
+                and isinstance(mm, (int, float))
+                and not isinstance(mm, bool)
+                and mc > 0
+                and mm > 0
+            ):
+                grant = resources.nominal_grant(
+                    resources.CLASSES["phase-static"],
+                    resources.Budget(int(mc), int(mm), "run-metadata-pool"),
+                )
+                return resources.Budget(
+                    cpus=int(grant["cpus"]), mem_mb=int(grant["mem_mb"]), source="phase-static-from-metadata"
+                )
+    return None
+
+
 def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
     """
     Whether `eva-<mod>` runs as shards (eva_shards.py), and which cases each keeps: the recorded plan
@@ -1167,6 +1212,16 @@ def _plan_shards(plan: Plan, mod: ModulePlan, sidecar: dict | None) -> None:
         f"({SHARD_DIR}/{mod.name}/plan.json, predicted {predicted} s for the slowest); the ladder does "
         "not run per shard yet" + (f"; {guessed}" if guessed else "") + (f". Warning: {risk}" if risk else "")
     )
+    pool = _eva_shard_pool_budget(plan.run_dir)
+    if pool is not None:
+        base_mb = resources.CLASSES["eva"].mem_base_mb
+        shard_mems = [
+            max(base_mb, resources.history_estimate(plan.run_dir, "eva", f"{mod.name}:shard{i}") or 0)
+            for i in range(len(mod.shards))
+        ]
+        mem_note = memory_concurrency_note(record, shard_mems, pool.mem_mb, pool.cpus)
+        if mem_note:
+            mod.warnings.append(SHARD_WARNING_PREFIX + mem_note)
 
 
 def build_plan(run_dir: Path | str = ".", templates_dir: Path | str | None = None) -> Plan:
@@ -2232,6 +2287,12 @@ def run_targets(
                     runnable.append(target)
             if not runnable:
                 continue
+            if any(t in ("eva", "eva-tune", "eva-tune-base") or t.startswith(("eva-", "module-")) for t in runnable):
+                for w in plan.warnings:
+                    if f"{SHARD_WARNING_PREFIX}memory concurrency:" in w:
+                        msg = f"[pipeline_make] Warning: {w}"
+                        print(msg, file=sys.stderr, flush=True)
+                        log.write(msg + "\n")
             nodes = {n for t in runnable for n in _target_nodes(t, plan)}
             outputs = {n: _node_output(n, plan) for n in nodes}
             before = {out: _output_state(run_dir, out) for out in outputs.values() if out}

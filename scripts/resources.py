@@ -1886,6 +1886,124 @@ def cache_mount_mode(cmd: str, cache_rw_requested: bool, cache_dir: str | Path |
 
 _HISTORY_KEEP = 400
 _SHARED_HISTORY_SUBDIR = "resource-history"
+_EVA_SHARD_KEY_RE = re.compile(r"^(?P<mod>[^:#]+):shard(?P<idx>\d+)(?::(?P<rung>[^:#]+))?$")
+_EVA_SHARD_DIR = Path("workspace") / "reports" / "eva-shards"
+_EVA_HARNESS_DIR = Path("workspace") / "harnesses"
+
+
+def _parse_eva_shard_key(key: str | None) -> tuple[str, int, str | None] | None:
+    """Parse `<module>:shard<N>[:<rung>]` into `(module, index, rung)`, or None."""
+    if not key:
+        return None
+    m = _EVA_SHARD_KEY_RE.fullmatch(key)
+    if m is None:
+        return None
+    return m.group("mod"), int(m.group("idx")), m.group("rung")
+
+
+def _eva_harness_digest(run_dir: Path, module: str | None) -> str | None:
+    """Current harness digest for `module` (`phase0_gates.harness_digest(..., ignore_exempt=True)`), or None."""
+    if not module:
+        return None
+    with contextlib.suppress(Exception):
+        import phase0_gates
+
+        return phase0_gates.harness_digest(run_dir, module, ignore_exempt=True)
+    return None
+
+
+def _eva_harness_mtime(run_dir: Path, module: str | None) -> float | None:
+    """Modification time of `harness_<module>.c` (else `.json`), or None when missing."""
+    if not module:
+        return None
+    for suffix in (".c", ".json"):
+        path = run_dir / _EVA_HARNESS_DIR / f"harness_{module}{suffix}"
+        with contextlib.suppress(OSError):
+            if path.is_file():
+                return path.stat().st_mtime
+    return None
+
+
+def _load_eva_shard_plan(run_dir: Path, module: str | None) -> tuple[dict | None, float | None]:
+    """Load `(plan_dict, mtime)` from `workspace/reports/eva-shards/<module>/plan.json`, else `(None, None)`."""
+    if not module:
+        return None, None
+    path = run_dir / _EVA_SHARD_DIR / module / "plan.json"
+    data = _load_json(path, max_bytes=16 << 20)
+    if not isinstance(data, dict):
+        return None, None
+    mtime: float | None = None
+    with contextlib.suppress(OSError):
+        mtime = path.stat().st_mtime
+    return data, mtime
+
+
+def _eva_shard_plan_digest(plan: dict | None) -> str | None:
+    """Matches `eva_shards.plan_digest(plan)`: sha256[:16] of the compact JSON shard list."""
+    if not isinstance(plan, dict) or not isinstance(plan.get("shards"), list):
+        return None
+    return hashlib.sha256(json.dumps(plan["shards"], separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+def _eva_shard_share(plan: dict | None, index: int) -> float | None:
+    """
+    Fraction of the module's Eva work represented by shard `index` in `plan.json` (in [0, 1]),
+    or None when `plan` is missing/malformed or `index` is out of range.
+    Prefers `predicted_shard_s[index] / sum(predicted_shard_s)` so skewed dominant-case shards keep
+    their proportional memory; falls back to `len(shards[index]) / case_count` for legacy plans.
+    """
+    if not isinstance(plan, dict):
+        return None
+    shards = plan.get("shards")
+    if not isinstance(shards, list) or not (0 <= index < len(shards)):
+        return None
+    shard = shards[index]
+    if not isinstance(shard, list):
+        return None
+    pred = plan.get("predicted_shard_s")
+    if isinstance(pred, list) and len(pred) == len(shards):
+        vals: list[float] = []
+        valid = True
+        for x in pred:
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+                valid = False
+                break
+            vals.append(float(x))
+        total_pred = sum(vals)
+        if valid and total_pred > 0:
+            return min(1.0, max(0.0, vals[index] / total_pred))
+    raw_count = plan.get("case_count")
+    total_cases = (
+        raw_count
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count > 0
+        else sum(len(s) for s in shards if isinstance(s, list))
+    )
+    if total_cases <= 0:
+        return None
+    return min(1.0, max(0.0, len(shard) / total_cases))
+
+
+def _enrich_eva_record(run_dir: Path, record: dict) -> dict:
+    """Attach `harness_digest` (and `shard_plan_digest` for shard keys) to Eva history records when absent."""
+    if record.get("class") != "eva":
+        return record
+    key = record.get("key")
+    if not isinstance(key, str) or not key:
+        return record
+    mod = key.split(":", 1)[0]
+    out: dict[str, Any] | None = None
+    if "harness_digest" not in record:
+        hdig = _eva_harness_digest(run_dir, mod)
+        if hdig is not None:
+            out = dict(record)
+            out["harness_digest"] = hdig
+    if "shard_plan_digest" not in record and _parse_eva_shard_key(key) is not None:
+        plan, _ = _load_eva_shard_plan(run_dir, mod)
+        pdig = _eva_shard_plan_digest(plan)
+        if pdig is not None:
+            out = dict(record) if out is None else out
+            out["shard_plan_digest"] = pdig
+    return out if out is not None else record
 
 
 def _prune_history_dir(d: Path) -> None:
@@ -1916,20 +2034,167 @@ def write_history(run_dir: Path | str, record: dict) -> Path | None:
     cls = record.get("class")
     if cls not in CLASSES:
         return None
-    d = Path(run_dir) / HISTORY_DIR / str(cls)
+    run_p = Path(run_dir)
+    stored = _enrich_eva_record(run_p, record)
+    d = run_p / HISTORY_DIR / str(cls)
     d.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     fname = f"{stamp}-{secrets.token_hex(4)}.json"
     path = d / fname
-    _write_json(path, record)
+    _write_json(path, stored)
     _prune_history_dir(d)
     if (os.environ.get("FRAMAC_CACHE_MODE") or "").strip().lower() == "rw":
         for sd in _shared_history_dirs(str(cls)):
             with contextlib.suppress(OSError):
                 sd.mkdir(parents=True, exist_ok=True)
-                _write_json(sd / fname, record)
+                _write_json(sd / fname, stored)
                 _prune_history_dir(sd)
     return path
+
+
+def _history_record_value(rec: dict) -> float | None:
+    peak = rec.get("peak_mb")
+    if isinstance(peak, bool) or not isinstance(peak, (int, float)) or peak <= 0:
+        return None
+    return float(peak) * (2.0 if rec.get("oom_killed") else 1.25)
+
+
+def _eva_history_estimate(
+    run_dir: Path,
+    key: str | None,
+    loaded_entries: list[tuple[dict, bool, float | None]],
+    last: int,
+) -> int | None:
+    """
+    Eva-specific history lookup:
+    - Prefers records matching the module's current `harness_digest` (falling back to the newest
+      prior-harness group rather than the max across all runs when the harness changed).
+    - Never lets a shard key (`<mod>:shard<N>`) inherit an unscaled whole-module peak: exact matches
+      require a compatible shard plan digest, and unsharded module fallback scales by the shard's
+      share from `workspace/reports/eva-shards/<mod>/plan.json` (or returns None without a plan).
+    - Excludes shard records when non-shard Eva keys (`<mod>:<rung>`) fall back to module prefix.
+    """
+    mod = key.split(":", 1)[0] if key else None
+    shard_info = _parse_eva_shard_key(key)
+    current_harness = _eva_harness_digest(run_dir, mod)
+    harness_mtime = _eva_harness_mtime(run_dir, mod) if current_harness is not None else None
+
+    def _is_current_harness(rec: dict, is_local: bool, mtime: float | None) -> bool:
+        if current_harness is None:
+            return True
+        rec_h = rec.get("harness_digest")
+        if isinstance(rec_h, str) and rec_h:
+            return rec_h == current_harness
+        if not is_local:
+            return False
+        if harness_mtime is not None and mtime is not None:
+            return mtime >= harness_mtime - 1e-3
+        return True
+
+    def _extract_split(
+        match_fn: Callable[[str | None], bool],
+        *,
+        plan_filter: Callable[[dict, bool, float | None], bool] | None = None,
+    ) -> tuple[float | None, float | None]:
+        current_vals: list[float] = []
+        stale_items: list[tuple[dict, float]] = []
+        for rec, is_local, mtime in loaded_entries:
+            rec_key = rec.get("key") or None
+            if not match_fn(rec_key):
+                continue
+            if plan_filter is not None and not plan_filter(rec, is_local, mtime):
+                continue
+            val = _history_record_value(rec)
+            if val is None:
+                continue
+            if _is_current_harness(rec, is_local, mtime):
+                if len(current_vals) < last:
+                    current_vals.append(val)
+            else:
+                stale_items.append((rec, val))
+        cur_est = max(current_vals) if current_vals else None
+        stale_est: float | None = None
+        if stale_items:
+            newest_rec, newest_val = stale_items[0]
+            newest_h = newest_rec.get("harness_digest")
+            if isinstance(newest_h, str) and newest_h:
+                group = [v for r, v in stale_items if r.get("harness_digest") == newest_h][:last]
+                stale_est = max(group) if group else newest_val
+            else:
+                stale_est = newest_val
+        return cur_est, stale_est
+
+    if shard_info is not None:
+        s_mod, s_idx, s_rung = shard_info
+        plan, plan_mtime = _load_eva_shard_plan(run_dir, s_mod)
+        current_plan_digest = _eva_shard_plan_digest(plan)
+        share = _eva_shard_share(plan, s_idx)
+
+        def _matches_current_plan(rec: dict, is_local: bool, mtime: float | None) -> bool:
+            if current_plan_digest is None:
+                return True
+            rec_p = rec.get("shard_plan_digest")
+            if isinstance(rec_p, str) and rec_p:
+                return rec_p == current_plan_digest
+            if not is_local:
+                return False
+            if plan_mtime is not None and mtime is not None:
+                return mtime >= plan_mtime - 1e-3
+            return True
+
+        cur, stale = _extract_split(lambda rk: rk == key, plan_filter=_matches_current_plan)
+        if cur is not None:
+            return int(math.ceil(cur))
+        if s_rung is not None:
+            base_key = f"{s_mod}:shard{s_idx}"
+            base_cur, base_stale = _extract_split(lambda rk: rk == base_key, plan_filter=_matches_current_plan)
+            if base_cur is not None:
+                return int(math.ceil(base_cur))
+            if stale is None:
+                stale = base_stale
+
+        if share is not None and share > 0.0:
+
+            def _is_unsharded(rk: str | None) -> bool:
+                return bool(rk and (rk == s_mod or (rk.startswith(f"{s_mod}:") and _parse_eva_shard_key(rk) is None)))
+
+            un_cur, un_stale = _extract_split(_is_unsharded)
+            if un_cur is not None:
+                return int(math.ceil(un_cur * share))
+            if stale is not None:
+                return int(math.ceil(stale))
+            if un_stale is not None:
+                return int(math.ceil(un_stale * share))
+        elif stale is not None:
+            return int(math.ceil(stale))
+        return None
+
+    # Non-shard Eva key (`<mod>` or `<mod>:<rung>`): Tier 1 exact -> Tier 2 TU -> Tier 3 non-shard module.
+    cur, stale = _extract_split(lambda rk: rk == (key or None))
+    if cur is not None:
+        return int(math.ceil(cur))
+
+    tu_cur: float | None = None
+    tu_stale: float | None = None
+    if key and "#" in key:
+        tu_prefix = key.split("#", 1)[0]
+        tu_cur, tu_stale = _extract_split(lambda rk: bool(rk and (rk == tu_prefix or rk.startswith(f"{tu_prefix}#"))))
+        if tu_cur is not None:
+            return int(math.ceil(tu_cur))
+
+    mod_cur: float | None = None
+    mod_stale: float | None = None
+    if key and ":" in key and mod:
+        mod_cur, mod_stale = _extract_split(
+            lambda rk: bool(rk and (rk == mod or (rk.startswith(f"{mod}:") and _parse_eva_shard_key(rk) is None)))
+        )
+        if mod_cur is not None:
+            return int(math.ceil(mod_cur))
+
+    for fallback in (stale, tu_stale, mod_stale):
+        if fallback is not None:
+            return int(math.ceil(fallback))
+    return None
 
 
 def history_estimate(
@@ -1942,10 +2207,11 @@ def history_estimate(
     """Memory (MiB) the history suggests: 1.25 x the max of the last `last` peaks (2 x after an OOM kill)."""
     if run_dir is None or cls not in CLASSES:
         return None
-    dirs = [Path(run_dir) / HISTORY_DIR / cls, *_shared_history_dirs(cls, cache_dir=cache_dir)]
-    candidates: list[tuple[str, Path]] = []
+    run_p = Path(run_dir)
+    dirs = [(True, run_p / HISTORY_DIR / cls), *((False, d) for d in _shared_history_dirs(cls, cache_dir=cache_dir))]
+    candidates: list[tuple[str, Path, bool]] = []
     seen_names: set[str] = set()
-    for d in dirs:
+    for is_local, d in dirs:
         try:
             names = [n for n in os.listdir(d) if n.endswith(".json")]
         except OSError:
@@ -1953,26 +2219,33 @@ def history_estimate(
         for n in names:
             if n not in seen_names:
                 seen_names.add(n)
-                candidates.append((n, d / n))
+                candidates.append((n, d / n, is_local))
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
-    loaded_records: list[dict] = []
-    for _, path in candidates[:64]:
+    loaded_entries: list[tuple[dict, bool, float | None]] = []
+    for _, path, is_local in candidates[:64]:
         rec = _load_json(path, max_bytes=64 * 1024)
         if isinstance(rec, dict):
-            loaded_records.append(rec)
+            mtime: float | None = None
+            if cls == "eva" and is_local and ("harness_digest" not in rec or "shard_plan_digest" not in rec):
+                with contextlib.suppress(OSError):
+                    mtime = path.stat().st_mtime
+            loaded_entries.append((rec, is_local, mtime))
+
+    if cls == "eva":
+        return _eva_history_estimate(run_p, key, loaded_entries, last)
 
     def _extract_values(match_fn: Callable[[str | None], bool]) -> list[float]:
         vals: list[float] = []
-        for rec in loaded_records:
+        for rec, _, _ in loaded_entries:
             rec_key = rec.get("key") or None
             if not match_fn(rec_key):
                 continue
-            peak = rec.get("peak_mb")
-            if isinstance(peak, bool) or not isinstance(peak, (int, float)) or peak <= 0:
+            val = _history_record_value(rec)
+            if val is None:
                 continue
-            vals.append(float(peak) * (2.0 if rec.get("oom_killed") else 1.25))
+            vals.append(val)
             if len(vals) >= last:
                 break
         return vals
