@@ -161,9 +161,11 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -189,6 +191,44 @@ from seed_harvest import (  # noqa: E402
 MODEL_JSON = Path("workspace/reports/phase0_model.json")
 TRACES_JSONL = Path("workspace/seed_records/traces.jsonl")
 MAX_SEQUENCE_CASES = 16  # recorded chains first, then synthesized lifecycle cases (H2)
+GLOBAL_SETUP_MAX_PREFIX = 6  # max global-state setup calls prepended to one recorded sequence case
+_GLOBAL_SETUP_WORDS = frozenset(
+    {
+        "init",
+        "initialize",
+        "initialise",
+        "config",
+        "configure",
+        "setup",
+        "register",
+        "set",
+        "add",
+        "enable",
+        "start",
+        "open",
+        "create",
+        "new",
+    }
+)
+_GLOBAL_INIT_WORDS = frozenset({"init", "initialize", "initialise", "setup"})
+_GLOBAL_TEARDOWN_WORDS = frozenset(
+    {
+        "shutdown",
+        "cleanup",
+        "deinit",
+        "uninit",
+        "fini",
+        "finalize",
+        "finalise",
+        "destroy",
+        "free",
+        "teardown",
+        "reset",
+        "close",
+        "stop",
+        "release",
+    }
+)
 LIFECYCLE_MAX_CALLS = 8  # calls on the handle per run of a lifecycle case, each picked by one input byte
 MAX_VARIADIC_CASES = 32  # per variadic function: one case per harvested (format, objects)
 # Two selector bytes above 256 cases (generate_harness.DISPATCH_SELECTOR_IDENTITY16, D7).
@@ -502,6 +542,7 @@ class ApiInfo:
     """
 
     structs: dict[str, dict] = field(default_factory=dict)
+    pointer_free_records: set[str] = field(default_factory=set)
     probed: bool = False
     inits: dict[str, str] = field(default_factory=dict)
     candidates: dict[str, set[str]] = field(default_factory=dict)
@@ -4304,6 +4345,339 @@ def _shared_size(
     return max(sizes, default=0)
 
 
+def _is_global_teardown_name(name: str) -> bool:
+    return bool(set(_words(name)) & _GLOBAL_TEARDOWN_WORDS)
+
+
+def _is_global_setup_name(name: str) -> bool:
+    return not _is_global_teardown_name(name) and bool(set(_words(name)) & _GLOBAL_SETUP_WORDS)
+
+
+def _is_global_init_name(name: str) -> bool:
+    return not _is_global_teardown_name(name) and bool(set(_words(name)) & _GLOBAL_INIT_WORDS)
+
+
+def _global_state_flow(model_functions: Mapping[str, Any]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """
+    Per function name in the Phase 0 model, the global variable names it transitively writes
+    (`writes.globals`) and references (`global_refs` union `writes.globals`) across its call graph.
+    Returns `({}, {})` when no function in the model records global writes.
+    """
+    direct_writes: dict[str, set[str]] = {}
+    direct_refs: dict[str, set[str]] = {}
+    has_writes = False
+    for rec in model_functions.values():
+        if not isinstance(rec, dict) or not isinstance(rec.get("name"), str):
+            continue
+        name = rec["name"]
+        writes_obj = rec.get("writes")
+        wg = {
+            str(g)
+            for g in ((writes_obj.get("globals") if isinstance(writes_obj, dict) else None) or [])
+            if isinstance(g, str) and g
+        }
+        if wg:
+            has_writes = True
+        gr = {str(g).split("#")[-1] for g in (rec.get("global_refs") or []) if isinstance(g, str) and g}
+        direct_writes.setdefault(name, set()).update(wg)
+        direct_refs.setdefault(name, set()).update(gr | wg)
+    if not has_writes:
+        return {}, {}
+    callees = _callee_names(dict(model_functions))
+    trans_writes: dict[str, set[str]] = {}
+    trans_refs: dict[str, set[str]] = {}
+    for name in sorted(direct_refs):
+        reached = {name} | _reach(callees, name)
+        tw: set[str] = set()
+        tr: set[str] = set()
+        for fn in reached:
+            tw.update(direct_writes.get(fn, ()))
+            tr.update(direct_refs.get(fn, ()))
+        trans_writes[name] = tw
+        trans_refs[name] = tr
+    return trans_writes, trans_refs
+
+
+def _recorded_arg_bytes(call: Mapping[str, Any], idx: int, kind: str) -> bytes | None:
+    """Recorded bytes of argument `idx` with record kind `kind` at offset 0, or None."""
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return None
+    vals = args.get(str(idx))
+    if not isinstance(vals, list):
+        return None
+    for val in vals:
+        if isinstance(val, list) and len(val) == 3 and val[0] == kind and val[1] == 0:
+            try:
+                return bytes.fromhex(str(val[2]))
+            except ValueError:
+                return None
+    return None
+
+
+def _is_pointer_free_setup_struct(ctype: str, raw: bytes | None, api: ApiInfo | None) -> bool:
+    """
+    Whether a struct/union type `ctype` is proven pointer-free by clang's AST (either via a full
+    layout in `api.structs` matching `len(raw)` or via `api.pointer_free_records` for packed or
+    bit-field records whose exact `sizeof` is checked at C compile time).
+    """
+    if not raw or api is None:
+        return False
+    lay = api.structs.get(ctype)
+    if lay is not None:
+        return not lay.get("pointers") and int(lay.get("size") or 0) == len(raw)
+    return ctype in api.pointer_free_records
+
+
+def _can_bind_recorded_setup_call(call: Mapping[str, Any], params: list[dict[str, Any]], api: ApiInfo | None) -> bool:
+    """
+    Whether a global-state setup/teardown call has zero pointer parameters and every parameter can
+    be materialized concretely from its recorded trace arguments (never reading fuzz bytes).
+    """
+    for i, p in enumerate(params):
+        kind = p.get("kind")
+        if kind == "int":
+            raw = _recorded_arg_bytes(call, i, "i")
+            if raw is None or not 0 < len(raw) <= 8:
+                return False
+        elif kind == "float":
+            raw = _recorded_arg_bytes(call, i, "f")
+            if raw is None or len(raw) not in (4, 8):
+                return False
+            fmt = "<f" if len(raw) == 4 else "<d"
+            if not math.isfinite(struct.unpack(fmt, raw)[0]):
+                return False
+        elif kind == "struct":
+            raw = _recorded_arg_bytes(call, i, "t")
+            if not _is_pointer_free_setup_struct(str(p.get("ctype") or ""), raw, api):
+                return False
+        else:
+            return False
+    return True
+
+
+def _bind_recorded_setup_call(
+    case: _Case,
+    call_pos: int,
+    name: str,
+    params: list[dict[str, Any]],
+    call: Mapping[str, Any],
+) -> str:
+    """
+    Emit a global-state setup or teardown call bound strictly to the concrete values recorded in
+    the target's test traces: zero fuzz slots are consumed and `case.rest` stays free for the
+    target entry point.
+    """
+    params = _respell_anon_records(case.api, _respell_enum_pointers(case.api, name, params))
+    params = _respell_qualified_pointers(case.api, name, params)
+    args: list[str] = []
+    for i, p in enumerate(params):
+        kind = p.get("kind")
+        ctype = str(p["ctype"])
+        v = f"c{call_pos}a{i}"
+        if kind == "int":
+            raw = _recorded_arg_bytes(call, i, "i")
+            if raw is None or not 0 < len(raw) <= 8:
+                raise _CaseError(f"{name}: missing recorded scalar for setup parameter {i}")
+            val = int.from_bytes(raw, "little")
+            if ctype == "_Bool":
+                args.append(f"((_Bool){1 if val else 0})")
+            else:
+                signed = not (ctype.startswith(("unsigned", "enum", "_Bool")) or ctype in ("char", "size_t", "uint8_t"))
+                if signed and val >= 1 << (8 * len(raw) - 1):
+                    val -= 1 << (8 * len(raw))
+                lit = f"{val}LL" if val < 0 else f"{val}ULL"
+                args.append(f"(({ctype}){lit})")
+            case.note(call_pos, i, "global setup call: recorded scalar value from seed traces; not read from input")
+        elif kind == "float":
+            raw = _recorded_arg_bytes(call, i, "f")
+            if raw is None or len(raw) not in (4, 8):
+                raise _CaseError(f"{name}: missing recorded float for setup parameter {i}")
+            fmt = "<f" if len(raw) == 4 else "<d"
+            if not math.isfinite(struct.unpack(fmt, raw)[0]):
+                raise _CaseError(f"{name}: non-finite recorded float for setup parameter {i}")
+            rec_var = case.declare(f"{v}_rec")
+            hex_bytes = ", ".join(f"0x{b:02x}" for b in raw)
+            case.decls.append(f"static const unsigned char {rec_var}[{len(raw)}] = {{ {hex_bytes} }};")
+            case.decls.append(f"{ctype} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+            case.decls.append(f"if (sizeof({v}) == {len(raw)}U) {{ memcpy(&{v}, {rec_var}, {len(raw)}U); }}")
+            args.append(v)
+            case.note(call_pos, i, "global setup call: recorded float value from seed traces; not read from input")
+        elif kind == "struct":
+            raw = _recorded_arg_bytes(call, i, "t")
+            if raw is None or not _is_pointer_free_setup_struct(ctype, raw, case.api):
+                raise _CaseError(f"{name}: cannot concretely bind setup struct parameter {i} ({ctype})")
+            rec_var = case.declare(f"{v}_rec")
+            hex_bytes = ", ".join(f"0x{b:02x}" for b in raw)
+            case.decls.append(f"static const unsigned char {rec_var}[{len(raw)}] = {{ {hex_bytes} }};")
+            case.decls.append(f"{ctype} {case.declare(v)}; memset(&{v}, 0, sizeof({v}));")
+            case.decls.append(
+                f"if (sizeof({v}) == sizeof({rec_var})) {{ memcpy(&{v}, {rec_var}, sizeof({rec_var})); }}"
+            )
+            args.append(v)
+            case.note(call_pos, i, "global setup call: recorded struct bytes from seed traces; not read from input")
+        else:
+            raise _CaseError(f"{name}: setup parameter {i} has unsupported kind {kind!r}")
+    return f"(void){name}({', '.join(args)});"
+
+
+def _global_setup_prefix(
+    trace: list[dict],
+    target_indices: list[int],
+    records: Mapping[str, dict],
+    api: ApiInfo,
+    trans_writes: Mapping[str, set[str]],
+    trans_refs: Mapping[str, set[str]],
+) -> tuple[list[int], int | None]:
+    """
+    Backward-closed global-state setup calls preceding `target_indices` in `trace` (after the most
+    recent teardown) whose transitively written globals feed `target_indices` (directly or through
+    later setup calls such as `Crypto_Init`), plus an optional 0-arg trailing teardown call that
+    resets those globals. Returns `([], None)` when no global setup applies.
+    """
+    if not target_indices or not trans_writes:
+        return [], None
+    first, last = target_indices[0], target_indices[-1]
+    needed: set[str] = set()
+    for idx in target_indices:
+        needed.update(trans_refs.get(str(trace[idx]["fn"]), ()))
+    if not needed:
+        return [], None
+    start = 0
+    for k in range(first - 1, -1, -1):
+        sfn = str(trace[k]["fn"])
+        if _is_global_teardown_name(sfn) and trans_writes.get(sfn):
+            start = k + 1
+            break
+    kept: list[int] = []
+    for k in range(first - 1, start - 1, -1):
+        sfn = str(trace[k]["fn"])
+        if not _is_global_setup_name(sfn):
+            continue
+        sw = trans_writes.get(sfn)
+        if not sw or not (sw & needed):
+            continue
+        srec = records.get(sfn) or api.records.get(sfn)
+        if not srec or path_parameter(srec):
+            continue
+        params, _ = plan_params(str(srec.get("signature") or ""), srec.get("formals"))
+        if params is None or not _can_bind_recorded_setup_call(trace[k], params, api):
+            continue
+        kept.append(k)
+        needed.update(trans_refs.get(sfn, ()))
+    if not kept:
+        return [], None
+    kept.reverse()
+    # A sliding trace window without a teardown between two test cases may include an earlier init
+    # before a fresh config+init block: keep only the final setup block leading into the last init.
+    init_pos = [idx for idx, k in enumerate(kept) if _is_global_init_name(str(trace[k]["fn"]))]
+    if len(init_pos) >= 2:
+        kept = kept[init_pos[-2] + 1 :]
+    if len(kept) > GLOBAL_SETUP_MAX_PREFIX:
+        # Collapse repeated setup calls (e.g. multiple Add_*_Managed_Parameters) before capping so
+        # the earliest required configurator (Crypto_Config_CryptoLib) is not sliced off.
+        last_by_fn: dict[str, int] = {}
+        for k in kept:
+            last_by_fn[str(trace[k]["fn"])] = k
+        kept = [k for k in kept if last_by_fn[str(trace[k]["fn"])] == k]
+    kept = kept[-GLOBAL_SETUP_MAX_PREFIX:]
+    setup_writes: set[str] = set()
+    for k in kept:
+        setup_writes.update(trans_writes.get(str(trace[k]["fn"]), ()))
+    teardown: int | None = None
+    for k in range(last + 1, min(len(trace), last + 5)):
+        tfn = str(trace[k]["fn"])
+        if _is_global_setup_name(tfn):
+            break
+        if _is_global_teardown_name(tfn) and (trans_writes.get(tfn, set()) & setup_writes):
+            trec = records.get(tfn) or api.records.get(tfn)
+            if not trec or path_parameter(trec):
+                continue
+            tparams, _ = plan_params(str(trec.get("signature") or ""), trec.get("formals"))
+            if tparams == []:
+                teardown = k
+                break
+    return kept, teardown
+
+
+def _global_setup_plan(
+    filtered_traces: list[list[dict]],
+    records: Mapping[str, dict],
+    singles: Mapping[str, dict],
+    api: ApiInfo,
+    trans_writes: Mapping[str, set[str]],
+    trans_refs: Mapping[str, set[str]],
+) -> list[dict[str, Any]]:
+    """
+    Best recorded global-state setup (+ optional teardown) per distinct non-setup API entry point
+    in `records`, ranked to prefer complete setups with teardown, then most frequent and concise
+    recorded setup, ordered with input-reading entry points first.
+    """
+    if not trans_writes:
+        return []
+    freq: dict[tuple[str, tuple[str, ...], str | None], int] = {}
+    total_freq: dict[str, int] = {}
+    candidates: dict[str, list[dict[str, Any]]] = {}
+    for trace in filtered_traces:
+        for j, call in enumerate(trace):
+            fn = str(call["fn"])
+            if fn not in records or _is_global_setup_name(fn) or _is_global_teardown_name(fn):
+                continue
+            prefix, td = _global_setup_prefix(trace, [j], records, api, trans_writes, trans_refs)
+            if not prefix:
+                continue
+            prefix_sig = tuple(str(trace[k]["fn"]) for k in prefix)
+            td_fn = str(trace[td]["fn"]) if td is not None else None
+            key = (fn, prefix_sig, td_fn)
+            freq[key] = freq.get(key, 0) + 1
+            total_freq[fn] = total_freq.get(fn, 0) + 1
+            if freq[key] == 1:
+                prefix_writes: set[str] = set()
+                for k in prefix:
+                    prefix_writes.update(trans_writes.get(str(trace[k]["fn"]), ()))
+                coverage = len(prefix_writes & trans_refs.get(fn, set()))
+                candidates.setdefault(fn, []).append(
+                    {
+                        "fn": fn,
+                        "trace": trace,
+                        "prefix": prefix,
+                        "target": j,
+                        "teardown": td,
+                        "prefix_sig": prefix_sig,
+                        "td_fn": td_fn,
+                        "coverage": coverage,
+                    }
+                )
+    chosen: list[dict[str, Any]] = []
+    for fn, items in candidates.items():
+        best = min(
+            items,
+            key=lambda it: (
+                0 if it["teardown"] is not None else 1,
+                -it["coverage"],
+                -freq[(fn, it["prefix_sig"], it["td_fn"])],
+                len(it["prefix"]),
+                it["prefix_sig"],
+                it["td_fn"] or "",
+            ),
+        )
+        chosen.append(best)
+
+    def _reads_input(fn: str) -> bool:
+        lay = singles.get(fn)
+        return bool(lay and (lay.get("slots") or lay.get("rest")))
+
+    chosen.sort(
+        key=lambda it: (
+            0 if _reads_input(it["fn"]) else 1,
+            -it["coverage"],
+            -total_freq.get(it["fn"], 0),
+            it["fn"],
+        )
+    )
+    return chosen
+
+
 def sequence_case(
     trace: list[dict],
     chain: list[int],
@@ -4311,6 +4685,7 @@ def sequence_case(
     spare: int,
     api: ApiInfo | None = None,
     trust: Mapping[str, _EntryTrust] | None = None,
+    setup_positions: Collection[int] | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """
     The case that replays one chain of a trace: one buffer per shared address (the largest size the
@@ -4322,10 +4697,11 @@ def sequence_case(
     (`_recorded_scalar_arg`), zero when none was. Under `FRAMAC_API_TRUST_SCHEMA`, optional
     `no-attacker-data` configurator/setup calls absent from `records` may be resolved from
     `api.records` (treating their non-shared parameters as trusted) as long as at least one call in
-    `chain` is a real entry point in `records`.
+    `chain` is a real entry point in `records`. Positions listed in `setup_positions` are global-state
+    setup or teardown calls bound strictly to their concrete recorded trace values (zero fuzz slots).
     """
     try:
-        return _sequence_case(trace, chain, records, spare, api, trust)
+        return _sequence_case(trace, chain, records, spare, api, trust, setup_positions)
     except _CaseError as e:
         return None, None, str(e)
 
@@ -4337,16 +4713,21 @@ def _sequence_case(
     spare: int,
     api: ApiInfo | None,
     trust: Mapping[str, _EntryTrust] | None = None,
+    setup_positions: Collection[int] | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     case = _Case(spare, api, calls=len(chain))
     case.recorded_scalars = True
     buffers: dict[str, str] = {}
     calls: list[str] = []
     names: list[str] = []
-    if not any(trace[k]["fn"] in records for k in chain):
+    setup_pos = set(setup_positions or ())
+    if not any(trace[k]["fn"] in records for pos, k in enumerate(chain) if pos not in setup_pos):
         return None, None, "sequence has no API entry point"
     seen_addr: dict[str, int] = {}
-    for call in (trace[k] for k in chain):
+    for pos, k in enumerate(chain):
+        if pos in setup_pos:
+            continue
+        call = trace[k]
         for addr in (call.get("addrs") or {}).values():
             if isinstance(addr, str) and addr not in ("0", "-"):
                 seen_addr[addr] = seen_addr.get(addr, 0) + 1
@@ -4365,6 +4746,10 @@ def _sequence_case(
         params, why = plan_params(str(rec.get("signature") or ""), rec.get("formals"))
         if params is None:
             return None, None, f"{name}: {why}"
+        if pos in setup_pos:
+            calls.append(_bind_recorded_setup_call(case, pos, name, params, call))
+            names.append(name)
+            continue
         shared: dict[int, str] = {}
         before: list[str] = []
         for idx_s, addr in (call.get("addrs") or {}).items():
@@ -5047,6 +5432,7 @@ def plan(
         init_skip_notes=init_skip_notes,
         bounds=dict(getattr(visible, "bound_forwards", None) or {}),
         null_defaults=set(getattr(visible, "null_defaults", None) or ()),
+        pointer_free_records=set(getattr(visible, "pointer_free_records", None) or ()),
         table_stubs=callback_stubs,
         owners=owners,
         owner_names=owner_names,
@@ -5144,36 +5530,80 @@ def plan(
         api.records.setdefault(cname, crec)
     seq_allowed = set(records) | set(configurators)
     seq_seen: set[tuple[str, ...]] = set()
-    for full in traces or []:
-        # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
-        # produced comes from the input instead, and the rest of the chain stays.
-        trace = [c for c in full if c.get("fn") in seq_allowed]
-        for chain in chains(trace):
-            if not any(trace[k]["fn"] in records for k in chain):
-                continue
-            sig = tuple(trace[k]["fn"] for k in chain)
-            if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
-                continue
-            seq_stmt, seq_layout, _why = sequence_case(trace, chain, records, spare, api, trust_by_name)
-            if seq_stmt is None or seq_layout is None:
-                if any(trace[k]["fn"] not in records for k in chain):
-                    rec_trace = [trace[k] for k in chain if trace[k]["fn"] in records]
-                    for sub_chain in chains(rec_trace):
-                        sub_sig = tuple(rec_trace[k]["fn"] for k in sub_chain)
-                        if sub_sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
-                            continue
-                        sub_stmt, sub_layout, _ = sequence_case(
-                            rec_trace, sub_chain, records, spare, api, trust_by_name
-                        )
-                        if sub_stmt is None or sub_layout is None:
-                            continue
-                        seq_seen.add(sub_sig)
-                        cases.append(sub_stmt)
-                        layouts.append(sub_layout)
-                continue
-            seq_seen.add(sig)
-            cases.append(seq_stmt)
-            layouts.append(seq_layout)
+    # Calls into other modules (an entropy source filling a nonce) are not replayed: what they
+    # produced comes from the input instead, and the rest of the chain stays.
+    filtered_traces = [[c for c in full if c.get("fn") in seq_allowed] for full in traces or []]
+    trans_writes: dict[str, set[str]] = {}
+    trans_refs: dict[str, set[str]] = {}
+    global_setups: list[dict[str, Any]] = []
+    if effective_trust_schema and filtered_traces:
+        trans_writes, trans_refs = _global_state_flow(model.get("functions") or {})
+        if trans_writes:
+            global_setups = _global_setup_plan(filtered_traces, records, singles, api, trans_writes, trans_refs)
+
+    def _emit_sequence(trace: list[dict], chain: list[int], setup_positions: Collection[int] | None = None) -> None:
+        setup_pos = set(setup_positions or ())
+        if not any(trace[k]["fn"] in records for pos, k in enumerate(chain) if pos not in setup_pos):
+            return
+        sig = tuple(trace[k]["fn"] for k in chain)
+        if sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
+            return
+        seq_stmt, seq_layout, _why = sequence_case(
+            trace, chain, records, spare, api, trust_by_name, setup_positions=setup_pos or None
+        )
+        if seq_stmt is None or seq_layout is None:
+            if not setup_pos and any(trace[k]["fn"] not in records for k in chain):
+                rec_trace = [trace[k] for k in chain if trace[k]["fn"] in records]
+                for sub_chain in chains(rec_trace):
+                    sub_sig = tuple(rec_trace[k]["fn"] for k in sub_chain)
+                    if sub_sig in seq_seen or len(seq_seen) >= MAX_SEQUENCE_CASES:
+                        continue
+                    sub_stmt, sub_layout, _ = sequence_case(rec_trace, sub_chain, records, spare, api, trust_by_name)
+                    if sub_stmt is None or sub_layout is None:
+                        continue
+                    seq_seen.add(sub_sig)
+                    cases.append(sub_stmt)
+                    layouts.append(sub_layout)
+            return
+        seq_seen.add(sig)
+        cases.append(seq_stmt)
+        layouts.append(seq_layout)
+
+    if not global_setups:
+        for trace in filtered_traces:
+            for chain in chains(trace):
+                _emit_sequence(trace, chain)
+    else:
+        global_targets = {item["fn"] for item in global_setups}
+        multi_fn_chains: list[tuple[list[dict], list[int], set[int]]] = []
+        same_fn_chains: list[tuple[list[dict], list[int], set[int]]] = []
+        for trace in filtered_traces:
+            for chain in chains(trace):
+                if not any(trace[k]["fn"] in records for k in chain):
+                    continue
+                prefix, td = _global_setup_prefix(trace, chain, records, api, trans_writes, trans_refs)
+                prefix = [k for k in prefix if k not in chain]
+                if td is not None and td in chain:
+                    td = None
+                full_chain = [*prefix, *chain, *([td] if td is not None else [])]
+                setup_pos = set(range(len(prefix))) | ({len(full_chain) - 1} if td is not None else set())
+                needs_setup = any(trace[k]["fn"] in global_targets for k in chain)
+                if needs_setup and not prefix:
+                    continue
+                if len({trace[k]["fn"] for k in chain}) > 1:
+                    multi_fn_chains.append((trace, full_chain, setup_pos))
+                else:
+                    same_fn_chains.append((trace, full_chain, setup_pos))
+        for item in global_setups:
+            prefix = list(item["prefix"])
+            td = item["teardown"]
+            full_chain = [*prefix, int(item["target"]), *([int(td)] if td is not None else [])]
+            setup_pos = set(range(len(prefix))) | ({len(full_chain) - 1} if td is not None else set())
+            _emit_sequence(item["trace"], full_chain, setup_pos)
+        for trace, full_chain, setup_pos in multi_fn_chains:
+            _emit_sequence(trace, full_chain, setup_pos)
+        for trace, full_chain, setup_pos in same_fn_chains:
+            _emit_sequence(trace, full_chain, setup_pos)
     # Every handle type with a constructor and a destructor gets one synthesized lifecycle case, within
     # the same cap as the recorded sequences (which come first). A recorded chain does not cover the
     # type: sequence_case passes a shared handle as a zeroed buffer (an incomplete struct does not
@@ -5433,6 +5863,7 @@ class Declared(set):  # type: ignore[type-arg]
     anon_records: dict[str, dict[str, str]]
     anon_record_pointers: dict[str, dict[int, str]]
     null_defaults: set[str]
+    pointer_free_records: set[str]
 
     def __init__(
         self,
@@ -5447,6 +5878,7 @@ class Declared(set):  # type: ignore[type-arg]
         anon_records: dict[str, dict[str, str]] | None = None,
         anon_record_pointers: dict[str, dict[int, str]] | None = None,
         null_defaults: set[str] | None = None,
+        pointer_free_records: set[str] | None = None,
     ) -> None:
         super().__init__(names)
         self.prototypes = prototypes or {}
@@ -5470,6 +5902,8 @@ class Declared(set):  # type: ignore[type-arg]
         self.anon_record_pointers = anon_record_pointers or {}
         # `null_default_records`: the struct types a doc comment documents as NULL for a default.
         self.null_defaults = set(null_defaults or ())
+        # Complete structs/unions (including packed or bit-field records) with no pointer fields.
+        self.pointer_free_records = set(pointer_free_records or ())
 
 
 def _spelled(t: str) -> str:
@@ -6039,7 +6473,7 @@ def handle_prototypes(tree: dict, complete: set[str], anon: Collection[str] = ()
     return out
 
 
-def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
+def record_layouts(tree: dict) -> tuple[dict[str, dict], Declared]:
     """
     The layouts of every complete named struct and union of a clang JSON AST (x86_64 sizes and
     alignments), and the functions it declares. A layout: {what, size, align, pointers, fields: [{name,
@@ -6172,7 +6606,63 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         memo[key] = out
         return out
 
+    pf_memo: dict[str, bool] = {}
+
+    def is_pf_type(t: str) -> bool:
+        t = " ".join(t.split())
+        if not t or _POINTER_RE.search(t):
+            return False
+        m = _ARRAY_RE.match(t)
+        if m:
+            return is_pf_type(m.group("elem"))
+        if "unnamed" in t or "anonymous" in t:
+            return t.startswith("enum ") and "(*" not in t
+        if "(" in t:
+            return False
+        n = " ".join(_QUALIFIERS_RE.sub(" ", t).split())
+        seen_td: set[str] = set()
+        while n in typedefs and n not in seen_td:
+            seen_td.add(n)
+            n = _spelled(typedefs[n])
+            if not n or _POINTER_RE.search(n):
+                return False
+            m = _ARRAY_RE.match(n)
+            if m:
+                return is_pf_type(m.group("elem"))
+            if "unnamed" in n or "anonymous" in n:
+                return n.startswith("enum ") and "(*" not in n
+            if "(" in n:
+                return False
+        if n in SCALAR_BYTES:
+            return True
+        rm = _RECORD_TYPE_RE.match(n)
+        if rm and rm.group(1) == "enum":
+            return True
+        if n in raw:
+            return is_pf_record(n)
+        return False
+
+    def is_pf_record(key: str) -> bool:
+        if key in pf_memo:
+            return pf_memo[key]
+        pf_memo[key] = False
+        node = raw.get(key)
+        if node is None:
+            return False
+        fields = [n for n in (node.get("inner") or []) if isinstance(n, dict) and n.get("kind") == "FieldDecl"]
+        if not fields:
+            return False
+        for f in fields:
+            ftype = f.get("type") or {}
+            qual = str(ftype.get("qualType") or "")
+            t = qual if anon_name(qual) else str(ftype.get("desugaredQualType") or qual)
+            if not is_pf_type(t):
+                return False
+        pf_memo[key] = True
+        return True
+
     layouts = {k: lay for k in raw if (lay := layout(k)) is not None}
+    pf_records = {k for k in raw if is_pf_record(k)}
     return layouts, Declared(
         functions,
         handle_prototypes(tree, set(raw), set(anon_nodes)),
@@ -6185,6 +6675,7 @@ def record_layouts(tree: dict) -> tuple[dict[str, dict], set[str]]:
         {name: {"what": what, "id": rid} for name, (what, rid, _) in anon_nodes.items()},
         anon_record_pointers(tree, set(anon_nodes)),
         null_default_records(tree),
+        pf_records,
     )
 
 
