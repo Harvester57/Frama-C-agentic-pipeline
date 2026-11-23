@@ -2405,6 +2405,18 @@ def _verify_sibling_key(task: dict) -> str | None:
     return root_cause_sibling_key(str(task.get("module") or ""), str(task.get("fingerprint") or ""))
 
 
+def _verify_sibling_fingerprints(state: dict, task: dict) -> list[str]:
+    """The fingerprints of `task`'s root-cause siblings (same `_verify_sibling_key`), itself excluded."""
+    key = _verify_sibling_key(task)
+    if key is None:
+        return []
+    return sorted(
+        str(t["fingerprint"])
+        for t in state["tasks"].values()
+        if t.get("id") != task.get("id") and _verify_sibling_key(t) == key
+    )
+
+
 def _hold_verify_siblings(state: dict, ordered: list[dict]) -> list[dict]:
     """
     Verify tasks of one module that fail the same normalized predicate in different functions (same
@@ -3389,6 +3401,9 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
         _pass_eva_obligations = "eva_unknown_obligations" in _prepare_params
         # Passed once prepare_agent accepts it (the brief then names the calls whose callee has no contract).
         _pass_no_contract = "callees_without_contract" in _prepare_params
+        # A verifier's root-cause siblings, keyed like `_hold_verify_siblings` (the task's module, not the
+        # candidate's possibly empty `module` field): the brief lists their verified records.
+        _pass_siblings = "sibling_fingerprints" in _prepare_params
 
         def _do_prepare(tid: str) -> tuple[str, dict | None, str | None]:
             task = snapshot[tid]
@@ -3398,6 +3413,8 @@ def cmd_next(slots: str = "auto", prepare: bool = False, max_agents: int | None 
                     kw["eva_unknown_obligations"] = pre_eva[tid]
                 if _pass_no_contract and task.get("callees_without_contract"):
                     kw["callees_without_contract"] = list(task["callees_without_contract"])
+                if _pass_siblings and task["kind"] == "verify":
+                    kw["sibling_fingerprints"] = _verify_sibling_fingerprints(sched, task)
                 res = DEPS.prepare_agent(Path.cwd(), task["agent_id"], ROLE_BY_KIND[task["kind"]], **kw)
                 return tid, res, None
             except Exception as exc:  # any failure leaves the task re-dispatchable, never stuck running

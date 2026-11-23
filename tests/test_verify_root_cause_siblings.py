@@ -9,6 +9,7 @@ no verifier saw another's verdict: 17 confirmed, 1 duplicate, 1 `other`, 1 `disp
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +101,10 @@ def _seed(sim: Sim, siblings: int, distinct: int = 0) -> list[dict[str, Any]]:
     return cands
 
 
+def _load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _is_sibling(fp: str) -> bool:
     return fp.endswith(f"::{_SIB_KIND}::{_SIB_SUFFIX}")
 
@@ -147,6 +152,51 @@ def test_siblings_dispatch_one_representative_and_distinct_candidates_are_not_he
     assert len(released) == 2
     assert all(_is_sibling(fp) for fp in released)
     assert rep["fingerprint"] not in released
+
+    # The released siblings return `duplicate` of the representative: no conflict, no harness repair.
+    for t in second["tasks"]:
+        if not _is_sibling(t["fingerprint"]):
+            continue
+        out = _complete_verifier_as(sim, t, "rejected", rejection_class="duplicate")
+        assert out["decision"] == "rejected"
+        assert not out.get("sink_conflicts")
+    assert not any(tid.startswith("repair:") for tid in tasks())
+    sibling_tasks = [t for t in tasks().values() if t["kind"] == "verify" and _is_sibling(t["fingerprint"])]
+    assert all(t["state"] == "done" for t in sibling_tasks)
+    assert sorted(t.get("rejection_class") or t["outcome"] for t in sibling_tasks) == [
+        "confirmed",
+        "duplicate",
+        "duplicate",
+    ]
+
+
+def test_scheduler_passes_siblings_of_candidates_recorded_without_a_module(
+    sim: Sim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A candidate whose `module` field is empty gets its module from the DAG; its brief still sees siblings."""
+    cands = _seed(sim, siblings=2)
+    for c in cands:
+        c["module"] = ""
+    write_json(sim.run_dir / "candidates.json", cands)
+    seen: dict[str, list[str] | None] = {}
+
+    def prepare(
+        run_dir: Path, agent_id: str, role: str, sibling_fingerprints: list[str] | None = None, **kw: Any
+    ) -> dict[str, Any]:
+        seen[str(kw.get("candidate_fp"))] = sibling_fingerprints
+        return sim.prepare_agent(run_dir, agent_id, role, **kw)
+
+    monkeypatch.setattr(S.DEPS, "prepare_agent", prepare)
+    S.cmd_init()
+    first = S.cmd_next("auto", prepare=True)
+    assert len(first["tasks"]) == 1
+    rep_fp = first["tasks"][0]["fingerprint"]
+    other_fp = next(c["fingerprint"] for c in cands if c["fingerprint"] != rep_fp)
+    assert seen[rep_fp] == [other_fp]
+    _complete_verifier_as(sim, first["tasks"][0], "confirmed")
+    second = S.cmd_next("auto", prepare=True)
+    assert [t["fingerprint"] for t in second["tasks"]] == [other_fp]
+    assert seen[other_fp] == [rep_fp]
 
 
 def test_breaker_on_siblings_drain_without_deadlock(sim: Sim, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,6 +337,30 @@ def test_sibling_brief_lists_the_verified_representative_record(tmp_path: Path) 
     assert unrelated_fp not in section
     # The rule that goes with the list: duplicate on the same decision point, else verify independently.
     assert "duplicate" in section
+
+
+def test_sibling_brief_uses_the_schedulers_list_for_candidates_without_a_module(tmp_path: Path) -> None:
+    run, rep_fp, sib_fp, _o, unrelated_fp = _brief_run(tmp_path)
+    cands = _load_json(run / "candidates.json")
+    for c in cands:
+        c["module"] = ""
+    write_json(run / "candidates.json", cands)
+    # Derived from candidates.json alone, a module-less candidate's siblings cannot be told apart.
+    WO.prepare_agent(run_dir=run, agent_id="verify-a", role="verifier", module=_MOD, candidate_fp=sib_fp)
+    assert "## Verified Siblings" not in (run / "agents/verify-a/brief.md").read_text(encoding="utf-8")
+    # The scheduler's list (keyed on the task's module) decides.
+    WO.prepare_agent(
+        run_dir=run,
+        agent_id="verify-b",
+        role="verifier",
+        module=_MOD,
+        candidate_fp=sib_fp,
+        sibling_fingerprints=[rep_fp],
+    )
+    brief = (run / "agents/verify-b/brief.md").read_text(encoding="utf-8")
+    section = brief[brief.index("## Verified Siblings") :]
+    assert rep_fp in section
+    assert unrelated_fp not in section
 
 
 def test_brief_without_verified_siblings_has_no_sibling_section(tmp_path: Path) -> None:

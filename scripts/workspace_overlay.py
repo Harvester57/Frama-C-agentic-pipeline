@@ -3739,6 +3739,7 @@ def _verified_siblings_section(
     module: str | None,
     candidates: list,
     findings: list,
+    sibling_fingerprints: list[str] | None = None,
 ) -> str:
     """
     Appended to a verifier's brief: the verified records of the candidate's root-cause siblings, the
@@ -3746,21 +3747,22 @@ def _verified_siblings_section(
     (`fingerprint.root_cause_sibling_key`) in other functions. The scheduler verifies one sibling first
     (wp_scheduler `_hold_verify_siblings`), so the others read its verdict here and return `duplicate`
     when their decision point is the same one (QCBOR run-2: twenty candidates, one missing write).
+    `sibling_fingerprints` is the scheduler's list (it keys on the task's module, which it resolves for a
+    candidate recorded without one); without it, the siblings are derived from `candidates.json`.
     """
     if role != "verifier" or not candidate_fp:
         return ""
-    module_of = {str(c.get("fingerprint")): str(c.get("module") or "") for c in candidates if isinstance(c, dict)}
-    own_key = root_cause_sibling_key(module_of.get(candidate_fp) or module or "", candidate_fp)
-    if own_key is None:
-        return ""
-    rows = [
-        r
-        for r in findings
-        if isinstance(r, dict)
-        and r.get("fingerprint") != candidate_fp
-        and str(r.get("fingerprint")) in module_of
-        and root_cause_sibling_key(module_of[str(r.get("fingerprint"))], str(r.get("fingerprint"))) == own_key
-    ]
+    if sibling_fingerprints is not None:
+        siblings = {str(fp) for fp in sibling_fingerprints} - {candidate_fp}
+    else:
+        module_of = {str(c.get("fingerprint")): str(c.get("module") or "") for c in candidates if isinstance(c, dict)}
+        own_key = root_cause_sibling_key(module_of.get(candidate_fp) or module or "", candidate_fp)
+        if own_key is None:
+            return ""
+        siblings = {
+            fp for fp, mod in module_of.items() if fp != candidate_fp and root_cause_sibling_key(mod, fp) == own_key
+        }
+    rows = [r for r in findings if isinstance(r, dict) and str(r.get("fingerprint")) in siblings]
     if not rows:
         return ""
     # Records with their own analysis first; a `duplicate` only points at another record.
@@ -3889,6 +3891,7 @@ def prepare_agent(
     rejected_result: dict | None = None,
     eva_unknown_obligations: list[dict] | None = None,
     callees_without_contract: list[str] | None = None,
+    sibling_fingerprints: list[str] | None = None,
 ) -> dict:
     """
     Initialize an agent's scratch directory/overlay and render its populated brief markdown
@@ -3905,6 +3908,8 @@ def prepare_agent(
     result.json failed validation: the brief ends with those errors.
     `callees_without_contract` (`<file>#<name>` keys, from the scheduler) are the prover's callees that
     have no contract and cannot get one: the brief names them.
+    `sibling_fingerprints` (a verifier, from the scheduler) are the candidate's root-cause siblings: the
+    brief lists their verified records. Without it they are derived from `candidates.json`.
     """
     if not is_safe_agent_id(agent_id):
         raise ArtifactError(f"invalid canonical agent_id: {agent_id!r}")
@@ -4359,6 +4364,7 @@ def prepare_agent(
             module,
             candidates_list if isinstance(candidates_list, list) else [],
             findings_list if isinstance(findings_list, list) else [],
+            sibling_fingerprints,
         )
     rendered += _rejected_result_section(rejected_result, agent_id, role)
 
