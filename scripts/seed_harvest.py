@@ -311,6 +311,29 @@ def is_length(p: dict[str, Any], name: str | None = None) -> bool:
     return ctype in _LEN_SCALARS and (name is None or bool(_LEN_NAME_RE.search(name)))
 
 
+_OUT_BUF_WORDS = frozenset({"out", "output", "dst", "dest", "destination", "result", "reply", "resp", "response"})
+_WORD_SPLIT_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def _looks_output_name(name: str | None) -> bool:
+    if not name:
+        return False
+    return bool({w.lower() for w in _WORD_SPLIT_RE.findall(name)} & _OUT_BUF_WORDS)
+
+
+def is_length_ptr(p: dict[str, Any], name: str | None = None) -> bool:
+    """
+    Whether a classified parameter is a pointer to a length integer for the byte pointer before it
+    (e.g. `Crypto_TC_ProcessSecurity(uint8_t *ingest, int *len_ingest, ...)`). Requires a length-like
+    formal name (`_LEN_NAME_RE`) so ordinary `int *` out-parameters are not treated as buffer lengths.
+    """
+    if p.get("kind") != "ptr" or p.get("enum"):
+        return False
+    if p.get("pointee") not in _LEN_SCALARS:
+        return False
+    return name is not None and bool(_LEN_NAME_RE.search(name))
+
+
 def plan_function(
     name: str, signature: str, sizes: dict | None = None, names: list[str | None] | None = None
 ) -> dict[str, Any]:
@@ -344,6 +367,15 @@ def plan_function(
         nxt_name = names[i + 1] if names is not None and i + 1 < len(names) else None
         if pointee in _CHAR_POINTEES and nxt is not None and is_length(nxt, nxt_name):
             p["record"] = "b"  # (buffer, length) pair: the next argument is its length
+        elif (
+            pointee in _CHAR_POINTEES
+            and nxt is not None
+            and is_length_ptr(nxt, nxt_name)
+            and not _looks_output_name(names[i] if names is not None and i < len(names) else None)
+            and not _looks_output_name(nxt_name)
+        ):
+            p["record"] = "bp"  # (buffer, length *) pair: dereference next argument safely on entry
+            p["len_pointee"] = nxt["pointee"]
         elif pointee in ("char", "signed char"):
             p["record"] = "s"
         elif pointee in _SCALARS and pointee != "_Bool":
@@ -509,6 +541,32 @@ void fc_mem(int idx, char kind, const void *p, size_t n) {
     free(tmp);
 }
 
+/* Buffer whose length is passed through a pointer (`uint8_t *buf, int *len`): read `*len` safely. */
+void fc_mem_lenptr(int idx, const void *p, const void *lenp, size_t len_size, int len_signed) {
+    if (lenp == NULL || len_size == 0 || len_size > sizeof(long long)) return;
+    unsigned char buf[sizeof(long long)];
+    if (fc_copy(buf, lenp, len_size) != len_size) return;
+    size_t n = 0;
+    if (len_signed) {
+        long long sv = 0;
+        if (len_size == sizeof(short)) { short v; memcpy(&v, buf, sizeof v); sv = v; }
+        else if (len_size == sizeof(int)) { int v; memcpy(&v, buf, sizeof v); sv = v; }
+        else if (len_size == sizeof(long)) { long v; memcpy(&v, buf, sizeof v); sv = v; }
+        else if (len_size == sizeof(long long)) { long long v; memcpy(&v, buf, sizeof v); sv = v; }
+        if (sv <= 0) return;
+        n = (size_t)sv;
+    } else {
+        unsigned long long uv = 0;
+        if (len_size == sizeof(unsigned short)) { unsigned short v; memcpy(&v, buf, sizeof v); uv = v; }
+        else if (len_size == sizeof(unsigned int)) { unsigned int v; memcpy(&v, buf, sizeof v); uv = v; }
+        else if (len_size == sizeof(unsigned long)) { unsigned long v; memcpy(&v, buf, sizeof v); uv = v; }
+        else if (len_size == sizeof(unsigned long long)) { unsigned long long v; memcpy(&v, buf, sizeof v); uv = v; }
+        if (uv == 0) return;
+        n = (size_t)uv;
+    }
+    fc_mem(idx, 'b', p, n);
+}
+
 /* A pointer argument's address: calls passing the same address share that buffer (call traces). */
 void fc_addr(int idx, const void *p) {
     char tok[48];
@@ -590,6 +648,10 @@ def _record_stmt(i: int, p: dict[str, Any], params: list[dict[str, Any]]) -> str
         return f"fc_str({i}, {a});"
     if kind == "b":
         return f"fc_mem({i}, 'b', {a}, (size_t)a{i + 1});"
+    if kind == "bp":
+        lpt = str(p.get("len_pointee") or "int")
+        is_signed = 0 if lpt.startswith("unsigned ") else 1
+        return f"fc_mem_lenptr({i}, {a}, a{i + 1}, sizeof({lpt}), {is_signed});"
     if kind == "p":
         return f"fc_mem({i}, 'p', {a}, sizeof({p['pointee']}));"
     if kind == "a":
@@ -608,6 +670,7 @@ def wrapper_source(plans: list[dict[str, Any]], headers: list[str]) -> str:
         "void fc_begin(const char *name);",
         "void fc_raw(int idx, char kind, const void *p, size_t n);",
         "void fc_mem(int idx, char kind, const void *p, size_t n);",
+        "void fc_mem_lenptr(int idx, const void *p, const void *lenp, size_t len_size, int len_signed);",
         "void fc_str(int idx, const void *p);",
         "void fc_addr(int idx, const void *p);",
         "void fc_struct(int idx, const void *p, size_t n);",

@@ -184,6 +184,7 @@ from seed_harvest import (  # noqa: E402
     _norm_type,
     classify_type,
     is_length,
+    is_length_ptr,
     is_variadic,
     split_signature,
 )
@@ -229,6 +230,22 @@ _GLOBAL_TEARDOWN_WORDS = frozenset(
         "release",
     }
 )
+# Words on a non-`const` byte buffer or its paired length parameter that positively indicate an
+# input / in-out buffer (e.g. `p_ingest`, `len_ingest`, `in_buf`, `src`), vs unambiguous output words
+# (`out`, `dst`, `reply`, `result`) that must stay zeroed unless explicitly marked by a threat model.
+_IN_BUF_WORDS = frozenset({"in", "input", "inbuf", "ingest", "src", "source"})
+_OUT_BUF_WORDS = frozenset({"out", "output", "dst", "dest", "destination", "result", "reply", "resp", "response"})
+# Upper bound of positive values for narrow length types when clamping `rest_n` into a length scalar.
+_SCALAR_MAX_POS: dict[str, int] = {
+    "signed char": 127,
+    "unsigned char": 255,
+    "short": 32767,
+    "unsigned short": 65535,
+}
+# Functions that query heap allocation metadata on a caller-supplied buffer (`Crypto_check_buffer_size`
+# calling `malloc_usable_size(pTfBuffer)`): passing a static or stack array triggers ASan
+# `bad-malloc_usable_size` and glibc UB, so writable byte buffers for callers reaching these use `calloc`+`free`.
+_HEAP_SIZE_PROBERS = frozenset({"malloc_usable_size", "malloc_size", "_msize"})
 LIFECYCLE_MAX_CALLS = 8  # calls on the handle per run of a lifecycle case, each picked by one input byte
 MAX_VARIADIC_CASES = 32  # per variadic function: one case per harvested (format, objects)
 # Two selector bytes above 256 cases (generate_harness.DISPATCH_SELECTOR_IDENTITY16, D7).
@@ -625,6 +642,13 @@ class ApiInfo:
     # unsigned value), most frequent first (`recorded_scalars`): what a trusted scalar takes in a
     # sequence case.
     trusted_scalars: dict[str, dict[int, list[tuple[int, int]]]] = field(default_factory=dict)
+    # Per function: argument indices where recorded seed traces observed a non-empty, non-zero byte
+    # buffer (`b` record) on entry (`recorded_input_buffers`), evidencing that a non-`const` byte
+    # pointer pair carries input data (including in-place read/write buffers).
+    recorded_input_buffers: dict[str, set[int]] = field(default_factory=dict)
+    # Functions that transitively call `_HEAP_SIZE_PROBERS` (`malloc_usable_size` etc.): their
+    # writable byte buffers are heap-allocated (`calloc`/`free`) rather than `static` arrays.
+    heap_buffer_fns: set[str] = field(default_factory=set)
 
 
 class _Case:
@@ -716,6 +740,100 @@ def _is_pair(params: list[dict], i: int, formals: list[dict] | None = None) -> b
     p = params[i]
     nxt = params[i + 1] if i + 1 < len(params) else None
     return p["kind"] == "ptr" and _charlike(p) and nxt is not None and is_length(nxt, _name(formals or [], i + 1))
+
+
+def _is_buf_len_ptr_pair(params: list[dict], i: int, formals: list[dict] | None = None) -> bool:
+    """
+    A byte pointer followed by a pointer to a length-named integer (`uint8_t *ingest, int *len_ingest`):
+    a (buffer, length *) pair where the length is passed by pointer (often in-out).
+    """
+    p = params[i]
+    nxt = params[i + 1] if i + 1 < len(params) else None
+    return p["kind"] == "ptr" and _charlike(p) and nxt is not None and is_length_ptr(nxt, _name(formals or [], i + 1))
+
+
+def _len_cap_expr(ctype: str, buf_expr: str) -> str:
+    """Upper bound expression for `rest_n` so casting to `ctype` never truncates or overflows."""
+    limit = _SCALAR_MAX_POS.get(ctype)
+    if limit is None:
+        return buf_expr
+    return f"({buf_expr} < {limit}U ? {buf_expr} : {limit}U)"
+
+
+def recorded_input_buffers(traces: list[list[dict]] | None) -> dict[str, set[int]]:
+    """
+    Per function name, the parameter indices where recorded seed traces captured a non-empty,
+    non-zero length-sized byte buffer (`b` record) on entry. Pointee-only `p` records are ignored
+    because they are non-zero for scalar out-parameters too.
+    """
+    out: dict[str, set[int]] = {}
+    for trace in traces or []:
+        for call in trace:
+            fn = call.get("fn")
+            if not isinstance(fn, str):
+                continue
+            for k_s, vals in (call.get("args") or {}).items():
+                if not str(k_s).isdigit() or not isinstance(vals, list):
+                    continue
+                for entry in vals:
+                    if not isinstance(entry, list) or len(entry) < 3 or entry[0] != "b":
+                        continue
+                    hx = entry[2]
+                    if not isinstance(hx, str) or not hx:
+                        continue
+                    try:
+                        raw = bytes.fromhex(hx)
+                    except ValueError:
+                        continue
+                    if raw and any(raw):
+                        out.setdefault(fn, set()).add(int(k_s))
+                        break
+    return out
+
+
+def _is_nonconst_input_buf(
+    name: str,
+    params: list[dict],
+    i: int,
+    formals: list[dict],
+    api: ApiInfo,
+    *,
+    role: str | None = None,
+    entry_trust: _EntryTrust | None = None,
+    is_len_ptr: bool = False,
+) -> bool:
+    """
+    Whether a non-`const` byte buffer at `i` (paired with a length or length-pointer at `i + 1`)
+    carries input data (read-only missing `const`, or read-and-modified in place).
+
+    Never promotes parameters marked `output`, `caller_storage`, or `trusted` by a threat model.
+    Requires positive evidence from at least one of:
+      1. Threat model explicitly naming parameter `i` in `attacker_params`;
+      2. Recorded seed traces passing a non-empty, non-zero `b` byte buffer at entry;
+      3. Parameter or paired-length formal name containing an input word (`_IN_BUF_WORDS`),
+         while neither formal name contains an output word (`_OUT_BUF_WORDS`).
+    For `(byte *, int)` pairs, when the length formal is named, it must match `_LEN_NAME_RE`
+    (so `(char *hostname, uint16_t port)` or `(uint8_t *p, uint16_t byte_idx)` is never promoted).
+    """
+    if role in ("output", "caller_storage", "trusted"):
+        return False
+    if i + 1 >= len(params) or params[i]["kind"] != "ptr" or not _charlike(params[i]):
+        return False
+    if _is_input(formals, i):
+        return False
+    pname = _name(formals, i)
+    lname = _name(formals, i + 1)
+    if not is_len_ptr and lname is not None and not _LEN_NAME_RE.search(lname):
+        return False
+    if entry_trust is not None and entry_trust.attacker_params is not None and pname in entry_trust.attacker_params:
+        return True
+    pwords = set(_words(pname or ""))
+    lwords = set(_words(lname or ""))
+    if (pwords | lwords) & _OUT_BUF_WORDS:
+        return False
+    if i in (api.recorded_input_buffers.get(name) or ()):
+        return True
+    return bool((pwords | lwords) & _IN_BUF_WORDS)
 
 
 def _array_element(p: dict) -> bool:
@@ -833,20 +951,50 @@ def _array_args(
     return [*args, ln]
 
 
-def _variable_length(params: list[dict], formals: list[dict], rec: dict, shared: dict[int, str]) -> bool:
+def _variable_length(
+    params: list[dict],
+    formals: list[dict],
+    rec: dict,
+    shared: dict[int, str],
+    *,
+    name: str = "",
+    api: ApiInfo | None = None,
+    roles: list[str] | None = None,
+    entry_trust: _EntryTrust | None = None,
+) -> bool:
     """
     Whether the call reads an input pair of no known size, so its length comes from the fuzz input. A
     lone output pointer of such a call (crypto_box's `c`, sized by `mlen`) may receive that many bytes,
     whatever size its call sites showed: it gets a spare buffer.
     """
-    return any(
-        _is_pair(params, i, formals) and i not in shared and _is_input(formals, i) and param_size(rec, i) is None
-        for i in range(len(params))
-    )
+    for i in range(len(params)):
+        if i in shared or param_size(rec, i) is not None:
+            continue
+        role = roles[i] if roles is not None else None
+        if _is_pair(params, i, formals):
+            if _is_input(formals, i) or (
+                api is not None
+                and _is_nonconst_input_buf(name, params, i, formals, api, role=role, entry_trust=entry_trust)
+            ):
+                return True
+        elif _is_buf_len_ptr_pair(params, i, formals):
+            if _is_input(formals, i) or (
+                api is not None
+                and _is_nonconst_input_buf(
+                    name, params, i, formals, api, role=role, entry_trust=entry_trust, is_len_ptr=True
+                )
+            ):
+                return True
+    return False
 
 
 def _lone_output(params: list[dict], formals: list[dict], i: int) -> bool:
-    return params[i]["kind"] == "ptr" and not _is_pair(params, i, formals) and not _is_input(formals, i)
+    return (
+        params[i]["kind"] == "ptr"
+        and not _is_pair(params, i, formals)
+        and not _is_buf_len_ptr_pair(params, i, formals)
+        and not _is_input(formals, i)
+    )
 
 
 def _is_record(t: str) -> bool:
@@ -1316,13 +1464,14 @@ def _target_claims_rest(
     shared: dict[int, str],
     roles: list[str] | None,
     schema_bindings: dict[int, tuple[str, bool]],
+    entry_trust: _EntryTrust | None = None,
 ) -> bool:
     """
     Whether any parameter of target function `name` itself (excluding S2 builder-initialized params
     and trusted params) would claim `case.rest`. When False, an S2 stream/buffer builder IS the
     whole-input consumer and feeds its read-only `(buf, len)` pair directly from `rest`.
     """
-    varlen = _variable_length(params, formals, rec, shared)
+    varlen = _variable_length(params, formals, rec, shared, name=name, api=api, roles=roles, entry_trust=entry_trust)
     handles = api.handles.get(name) or {}
     outs = api.outs.get(name) or {}
     i = 0
@@ -1394,10 +1543,27 @@ def _target_claims_rest(
                 and (i + 1) not in shared
                 and (roles is None or roles[i + 1] != "trusted_scalar")
             ):
-                if is_input and size is None:
+                nonconst_in = not is_input and _is_nonconst_input_buf(
+                    name, params, i, formals, api, role=role, entry_trust=entry_trust
+                )
+                if (is_input or nonconst_in) and size is None:
                     return True
                 i += 2
                 continue
+            if (
+                _is_buf_len_ptr_pair(params, i, formals)
+                and nxt is not None
+                and (i + 1) not in shared
+                and (roles is None or roles[i + 1] != "trusted_scalar")
+            ):
+                nonconst_in = not is_input and _is_nonconst_input_buf(
+                    name, params, i, formals, api, role=role, entry_trust=entry_trust, is_len_ptr=True
+                )
+                if (is_input or nonconst_in) and size is None:
+                    return True
+                if is_input or nonconst_in:
+                    i += 2
+                    continue
             if _charlike(p):
                 if size is None and is_input and pointee in ("char", "signed char"):
                     return True
@@ -2399,7 +2565,11 @@ def _param_roles(
             is_in = _is_input(formals, i)
             if fname in att:
                 roles.append("attacker")
-            elif i > 0 and _is_pair(params, i - 1, formals) and _name(formals, i - 1) in att:
+            elif (
+                i > 0
+                and (_is_pair(params, i - 1, formals) or _is_buf_len_ptr_pair(params, i - 1, formals))
+                and _name(formals, i - 1) in att
+            ):
                 roles.append("attacker")
             elif i + 1 < n and _len_ptr_params(params, i, formals, rec) and _name(formals, i + 1) in att:
                 roles.append("attacker")
@@ -2492,9 +2662,9 @@ def _bind_call(
     target_claims_rest = (
         api.trust_schema
         and allow_init
-        and _target_claims_rest(name, params, formals, rec, api, shared, roles, schema_bindings)
+        and _target_claims_rest(name, params, formals, rec, api, shared, roles, schema_bindings, entry_trust)
     )
-    varlen = _variable_length(params, formals, rec, shared)
+    varlen = _variable_length(params, formals, rec, shared, name=name, api=api, roles=roles, entry_trust=entry_trust)
     args: list[str] = []
     before: list[str] = []
     after: list[str] = []
@@ -2612,17 +2782,74 @@ def _bind_call(
                 )
             args.append(f"({p['type']}){shared[i]}")
             if nxt is not None and (i + 1) not in shared and _is_pair(params, i, formals):
-                # The length of a shared buffer: from the input, clamped to that buffer.
-                ln = f"c{call}a{i + 1}"
-                case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
-                case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
-                case.decls.append(
-                    f"if ((unsigned long long){ln} > sizeof({shared[i]})) {{ {ln} = ({nxt['ctype']})sizeof({shared[i]}); }}"
+                sh_in = (
+                    role not in ("output", "caller_storage", "trusted")
+                    and param_size(rec, i) is None
+                    and (
+                        _is_input(formals, i)
+                        or _is_nonconst_input_buf(name, params, i, formals, api, role=role, entry_trust=entry_trust)
+                    )
                 )
-                args.append(ln)
-                pairs.append((i, ln, False))
+                ln = f"c{call}a{i + 1}"
+                if sh_in and case.rest is None:
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)} = 0;")
+                    case.rest = {"call": call, "param": i, "kind": "bytes"}
+                    cap = _len_cap_expr(nxt["ctype"], f"sizeof({shared[i]})")
+                    case.post.append(
+                        f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                        f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
+                        f"if (rest_n > 0) {{ memcpy({shared[i]}, {FUZZ_COPY}, rest_n); }} "
+                        f"{ln} = ({nxt['ctype']})rest_n; }}"
+                    )
+                    case.note(call, i, "shared input buffer: copied from the rest of the input")
+                    args.append(ln)
+                    pairs.append((i, ln, True))
+                else:
+                    # The length of a shared buffer: from the input, clamped to that buffer.
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+                    case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
+                    case.decls.append(
+                        f"if ((unsigned long long){ln} > sizeof({shared[i]})) {{ {ln} = ({nxt['ctype']})sizeof({shared[i]}); }}"
+                    )
+                    args.append(ln)
+                    pairs.append((i, ln, False))
                 i += 2
                 continue
+            if nxt is not None and (i + 1) not in shared and _is_buf_len_ptr_pair(params, i, formals):
+                sh_lp_in = role not in ("output", "caller_storage", "trusted") and (
+                    _is_input(formals, i)
+                    or _is_nonconst_input_buf(
+                        name, params, i, formals, api, role=role, entry_trust=entry_trust, is_len_ptr=True
+                    )
+                )
+                if sh_lp_in:
+                    lpt = str(nxt.get("pointee") or "int")
+                    ln = f"c{call}a{i + 1}"
+                    if case.rest is None and param_size(rec, i) is None:
+                        case.decls.append(f"{lpt} {case.declare(ln)} = 0;")
+                        case.rest = {"call": call, "param": i, "kind": "bytes"}
+                        cap = _len_cap_expr(lpt, f"sizeof({shared[i]})")
+                        case.post.append(
+                            f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                            f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
+                            f"if (rest_n > 0) {{ memcpy({shared[i]}, {FUZZ_COPY}, rest_n); }} "
+                            f"{ln} = ({lpt})rest_n; }}"
+                        )
+                        case.note(
+                            call, i, "shared input buffer with pointer-to-length: copied from the rest of the input"
+                        )
+                        args.append(f"({nxt['type']})&{ln}")
+                        pairs.append((i, ln, True))
+                    else:
+                        case.decls.append(f"{lpt} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+                        case.slot(ln, SCALAR_BYTES.get(lpt), call, i + 1, "int")
+                        case.decls.append(
+                            f"if ((unsigned long long){ln} > sizeof({shared[i]})) {{ {ln} = ({lpt})sizeof({shared[i]}); }}"
+                        )
+                        args.append(f"({nxt['type']})&{ln}")
+                        pairs.append((i, ln, False))
+                    i += 2
+                    continue
             i += 1
             continue
         if p["kind"] == "int" and (i + 1) not in shared and _len_ptr_params(params, i, formals, rec):
@@ -2818,6 +3045,9 @@ def _bind_call(
                 and (i + 1) not in shared
                 and (roles is None or roles[i + 1] != "trusted_scalar")
             ):
+                nonconst_in = not is_input and _is_nonconst_input_buf(
+                    name, params, i, formals, api, role=role, entry_trust=entry_trust
+                )
                 if is_input and case.rest is None and size is None:
                     case.rest = {"call": call, "param": i, "kind": "bytes"}
                     if builder_rest:
@@ -2830,11 +3060,52 @@ def _bind_call(
                         args.append(f"({p['type']})(fuzz_buf + fuzz_off)")
                         args.append(f"({nxt['type']})(fuzz_len - fuzz_off)")
                         pairs.append((i, "(fuzz_len - fuzz_off)", True))
+                elif nonconst_in and case.rest is None and size is None:
+                    # Writable (non-`const` / in-place) input buffer: copy rest into a writable zeroed
+                    # buffer so in-place writes never mutate `const uint8_t *fuzz_buf`.
+                    buf = case.spare
+                    heap_buf = name in api.heap_buffer_fns
+                    if heap_buf:
+                        case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {buf}U);")
+                        guards.append(f"{v} != 0")
+                        after.append(f"free({v});")
+                        size_expr = f"{buf}U"
+                        copy_guard = f"{v} != 0 && rest_n > 0"
+                    else:
+                        case.decls.append(_byte_buffer(_storage(None), case.declare(v), buf))
+                        size_expr = f"sizeof({v})"
+                        copy_guard = "rest_n > 0"
+                    ln = f"c{call}a{i + 1}"
+                    case.decls.append(f"{nxt['ctype']} {case.declare(ln)} = 0;")
+                    case.rest = {"call": call, "param": i, "kind": "bytes"}
+                    cap = _len_cap_expr(nxt["ctype"], size_expr)
+                    case.post.append(
+                        f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                        f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
+                        f"if ({copy_guard}) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} "
+                        f"{ln} = ({nxt['ctype']})rest_n; }}"
+                    )
+                    case.note(call, i, "writable input buffer: copied from the rest of the input")
+                    args.append(f"({p['type']}){v}")
+                    args.append(ln)
+                    pairs.append((i, ln, True))
                 else:
                     buf = size or case.spare
-                    case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
-                    if size and is_input:
-                        case.slot(v, size, call, i, "bytes", addr=False)
+                    heap_buf = name in api.heap_buffer_fns and not is_input
+                    if heap_buf:
+                        case.decls.append(f"unsigned char *{case.declare(v)} = (unsigned char *)calloc(1, {buf}U);")
+                        guards.append(f"{v} != 0")
+                        after.append(f"free({v});")
+                        if size and nonconst_in:
+                            case.decls.append(
+                                f"if ({v} != 0 && fuzz_len >= fuzz_off + {size}U) {{ "
+                                f"memcpy({v}, {FUZZ_COPY}, {size}U); fuzz_off += {size}U; }}"
+                            )
+                            case.slots.append({"call": call, "param": i, "size": size, "kind": "bytes"})
+                    else:
+                        case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
+                        if size and (is_input or nonconst_in):
+                            case.slot(v, size, call, i, "bytes", addr=False)
                     ln = f"c{call}a{i + 1}"
                     case.decls.append(f"{nxt['ctype']} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
                     case.slot(ln, SCALAR_BYTES.get(nxt["ctype"]), call, i + 1, "int")
@@ -2844,6 +3115,47 @@ def _bind_call(
                     pairs.append((i, ln, False))
                 i += 2
                 continue
+            if (
+                _is_buf_len_ptr_pair(params, i, formals)
+                and nxt is not None
+                and (i + 1) not in shared
+                and (roles is None or roles[i + 1] != "trusted_scalar")
+            ):
+                nonconst_lp_in = not is_input and _is_nonconst_input_buf(
+                    name, params, i, formals, api, role=role, entry_trust=entry_trust, is_len_ptr=True
+                )
+                if is_input or nonconst_lp_in:
+                    buf = size or case.spare
+                    lpt = str(nxt.get("pointee") or "int")
+                    ln = f"c{call}a{i + 1}"
+                    case.decls.append(_byte_buffer(_storage(size), case.declare(v), buf))
+                    if size is None and case.rest is None:
+                        case.decls.append(f"{lpt} {case.declare(ln)} = 0;")
+                        case.rest = {"call": call, "param": i, "kind": "bytes"}
+                        cap = _len_cap_expr(lpt, f"sizeof({v})")
+                        case.post.append(
+                            f"{{ size_t rest_n = (fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U; "
+                            f"if (rest_n > {cap}) {{ rest_n = {cap}; }} "
+                            f"if (rest_n > 0) {{ memcpy({v}, {FUZZ_COPY}, rest_n); }} "
+                            f"{ln} = ({lpt})rest_n; }}"
+                        )
+                        case.note(
+                            call, i, "writable input buffer with pointer-to-length: copied from the rest of the input"
+                        )
+                        args.append(f"({p['type']}){v}")
+                        args.append(f"({nxt['type']})&{ln}")
+                        pairs.append((i, ln, True))
+                    else:
+                        if size:
+                            case.slot(v, size, call, i, "bytes", addr=False)
+                        case.decls.append(f"{lpt} {case.declare(ln)}; memset(&{ln}, 0, sizeof({ln}));")
+                        case.slot(ln, SCALAR_BYTES.get(lpt), call, i + 1, "int")
+                        case.decls.append(f"if ((unsigned long long){ln} > {buf}ULL) {{ {ln} = ({lpt}){buf}; }}")
+                        args.append(f"({p['type']}){v}")
+                        args.append(f"({nxt['type']})&{ln}")
+                        pairs.append((i, ln, False))
+                    i += 2
+                    continue
             if (
                 charlike
                 and size is None
@@ -5445,6 +5757,8 @@ def plan(
         schema_globals=schema_globals,
         trusted_strings=recorded_strings(traces) if effective_trust_schema else {},
         trusted_scalars=recorded_scalars(traces) if effective_trust_schema else {},
+        recorded_input_buffers=recorded_input_buffers(traces),
+        heap_buffer_fns=_reaching(model.get("functions") or {}, _HEAP_SIZE_PROBERS),
     )
     # Each function's threat-model roles by name, for the sequence cases (bound as in its single case).
     trust_by_name: dict[str, _EntryTrust] = {}
