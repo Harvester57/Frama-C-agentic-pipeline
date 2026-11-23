@@ -204,6 +204,7 @@ _MACHO_MAGICS = (
 )
 OBJECT_HEAD_BYTES = 20  # up to e_machine of an ELF header
 _AR_RE = re.compile(r"^(?:[\w.+-]+-)?(?:gcc-|llvm-)?ar(?:-\d+(?:\.\d+)*)?$")
+_FILE_CMD_NAMES = frozenset({"cp", "mv", "install", "ginstall", "rm", "unlink", "mkdir", "cmake"})
 # Options whose value is the next argument.
 _ARG_OPTS = {
     "-o",
@@ -515,7 +516,7 @@ def tree_rel(path: str, tree: str) -> str | None:
 
 
 def absolute(path: str, cwd: str) -> str:
-    return posixpath.normpath(path if posixpath.isabs(path) else posixpath.join(cwd, path))
+    return posixpath.normpath(path if posixpath.isabs(path) or os.path.isabs(path) else posixpath.join(cwd, path))
 
 
 def norm_in_tree(path: str, cwd: str, tree: str) -> str:
@@ -763,18 +764,184 @@ def compile_argv(args: list[str], source: str, output: str) -> list[str]:
     return base[:-1] + ["-c", base[-1], "-o", output]
 
 
+def _parse_posix_opts(
+    args: list[str],
+    *,
+    short_val: str = "",
+    long_val: frozenset[str] = frozenset(),
+) -> tuple[list[str], dict[str, str], set[str]]:
+    """Parse GNU/POSIX short and long options of `args[1:]`; returns (operands, option values, flags)."""
+    operands: list[str] = []
+    values: dict[str, str] = {}
+    flags: set[str] = set()
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            operands.extend(args[i + 1 :])
+            break
+        if a.startswith("--") and len(a) > 2:
+            if "=" in a:
+                opt, val = a.split("=", 1)
+                values[opt] = val
+                flags.add(opt)
+            elif a in long_val and i + 1 < len(args):
+                values[a] = args[i + 1]
+                flags.add(a)
+                i += 1
+            else:
+                flags.add(a)
+            i += 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            j = 1
+            while j < len(a):
+                ch = a[j]
+                if ch in short_val:
+                    rest = a[j + 1 :]
+                    if rest:
+                        values[f"-{ch}"] = rest
+                    elif i + 1 < len(args):
+                        i += 1
+                        values[f"-{ch}"] = args[i]
+                    flags.add(f"-{ch}")
+                    break
+                flags.add(f"-{ch}")
+                j += 1
+            i += 1
+            continue
+        operands.append(a)
+        i += 1
+    return operands, values, flags
+
+
+def _transfer_spec(
+    operands: list[str],
+    *,
+    move: bool,
+    target_dir: str | None = None,
+    no_target_dir: bool = False,
+) -> dict[str, Any] | None:
+    if target_dir is not None:
+        if not operands:
+            return None
+        return {"kind": "transfer", "move": move, "srcs": operands, "dst": target_dir, "dst_is_dir": True}
+    if len(operands) < 2:
+        return None
+    srcs, dst = operands[:-1], operands[-1]
+    if no_target_dir:
+        if len(srcs) != 1:
+            return None
+        dst_is_dir: bool | None = False
+    elif len(srcs) > 1 or dst in (".", "..") or dst.endswith(("/", "/.", "/..")):
+        dst_is_dir = True
+    else:
+        dst_is_dir = None
+    return {"kind": "transfer", "move": move, "srcs": srcs, "dst": dst, "dst_is_dir": dst_is_dir}
+
+
+def parse_file_action(cmd_name: str, args: list[str]) -> dict[str, Any] | None:
+    """
+    Parse a post-build file copy/move/install/remove/mkdir command (`cp`, `mv`, `install`/`ginstall`,
+    `rm`/`unlink`, `mkdir`, and `cmake -E copy|copy_if_different|rename|remove|rm|make_directory`).
+    Returns None when `args` is not a supported file action (for example `cp -s` or `cmake -E echo`).
+    """
+    if not args:
+        return None
+    if cmd_name == "cmake":
+        if len(args) < 4 or args[1] != "-E":
+            return None
+        sub = args[2]
+        sub_args = [sub, *args[3:]]
+        if sub in ("copy", "copy_if_different"):
+            operands, values, _ = _parse_posix_opts(sub_args, short_val="t")
+            return _transfer_spec(operands, move=False, target_dir=values.get("-t"))
+        if sub == "rename":
+            operands, _, _ = _parse_posix_opts(sub_args)
+            return _transfer_spec(operands, move=True, no_target_dir=True)
+        if sub in ("remove", "rm"):
+            operands, _, _ = _parse_posix_opts(sub_args)
+            return {"kind": "remove", "paths": operands} if operands else None
+        if sub == "make_directory":
+            operands, _, _ = _parse_posix_opts(sub_args)
+            return {"kind": "mkdir", "dirs": operands} if operands else None
+        return None
+    if cmd_name == "cp":
+        operands, values, flags = _parse_posix_opts(
+            args, short_val="tS", long_val=frozenset({"--target-directory", "--suffix"})
+        )
+        if {"-s", "--symbolic-link", "--parents"} & flags:
+            return None
+        return _transfer_spec(
+            operands,
+            move=False,
+            target_dir=values.get("-t") or values.get("--target-directory"),
+            no_target_dir=bool({"-T", "--no-target-directory"} & flags),
+        )
+    if cmd_name == "mv":
+        operands, values, flags = _parse_posix_opts(
+            args, short_val="tS", long_val=frozenset({"--target-directory", "--suffix"})
+        )
+        if "--exchange" in flags:
+            return None
+        return _transfer_spec(
+            operands,
+            move=True,
+            target_dir=values.get("-t") or values.get("--target-directory"),
+            no_target_dir=bool({"-T", "--no-target-directory"} & flags),
+        )
+    if cmd_name in ("install", "ginstall"):
+        operands, values, flags = _parse_posix_opts(
+            args,
+            short_val="gmoSt",
+            long_val=frozenset({"--group", "--mode", "--owner", "--suffix", "--target-directory", "--strip-program"}),
+        )
+        if {"-d", "--directory"} & flags:
+            return {"kind": "mkdir", "dirs": operands} if operands else None
+        tdir = values.get("-t") or values.get("--target-directory")
+        return _transfer_spec(
+            operands,
+            move=False,
+            target_dir=tdir,
+            no_target_dir=bool({"-T", "--no-target-directory"} & flags) or ("-D" in flags and tdir is None),
+        )
+    if cmd_name == "rm":
+        operands, _, _ = _parse_posix_opts(args)
+        return {"kind": "remove", "paths": operands} if operands else None
+    if cmd_name == "unlink":
+        operands, _, _ = _parse_posix_opts(args)
+        return {"kind": "remove", "paths": operands[:1]} if operands else None
+    if cmd_name == "mkdir":
+        operands, _, _ = _parse_posix_opts(args, short_val="m", long_val=frozenset({"--mode"}))
+        return {"kind": "mkdir", "dirs": operands} if operands else None
+    return None
+
+
 def classify_executions(execs: list[dict], tree: str) -> dict:
-    """Compile entries and raw artifacts (outputs of link and archive steps)."""
+    """Compile entries and raw artifacts (outputs of link and archive steps, plus post-build copies/moves)."""
     compiles: dict[str, dict] = {}  # object -> entry (the last compile of an object wins)
     artifacts: dict[str, dict] = {}
     archives: dict[str, list[str]] = defaultdict(list)
+    known_dirs: set[str] = set()
+    origin_of: dict[str, str] = {}  # in-tree path -> original linked/archived artifact key
+    installed: dict[str, list[str]] = defaultdict(list)  # origin artifact -> in-tree copied/moved destinations
     probes = 0
     skipped_compiler_like: list[str] = []
+
+    def _drop_copy(rel: str) -> None:
+        prev = origin_of.get(rel)
+        if prev is not None and prev != rel:
+            origin_of.pop(rel, None)
+            if rel in installed[prev]:
+                installed[prev].remove(rel)
+
     for ex in execs:
-        name = posixpath.basename(ex["exe"] or (ex["args"][0] if ex["args"] else ""))
+        args_raw = ex.get("args") or []
+        name = posixpath.basename(ex["exe"] or (args_raw[0] if args_raw else ""))
+        arg0 = posixpath.basename(args_raw[0]) if args_raw else ""
         cwd = ex["cwd"] or tree
         if _AR_RE.match(name):
-            parsed = parse_ar(ex["args"])
+            parsed = parse_ar(args_raw)
             if parsed is None:
                 continue
             archive = norm_in_tree(parsed[0], cwd, tree)
@@ -786,18 +953,61 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
                     member = norm_in_tree(m, cwd, tree)
                     if member not in archives[archive]:
                         archives[archive].append(member)
+            origin_of[archive] = archive
             continue
-        is_compiler = bool(
-            _COMPILER_RE.match(name) or (ex["args"] and _COMPILER_RE.match(posixpath.basename(ex["args"][0])))
-        )
+        cmd_name = arg0 if arg0 in _FILE_CMD_NAMES else (name if name in _FILE_CMD_NAMES else "")
+        if cmd_name:
+            action = parse_file_action(cmd_name, args_raw)
+            if action is None:
+                continue
+            kind = action["kind"]
+            if kind == "mkdir":
+                for d_raw in action["dirs"]:
+                    d_rel = tree_rel(absolute(d_raw, cwd), tree)
+                    if d_rel:
+                        known_dirs.add(d_rel)
+            elif kind == "remove":
+                for p_raw in action["paths"]:
+                    p_rel = tree_rel(absolute(p_raw, cwd), tree)
+                    if p_rel:
+                        _drop_copy(p_rel)
+            elif kind == "transfer":
+                abs_dst = absolute(action["dst"], cwd)
+                dst_rel = tree_rel(abs_dst, tree)
+                dst_is_dir = action["dst_is_dir"]
+                if dst_is_dir is None:
+                    dst_is_dir = (dst_rel in known_dirs if dst_rel is not None else False) or os.path.isdir(abs_dst)
+                for src_raw in action["srcs"]:
+                    src_rel = norm_in_tree(src_raw, cwd, tree)
+                    final_abs = posixpath.join(abs_dst, posixpath.basename(src_rel)) if dst_is_dir else abs_dst
+                    final_rel = tree_rel(final_abs, tree)
+                    origin = origin_of.get(src_rel)
+                    if origin is None:
+                        if final_rel:
+                            _drop_copy(final_rel)
+                        continue
+                    if (
+                        final_rel is not None
+                        and final_rel != "."
+                        and final_rel != origin
+                        and final_rel not in artifacts
+                        and final_rel not in archives
+                    ):
+                        _drop_copy(final_rel)
+                        if final_rel not in installed[origin]:
+                            installed[origin].append(final_rel)
+                        origin_of[final_rel] = origin
+                    if action["move"] and src_rel != origin:
+                        _drop_copy(src_rel)
+            continue
+        is_compiler = bool(_COMPILER_RE.match(name) or (arg0 and _COMPILER_RE.match(arg0)))
         if not is_compiler:
-            args = ex.get("args") or []
             if _COMPILER_LIKE_RE.search(name) or (
-                "-c" in args and any(a.endswith((".c", ".cc", ".cpp", ".cxx")) for a in args)
+                "-c" in args_raw and any(a.endswith((".c", ".cc", ".cpp", ".cxx")) for a in args_raw)
             ):
-                skipped_compiler_like.append(f"{name} (args: {args[:5]})")
+                skipped_compiler_like.append(f"{name} (args: {args_raw[:5]})")
             continue
-        args = expand_response_files(ex["args"], cwd)
+        args = expand_response_files(args_raw, cwd)
         d = parse_driver(args)
         if d["mode"] == "other":
             continue
@@ -844,6 +1054,7 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
             "external_libdirs": external_dirs,
             "compiler": args[0],
         }
+        origin_of[output] = output
     for archive, members in archives.items():
         artifacts[archive] = {
             "kind": "static_lib",
@@ -853,6 +1064,9 @@ def classify_executions(execs: list[dict], tree: str) -> dict:
             "external_libdirs": [],
             "compiler": None,
         }
+    for key, art in artifacts.items():
+        if installed.get(key):
+            art["installed_as"] = list(installed[key])
     return {
         "compiles": compiles,
         "artifacts": artifacts,
@@ -881,15 +1095,22 @@ def drop_vanished_probes(cap: dict, tree: str) -> list[dict]:
 
     compiles: dict[str, dict] = cap["compiles"]
     artifacts: dict[str, dict] = cap["artifacts"]
+
+    def artifact_gone(name: str) -> bool:
+        art = artifacts.get(name) or {}
+        return all(gone(p) for p in (name, *(art.get("installed_as") or [])))
+
     vanished = {
         key
         for key, c in compiles.items()
-        if gone(c["source"]) and gone(key.split("::", 1)[0] if c.get("implicit") else key)
+        if gone(c["source"]) and (artifact_gone(key.split("::", 1)[0]) if c.get("implicit") else gone(key))
     }
     removed = {
         name: artifacts.pop(name)
         for name in [
-            n for n, a in artifacts.items() if a["objects"] and gone(n) and all(o in vanished for o in a["objects"])
+            n
+            for n, a in artifacts.items()
+            if a["objects"] and artifact_gone(n) and all(o in vanished for o in a["objects"])
         ]
     }
     named = {o for a in artifacts.values() for o in a["objects"]}
@@ -994,24 +1215,42 @@ def mark_test_drivers(units: dict[str, dict], main_file: dict[str, str]) -> list
     return marked
 
 
+def unit_binary_path(tree: Path, name: str, unit: dict[str, Any]) -> Path | None:
+    """Where a unit's built binary lives in `tree`: its link output, else its first existing `installed_as` path."""
+    primary = tree / name
+    if primary.is_file():
+        return primary
+    for alt in unit.get("installed_as") or []:
+        if isinstance(alt, str) and alt and not posixpath.isabs(alt) and ".." not in Path(alt).parts:
+            cand = tree / alt
+            if cand.is_file():
+                return cand
+    return None
+
+
 def derive_units(capture: dict, tree: str) -> dict[str, dict]:
     """Link units from compile entries and artifacts; `unlinked:<dir>` for objects linked into nothing."""
     compiles: dict[str, dict] = capture["compiles"]
     artifacts: dict[str, dict] = capture["artifacts"]
-    # Symlinked artifacts (libfoo.so -> libfoo.so.1.2) resolve through the tree on the scratch volume.
+    # Symlinked artifacts (libfoo.so -> libfoo.so.1.2) and post-build copies/moves resolve back to their unit.
     posix = os.name == "posix"
     real_index: dict[str, str] = {}
-    for key in artifacts:
+    alias_index: dict[str, str] = {}
+    for key, art in artifacts.items():
+        for alt in art.get("installed_as") or []:
+            alias_index.setdefault(alt, key)
         if posix and not posixpath.isabs(key):
             real = tree_rel(os.path.realpath(posixpath.join(tree, key)), os.path.realpath(tree))
             if real:
                 real_index[real] = key
 
     def real_of(rel: str) -> str | None:
+        if rel in alias_index:
+            return alias_index[rel]
         if not posix or posixpath.isabs(rel):
             return None
         real = tree_rel(os.path.realpath(posixpath.join(tree, rel)), os.path.realpath(tree))
-        return real_index.get(real or "", real)
+        return real_index.get(real or "", alias_index.get(real or "", real))
 
     units: dict[str, dict] = {}
     for path, art in sorted(artifacts.items()):
@@ -1036,7 +1275,7 @@ def derive_units(capture: dict, tree: str) -> dict[str, dict]:
         if not own and not links:
             continue  # nothing of the project in it (a probe the filter missed, or a copy)
         files = sorted({c["source"] for c in own})
-        units[path] = {
+        unit: dict[str, Any] = {
             "kind": art["kind"],
             "files": files,
             "objects": sorted({c["object"] for c in own}),
@@ -1044,6 +1283,9 @@ def derive_units(capture: dict, tree: str) -> dict[str, dict]:
             "external_libs": external,
             "compiler": art.get("compiler"),
         }
+        if art.get("installed_as"):
+            unit["installed_as"] = list(art["installed_as"])
+        units[path] = unit
     linked = {o for a in artifacts.values() for o in a["objects"]}
     by_dir: dict[str, list[dict]] = defaultdict(list)
     for c in compiles.values():
@@ -1827,19 +2069,27 @@ def check_architecture(
     files: dict[str, dict] = {}
     for key, c in sorted(compiles.items()):
         path = key.split("::", 1)[0] if c.get("implicit") else c["object"]
-        entry = files.setdefault(path, {"sources": [], "hint": None})
+        entry = files.setdefault(path, {"sources": [], "hint": None, "fallbacks": []})
         if c["source"] not in entry["sources"]:
             entry["sources"].append(c["source"])
         entry["hint"] = entry["hint"] or arch_hint(c.get("arguments") or [])
     for path, art in sorted(artifacts.items()):
         if art["kind"] in ("executable", "shared_lib"):
-            entry = files.setdefault(path, {"sources": [], "hint": None})
+            entry = files.setdefault(path, {"sources": [], "hint": None, "fallbacks": []})
             entry["hint"] = entry["hint"] or arch_hint([art["compiler"]] if art.get("compiler") else [])
+            for alt in art.get("installed_as") or []:
+                if alt not in entry["fallbacks"]:
+                    entry["fallbacks"].append(alt)
     unsupported: list[dict] = []
     unknown = 0
     for path in sorted(files):
         entry = files[path]
         head = read(absolute(path, tree))
+        if head is None:
+            for alt in entry["fallbacks"]:
+                head = read(absolute(alt, tree))
+                if head is not None:
+                    break
         verdict, found = (None, "not found after the build") if head is None else object_format(head)
         decided_by = "header"
         if verdict is None and entry["hint"]:
@@ -2358,6 +2608,13 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
     t = str(tree)
     compiles: dict[str, dict] = cap["compiles"]
     units = derive_units(cap, t)
+    for u in units.values():
+        if u.get("installed_as"):
+            kept = [p for p in u["installed_as"] if (tree / p).is_file()]
+            if kept:
+                u["installed_as"] = kept
+            else:
+                u.pop("installed_as", None)
     tmp = scratch / "tmp"
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -2478,7 +2735,8 @@ def analyse(report: dict, cap: dict, tree: Path, scratch: Path, recipe: dict, ti
                 if api and headers:
                     embedded = {api[n] for n in declared_in([tree / h for h in headers], set(api), flags)}
         elif u["kind"] == "shared_lib":
-            rc, out, _ = run_tool(["nm", "-D", "--defined-only", str(tree / name)])
+            binary = unit_binary_path(tree, name, u) or (tree / name)
+            rc, out, _ = run_tool(["nm", "-D", "--defined-only", str(binary)])
             nm_syms = parse_nm(out) if rc == 0 else {}
             exported = {s for s, (typ, _) in nm_syms.items() if typ in FUNCTION_TYPES}
             entries_ = {i for n, i in globals_.items() if n in exported}
@@ -2609,7 +2867,11 @@ def build_snapshot(
                 warnings.append(f"{name}: {ext['ref']} not resolved")
     rc, out, _ = run_tool(["ldconfig", "-p"])
     ldconfig = parse_ldconfig(out) if rc == 0 else {}
-    starts = [tree / n for n, u in units.items() if u["kind"] in ("executable", "shared_lib") and (tree / n).is_file()]
+    starts = [
+        bin_path
+        for n, u in units.items()
+        if u["kind"] in ("executable", "shared_lib") and (bin_path := unit_binary_path(tree, n, u)) is not None
+    ]
     starts += [Path(p) for p in libs if _SHARED_RE.search(p)]
     for _, paths in shared_closure(starts, ldconfig).items():
         for p in paths:

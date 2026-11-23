@@ -44,6 +44,7 @@
         "properties": {
           "status": {"type": "string", "enum": ["relinked", "not_built", "no_link_command", "no_api_function", "recorder_compile_failed", "relink_failed"]},
           "wrapped": {"type": "array", "items": {"type": "string"}},
+          "installed_as": {"$comment": "In-tree paths the relinked binary was copied to when the build moved or copied the artifact after linking.", "type": "array", "items": {"type": "string", "minLength": 1}},
           "log": {"type": "string"}
         },
         "additionalProperties": false

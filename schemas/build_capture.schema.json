@@ -172,7 +172,8 @@
           "embedded_api": {"$comment": "executables: globals of non-main files declared in the project headers they include", "type": "array", "items": {"$ref": "#/definitions/function_id"}},
           "embedded_api_source": {"$comment": "Origin of embedded_api on an executable (e.g. header_declared_internal). Absent when embedded_api is empty or in older captures.", "type": "string", "minLength": 1},
           "exported_data_symbols": {"$comment": "shared_lib: exported non-function global data objects from nm -D --defined-only (e.g. plugin descriptor structs). Absent in older captures.", "type": "array", "items": {"type": "string", "minLength": 1}},
-          "unit_visibility": {"$comment": "External visibility class of a non-test link unit for harness scoping. Absent on test units and in older captures.", "type": "string", "enum": ["executable", "plugin_so", "public_lib", "internal_convenience"]}
+          "unit_visibility": {"$comment": "External visibility class of a non-test link unit for harness scoping. Absent on test units and in older captures.", "type": "string", "enum": ["executable", "plugin_so", "public_lib", "internal_convenience"]},
+          "installed_as": {"$comment": "In-tree paths a built artifact was copied, moved, or installed to after linking (cp, mv, install, cmake -E copy/copy_if_different/rename). Absent when the artifact stayed at its link output path or in older captures.", "type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
         },
         "required": ["kind", "test", "test_reason", "files", "objects", "links", "external_libs", "cppflags", "entry_points", "embedded_api"]
       }

@@ -73,9 +73,11 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import sys
+import tempfile
 import time
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Sequence
@@ -756,15 +758,16 @@ def link_commands(events: Path, tree: Path) -> dict[str, dict]:
     import build_capture as bc
 
     out: dict[str, dict] = {}
+    tree_str = tree.as_posix()
     for ex in bc.read_executions(events):
         args = ex["args"]
         if not args or not bc._COMPILER_RE.match(Path(args[0]).name):
             continue
-        cwd = ex["cwd"] or str(tree)
+        cwd = ex["cwd"] or tree_str
         d = bc.parse_driver(bc.expand_response_files(args, cwd))
         if d["mode"] != "link":
             continue
-        output = bc.norm_in_tree(d["output"] or "a.out", cwd, str(tree))
+        output = bc.norm_in_tree(d["output"] or "a.out", cwd, tree_str)
         out[output] = {"args": args, "cwd": cwd}
     return out
 
@@ -870,6 +873,53 @@ def _load_recipe() -> dict | None:
     return recipe if isinstance(recipe, dict) else None
 
 
+def _safe_tree_path(tree: Path, rel: str) -> Path | None:
+    """Resolve an in-tree relative path `rel` under `tree`, or None if absolute or escaping `tree`."""
+    if not isinstance(rel, str) or not rel or posixpath.isabs(rel) or Path(rel).is_absolute():
+        return None
+    if ".." in Path(rel).parts:
+        return None
+    cand = tree / rel
+    try:
+        if not cand.resolve().is_relative_to(tree.resolve()):
+            return None
+    except OSError:
+        return None
+    return cand
+
+
+def _installed_from_events(events: Path, tree: Path) -> dict[str, list[str]]:
+    """Fallback for captures predating `units[].installed_as`: follow post-build copies/moves in events."""
+    if not events.is_file():
+        return {}
+    import build_capture as bc
+
+    cap = bc.classify_executions(bc.read_executions(events), tree.as_posix())
+    return {
+        name: list(art["installed_as"]) for name, art in (cap.get("artifacts") or {}).items() if art.get("installed_as")
+    }
+
+
+def _copy_relinked_binary(src: Path, dst: Path) -> None:
+    """Atomically copy a relinked binary `src` to `dst`, preserving mode and skipping same-file links."""
+    if dst.exists():
+        try:
+            if os.path.samefile(src, dst):
+                return
+        except OSError:
+            pass
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def record(args: argparse.Namespace) -> tuple[dict, int]:
     started = time.monotonic()
     report: dict[str, Any] = {
@@ -925,6 +975,7 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
 
     plans, skipped = plan_recorder(model)
     links = link_commands(EVENTS_JSONL, tree)
+    events_installed: dict[str, list[str]] | None = None
     work = scratch / "seed_harvest"
     shutil.rmtree(work, ignore_errors=True)
     out_dir = work / "calls"
@@ -936,14 +987,27 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
     for unit_name, unit in sorted(tests.items()):
         info: dict[str, Any] = {}
         relinked[unit_name] = info
-        exe = tree / unit_name
+        link_out = tree / unit_name
+        orig_exists = link_out.is_file()
+        if "installed_as" in unit:
+            raw_installed = list(unit.get("installed_as") or [])
+        else:
+            if events_installed is None:
+                events_installed = _installed_from_events(EVENTS_JSONL, tree)
+            raw_installed = list(events_installed.get(unit_name) or [])
+        existing_installed: list[tuple[str, Path]] = []
+        for rel in raw_installed:
+            cand = _safe_tree_path(tree, rel)
+            if cand is not None and cand.is_file():
+                existing_installed.append((rel, cand))
+        probe_exe = link_out if orig_exists else (existing_installed[0][1] if existing_installed else None)
         link = links.get(unit_name)
-        if not exe.is_file() or link is None:
-            info["status"] = "not_built" if not exe.is_file() else "no_link_command"
+        if probe_exe is None or link is None:
+            info["status"] = "not_built" if probe_exe is None else "no_link_command"
             continue
         # The API it defines (library sources or a static archive linked in) and the API it calls
         # from a shared library (undefined references): `--wrap` covers both.
-        linked = defined_functions(exe) | undefined_functions(exe)
+        linked = defined_functions(probe_exe) | undefined_functions(probe_exe)
         mine = [p for p in plans if p["name"] in linked][:WRAP_LIMIT]
         if not mine:
             info["status"] = "no_api_function"
@@ -973,11 +1037,34 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
         if not compiled:
             info.update(status="recorder_compile_failed", log=log[-2000:])
             continue
+        link_out.parent.mkdir(parents=True, exist_ok=True)
         argv = [link["args"][0], str(rt_o), str(wr_o), *link["args"][1:]] + [f"-Wl,--wrap={p['name']}" for p in mine]
         res = _sandboxed(argv, Path(link["cwd"]), scratch, 600, {})
         if res.returncode != 0:
             info.update(status="relink_failed", log=((res.stdout or "") + (res.stderr or ""))[-2000:])
             continue
+        if existing_installed:
+            if not link_out.is_file():
+                info.update(
+                    status="relink_failed",
+                    log=f"relinked output {unit_name} not found to copy to {', '.join(r for r, _ in existing_installed)}",
+                )
+                continue
+            copied: list[str] = []
+            copy_err: str | None = None
+            for rel, dest in existing_installed:
+                try:
+                    _copy_relinked_binary(link_out, dest)
+                except OSError as exc:
+                    copy_err = f"copying relinked {unit_name} to {rel}: {exc}"
+                    break
+                copied.append(rel)
+            if copy_err is not None:
+                info.update(status="relink_failed", log=copy_err)
+                continue
+            if not orig_exists:
+                link_out.unlink(missing_ok=True)
+            info["installed_as"] = copied
         info["status"] = "relinked"
     report["relink"] = relinked
     if not any(i.get("status") == "relinked" for i in relinked.values()):
@@ -1045,9 +1132,19 @@ def shared_library_dirs(capture: dict, tree: Path) -> list[str]:
     dirs: list[str] = []
     for name, unit in sorted((capture.get("units") or {}).items()):
         if isinstance(unit, dict) and unit.get("kind") == "shared_lib":
-            d = (tree / name).parent
-            if d.is_dir() and str(d) not in dirs:
-                dirs.append(str(d))
+            installed = unit.get("installed_as") or []
+            added_any = False
+            for rel in (name, *installed):
+                cand = _safe_tree_path(tree, rel)
+                if cand is not None and cand.is_file():
+                    added_any = True
+                    d = cand.parent
+                    if str(d) not in dirs:
+                        dirs.append(str(d))
+            if not added_any:
+                d = (tree / name).parent
+                if d.is_dir() and str(d) not in dirs:
+                    dirs.append(str(d))
     if dirs:
         return dirs
     skip = {".git", "CMakeFiles"}
@@ -1076,7 +1173,14 @@ def _run_executables(
         if info.get("status") != "relinked":
             continue
         t0 = time.monotonic()
-        res = _sandboxed([str(tree / name)], cwd, scratch, cap, env)
+        exe = tree / name
+        if not exe.is_file():
+            for rel in info.get("installed_as") or []:
+                cand = _safe_tree_path(tree, rel)
+                if cand is not None and cand.is_file():
+                    exe = cand
+                    break
+        res = _sandboxed([str(exe)], cwd, scratch, cap, env)
         runs[name] = {
             "returncode": res.returncode,
             "timed_out": res.timed_out,
