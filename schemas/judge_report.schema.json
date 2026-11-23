@@ -168,6 +168,28 @@
         "fresh_confirmations"
       ],
       "additionalProperties": false
+    },
+    "frontier_merge_info": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "pattern": "^(ok|provided|disabled|below_cap|no_san_binary|skipped|timed_out|no_files|sandbox_unavailable|rc=-?[0-9]+)$"
+        },
+        "returncode": {"type": ["integer", "null"]},
+        "timed_out": {"type": "boolean"},
+        "timeout_s": {"type": "integer", "minimum": 0},
+        "elapsed_s": {"type": "number", "minimum": 0},
+        "stage_s": {"type": "number", "minimum": 0},
+        "staged_locally": {"type": "boolean"},
+        "corpus_files": {"type": "integer", "minimum": 0},
+        "merged_files": {"type": "integer", "minimum": 0},
+        "matched_files": {"type": "integer", "minimum": 0},
+        "stderr_tail": {"type": "string"},
+        "reason": {"type": ["string", "null"]}
+      },
+      "required": ["status"],
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -197,6 +219,11 @@
     "not_judged": {"type": "integer", "minimum": 0},
     "frontier_total": {"type": "integer", "minimum": 0},
     "frontier_judged": {"type": "integer", "minimum": 0},
+    "frontier_status": {
+      "type": "string",
+      "pattern": "^(ok|provided|disabled|below_cap|no_san_binary|skipped|timed_out|no_files|sandbox_unavailable|rc=-?[0-9]+)$"
+    },
+    "frontier_merge": {"$ref": "#/definitions/frontier_merge_info"},
     "not_judged_by_case": {
       "type": "object",
       "additionalProperties": {"type": "integer", "minimum": 0}

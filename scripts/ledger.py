@@ -2659,6 +2659,12 @@ def _ingest_judge_report_into_state(
     if raw_frontier_judged is None:
         raw_frontier_judged = inputs.get("frontier_judged", 0)
     frontier_judged = int(raw_frontier_judged or 0)
+    raw_frontier_status = report.get("frontier_status")
+    frontier_status = (
+        str(raw_frontier_status).strip()
+        if isinstance(raw_frontier_status, str) and raw_frontier_status.strip()
+        else None
+    )
 
     raw_nj_by_case = report.get("not_judged_by_case")
     if not isinstance(raw_nj_by_case, dict):
@@ -2737,6 +2743,13 @@ def _ingest_judge_report_into_state(
                 gap_details["frontier_total"] = frontier_total
                 gap_details["frontier_judged"] = frontier_judged
                 gap_details["judge_frontier_complete"] = frontier_complete
+            if frontier_status is not None:
+                gap_details["frontier_status"] = frontier_status
+            frontier_note = (
+                f", frontier_status={frontier_status}"
+                if nj_cap > 0 and frontier_total == 0 and frontier_status is not None
+                else ""
+            )
             add_evidence(
                 u,
                 "fuzz",
@@ -2744,7 +2757,7 @@ def _ingest_judge_report_into_state(
                 "fuzz_not_judged",
                 False,
                 tool_output,
-                f"E-ACSL judge left inputs unjudged ({gap_desc}); E-ACSL fuzz_clean not granted.",
+                f"E-ACSL judge left inputs unjudged ({gap_desc}{frontier_note}); E-ACSL fuzz_clean not granted.",
                 gap_details,
             )
         return module
@@ -2899,6 +2912,13 @@ def _ingest_judge_report_into_state(
                     cap_unmapped_details["frontier_total"] = frontier_total
                     cap_unmapped_details["frontier_judged"] = frontier_judged
                     cap_unmapped_details["judge_frontier_complete"] = False
+                if frontier_status is not None:
+                    cap_unmapped_details["frontier_status"] = frontier_status
+                frontier_note = (
+                    f" (frontier_status={frontier_status})"
+                    if frontier_total == 0 and frontier_status is not None
+                    else ""
+                )
                 add_evidence(
                     u,
                     "fuzz",
@@ -2906,7 +2926,7 @@ def _ingest_judge_report_into_state(
                     "fuzz_not_judged",
                     False,
                     tool_output,
-                    f"E-ACSL judge had capped overflow (cap={nj_cap}) with incomplete frontier and reaching "
+                    f"E-ACSL judge had capped overflow (cap={nj_cap}) with incomplete frontier{frontier_note} and reaching "
                     f"cases for {u['function']} could not be isolated; E-ACSL fuzz_clean not granted.",
                     cap_unmapped_details,
                 )
@@ -2927,7 +2947,14 @@ def _ingest_judge_report_into_state(
                     capped_details["frontier_total"] = frontier_total
                     capped_details["frontier_judged"] = frontier_judged
                     capped_details["judge_frontier_complete"] = False
-                frontier_desc = f", frontier={frontier_judged}/{frontier_total}" if frontier_total > 0 else ""
+                if frontier_status is not None:
+                    capped_details["frontier_status"] = frontier_status
+                if frontier_total > 0:
+                    frontier_desc = f", frontier={frontier_judged}/{frontier_total}"
+                elif frontier_status is not None:
+                    frontier_desc = f", frontier_status={frontier_status}"
+                else:
+                    frontier_desc = ""
                 add_evidence(
                     u,
                     "fuzz",

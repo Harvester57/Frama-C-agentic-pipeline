@@ -831,3 +831,56 @@ def test_run_eacsl_fuzz_tags_pure_harness_explore_and_judge_artifacts(
     assert judge_by_name["seed-pure"]["failure"]["function"] == "LLVMFuzzerTestOneInput"
     assert "harness_self_fault" not in judge_by_name["seed-target"]
     assert judge_by_name["seed-target"]["failure"]["function"] == "ber_decode_len"
+
+
+def test_ledger_propagates_frontier_status_when_frontier_merge_failed(run_dir: Path) -> None:
+    """When a judge report falls back to uniform cap with `frontier_total == 0` and
+    `frontier_status == "timed_out"`, `ledger.py` preserves `frontier_status` on the
+    `fuzz_not_judged` evidence so callers see why frontier discovery produced 0 files.
+    """
+    seed(run_dir)
+    _write_coverage(
+        run_dir,
+        "snmp",
+        [
+            _cov_row("ber_decode_len", "src/snmp/ber.c", 142),
+            _cov_row("ber_decode_tag", "src/snmp/ber.c", 87),
+        ],
+    )
+    report = _make_judge_report(
+        "snmp",
+        status="clean",
+        passed=3283,
+        failed=0,
+        not_judged_breakdown={"cap": 58419},
+        frontier_total=0,
+        frontier_judged=0,
+        not_judged_by_case={"0": 500, "1": 1200},
+    )
+    report["frontier_status"] = "timed_out"
+    report["frontier_merge"] = {
+        "status": "timed_out",
+        "returncode": -9,
+        "timed_out": True,
+        "timeout_s": 202,
+        "elapsed_s": 202.1,
+        "stage_s": 1.2,
+        "staged_locally": True,
+        "corpus_files": 60467,
+        "merged_files": 0,
+        "matched_files": 0,
+        "stderr_tail": "MERGE-INNER: slow",
+    }
+    assert list(V.validate_judge_report(report, "snmp")) == []
+
+    judge_path = run_dir / "workspace/reports/judge/snmp.json"
+    write_json(judge_path, report)
+    L.cmd_ingest_judge([judge_path])
+
+    units = units_by_id(run_dir)
+    evs = _judge_ev(units, "src/snmp/ber.c#ber_decode_len::rte")
+    assert len(evs) == 1
+    assert evs[0]["result"] == "fuzz_not_judged"
+    assert evs[0]["details"]["frontier_status"] == "timed_out"
+    assert "frontier_status=timed_out" in evs[0]["summary"]
+    assert list(V.validate_ledger(load(run_dir / "coverage-ledger.json"), run_dir)) == []

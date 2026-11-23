@@ -100,6 +100,8 @@ import threading
 import time
 from collections import Counter, deque
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -381,6 +383,27 @@ JUDGE_TARGET_REPLAY_S_BY_PROFILE: dict[str, int] = {
 }
 JUDGE_TIER2_HARD_CAP = 16384
 JUDGE_MERGE_TIMEOUT_S = 30
+JUDGE_MERGE_FILES_PER_S = 300
+JUDGE_MERGE_MAX_TIMEOUT_S = 300
+JUDGE_MERGE_BUDGET_FRACTION = 3
+JUDGE_MERGE_STAGE_WORKERS = 8
+JUDGE_MERGE_STAGE_MAX_BYTES = 512 * 1024 * 1024
+JUDGE_MERGE_STAGE_MIN_FREE_BYTES = 64 * 1024 * 1024
+JUDGE_MERGE_STDERR_TAIL_BYTES = 2000
+_SLOW_MOUNT_FSTYPES: frozenset[str] = frozenset(
+    {
+        "9p",
+        "cifs",
+        "smb3",
+        "nfs",
+        "nfs4",
+        "drvfs",
+        "vboxsf",
+        "virtiofs",
+        "fuse",
+        "fuseblk",
+    }
+)
 
 # W1-D execution-count plateau stop (strictly execution-counted to preserve P3 hardware independence).
 FUZZ_PLATEAU_STOP_ENV = "FRAMAC_FUZZ_PLATEAU_STOP"
@@ -4338,6 +4361,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_judge.add_argument("--per-input-timeout", type=int, default=DEFAULT_PER_INPUT_TIMEOUT_S)
     p_judge.add_argument("--batch-size", type=int, default=JUDGE_BATCH_SIZE)
+    p_judge.add_argument(
+        "--merge-timeout",
+        type=int,
+        default=None,
+        help="Override wall-clock seconds for -merge=1 frontier discovery (default: scaled with corpus size)",
+    )
     p_judge.add_argument("--scratch-dir", type=Path, default=None)
     p_judge.add_argument(
         "--sources", nargs="*", default=None, help="Optional harness/module sources (defaults to build-json)"
@@ -5240,26 +5269,262 @@ def _count_grown_corpus_files(corpus_dir: Path) -> int:
     return count
 
 
-def discover_judge_frontier(
+@dataclass(frozen=True)
+class FrontierMergeResult:
+    """Outcome and telemetry of `libFuzzer -merge=1` coverage-frontier discovery."""
+
+    frontier_names: set[str] | None
+    status: str
+    returncode: int | None = None
+    timed_out: bool = False
+    timeout_s: int = 0
+    elapsed_s: float = 0.0
+    stage_s: float = 0.0
+    staged_locally: bool = False
+    corpus_files: int = 0
+    merged_files: int = 0
+    matched_files: int = 0
+    stderr_tail: str = ""
+    reason: str | None = None
+
+    def to_report_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "status": self.status,
+            "returncode": self.returncode,
+            "timed_out": self.timed_out,
+            "timeout_s": max(0, int(self.timeout_s)),
+            "elapsed_s": round(max(0.0, float(self.elapsed_s)), 3),
+            "stage_s": round(max(0.0, float(self.stage_s)), 3),
+            "staged_locally": bool(self.staged_locally),
+            "corpus_files": max(0, int(self.corpus_files)),
+            "merged_files": max(0, int(self.merged_files)),
+            "matched_files": max(0, int(self.matched_files)),
+            "stderr_tail": self.stderr_tail,
+        }
+        if self.reason is not None:
+            out["reason"] = self.reason
+        return out
+
+
+def compute_judge_merge_timeout(
+    corpus_files: int,
+    *,
+    base_timeout_s: int = JUDGE_MERGE_TIMEOUT_S,
+    max_time_s: int | None = None,
+    max_timeout_s: int = JUDGE_MERGE_MAX_TIMEOUT_S,
+) -> int:
+    """
+    Compute the wall-clock limit for `libFuzzer -merge=1` frontier discovery.
+
+    Scales linearly with `corpus_files` above the `base_timeout_s` floor (at
+    `JUDGE_MERGE_FILES_PER_S` files/s), capped at `max_timeout_s` and, when a judge
+    `max_time_s` budget is given, at a `1 / JUDGE_MERGE_BUDGET_FRACTION` share of
+    `max_time_s` so frontier discovery cannot starve E-ACSL batch replay.
+    """
+    base = max(1, int(base_timeout_s))
+    n = max(0, int(corpus_files))
+    scaled = max(base, (n + JUDGE_MERGE_FILES_PER_S - 1) // JUDGE_MERGE_FILES_PER_S)
+    cap = max(base, int(max_timeout_s))
+    if max_time_s is not None:
+        budget_share = max(1, int(max_time_s) // JUDGE_MERGE_BUDGET_FRACTION)
+        cap = min(cap, budget_share)
+        if cap < base:
+            return cap
+    return min(cap, scaled)
+
+
+def _unescape_mount_path(raw: str) -> str:
+    """Decode octal escapes (e.g. ``\\040`` for space) used in Linux `/proc/self/mountinfo`."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), raw)
+
+
+def _filesystem_type_for_path(
+    path: Path,
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> str | None:
+    """Return the Linux filesystem type hosting `path` from `/proc/self/mountinfo`, or None."""
+    try:
+        target = os.path.realpath(str(path))
+        text = mountinfo_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    best_len = -1
+    best_fstype: str | None = None
+    for line in text.splitlines():
+        sep = " - "
+        idx = line.find(sep)
+        if idx < 0:
+            continue
+        left = line[:idx].split()
+        right = line[idx + len(sep) :].split()
+        if len(left) < 5 or not right:
+            continue
+        mp = _unescape_mount_path(left[4])
+        if not mp:
+            continue
+        if mp == "/":
+            matched = target.startswith("/")
+        else:
+            mp_norm = mp.rstrip("/")
+            matched = target == mp_norm or target.startswith(mp_norm + "/")
+        if matched and len(mp) > best_len:
+            best_len = len(mp)
+            best_fstype = right[0].strip().lower()
+    return best_fstype
+
+
+def _is_slow_mount(
+    path: Path,
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+) -> bool:
+    """True when `path` resides on a remote/host-bridged mount (9p, fuse.*, cifs, nfs, virtiofs)."""
+    fstype = _filesystem_type_for_path(path, mountinfo_path=mountinfo_path)
+    if not fstype:
+        return False
+    return fstype in _SLOW_MOUNT_FSTYPES or fstype.startswith("fuse.")
+
+
+def _stage_corpus_for_merge(
+    dest_dir: Path,
+    entries: Sequence[tuple[str, str]],
+    *,
+    max_bytes: int = JUDGE_MERGE_STAGE_MAX_BYTES,
+    min_free_bytes: int = JUDGE_MERGE_STAGE_MIN_FREE_BYTES,
+    max_workers: int = JUDGE_MERGE_STAGE_WORKERS,
+) -> tuple[bool, float, dict[tuple[int, str], list[str]], str | None]:
+    """
+    Copy corpus files into container-local `dest_dir` in parallel so `libFuzzer -merge=1`
+    reads local storage instead of a slow host mount (e.g. 9p `/framac-run`).
+
+    While copying, computes `(size, sha256) -> sorted original filenames` in memory so
+    matching libFuzzer's SHA-1 output files back to non-SHA1 corpus names (like `floor_*`)
+    needs zero extra reads on the slow mount.
+    """
+    t0 = time.monotonic()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        free_bytes = shutil.disk_usage(dest_dir).free
+    except OSError:
+        free_bytes = max_bytes + min_free_bytes
+    eff_max_bytes = min(int(max_bytes), max(0, int(free_bytes) - int(min_free_bytes)))
+    if eff_max_bytes <= 0:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return False, max(0.0, time.monotonic() - t0), {}, "local staging skipped: insufficient free space on scratch"
+
+    lock = threading.Lock()
+    state: dict[str, Any] = {"bytes": 0, "abort": None}
+    by_size_sha256: dict[tuple[int, str], list[str]] = {}
+    dest_str = str(dest_dir)
+
+    def _copy_one(item: tuple[str, str]) -> tuple[str, int, str] | None:
+        if state["abort"] is not None:
+            return None
+        name, src_path = item
+        try:
+            with open(src_path, "rb") as rf:
+                data = rf.read()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            with lock:
+                if state["abort"] is None:
+                    state["abort"] = f"local staging read failed: {exc}"
+            return None
+        sz = len(data)
+        with lock:
+            if state["abort"] is not None:
+                return None
+            if state["bytes"] + sz > eff_max_bytes:
+                state["abort"] = f"local staging skipped: corpus exceeds {eff_max_bytes // (1024 * 1024)} MiB cap"
+                return None
+            state["bytes"] += sz
+        try:
+            with open(os.path.join(dest_str, name), "wb") as wf:
+                wf.write(data)
+        except OSError as exc:
+            with lock:
+                if state["abort"] is None:
+                    state["abort"] = f"local staging write failed: {exc}"
+            return None
+        return (name, sz, hashlib.sha256(data).hexdigest())
+
+    workers = max(1, min(int(max_workers), len(entries))) if entries else 1
+    if workers == 1:
+        results = [_copy_one(item) for item in entries]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(_copy_one, entries))
+
+    stage_s = max(0.0, time.monotonic() - t0)
+    if state["abort"] is not None:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return False, stage_s, {}, str(state["abort"])
+
+    for rec in results:
+        if rec is None:
+            continue
+        name, sz, digest = rec
+        by_size_sha256.setdefault((sz, digest), []).append(name)
+    for names in by_size_sha256.values():
+        names.sort()
+    return True, stage_s, by_size_sha256, None
+
+
+def discover_judge_frontier_detailed(
     san_binary: Path,
     corpus_dir: Path,
     *,
     per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
-    merge_timeout_s: int = JUDGE_MERGE_TIMEOUT_S,
+    merge_timeout_s: int | None = None,
+    max_time_s: int | None = None,
     smoke_skipped: Sequence[int] = (),
     scratch_dir: Path | None = None,
-) -> set[str] | None:
+    stage_locally: bool | None = None,
+) -> FrontierMergeResult:
     """
-    Run a fast read-only `libFuzzer -merge=1` pass using the `.san` binary into a temporary
+    Run a read-only `libFuzzer -merge=1` pass using the `.san` binary into a temporary
     scratch directory to identify the filenames in `corpus_dir` forming the minimized coverage
     frontier. `corpus_dir` is never modified (all grown corpus files stay on disk).
 
-    Returns the set of matched filenames in `corpus_dir`, or `None` if the merge fails, times
-    out, cannot run, or produces no frontier files.
+    - When `merge_timeout_s` is `None`, scales the wall limit with the corpus file count via
+      `compute_judge_merge_timeout` (capped by `max_time_s // 3` and `JUDGE_MERGE_MAX_TIMEOUT_S`).
+    - When `stage_locally` is `None` (default), copies `corpus_dir` in parallel to container-local
+      scratch whenever `corpus_dir` resides on a slow mount (such as 9p `/framac-run`) and scratch
+      is local, keeping mount RPC latency out of `-merge=1` and filename matching.
+    - Returns a `FrontierMergeResult` recording `status` (`ok`, `timed_out`, `rc=<N>`, `no_files`,
+      `sandbox_unavailable`), timing, staging metadata, and the stderr tail.
     """
     cdir = Path(corpus_dir)
     if not cdir.is_dir():
-        return None
+        return FrontierMergeResult(
+            frontier_names=None,
+            status="no_files",
+            reason=f"corpus directory missing: {cdir}",
+        )
+
+    entries: list[tuple[str, str]] = []
+    with os.scandir(cdir) as it:
+        for entry in it:
+            name = entry.name
+            if name.startswith(".") or entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+            entries.append((name, entry.path))
+    entries.sort(key=lambda item: item[0])
+    corpus_files = len(entries)
+    if corpus_files == 0:
+        return FrontierMergeResult(
+            frontier_names=None,
+            status="no_files",
+            corpus_files=0,
+            reason="corpus directory is empty",
+        )
+
+    wall = (
+        max(1, int(merge_timeout_s))
+        if merge_timeout_s is not None
+        else compute_judge_merge_timeout(corpus_files, max_time_s=max_time_s)
+    )
+
     own_scratch = scratch_dir is None
     merge_scratch = (
         Path(scratch_dir) if scratch_dir is not None else Path(tempfile.mkdtemp(prefix="judge_frontier_merge_"))
@@ -5267,6 +5532,22 @@ def discover_judge_frontier(
     merge_dst = merge_scratch / "merged"
     merge_dst.mkdir(parents=True, exist_ok=True)
     try:
+        should_stage = (
+            bool(stage_locally)
+            if stage_locally is not None
+            else (_is_slow_mount(cdir) and not _is_slow_mount(merge_scratch))
+        )
+        staged_locally = False
+        stage_s = 0.0
+        staged_by_size_sha256: dict[tuple[int, str], list[str]] = {}
+        stage_note: str | None = None
+        merge_src = cdir
+        if should_stage:
+            staged_src = merge_scratch / "src_corpus"
+            staged_locally, stage_s, staged_by_size_sha256, stage_note = _stage_corpus_for_merge(staged_src, entries)
+            if staged_locally:
+                merge_src = staged_src
+
         merge_env = dict(SANITIZER_RUNTIME_ENV)
         merge_env["TMPDIR"] = str(merge_scratch.resolve())
         if smoke_skipped:
@@ -5277,9 +5558,9 @@ def discover_judge_frontier(
             f"-timeout={per_input_timeout}",
             f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
             str(merge_dst.resolve()),
-            str(cdir.resolve()),
+            str(merge_src.resolve()),
         ]
-        wall = max(1, int(merge_timeout_s))
+        t_merge = time.monotonic()
         try:
             res = sandbox_exec.run_sandboxed(
                 cmd,
@@ -5288,18 +5569,68 @@ def discover_judge_frontier(
                 limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
                 extra_env=merge_env,
             )
-        except SandboxUnavailable:
-            return None
-        if res.returncode != 0 or res.timed_out:
-            return None
+        except SandboxUnavailable as exc:
+            return FrontierMergeResult(
+                frontier_names=None,
+                status="sandbox_unavailable",
+                timeout_s=wall,
+                stage_s=stage_s,
+                staged_locally=staged_locally,
+                corpus_files=corpus_files,
+                reason=str(exc),
+            )
+        elapsed_s = max(0.0, time.monotonic() - t_merge)
+        raw_err = res.stderr if res.stderr else res.stdout
+        stderr_tail = raw_err[-JUDGE_MERGE_STDERR_TAIL_BYTES:] if raw_err else ""
+
+        if res.timed_out:
+            return FrontierMergeResult(
+                frontier_names=None,
+                status="timed_out",
+                returncode=res.returncode,
+                timed_out=True,
+                timeout_s=wall,
+                elapsed_s=elapsed_s,
+                stage_s=stage_s,
+                staged_locally=staged_locally,
+                corpus_files=corpus_files,
+                stderr_tail=stderr_tail,
+                reason=f"libFuzzer -merge=1 timed out after {wall}s",
+            )
+        if res.returncode != 0:
+            return FrontierMergeResult(
+                frontier_names=None,
+                status=f"rc={res.returncode}",
+                returncode=res.returncode,
+                timed_out=False,
+                timeout_s=wall,
+                elapsed_s=elapsed_s,
+                stage_s=stage_s,
+                staged_locally=staged_locally,
+                corpus_files=corpus_files,
+                stderr_tail=stderr_tail,
+                reason=f"libFuzzer -merge=1 exited with code {res.returncode}",
+            )
 
         merged_files = [p for p in sorted(merge_dst.iterdir()) if p.is_file() and not p.is_symlink()]
         if not merged_files:
-            return None
+            return FrontierMergeResult(
+                frontier_names=None,
+                status="no_files",
+                returncode=res.returncode,
+                timed_out=False,
+                timeout_s=wall,
+                elapsed_s=elapsed_s,
+                stage_s=stage_s,
+                staged_locally=staged_locally,
+                corpus_files=corpus_files,
+                merged_files=0,
+                matched_files=0,
+                stderr_tail=stderr_tail,
+                reason="libFuzzer -merge=1 produced 0 frontier files",
+            )
 
-        corpus_by_name = {
-            p.name: p for p in cdir.iterdir() if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
-        }
+        corpus_by_name = {name: Path(path_str) for name, path_str in entries}
         frontier_names: set[str] = set()
         unmatched_by_size: dict[int, set[str]] = {}
         for mf in merged_files:
@@ -5311,9 +5642,18 @@ def discover_judge_frontier(
                     digest = sha256_file(mf)
                 except OSError:
                     continue
-                unmatched_by_size.setdefault(sz, set()).add(digest)
+                if staged_locally:
+                    candidates = staged_by_size_sha256.get((sz, digest))
+                    if candidates:
+                        for cand in candidates:
+                            if cand not in frontier_names:
+                                frontier_names.add(cand)
+                                break
+                else:
+                    unmatched_by_size.setdefault(sz, set()).add(digest)
 
-        # Resolve non-SHA1-named corpus files (e.g. `floor_c<k>_...`) by size + content SHA-256.
+        # Resolve non-SHA1-named corpus files (e.g. `floor_c<k>_...`) by size + content SHA-256
+        # when we did not stage locally.
         if unmatched_by_size:
             for name in sorted(corpus_by_name):
                 if name in frontier_names:
@@ -5337,10 +5677,74 @@ def discover_judge_frontier(
                         unmatched_by_size.pop(sz, None)
                         if not unmatched_by_size:
                             break
-        return frontier_names if frontier_names else None
+
+        if not frontier_names:
+            return FrontierMergeResult(
+                frontier_names=None,
+                status="no_files",
+                returncode=res.returncode,
+                timed_out=False,
+                timeout_s=wall,
+                elapsed_s=elapsed_s,
+                stage_s=stage_s,
+                staged_locally=staged_locally,
+                corpus_files=corpus_files,
+                merged_files=len(merged_files),
+                matched_files=0,
+                stderr_tail=stderr_tail,
+                reason=f"0 of {len(merged_files)} merged files matched corpus_dir",
+            )
+
+        return FrontierMergeResult(
+            frontier_names=frontier_names,
+            status="ok",
+            returncode=res.returncode,
+            timed_out=False,
+            timeout_s=wall,
+            elapsed_s=elapsed_s,
+            stage_s=stage_s,
+            staged_locally=staged_locally,
+            corpus_files=corpus_files,
+            merged_files=len(merged_files),
+            matched_files=len(frontier_names),
+            stderr_tail=stderr_tail,
+            reason=stage_note,
+        )
     finally:
         if own_scratch:
             shutil.rmtree(merge_scratch, ignore_errors=True)
+
+
+def discover_judge_frontier(
+    san_binary: Path,
+    corpus_dir: Path,
+    *,
+    per_input_timeout: int = DEFAULT_PER_INPUT_TIMEOUT_S,
+    merge_timeout_s: int | None = None,
+    max_time_s: int | None = None,
+    smoke_skipped: Sequence[int] = (),
+    scratch_dir: Path | None = None,
+    stage_locally: bool | None = None,
+) -> set[str] | None:
+    """
+    Run a read-only `libFuzzer -merge=1` pass using the `.san` binary into a temporary
+    scratch directory to identify the filenames in `corpus_dir` forming the minimized coverage
+    frontier. `corpus_dir` is never modified (all grown corpus files stay on disk).
+
+    Returns the set of matched filenames in `corpus_dir`, or `None` if the merge fails, times
+    out, cannot run, or produces no frontier files. Use `discover_judge_frontier_detailed` for
+    structured diagnostics (`FrontierMergeResult`).
+    """
+    return discover_judge_frontier_detailed(
+        san_binary,
+        corpus_dir,
+        per_input_timeout=per_input_timeout,
+        merge_timeout_s=merge_timeout_s,
+        max_time_s=max_time_s,
+        smoke_skipped=smoke_skipped,
+        scratch_dir=scratch_dir,
+        stage_locally=stage_locally,
+    ).frontier_names
 
 
 def compute_tier2_expansion(
@@ -5752,7 +6156,8 @@ def run_judge(
     frontier_cap: int | None = None,
     target_replay_s: int | None = None,
     tier2_hard_cap: int = JUDGE_TIER2_HARD_CAP,
-    merge_timeout_s: int = JUDGE_MERGE_TIMEOUT_S,
+    merge_timeout_s: int | None = None,
+    stage_locally: bool | None = None,
 ) -> dict[str, Any]:
     """
     P2d + W1-D standalone E-ACSL judge:
@@ -5819,22 +6224,83 @@ def run_judge(
         eacsl_missing_reason = str(exc)
 
     resolved_frontier: set[str] | None = None
-    if eacsl_binary is not None and eff_frontier_enabled:
-        if frontier_names is not None:
-            resolved_frontier = {str(n) for n in frontier_names}
-        elif _count_grown_corpus_files(corpus_dir) > cap:
+    frontier_status = "disabled"
+    frontier_merge_info: dict[str, Any] | None = None
+    diagnostic_hints: list[str] = []
+
+    if eacsl_binary is None:
+        frontier_status = "skipped"
+    elif not eff_frontier_enabled:
+        frontier_status = "disabled"
+    elif frontier_names is not None:
+        resolved_frontier = {str(n) for n in frontier_names}
+        frontier_status = "provided"
+    else:
+        grown_count = _count_grown_corpus_files(corpus_dir)
+        if grown_count <= cap:
+            frontier_status = "below_cap"
+        else:
+            san_missing_reason: str | None = None
             try:
                 san_binary = fuzz_build.resolve_prebuilt_binary(build_json, "sanitizers")
-            except (PrebuiltBinaryError, ValueError, TypeError):
+            except (PrebuiltBinaryError, ValueError, TypeError) as exc:
                 san_binary = None
-            if san_binary is not None:
-                resolved_frontier = discover_judge_frontier(
+                san_missing_reason = str(exc)
+            if san_binary is None:
+                frontier_status = "no_san_binary"
+                reason_text = san_missing_reason or "sanitizer binary unavailable"
+                frontier_merge_info = {
+                    "status": "no_san_binary",
+                    "returncode": None,
+                    "timed_out": False,
+                    "timeout_s": 0,
+                    "elapsed_s": 0.0,
+                    "stage_s": 0.0,
+                    "staged_locally": False,
+                    "corpus_files": grown_count,
+                    "merged_files": 0,
+                    "matched_files": 0,
+                    "stderr_tail": "",
+                    "reason": reason_text,
+                }
+                hint = (
+                    f"frontier merge skipped: sanitizer binary unavailable ({reason_text}); "
+                    f"fell back to uniform cap selection (cap={cap})"
+                )
+                diagnostic_hints.append(hint)
+                print(f"[judge] {module}: {hint}", file=sys.stderr)
+            else:
+                merge_res = discover_judge_frontier_detailed(
                     san_binary,
                     corpus_dir,
                     per_input_timeout=per_input_timeout,
                     merge_timeout_s=merge_timeout_s,
+                    max_time_s=max_time,
                     smoke_skipped=smoke_skipped,
+                    stage_locally=stage_locally,
                 )
+                resolved_frontier = merge_res.frontier_names
+                frontier_status = merge_res.status
+                frontier_merge_info = merge_res.to_report_dict()
+                if merge_res.status == "ok":
+                    print(
+                        f"[judge] {module}: frontier merge status=ok matched={merge_res.matched_files}/"
+                        f"{merge_res.corpus_files} timeout={merge_res.timeout_s}s "
+                        f"elapsed={merge_res.elapsed_s:.2f}s stage={merge_res.stage_s:.2f}s "
+                        f"staged_locally={merge_res.staged_locally}",
+                        file=sys.stderr,
+                    )
+                else:
+                    hint = (
+                        f"frontier merge fell back to uniform cap (status={merge_res.status}, "
+                        f"corpus_files={merge_res.corpus_files}, timeout_s={merge_res.timeout_s}, "
+                        f"elapsed_s={merge_res.elapsed_s:.2f}, stage_s={merge_res.stage_s:.2f}, "
+                        f"staged_locally={merge_res.staged_locally}"
+                        + (f", reason={merge_res.reason}" if merge_res.reason else "")
+                        + ")"
+                    )
+                    diagnostic_hints.append(hint)
+                    print(f"[judge] {module}: {hint}", file=sys.stderr)
 
     selection = select_judge_inputs(
         corpus_dir,
@@ -5922,6 +6388,7 @@ def run_judge(
             "not_judged": nj_total,
             "frontier_total": frontier_total,
             "frontier_judged": int(frontier_judged_count),
+            "frontier_status": frontier_status,
             "not_judged_by_case": nj_by_case,
             "artifacts": list(artifacts or []),
             "batch_state_only": list(batch_state_only or []),
@@ -5951,6 +6418,10 @@ def run_judge(
             report["reason"] = reason
         if startup_error is not None:
             report["startup_error"] = startup_error
+        if frontier_merge_info is not None:
+            report["frontier_merge"] = frontier_merge_info
+        if diagnostic_hints:
+            report["diagnostic_hints"] = list(diagnostic_hints)
         return report
 
     def _case_of(p: Path) -> int | None:
@@ -6365,6 +6836,7 @@ def _run_judge_mode(args) -> dict:
         batch_size=args.batch_size,
         scratch_dir=args.scratch_dir,
         sources=args.sources,
+        merge_timeout_s=getattr(args, "merge_timeout", None),
     )
 
 
