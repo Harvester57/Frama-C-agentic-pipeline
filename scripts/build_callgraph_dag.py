@@ -9,7 +9,9 @@ Writes the call-graph DAG (workspace/reports/callgraph_dag.json) from the Phase 
   leaves) and recursion cycles.
 - **Per-function facts, all from the model:** lines, storage, loops and cyclomatic complexity; from the
   signature, the parameters, pointer parameters, pointer result and variadic; from the external calls,
-  allocation and formatting; the indirect call sites; trust (scripts/trust.py). From the source lines
+  allocation and formatting; the indirect call sites, and among them the open-world callbacks no
+  function of the program can be the target of (`open_indirect_calls`: the prover brief and
+  run_wp_function.py stop on them instead of asking for `//@ calls`); trust (scripts/trust.py). From the source lines
   of each definition, backward gotos, `container_of`, volatile and inline assembly. From these, the WP
   blockers and notes, and the termination obligation (Layer 2).
 - **Modules:** the build's link units (`unit_view`, step I5b), libraries first: their sources plus the
@@ -348,6 +350,26 @@ def signature_facts(m: dict) -> dict:
     }
 
 
+def open_indirect_sites(model: dict) -> dict[str, list[dict]]:
+    """
+    Model function id -> its open-world indirect call sites: a call through a pointer whose type
+    (`signature`, known from Frama-C's parse) no address-taken function of the parsed program has, so
+    the model's type match found no candidate. Its targets are supplied by code outside the program (a
+    callback the library's user installs): no `//@ calls` can name one, and WP cannot frame the call.
+    A site without a signature (the GCC fallback) is unknown, not open. One entry per expression.
+    """
+    out: dict[str, list[dict]] = defaultdict(list)
+    for site in model.get("indirect_sites") or []:
+        if not site.get("signature") or site.get("candidates"):
+            continue
+        caller = str(site.get("caller") or "")
+        expr = str(site.get("expr") or "")
+        if not caller or not expr or any(s["expr"] == expr for s in out[caller]):
+            continue
+        out[caller].append({"expr": expr, "signature": str(site["signature"]), "loc": site.get("loc")})
+    return dict(out)
+
+
 def call_facts(m: dict, indirect_exprs: list[str]) -> dict:
     """What the calls say: externals called (allocation, formatting or bounded copies) and indirect call sites."""
     external = sorted({str(c) for c in m.get("external_calls") or [] if c})
@@ -455,8 +477,15 @@ def wp_facts(name: str, rec: dict) -> dict:
         blockers.append("container_of")
     if rec.get("has_volatile_or_asm"):
         blockers.append("volatile_or_asm")
-    if rec["indirect_calls"]:
-        notes.append(f"indirect call(s) {rec['indirect_calls']} require '//@ calls <targets>;'")
+    open_exprs = [str(s.get("expr")) for s in rec.get("open_indirect_calls") or []]
+    closed_exprs = [e for e in rec["indirect_calls"] if e not in open_exprs]
+    if closed_exprs:
+        notes.append(f"indirect call(s) {closed_exprs} require '//@ calls <targets>;'")
+    if open_exprs:
+        notes.append(
+            f"open-world callback(s) {open_exprs}: no function of the pointer's type has its address taken in "
+            "the program, so no '//@ calls' target exists and WP cannot frame the call (contract boundary)"
+        )
     if blockers:
         verifiability = "shell_unverifiable_wp"
     elif rec["indirect_calls"]:
@@ -997,6 +1026,7 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
         expr = str(site.get("expr") or "")
         if expr and expr not in site_exprs[str(site.get("caller"))]:
             site_exprs[str(site.get("caller"))].append(expr)
+    open_sites = open_indirect_sites(model)
 
     functions: dict[str, dict] = {}
     for fid, m in sorted(model_fns.items()):
@@ -1040,6 +1070,8 @@ def model_view(model: dict, capture: dict | None = None, root: str = "", sources
         text = sources.span(str(m["file"]), int(rec["line"]), int(rec["end_line"])) if sources else None
         if text is not None:
             rec.update(source_facts(text))
+        if open_sites.get(fid):
+            rec["open_indirect_calls"] = open_sites[fid]
         rec.update(wp_facts(m["name"], rec))
         errors = sorted({fallback_error[u] for u in m.get("units") or [] if u in fallback_error})
         if errors:

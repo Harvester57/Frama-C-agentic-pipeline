@@ -1116,13 +1116,34 @@ def _render_loop_templates(record: dict, mapped, lines: list[str]) -> None:
                 lines.append(f"{indent}   - {_code(f'loop invariant PLACE_HOLDER_for_{safe};')}")
 
 
+def mark_open_callbacks(record: dict, exprs: list[str]) -> dict:
+    """
+    A copy of `record` whose indirect calls through one of `exprs` carry `open_callback`: the call-graph DAG
+    found no function of the program the pointer's type can be (build_callgraph_dag.open_indirect_sites).
+    Expressions are compared without white space, as both come from the kernel's printer.
+    """
+    wanted = {re.sub(r"\s+", "", e) for e in exprs if e}
+    calls = [
+        {**c, "open_callback": True}
+        if c.get("indirect") and re.sub(r"\s+", "", str(c.get("expr") or "")) in wanted
+        else c
+        for c in record.get("calls") or []
+    ]
+    return {**record, "calls": calls}
+
+
 def _render_calls(record: dict, mapped, lines: list[str]) -> None:
     sites = [c for c in record.get("calls") or [] if c.get("indirect")]
     if sites:
-        lines.append("\n**Indirect calls** (each needs `//@ calls ...;`):")
+        lines.append("\n**Indirect calls** (each needs `//@ calls ...;`, except an open-world callback):")
         for site in sites:
             targets = site.get("eva_targets")
-            if targets:
+            if site.get("open_callback"):
+                note = (
+                    "open-world callback: no function of the program has its type and its address taken, so no "
+                    "`calls` target exists and WP cannot frame the call (Step A, open-world callback)"
+                )
+            elif targets:
                 note = f"Eva resolved it to {', '.join(_code(t) for t in targets)} under this harness"
             elif targets is None:
                 note = "no Eva run to resolve its targets"

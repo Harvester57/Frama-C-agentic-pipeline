@@ -110,6 +110,19 @@
         "address_refs": {"$comment": "Dump schema 6: project functions whose address this function body takes", "$ref": "#/definitions/keys"},
         "global_refs": {"$comment": "Dump schema 6: project global_variables ids this function body names", "$ref": "#/definitions/strings"},
         "external_callees": {"$ref": "#/definitions/strings"},
+        "open_indirect_calls": {
+          "$comment": "indirect call sites whose pointer type no address-taken function of the program has (an open-world callback): no '//@ calls' target exists",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "expr": {"type": "string", "minLength": 1},
+              "signature": {"type": "string", "minLength": 1},
+              "loc": {"type": ["string", "null"]}
+            },
+            "required": ["expr", "signature"]
+          }
+        },
         "wave": {"type": "integer", "minimum": 0},
         "is_recursive": {"type": "boolean"},
         "self_recursive": {"type": "boolean"},

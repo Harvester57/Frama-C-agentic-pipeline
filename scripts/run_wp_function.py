@@ -31,6 +31,11 @@ Drives Frama-C WP + RTE deductive verification on a single C function (-wp-fct).
    workspace/reports/security_props.json when it exists; `none` turns it off) writes them to a
    meta file parsed with the sources, plus the files defining the globals they name, and runs
    `-meta -then-last -wp ...`. The report's `security_props` names them.
+8. Open-world callbacks (apply_open_callback_boundary): when the call-graph DAG marks an indirect
+   call of the function as one no function of the program can be the target of
+   (`open_indirect_calls`), the report gets `open_callback_boundary` (the goals that depend on the
+   call), the focus `open_callback_boundary_stop_now` once nothing else is open, and a `calls`
+   annotation naming a non-target there is Tier-B unsound.
 """
 
 from __future__ import annotations
@@ -70,6 +75,7 @@ from acsl_ast import (  # noqa: E402
     find_top_level_lemmas,
     find_unsound_recursive_logic,
     is_trivial_predicate,
+    locate_function_span,
     mask_comments_and_literals,
 )
 from framac_common import (  # noqa: E402
@@ -172,6 +178,21 @@ _SKIPPED_RTE_RE = re.compile(
     r"(?:Skipped RTE guards:\s*([^\n)]+\))|([^\n]*Through function pointer[^\n]*cannot generate[^\n]*))"
 )
 _INDIRECT_CALL_UNSOUND_RE = re.compile(r"Missing 'calls'|Unknown callee")
+CALLS_ANNOTATION_HINT = (
+    "Indirect call through a function pointer without a 'calls' annotation: place "
+    "'//@ calls f1, f2;' immediately above the indirect call statement."
+)
+# An open-world callback (the DAG's `open_indirect_calls`): WP's own warning gives the line of each call
+# it could not resolve, and `calls` annotations name the targets a prover wrote.
+_MISSING_CALLS_LINE_RE = re.compile(
+    r"^\[wp\]\s+(?P<file>\S+?):(?P<line>\d+):\s+Warning:\s+Missing 'calls'", re.MULTILINE
+)
+_ACSL_COMMENT_RE = re.compile(r"//@[^\n]*|/\*@.*?\*/", re.DOTALL)
+_ACSL_CALLS_RE = re.compile(r"(?<![\w\\])calls\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*;")
+OPEN_CALLBACK_FOCUS = "open_callback_boundary_stop_now"
+# Goal kinds of the function's own contract: after an unresolved call WP havocs memory and assumes the
+# callee may recurse, so these depend on the callback wherever they sit.
+_CONTRACT_GOAL_KINDS = ("termination", "assigns clause", "from", "postcondition", "exit")
 _FPV_DEGEN_RE = re.compile(
     r"^\[wp\] \[(?:Timeout|Unknown|Failed|Failure|Stepout)\] ([A-Za-z0-9_]+_assert_rte_pointer_value[A-Za-z0-9_]*) .*\(Degenerated(?:, [^)]*)?\)",
     re.MULTILINE,
@@ -2172,10 +2193,7 @@ def derive_wp_diagnostic_hints(
             or "No 'calls' specification" in indirect_call_text
             or "indirect call present without '//@ calls'" in indirect_call_text
         ):
-            _add(
-                "Indirect call through a function pointer without a 'calls' annotation: place "
-                "'//@ calls f1, f2;' immediately above the indirect call statement."
-            )
+            _add(CALLS_ANNOTATION_HINT)
         if "unproven lemma" in aborts_and_unsound.lower():
             lemma_names = [
                 str(g.get("annotation") or "").split(":", 1)[0].strip()
@@ -2460,6 +2478,21 @@ def _find_and_load_dag(c_file: Path, out_dir: Path) -> dict | None:
     return None
 
 
+def _dag_function_record(dag: dict, c_file: Path, fn_name: str) -> dict | None:
+    """The DAG record of `fn_name`: under its plain key, else the record of that name whose file `c_file` ends with."""
+    functions = dag.get("functions") or {}
+    fn_data = functions.get(fn_name)
+    if isinstance(fn_data, dict) and fn_data.get("name", fn_name) == fn_name:
+        return fn_data
+    c_str = str(c_file).replace("\\", "/")
+    for v in functions.values():
+        if isinstance(v, dict) and v.get("name") == fn_name:
+            v_file = str(v.get("file") or "").replace("\\", "/")
+            if v_file and (v_file == c_str or c_str.endswith("/" + v_file)):
+                return v
+    return None
+
+
 def _check_internal_variadic(
     c_file: Path,
     fn_name: str,
@@ -2471,15 +2504,7 @@ def _check_internal_variadic(
 
     dag = _find_and_load_dag(c_file, out_dir)
     if dag:
-        fn_data = dag.get("functions", {}).get(fn_name)
-        if not fn_data:
-            c_str = str(c_file).replace("\\", "/")
-            for v in dag.get("functions", {}).values():
-                if v.get("name") == fn_name:
-                    v_file = v.get("file", "").replace("\\", "/")
-                    if v_file == c_str or c_str.endswith("/" + v_file) or c_str == v_file:
-                        fn_data = v
-                        break
+        fn_data = _dag_function_record(dag, c_file, fn_name)
         if fn_data and "internal_variadic" in fn_data.get("wp_blockers", []):
             return (
                 True,
@@ -4443,6 +4468,155 @@ def frame_only_ensures_limit(
     return contract_refinement.frame_only_ensures(contract, c_file, cppflags, machdep, work_dir=work_dir)
 
 
+def _function_text(c_file: Path, fn_name: str) -> tuple[str, int]:
+    """The definition of `fn_name` in `c_file` with its contract, and its first line; ('', 0) when not found."""
+    try:
+        text = c_file.read_text(encoding="utf-8", errors="replace")
+        span = locate_function_span(text, fn_name, path=str(c_file))
+    except (OSError, AcslError):
+        return "", 0
+    if span is None:
+        return "", 0
+    return span.text, span.start_line
+
+
+def calls_targets(fn_text: str) -> list[str]:
+    """The functions named by `//@ calls f, g;` annotations in a function's text, in order."""
+    names: list[str] = []
+    for comment in _ACSL_COMMENT_RE.findall(fn_text):
+        for m in _ACSL_CALLS_RE.finditer(comment):
+            names.extend(n.strip() for n in m.group(1).split(","))
+    return list(dict.fromkeys(names))
+
+
+def _open_call_lines(log_text: str, fn_text: str, fn_line: int, exprs: list[str]) -> list[int]:
+    """
+    Lines of the indirect calls WP could not resolve (its `Missing 'calls'` warning), else the lines of the
+    function's text where an open site's expression is called (`p->cb(` or `(*p->cb)(`).
+    """
+    lines = sorted({int(m.group("line")) for m in _MISSING_CALLS_LINE_RE.finditer(log_text or "")})
+    if lines or not fn_text:
+        return lines
+    code = mask_comments_and_literals(fn_text, acsl="blank", literals=True, on_error="mask")
+    found: set[int] = set()
+    for expr in exprs:
+        spaced = r"\s*".join(re.escape(part) for part in re.split(r"\s+", expr.strip()) if part)
+        for m in re.finditer(rf"(?:\(\s*\*\s*)?{spaced}\s*\)?\s*\(", code):
+            found.add(fn_line + code.count("\n", 0, m.start()))
+    return sorted(found)
+
+
+def _downstream_of_open_call(goal: dict, call_lines: list[int]) -> bool:
+    """
+    A goal of the function's own contract, or one on a line after the first open call of the body. A goal on
+    the call's own line is not: it is usually about the call's arguments (`\\object_pointer(p->ctx)`), which
+    are evaluated before the call and can be proved.
+    """
+    kind = str(goal.get("kind") or "").strip().lower()
+    if "loop" not in kind and kind.startswith(_CONTRACT_GOAL_KINDS):
+        return True
+    line = goal.get("line")
+    return bool(call_lines) and isinstance(line, int) and line > min(call_lines)
+
+
+def _open_callback_hint(sites: list[dict], downstream: int, other: int) -> str:
+    shown = ", ".join(f"`{s.get('expr')}` (type `{s.get('signature')}`)" for s in sites[:3])
+    hint = (
+        f"Open-world callback: {shown} has no target in the program (no function of that type has its address "
+        "taken), so no '//@ calls' or 'assert fp \\in {...}' can name one and WP cannot frame the call: it havocs "
+        "memory and may not terminate. Do not name any function in 'calls' at this site. "
+    )
+    if other:
+        return hint + (
+            f"{other} unproven goal(s) do not depend on the callback (before the call, not in the contract): prove "
+            "those, then finish as below. "
+            f"The {downstream} goal(s) in 'open_callback_boundary.downstream_goals' cannot be proved: keep the "
+            "contract callers need (never delete 'assigns' or 'ensures'), list them in 'unproven_goals', record the "
+            "callback in 'boundary_assumptions' and 'proof_gap', and finish with 'stalled_after_k_retries'."
+        )
+    return hint + (
+        f"Every unproven goal ({downstream}) depends on the callback: stop now. Keep the contract callers need "
+        "(never delete 'assigns' or 'ensures'), list these goals in 'unproven_goals', record the callback in "
+        "'boundary_assumptions' and 'proof_gap', and finish with 'stalled_after_k_retries'."
+    )
+
+
+def apply_open_callback_boundary(
+    res: dict, c_file: Path, fn_name: str, out_dir: Path, dag: dict | None = None, log_text: str | None = None
+) -> dict:
+    """
+    An open-world callback in `fn_name` (the DAG's `open_indirect_calls`, from the Phase 0 model: no function
+    of the called pointer's type has its address taken in the program). No `calls` target exists, so WP
+    cannot frame the call and the goals after it stay Unknown whatever the contract says. Records
+    `open_callback_boundary` in the report; when every unproven goal depends on the call, the focus becomes
+    OPEN_CALLBACK_FOCUS so the prover stops instead of spending its retries. A `calls` annotation naming a
+    function that is not a type-matched target of the function's call sites is tier-B unsound: that
+    function is never the target, and WP would use its contract as an unrecorded assumption about the
+    user's callback. Never makes a proof pass: `soundness.ok` and the status only ever get worse.
+    """
+    if res.get("status") not in ("all_proven", "unproven_goals_remain", "unsound_proof"):
+        return res
+    dag = dag if dag is not None else _find_and_load_dag(c_file, out_dir)
+    rec = _dag_function_record(dag, c_file, fn_name) if dag else None
+    sites = [s for s in (rec or {}).get("open_indirect_calls") or [] if isinstance(s, dict) and s.get("expr")]
+    if not sites:
+        return res
+    functions = (dag or {}).get("functions") or {}
+    allowed_keys = (rec or {}).get("indirect_callees")
+    if allowed_keys is None:
+        allowed_keys = (rec or {}).get("internal_callees") or []
+    allowed = {str((functions.get(k) or {}).get("name") or str(k).rpartition("#")[2]) for k in allowed_keys}
+    fn_text, fn_line = _function_text(c_file, fn_name)
+    named = calls_targets(fn_text)
+    foreign = [t for t in named if t not in allowed]
+    if log_text is None:
+        try:
+            log_text = (out_dir / f"wp_{fn_name}.log").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log_text = str(res.get("wp_log_tail") or "")
+    call_lines = _open_call_lines(log_text, fn_text, fn_line, [str(s["expr"]) for s in sites])
+    unproven = list(res.get("unproven_goals") or [])
+    downstream = [g for g in unproven if _downstream_of_open_call(g, call_lines)]
+    other = [g for g in unproven if not _downstream_of_open_call(g, call_lines)]
+    res["open_callback_boundary"] = {
+        "sites": sites,
+        "call_lines": call_lines,
+        "calls_targets": named,
+        "foreign_calls_targets": foreign,
+        "downstream_goals": [
+            {"file": g.get("file"), "line": g.get("line"), "kind": g.get("kind"), "annotation": g.get("annotation")}
+            for g in downstream
+        ],
+        "other_unproven": len(other),
+    }
+    soundness = res.setdefault("soundness", {})
+    hints = [h for h in res.get("diagnostic_hints") or [] if h != CALLS_ANNOTATION_HINT]
+    if foreign:
+        exprs = ", ".join(str(s["expr"]) for s in sites)
+        soundness.setdefault("tier_b_unsound", []).append(
+            f"'//@ calls {', '.join(foreign)}' in {fn_name}, which has an open-world callback ({exprs}): no "
+            "function of the pointer's type has its address taken in the program, so that function is never the "
+            "target and WP would assume its contract for the user's callback without recording it"
+        )
+        soundness["ok"] = False
+        if res.get("status") == "all_proven":
+            res["status"] = "unsound_proof"
+        res["next_synthesis_focus"] = "tier_b_soundness_fix_required"
+        hints.insert(
+            0,
+            f"Remove '//@ calls {', '.join(foreign)}': {exprs} is an open-world callback (no function of the program has its type and its address taken), so no "
+            "function is its target, the 'Call point' goal can never be proved, and the other goals would rest on "
+            "that function's unchecked contract. Leave the call without 'calls' and follow the open-world callback "
+            "recipe of the brief (Step A).",
+        )
+    else:
+        if unproven and not other:
+            res["next_synthesis_focus"] = OPEN_CALLBACK_FOCUS
+        hints.insert(0, _open_callback_hint(sites, len(downstream), len(other)))
+    res["diagnostic_hints"] = list(dict.fromkeys(hints))
+    return res
+
+
 def apply_verdict_limits(
     res: dict,
     c_file: Path,
@@ -5166,6 +5340,8 @@ def main(argv: list[str] | None = None) -> int:
                     wall_timeout=default_wall_timeout(args.wall_timeout),
                     cache_dir=args.cache_dir,
                 )
+            # Before the verdict limits: a `calls` naming a non-target at an open site makes the proof unsound.
+            res = apply_open_callback_boundary(res, args.file, args.function, args.out_dir)
             vacuity = None
             # A filtered or goal-dump run is not a whole proof: nothing is credited from it.
             if res.get("status") == "all_proven" and not args.prop and not args.dump_goal:
