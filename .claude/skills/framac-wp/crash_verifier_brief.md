@@ -25,7 +25,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
      - `critical`: `untrusted_surface` + out-of-bounds write / control-flow corruption, or Layer 4 authentication bypass.
      - `high`: `untrusted_surface` out-of-bounds read of secrets, Layer 6 secret leak, Layer 5 injection into a security-relevant sink.
      - `medium`: `untrusted_surface` DoS / non-termination, `untrusted_surface` arithmetic undefined behavior (signed integer overflow, divide-by-zero, invalid shift) that bypasses validation logic, corrupts state, or feeds invalid parameters into subsequent APIs, or `internal_api` memory corruption.
-     - `low`: `untrusted_surface` arithmetic undefined behavior that is strictly localized (e.g. fractional scaling) with no memory safety, bypass, or DoS effect; `internal_api` read or undefined behavior with no shown security impact.
+     - `low`: `untrusted_surface` arithmetic undefined behavior that is strictly localized (e.g. fractional scaling) with no memory safety, bypass, or DoS effect; `internal_api` read or undefined behavior with no shown security impact; a true alarm whose bad value is never consumed on the reproducer's path (see "True Alarm Without Effect").
 
 ---
 
@@ -110,6 +110,19 @@ A leak candidate comes from LeakSanitizer: its failure kind is `lsan_direct_leak
 - A leak of the harness's own allocation, or of an object the harness creates and never releases, is `harness_induced`: repair the harness and re-fuzz.
 - A leak the target makes on a call a legitimate caller can make, with no release on the path the input takes, is a defect: `confirmed`, with CWE-401 (Missing Release of Memory after Effective Lifetime) named in `record.reason`. The allocation site is the sink of `record.trace`.
 
+### True Alarm Without Effect (`confirmed`, `low`)
+
+The property fails at the sink for the reproducer, so the alarm is true, but the bad value is never consumed on any path the reproducer takes. The typical case is an `initialization` failure: a callee returns early before it writes an out-parameter, the caller copies its uninitialized local by value, and every reader of the copy returns on an error check before it reads it. In C11 such a copy is not undefined behaviour when the object's address was taken and its type has no trap representation (6.3.2.1p2): the value is only unspecified. The checking tool is still right: the property it checks fails.
+
+Every verifier returns the same outcome for this case:
+
+- Return `decision: "confirmed"` with `severity: "low"`. The reproducer and the failing property are the witness, as for any confirmed candidate.
+- Start `severity_rationale` with `No effect:` and cite the line where each reader of the value returns or branches away before reading it.
+- Put the decision point where the value is left bad, not at the copy. For a missing write, it is the callee's early `return` that skips the write (its file, line and function). Candidates in other functions that copy the same unwritten value then name the same decision point, and the report lists them together.
+- Never reject it as `disproved_by_source` (that class is for a failure that does not happen, and this one does), `toolchain_artifact` (the tool is right) or `"other"`.
+- A candidate whose decision point is the same as a verified sibling's is `duplicate` (see "Verified Siblings" at the end of this brief, when it is there).
+- When the value is consumed on the path (a branch, an index, a size, an output or a returned error code depends on it), this section does not apply: rate the effect with the anchors in Strict Rule 3.
+
 ### Decision Point (`confirmed` and `needs_validation`)
 
 The decision point is the earliest step at which a value chosen outside the target makes the failure inevitable. It is usually before the sink: the sink only executes what was decided earlier. Give its `file`, `line`, `function`, a `description`, and `controlled_by`:
@@ -166,7 +179,7 @@ Choose `record.rejection_class` by what would have to change for the failure to 
 - `"dead_code"`: nothing. The sink cannot execute.
 - `"contract_overconstraint"`: an ACSL contract, not the code. The failing clause demands more than the function's callers need or its documentation states.
 - `"toolchain_artifact"`: the checking tool. The target and the harness are both correct, and the tool itself produces the failure: E-ACSL's instrumentation or runtime, a sanitizer runtime, or the compiler or linker under the instrumented build. What makes the property hold is a behaviour of the toolchain, not a line of the target (that would be `disproved_by_source`). See "Toolchain Artifacts" below.
-- `"duplicate"`: nothing new. Another verified record already covers the same root cause at a different sink. Name its fingerprint in `record.reason`. A duplicate does not count as an opposite verdict at its sink. Records at the same sink are merged by the parent without this class, and a wrong fingerprint is fixed by refingerprinting (see "Refingerprinting, Merging, and Splitting").
+- `"duplicate"`: nothing new. Another verified record already covers the same root cause at a different sink: a `related` candidate, or a record listed under "Verified Siblings" at the end of this brief with the same decision point as yours. Name its fingerprint in `record.reason`. A duplicate does not count as an opposite verdict at its sink. Records at the same sink are merged by the parent without this class, and a wrong fingerprint is fixed by refingerprinting (see "Refingerprinting, Merging, and Splitting").
 - `"other"`: none of the above fits. This is the last resort: say in `record.reason` why no other class applies.
 
 Only `harness_induced` makes the parent change anything (a harness repair, up to 2 per module). Every other class leaves the target and the harness as they are.

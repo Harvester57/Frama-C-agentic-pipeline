@@ -799,8 +799,16 @@ def test_repair_waits_for_all_open_verifiers_of_module_and_accumulates_reasons(t
             "status": "ok",
             "module": "mod_a",
             "unknown_obligations_by_function": {},
+            # One predicate per function: a shared predicate hash would make the three candidates
+            # root-cause siblings, which the scheduler verifies one at a time (`_hold_verify_siblings`).
             "invalid_alarms": [
-                {"file": f"src/mod_a/{fn}.c", "function": fn, "line": 1, "kind": "mem_access", "annotation": "p != 0"}
+                {
+                    "file": f"src/mod_a/{fn}.c",
+                    "function": fn,
+                    "line": 1,
+                    "kind": "mem_access",
+                    "annotation": f"p != {fn[-1]}",
+                }
                 for fn in ("f1", "f2", "f3")
             ],
             "dead_alarms": [],
