@@ -42,8 +42,8 @@ Modes:
    run-2: nine inputs, one known defect), and any other dropped input counts on its own. Each input is still
    checked on its own stack and scope before it is dropped. `excluded_inputs` lists each dropped input with
    its crash (and the E-ACSL `failure` and `fingerprint`), and `excluded_root_causes` groups them
-   (`root_cause`, `inputs`, `crash`). Dropping every replayed input is a `guardrail_error`, never a pass.
-   Such a failure is never a `code_fault` or `rejected_overconstrained`
+   (`root_cause`, `inputs`, `crash`). A pass after every corpus input was dropped (`corpus_replayed` 0) replayed
+   no real input, and its diagnostic hint says so. Such a failure is never a `code_fault` or `rejected_overconstrained`
    of the contract under check. When the input is a mutation of the burst, not a corpus file, the
    corpus is replayed again without mutations and `mutations_skipped` holds the crash (and, for an
    E-ACSL failure, its `failure` and `fingerprint`), whether or not E-ACSL reported it. When the
@@ -2980,8 +2980,8 @@ def classify_guardrail(returncode: int, timed_out: bool, output: str) -> dict:
 
 
 # Part of the verdict cache key: raise it when the fields a guardrail verdict carries change, so that a
-# verdict stored without them is not returned. (2: the dynamic_oracle_fields.)
-GUARDRAIL_VERDICT_FIELDS = 2
+# verdict stored without them is not returned. (2: the dynamic_oracle_fields. 3: `excluded_root_causes`.)
+GUARDRAIL_VERDICT_FIELDS = 3
 MAX_HINTED_UNCHECKED_CLAUSES = 5
 _UNCHECKED_HINT_STATUSES = ("passed_dynamic_oracle", "rejected_overconstrained", "compile_error", "guardrail_error")
 
@@ -3170,6 +3170,12 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
                 f"functions ({n_causes} root cause(s); the first: {dropped[0].get('crash')}). "
                 "That is a defect candidate or an alarm in "
                 "other code, not evidence about this contract; `excluded_inputs` lists each one."
+            )
+        if res.get("excluded_inputs") and res.get("corpus_replayed") == 0 and not res.get("corpus_empty"):
+            passed_hints.append(
+                "Every replayed corpus input was dropped into `excluded_inputs`: this pass replayed no real input "
+                "(passed on no real input: all inputs excluded). It is not evidence that the contract holds on real "
+                "inputs."
             )
         if res.get("mutations_skipped"):
             passed_hints.append(
@@ -3928,12 +3934,6 @@ def run_guardrail_check(
         excluded.append(dropped_entry)
         _add_excluded(causes, dropped_entry)
         drop([name])
-        if not replay_names:
-            verdict["reason"] = (
-                f"Every replayed input crashed outside the checked functions and was dropped (the last: {why}); "
-                "the contract was not tested on any corpus input."
-            )
-            break
         wall_left = math.ceil(deadline - time.monotonic())
         if wall_left < 1:
             break

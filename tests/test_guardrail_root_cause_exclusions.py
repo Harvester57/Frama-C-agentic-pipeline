@@ -200,13 +200,14 @@ def test_a_known_root_cause_reached_through_a_checked_function_is_never_excused(
     assert verdict["failure"]["function"] == "QCBORDecode_GetTBigFloatInMapN"
 
 
-def test_dropping_every_replayed_input_is_no_pass(tmp_path, monkeypatch, run_cwd):
+def test_dropping_every_replayed_input_passes_on_no_real_input(tmp_path, monkeypatch, run_cwd):
+    # The briefs' "passed on no real input: all inputs excluded" case: a pass, with `corpus_replayed` 0 and a hint.
     calls: list = []
     verdict = _rc_guardrail(tmp_path, monkeypatch, _same_root_cause(4), calls, clean=0)
-    assert verdict["status"] == "guardrail_error" and verdict["failure"] is None
+    assert verdict["status"] == "passed_dynamic_oracle" and not verdict["corpus_empty"]
     assert len(verdict["excluded_inputs"]) == 4 and verdict["corpus_replayed"] == 0
-    assert "Every replayed input" in verdict["reason"] and "not tested on any corpus input" in verdict["reason"]
-    assert len(calls) == 4  # no replay of an empty directory
+    assert len(calls) == 5
+    assert any("passed on no real input: all inputs excluded" in h for h in verdict["diagnostic_hints"])
 
 
 @pytest.mark.parametrize(
