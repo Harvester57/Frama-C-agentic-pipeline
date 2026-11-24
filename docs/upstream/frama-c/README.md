@@ -802,8 +802,11 @@ disclosure-channel decision and has no public filing text.
    - The commits are authored as Florian Stosse and carry a `Co-Authored-By: Claude` trailer. Each
      text also ends with an LLM-assistance line. Keep or drop both consistently.
    - MR 10's branch goes on top of 12's.
-5. **Contributor Licence Agreement** (the owner's call): upstream asks for it on a first non-trivial
-   contribution (`CLA.md`, `TCA.md`). Patches 13 (63 files) and 26 (16 files) are the largest.
+5. **Contributor Licence Agreement:** upstream asks for it on a first non-trivial contribution
+   (`CLA.md`, `TCA.md`). Patches 13 (63 files) and 26 (16 files) are the largest. **Sent on
+   2026-11-24** by the owner to `cla@frama-c.com`, signed as an individual, after `maroneze` asked
+   for it on #2832; the cover email is [`filing/00-cla-cover-email.md`](./filing/00-cla-cover-email.md).
+   Upstream said not to tick the CLA box on each merge request.
 6. **Lint and headers (2026-11-15):** upstream's own `./dev/check-files.sh -p HEAD~1`
    (`make check-lint` and `make check-headers` on the files each branch changes) was run on every
    branch with patches (all 22), in a git clone inside the image `framac-lint:3dff90f`

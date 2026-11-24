@@ -202,9 +202,8 @@ of this text lists every finding, the ones above included, in one line each.
    for the format checks; !40 and !41 for `e-acsl-gcc`; !54 and !55 for bittree), and mark the
    low-priority ones as drafts so that they leave your review queue.
 
-**Contributor Licence Agreement:** I have not signed it yet, which is why that box is unticked on
-every merge request. I will send it before you spend review time on anything beyond a trivial
-patch.
+**Contributor Licence Agreement:** signed and sent to `cla@frama-c.com` on 24 November, as an
+individual. As suggested, I have left the CLA box unticked on the merge requests.
 
 Two issues already ask you to choose between possible fixes (#2815 and #2816). There is no hurry
 on either.
