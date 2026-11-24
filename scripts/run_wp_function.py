@@ -4562,9 +4562,9 @@ def apply_open_callback_boundary(
     if not sites:
         return res
     functions = (dag or {}).get("functions") or {}
-    allowed_keys = (rec or {}).get("indirect_callees")
-    if allowed_keys is None:
-        allowed_keys = (rec or {}).get("internal_callees") or []
+    # `internal_callees` holds every edge, the type-matched targets of the closed sites included (a target
+    # the function also calls directly is not in `indirect_callees`).
+    allowed_keys = {*((rec or {}).get("internal_callees") or []), *((rec or {}).get("indirect_callees") or [])}
     allowed = {str((functions.get(k) or {}).get("name") or str(k).rpartition("#")[2]) for k in allowed_keys}
     fn_text, fn_line = _function_text(c_file, fn_name)
     named = calls_targets(fn_text)
@@ -4610,7 +4610,14 @@ def apply_open_callback_boundary(
             "recipe of the brief (Step A).",
         )
     else:
-        if unproven and not other:
+        # Only when the unresolved call is all that makes the run unsound: a missing `assigns`, an unproven
+        # lemma or an abort keeps its own focus.
+        unrelated = [
+            m
+            for m in soundness.get("tier_b_unsound") or []
+            if not _INDIRECT_CALL_UNSOUND_RE.search(m) and "indirect call present without '//@ calls'" not in m
+        ]
+        if unproven and not other and not unrelated and not soundness.get("tier_a_aborts"):
             res["next_synthesis_focus"] = OPEN_CALLBACK_FOCUS
         hints.insert(0, _open_callback_hint(sites, len(downstream), len(other)))
     res["diagnostic_hints"] = list(dict.fromkeys(hints))

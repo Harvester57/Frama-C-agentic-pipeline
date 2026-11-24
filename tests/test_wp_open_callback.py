@@ -83,6 +83,12 @@ def test_only_a_typed_site_without_candidates_is_open() -> None:
             {"caller": "src/d.c#alloc", "expr": "pMe->pfAllocator", "signature": "void *(void *)", "candidates": ["src/d.c#pool"]},
             # The GCC fallback knows no call-site type: unknown, never open.
             {"caller": "src/g.c#run", "expr": None, "signature": None, "candidates": []},
+            # One unit's parse found a target: the site is closed, whatever the other records say.
+            {"caller": "src/m.c#mix", "expr": "p->cb", "signature": "void(void)", "candidates": []},
+            {"caller": "src/m.c#mix", "expr": "p->cb", "signature": "void(void)", "candidates": ["src/m.c#cb"]},
+            # A caller another unit could only parse with GCC: none of its sites is open.
+            {"caller": "src/h.c#half", "expr": "p->cb", "signature": "void(void)", "candidates": []},
+            {"caller": "src/h.c#half", "expr": None, "signature": None, "candidates": []},
         ]
     }  # fmt: skip
     assert bcd.open_indirect_sites(model) == {
@@ -161,6 +167,45 @@ def test_the_prover_context_marks_the_open_site() -> None:
     assert "open-world callback" in lines[1] and "Eva resolved it to `real_cb`" in lines[2]
 
 
+@pytest.mark.unit
+def test_prepare_agent_gives_the_rule_and_the_feature_only_to_an_open_function(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    (target / "src/u.c").write_text("void flush(void *p) { }\nvoid other(void *p) { }\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    wo.init_overlay(target, run_dir / "workspace")
+    (run_dir / "run-metadata.json").write_text(json.dumps({"profile": "standard"}), encoding="utf-8")
+    reports = run_dir / "workspace" / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    common = {"file": "src/u.c", "module": "u", "verifiability": "needs_calls_annotation", "wp_blockers": []}
+    functions = {
+        "flush": {**common, "name": "flush", "open_indirect_calls": [{"expr": "pMe->pfFlush", "signature": OPEN_CB_SIG}]},
+        "other": {**common, "name": "other"},
+    }  # fmt: skip
+    (reports / "callgraph_dag.json").write_text(json.dumps({"functions": functions}), encoding="utf-8")
+    seen: dict[str, object] = {}
+    real_render = function_facts.render_conditionals
+
+    def _render(template: str, features: dict | None) -> str:
+        seen["features"] = features
+        return real_render(template, features)
+
+    facts = {"features": {"indirect_calls": True}, "calls": [{"line": 1, "indirect": True, "expr": "pMe->pfFlush"}]}
+    monkeypatch.setattr(wo, "_load_function_facts", lambda *a, **k: facts)
+    monkeypatch.setattr(wo.function_slice, "build_slice", lambda *a, **k: {"status": "failed"})
+    monkeypatch.setattr(function_facts, "render_conditionals", _render)
+    briefs = {}
+    for fn in ("flush", "other"):
+        prep = wo.prepare_agent(run_dir=run_dir, agent_id=f"prove-{fn}", role="prover", c_file="src/u.c", function=fn)
+        briefs[fn] = ((run_dir / prep["brief_file"]).read_text(encoding="utf-8"), seen["features"])
+    flush_brief, flush_features = briefs["flush"]
+    other_brief, other_features = briefs["other"]
+    assert "Open-World Callback Rule for `flush`" in flush_brief and "**Open-world callback" in flush_brief
+    assert isinstance(flush_features, dict) and flush_features["open_callbacks"] is True
+    assert "Open-World Callback Rule" not in other_brief and "**Open-world callback" not in other_brief
+    assert isinstance(other_features, dict) and other_features["open_callbacks"] is False
+
+
 # ---------------------------------------------------------------------------
 # run_wp_function.py
 # ---------------------------------------------------------------------------
@@ -179,6 +224,31 @@ def test_an_open_callback_stops_the_prover_when_only_its_goals_remain(tmp_path: 
     assert res["status"] == "unproven_goals_remain" and res["soundness"]["ok"] is False
     assert W.CALLS_ANNOTATION_HINT not in res["diagnostic_hints"]
     assert res["diagnostic_hints"][0].startswith("Open-world callback: `pMe->pfFlush`")
+
+
+@pytest.mark.unit
+def test_another_soundness_problem_keeps_its_own_focus(tmp_path: Path) -> None:
+    report = _report(OPEN_CB_GOALS)
+    report["soundness"]["tier_b_unsound"].append("Missing assigns clause (assigns 'everything' instead)")
+    res = W.apply_open_callback_boundary(
+        report, OPEN_CB_DIR / "src" / "flush.c", "OutBuf_Flush", tmp_path, OPEN_CB_DAG, OPEN_CB_LOG
+    )
+    assert res["next_synthesis_focus"] == "tier_b_soundness_fix_required"
+    assert res["open_callback_boundary"]["other_unproven"] == 0
+
+
+@pytest.mark.unit
+def test_a_target_of_a_closed_site_may_be_named(tmp_path: Path) -> None:
+    # The stub's name stands for a real target the function also calls directly: only in `internal_callees`.
+    dag = json.loads(json.dumps(OPEN_CB_DAG))
+    dag["functions"]["OutBuf_Flush"]["internal_callees"] = ["OutBuf_FlushCallback_contract"]
+    report = _report([])
+    report.update(status="all_proven", soundness={"ok": True, "tier_a_aborts": [], "tier_b_unsound": []})
+    res = W.apply_open_callback_boundary(
+        report, OPEN_CB_DIR / "src" / "flush_stub.c", "OutBuf_Flush", tmp_path, dag, ""
+    )
+    assert res["open_callback_boundary"]["foreign_calls_targets"] == []
+    assert res["status"] == "all_proven" and res["soundness"]["ok"] is True
 
 
 @pytest.mark.unit

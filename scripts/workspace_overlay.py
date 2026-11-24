@@ -3511,15 +3511,10 @@ def _prover_context(
 def open_callback_sites(dag_functions: dict | None, c_file: str | None, function: str | None) -> list[dict]:
     """
     The DAG's `open_indirect_calls` of `function` (build_callgraph_dag.open_indirect_sites): indirect calls
-    no function of the program can be the target of. Looked up under the plain name, else as `file#name`.
+    no function of the program can be the target of. The record is the one prepare_agent uses
+    (dag_function_record).
     """
-    if not function or not isinstance(dag_functions, dict):
-        return []
-    rec = dag_functions.get(function)
-    if not isinstance(rec, dict) or (c_file and rec.get("file") and rec.get("file") != c_file):
-        rec = dag_functions.get(f"{c_file}#{function}") if c_file else None
-    if not isinstance(rec, dict):
-        return []
+    rec = dag_function_record(dag_functions if isinstance(dag_functions, dict) else {}, function, c_file)
     return [s for s in rec.get("open_indirect_calls") or [] if isinstance(s, dict) and s.get("expr")]
 
 

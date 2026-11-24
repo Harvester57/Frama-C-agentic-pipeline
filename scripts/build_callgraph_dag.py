@@ -356,17 +356,25 @@ def open_indirect_sites(model: dict) -> dict[str, list[dict]]:
     (`signature`, known from Frama-C's parse) no address-taken function of the parsed program has, so
     the model's type match found no candidate. Its targets are supplied by code outside the program (a
     callback the library's user installs): no `//@ calls` can name one, and WP cannot frame the call.
-    A site without a signature (the GCC fallback) is unknown, not open. One entry per expression.
+    A site without a signature (the GCC fallback) is unknown, not open, and so is every site of its caller.
+    The model has one record per unit parsing the caller: an expression is open only when every record of
+    it is. One entry per expression.
     """
-    out: dict[str, list[dict]] = defaultdict(list)
+    records: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    # A caller one unit could only parse with GCC has a site of unknown expression and type: none is open.
+    unknown: set[str] = set()
     for site in model.get("indirect_sites") or []:
-        if not site.get("signature") or site.get("candidates"):
-            continue
         caller = str(site.get("caller") or "")
         expr = str(site.get("expr") or "")
-        if not caller or not expr or any(s["expr"] == expr for s in out[caller]):
-            continue
-        out[caller].append({"expr": expr, "signature": str(site["signature"]), "loc": site.get("loc")})
+        if caller and not (expr and site.get("signature")):
+            unknown.add(caller)
+        elif caller:
+            records[(caller, expr)].append(site)
+    out: dict[str, list[dict]] = defaultdict(list)
+    for (caller, expr), sites in records.items():
+        if caller not in unknown and all(not s.get("candidates") for s in sites):
+            first = sites[0]
+            out[caller].append({"expr": expr, "signature": str(first["signature"]), "loc": first.get("loc")})
     return dict(out)
 
 
