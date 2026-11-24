@@ -25,13 +25,13 @@ the test suites that were run on it.
 
 ### The ones I think matter
 
-| Report | Fix | Why |
-| :-- | :-- | :-- |
-| #2793 | !25 | E-ACSL lets a false predicate pass at run time, with default options and an ordinary guarded quantifier. No warning. |
-| #2800 | !31 | `<==>` over `\old`, `\at` or a formal in a postcondition aborts the instrumentation. A 34.0 development build translated it; `34.0~beta` and `master` do not. |
-| #2797 | !28 | Closed issue #177 fails again: formal parameters are never marked initialized. |
-| #2831 | !59 | WP does not read hexadecimal floating-point literals: a hypothesis on `DBL_MAX` is dropped, and under `-wp-model +real` a suffixed literal is read as 0 (a wrong proof). |
-| #2798, #2799 | !29, !30 | An unbounded range aborts the whole E-ACSL instrumentation, and Frama-C's libc contracts contain some (`getsockopt`, `strtok_r`, four `wcs*` functions). |
+| Report | Component | Fix | Why |
+| :-- | :-- | :-- | :-- |
+| #2793 | E-ACSL | !25 | E-ACSL lets a false predicate pass at run time, with default options and an ordinary guarded quantifier. No warning. |
+| #2800 | E-ACSL | !31 | `<==>` over `\old`, `\at` or a formal in a postcondition aborts the instrumentation. A 34.0 development build translated it; `34.0~beta` and `master` do not. |
+| #2797 | E-ACSL | !28 | Closed issue #177 fails again: formal parameters are never marked initialized. |
+| #2831 | WP | !59 | WP does not read hexadecimal floating-point literals: a hypothesis on `DBL_MAX` is dropped, and under `-wp-model +real` a suffixed literal is read as 0 (a wrong proof). |
+| #2798, #2799 | E-ACSL, Libc | !29, !30 | An unbounded range aborts the whole E-ACSL instrumentation, and Frama-C's libc contracts contain some (`getsockopt`, `strtok_r`, four `wcs*` functions). |
 
 Four more can give a wrong answer, in narrower settings:
 
@@ -57,21 +57,67 @@ issue or merge request you do not want: one line is enough.
 
 ### Index by component
 
+Every report I filed, with the merge request that fixes it. Three issues have no merge request
+(#2815, #2816, #2823), and !26 closes two issues.
+
 **E-ACSL (27)**
 
-- Wrong verdict: #2793
-- The instrumentation aborts, or its output does not compile: #2795, #2798, #2800, #2804, #2805,
-  #2806, #2816
-- A correct program fails at run time: #2794, #2797, #2801, #2802, #2803, #2815, #2817, #2818
-- `--validate-format-strings`: #2819, #2820, #2821, #2822
-- bittree memory model: #2826, #2827
-- `e-acsl-gcc` and options: #2807, #2808, #2809, #2810, #2825
+| Report | Fix | What happens | Kind |
+| :-- | :-- | :-- | :-- |
+| #2793 | !25 | In `\exists integer n; 0 <= n < size && P && Q`, only `Q` is checked, so a false predicate passes. | wrong verdict |
+| #2795 | !26 | A monitored `const` union global: "implicit cast: cast from union u to void *". Same root cause as #2794. | the instrumentation aborts |
+| #2798 | !29 | An unbounded range (`p + (0..)`) in any annotation, including the libc contracts used with `-L`, aborts the whole instrumentation. | the instrumentation aborts |
+| #2800 | !31 | `<==>` over a labelled term: "labels pre-analysis was not performed". | the instrumentation aborts |
+| #2804 | !35 | A `register` local under `-e-acsl-full-mtracking`: "Taking the address of a register variable". | the instrumentation aborts |
+| #2805 | !36 | An annotation on a pointer to an opaque struct emits `sizeof` and `__alignof__` of the incomplete type. | the output does not compile |
+| #2806 | !37 | "typing was not performed" on a memory-reading logic function in a loop variant or a `\let`. | the instrumentation aborts |
+| #2816 | none | `Rtl.Symbols.Unregistered("__gmpz_clear")` when the program and an annotation both use GMP. The issue asks which fix you prefer. | the instrumentation aborts |
+| #2794 | !26 | `__e_acsl_mark_readonly` gets the value of a `const` global instead of its address: "Use of invalid address" at start-up. | a correct program fails at run time |
+| #2797 | !28 | Formal parameters are never marked initialized: `\initialized` on a by-value struct field or through `&formal` fails (#177 is back). | a correct program fails at run time |
+| #2801 | !32 | With initialization checks, a postcondition reading a field of a struct `\result` fails on every call. | a correct program fails at run time |
+| #2802 | !33 | When `main` takes `argc` and `argv`, `environ` is emptied: `getenv` always returns `NULL`. | a correct program fails at run time |
+| #2803 | !34 | With `--libc-replacements`, `memcmp` on overlapping or identical buffers aborts. | a correct program fails at run time |
+| #2815 | none | `--temporal`: a callee reads parameter metadata that its caller never saved ("Unreachable"). The issue asks which fix you prefer. | a correct program fails at run time |
+| #2817 | !46 | `-e-acsl-full-mtracking` with clang: a literal stored inside another one makes `\valid_read` fail on correct code. | a correct program fails at run time |
+| #2818 | !47 | `\object_pointer` is false on read-only data, so every `-warn-invalid-pointer` guard on it fails. | a correct program fails at run time |
+| #2819 | !48 | `"%u"` or `"%x"` with an `unsigned char` or `unsigned short` argument aborts. | `--validate-format-strings` |
+| #2820 | !49 | After a `double` or `long double` argument, `"%s"`, `"%p"` and `"%n"` are checked against the next argument. | `--validate-format-strings` |
+| #2821 | !51 | Without `--full-mtracking`, every `printf` call aborts ("invalid format string"). | `--validate-format-strings` |
+| #2822 | !50 | A `*` field width or precision makes every later directive be checked against the wrong argument. | `--validate-format-strings` |
+| #2826 | !54 | `pt_lookup` returns an uninitialized pointer: every `free` aborts, and a program that stores no block crashes at exit. | bittree memory model |
+| #2827 | !55 | `stdin`, `stdout`, `stderr` and `errno` are not safe locations, so run-time checks on them fail. | bittree memory model |
+| #2807 | !38 | Option arguments are read again as options: `-e "-g -O1"` enables GMP and drops an input file. | `e-acsl-gcc` and options |
+| #2808 | !39 | The deprecated `-e-acsl-assert-print-data` is an alias of `-e-acsl-O-valid` instead of `-e-acsl-O-print-values`. | `e-acsl-gcc` and options |
+| #2809 | !40 | Frama-C preprocesses with `-D_DEFAULT_SOURCE` but the compiler does not: programs calling `strdup` or `stpcpy` fail to build. | `e-acsl-gcc` and options |
+| #2810 | !41 | With `-G clang`, `CFLAGS` is overwritten: `-std=c99`, `-g`/`-O`, `-fno-builtin` and the warning flags are dropped. | `e-acsl-gcc` and options |
+| #2825 | !53 | `--zone-sizes heap:2048` or `stack:2048` makes every run crash: the size overflows `int` when converted to bytes. | `e-acsl-gcc` and options |
 
-**Kernel (4):** #2796, #2812, #2813, #2824
+**Kernel (4)**
 
-**Libc (5):** #2799, #2814, #2823, #2828, #2830
+| Report | Fix | What happens | Kind |
+| :-- | :-- | :-- | :-- |
+| #2796 | !27 | A variadic call in a local initializer is printed with the generated name (`open_fallback_1`). | the printed program does not link |
+| #2812 | !43 | `_Alignas` is printed after the declarator of struct members and after `*` in pointer declarators. | the printed program does not compile |
+| #2813 | !44 | `offsetof(T, m[i])` with a non-constant index (GCC and Clang extension) is rejected. | feature request |
+| #2824 | !52 | `__restrict__` is a syntax error unless a Frama-C libc header is included. | valid code rejected |
 
-**WP (3):** #2811, #2829, #2831
+**Libc (5)**
+
+| Report | Fix | What happens | Kind |
+| :-- | :-- | :-- | :-- |
+| #2799 | !30 | `getsockopt`: the precondition `\valid(((char*)optval)+(0..))` cannot be satisfied: Eva rejects correct calls, WP aborts. | false alarm, abort |
+| #2814 | !45 | `sockaddr_in` lacks `sin_zero` and is smaller than `struct sockaddr`; `struct ip_mreq` is missing; `fd_set` is not visible from `<sys/socket.h>`. | false alarm, header gap |
+| #2823 | none | `__builtin_{add,sub,mul}_overflow`: wrong results for mixed operand types, parse error for small types, `_p` forms missing. The issue lists options. | wrong value |
+| #2828 | !56 | Linux `<sys/epoll.h>` and `<sys/inotify.h>` are missing. | header addition |
+| #2830 | !58 | `<sys/ioctl.h>` defines `TIOCMGET` and `TIOCMSET` but not the `TIOCM_*` modem line bits. | header addition |
+
+**WP (3)**
+
+| Report | Fix | What happens | Kind |
+| :-- | :-- | :-- | :-- |
+| #2811 | !42 | A probe (`-wp-counter-examples` or a `probe` annotation) makes a valid goal unprovable. | valid goal not proved |
+| #2829 | !57 | `-wp-report-json` keeps only the best prover per goal. !57 fixes only the manual inaccuracies, not the report itself. | feature request |
+| #2831 | !59 | Hexadecimal floating-point literals are not read: a hypothesis on `DBL_MAX` is dropped, and under `-wp-model +real` a suffixed one is read as 0. | wrong proof |
 
 ### Findings I have not filed
 
