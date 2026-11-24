@@ -3489,16 +3489,33 @@ def _prover_context(
         snapshot = (work_dir / c_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
         snapshot = None
+    open_sites = open_callback_sites(dag_functions, c_file, function)
+    if record is not None and open_sites:
+        record = function_facts.mark_open_callbacks(record, [str(s.get("expr")) for s in open_sites])
     section = function_facts.render_section(record, usable_slice, snapshot, function)
     features = record.get("features") if record is not None else None
+    if isinstance(features, dict):
+        # Always set: an unknown feature keeps its brief block open (function_facts._condition_holds).
+        features = {**features, "open_callbacks": bool(open_sites)}
     summary = {
         "enabled": True,
         "facts": record is not None,
         "slice": slice_result.get("status"),
         "slice_reason": slice_result.get("reason"),
         "section_chars": len(section),
+        "open_callbacks": len(open_sites),
     }
     return section, features if isinstance(features, dict) else None, summary
+
+
+def open_callback_sites(dag_functions: dict | None, c_file: str | None, function: str | None) -> list[dict]:
+    """
+    The DAG's `open_indirect_calls` of `function` (build_callgraph_dag.open_indirect_sites): indirect calls
+    no function of the program can be the target of. The record is the one prepare_agent uses
+    (dag_function_record).
+    """
+    rec = dag_function_record(dag_functions if isinstance(dag_functions, dict) else {}, function, c_file)
+    return [s for s in rec.get("open_indirect_calls") or [] if isinstance(s, dict) and s.get("expr")]
 
 
 REJECTED_RESULT_MAX_ERRORS = 10
@@ -4333,6 +4350,17 @@ def prepare_agent(
                 '`"wp_dynamic_allocation_limitation_stop_now"` / `"budget_exhausted_write_result_json_now"`), '
                 'immediately write `result.json` with `"status": "stalled_after_k_retries"`. Never write '
                 "synthetic `probe_*.c` files.\n"
+            )
+        open_sites = open_callback_sites(dag_fns, norm_c_file, function)
+        if open_sites:
+            shown = ", ".join(f"`{s.get('expr')}` (type `{s.get('signature')}`)" for s in open_sites)
+            rendered += (
+                f"- **Open-World Callback Rule for `{fn_label}`:** {shown}: no function of the program has this "
+                "type and its address taken, so the target is supplied by the library's user and WP cannot frame "
+                "the call. Follow Step A's open-world callback recipe: never name a function in `calls` there, "
+                "prove what does not depend on the callback, and when `next_synthesis_focus` is "
+                '`"open_callback_boundary_stop_now"` finish at once with `"status": "stalled_after_k_retries"`, '
+                "the boundary assumption and the `proof_gap` the recipe gives.\n"
             )
     if wp_report_rel:
         rendered += (

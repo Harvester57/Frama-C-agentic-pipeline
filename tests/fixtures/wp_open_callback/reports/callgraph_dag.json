@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "module_kind": "link_unit",
+  "functions": {
+    "OutBuf_Flush": {
+      "name": "OutBuf_Flush",
+      "file": "src/flush.c",
+      "module": "lib",
+      "internal_callees": [],
+      "internal_callers": [],
+      "indirect_callees": [],
+      "indirect_calls": ["pMe->pfFlush"],
+      "open_indirect_calls": [
+        {"expr": "pMe->pfFlush", "signature": "int(void *,BufC)", "loc": "src/flush.c:44"}
+      ],
+      "wp_blockers": [],
+      "verifiability": "needs_calls_annotation"
+    }
+  }
+}
