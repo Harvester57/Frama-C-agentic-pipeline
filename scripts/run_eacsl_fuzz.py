@@ -36,9 +36,14 @@ Modes:
    `corpus_empty` say what was replayed. A pass on an empty corpus is not a pass on real inputs.
    A replayed input that crashes outside the checked functions (a seed that reproduces a known bug
    elsewhere in the module), with no E-ACSL report or with an E-ACSL failure in a function that is
-   not checked and was not reached through one, is dropped and the rest replayed again, at most
-   GUARDRAIL_MAX_EXCLUDED_INPUTS times; `excluded_inputs` lists each with its crash (and the E-ACSL
-   `failure` and `fingerprint`). Such a failure is never a `code_fault` or `rejected_overconstrained`
+   not checked and was not reached through one, is dropped and the rest replayed again, for at most
+   GUARDRAIL_MAX_EXCLUDED_INPUTS root causes: an E-ACSL failure with a fingerprint counts once per
+   `<kind>::<predicate hash>` (exclusion_root_cause), however many inputs and functions reach it (QCBOR
+   run-2: nine inputs, one known defect), and any other dropped input counts on its own. Each input is still
+   checked on its own stack and scope before it is dropped. `excluded_inputs` lists each dropped input with
+   its crash (and the E-ACSL `failure` and `fingerprint`), and `excluded_root_causes` groups them
+   (`root_cause`, `inputs`, `crash`). Dropping every replayed input is a `guardrail_error`, never a pass.
+   Such a failure is never a `code_fault` or `rejected_overconstrained`
    of the contract under check. When the input is a mutation of the burst, not a corpus file, the
    corpus is replayed again without mutations and `mutations_skipped` holds the crash (and, for an
    E-ACSL failure, its `failure` and `fingerprint`), whether or not E-ACSL reported it. When the
@@ -3159,9 +3164,11 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
             )
         dropped = [e for e in res.get("excluded_inputs") or [] if e.get("failure")]
         if dropped:
+            n_causes = len({exclusion_root_cause(e) for e in dropped})
             passed_hints.append(
                 f"{len(dropped)} replayed input(s) were dropped because a check failed outside the checked "
-                f"functions (the first: {dropped[0].get('crash')}). That is a defect candidate or an alarm in "
+                f"functions ({n_causes} root cause(s); the first: {dropped[0].get('crash')}). "
+                "That is a defect candidate or an alarm in "
                 "other code, not evidence about this contract; `excluded_inputs` lists each one."
             )
         if res.get("mutations_skipped"):
@@ -3456,8 +3463,34 @@ _SANITIZER_SUMMARY_RE = re.compile(r"^SUMMARY:\s*(?P<summary>\S.*)$", re.MULTILI
 # line, so it skips a frame in `gram.y`, in `tables.inc`, or with no line information; deciding that a crash
 # is outside the checked functions must see those frames too.
 _STACK_FRAME_FN_RE = re.compile(r"^\s*#\d+\s+0x[0-9a-fA-F]+\s+in\s+(?P<function>[A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
-# How many replayed inputs a guardrail drops for crashing outside the checked functions before it gives up.
+# How many root causes (exclusion_root_cause) of replayed inputs that crash or hang outside the checked functions a
+# guardrail drops before it gives up. Inputs that share one root cause count once.
 GUARDRAIL_MAX_EXCLUDED_INPUTS = 8
+# The `<kind>::<hash10>` tail of a fingerprint (fingerprint.make_fingerprint): the hash is of the normalized
+# predicate, so one defect reported in several callers (QCBOR `\initialized(&uOffset)`) has one tail.
+_FINGERPRINT_ROOT_CAUSE_RE = re.compile(r"#[A-Za-z0-9_]+::(?P<kind>[a-z0-9_]+)::(?P<digest>[0-9a-f]{10})$")
+
+
+def exclusion_root_cause(entry: dict) -> str:
+    """
+    The root cause an `excluded_inputs` entry counts against GUARDRAIL_MAX_EXCLUDED_INPUTS.
+
+    An E-ACSL failure with a fingerprint is `<kind>::<predicate hash>`, whatever its file and function: the same
+    failed predicate reached by many inputs, or reported in many callers of one helper, is one root cause. Any
+    other entry (a sanitizer crash, a hang, an annotation failure: no fingerprint) is `input::<name>`, a root
+    cause of its own.
+    """
+    m = _FINGERPRINT_ROOT_CAUSE_RE.search(str(entry.get("fingerprint") or ""))
+    if m is not None:
+        return f"{m.group('kind')}::{m.group('digest')}"
+    return f"input::{entry.get('input')}"
+
+
+def _add_excluded(causes: dict[str, dict], entry: dict) -> None:
+    """Record a dropped input under its root cause (`excluded_root_causes`)."""
+    key = exclusion_root_cause(entry)
+    cause = causes.setdefault(key, {"root_cause": key, "inputs": [], "crash": entry.get("crash")})
+    cause["inputs"].append(entry.get("input"))
 
 
 def crash_outside_checked_functions(output: str, functions: list[str] | None) -> str | None:
@@ -3752,11 +3785,25 @@ def run_guardrail_check(
                     return cached
 
     # A replay stops at its first crash. An input that crashes outside the checked functions says nothing about
-    # the contract: drop it and replay the rest (crash_outside_checked_functions), at most a few times. So does an
-    # input that hangs (replay_hang). Each replay starts over, so that `reach` comes from one complete run of the
-    # inputs left, and `timeout_s` is the budget of all of them: a hang costs a whole per-input timeout.
+    # the contract: drop it and replay the rest (crash_outside_checked_functions), for at most a few root causes
+    # (exclusion_root_cause). So does an input that hangs (replay_hang). Each replay starts over, so that `reach`
+    # comes from one complete run of the inputs left, and `timeout_s` is the budget of all of them: a hang costs a
+    # whole per-input timeout. The scratch copy of the inputs left is made once; a dropped input is removed from it.
     replay_names = list(chosen_names)
     excluded: list[dict] = []
+    causes: dict[str, dict] = {}
+    staged: Path | None = None
+
+    def drop(names: Iterable[str]) -> None:
+        nonlocal staged
+        for dropped_name in names:
+            replay_names.remove(dropped_name)
+            if staged is not None:
+                try:
+                    (staged / dropped_name).unlink(missing_ok=True)
+                except OSError:
+                    staged = None  # copy the inputs left again before the next replay
+
     mutation_runs = runs
     mutations_skipped: dict | None = None
     hang_stop: str | None = None
@@ -3765,7 +3812,9 @@ def run_guardrail_check(
     while True:
         replay_dir = corpus_dir
         if sampled or excluded:
-            replay_dir = _stage_replay_corpus(scratch_dir, corpus_dir, replay_names)
+            if staged is None:
+                staged = _stage_replay_corpus(scratch_dir, corpus_dir, replay_names)
+            replay_dir = staged
         cmd = [
             str(binary.resolve()),
             f"-runs={mutation_runs}",
@@ -3805,14 +3854,18 @@ def run_guardrail_check(
             elif not hung:
                 hang_stop = f"An input that is not a replayed corpus file hung ({hang})"
                 break
-            elif len(excluded) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
+            elif len(causes) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
                 hang_stop = (
-                    f"More than {GUARDRAIL_MAX_EXCLUDED_INPUTS} replayed inputs hang or crash elsewhere ({hang})"
+                    f"More than {GUARDRAIL_MAX_EXCLUDED_INPUTS} root causes hang or crash replayed inputs "
+                    f"elsewhere ({hang})"
                 )
                 break
             else:
-                excluded.extend(_hang_entry(name, hang, crash_input, combined_out, functions) for name in hung)
-                replay_names = [name for name in replay_names if name not in hung]
+                for hung_name in hung:
+                    hang_entry = _hang_entry(hung_name, hang, crash_input, combined_out, functions)
+                    excluded.append(hang_entry)
+                    _add_excluded(causes, hang_entry)
+                drop(hung)
                 if not replay_names:
                     hang_stop = f"every replayed input hung or was dropped ({hang})"
                     break
@@ -3862,14 +3915,25 @@ def run_guardrail_check(
             if wall_left < 1:
                 break
             continue
-        if len(excluded) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
+        # This input failed outside the checked functions on its own stack and scope (`why`), so it may be dropped.
+        # It counts against the limit only when its root cause is new: one defect reached by many inputs, or
+        # reported in many callers of one helper, is one exclusion (QCBOR run-2: nine inputs, one `uOffset`).
+        dropped_entry = {"input": name, **outside}
+        if exclusion_root_cause(dropped_entry) not in causes and len(causes) >= GUARDRAIL_MAX_EXCLUDED_INPUTS:
             verdict["reason"] = (
-                f"More than {GUARDRAIL_MAX_EXCLUDED_INPUTS} replayed inputs crash outside the checked functions "
-                f"(the last: {why}); the contract was not tested on the rest."
+                f"More than {GUARDRAIL_MAX_EXCLUDED_INPUTS} root causes make replayed inputs crash outside the "
+                f"checked functions (the last: {why}); the contract was not tested on the rest."
             )
             break
-        excluded.append({"input": name, **outside})
-        replay_names.remove(name)
+        excluded.append(dropped_entry)
+        _add_excluded(causes, dropped_entry)
+        drop([name])
+        if not replay_names:
+            verdict["reason"] = (
+                f"Every replayed input crashed outside the checked functions and was dropped (the last: {why}); "
+                "the contract was not tested on any corpus input."
+            )
+            break
         wall_left = math.ceil(deadline - time.monotonic())
         if wall_left < 1:
             break
@@ -3893,6 +3957,7 @@ def run_guardrail_check(
     verdict.update(
         {
             "excluded_inputs": excluded,
+            "excluded_root_causes": list(causes.values()),
             "crash_input": crash_input,
             "reach": reach,
             "returncode": res.returncode,

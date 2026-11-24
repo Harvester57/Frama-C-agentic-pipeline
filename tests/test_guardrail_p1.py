@@ -606,7 +606,8 @@ def test_guardrail_gives_up_after_too_many_crashing_inputs(tmp_path, monkeypatch
         binary, corpus, tmp_path / "scratch", 0, use_cache=False, module="attr", seed=1, functions=["mnl_attr_get_len"]
     )
     assert verdict["status"] == "guardrail_error"
-    assert len(verdict["excluded_inputs"]) == 1 and "More than 1 replayed inputs" in verdict["reason"]
+    # A sanitizer crash has no fingerprint to group by: each input is a root cause of its own.
+    assert len(verdict["excluded_inputs"]) == 1 and "More than 1 root causes" in verdict["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -775,12 +776,47 @@ def test_module_wide_guardrail_never_excuses_a_failed_annotation(
 
 
 def test_guardrail_never_blames_the_contract_past_the_exclusion_limit(tmp_path, monkeypatch, chdir_tmp):
+    # The limit counts root causes (P11): two inputs need two distinct failed predicates to pass a limit of 1.
+    monkeypatch.setattr(R, "GUARDRAIL_MAX_EXCLUDED_INPUTS", 1)
+    corpus = _corpus(tmp_path)
+    (corpus / "seed-gll-scale").write_bytes(MINMEA_CRASHER)
+    other = b"$GPGLL,.1111111111"
+    (corpus / "seed-gll-scale-1").write_bytes(other)
+    calls: list = []
+    _crashing_replays(monkeypatch, MINMEA_CRASHER, calls, EACSL_RTE_ELSEWHERE)
+    first_run = sandbox_exec.run_sandboxed
+    second = EACSL_RTE_ELSEWHERE.replace("scale * 10 ≤ 2147483647", "scale * 100 ≤ 2147483647")
+
+    def two_crashers(cmd, **kw):
+        if any(p.read_bytes() == MINMEA_CRASHER for p in Path(cmd[-1]).iterdir()):
+            return first_run(cmd, **kw)
+        calls.append(list(cmd))
+        prefix = Path(next(a for a in cmd if a.startswith("-artifact_prefix=")).split("=", 1)[1])
+        (prefix / "crash-4567").write_bytes(other)
+        out = second + f"Test unit written to {prefix}/crash-4567\n"
+        return SandboxResult(1, "", out, False, "rlimits", list(cmd))
+
+    monkeypatch.setattr(sandbox_exec, "run_sandboxed", two_crashers)
+    binary = tmp_path / "guard.e-acsl"
+    binary.write_bytes(b"bin")
+    verdict = R.run_guardrail_check(
+        binary, corpus, tmp_path / "scratch", 0, use_cache=False, module="minmea", seed=1, functions=["minmea_tocoord"]
+    )
+    assert verdict["status"] == "guardrail_error" and verdict["failure"] is None and len(calls) == 2
+    assert len(verdict["excluded_inputs"]) == 1 and "More than 1 root causes" in verdict["reason"]
+    assert verdict["outside_checked_functions"]["failure"]["function"] == "minmea_scan"
+    assert "scale * 100" in verdict["outside_checked_functions"]["failure"]["predicate"]
+
+
+def test_guardrail_drops_every_input_of_one_root_cause_past_the_limit(tmp_path, monkeypatch, chdir_tmp):
+    # P11: two inputs on the same failed predicate are one root cause, within a limit of 1.
     monkeypatch.setattr(R, "GUARDRAIL_MAX_EXCLUDED_INPUTS", 1)
     calls: list = []
     verdict = _minmea_guardrail(tmp_path, monkeypatch, EACSL_RTE_ELSEWHERE, ["minmea_tocoord"], calls, crashers=2)
-    assert verdict["status"] == "guardrail_error" and verdict["failure"] is None and len(calls) == 2
-    assert len(verdict["excluded_inputs"]) == 1 and "More than 1 replayed inputs" in verdict["reason"]
-    assert verdict["outside_checked_functions"]["failure"]["function"] == "minmea_scan"
+    assert verdict["status"] == "passed_dynamic_oracle" and len(calls) == 3
+    assert [e["input"] for e in verdict["excluded_inputs"]] == ["seed-gll-scale", "seed-gll-scale-1"]
+    (cause,) = verdict["excluded_root_causes"]
+    assert cause["root_cause"].startswith("signed_overflow::") and len(cause["inputs"]) == 2
 
 
 def _mutation_guardrail(
