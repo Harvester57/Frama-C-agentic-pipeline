@@ -326,7 +326,7 @@ its contract. Not run either: ptests on the stacked tree (the 22 patches plus th
 
 None in the pipeline: it does not pass `-warn-invalid-pointer` to E-ACSL, so Eva's `pointer_value`
 alarms get no run-time check in Phase 1. See
-[`../../troubleshooting/eacsl-and-fuzzing.md`](../../troubleshooting/eacsl-and-fuzzing.md), entry
+[`../../troubleshooting/resolved.md`](../../troubleshooting/resolved.md), entry
 "With `-warn-invalid-pointer`, Almost Every Input Fails an E-ACSL Build ...". Shipping a patched copy
 of the runtime through `e-acsl-gcc --e-acsl-share` would work, as the check above shows, but it was not
 adopted.

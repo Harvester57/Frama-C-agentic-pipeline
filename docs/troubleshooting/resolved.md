@@ -1,6 +1,6 @@
 # Resolved & Archived Troubleshooting Entries
 
-Entries moved out of the thematic guides because nothing in them is still actionable: the pipeline defect is fixed on `main`, the script, flag or gate they describe no longer exists, or the one-off workaround is no longer needed. They are kept verbatim as history (with the archive date and reason as their first bullet), so `git grep` on an old error message still finds them.
+Entries moved out of the thematic guides because nothing in them is still actionable: the pipeline defect is fixed on `main`, the script, flag or gate they describe no longer exists, or the one-off workaround is no longer needed. They are kept verbatim as history (with the archive date and reason as their first bullet), so `git grep` on an old error message still finds them. The body of each entry reads as it did when it was last updated: where it says a fix is uncommitted or on an unmerged branch, the `Archived` bullet gives the current status (every fix it relies on was checked to be on `main`).
 
 Open and current entries live in the thematic guides listed in [`./README.md`](./README.md). No entry here carries an open marker: `git grep -n -i "open pipeline" docs/troubleshooting/` lists only what is still to do. If a symptom recorded here comes back, move the entry back to its thematic guide and mark it open (see [`./AGENTS.md`](./AGENTS.md)).
 

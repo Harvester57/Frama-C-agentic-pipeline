@@ -86,7 +86,7 @@ The full resource and cache design guide is [`../guides/resources-and-caching.md
   - `gcc -M -MG` took 242 s and `clang -M -MG` 41 s, both with exit code 0.
   - `cache.dependency_manifest` returned `None` after 120.0 s, the timeout of the `gcc` scan.
 
-  This is not the skip rebuild of "Multi-Round Dispatch Fuzzing Spends Over Half Its Wall-Clock Time in Single-Threaded `frama-c -e-acsl` Stage 1 Rebuilds" in [`./eacsl-and-fuzzing.md`](./eacsl-and-fuzzing.md), which also builds without a key: the only round of `libcares_a__channel` skipped at run time (`runtime_skip: true`, one round), `ahost` runs in fork mode, and `build-%` has no skip rebuild.
+  This is not the skip rebuild of "Multi-Round Dispatch Fuzzing Spends Over Half Its Wall-Clock Time in Single-Threaded `frama-c -e-acsl` Stage 1 Rebuilds" in [`./resolved.md`](./resolved.md), which also builds without a key: the only round of `libcares_a__channel` skipped at run time (`runtime_skip: true`, one round), `ahost` runs in fork mode, and `build-%` has no skip rebuild.
 
   So the scan is close to its limit on this target even when it succeeds (hence 154 to 200 s for a cache hit), and it can pass it. What was not checked:
   - **What makes the scan's time vary.** It stayed under 120 s per tool on the restores and took 242 s today. CPU load is one candidate, the Windows bind mount of the run directory another. The second full build of `libcares_a__channel` started when only one other lease was running, a single Frama-C build, so many fuzz workers are not needed for a miss.
