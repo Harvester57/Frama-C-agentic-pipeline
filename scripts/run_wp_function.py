@@ -241,7 +241,6 @@ def parse_failed_wp_goals(log: str) -> set[str]:
 # the JSON is missing: they carry no solver time at all (the `Qed 2ms` tag is the simplifier's), and
 # `(Cached)` also appears on a first run under `-wp-cache update`, so a log-sourced entry never has a
 # time either.
-GOAL_COSTS_ENV = "FRAMAC_WP_GOAL_COSTS"
 _VERDICT_KINDS = {
     "timeout": "timeout",
     "stepout": "stepout",
@@ -578,11 +577,6 @@ def parse_wp_status_per_prover(
         if len(set(verdict_maps)) == 1:
             matched[str(targets[ti]["goal"])] = dict(blocks[cands_b[0]]["per_prover"])
     return matched
-
-
-def goal_costs_enabled() -> bool:
-    """FRAMAC_WP_GOAL_COSTS=off drops the goal-cost hints (the fields stay), for A/B comparisons."""
-    return os.environ.get(GOAL_COSTS_ENV, "on").strip().lower() not in ("off", "0", "false", "no", "disabled")
 
 
 def _prover_name(raw: object) -> str | None:
@@ -2387,9 +2381,8 @@ def derive_wp_diagnostic_hints(
                     "'requires n > 0 ==> \\initialized(in_buf + (0 .. n - 1));' for caller inputs, or add "
                     "'loop invariant \\initialized(out_buf + (0 .. i - 1));' for loops that populate an output buffer."
                 )
-        if goal_costs_enabled():
-            for cost_hint in goal_cost_hints(res):
-                _add(cost_hint)
+        for cost_hint in goal_cost_hints(res):
+            _add(cost_hint)
     unframed_var = res.get("unframed_variadic_callees") or []
     has_variadic_err = bool(_VARIADIC_CALLEE_RE.search(aborts_and_unsound)) or bool(
         _VARIADIC_CALLEE_RE.search(log_text or "")

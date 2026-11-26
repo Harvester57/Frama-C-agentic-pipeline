@@ -3463,8 +3463,6 @@ def _prover_context(
     here because it must show the contracts in this agent's snapshot. Any problem only means less
     context, and None as features keeps every conditional part of the brief.
     """
-    if not function_facts.context_enabled():
-        return "", None, {"enabled": False}
     if not (function and c_file):
         return "", None, {"enabled": True, "facts": False, "slice": "no_target"}
     work_dir = agent_root / "scratch" / "work"

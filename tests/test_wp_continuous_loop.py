@@ -9,7 +9,6 @@ Covers Requirements R1 through R5 across a 4-tier systematic methodology:
 
 from __future__ import annotations
 
-import inspect
 import sys
 from pathlib import Path
 
@@ -30,31 +29,11 @@ import resources as R  # noqa: E402
 import wp_scheduler as S  # noqa: E402
 from test_wp_scheduler import Sim, tasks, units  # noqa: E402
 
-# Feature capability probes for progressive testability across M1-M4
-_HAS_M1_SPLICE = hasattr(acsl_ast, "splice_architect_header")
-_HAS_M2_SPECULATIVE = hasattr(S, "callee_has_contract") or (
-    hasattr(getattr(S, "_compute_deps", None), "__code__")
-    and "has_function_contract" in S._compute_deps.__code__.co_names
-)
-_HAS_M2_GATING = hasattr(S, "_gate_blockers") and "task" in inspect.signature(S._gate_blockers).parameters
-_HAS_M3_STEP = hasattr(S, "cmd_step")
-_HAS_M4_RESOURCES = R.recommend(pool=R.Budget(128, 512_000, "t"))["max_agents"] == 64
-
 
 @pytest.fixture
 def sim(run_dir, monkeypatch):
     """Synthetic run directory fixture leveraging Sim harness."""
     return Sim(run_dir, monkeypatch)
-
-
-def _splice_architect_header(*args, **kwargs) -> str:
-    fn = getattr(acsl_ast, "splice_architect_header")  # noqa: B009
-    return str(fn(*args, **kwargs))
-
-
-def _cmd_step(*args, **kwargs) -> dict:
-    fn = getattr(S, "cmd_step")  # noqa: B009
-    return dict(fn(*args, **kwargs))
 
 
 def ready() -> list[str]:
@@ -71,11 +50,6 @@ def ready() -> list[str]:
 # ============================================================================
 
 
-@pytest.mark.xfail(
-    not _HAS_M2_SPECULATIVE,
-    reason="Pending M2: speculative contract-first dispatch in _compute_deps",
-    strict=False,
-)
 def test_tier1_r1_speculative_dispatch_callee_has_contract_before_body_proven(sim):
     """R1: Caller proceeds as soon as callee has a contract in workspace/work/."""
     sim.build(
@@ -104,11 +78,6 @@ def test_tier1_r1_speculative_dispatch_callee_has_contract_before_body_proven(si
     assert "src/m/caller.c#caller" in ready()
 
 
-@pytest.mark.xfail(
-    not _HAS_M2_SPECULATIVE,
-    reason="Pending M2: Option A for static callees without contract in _compute_deps",
-    strict=False,
-)
 def test_tier1_r1_option_a_caller_waits_for_static_callee_without_contract(sim):
     """R1: Caller waits for internal static callee when the callee has no contract at all (Option A)."""
     sim.build(
@@ -135,11 +104,6 @@ def test_tier1_r1_option_a_caller_waits_for_static_callee_without_contract(sim):
     assert "src/m/m.c#static_callee" in ready()
 
 
-@pytest.mark.xfail(
-    not _HAS_M2_SPECULATIVE,
-    reason="Pending M2: caller unblocking upon callee contract merge",
-    strict=False,
-)
 def test_tier1_r1_option_a_caller_unblocks_when_static_callee_acquires_contract(sim):
     """R1: Caller unblocks as soon as static callee produces or acquires a contract."""
     sim.build(
@@ -193,11 +157,6 @@ def test_tier1_r1_reconciliation_rechecks_speculative_caller_on_callee_contract_
     assert any("caller" in r for r in rechecks)
 
 
-@pytest.mark.xfail(
-    not _HAS_M2_GATING,
-    reason="Pending M2: fine-grained gating by call cone in _gate_blockers",
-    strict=False,
-)
 def test_tier1_r2_fine_grained_gate_blocks_only_affected_call_cone(sim):
     """R2: Verify task gates only functions in its call cone; safe functions remain unblocked."""
     sim.build(
@@ -220,11 +179,6 @@ def test_tier1_r2_fine_grained_gate_blocks_only_affected_call_cone(sim):
     assert "src/m/caller.c#caller_of_vuln" not in ready_tasks
 
 
-@pytest.mark.xfail(
-    not _HAS_M2_GATING,
-    reason="Pending M2: leaf/static functions run in parallel with arch:module",
-    strict=False,
-)
 def test_tier1_r2_leaf_and_static_functions_run_in_parallel_with_module_architect(sim):
     """R2: Leaf and internal static functions that do not touch module headers run in parallel with arch:m."""
     sim.build(
@@ -248,11 +202,6 @@ def test_tier1_r2_leaf_and_static_functions_run_in_parallel_with_module_architec
     assert "src/m/internal.c#leaf_internal" in ready()
 
 
-@pytest.mark.xfail(
-    not _HAS_M1_SPLICE,
-    reason="Pending M1: tolerant header splice in acsl_ast.splice_architect_header",
-    strict=False,
-)
 def test_tier1_r2_tolerant_architect_header_merge_per_declaration_splice():
     """R2: Per-declaration splice merges concurrent non-overlapping header modifications cleanly."""
     base_text = "#ifndef M_H\n#define M_H\n\nint parse_magic(void);\n\nint parse_payload(int len);\n\n#endif\n"
@@ -275,7 +224,7 @@ def test_tier1_r2_tolerant_architect_header_merge_per_declaration_splice():
         "#endif\n"
     )
 
-    spliced = _splice_architect_header(
+    spliced = acsl_ast.splice_architect_header(
         base_text=base_text,
         agent_text=agent_text,
         current_text=current_text,
@@ -290,11 +239,6 @@ def test_tier1_r2_tolerant_architect_header_merge_per_declaration_splice():
     assert acsl_ast.verify_acsl_only(base_text, spliced) == []
 
 
-@pytest.mark.xfail(
-    not _HAS_M3_STEP,
-    reason="Pending M3: atomic cmd_step command implementation in wp_scheduler",
-    strict=False,
-)
 def test_tier1_r3_atomic_step_command_completes_merges_and_dispatches(sim):
     """R3: cmd_step atomically executes complete + merge-pending + next in one call."""
     sim.build(
@@ -311,7 +255,7 @@ def test_tier1_r3_atomic_step_command_completes_merges_and_dispatches(sim):
     sim.prover(aid, "f1", "src/m/f1.c", status="all_proven")
 
     # Atomic step: complete f1, eagerly merge it, and dispatch f2
-    res = _cmd_step(complete_ids=[aid], slots="auto", prepare=True)
+    res = S.cmd_step(complete_ids=[aid], slots="auto", prepare=True)
 
     assert res["ok"] is True
     assert any(c.get("agent_id") == aid for c in res["completed"])
@@ -320,11 +264,6 @@ def test_tier1_r3_atomic_step_command_completes_merges_and_dispatches(sim):
     assert not res["errors"]
 
 
-@pytest.mark.xfail(
-    not _HAS_M3_STEP,
-    reason="Pending M3: eager merge when caller waits on queued callee",
-    strict=False,
-)
 def test_tier1_r3_eager_merge_triggered_when_caller_waits_on_queued_callee(sim):
     """R3: cmd_merge_pending triggers eagerly when a caller is waiting on a queued callee."""
     sim.build(
@@ -344,11 +283,6 @@ def test_tier1_r3_eager_merge_triggered_when_caller_waits_on_queued_callee(sim):
     assert any(m["agent_id"] == aid for m in out["merged"])
 
 
-@pytest.mark.xfail(
-    not _HAS_M3_STEP,
-    reason="Pending M3: eager merge when no merge is in flight",
-    strict=False,
-)
 def test_tier1_r3_eager_merge_triggered_when_no_merge_in_flight(sim):
     """R3: cmd_merge_pending merges eagerly when no other merge is currently in flight."""
     sim.build({"f1": ("src/m/f1.c", "m", [])})
@@ -363,11 +297,6 @@ def test_tier1_r3_eager_merge_triggered_when_no_merge_in_flight(sim):
     assert any(m["agent_id"] == aid for m in out["merged"])
 
 
-@pytest.mark.xfail(
-    not _HAS_M4_RESOURCES,
-    reason="Pending M4: recommend() cap scaling for pools >= 32 and >= 64 CPUs",
-    strict=False,
-)
 def test_tier1_r4_resource_scaling_agent_cap_for_large_pools():
     """R4: recommend() agent caps scale to 32 on >= 32 CPUs and 64 on >= 64 CPUs."""
     assert R.recommend(pool=R.Budget(16, 64_000, "t"))["max_agents"] == 16
@@ -376,11 +305,6 @@ def test_tier1_r4_resource_scaling_agent_cap_for_large_pools():
     assert R.recommend(pool=R.Budget(128, 512_000, "t"))["max_agents"] == 64
 
 
-@pytest.mark.xfail(
-    not _HAS_M4_RESOURCES,
-    reason="Pending M4: nominal_grant wp max_cpus scaling to 16 for pool >= 32 CPUs",
-    strict=False,
-)
 def test_tier1_r4_resource_scaling_wp_max_cpus():
     """R4: CLASSES['wp'] nominal grant scales up to 16 CPUs when pool >= 32 CPUs."""
     small_grant = R.nominal_grant(R.CLASSES["wp"], R.Budget(16, 64_000, "t"))
@@ -389,11 +313,6 @@ def test_tier1_r4_resource_scaling_wp_max_cpus():
     assert large_grant["cpus"] == 16
 
 
-@pytest.mark.xfail(
-    not _HAS_M4_RESOURCES,
-    reason="Pending M4: nominal_grant guardrail max_cpus scaling to 4 for pool >= 32 CPUs",
-    strict=False,
-)
 def test_tier1_r4_resource_scaling_guardrail_max_cpus():
     """R4: CLASSES['guardrail'] nominal grant scales up to 4 CPUs when pool >= 32 CPUs."""
     small_grant = R.nominal_grant(R.CLASSES["guardrail"], R.Budget(8, 32_000, "t"))
@@ -446,11 +365,6 @@ def test_tier1_r5_continuous_sliding_window_ignores_wave_barriers(sim, monkeypat
 # ============================================================================
 
 
-@pytest.mark.xfail(
-    not _HAS_M4_RESOURCES,
-    reason="Pending M4: pool size boundary 31 vs 32 CPUs scaling",
-    strict=False,
-)
 def test_tier2_boundary_cpu_pool_31_vs_32():
     """Boundary transition between 31 and 32 CPUs."""
     pool_31 = R.Budget(31, 128_000, "t")
@@ -466,11 +380,6 @@ def test_tier2_boundary_cpu_pool_31_vs_32():
     assert R.nominal_grant(R.CLASSES["guardrail"], pool_32)["cpus"] == 4
 
 
-@pytest.mark.xfail(
-    not _HAS_M4_RESOURCES,
-    reason="Pending M4: pool size boundary 63 vs 64 CPUs scaling",
-    strict=False,
-)
 def test_tier2_boundary_cpu_pool_63_vs_64():
     """Boundary transition between 63 and 64 CPUs."""
     pool_63 = R.Budget(63, 256_000, "t")
@@ -480,16 +389,11 @@ def test_tier2_boundary_cpu_pool_63_vs_64():
     assert R.recommend(pool=pool_64)["max_agents"] == 64
 
 
-@pytest.mark.xfail(
-    not _HAS_M3_STEP,
-    reason="Pending M3: empty cmd_step handling",
-    strict=False,
-)
 def test_tier2_empty_step_command(sim):
     """Corner case: cmd_step with empty complete list and zero tasks returns clean schema."""
     sim.build({})
     S.cmd_init()
-    res = _cmd_step(complete_ids=[], slots="auto")
+    res = S.cmd_step(complete_ids=[], slots="auto")
     assert res["ok"] is True
     assert res["completed"] == []
     assert res["errors"] == []
@@ -505,16 +409,11 @@ def test_tier2_empty_merge_pending(sim):
     assert out["failed"] == []
 
 
-@pytest.mark.xfail(
-    not _HAS_M3_STEP,
-    reason="Pending M3: cmd_step with slots=0",
-    strict=False,
-)
 def test_tier2_zero_slots_step(sim):
     """Corner case: cmd_step with slots=0 performs complete and merge but picks zero next tasks."""
     sim.build({"f": ("src/m/f.c", "m", [])})
     S.cmd_init()
-    res = _cmd_step(complete_ids=[], slots="0")
+    res = S.cmd_step(complete_ids=[], slots="0")
     assert res["ok"] is True
     assert res["next"]["tasks"] == []
 
@@ -550,11 +449,6 @@ def test_tier2_self_recursion_edge(sim):
     assert "prove:src/m/self.c#self_fn" in ready()
 
 
-@pytest.mark.xfail(
-    not _HAS_M1_SPLICE,
-    reason="Pending M1: disjoint multi-declaration splicing in splice_architect_header",
-    strict=False,
-)
 def test_tier2_disjoint_header_splice_multiple_declarations():
     """Corner case: Multiple disjoint function contracts and predicates spliced concurrently."""
     base_text = "int fa(int x);\nint fb(int y);\nint fc(int z);\n"
@@ -573,7 +467,7 @@ def test_tier2_disjoint_header_splice_multiple_declarations():
         "int fc(int z);\n"
     )
 
-    spliced = _splice_architect_header(
+    spliced = acsl_ast.splice_architect_header(
         base_text=base_text,
         agent_text=agent_text,
         current_text=current_text,
@@ -586,11 +480,6 @@ def test_tier2_disjoint_header_splice_multiple_declarations():
     assert "int fc(int z);" in spliced
 
 
-@pytest.mark.xfail(
-    not _HAS_M1_SPLICE,
-    reason="Pending M1: ScopeViolationError on conflicting header modifications",
-    strict=False,
-)
 def test_tier2_conflicting_header_splice_raises_scope_violation():
     """Corner case: Conflicting contract edits on the same prototype raise ScopeViolationError."""
     base_text = "int parse(int x);\n"
@@ -598,7 +487,7 @@ def test_tier2_conflicting_header_splice_raises_scope_violation():
     current_text = "/*@ requires x > 100; */\nint parse(int x);\n"
 
     with pytest.raises(acsl_ast.ScopeViolationError) as exc_info:
-        _splice_architect_header(
+        acsl_ast.splice_architect_header(
             base_text=base_text,
             agent_text=agent_text,
             current_text=current_text,
@@ -607,18 +496,13 @@ def test_tier2_conflicting_header_splice_raises_scope_violation():
     assert "parse" in str(exc_info.value)
 
 
-@pytest.mark.xfail(
-    not _HAS_M1_SPLICE,
-    reason="Pending M1: predicate deduplication in splice_architect_header",
-    strict=False,
-)
 def test_tier2_identical_concurrent_predicate_deduplication():
     """Corner case: Identical concurrent top-level ACSL predicates are merged without error."""
     base_text = "int parse(int x);\n"
     agent_text = "/*@ predicate Valid(int x) = x >= 0; */\nint parse(int x);\n"
     current_text = "/*@ predicate Valid(int x) = x >= 0; */\nint parse(int x);\n"
 
-    spliced = _splice_architect_header(
+    spliced = acsl_ast.splice_architect_header(
         base_text=base_text,
         agent_text=agent_text,
         current_text=current_text,
@@ -633,11 +517,6 @@ def test_tier2_identical_concurrent_predicate_deduplication():
 # ============================================================================
 
 
-@pytest.mark.xfail(
-    not (_HAS_M2_SPECULATIVE and _HAS_M3_STEP),
-    reason="Pending M2/M3: speculative dispatch combined with atomic step",
-    strict=False,
-)
 def test_tier3_speculative_dispatch_with_atomic_step(sim):
     """Interaction: cmd_step completion immediately dispatches speculatively ready callers."""
     sim.build(
@@ -659,18 +538,13 @@ def test_tier3_speculative_dispatch_with_atomic_step(sim):
     sim.prover(aid, "unrelated", "src/m/unrelated.c")
 
     # In one atomic step: unrelated completes, caller is speculatively ready and dispatched
-    step_out = _cmd_step(complete_ids=[aid], slots="auto", prepare=True)
+    step_out = S.cmd_step(complete_ids=[aid], slots="auto", prepare=True)
 
     assert step_out["ok"] is True
     dispatched = [t["task"] for t in step_out["next"]["tasks"]]
     assert any(t in ("src/m/caller.c#caller", "prove:src/m/caller.c#caller") for t in dispatched)
 
 
-@pytest.mark.xfail(
-    not (_HAS_M2_GATING and _HAS_M3_STEP),
-    reason="Pending M2/M3: fine-grained gating combined with eager merge",
-    strict=False,
-)
 def test_tier3_fine_grained_gating_with_eager_merge(sim):
     """Interaction: Eager merge unblocks waiting callers while unrelated functions remain gated."""
     sim.build(
@@ -741,11 +615,6 @@ def test_tier3_concurrent_rechecks_with_eager_merge(sim):
 # ============================================================================
 
 
-@pytest.mark.xfail(
-    not (_HAS_M2_SPECULATIVE and _HAS_M3_STEP and _HAS_M4_RESOURCES),
-    reason="Pending M2/M3/M4: full reactive sliding-window loop orchestration",
-    strict=False,
-)
 def test_tier4_end_to_end_sliding_window_simulation(sim):
     """Tier 4: Realistic multi-module sliding-window verification pipeline execution.
 
@@ -803,7 +672,7 @@ def test_tier4_end_to_end_sliding_window_simulation(sim):
         running_agents.clear()
 
         # Step: complete finished agents, eager merge, and pull next ready tasks
-        step_out = _cmd_step(complete_ids=completed_ids, slots="auto", prepare=True)
+        step_out = S.cmd_step(complete_ids=completed_ids, slots="auto", prepare=True)
 
         assert step_out["ok"] is True, f"Step failed at iteration {iteration}: {step_out['errors']}"
 

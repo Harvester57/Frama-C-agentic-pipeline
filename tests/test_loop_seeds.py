@@ -639,9 +639,8 @@ def test_nothing_to_seed_is_reported_not_raised(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_flag_is_off_by_default_and_follows_the_context_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flag_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(ff.LOOP_SEEDS_ENV, raising=False)
-    monkeypatch.delenv(ff.CONTEXT_ENV, raising=False)
     assert ff.loop_seeds_enabled() is False
     for value in ("on", "1", "TRUE", " yes "):
         monkeypatch.setenv(ff.LOOP_SEEDS_ENV, value)
@@ -649,9 +648,6 @@ def test_flag_is_off_by_default_and_follows_the_context_switch(monkeypatch: pyte
     for value in ("off", "0", "", "maybe"):
         monkeypatch.setenv(ff.LOOP_SEEDS_ENV, value)
         assert ff.loop_seeds_enabled() is False
-    monkeypatch.setenv(ff.LOOP_SEEDS_ENV, "on")
-    monkeypatch.setenv(ff.CONTEXT_ENV, "off")
-    assert ff.loop_seeds_enabled() is False
 
 
 @pytest.mark.unit
@@ -671,7 +667,6 @@ def test_cli_finds_facts_runs_the_filters_and_writes_the_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     monkeypatch.setenv(ff.LOOP_SEEDS_ENV, "on")
-    monkeypatch.delenv(ff.CONTEXT_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
     src = tmp_path / "agents" / "p1" / "scratch" / "work" / "src" / "sum.c"
     src.parent.mkdir(parents=True)
@@ -722,7 +717,6 @@ def test_cli_finds_facts_runs_the_filters_and_writes_the_report(
 @pytest.mark.unit
 def test_cli_survives_a_crashing_tool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     monkeypatch.setenv(ff.LOOP_SEEDS_ENV, "on")
-    monkeypatch.delenv(ff.CONTEXT_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "sum.c").write_text(SUM_INT, encoding="utf-8")
     monkeypatch.setattr(ls, "find_facts", lambda *a: _sum_int_record())
@@ -786,7 +780,6 @@ def _features(**on) -> dict[str, bool]:
 def test_brief_shows_the_seed_step_only_with_the_flag_and_a_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     marker = "scripts/loop_seeds.py --file agents/{agent_id}/scratch/work/{c_file}"
     assert BRIEF.count(marker) == 1
-    monkeypatch.delenv(ff.CONTEXT_ENV, raising=False)
     monkeypatch.delenv(ff.LOOP_SEEDS_ENV, raising=False)
     assert marker not in ff.render_conditionals(BRIEF, _features(loops=True))
     assert marker not in ff.render_conditionals(BRIEF, None)
@@ -803,9 +796,6 @@ def test_brief_shows_the_seed_step_only_with_the_flag_and_a_loop(monkeypatch: py
     assert with_loop.index(marker) < with_loop.index("1. For every loop in `{function_name}`")
     assert marker not in ff.render_conditionals(BRIEF, _features(loops=False))
     assert marker not in ff.render_conditionals(BRIEF, None)  # no facts: nothing to seed from
-    monkeypatch.setenv(ff.CONTEXT_ENV, "off")
-    assert marker not in ff.render_conditionals(BRIEF, None)
-    assert marker not in ff.render_conditionals(BRIEF, _features(loops=True))
 
 
 @pytest.mark.unit
@@ -841,7 +831,6 @@ def test_scheduler_copies_the_provers_report_to_the_run_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv(ff.CONTEXT_ENV, raising=False)
     monkeypatch.setenv(ff.LOOP_SEEDS_ENV, "on")
     task = {"function": "sum_int", "file": "src/sum.c", "module": "m"}
     scratch = tmp_path / "agents" / "p1" / "scratch"

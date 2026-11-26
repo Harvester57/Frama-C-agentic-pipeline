@@ -237,16 +237,13 @@ def test_other_subcommands_keep_their_class(cmd):
 
 
 @pytest.mark.unit
-def test_wrappers_and_compose_no_longer_chmod_the_scratch_volume():
+def test_wrappers_no_longer_chmod_the_scratch_volume():
     sh = (ROOT / "wrappers" / "framac-docker.sh").read_text(encoding="utf-8")
     ps1 = (ROOT / "wrappers" / "framac-docker.ps1").read_text(encoding="utf-8")
-    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     for text in (sh, ps1):
         assert "volume create" in text and "/framac-scratch" in text
         assert not re.search(r"entrypoint\W+(/bin/)?chmod", text)
         assert "Failed to initialize scratch volume" not in text
-    assert not re.search(r"chmod\S*\s+framac-build\s+1777", compose)
-    assert "--user 0" not in compose
 
 
 @pytest.mark.unit

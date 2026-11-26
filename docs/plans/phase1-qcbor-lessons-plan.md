@@ -185,7 +185,7 @@ Branched from Wave 0 + merged Wave 1 (`W1-A`..`W1-E`) with disjoint file ownersh
 - **Owned files:**
   - [`../../wrappers/framac-docker.sh`](../../wrappers/framac-docker.sh)
   - [`../../wrappers/framac-docker.ps1`](../../wrappers/framac-docker.ps1)
-  - [`../../docker-compose.yml`](../../docker-compose.yml)
+  - `docker-compose.yml` (since retired)
   - [`../guides/resources-and-caching.md`](../guides/resources-and-caching.md)
   - [`../guides/slicing-and-onboarding.md`](../guides/slicing-and-onboarding.md)
   - [`./phase1-qcbor-lessons-plan.md`](./phase1-qcbor-lessons-plan.md) and [`./README.md`](./README.md)

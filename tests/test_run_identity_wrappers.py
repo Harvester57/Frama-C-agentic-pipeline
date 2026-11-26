@@ -164,13 +164,6 @@ def test_both_images_create_the_cache_directory_world_writable():
             assert {"/framac-scratch", "/framac-cache"} <= dockerfile_command_args(stage.text, *command), stage.name
 
 
-@pytest.mark.unit
-def test_compose_labels_both_services():
-    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert compose.count("      framac.repo: ${FRAMAC_REPO_KEY:-manual}\n") == 2
-    assert compose.count("      framac.run: ${FRAMAC_RUN_ID:-run-1}\n") == 2
-
-
 # ------------------------------------------------------------------------------------- PowerShell wrapper
 
 

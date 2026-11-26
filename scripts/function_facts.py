@@ -59,10 +59,8 @@ from framac_common import (  # noqa: E402
 # 2: frame_skeleton; 3: loop var_classes + loop_graph (SESpec/InvWeaver-style loop templates);
 # 4: `assigns \nothing` only when no call may write (calls carry the callee's kernel name)
 FACTS_SCHEMA = 4
-LOOP_TEMPLATES_ENV = "FRAMAC_LOOP_TEMPLATES"
 LOOP_SEEDS_ENV = "FRAMAC_LOOP_SEEDS"
 FACTS_DIR = "workspace/reports/facts"
-CONTEXT_ENV = "FRAMAC_PROVER_CONTEXT"
 CONTEXT_SENTINEL = "<!-- deterministic-context -->"
 
 # ACSL's \at, kept out of f-strings: a backslash inside an f-string is a syntax error before Python 3.12.
@@ -656,7 +654,7 @@ def _function_record(
         "truncated": bool(raw.get("truncated")),
     }
     record["frame_skeleton"] = frame_skeleton.compute(record)
-    record["loop_graph"] = _loop_graph(record) if loop_templates_enabled() else {"status": "disabled", "edges": []}
+    record["loop_graph"] = _loop_graph(record)
     return record
 
 
@@ -1039,11 +1037,6 @@ def _render_loops(record: dict, mapped, lines: list[str]) -> None:
             )
 
 
-def loop_templates_enabled() -> bool:
-    """FRAMAC_LOOP_TEMPLATES=off: no loop templates/graph, for A/B comparisons."""
-    return (os.environ.get(LOOP_TEMPLATES_ENV) or "").strip().lower() not in ("off", "0", "false", "no", "disabled")
-
-
 def _render_loop_deps(record: dict, mapped, lines: list[str]) -> None:
     graph = record.get("loop_graph") or {}
     if graph.get("status") == "disabled" or not graph.get("edges"):
@@ -1295,9 +1288,8 @@ def render_section(
         lines.append("")
         _render_frame(record, lines)
         _render_loops(record, mapped, lines)
-        if loop_templates_enabled():
-            _render_loop_deps(record, mapped, lines)
-            _render_loop_templates(record, mapped, lines)
+        _render_loop_deps(record, mapped, lines)
+        _render_loop_templates(record, mapped, lines)
         _render_calls(record, mapped, lines)
         _render_callers(record, lines)
         _render_alias(record, lines)
@@ -1333,18 +1325,12 @@ def render_section(
     return "\n".join(lines) + "\n"
 
 
-def context_enabled() -> bool:
-    """FRAMAC_PROVER_CONTEXT=off: briefs without facts and slice, for A/B comparisons."""
-    return (os.environ.get(CONTEXT_ENV) or "").strip().lower() not in ("off", "0", "false", "no", "disabled")
-
-
 def loop_seeds_enabled() -> bool:
     """
     FRAMAC_LOOP_SEEDS=on: provers get loop invariant candidates filtered by WP and by the corpus
-    (loop_seeds.py). Off by default, and off whenever FRAMAC_PROVER_CONTEXT=off removes the facts.
+    (loop_seeds.py). Off by default.
     """
-    wanted = (os.environ.get(LOOP_SEEDS_ENV) or "").strip().lower() in ("on", "1", "true", "yes", "enabled")
-    return wanted and context_enabled()
+    return (os.environ.get(LOOP_SEEDS_ENV) or "").strip().lower() in ("on", "1", "true", "yes", "enabled")
 
 
 def main(argv: list[str] | None = None) -> int:

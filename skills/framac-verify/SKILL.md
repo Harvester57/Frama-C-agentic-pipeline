@@ -185,7 +185,7 @@ Operational kill switches:
 - `FRAMAC_BROKER=off` (or `-NoBroker`): the wrapper's previous static sizing.
 - `FRAMAC_SCHEDULER=waves`: wave-by-wave dispatch with barriers.
 
-Harness & fuzzing overhaul A/B feature flags (all five are forwarded by `wrappers/framac-docker.ps1`, `wrappers/framac-docker.sh`, and `docker-compose.yml`, and **default to `on`**; pass `=off` for A/B rollback):
+Harness & fuzzing overhaul A/B feature flags (all five are forwarded by `wrappers/framac-docker.ps1` and `wrappers/framac-docker.sh`, and **default to `on`**; pass `=off` for A/B rollback):
 - `FRAMAC_HARNESS_SCOPE_V2` (`on` | `off`, default `on`): P1 unit-visibility scoping (`executable`, `plugin_so`, `internal_convenience`, `public_lib`), first-class `tf_*` reach credit, and sidecar `api_auto_exempt` acceptance (`/framac-slice`).
 - `FRAMAC_API_TRUST_SCHEMA` (`on` | `off`, default `on`): P2A deterministic `--api` upgrades: threat-model parameter roles (S1), widened by-value and schema-taking builders (S2), `const` schema instances (S3), and `--api` hygiene (`/framac-slice`).
 - `FRAMAC_HARNESS_SMOKE` (`on` | `off`, default `on`): P3 standalone harness smoke gate (`smoke` / `smoke-%` running `harness_smoke.py run` + `phase0_gates.py record-smoke` before fuzzing and Eva) (`/framac-slice`, `/framac-fuzz`).

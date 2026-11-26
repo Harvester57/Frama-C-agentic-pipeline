@@ -971,13 +971,6 @@ def test_slice_is_shown_as_reading_context_only() -> None:
     assert "`#if` blocks are not resolved" in degraded
 
 
-def test_context_switch_for_ab_comparisons(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(ff.CONTEXT_ENV, raising=False)
-    assert ff.context_enabled() is True
-    monkeypatch.setenv(ff.CONTEXT_ENV, "off")
-    assert ff.context_enabled() is False
-
-
 # ---------------------------------------------------------------------------
 # Projected frame skeleton (AutoFraming-style)
 # ---------------------------------------------------------------------------
@@ -1164,16 +1157,6 @@ def test_section_renders_loop_templates_and_dependency_context() -> None:
     assert "!(up < length) ==> length == \\at(length, Pre);" in section
     assert "**Loop dependency context**" in section
     assert "inner loop(s) L8" in section
-
-
-def test_loop_templates_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(ff.LOOP_TEMPLATES_ENV, "off")
-    rec = _record(_nested_loop_raw(), "void bubble_sort(int *a, int length) { }\n")
-    assert rec["loop_graph"].get("status") == "disabled"
-    section = ff.render_section(rec, function="bubble_sort")
-    assert "PLACE_HOLDER" not in section and "Loop dependency context" not in section
-    monkeypatch.delenv(ff.LOOP_TEMPLATES_ENV)
-    assert ff.loop_templates_enabled() is True
 
 
 def test_function_level_writes_carry_their_rhs_values() -> None:

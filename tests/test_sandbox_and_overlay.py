@@ -103,7 +103,7 @@ def _read(rel: str) -> str:
 
 
 def test_container_configs_keep_default_seccomp_and_apparmor():
-    for rel in ("wrappers/framac-docker.sh", "wrappers/framac-docker.ps1", "docker-compose.yml"):
+    for rel in ("wrappers/framac-docker.sh", "wrappers/framac-docker.ps1"):
         text = _read(rel)
         for forbidden in ("seccomp=unconfined", "seccomp:unconfined", "apparmor=unconfined"):
             assert forbidden not in text, f"{rel} contains {forbidden}"

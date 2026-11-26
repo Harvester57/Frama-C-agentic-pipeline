@@ -214,7 +214,6 @@ Every run directory (`~/framac-pipeline/<repo>/run-<N>/`) produces a self-contai
 frama-c/
 ├── Dockerfile                  # Stages framac-build, framac-opam (Frama-C, MetAcsl, Why3, Alt-Ergo) and framac-analysis
 ├── Dockerfile.codeql           # Optional CodeQL image, built from framac-build
-├── docker-compose.yml          # Manual container service definition & volume mappings
 ├── opam/                       # Local opam repository: Frama-C and MetAcsl releases not yet in opam-repository
 ├── wrappers/                   # framac-docker.ps1 / .sh (broker, image choice, hardening), CodeQL derived image
 ├── skills/                     # Agent Skills (single source of truth; .agents/skills/ and .claude/skills/ mirror them)

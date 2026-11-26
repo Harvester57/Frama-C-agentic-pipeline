@@ -935,15 +935,12 @@ class TestWrappersAndBenchmark:
     def test_wrappers_declare_the_options(self):
         sh = (ROOT / "wrappers" / "framac-docker.sh").read_text(encoding="utf-8")
         ps1 = (ROOT / "wrappers" / "framac-docker.ps1").read_text(encoding="utf-8")
-        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
         for flag in ("--build-image", "--scratch", "--remove-scratch", "--target framac-build", "/framac-scratch"):
             assert flag in sh, flag
         for flag in ("$BuildImage", "$Scratch", "$RemoveScratch", '"framac-build"', "/framac-scratch"):
             assert flag in ps1, flag
-        assert "target: framac-build" in compose and "scratch:/framac-scratch" in compose
-        # The monolithic image is gone (plan step I10): no wrapper names or derives it (compose keeps the
-        # service name framac-pipeline, which runs the analysis image).
-        for text in (sh, ps1, compose):
+        # The monolithic image is gone (plan step I10): no wrapper names or derives it.
+        for text in (sh, ps1):
             assert not re.search(r"framac-pipeline:[\w$<{]", text)
 
     def test_ps1_runs_build_steps_in_the_build_image_with_the_scratch_volume(self, tmp_path):

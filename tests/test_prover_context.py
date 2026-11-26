@@ -6,8 +6,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import function_facts as ff  # noqa: E402
@@ -171,19 +169,6 @@ def test_brief_without_a_facts_file_keeps_all_guidance_and_the_slice(tmp_path: P
     assert "### Reading Slice" in brief
     assert "**Writes (AST" not in brief
     assert not MARKER_RE.search(brief)
-
-
-def test_context_off_gives_the_full_brief_without_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(ff.CONTEXT_ENV, "off")
-    run_dir = _prover_run(tmp_path)
-    prep = _prepare(run_dir)
-    brief = (run_dir / prep["brief_file"]).read_text(encoding="utf-8")
-    assert prep["prover_context"] == {"enabled": False}
-    assert "## Deterministic Function Context" not in brief and "### Reading Slice" not in brief
-    assert "Inspect every loop, pointer write" in brief
-    assert "One String Vocabulary" in brief
-    assert ff.CONTEXT_SENTINEL not in brief and not MARKER_RE.search(brief)
-    assert not (run_dir / "agents" / "prove-total" / "scratch" / "context").exists()
 
 
 def test_facts_of_a_same_named_static_elsewhere_are_not_used(tmp_path: Path) -> None:

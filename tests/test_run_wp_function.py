@@ -707,18 +707,6 @@ def test_goal_cost_hints_leave_out_assumed_degenerated_goals() -> None:
 
 
 @pytest.mark.unit
-def test_goal_costs_flag_off_removes_the_hints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    res = _cost_res([_cost("typed_f_a", "unknown")], unproven_goals=[], unproven_by_bucket={})
-    monkeypatch.delenv(W.GOAL_COSTS_ENV, raising=False)
-    on = W.derive_wp_diagnostic_hints(res, "", kb_dir=tmp_path / "kb")
-    assert any("probably false or missing a fact" in h for h in on)
-    monkeypatch.setenv(W.GOAL_COSTS_ENV, "off")
-    off = W.derive_wp_diagnostic_hints(res, "", kb_dir=tmp_path / "kb")
-    assert not any("probably false or missing a fact" in h for h in off)
-    assert res["unproven_goal_costs"]  # the fields stay
-
-
-@pytest.mark.unit
 def test_run_wp_on_function_reports_goal_costs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out_dir = tmp_path / "wp"
     out_dir.mkdir()
@@ -746,7 +734,6 @@ def test_run_wp_on_function_reports_goal_costs(tmp_path: Path, monkeypatch: pyte
 
     monkeypatch.setattr(W.subprocess, "run", fake_run)
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv(W.GOAL_COSTS_ENV, raising=False)
     res = W.run_wp_on_function(
         c_file,
         "f",

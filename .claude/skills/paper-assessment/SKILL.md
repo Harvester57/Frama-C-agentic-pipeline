@@ -114,7 +114,7 @@ For each mechanism, restate it without the paper's tool or language: what it tak
 | A new tool or dependency is tried in a trial image first; it enters the hardened analysis image only as a milestone of its own | precedent: Tier 2 of the papers plan (Heurix) and Tier 2b and 2c of the proof-papers plan (Rocq) |
 | The pipeline assumes no machine size (no GPU, no fixed memory), and hardware changes throughput, never results | [`../../docs/guides/resources-and-caching.md`](../../docs/guides/resources-and-caching.md), opening rules |
 | Deterministic work goes to Make and scripts; subagents are used only where judgment is needed, and an independent agent or the parent checks their output | [`../../docs/guides/agentic-swarm.md`](../../docs/guides/agentic-swarm.md), Section 1 |
-| A new environment flag is added to both wrappers, `docker-compose.yml` and the container test | "Common requirements" of [`../../docs/plans/archive/formal-discovery-plan.md`](../../docs/plans/archive/formal-discovery-plan.md) |
+| A new environment flag is added to both wrappers and the container test | "Common requirements" of [`../../docs/plans/archive/formal-discovery-plan.md`](../../docs/plans/archive/formal-discovery-plan.md) |
 
 What passes both filters is a candidate.
 

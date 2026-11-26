@@ -4,18 +4,34 @@
 # Allow only the directories copied by Dockerfile
 !scripts/
 !scripts/**
+# Exclude non-product scripts from Docker images (kept in git for host-side benchmarking/maintenance;
+# scripts/image_toolchain.py stays in the image because CI runs it inside both containers)
+scripts/benchmark.py
+scripts/benchmark_briefs.py
+scripts/benchmark_compare.py
+scripts/benchmark_seeded.py
+scripts/extract_references.py
+scripts/libc_gap_report.py
+scripts/wp_residual_census.py
 !templates/
 !templates/**
 !schemas/
 !schemas/**
 !skills/
 !skills/**
+# Exclude maintainer/contributor-only skills from Docker images
+skills/paper-assessment/
+skills/python-patterns/
+skills/python-testing/
+skills/run-supervisor/
+skills/upstream-bug-report/
 # The local opam repository the analysis image installs Frama-C and MetAcsl from
 !opam/
 !opam/**
-# Only the greppable Frama-C manuals from docs/ (do not re-include docs/ itself: that would pull in all of it)
+# Only the greppable Markdown Frama-C manuals from docs/ (exclude raw binary PDFs)
 !docs/references/
 !docs/references/**
+docs/references/**/*.pdf
 
 # Exclude Python bytecode/caches inside allowed directories
 **/__pycache__/
