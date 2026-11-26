@@ -19,7 +19,7 @@ argument-hint: "<pdf path | arXiv id | URL>... [--triage] [--into <existing plan
 
 # Paper assessment
 
-You read research papers and decide what, if anything, they should change in this pipeline. The output is a ranked plan in the format of [`../../docs/plans/papers-generalization-plan.md`](../../docs/plans/papers-generalization-plan.md) and [`../../docs/plans/proof-papers-generalization-plan.md`](../../docs/plans/proof-papers-generalization-plan.md). Read one of them before you write your first plan: they are the reference for tone, depth and layout.
+You read research papers and decide what, if anything, they should change in this pipeline. The output is a ranked plan in the format of [`../../docs/plans/archive/papers-generalization-plan.md`](../../docs/plans/archive/papers-generalization-plan.md) and [`../../docs/plans/proof-papers-generalization-plan.md`](../../docs/plans/proof-papers-generalization-plan.md). Read one of them before you write your first plan: they are the reference for tone, depth and layout.
 
 A paper that yields nothing is a normal result. So is one whose only output is a measurement to run before anything is built.
 
@@ -109,12 +109,12 @@ For each mechanism, restate it without the paper's tool or language: what it tak
 | Proofs change ACSL only, never a C token | [`../framac-wp/prover_brief.md`](../framac-wp/prover_brief.md), Rule 1 |
 | No global `lemma`, no file-scope ghost function | the same brief; the merge refuses them |
 | No result under an option or memory model classed `unsound_proof` (only `Typed` and `Bytes` count) | the same brief, Rule 3 ("Memory model"), and `scripts/run_wp_function.py` |
-| No value bound on attacker-controlled input and no magic constant in a `requires`; a value observed under a harness is a hint, never a contract clause | the same brief, Rule 3 ("Trust Boundary & No Magic Bounds"); the Tier 1b result in [`../../docs/plans/papers-generalization-plan.md`](../../docs/plans/papers-generalization-plan.md) shows what happens otherwise |
+| No value bound on attacker-controlled input and no magic constant in a `requires`; a value observed under a harness is a hint, never a contract clause | the same brief, Rule 3 ("Trust Boundary & No Magic Bounds"); the Tier 1b result in [`../../docs/plans/archive/papers-generalization-plan.md`](../../docs/plans/archive/papers-generalization-plan.md) shows what happens otherwise |
 | Pipeline scripts are stdlib-only Python | [`../python-patterns/SKILL.md`](../python-patterns/SKILL.md) |
 | A new tool or dependency is tried in a trial image first; it enters the hardened analysis image only as a milestone of its own | precedent: Tier 2 of the papers plan (Heurix) and Tier 2b and 2c of the proof-papers plan (Rocq) |
 | The pipeline assumes no machine size (no GPU, no fixed memory), and hardware changes throughput, never results | [`../../docs/guides/resources-and-caching.md`](../../docs/guides/resources-and-caching.md), opening rules |
 | Deterministic work goes to Make and scripts; subagents are used only where judgment is needed, and an independent agent or the parent checks their output | [`../../docs/guides/agentic-swarm.md`](../../docs/guides/agentic-swarm.md), Section 1 |
-| A new environment flag is added to both wrappers, `docker-compose.yml` and the container test | "Common requirements" of [`../../docs/plans/formal-discovery-plan.md`](../../docs/plans/formal-discovery-plan.md) |
+| A new environment flag is added to both wrappers, `docker-compose.yml` and the container test | "Common requirements" of [`../../docs/plans/archive/formal-discovery-plan.md`](../../docs/plans/archive/formal-discovery-plan.md) |
 
 What passes both filters is a candidate.
 
@@ -155,7 +155,7 @@ Sections, as in the two reference plans:
 1. **Opening paragraph and limits:** what was read, the date the pipeline claims were checked, then "not read", "not checked" and "not measured".
 2. **`## 1. What each paper does`:** step 3, one subsection per paper.
 3. **`## 2. Mapping onto the pipeline`:** the table, then `### 2.1 Verified gaps`.
-4. **`## 3. Ranked plan (by expected value)`:** a small Mermaid graph of the dependencies, the rank table (rank, upgrade, paper origin, value, risk; the value cell carries the evidence and transfer labels, the risk cell carries the cost label), and "Common requirements" pointing to [`../../docs/plans/formal-discovery-plan.md`](../../docs/plans/formal-discovery-plan.md).
+4. **`## 3. Ranked plan (by expected value)`:** a small Mermaid graph of the dependencies, the rank table (rank, upgrade, paper origin, value, risk; the value cell carries the evidence and transfer labels, the risk cell carries the cost label), and "Common requirements" pointing to [`../../docs/plans/archive/formal-discovery-plan.md`](../../docs/plans/archive/formal-discovery-plan.md).
 5. **One subsection per tier:**
    - **Problem:** the gap number and the paper anchor.
    - **Step 0:** the cheapest measurement that could kill the tier, on which run or module, with the stop-or-go rule written before it is run.

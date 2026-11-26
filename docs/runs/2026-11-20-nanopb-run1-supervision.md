@@ -157,7 +157,7 @@ All 25 have harness-induced shapes; the run's Crash Verifiers decide each one.
 
 Eva stops at the NULL descriptor accesses (non-terminating statements at `pb_common.c:126`, `:168`, `:201`), so 1844 obligations are Dead, most of the decoder and encoder. The ledger handles this correctly (Dead never counts as proof).
 
-Plan: [`../plans/schema-driven-api-harness-plan.md`](../plans/schema-driven-api-harness-plan.md) (proposal, not implemented).
+Plan: [`../plans/archive/schema-driven-api-harness-plan.md`](../plans/archive/schema-driven-api-harness-plan.md) (proposal, not implemented).
 
 **Early data point (repair 1, one hand-written schema instance).** The driver's repair gave 14 cases one valid descriptor (int32, bool, string[8]). On the rerun:
 
@@ -181,7 +181,7 @@ Plan: [`../plans/schema-driven-api-harness-plan.md`](../plans/schema-driven-api-
 | `seed_harvest` record: `no_test_units` for a test suite that builds its own copy of the library (scons) | Pipeline gap | Open (written by the driver) | [`../troubleshooting/harnesses-and-seeds.md`](../troubleshooting/harnesses-and-seeds.md) |
 | Shipped fuzzer and corpora feed no case (generated descriptors missing, `-Dnanopb_BUILD_GENERATOR=OFF`) | Pipeline gap | Open (written by the driver; plan S3) | same file |
 | Fuzz report: `seed_harvest.py record has not run` although it ran (`scripts/seed_harvest.py` about line 1768) | Pipeline bug, cosmetic | Open. Not dispatched: `scripts/seed_harvest.py` is in the dirty list | same file (written by the supervisor) |
-| `--api` harness fills trusted parameters and zeroes attacker ones | Pipeline design gap | Open, planned | [`../plans/schema-driven-api-harness-plan.md`](../plans/schema-driven-api-harness-plan.md) |
+| `--api` harness fills trusted parameters and zeroes attacker ones | Pipeline design gap | Open, planned | [`../plans/archive/schema-driven-api-harness-plan.md`](../plans/archive/schema-driven-api-harness-plan.md) |
 | Guardrail `guardrail_error` on a sanitizer crash outside the checked functions found by the mutation burst (`run_eacsl_fuzz.py` about line 2043); the `pb.h` contract was exercised (64 corpus inputs clean, `pb_default_field_callback` reached 8 times) but the error discarded that result | Pipeline bug (code and docstring disagree; policy chosen in `b967da7`) | Fixed; fixer dispatched at the user's request (2026-11-20 22:50), branch `sup/nanopb-guardrail-mutation-sanitizer`, merged to main in `6ce14ac` | [`../troubleshooting/wp-and-guardrail.md`](../troubleshooting/wp-and-guardrail.md) |
 | eva-tune rungs repeat the first Eva attempt that aborts on the `pb_read` recursion, then retry with what is left of the rung budget (`returns`: 893 s lost, 137 s retry, `analysis_timeout`); `elapsed_s` hides the lost time | Pipeline gap | Fixed; fixer dispatched at the user's request (2026-11-20 22:50), branch `sup/nanopb-eva-tune-recursion`, merged to main in `794b367` | [`../troubleshooting/eva.md`](../troubleshooting/eva.md) |
 | L3 asset properties `L3_writers_ostream_bytes_written` / `_max_size` guard `\formal(stream)->bytes_written` by parameter NAME (`security_props.py` `assets()`), so every `pb_decode.c`/`pb_common.c` function with a `pb_istream_t *stream` (47 and 49 instances, `buf_read` and `pb_read` among them) aborts WP: `Cannot find field bytes_written in type struct pb_istream_s` | Pipeline bug (found by the driver, confirmed by the supervisor in `security_props.json` and `wp_decode_pointer_field.json`) | Fixed; fixer dispatched 00:35 (supervisor rule for a confirmed bug in clean files; tests go in a new module because `tests/test_security_props*.py` are dirty), branch `sup/nanopb-l3-asset-param-type`, merged to main in `2444bd7`. The run ended `incomplete` partly for it | [`../troubleshooting/security-properties.md`](../troubleshooting/security-properties.md) (written by the driver) |
@@ -252,7 +252,7 @@ No upstream Frama-C or E-ACSL draft: the WP limits met here (the `void *` cast, 
 - Crash Verifier brief: no threat-model path (brief gap; open).
 - `seed_harvest` status line in the fuzz report (cosmetic; open, its file is dirty).
 - `seed_harvest` `no_test_units` for a test suite that builds its own library copy, and shipped fuzzers whose generated descriptors are missing (gaps; open).
-- The `--api` harness fills trusted parameters and zeroes attacker ones (design gap; plan [`../plans/schema-driven-api-harness-plan.md`](../plans/schema-driven-api-harness-plan.md), not implemented).
+- The `--api` harness fills trusted parameters and zeroes attacker ones (design gap; plan [`../plans/archive/schema-driven-api-harness-plan.md`](../plans/archive/schema-driven-api-harness-plan.md), not implemented).
 - Verifier briefs do not list the `evidence[].phase` values (suggestion only).
 
 The five fixed bugs (guardrail burst, eva-tune recursion, L3 asset type, `#ifdef` twins, sweep out-dir) are merged into local `main` and not pushed.

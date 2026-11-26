@@ -1,6 +1,6 @@
 # Proof-Workflow Papers: Generalization Analysis & Ranked Implementation Plan
 
-This document reads five papers on LLM-assisted proof and verified code generation, maps what each one offers onto the Frama-C agentic verification pipeline ([`../guides/v2-design.md`](../guides/v2-design.md), [`../guides/agentic-swarm.md`](../guides/agentic-swarm.md)), and sets out an implementation plan **ordered by expected value**. It follows the format of [`./papers-generalization-plan.md`](./papers-generalization-plan.md) and [`./formal-discovery-plan.md`](./formal-discovery-plan.md), and does not repeat work those two plans already cover. Claims about the pipeline were checked against the scripts on 2026-11-16; every claim about a paper carries the section it comes from.
+This document reads five papers on LLM-assisted proof and verified code generation, maps what each one offers onto the Frama-C agentic verification pipeline ([`../guides/v2-design.md`](../guides/v2-design.md), [`../guides/agentic-swarm.md`](../guides/agentic-swarm.md)), and sets out an implementation plan **ordered by expected value**. It follows the format of [`./archive/papers-generalization-plan.md`](./archive/papers-generalization-plan.md) and [`./archive/formal-discovery-plan.md`](./archive/formal-discovery-plan.md), and does not repeat work those two plans already cover. Claims about the pipeline were checked against the scripts on 2026-11-16; every claim about a paper carries the section it comes from.
 
 Limits on the reading and on the checks:
 
@@ -69,7 +69,7 @@ An invited-talk perspective with no new experiment. Its claims that bear on the 
 | Truth test of candidate invariants on executions (1.3) | Dual-Oracle Guardrail on the Phase 1 corpus at every prover iteration | [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) |
 | Counterexample-to-induction and drop tests (1.3) | Loop seeds: Houdini with WP, then corpus replay of what WP dropped (`FRAMAC_LOOP_SEEDS`, default off) | [`../../scripts/loop_seeds.py`](../../scripts/loop_seeds.py) |
 | Per-obligation solver cost to find bottlenecks (1.3) | **none**: goals carry status, kind and property; only a timeout count is kept, and only to trigger the tail retry (Tier 1) | [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) |
-| Lemma decomposition, opaque predicates (1.3) | **excluded today**; formal-discovery Tier 7 (deferred) | [`./formal-discovery-plan.md`](./formal-discovery-plan.md) |
+| Lemma decomposition, opaque predicates (1.3) | **excluded today**; formal-discovery Tier 7 (deferred) | [`./archive/formal-discovery-plan.md`](./archive/formal-discovery-plan.md) |
 | Technique catalogue and lessons reused across proofs (1.3, Section 7) | Specification KB, dead-end ledger, proof carry-forward | [`../../scripts/spec_kb.py`](../../scripts/spec_kb.py), [`../../scripts/proof_carry.py`](../../scripts/proof_carry.py) |
 | Deterministic controller decides, agents judge; no agent grades its own work (1.4) | Make and the scheduler decide; independent Crash Verifiers; parent re-verification at merge | [`../../scripts/wp_scheduler.py`](../../scripts/wp_scheduler.py) |
 | Portfolio of candidates from different strategies (1.4, Appendix C) | One prover per function, K iterations, candidates ranked within that one agent | [`../../scripts/prover_candidates.py`](../../scripts/prover_candidates.py) |
@@ -111,7 +111,7 @@ Tiers 1 and 3 are independent. Tier 2a needs Tier 1's fields. Tier 2b should run
 
 ### Common requirements
 
-The requirements of [`./formal-discovery-plan.md`](./formal-discovery-plan.md) ("Common requirements for every tier") apply unchanged: an A/B environment flag for behaviour changes (added to both wrappers, `docker-compose.yml` and `tests/test_remediation_p2_container.py`), acceptance on a `benchmark.py` run compared with `benchmark_compare.py`, guides and briefs updated in the same change, tests run with `-n auto`. Any pipeline bug found on the way goes into [`../troubleshooting/`](../troubleshooting/README.md) in the same session.
+The requirements of [`./archive/formal-discovery-plan.md`](./archive/formal-discovery-plan.md) ("Common requirements for every tier") apply unchanged: an A/B environment flag for behaviour changes (added to both wrappers, `docker-compose.yml` and `tests/test_remediation_p2_container.py`), acceptance on a `benchmark.py` run compared with `benchmark_compare.py`, guides and briefs updated in the same change, tests run with `-n auto`. Any pipeline bug found on the way goes into [`../troubleshooting/`](../troubleshooting/README.md) in the same session.
 
 ---
 
@@ -179,7 +179,7 @@ The requirements of [`./formal-discovery-plan.md`](./formal-discovery-plan.md) (
 
 **Later, only with data.** If the report shows that `safety_only` callees are a frequent source of strengthening requests, feed the shape to the candidate rank or to the Header Architect brief. Not before.
 
-*Measured on 2026-11-18 (Tier 2, Step 0 of [`./harness-and-spec-papers-generalization-plan.md`](./harness-and-spec-papers-generalization-plan.md), counts in its Section 6): the data cannot answer yet, so this stays "not before".*
+*Measured on 2026-11-18 (Tier 2, Step 0 of [`./archive/harness-and-spec-papers-generalization-plan.md`](./archive/harness-and-spec-papers-generalization-plan.md), counts in its Section 6): the data cannot answer yet, so this stays "not before".*
 
 - Six finished runs hold 305 strengthening requests: 273 filed by the scheduler (`caller needs a contract`) and 32 by provers, of which 5 are structural rejections. That leaves 27.
 - None of the 27 has a callee contract shape from before the request. 26 come from QCBOR runs that predate `limits.contract_shape`, and the one from libmodbus run-1 names a callee with no WP report.

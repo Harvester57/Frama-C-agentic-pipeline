@@ -1,6 +1,6 @@
 # Papers Generalization Analysis & Ranked Implementation Plan
 
-This document reads the seven items under `docs/papers/`, maps what each one offers onto the Frama-C agentic verification pipeline ([`../guides/v2-design.md`](../guides/v2-design.md), [`../guides/agentic-swarm.md`](../guides/agentic-swarm.md)), and sets out an implementation plan **ordered by expected value**. It follows the format of [`./formal-discovery-plan.md`](./formal-discovery-plan.md). Every claim about the pipeline below was checked against the scripts on 2026-11-10; every claim about a paper carries the section it comes from.
+This document reads the seven items under `docs/papers/`, maps what each one offers onto the Frama-C agentic verification pipeline ([`../guides/v2-design.md`](../../guides/v2-design.md), [`../guides/agentic-swarm.md`](../../guides/agentic-swarm.md)), and sets out an implementation plan **ordered by expected value**. It follows the format of [`./formal-discovery-plan.md`](./formal-discovery-plan.md). Every claim about the pipeline below was checked against the scripts on 2026-11-10; every claim about a paper carries the section it comes from.
 
 Two limits on the reading:
 
@@ -65,20 +65,20 @@ A four-page extended abstract. It recasts planning heuristics (`h_max`, `h_add`,
 
 | Paper mechanism | Pipeline counterpart | Where |
 | :--- | :--- | :--- |
-| Abstract interpretation before SMT (1.1) | Phase 2 Eva before Phase 3 WP; Unknown obligations reach the prover brief through `{unknown_obligations_json}` | [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py), [`../../skills/framac-wp/prover_brief.md`](../../skills/framac-wp/prover_brief.md) |
-| Loop-head fixpoint states as loop invariants (1.1) | **none**: provers get loop structure and Eva read and write sets, not Eva values (Tier 1) | [`../../scripts/function_facts.py`](../../scripts/function_facts.py) |
-| `weaken`: drop conjuncts over irrelevant variables (1.1) | **none** for hints; `var_classes` already classifies loop variables as unchanged, non-inductive or inductive | [`../../scripts/function_facts.py`](../../scripts/function_facts.py) |
-| Cache of path programs the domain could not prove (1.1, Section 4) | Dead-end ledger (formal-discovery Tier 1) | [`../../scripts/spec_kb.py`](../../scripts/spec_kb.py) |
-| Learned choice of loops to unroll (1.2) | Fixed ladder, then per-loop differential trials capped at `MAX_LOOP_TRIALS = 8`, ordered by Unknown count per function | [`../../scripts/eva_tuning.py`](../../scripts/eva_tuning.py), [`../../scripts/eva_loops.py`](../../scripts/eva_loops.py) |
-| Learned domain selection (1.2) | Base domains fixed (`cvalue`, `equality`, `symbolic-locations`, `octagon`, `gauges`); only `multidim` and `taint` can be added | [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py), [`../../scripts/eva_options.py`](../../scripts/eva_options.py) |
-| Responsible entity: first free choice that guarantees the behaviour (1.3) | `root_cause` free text; `trace` of `entrypoint`, `propagation`, `sink` steps; `reachability` (`untrusted_surface`, `internal_api`); "Audit Harness Legitimacy" in the verifier brief | [`../../schemas/findings.schema.json`](../../schemas/findings.schema.json), [`../../skills/framac-wp/crash_verifier_brief.md`](../../skills/framac-wp/crash_verifier_brief.md) |
-| Dependency and taint, which 1.3 shows are weaker | Optional Eva `taint` domain (`--eva-taint`), CodeQL trust marking | [`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py), [`../../scripts/codeql_trust.py`](../../scripts/codeql_trust.py) |
-| Claims graded on a lattice, never trusted until checked (1.4) | `candidate`, `needs_validation`, `confirmed`, `rejected` verdicts; the Crash Verifier gate | [`../../scripts/ledger.py`](../../scripts/ledger.py) |
-| Confidence basis of evidence (1.4, Section 4.1) | `verifier.method` (`reproduced`, `source_review`, `reproduced_and_source_review`) is recorded but nothing reads it (Tier 4) | [`../../schemas/findings.schema.json`](../../schemas/findings.schema.json) |
-| Feedback edges: a downstream finding re-targets upstream work (1.4) | Strengthening requests and `negotiate` tasks; a breaker crash reopens the gates of the slices it affects | [`../../scripts/contract_negotiator.py`](../../scripts/contract_negotiator.py), [`../../scripts/wp_scheduler.py`](../../scripts/wp_scheduler.py) |
-| Flow-sensitive equalities and `x = y + k` (1.5) | Eva's `equality`, `octagon` and `gauges` domains, used as a black box | [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py) |
+| Abstract interpretation before SMT (1.1) | Phase 2 Eva before Phase 3 WP; Unknown obligations reach the prover brief through `{unknown_obligations_json}` | [`../../scripts/run_eva_slice.py`](../../../scripts/run_eva_slice.py), [`../../skills/framac-wp/prover_brief.md`](../../../skills/framac-wp/prover_brief.md) |
+| Loop-head fixpoint states as loop invariants (1.1) | **none**: provers get loop structure and Eva read and write sets, not Eva values (Tier 1) | [`../../scripts/function_facts.py`](../../../scripts/function_facts.py) |
+| `weaken`: drop conjuncts over irrelevant variables (1.1) | **none** for hints; `var_classes` already classifies loop variables as unchanged, non-inductive or inductive | [`../../scripts/function_facts.py`](../../../scripts/function_facts.py) |
+| Cache of path programs the domain could not prove (1.1, Section 4) | Dead-end ledger (formal-discovery Tier 1) | [`../../scripts/spec_kb.py`](../../../scripts/spec_kb.py) |
+| Learned choice of loops to unroll (1.2) | Fixed ladder, then per-loop differential trials capped at `MAX_LOOP_TRIALS = 8`, ordered by Unknown count per function | [`../../scripts/eva_tuning.py`](../../../scripts/eva_tuning.py), [`../../scripts/eva_loops.py`](../../../scripts/eva_loops.py) |
+| Learned domain selection (1.2) | Base domains fixed (`cvalue`, `equality`, `symbolic-locations`, `octagon`, `gauges`); only `multidim` and `taint` can be added | [`../../scripts/run_eva_slice.py`](../../../scripts/run_eva_slice.py), [`../../scripts/eva_options.py`](../../../scripts/eva_options.py) |
+| Responsible entity: first free choice that guarantees the behaviour (1.3) | `root_cause` free text; `trace` of `entrypoint`, `propagation`, `sink` steps; `reachability` (`untrusted_surface`, `internal_api`); "Audit Harness Legitimacy" in the verifier brief | [`../../schemas/findings.schema.json`](../../../schemas/findings.schema.json), [`../../skills/framac-wp/crash_verifier_brief.md`](../../../skills/framac-wp/crash_verifier_brief.md) |
+| Dependency and taint, which 1.3 shows are weaker | Optional Eva `taint` domain (`--eva-taint`), CodeQL trust marking | [`../../scripts/pipeline_make.py`](../../../scripts/pipeline_make.py), [`../../scripts/codeql_trust.py`](../../../scripts/codeql_trust.py) |
+| Claims graded on a lattice, never trusted until checked (1.4) | `candidate`, `needs_validation`, `confirmed`, `rejected` verdicts; the Crash Verifier gate | [`../../scripts/ledger.py`](../../../scripts/ledger.py) |
+| Confidence basis of evidence (1.4, Section 4.1) | `verifier.method` (`reproduced`, `source_review`, `reproduced_and_source_review`) is recorded but nothing reads it (Tier 4) | [`../../schemas/findings.schema.json`](../../../schemas/findings.schema.json) |
+| Feedback edges: a downstream finding re-targets upstream work (1.4) | Strengthening requests and `negotiate` tasks; a breaker crash reopens the gates of the slices it affects | [`../../scripts/contract_negotiator.py`](../../../scripts/contract_negotiator.py), [`../../scripts/wp_scheduler.py`](../../../scripts/wp_scheduler.py) |
+| Flow-sensitive equalities and `x = y + k` (1.5) | Eva's `equality`, `octagon` and `gauges` domains, used as a black box | [`../../scripts/run_eva_slice.py`](../../../scripts/run_eva_slice.py) |
 | Planning heuristics (1.6) | none | |
-| Cost bounds from bounded exploration (1.7) | LibFuzzer per-input `-timeout` (`timeout_found`, `slow_unit`) and `loop variant` proofs; no cost model | [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) |
+| Cost bounds from bounded exploration (1.7) | LibFuzzer per-input `-timeout` (`timeout_found`, `slow_unit`) and `loop variant` proofs; no cost model | [`../../scripts/run_eacsl_fuzz.py`](../../../scripts/run_eacsl_fuzz.py) |
 
 ### 2.1 Verified gaps
 
@@ -111,7 +111,7 @@ The four tiers are independent of each other, so postponing Tier 2 blocks nothin
 
 ### Common requirements
 
-The requirements of [`./formal-discovery-plan.md`](./formal-discovery-plan.md) ("Common requirements for every tier") apply unchanged: an A/B environment flag for behaviour changes (added to both wrappers, `docker-compose.yml` and `tests/test_remediation_p2_container.py`), acceptance on a `benchmark.py` run compared with `benchmark_compare.py`, docs updated in the same change, tests run with `-n auto`. Any pipeline bug found on the way goes into [`../troubleshooting/`](../troubleshooting/README.md) in the same session ([`../../AGENTS.md`](../../AGENTS.md)).
+The requirements of [`./formal-discovery-plan.md`](./formal-discovery-plan.md) ("Common requirements for every tier") apply unchanged: an A/B environment flag for behaviour changes (added to both wrappers, `docker-compose.yml` and `tests/test_remediation_p2_container.py`), acceptance on a `benchmark.py` run compared with `benchmark_compare.py`, docs updated in the same change, tests run with `-n auto`. Any pipeline bug found on the way goes into [`../troubleshooting/`](../../troubleshooting/README.md) in the same session ([`../../AGENTS.md`](../../../AGENTS.md)).
 
 ---
 
@@ -142,7 +142,7 @@ The requirements of [`./formal-discovery-plan.md`](./formal-discovery-plan.md) (
 |---|---|---|
 | Functions left with Unknown RTE goals / goals | 4 / 30 | 99 / 1,237 |
 | How Eva was obtained | Re-run with `run_eva_slice.py` on the run's sources and harnesses (its session was not kept), Frama-C 34.0~beta, `--no-warn-unsigned-downcast` as in the run. nlmsg matched the run: 72 Valid, 36 Unknown | The run's saved sessions, loaded in `framac-analysis:fc35dev`, which made them |
-| Functions with Eva results | 1: `mnl_nlmsg_batch_next` and `mnl_attr_nest_cancel` have 0 calls, and the one call to `mnl_nlmsg_fprintf_payload` is unreachable | 25: 21 of 92 in `libseccomp_a`, 4 of 4 in `scmp_bpf_disasm`, 0 of 3 in `scmp_bpf_sim`. The old harness stops at `db.c:1078` (gap D in [`../troubleshooting/eva.md`](../troubleshooting/eva.md)) |
+| Functions with Eva results | 1: `mnl_nlmsg_batch_next` and `mnl_attr_nest_cancel` have 0 calls, and the one call to `mnl_nlmsg_fprintf_payload` is unreachable | 25: 21 of 92 in `libseccomp_a`, 4 of 4 in `scmp_bpf_disasm`, 0 of 3 in `scmp_bpf_sim`. The old harness stops at `db.c:1078` (gap D in [`../troubleshooting/eva.md`](../../troubleshooting/eva.md)) |
 | `Eva_export` assertions | 0: `mnl_attr_next` is annotated but gets none | 218 in the unproved functions |
 | Filter: full type range / constant not in the code / `\false` / not in a goal / kept | none to filter | 111 / 57 / 15 / 31 / 4 |
 | WP: (a) proved from the code / (b) RTE goals closed / (c) need a new `requires` | 0 / 0 / 0 | 1 / 1 / 2 |
@@ -200,9 +200,9 @@ Design as written before the run:
 - **Go:** at least a few RTE goals close through assertions in (a).
 
 **Step 2, only on go.**
-- In [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py), add `collect_eva_export` next to `collect_flows`, with the same contract: hints only, a time limit, and a `status` field. It runs on the functions with Unknown alarms only.
-- In [`../../scripts/function_facts.py`](../../scripts/function_facts.py), apply the Step 1 filter and render the kept ranges beside the Unknown obligation, under "observed by Eva under this harness".
-- Brief rule (Step B of [`../../skills/framac-wp/prover_brief.md`](../../skills/framac-wp/prover_brief.md)): paste a range as an `assert` only if WP proves it; never add or strengthen a `requires` to make one hold.
+- In [`../../scripts/run_eva_slice.py`](../../../scripts/run_eva_slice.py), add `collect_eva_export` next to `collect_flows`, with the same contract: hints only, a time limit, and a `status` field. It runs on the functions with Unknown alarms only.
+- In [`../../scripts/function_facts.py`](../../../scripts/function_facts.py), apply the Step 1 filter and render the kept ranges beside the Unknown obligation, under "observed by Eva under this harness".
+- Brief rule (Step B of [`../../skills/framac-wp/prover_brief.md`](../../../skills/framac-wp/prover_brief.md)): paste a range as an `assert` only if WP proves it; never add or strengthen a `requires` to make one hold.
 - Put it behind the flag `FRAMAC_EVA_EXPORT_HINTS` (default off); `FRAMAC_PROVER_CONTEXT=off` removes it too.
 - Tests: parsing the annotated code, the three filter rules, and absence with the flag off.
 
@@ -223,14 +223,14 @@ Step 0 passes when, on one libmnl module and one QCBOR module, extraction finish
 **Which expressions to ask for.** Per loop, from the facts already computed: each inductive scalar, each `bound - scalar` for the operands of the guard, and each `walker - root` for a pointer walker and the formal it derives from. Differences are what make a candidate relational without reading domain internals.
 
 **Changes.**
-- [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py): `collect_loop_states` next to `collect_flows`, same contract. It decides nothing, and a failure or timeout only loses hints (`loop_states.status`). The report carries `loop_states` by kernel function name and loop line.
-- [`../../scripts/function_facts.py`](../../scripts/function_facts.py):
+- [`../../scripts/run_eva_slice.py`](../../../scripts/run_eva_slice.py): `collect_loop_states` next to `collect_flows`, same contract. It decides nothing, and a failure or timeout only loses hints (`loop_states.status`). The report carries `loop_states` by kernel function name and loop line.
+- [`../../scripts/function_facts.py`](../../../scripts/function_facts.py):
   - `_loop_record` gains `eva_candidates`: predicates over the function's own formals and locals.
   - **Relational first.** A candidate is `scalar <= bound`, `0 <= scalar` or `walker - root == scalar`, derived from the sign or the singleton value of a difference. A bound against a bare constant is kept only when that constant appears literally in the function's source (`_source_context` already collects literal uses). This rule is the main safeguard of the tier: Eva reports `i ∈ [0..16]` because the harness buffer has 16 bytes, and a prover given `i <= 16` may add `requires len <= 16` to make it hold. The guardrail cannot catch that, because its corpus comes from the same harness.
   - **`weaken` filter.** Keep a candidate only if each of its variables appears in the loop's guard, `scalars`, `pointer_walkers`, read or written lvalues, or in an Unknown RTE obligation located in the loop. Cap the candidates per loop.
   - `render_section` prints them under the loop as named clauses, headed as observations under this harness, not facts.
   - The facts cache key already covers "the Eva flows it was built from"; add the loop-state digest.
-- [`../../skills/framac-wp/prover_brief.md`](../../skills/framac-wp/prover_brief.md), Step B: candidates are hints; paste, then run both oracles; never add or strengthen a `requires` to make a candidate hold; drop a candidate that WP cannot establish or preserve.
+- [`../../skills/framac-wp/prover_brief.md`](../../../skills/framac-wp/prover_brief.md), Step B: candidates are hints; paste, then run both oracles; never add or strengthen a `requires` to make a candidate hold; drop a candidate that WP cannot establish or preserve.
 - Flag `FRAMAC_EVA_SEEDS`. The existing `FRAMAC_PROVER_CONTEXT=off` already removes the whole facts section and must remove these too.
 - Tests: `tests/test_function_facts.py` (difference to predicate, constant suppression, `weaken`, cap, rendering, absence with the flag off); parsing of the extraction output beside the existing `collect_flows` tests.
 
@@ -267,15 +267,15 @@ Step 0 passes when, on one libmnl module and one QCBOR module, extraction finish
 **Problem.** Gap 3. The responsibility paper gives the definition the verifier brief lacks: the responsible choice is the first free one after which the failure is guaranteed (Definition 1), and intermediaries such as the sink are not responsible because they are not free (Section 2.1, P2).
 
 **Changes.**
-- [`../../skills/framac-wp/crash_verifier_brief.md`](../../skills/framac-wp/crash_verifier_brief.md), Case A step 3 and Case B step 1: after the trace, name the **decision point**, the earliest step at which a value chosen outside the target makes the failure inevitable, and who controls it:
+- [`../../skills/framac-wp/crash_verifier_brief.md`](../../../skills/framac-wp/crash_verifier_brief.md), Case A step 3 and Case B step 1: after the trace, name the **decision point**, the earliest step at which a value chosen outside the target makes the failure inevitable, and who controls it:
   - `attacker_input`: bytes of the fuzz input;
   - `harness_choice`: an argument or state the harness sets;
   - `environment`: the return value of an external function, or configuration.
 
   Two rules follow. A `harness_choice` that no legitimate caller could make is `harness_induced`; this gives the existing harness audit a test. A fix patch belongs at or just after the decision point (the missing validation), not at the sink.
-- [`../../schemas/findings.schema.json`](../../schemas/findings.schema.json): an optional `decision_point` object (`file`, `line`, `function`, `controlled_by`, `description`) on `confirmed` and `needs_validation` records. Optional, so existing records still validate.
-- [`../../scripts/ledger.py`](../../scripts/ledger.py): `scaffold-verifier` emits the field; `ingest-verifier` accepts records with or without it.
-- [`../../scripts/generate_report.py`](../../scripts/generate_report.py): print it under the root cause, and list confirmed findings that share a decision point as possibly one defect. Report only: fingerprints and merging are unchanged.
+- [`../../schemas/findings.schema.json`](../../../schemas/findings.schema.json): an optional `decision_point` object (`file`, `line`, `function`, `controlled_by`, `description`) on `confirmed` and `needs_validation` records. Optional, so existing records still validate.
+- [`../../scripts/ledger.py`](../../../scripts/ledger.py): `scaffold-verifier` emits the field; `ingest-verifier` accepts records with or without it.
+- [`../../scripts/generate_report.py`](../../../scripts/generate_report.py): print it under the root cause, and list confirmed findings that share a decision point as possibly one defect. Report only: fingerprints and merging are unchanged.
 - Optional check for Case A: mutate the decision bytes of the minimized reproducer and replay. If the failure stays, the decision point is wrong. This uses the existing `replay` and `minimize` steps.
 - Tests: `tests/test_ledger.py` and `tests/test_promote_and_verifier.py` (scaffold and ingest, with and without the field, both shapes validating against the schema), and the report rendering. No test file references `findings.schema.json` by name today, so the validation cases go where the ingest tests are.
 
@@ -288,13 +288,13 @@ Step 0 passes when, on one libmnl module and one QCBOR module, extraction finish
 **Problem.** Gap 4. The agentic-interpretation paper separates how strong evidence is from how far it can be trusted, and shows why the two must not be merged: strong LLM-only support joined with weak checked refutation would otherwise read as "checked" (Section 4.1).
 
 **Changes.**
-- [`../../schemas/findings.schema.json`](../../schemas/findings.schema.json): `rejected` records gain `refutation_basis`, three of the paper's five levels:
+- [`../../schemas/findings.schema.json`](../../../schemas/findings.schema.json): `rejected` records gain `refutation_basis`, three of the paper's five levels:
   - `checked`: a tool output cited in `evidence` refutes the candidate (a rung or WP proves the property, Eva reports the statement Dead, a repaired harness no longer fails);
   - `located`: the record cites the file and line of the check or dead branch, with no tool output;
   - `model`: reasoning only.
-- [`../../skills/framac-wp/crash_verifier_brief.md`](../../skills/framac-wp/crash_verifier_brief.md): state the basis; `disproved_by_source` and `dead_code` need at least `located`.
-- [`../../scripts/ledger.py`](../../scripts/ledger.py), `ingest-verifier`: record the basis in the unit's attempt entry. For `dead_code`, check the claim against data already on disk (Eva's Dead status for the statement, Phase 1 per-function coverage) and raise the basis to `checked` when it agrees.
-- [`../../scripts/generate_report.py`](../../scripts/generate_report.py): count rejections by class and basis in `REPORT.md`.
+- [`../../skills/framac-wp/crash_verifier_brief.md`](../../../skills/framac-wp/crash_verifier_brief.md): state the basis; `disproved_by_source` and `dead_code` need at least `located`.
+- [`../../scripts/ledger.py`](../../../scripts/ledger.py), `ingest-verifier`: record the basis in the unit's attempt entry. For `dead_code`, check the claim against data already on disk (Eva's Dead status for the statement, Phase 1 per-function coverage) and raise the basis to `checked` when it agrees.
+- [`../../scripts/generate_report.py`](../../../scripts/generate_report.py): count rejections by class and basis in `REPORT.md`.
 - **Step 1 is record and report only.** Unit statuses do not change. After one benchmark run, decide from the counts whether a rejection below `checked` should stop returning a unit to `covered`.
 - Tests: `tests/test_ledger.py` and `tests/test_promote_and_verifier.py` (basis recorded, `dead_code` raised to `checked` only when Eva or coverage agrees, records without the field still ingest).
 
@@ -306,21 +306,21 @@ Step 0 passes when, on one libmnl module and one QCBOR module, extraction finish
 
 Three additions, implemented on branch `papers-generalization`. None has been run on a real target or through the wrapper; each was run on toy inputs in `framac-analysis:latest` or with mocked tools, as stated.
 
-**Loop invariant seeds (replaces Tier 1's Eva source).** [`../../scripts/loop_seeds.py`](../../scripts/loop_seeds.py), flag `FRAMAC_LOOP_SEEDS` (default off).
+**Loop invariant seeds (replaces Tier 1's Eva source).** [`../../scripts/loop_seeds.py`](../../../scripts/loop_seeds.py), flag `FRAMAC_LOOP_SEEDS` (default off).
 - Candidates come from the loop facts, not from Eva: `0 <= i`, `i <= bound`, the guarded `0 <= len ==> i <= len` for a signed bound, pointer-walker anchors on `\at(p, Pre)`, `p <= end`. A constant bound is kept only if the literal is in the function's code.
 - **Houdini with WP:** the candidates go into a private copy as `loop invariant seed_<n>`, WP is restricted to those goals (`-wp-prop`), and what it cannot establish or preserve is dropped until nothing drops. Measured on toy loops: about 1 s per round when everything proves, about 6 s with a failing goal at a 5 s goal timeout, 1 to 3 rounds. On eleven toy functions (bare contract plus `loop assigns`), pasting the proven seeds took the unproven memory-safety goals from 12 to 4 and helped five functions; the tool took 483 s in total with the no-harm check, 45 s without it.
 - **Corpus filter:** only on what WP dropped. The candidates are compiled with E-ACSL and the corpus is replayed with the guardrail machinery; a falsified candidate is dropped with the input, a survivor is printed as "held on every replayed corpus input, NOT proven". The replay stops at the first failure, so it falsifies one candidate per round.
 - **No-harm check:** proven seeds can still make a solver miss another goal (seen on a nested loop with a nonlinear index). The tool compares the function's unproven goals without and with the seeds and withholds the seeds that cost a goal. This adds two full WP runs per function.
-- The prover runs it at the start of Step B ([`../../skills/framac-wp/prover_brief.md`](../../skills/framac-wp/prover_brief.md)); the scheduler copies the report to `workspace/reports/loop_seeds/`. It never adds a `requires` and changes no unit status.
+- The prover runs it at the start of Step B ([`../../skills/framac-wp/prover_brief.md`](../../../skills/framac-wp/prover_brief.md)); the scheduler copies the report to `workspace/reports/loop_seeds/`. It never adds a `requires` and changes no unit status.
 - **Acceptance (open):** the A/B of Tier 1, on `FRAMAC_LOOP_SEEDS`: fewer prover iterations on functions with loops, no rise in `rejected_overconstrained`. The goal timeout and the caps come from toy measurements.
 
-**A weak rejection does not silence later tool evidence.** [`../../scripts/ledger.py`](../../scripts/ledger.py), flag `FRAMAC_REJECTION_REOPEN` (default on).
+**A weak rejection does not silence later tool evidence.** [`../../scripts/ledger.py`](../../../scripts/ledger.py), flag `FRAMAC_REJECTION_REOPEN` (default on).
 - Nothing carries rejections between runs, whatever the schema description says. Within a run, a verified candidate was never reopened by a later signal at the same sink.
 - Now a new reproduced failure (breaker crash, guardrail `code_fault` with an input, a reproducible fuzz artifact) reopens a rejection whose basis is `located`, `model`, unstated, or `checked` only because ingest raised it. A verifier-stated `checked` is not reopened; the evidence is recorded as contradicting it. A fault hypothesis reopens nothing.
 - The old rejection stays in the new record's `prior_verdicts`. Reopenings per candidate are bounded by the harness repair budget (`max_repair_attempts`, 2 without a sidecar), and a `harness_induced` rejection is not reopened by the same unrepaired harness.
 - The scheduler dispatches a second verifier for a reopened candidate.
 
-**Decision point checked by patch and replay.** [`../../scripts/decision_point_check.py`](../../scripts/decision_point_check.py), no flag (a tool the verifier runs).
+**Decision point checked by patch and replay.** [`../../scripts/decision_point_check.py`](../../../scripts/decision_point_check.py), no flag (a tool the verifier runs).
 - The verifier writes a small patch that neutralises the decision point. The tool builds the E-ACSL replay binary with and without it in the agent's scratch and replays the reproducers. `checked` means: the unpatched build fails with the candidate's failure and the patched build fails on no reproducer. Nothing more.
 - `decision_point.basis` (`checked`, `located`, `model`) is raised to `checked` by ingest only from an agreeing report on disk; a stated `checked` without one is lowered to `located`. No status or severity depends on it.
 - Run once in the container on a toy target: a bound-check patch gave `checked`, a patch that does not bound the index gave `not_removed`.
@@ -330,7 +330,7 @@ Three additions, implemented on branch `papers-generalization`. None has been ru
 
 | Item | Reason |
 | :--- | :--- |
-| Union-find lattice (1.5) | It is for authors of abstract domains. The pipeline uses Eva as a black box, and the paper's integration is in Codex. Watch item only: when mining upstream Frama-C ([`./backlog.md`](./backlog.md), Section 1a), note any Eva domain built on labelled union-find, since `x = y + k` is the shape of the pointer-offset invariants provers write by hand. |
+| Union-find lattice (1.5) | It is for authors of abstract domains. The pipeline uses Eva as a black box, and the paper's integration is in Codex. Watch item only: when mining upstream Frama-C ([`./backlog.md`](../backlog.md), Section 1a), note any Eva domain built on labelled union-find, since `x = y + k` is the shape of the pointer-offset invariants provers write by hand. |
 | Planning heuristics (1.6) | About PDDL planners; nothing maps to the pipeline. |
 | Resource bounds (1.7) | Functional programs only, a custom symbolic executor, and bounds valid only on the explored sizes. The pipeline has no cost model to feed. |
 | Static responsibility analysis (1.3, Appendix B) | No implementation exists and Eva has no backward analysis. |
@@ -345,7 +345,7 @@ $env:PYTHONIOENCODING="utf-8"
 python -m pytest tests/test_function_facts.py tests/test_eva_tuning.py tests/test_ledger.py tests/test_promote_and_verifier.py tests/test_workspace_overlay.py -n auto
 ```
 
-Then the full suite and static checks ([`../../skills/python-patterns/SKILL.md`](../../skills/python-patterns/SKILL.md)):
+Then the full suite and static checks ([`../../skills/python-patterns/SKILL.md`](../../../skills/python-patterns/SKILL.md)):
 
 ```powershell
 $env:PYTHONIOENCODING="utf-8"

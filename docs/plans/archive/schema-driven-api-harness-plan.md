@@ -7,7 +7,7 @@
 - **Evidence:** nanopb run-1 (2026-11-20, standard profile, module `libprotobuf_nanopb_a`),
   Section 2. Measured from the run's artifacts by the run supervisor, read only.
 - **Found:** 2026-11-20, while supervising nanopb run-1
-  ([`../runs/2026-11-20-nanopb-run1-supervision.md`](../runs/2026-11-20-nanopb-run1-supervision.md)).
+  ([`../runs/2026-11-20-nanopb-run1-supervision.md`](../../runs/2026-11-20-nanopb-run1-supervision.md)).
 - **Status:** proposal, not implemented. Nothing here was changed while the run was going.
 
 ## 1. The pattern
@@ -57,7 +57,7 @@ The consequences in the run:
 | :--- | :--- | :--- |
 | Phase 1 | 25 crash artifacts at 5 sites (`load_descriptor_values` `pb_common.c:17`, `advance_iterator` `:126`, `pb_field_iter_begin_extension` `:168`, `pb_field_iter_find` `:201`, `safe_read_bool` `pb_encode.c:130`). By dispatch case (the identity selector is the first input byte): **10** from a trusted descriptor filled from the input (`pb_decode` 2, `pb_decode_ex` 4, `pb_encode_ex` 4); **10** from a zeroed `iter`, an attacker parameter that holds a trusted descriptor pointer (`pb_field_iter_find` 5, `pb_field_iter_find_extension` 2, `pb_field_iter_next` 3); **5** from functions without attacker data (`pb_field_iter_begin_extension` 3, `_const` 2) | NULL or garbage descriptors and extension types: a violation of the API contract, which the Crash Verifiers must reject one by one |
 | Phase 2 | 783 properties, 98.34% discharged, but 1844 obligations Dead; non-terminating statements at `pb_common.c:126`, `:168`, `:201`. Dead by function: harness 534, `load_descriptor_values` 135, `decode_static_field` 127, `pb_field_set_to_default` 76, `pb_dec_varint` 75, `encode_array` 72, ... | Every path stops at the NULL descriptor accesses, so the decoder and encoder proper are never analysed. The ledger handles it correctly (Dead never counts as proof), but Eva contributes almost nothing for the codec |
-| Phase 0 / 1 | The shipped fuzzer `tests/fuzztest/fuzztest.c` is not built, and the mapped corpora (3670 + 7 + 2 inputs) feed no case (`seeds.writers.fuzz_assets`: "no imported corpus feeds a harness case that takes the whole input") | The corpora are whole messages for the `AllTypes` descriptors, which only the generator makes, and the recipe builds with `-Dnanopb_BUILD_GENERATOR=OFF`. Open entry in [`../troubleshooting/harnesses-and-seeds.md`](../troubleshooting/harnesses-and-seeds.md) ("A Shipped Fuzzer ... Cannot Feed the Run (nanopb)") |
+| Phase 0 / 1 | The shipped fuzzer `tests/fuzztest/fuzztest.c` is not built, and the mapped corpora (3670 + 7 + 2 inputs) feed no case (`seeds.writers.fuzz_assets`: "no imported corpus feeds a harness case that takes the whole input") | The corpora are whole messages for the `AllTypes` descriptors, which only the generator makes, and the recipe builds with `-Dnanopb_BUILD_GENERATOR=OFF`. Open entry in [`../troubleshooting/harnesses-and-seeds.md`](../../troubleshooting/harnesses-and-seeds.md) ("A Shipped Fuzzer ... Cannot Feed the Run (nanopb)") |
 | Phase 0 | `global_variables` in the model is empty | The runtime defines no descriptor. Instances exist only in generated sources |
 
 ## 3. What exists already
@@ -66,14 +66,14 @@ The consequences in the run:
 | :--- | :--- | :--- |
 | `input_sources[].params` (attacker parameters per entry) and `role: reader` | `schemas/threat_model.schema.json`, threat-model skill | The input of S1. Already filled by the threat-model skill; nothing reads it at harness time |
 | `trusted_callers` (functions only trusted code calls; preconditions may constrain values) | same schema | Per function, not per parameter. S5 needs the per-parameter form |
-| Struct initializers called before every case that takes the struct (`initializers()`, supervisor S10, `e70ede5` / `2fcd947`): a function named like an initializer (`_INIT_NAME_RE`: `*_init`, `*_new`, `*_create`, `*Init`) whose first parameter is a non-const pointer to the struct, preferring one that reads a (buffer, length) pair from the input. Entry "`--api` Cases Pass an All-Zero Context Struct" in [`../troubleshooting/harnesses-and-seeds.md`](../troubleshooting/harnesses-and-seeds.md) | `scripts/api_harness.py` | The right mechanism, but nanopb's builders miss its rule: `pb_istream_from_buffer` returns the stream by value and is named `*_from_*`; `pb_field_iter_begin` is named `*_begin`. S2 widens it |
+| Struct initializers called before every case that takes the struct (`initializers()`, supervisor S10, `e70ede5` / `2fcd947`): a function named like an initializer (`_INIT_NAME_RE`: `*_init`, `*_new`, `*_create`, `*Init`) whose first parameter is a non-const pointer to the struct, preferring one that reads a (buffer, length) pair from the input. Entry "`--api` Cases Pass an All-Zero Context Struct" in [`../troubleshooting/harnesses-and-seeds.md`](../../troubleshooting/harnesses-and-seeds.md) | `scripts/api_harness.py` | The right mechanism, but nanopb's builders miss its rule: `pb_istream_from_buffer` returns the stream by value and is named `*_from_*`; `pb_field_iter_begin` is named `*_begin`. S2 widens it |
 | Opaque-handle constructors (`handle_functions`) and out-parameter constructors (`outparam_constructors`) | `scripts/api_harness.py` | Same name rule; handles only |
 | Argument-domain rules A to F (supervisor S14, `08113dc` and following) and the open gaps G, H, I ("Most `--api` Crashes on a Library Come From Argument Values the API Documents as Invalid", same troubleshooting file) | `scripts/api_harness.py` | Gap H (fabricated internal objects) is the same family as SD1b; S1 and S2 cover the schema case of it |
 | Per-case Eva shards (`FRAMAC_EVA_SHARD_CASE_<k>`) | generated harness | S4: one case per schema instance gives per-instance Eva for free |
 | Corpus mapping to a case that takes the whole input | `scripts/fuzz_assets.py` (`map`, `import`) | S3: the shipped corpora feed the new "message for instance X" cases |
 | Shipped fuzzer skipped when it needs code outside the unit | Phase 0 skill (`skills/framac-slice/SKILL.md`) | S3 makes the generated sources part of the unit, so the rule no longer bites |
 | `harness_induced` rejection and its precondition | [`./harness-and-spec-papers-generalization-plan.md`](./harness-and-spec-papers-generalization-plan.md), Tier 1 | S1 removes most of these candidates at the source instead of rejecting them later |
-| Program harnesses | [`./fuzz-budget-design.md`](./fuzz-budget-design.md), P8 | An alternative for targets with a shipped fuzzer; S3 is the narrower route |
+| Program harnesses | [`./fuzz-budget-design.md`](../fuzz-budget-design.md), P8 | An alternative for targets with a shipped fuzzer; S3 is the narrower route |
 
 ## 4. Decisions
 
@@ -201,7 +201,7 @@ such run.
 ### S6: troubleshooting and skills
 
 - Close or update the two open nanopb entries in
-  [`../troubleshooting/harnesses-and-seeds.md`](../troubleshooting/harnesses-and-seeds.md).
+  [`../troubleshooting/harnesses-and-seeds.md`](../../troubleshooting/harnesses-and-seeds.md).
 - Describe the parameter roles in the Phase 0 and Phase 1 skills, and in the threat-model skill:
   the reviewer must check `params` on every entry, since the harness now depends on it.
 

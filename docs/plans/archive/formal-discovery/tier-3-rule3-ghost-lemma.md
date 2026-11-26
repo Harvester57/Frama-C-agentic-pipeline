@@ -4,7 +4,7 @@ Self-contained implementation plan. Parent document: [`../formal-discovery-plan.
 
 ## Goal
 
-The prover brief tells provers to write a file-scope `/*@ ghost ... */` lemma function; the merge splicer rejects exactly that block. Make the brief and the splicer agree, make the prover find out on its first iteration instead of at merge, and count the resulting gaps so the loss is visible per target. Troubleshooting entry: [`../../troubleshooting/wp-and-guardrail.md`](../../troubleshooting/wp-and-guardrail.md), "A Prover's Merge Is Refused ... After It Added a Ghost Lemma Function".
+The prover brief tells provers to write a file-scope `/*@ ghost ... */` lemma function; the merge splicer rejects exactly that block. Make the brief and the splicer agree, make the prover find out on its first iteration instead of at merge, and count the resulting gaps so the loss is visible per target. Troubleshooting entry: [`../../troubleshooting/wp-and-guardrail.md`](../../../troubleshooting/wp-and-guardrail.md), "A Prover's Merge Is Refused ... After It Added a Ghost Lemma Function".
 
 No new environment flag: this is a bug fix.
 

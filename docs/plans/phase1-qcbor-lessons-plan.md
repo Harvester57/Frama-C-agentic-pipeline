@@ -2,7 +2,7 @@
 
 - **Status:** Wave 0 (`F1`/`F2`/`F3`), Wave 1 (`W1-A`..`W1-E`), and Wave 2 (`W2-A`, `W2-B`, `W2-C`) implemented on `feat/phase1-qcbor-lessons` (2026-11-23); Wave 3 verification and QCBOR `v2.0-beta-1` acceptance rerun remain. Wave 0 merged the held supervision branches (`F1`, `F2`, `F3`) recorded in `docs/runs/2026-11-22-qcbor-run1-supervision.md` (see [`../runs/README.md`](../runs/README.md)).
 - **Evidence base:** read-only inspection of `QCBOR/run-1` (`v2.0-beta-1`, commit `47df2bc4240d`, `standard` profile, `main` at `069ab4b`, threat model SHA-256 `6b073f84...`) and pipeline source code on 2026-11-22.
-- **Related plans:** [`./fuzz-budget-design.md`](./fuzz-budget-design.md), [`./schema-driven-api-harness-plan.md`](./schema-driven-api-harness-plan.md), [`./api-sequence-fuzzing-papers-generalization-plan.md`](./api-sequence-fuzzing-papers-generalization-plan.md).
+- **Related plans:** [`./fuzz-budget-design.md`](./fuzz-budget-design.md), [`./archive/schema-driven-api-harness-plan.md`](./archive/schema-driven-api-harness-plan.md), [`./archive/api-sequence-fuzzing-papers-generalization-plan.md`](./archive/api-sequence-fuzzing-papers-generalization-plan.md).
 
 ---
 
@@ -71,7 +71,7 @@ All five workstreams branched from Wave 0, ran in parallel, and merged onto `fea
   - [`../../scripts/api_harness.py`](../../scripts/api_harness.py)
   - `tests/test_api_harness_caller_storage.py` (new)
 - **Design:**
-  - Generalize S2 ([`./schema-driven-api-harness-plan.md`](./schema-driven-api-harness-plan.md)) in `_param_roles`, `_single_cases_for_entry`, and `_bind_call` to recognize two trusted caller-storage shapes:
+  - Generalize S2 ([`./archive/schema-driven-api-harness-plan.md`](./archive/schema-driven-api-harness-plan.md)) in `_param_roles`, `_single_cases_for_entry`, and `_bind_call` to recognize two trusted caller-storage shapes:
     1. A trusted **by-value writable buffer struct** whose fields are a single writable byte/void pointer (`void *`, `unsigned char *`, `uint8_t *`, `char *`, non-`const` pointee) and a single size/length integer field (e.g., `UsefulBuf { void *ptr; size_t len; }`), with no function-pointer or other pointer fields.
     2. A trusted **writable `(void */byte *, size_t)` scratch pair** whose pointer is non-`const`.
   - Back each recognized parameter with a fixed `_Alignas(16) unsigned char <var>_buf[<spare>];` array owned by the harness and initialize its pointer/length to `(<var>_buf, sizeof(<var>_buf))` (or a fuzzed length clamped to `0..sizeof(<var>_buf)` only when the parameter is explicitly marked attacker-sized, never allowing out-of-bounds lengths or forged pointers).

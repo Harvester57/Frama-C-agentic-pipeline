@@ -6,7 +6,7 @@ pipeline path: `phase0_dump.ml` -> `phase0_model.build_model` -> `build_callgrap
 `generate_harness.generate_module_harness` -> `fuzz_build.build_module_binary` (sanitizers and/or
 E-ACSL) -> binary execution -> `run_eva_slice.run_eva_on_slice`.
 
-Covers every counterexample from `docs/plans/unit-split-address-flow-review.md` (CE-1..CE-7) plus
+Covers every counterexample from `docs/plans/archive/unit-split-address-flow-review.md` (CE-1..CE-7) plus
 deliberate link-stub abort detection (both ASan and E-ACSL, C4/C5) and deliberate omitted-body Eva
 rejection (C6). Opt-in via `FRAMAC_DOCKER_TESTS=1`.
 """
@@ -427,7 +427,7 @@ def _assert_clean_run(build: dict[str, Any], expected_marker: str) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------
-# Counterexamples CE-1 .. CE-7 (docs/plans/unit-split-address-flow-review.md section 1.2)
+# Counterexamples CE-1 .. CE-7 (docs/plans/archive/unit-split-address-flow-review.md section 1.2)
 # ---------------------------------------------------------------------------------------------------
 
 

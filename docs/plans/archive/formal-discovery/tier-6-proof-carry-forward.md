@@ -1,6 +1,6 @@
 # Tier 6: Cross-Run Proof Carry-Forward
 
-Self-contained implementation plan. Parent document: [`../formal-discovery-plan.md`](../formal-discovery-plan.md) (Section 3, Tier 6). Independent of the other tiers; it is the "publishing swept WP proofs" item of milestone M5 in [`../../guides/v2-design.md`](../../guides/v2-design.md) (Section 9) and [`../../guides/resources-and-caching.md`](../../guides/resources-and-caching.md) (Section 5, "WP results never reach the shared store today").
+Self-contained implementation plan. Parent document: [`../formal-discovery-plan.md`](../formal-discovery-plan.md) (Section 3, Tier 6). Independent of the other tiers; it is the "publishing swept WP proofs" item of milestone M5 in [`../../guides/v2-design.md`](../../../guides/v2-design.md) (Section 9) and [`../../guides/resources-and-caching.md`](../../../guides/resources-and-caching.md) (Section 5, "WP results never reach the shared store today").
 
 ## Goal
 

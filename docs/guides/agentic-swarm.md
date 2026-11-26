@@ -115,7 +115,7 @@ What WP 34 gives, measured in `framac-analysis:latest`: a proved goal carries th
 
 Both oracles record each iteration in the prover's scratch directory ([`../../scripts/prover_candidates.py`](../../scripts/prover_candidates.py)). Candidates that pass the guardrail are ranked by fewest unproven goals, then most proved goals. Only those compete, because a stronger `requires` can raise the proof ratio by excluding inputs. Clauses the prover added that hold whatever the code does (`\true`, `x == x`, `0 <= 1`; `acsl_ast.is_trivial_predicate`) earn no credit: a candidate with fewer of them wins a tie, and their goals are subtracted from the proved count (`FRAMAC_CANDIDATE_RANK=legacy` restores the plain count). The tracker tells the prover to stop when an iteration improves neither number. Before a stalled prover's report and partial contract are used, `wp_scheduler.py complete` restores its best candidate.
 
-A candidate that adds a top-level ACSL declaration outside the prover's function (a file-scope `/*@ ghost ... */` function, a `predicate`, a `lemma`) is never ranked: `merge-agent` would refuse the whole patch. The tracker diffs the declarations of `scratch/work` against `scratch/base` after every oracle run and lists them as `scope_violation_pending` in the first `candidate` block, with `next_synthesis_focus: "remove_top_level_acsl_declarations"`. A prover whose goal needs an inductive lemma stops with `proof_gap.reason` starting `inductive lemma required`; the ledger tags it `gap_kind: "inductive_lemma_required"` and `REPORT.md` counts those functions ([`../plans/formal-discovery/tier-3-rule3-ghost-lemma.md`](../plans/formal-discovery/tier-3-rule3-ghost-lemma.md)).
+A candidate that adds a top-level ACSL declaration outside the prover's function (a file-scope `/*@ ghost ... */` function, a `predicate`, a `lemma`) is never ranked: `merge-agent` would refuse the whole patch. The tracker diffs the declarations of `scratch/work` against `scratch/base` after every oracle run and lists them as `scope_violation_pending` in the first `candidate` block, with `next_synthesis_focus: "remove_top_level_acsl_declarations"`. A prover whose goal needs an inductive lemma stops with `proof_gap.reason` starting `inductive lemma required`; the ledger tags it `gap_kind: "inductive_lemma_required"` and `REPORT.md` counts those functions ([`../plans/archive/formal-discovery/tier-3-rule3-ghost-lemma.md`](../plans/archive/formal-discovery/tier-3-rule3-ghost-lemma.md)).
 
 ### What a Prover Starts From
 
@@ -134,7 +134,7 @@ These are hints. Eva's locations hold only under the harness (`a[0..15]`, not `o
 
 ### Loop Invariant Seeds (`FRAMAC_LOOP_SEEDS=on`, off by default)
 
-Eva does not hold the index-against-length relation at a widened loop head ([`../plans/papers-generalization-plan.md`](../plans/papers-generalization-plan.md), Tier 1, "Step 0 result"), so loop invariant candidates come from the loop facts and are filtered by the two oracles ([`../../scripts/loop_seeds.py`](../../scripts/loop_seeds.py)):
+Eva does not hold the index-against-length relation at a widened loop head ([`../plans/archive/papers-generalization-plan.md`](../plans/archive/papers-generalization-plan.md), Tier 1, "Step 0 result"), so loop invariant candidates come from the loop facts and are filtered by the two oracles ([`../../scripts/loop_seeds.py`](../../scripts/loop_seeds.py)):
 
 1. **Syntactic candidates**, over the function's own formals and locals:
    - `0 <= i` for a signed counter (a scalar whose every update is `i + k` or `i - k`);

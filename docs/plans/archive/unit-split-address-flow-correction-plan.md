@@ -1,11 +1,11 @@
 # Address-Flow Unit Split: Correction Plan
 
-- **Plans index:** [`./README.md`](./README.md)
-- **Original design:** [`./unit-split-address-flow.md`](./unit-split-address-flow.md)
+- **Plans index:** [`./README.md`](../README.md)
+- **Original design:** [`./unit-split-address-flow.md`](../unit-split-address-flow.md)
 - **Review findings:** [`./unit-split-address-flow-review.md`](./unit-split-address-flow-review.md) (verdict: **Rework**, blocking issues `B1`–`B9`)
 - **Base branch:** `claude/unit-split-indirect-edges` (`63cddeb`..`d1466bd`, on top of `origin/main` `7957660`)
 - **Implementation branch:** `fix/unit-split-address-flow` (commits `3dc1bfd` [C1], `a921072` [C2], `bb81795` [C3], `9462e81` [C4], `7aa4b3d` [C5], `36ba45f` [C6], `9b4a184` [C7.1], `e10d660` & `1fbe43a` [C7.2 nginx build fixes], plus C7.3 docs; merged to `main` on 2026-11-20 in `f956747`).
-- **Status:** Implemented (`C0`–`C7` complete); decisions settled as **D1(b)**, **D2(a)**, **D3(a)**, **D4(a)**. See [`./unit-split-address-flow.md`](./unit-split-address-flow.md) Section 2 and Section 6 for measured real nginx 1.31.9 dump-schema-6 and C7.2 validation numbers.
+- **Status:** Implemented (`C0`–`C7` complete); decisions settled as **D1(b)**, **D2(a)**, **D3(a)**, **D4(a)**. See [`./unit-split-address-flow.md`](../unit-split-address-flow.md) Section 2 and Section 6 for measured real nginx 1.31.9 dump-schema-6 and C7.2 validation numbers.
 
 This plan turns the nine blocking issues (`B1`–`B9`) and non-blocking defects recorded in [`./unit-split-address-flow-review.md`](./unit-split-address-flow-review.md) into ordered, independently testable implementation steps (`C0`–`C7`) for future implementation.
 
@@ -49,7 +49,7 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
 ## 3. Rules for Every Step
 
 - **One branch/worktree per step** (or sequential commits on a rework branch cut from `claude/unit-split-indirect-edges` `d1466bd`).
-- **Generated-text and doc guardrails:** edit files only with file-writing tools (no shell heredocs), keep LF line endings, no emojis, explicit `./` or `../` links in Markdown, and sync skill mirrors (`python tools/sync_skill_mirrors.py`) whenever [`../../skills/`](../../skills/framac-slice/SKILL.md) changes.
+- **Generated-text and doc guardrails:** edit files only with file-writing tools (no shell heredocs), keep LF line endings, no emojis, explicit `./` or `../` links in Markdown, and sync skill mirrors (`python tools/sync_skill_mirrors.py`) whenever [`../../skills/`](../../../skills/framac-slice/SKILL.md) changes.
 - **Standard checks** after every step (Windows PowerShell with `$env:PYTHONIOENCODING="utf-8"`):
 
   ```text
@@ -68,11 +68,11 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
 
 ### C0. Step 0 Measurement — Real Nginx Dump-Schema-6 Run (Settles D1, Prerequisite for B9)
 
-- **Goal:** Replace the ELF-relocation approximation in [`./unit-split-address-flow.md`](./unit-split-address-flow.md) with real Frama-C AST schema-6 facts on nginx 1.31.9, and measure **D1(a)** vs. **D1(b)** before changing the reach algorithm.
+- **Goal:** Replace the ELF-relocation approximation in [`./unit-split-address-flow.md`](../unit-split-address-flow.md) with real Frama-C AST schema-6 facts on nginx 1.31.9, and measure **D1(a)** vs. **D1(b)** before changing the reach algorithm.
 - **Code changes:** None (read-only measurement in an isolated scratch run directory; never write to `run-5`).
 - **Work:**
-  1. Mount `run-5/workspace/work` and `run-5/workspace/snapshot` read-only into a scratch run directory and run [`../../scripts/phase0_model.py`](../../scripts/phase0_model.py) (`phase0_dump.ml` schema 6) on `objs/nginx` inside `framac-analysis:latest` with explicit timeout and a dedicated `FRAMAC_RUN_TAG`.
-  2. Diff the resulting AST `address_refs`, `global_refs`, `init_functions`, and `init_globals` against the ELF-derived counts in [`./unit-split-address-flow.md`](./unit-split-address-flow.md) Table 2.1.
+  1. Mount `run-5/workspace/work` and `run-5/workspace/snapshot` read-only into a scratch run directory and run [`../../scripts/phase0_model.py`](../../../scripts/phase0_model.py) (`phase0_dump.ml` schema 6) on `objs/nginx` inside `framac-analysis:latest` with explicit timeout and a dedicated `FRAMAC_RUN_TAG`.
+  2. Diff the resulting AST `address_refs`, `global_refs`, `init_functions`, and `init_globals` against the ELF-derived counts in [`./unit-split-address-flow.md`](../unit-split-address-flow.md) Table 2.1.
   3. Run `unit_split.apply` on the real nginx schema-6 model under three variants: current branch reach, **D1(a)**, and **D1(b)**. Record cluster counts, `over_limit` count, function/line distributions, `build_sources` counts, and `link_stubs` counts.
 - **Stop / Decision rule:** If **D1(b)** keeps the within-limit cluster set within thresholds and close to current `build_sources` counts, adopt **D1(b)** in `C1`/`C2`; otherwise adopt **D1(a)**.
 
@@ -81,7 +81,7 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
 ### C1. AST & Model Completeness (`B1` cross-parse, `B2`/`B3` AST facts, `B5` global sizes, `B8` constructors & fallback globals)
 
 - **Goal:** Record complete AST facts in dump schema 6 and resolve cross-parse function/global references soundly in `phase0_model.py`.
-- **Owns:** [`../../scripts/phase0_dump.ml`](../../scripts/phase0_dump.ml), [`../../scripts/phase0_model.py`](../../scripts/phase0_model.py), [`../../schemas/phase0_model.schema.json`](../../schemas/phase0_model.schema.json), [`../../tests/test_phase0_model.py`](../../tests/test_phase0_model.py).
+- **Owns:** [`../../scripts/phase0_dump.ml`](../../../scripts/phase0_dump.ml), [`../../scripts/phase0_model.py`](../../../scripts/phase0_model.py), [`../../schemas/phase0_model.schema.json`](../../../schemas/phase0_model.schema.json), [`../../tests/test_phase0_model.py`](../../../tests/test_phase0_model.py).
 - **Changes:**
   1. **`scripts/phase0_dump.ml`:**
      - On each `GVar (vi, _, loc)` in `globals[]`, emit `"size"` (`I n` from `bytes_of vi.vtype` when known, else omit or `null`) so `fuzz_build.py` can emit accurately sized type-free `.bss` stubs in `C4`.
@@ -97,7 +97,7 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
      - Add optional `size` (`{"type": ["integer", "null"], "minimum": 1}`) to `global_variables` items (`additionalProperties: false` requires updating the schema).
      - Add optional `constructor` (`{"type": "boolean"}`) and (if D1(a)) `cast_address_refs` / `init_cast_functions`.
 - **Acceptance:**
-  - New unit tests in [`../../tests/test_phase0_model.py`](../../tests/test_phase0_model.py): cross-parse `address_refs` (`prog` referencing `libcore.a`), `global_refs` naming a global when a linked unit is `gcc_fallback`, `size` propagation, `constructor` propagation, and schema validation against `phase0_model.schema.json`.
+  - New unit tests in [`../../tests/test_phase0_model.py`](../../../tests/test_phase0_model.py): cross-parse `address_refs` (`prog` referencing `libcore.a`), `global_refs` naming a global when a linked unit is `gcc_fallback`, `size` propagation, `constructor` propagation, and schema validation against `phase0_model.schema.json`.
   - `phase0_model.selftest()` passes in `framac-analysis:latest`.
 
 ---
@@ -105,7 +105,7 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
 ### C2. DAG & Address-Flow Reach Rework (`B1` linked libraries, `B2`/`B3` reach, `B6` `.inc` sources, `B8` constructors & producer-consumer)
 
 - **Goal:** Make `unit_split.flow_reach` and `unit_split.build_plan` sound across linked libraries, external callbacks, function-pointer casts, `#include`d `.inc`/`.h` definitions, startup constructors, and producer-consumer splits.
-- **Owns:** [`../../scripts/build_callgraph_dag.py`](../../scripts/build_callgraph_dag.py), [`../../scripts/unit_split.py`](../../scripts/unit_split.py), [`../../schemas/callgraph_dag.schema.json`](../../schemas/callgraph_dag.schema.json), [`../../tests/test_dag_model_view.py`](../../tests/test_dag_model_view.py), [`../../tests/test_unit_split.py`](../../tests/test_unit_split.py).
+- **Owns:** [`../../scripts/build_callgraph_dag.py`](../../../scripts/build_callgraph_dag.py), [`../../scripts/unit_split.py`](../../../scripts/unit_split.py), [`../../schemas/callgraph_dag.schema.json`](../../../schemas/callgraph_dag.schema.json), [`../../tests/test_dag_model_view.py`](../../../tests/test_dag_model_view.py), [`../../tests/test_unit_split.py`](../../../tests/test_unit_split.py).
 - **Changes:**
   1. **`scripts/build_callgraph_dag.py` and `schemas/callgraph_dag.schema.json`:**
      - Declare `indirect_callees`, `address_refs`, `global_refs`, `constructor`, and (if D1(a)) `cast_address_refs` in `schemas/callgraph_dag.schema.json` under `definitions.function.properties`, plus `size` and `compiled_in` under `global_variables`, `linked_functions` (or `linked_modules`) under `definitions.module.properties`, and `cross_cluster_unclustered` under `split`.
@@ -121,14 +121,14 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
      - **B8 (constructors):** In `build_plan` / `flow_reach`, if any compiled `.c` file in `build_sources` defines a function with `constructor: true`, add it to `starts` and re-run `flow_reach` to fixpoint so startup-registered callbacks join `build_sources` (`ce7_ctor`).
      - **B8 (producer-consumer `unclustered`, D3):** After Step 2 (overlap merging) and before Step 3 (packing), compute `unit_reached = flow_reach(all entries)` and `lost = unit_reached - union(c["functions"])`. While `lost` is non-empty, try merging a producer cluster (whose `address_refs` or `globals` contain a function `f in lost`) with a consumer cluster (whose `indirect_callees` contain `f`) if the merged reach fits `max_functions` and `max_lines`. Any function still in `unit_reached - covered` after clustering is recorded in `rec["split"]["cross_cluster_unclustered"]` with a warning in `dag["warnings"]`.
 - **Acceptance:**
-  - Unit tests in [`../../tests/test_unit_split.py`](../../tests/test_unit_split.py) and [`../../tests/test_dag_model_view.py`](../../tests/test_dag_model_view.py) covering every counterexample shape (`ce1`, `ce2`, `ce3`, `ce4_inc`, `ce4_prodcons`, `ce7_ctor`), schema validation via `validate_artifacts.validate_dag`, and verification that unsplit small libraries stay unchanged.
+  - Unit tests in [`../../tests/test_unit_split.py`](../../../tests/test_unit_split.py) and [`../../tests/test_dag_model_view.py`](../../../tests/test_dag_model_view.py) covering every counterexample shape (`ce1`, `ce2`, `ce3`, `ce4_inc`, `ce4_prodcons`, `ce7_ctor`), schema validation via `validate_artifacts.validate_dag`, and verification that unsplit small libraries stay unchanged.
 
 ---
 
 ### C3. Harness Sources & `api_harness` Synchronization (`B1`, `B6` harness globals, `B7`)
 
 - **Goal:** Prevent `api_harness` cross-cluster struct initializers from re-inflating narrowed clusters back to whole-program builds, include harness-referenced globals in `_flow_harness_sources`, and keep `harness_<mod>.json` synchronized with `fuzz_build`.
-- **Owns:** [`../../scripts/api_harness.py`](../../scripts/api_harness.py), [`../../scripts/generate_harness.py`](../../scripts/generate_harness.py), [`../../tests/test_api_harness.py`](../../tests/test_api_harness.py), [`../../tests/test_api_harness_unit_initializers.py`](../../tests/test_api_harness_unit_initializers.py), [`../../tests/test_unit_split.py`](../../tests/test_unit_split.py).
+- **Owns:** [`../../scripts/api_harness.py`](../../../scripts/api_harness.py), [`../../scripts/generate_harness.py`](../../../scripts/generate_harness.py), [`../../tests/test_api_harness.py`](../../../tests/test_api_harness.py), [`../../tests/test_api_harness_unit_initializers.py`](../../../tests/test_api_harness_unit_initializers.py), [`../../tests/test_unit_split.py`](../../../tests/test_unit_split.py).
 - **Changes:**
   1. **`scripts/api_harness.py` (B7 / D2):**
      - Pass the cluster record (when `module` is an `address_flow` entry in `dag["submodules"]`) and split limits (`dag["unit_split"]`) into `initializers()` and `struct_destructors()`.
@@ -142,14 +142,14 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
      - In `_flow_harness_sources`: run `unit_split.flow_reach` over the unit's full link closure (`within_all`, B1) starting from `anchors + extra_fns` and seeded with `extra_globals`, then take `unit_split.build_plan(...)["build_sources"]`.
      - When `extra_fns` or `extra_globals` widens `sub["build_sources"]`, record `flow_build_sources` (tree-relative paths) in `harness_<mod>.json` so `fuzz_build._flow_cluster_files` sees the exact widened set, and emit a stderr warning if the widened reach exceeds `dag["unit_split"]` thresholds.
 - **Acceptance:**
-  - Tests in [`../../tests/test_api_harness_unit_initializers.py`](../../tests/test_api_harness_unit_initializers.py) and [`../../tests/test_unit_split.py`](../../tests/test_unit_split.py) proving: (i) an oversized cross-cluster initializer is rejected for a within-limit cluster while an in-cluster or small cross-cluster initializer is still chosen; (ii) `--dispatch-case "(void)api_use(&g_cfg);"` pulls `src/cfg.c` and its initializer callback `src/cb.c` into `sources`; (iii) widened `flow_build_sources` is persisted in `harness_<mod>.json`.
+  - Tests in [`../../tests/test_api_harness_unit_initializers.py`](../../../tests/test_api_harness_unit_initializers.py) and [`../../tests/test_unit_split.py`](../../../tests/test_unit_split.py) proving: (i) an oversized cross-cluster initializer is rejected for a within-limit cluster while an in-cluster or small cross-cluster initializer is still chosen; (ii) `--dispatch-case "(void)api_use(&g_cfg);"` pulls `src/cfg.c` and its initializer callback `src/cb.c` into `sources`; (iii) widened `flow_build_sources` is persisted in `harness_<mod>.json`.
 
 ---
 
 ### C4. E-ACSL-Safe Stubs, Type-Free `.bss` Globals, Single-Pass Build & Coverage Fix (`B4`, `B5`, `B7`, `B8`, `B9`)
 
 - **Goal:** Make `link_stubs.c` work identically in ASan/UBSan, full E-ACSL, and coverage builds; replace broken header-based `link_globals.c` for address-flow clusters with type-free `.bss` assembly definitions; eliminate double E-ACSL instrumentation; and fix symbol-lookup edge cases.
-- **Owns:** [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py), [`../../scripts/fuzz_coverage.py`](../../scripts/fuzz_coverage.py), [`../../tests/test_link_repair_flow_stubs.py`](../../tests/test_link_repair_flow_stubs.py), [`../../tests/test_coverage_link_repair.py`](../../tests/test_coverage_link_repair.py).
+- **Owns:** [`../../scripts/fuzz_build.py`](../../../scripts/fuzz_build.py), [`../../scripts/fuzz_coverage.py`](../../../scripts/fuzz_coverage.py), [`../../tests/test_link_repair_flow_stubs.py`](../../../tests/test_link_repair_flow_stubs.py), [`../../tests/test_coverage_link_repair.py`](../../../tests/test_coverage_link_repair.py).
 - **Changes:**
   1. **E-ACSL-safe function stubs (`fuzz_build.py`, B4 — verified in `framac-analysis:latest`):**
      - In `link_stubs_source`: replace `fprintf(stderr, ...)` with unbuffered `write(2, ...)` (`#include <unistd.h>`, `#include <stdlib.h>`) printing `FRAMAC_LINK_STUB_CALLED: <name> (not in the unit split's address-flow reach)\n` and calling `abort()`.
@@ -177,41 +177,41 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
   6. **Coverage exclusion (`fuzz_coverage.py`):**
      - In `_coverage_file_role`: return `"harness"` when `posixpath.basename(path) in (LINK_STUBS_FILE, LINK_GLOBALS_FILE)` or `"_link_globals/" in f"/{path}"`.
 - **Acceptance:**
-  - Unit tests in [`../../tests/test_link_repair_flow_stubs.py`](../../tests/test_link_repair_flow_stubs.py) and [`../../tests/test_coverage_link_repair.py`](../../tests/test_coverage_link_repair.py) covering `.bss` globals, static-name collision, `build_only_functions`, Attempt-1 pre-seeding (verifying `compile_eacsl_binary` is called once, not twice), `_discover_slice_functions` exclusion, and `_coverage_file_role`.
+  - Unit tests in [`../../tests/test_link_repair_flow_stubs.py`](../../../tests/test_link_repair_flow_stubs.py) and [`../../tests/test_coverage_link_repair.py`](../../../tests/test_coverage_link_repair.py) covering `.bss` globals, static-name collision, `build_only_functions`, Attempt-1 pre-seeding (verifying `compile_eacsl_binary` is called once, not twice), `_discover_slice_functions` exclusion, and `_coverage_file_role`.
 
 ---
 
 ### C5. Crash Triage & Ledger Pipeline-Defect Classification (`B4` / Design Open Item 2)
 
 - **Goal:** Ensure any `FRAMAC_LINK_STUB_CALLED` abort is classified as a pipeline reach defect, never fingerprinted or ingested as a target vulnerability candidate.
-- **Owns:** [`../../scripts/failure_identity.py`](../../scripts/failure_identity.py), [`../../scripts/crash_replay.py`](../../scripts/crash_replay.py), [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py), [`../../scripts/ledger.py`](../../scripts/ledger.py), [`../../tests/test_failure_identity.py`](../../tests/test_failure_identity.py), [`../../tests/test_crash_replay.py`](../../tests/test_crash_replay.py), [`../../tests/test_ledger.py`](../../tests/test_ledger.py).
+- **Owns:** [`../../scripts/failure_identity.py`](../../../scripts/failure_identity.py), [`../../scripts/crash_replay.py`](../../../scripts/crash_replay.py), [`../../scripts/run_eacsl_fuzz.py`](../../../scripts/run_eacsl_fuzz.py), [`../../scripts/ledger.py`](../../../scripts/ledger.py), [`../../tests/test_failure_identity.py`](../../../tests/test_failure_identity.py), [`../../tests/test_crash_replay.py`](../../../tests/test_crash_replay.py), [`../../tests/test_ledger.py`](../../../tests/test_ledger.py).
 - **Changes:**
   - Follow the existing `parse_eacsl_resource_abort` / `eacsl_resource_abort` architecture:
     1. In `failure_identity.py`: add `parse_link_stub_abort(text: str) -> dict | None` matching `^FRAMAC_LINK_STUB_CALLED:\s+(?P<symbol>[A-Za-z_]\w*)` (anchored at line start) and extracting `{symbol, message, caller}` (first non-runtime, non-`__framac_link_stub_called` frame from `_STACK_FRAME_RE`). Update `parse_runtime_failure` to return `None` when `parse_link_stub_abort(text)` matches (preventing a target `failure` or fingerprint).
     2. In `crash_replay.py` and `run_eacsl_fuzz.py`: detect `parse_link_stub_abort(out)` alongside `parse_eacsl_resource_abort(out)` and record `entry["link_stub_abort"] = record` on the artifact.
     3. In `ledger.py` (`ingest-fuzz`): filter out artifacts carrying `link_stub_abort` (or matching `parse_link_stub_abort(replay_log_tail)`) before creating target candidates; count them in `stats["link_stub_aborts"]` and record a pipeline-defect warning (`link_stub_aborts: [...]`) naming the module, stubbed symbol, and caller so the run flags the reach defect visibly.
 - **Acceptance:**
-  - Unit tests in [`../../tests/test_failure_identity.py`](../../tests/test_failure_identity.py), [`../../tests/test_crash_replay.py`](../../tests/test_crash_replay.py), and [`../../tests/test_ledger.py`](../../tests/test_ledger.py) using real ASan and E-ACSL stderr excerpts from `verify_plan_ideas.py`, confirming `failure is None`, `link_stub_abort["symbol"] == "far_fn"`, and zero target candidates created.
+  - Unit tests in [`../../tests/test_failure_identity.py`](../../../tests/test_failure_identity.py), [`../../tests/test_crash_replay.py`](../../../tests/test_crash_replay.py), and [`../../tests/test_ledger.py`](../../../tests/test_ledger.py) using real ASan and E-ACSL stderr excerpts from `verify_plan_ideas.py`, confirming `failure is None`, `link_stub_abort["symbol"] == "far_fn"`, and zero target candidates created.
 
 ---
 
 ### C6. Eva Missing-Body & Missing-Global Soundness Gate (`B6` / Design Open Item 3)
 
 - **Goal:** Make an address-flow reach miss loud in Phase 2 (Eva), matching the loudness of `FRAMAC_LINK_STUB_CALLED` in Phase 1.
-- **Owns:** [`../../scripts/run_eva_slice.py`](../../scripts/run_eva_slice.py), [`../../tests/test_eva_slice.py`](../../tests/test_eva_slice.py).
+- **Owns:** [`../../scripts/run_eva_slice.py`](../../../scripts/run_eva_slice.py), [`../../tests/test_eva_slice.py`](../../../tests/test_eva_slice.py).
 - **Changes:**
   1. Add `reject_address_flow_gaps(res, out_dir, module, dag_path, sources)` in `run_eva_slice.py`, modelled after `reject_stub_from_defects`, active only when `module` is a DAG submodule with `reach == "address_flow"`:
      - **Missing project bodies:** Parse `missing_spec_messages(eva_log)` and intersect with project functions defined in the unit or its `linked_modules` (excluding external libc/package functions). If non-empty, set `res["missing_project_bodies"]`, downgrade `status` from `"ok"` to `"analysis_error"` with `reason = "address_flow_missing_body"`, and prepend actionable lines to `error_summary`.
      - **Missing project globals:** Using the post-Eva `flows` / `inout` inputs of `eva_main` (when available), check whether any read global matches a project global in `dag["global_variables"]` whose defining `.c` file is not in `sources`. If non-empty, set `res["missing_project_globals"]` and set `status = "analysis_error"` with `reason = "address_flow_missing_global"`.
 - **Acceptance:**
-  - Unit tests in [`../../tests/test_eva_slice.py`](../../tests/test_eva_slice.py) verifying that (i) an external libc missing spec does not trigger the gate, (ii) a project function missing body in an `address_flow` cluster turns `status: "ok"` into `analysis_error` (`address_flow_missing_body`), and (iii) reading an omitted project global turns `status: "ok"` into `analysis_error` (`address_flow_missing_global`).
+  - Unit tests in [`../../tests/test_eva_slice.py`](../../../tests/test_eva_slice.py) verifying that (i) an external libc missing spec does not trigger the gate, (ii) a project function missing body in an `address_flow` cluster turns `status: "ok"` into `analysis_error` (`address_flow_missing_body`), and (iii) reading an omitted project global turns `status: "ok"` into `analysis_error` (`address_flow_missing_global`).
 
 ---
 
 ### C7. End-to-End Docker Counterexample Suite, Real Nginx Validation & Docs (`B9`)
 
 - **Goal:** Prove every counterexample from the review stays fixed end-to-end in `framac-analysis:latest`, validate real nginx 1.31.9 clusters through Phase 0 -> E-ACSL build -> fuzz -> coverage -> Eva, and bring all docs and skills into sync.
-- **Owns:** `tests/test_unit_split_docker.py` (new, `@pytest.mark.integration`, gated on `FRAMAC_DOCKER_TESTS=1`), [`./unit-split-address-flow.md`](./unit-split-address-flow.md), [`../guides/slicing-and-onboarding.md`](../guides/slicing-and-onboarding.md), [`../../skills/framac-slice/SKILL.md`](../../skills/framac-slice/SKILL.md) (plus `.agents/` and `.claude/` mirrors via `sync_skill_mirrors.py`), [`../troubleshooting/phase0-build-and-model.md`](../troubleshooting/phase0-build-and-model.md).
+- **Owns:** `tests/test_unit_split_docker.py` (new, `@pytest.mark.integration`, gated on `FRAMAC_DOCKER_TESTS=1`), [`./unit-split-address-flow.md`](../unit-split-address-flow.md), [`../guides/slicing-and-onboarding.md`](../../guides/slicing-and-onboarding.md), [`../../skills/framac-slice/SKILL.md`](../../../skills/framac-slice/SKILL.md) (plus `.agents/` and `.claude/` mirrors via `sync_skill_mirrors.py`), [`../troubleshooting/phase0-build-and-model.md`](../../troubleshooting/phase0-build-and-model.md).
 - **Work:**
   1. **Docker integration suite (`tests/test_unit_split_docker.py`):** Encode every counterexample (`ce1` linked library, `ce2` local/struct external callback, `ce3` function-pointer cast, `ce4_inc` included `.inc` global, `ce5` nginx-shaped non-self-contained header + by-value struct global, `ce6` dispatch-case global, `ce7` `__attribute__((constructor))`, plus deliberate stub-hit test in both ASan and E-ACSL verifying `FRAMAC_LINK_STUB_CALLED` and `parse_link_stub_abort`, plus deliberate omitted-body Eva test verifying `address_flow_missing_body`).
   2. **Real nginx 1.31.9 validation (isolated scratch run dir, dedicated `FRAMAC_RUN_TAG`, explicit timeouts):**
@@ -220,8 +220,8 @@ Steps `C2`, `C4`, and `C5` own disjoint files and can execute in parallel once `
      - Build both clusters with `build_module_binary(..., engine="auto")` and verify: single E-ACSL instrumentation pass, `rc=0`, wall clock and peak RSS well below the 3600 s / 10 GiB failure from run-5.
      - Run a short fuzz pass + `coverage` (verify zero `link_stub_aborts` and no `link_stubs.c` in target coverage) and `run_eva_slice.py` (verify `address_flow_missing_body`/`missing_global` gate passes).
   3. **Documentation updates:**
-     - Update [`./unit-split-address-flow.md`](./unit-split-address-flow.md) with real dump-schema-6 nginx measurements, fix Option A (`135 -> 137` target sources, not `134 -> 136`) and indirect-edge counts (`4753` type-match / `4761` total indirect), document the updated stub/global-`.bss`/Eva-gate/triage behavior, and record the policy for the remaining single-anchor `over_limit` clusters (Design Open Item 4).
-     - Update [`../guides/slicing-and-onboarding.md`](../guides/slicing-and-onboarding.md), [`../../skills/framac-slice/SKILL.md`](../../skills/framac-slice/SKILL.md) (run `python tools/sync_skill_mirrors.py`), and [`../troubleshooting/phase0-build-and-model.md`](../troubleshooting/phase0-build-and-model.md).
+     - Update [`./unit-split-address-flow.md`](../unit-split-address-flow.md) with real dump-schema-6 nginx measurements, fix Option A (`135 -> 137` target sources, not `134 -> 136`) and indirect-edge counts (`4753` type-match / `4761` total indirect), document the updated stub/global-`.bss`/Eva-gate/triage behavior, and record the policy for the remaining single-anchor `over_limit` clusters (Design Open Item 4).
+     - Update [`../guides/slicing-and-onboarding.md`](../../guides/slicing-and-onboarding.md), [`../../skills/framac-slice/SKILL.md`](../../../skills/framac-slice/SKILL.md) (run `python tools/sync_skill_mirrors.py`), and [`../troubleshooting/phase0-build-and-model.md`](../../troubleshooting/phase0-build-and-model.md).
 
 ---
 

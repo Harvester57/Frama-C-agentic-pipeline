@@ -25,6 +25,8 @@ Place each entry in the thematic sub-document matching the component or phase wh
 
 If you add a new thematic sub-document, add it both to the table in [`./README.md`](./README.md) and to the table above.
 
+[`./resolved.md`](./resolved.md) is not a thematic file: never add a new entry there. It only receives entries archived under section 4.
+
 ---
 
 ## 2. Entry Format
@@ -66,3 +68,27 @@ Because files in `docs/troubleshooting/` live **two levels below** the repositor
    python tools/check_generated_text.py docs/troubleshooting/
    ```
    This catches control characters, mangled ACSL escapes (`alse`, `orall`), and missing backslashes inside `/*@ ... */` or `//@ ...` regions.
+
+---
+
+## 4. Archiving Resolved Entries (`./resolved.md`)
+
+The thematic files list what is still actionable. Move an entry to [`./resolved.md`](./resolved.md) only when nothing in it is:
+
+- **Fixed:** every pipeline defect it records is fixed on `main`. Check that the commits are ancestors of `main` (`git merge-base --is-ancestor <sha> main`) and that the named regression test exists. A fix on an unmerged branch, or one that is "uncommitted", is not enough.
+- **Stale:** the script, flag, gate or file it describes no longer exists, or another entry supersedes it.
+- **One-off:** an upstream or target-side issue whose workaround is no longer needed, for example because the analysis image's opam patch queue now carries the upstream fix.
+
+These entries stay in their thematic file:
+
+- an entry with any part still open (an `**Open pipeline bug:**` / `**Open pipeline gap:**` marker, a "Still open" item, an unfiled upstream defect that still bites);
+- an upstream limitation or target-side issue whose workaround still applies, which is current guidance;
+- an entry that code comments, runtime messages or tests point to (`git grep -n "docs/troubleshooting" -- scripts tests skills`).
+
+To archive an entry:
+
+1. Cut it verbatim and put it under the `## From ./<file>` section of [`./resolved.md`](./resolved.md) for the file it came from.
+2. Add, as its first bullet, `- **Archived YYYY-MM-DD:** <fixed on main | stale | one-off>. <one-sentence reason with the commit or evidence>.`
+3. Reword any open marker left in it (for example `Pipeline bug (closed, see the archive note)`). Then `git grep -n -i "open pipeline" docs/troubleshooting/` still lists only open work.
+
+If an archived symptom comes back, move the entry back to its thematic file and mark the new part open. When a kept entry's status changes (a branch merges, an upstream report is filed), update its text in the same session.

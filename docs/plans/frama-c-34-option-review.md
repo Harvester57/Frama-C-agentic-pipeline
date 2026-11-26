@@ -1,6 +1,6 @@
 # Frama-C 34 option review (2026-11-14)
 
-Every option of the kernel and of the 36 plugins in `framac-analysis:latest` (Frama-C 34.0~beta), set against what the pipeline passes today, to find features the pipeline does not use. Nothing here is built yet; candidates 1-4 were tried on 2026-11-14 (see "Trial results"). Each candidate needs its own trial before any pipeline change, as with Tier 1b of [`./papers-generalization-plan.md`](./papers-generalization-plan.md).
+Every option of the kernel and of the 36 plugins in `framac-analysis:latest` (Frama-C 34.0~beta), set against what the pipeline passes today, to find features the pipeline does not use. Nothing here is built yet; candidates 1-4 were tried on 2026-11-14 (see "Trial results"). Each candidate needs its own trial before any pipeline change, as with Tier 1b of [`./archive/papers-generalization-plan.md`](./archive/papers-generalization-plan.md).
 
 ## Method
 
@@ -160,7 +160,7 @@ That needs a goal filter, for example `-wp-prop` on the unproved property names.
 
 ### Considered and not proposed
 
-- **Reduction plugin (`-reduc`).** Same Eva states as `-eva-annot`, with many more assertions and no per-function selection. See "Tier 1b" in [`./papers-generalization-plan.md`](./papers-generalization-plan.md).
+- **Reduction plugin (`-reduc`).** Same Eva states as `-eva-annot`, with many more assertions and no per-function selection. See "Tier 1b" in [`./archive/papers-generalization-plan.md`](./archive/papers-generalization-plan.md).
 - **`-eva-secure-flow`, `-eva-taint-auto`.**
   - Secure flow needs custom attributes on the target's data. The pipeline expresses Layers 5 and 6 through MetAcsl instead.
   - `-eva-taint-auto` only taints parameters of input functions (`scanf`, `fgets`). The pipeline's harnesses do not read through those, and the taint domain is already reachable through `--extra-domains`.

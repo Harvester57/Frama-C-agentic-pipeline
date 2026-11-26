@@ -24,6 +24,10 @@ If a symptom is not listed in the thematic guides below, look it up in the upstr
 | **Ledger, Verifier & Artifacts** | [`./ledger-and-verifier.md`](./ledger-and-verifier.md) | Schema validation (`function_id`, `coverage-ledger.json`, `findings.schema.json`), `scaffold-verifier` and `ingest-verifier` (`linked_units`, `deferred` units), `unresolved` deduplication, and candidate reopening after re-fuzzing. |
 | **Resources, Caches & Host Tooling** | [`./resources-and-infra.md`](./resources-and-infra.md) | Resource broker leases and static command allowlists, per-module stub cache keys, `loop_seeds.py` sizing and `no_harm` checks, `pipeline.mk` staging, `patterns.py`, PowerShell flag quoting, Windows skill mirror sync, and Cygwin fork failures. |
 
+### Resolved & Archived Entries
+
+[`./resolved.md`](./resolved.md) holds the entries moved out of the guides above because nothing in them is still actionable: the pipeline defect is fixed on `main`, what they describe no longer exists, or the one-off workaround is no longer needed. They are kept verbatim, grouped by the guide they came from, each with an `Archived` bullet giving the date and reason. Search it when an old error message is not in the thematic guides.
+
 ---
 
 ## Quick Lookup Commands
@@ -40,7 +44,7 @@ git grep -n -i "<error text or script>" docs/troubleshooting/
 git grep -n -i "<error text or script>" docs/troubleshooting/
 ```
 
-List all currently open pipeline bugs recorded across the guides:
+List all currently open pipeline bugs recorded across the guides (no archived entry matches):
 
 ```powershell
 git grep -n -i "open pipeline" docs/troubleshooting/

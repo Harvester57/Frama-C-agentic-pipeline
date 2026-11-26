@@ -8,7 +8,7 @@ Claims about a paper come from the paper itself (the part read is stated). Claim
 
 | Paper | Identifier | Assessed | Where | Decision |
 |---|---|---|---|---|
-| Loop Invariants from Counterexamples; Heurix; Responsibility Analysis; Agentic Interpretation; A Lattice of Union-Finds; Abstract Interpretation for Heuristic Search; Empirical Sound Resource Bounds | see the plan | before 2026-11-16 | [`./papers-generalization-plan.md`](./papers-generalization-plan.md) | see the plan |
+| Loop Invariants from Counterexamples; Heurix; Responsibility Analysis; Agentic Interpretation; A Lattice of Union-Finds; Abstract Interpretation for Heuristic Search; Empirical Sound Resource Bounds | see the plan | before 2026-11-16 | [`./archive/papers-generalization-plan.md`](./archive/papers-generalization-plan.md) | see the plan |
 | ProofCoder | arXiv 2611.14106 | 2026-11-16 | [`./proof-papers-generalization-plan.md`](./proof-papers-generalization-plan.md) | per-goal cost, residual census, Rocq trial |
 | VeriGen-C | arXiv 2610.30725 | 2026-11-16 | same plan | contract shape |
 | LLM-Assisted Verification in Dafny | arXiv 2611.16886 | 2026-11-16 | same plan | see the plan |
