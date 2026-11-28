@@ -831,7 +831,7 @@ def no_harm(
 # ---------------------------------------------------------------------------
 
 
-def _input_evidence(crash_input: str | None, corpus_dir: Path | None) -> dict:
+def _input_evidence(crash_input: str | None, corpus_dir: Path | None, max_corpus_inputs: int = 64) -> dict:
     """The falsifying input by content: the replay's own copy lives in a scratch directory."""
     if not crash_input:
         return {}
@@ -841,15 +841,34 @@ def _input_evidence(crash_input: str | None, corpus_dir: Path | None) -> dict:
     except OSError:
         return {"input": None}
     digest = hashlib.sha256(data).hexdigest()
-    name = None
-    if corpus_dir is not None and Path(corpus_dir).is_dir():
-        for item in sorted(Path(corpus_dir).iterdir()):
+    name: str | None = None
+    corpus_path = Path(corpus_dir) if corpus_dir is not None else None
+    if corpus_path is not None and corpus_path.is_dir():
+
+        def _matches(candidate: Path) -> bool:
             try:
-                if item.is_file() and item.stat().st_size == len(data) and item.read_bytes() == data:
-                    name = item.name
-                    break
+                return candidate.is_file() and candidate.stat().st_size == len(data) and candidate.read_bytes() == data
             except OSError:
-                continue
+                return False
+
+        # O(1) direct lookups first: libFuzzer's SHA-1 unit naming and promoted `seed-<sha256[:16]>` files.
+        sha1_name = hashlib.sha1(data, usedforsecurity=False).hexdigest()
+        for direct_name in (sha1_name, f"seed-{digest[:16]}"):
+            if _matches(corpus_path / direct_name):
+                name = direct_name
+                break
+
+        if name is None:
+            import run_eacsl_fuzz
+
+            chosen, _ = run_eacsl_fuzz.select_replay_inputs(
+                run_eacsl_fuzz._list_corpus_names(corpus_path),
+                max_corpus_inputs,
+            )
+            for item_name in chosen:
+                if _matches(corpus_path / item_name):
+                    name = item_name
+                    break
     return {"input": name, "input_sha256": digest, "input_size": len(data)}
 
 

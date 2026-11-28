@@ -1225,3 +1225,92 @@ def test_default_full_runner_caps_goal_timeout_and_wall_budget(tmp_path: Path, m
     assert res["status"] == "all_proven"
     assert seen["timeout"] <= ls.NO_HARM_GOAL_TIMEOUT_S
     assert seen["wall_timeout"] <= ls.NO_HARM_MAX_WALL_S // 2
+
+
+@pytest.mark.unit
+def test_input_evidence_finds_sha1_and_seed_files_in_o1_without_scanning_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import os
+
+    import run_eacsl_fuzz
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(20):
+        (corpus / f"{i:040x}").write_bytes(f"unrelated-{i}".encode())
+
+    # 1. libFuzzer SHA-1-named corpus file: found in O(1), never scans or stats unrelated files.
+    payload = b"qcbor-falsifying-input"
+    sha1_name = hashlib.sha1(payload, usedforsecurity=False).hexdigest()
+    sha256_hex = hashlib.sha256(payload).hexdigest()
+    (corpus / sha1_name).write_bytes(payload)
+    crash = tmp_path / "crash-sha1"
+    crash.write_bytes(payload)
+
+    orig_stat = Path.stat
+    statted: list[str] = []
+
+    def tracking_stat(self: Path, *args, **kwargs):
+        statted.append(self.name)
+        return orig_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "iterdir", lambda _self: pytest.fail("must not iterdir corpus_dir on O(1) hit"))
+    monkeypatch.setattr(os, "scandir", lambda *_a, **_k: pytest.fail("must not scandir corpus_dir on O(1) hit"))
+    monkeypatch.setattr(
+        run_eacsl_fuzz, "_list_corpus_names", lambda *_a, **_k: pytest.fail("must not list corpus on O(1) hit")
+    )
+    monkeypatch.setattr(Path, "stat", tracking_stat)
+
+    evidence = ls._input_evidence(str(crash), corpus)
+    assert evidence == {"input": sha1_name, "input_sha256": sha256_hex, "input_size": len(payload)}
+    assert not any(name.startswith("000000") for name in statted)
+
+    # 2. Promoted `seed-<sha256[:16]>` file: also found in O(1) without scanning.
+    seed_payload = b"promoted-seed-input"
+    seed_sha256 = hashlib.sha256(seed_payload).hexdigest()
+    seed_name = f"seed-{seed_sha256[:16]}"
+    (corpus / seed_name).write_bytes(seed_payload)
+    crash_seed = tmp_path / "crash-seed"
+    crash_seed.write_bytes(seed_payload)
+
+    statted.clear()
+    seed_evidence = ls._input_evidence(str(crash_seed), corpus)
+    assert seed_evidence == {"input": seed_name, "input_sha256": seed_sha256, "input_size": len(seed_payload)}
+    assert not any(name.startswith("000000") for name in statted)
+
+
+@pytest.mark.unit
+def test_input_evidence_fallback_is_bounded_by_select_replay_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(40):
+        (corpus / f"unit-{i:03d}").write_bytes(f"payload-{i}".encode())
+
+    # An input not present under a direct SHA-1 / seed-* name triggers the bounded fallback.
+    missing_payload = b"not-in-corpus"
+    crash = tmp_path / "crash-missing"
+    crash.write_bytes(missing_payload)
+
+    orig_stat = Path.stat
+    statted_units: set[str] = set()
+
+    def tracking_stat(self: Path, *args, **kwargs):
+        if self.name.startswith("unit-"):
+            statted_units.add(self.name)
+        return orig_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", tracking_stat)
+    evidence = ls._input_evidence(str(crash), corpus, max_corpus_inputs=5)
+    assert evidence == {
+        "input": None,
+        "input_sha256": hashlib.sha256(missing_payload).hexdigest(),
+        "input_size": len(missing_payload),
+    }
+    # At most max_corpus_inputs (5) non-targeted corpus files are statted, never all 40.
+    assert len(statted_units) <= 5
