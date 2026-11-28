@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -474,8 +476,8 @@ class FakeGuard:
         return self.verdicts.pop(0)
 
 
-def _passed(reached=3):
-    return {
+def _passed(reached=3, loop_reached: bool | dict | None = True):
+    res: dict = {
         "status": "passed_dynamic_oracle",
         "reach": {"functions": {"sum_int": reached}},
         "corpus_total": 5,
@@ -485,6 +487,9 @@ def _passed(reached=3):
         "unchecked_clauses": [],
         "unattributed_ignored_annotations": [],
     }
+    if loop_reached is not None:
+        res["loop_reached"] = loop_reached
+    return res
 
 
 def _rejected(label, crash_input=None):
@@ -973,3 +978,250 @@ def test_kernel_error_line_rejects_prefix_overlapping_filename() -> None:
     assert ls._kernel_error_line(result_ws, "sum.c") == 9
     result_dir_overlap = {"syntax_check": {"errors": ["[kernel] dir/not_sum.c:9: error", "dir/prefix_sum.c:10: error"]}}
     assert ls._kernel_error_line(result_dir_overlap, "sum.c") is None
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Stage 1 real-target blockers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_guard_runner_skips_when_remaining_budget_is_too_small(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import fuzz_build
+    import run_eacsl_fuzz
+
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", lambda *a, **k: pytest.fail("must not compile"))
+    monkeypatch.setattr(run_eacsl_fuzz, "run_guardrail_check", lambda *a, **k: pytest.fail("must not replay"))
+
+    runner = ls.default_guard_runner(
+        src, [str(src)], "-I.", "", tmp_path, "m", tmp_path / "out", deadline=time.monotonic() + 1.0
+    )
+    assert runner is not None
+    verdict = runner(src, "sum_int")
+    assert verdict["status"] == "timeout"
+
+    cands = ls.generate_candidates(_sum_int_record(), SUM_INT)
+    summary = ls.corpus_filter(SUM_INT, "sum_int", tmp_path / "copy.c", cands, runner)
+    assert summary["status"] == "timeout"
+    assert {c.corpus["verdict"] for c in cands} == {"not_tested"}
+
+
+@pytest.mark.unit
+def test_guard_runner_propagates_deadline_to_compile_and_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fuzz_build
+    import run_eacsl_fuzz
+
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    seen_compile: dict = {}
+    seen_replay: dict = {}
+
+    def fake_compile(*args, **kwargs):
+        seen_compile.update(kwargs)
+        # Verify the bounded runner caps timeout to remaining budget.
+        runner_fn = kwargs.get("runner")
+        assert callable(runner_fn)
+        return {"returncode": 0, "binary": str(tmp_path / "guard"), "ignored_annotations": []}
+
+    def fake_replay(*args, **kwargs):
+        seen_replay.update(kwargs)
+        return _passed()
+
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", fake_compile)
+    monkeypatch.setattr(run_eacsl_fuzz, "run_guardrail_check", fake_replay)
+
+    deadline = time.monotonic() + 20.0
+    runner = ls.default_guard_runner(src, [str(src)], "-I.", "", tmp_path, "m", tmp_path / "out", deadline=deadline)
+    assert runner is not None
+    verdict = runner(src, "sum_int")
+    assert verdict["status"] == "passed_dynamic_oracle"
+    assert "runner" in seen_compile
+    assert 1 <= seen_replay["timeout_s"] <= 20
+    assert seen_replay["per_input_timeout"] <= seen_replay["timeout_s"]
+
+
+@pytest.mark.unit
+def test_guard_runner_reports_compile_timeout_as_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import fuzz_build
+
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    monkeypatch.setattr(
+        fuzz_build,
+        "compile_eacsl_binary",
+        lambda *a, **k: {"returncode": 124, "reason": "eacsl_build_timeout"},
+    )
+    runner = ls.default_guard_runner(
+        src, [str(src)], "-I.", "", tmp_path, "m", tmp_path / "out", deadline=time.monotonic() + 30.0
+    )
+    assert runner is not None
+    assert runner(src, "sum_int")["status"] == "timeout"
+
+    def raise_timeout(*_a, **_k):
+        raise subprocess.TimeoutExpired(["frama-c"], timeout=5)
+
+    monkeypatch.setattr(fuzz_build, "compile_eacsl_binary", raise_timeout)
+    assert runner(src, "sum_int")["status"] == "timeout"
+
+
+@pytest.mark.unit
+def test_corpus_filter_requires_loop_entry_confirmation_for_held(tmp_path: Path) -> None:
+    # Function reached, but no loop_reached / reach.loops confirmation: never emit held_on_corpus_unproven.
+    cands = ls.generate_candidates(_sum_int_record(), SUM_INT)
+    ls.corpus_filter(SUM_INT, "sum_int", tmp_path / "sum.c", cands, FakeGuard([_passed(5, loop_reached=None)]))
+    assert {c.corpus["verdict"] for c in cands} == {"not_reached"}
+    assert all("loop entry" in str(c.corpus.get("reason") or "") for c in cands)
+
+    # Explicit loop_reached=False also refuses to emit held.
+    cands2 = ls.generate_candidates(_sum_int_record(), SUM_INT)
+    ls.corpus_filter(SUM_INT, "sum_int", tmp_path / "sum2.c", cands2, FakeGuard([_passed(5, loop_reached=False)]))
+    assert {c.corpus["verdict"] for c in cands2} == {"not_reached"}
+
+    # Falsified candidates are still recorded as falsified even when surviving loops are not confirmed reached.
+    wp = FakeWp([{"seed_2": ["preserved"], "seed_3": ["preserved"]}, {}])
+    report = _compute(tmp_path, wp, FakeGuard([_rejected("seed_2"), _passed(5, loop_reached=None)]))
+    assert report["held_on_corpus_unproven"] == []
+    by_name = {c["name"]: c for c in report["candidates"]}
+    assert by_name["seed_2"]["corpus"]["verdict"] == "falsified"
+    assert by_name["seed_3"]["corpus"]["verdict"] == "not_reached"
+    assert by_name["seed_3"]["label"] == "dropped"
+    assert "loop entry not confirmed" in ls.render(report)
+
+    # Per-loop reach confirmation via reach.loops only marks the confirmed loop as held.
+    two_loops_src = "void f(int n) {\n  int i, j;\n  for (i = 0; i < n; i++) {}\n  for (j = 0; j < n; j++) {}\n}\n"
+    rec = _record(
+        "f",
+        [
+            _loop(3, "i < n", [("i", ["i + 1"])], index=0),
+            _loop(4, "j < n", [("j", ["j + 1"])], index=1),
+        ],
+        [("n", "int")],
+    )
+    two_cands = ls.generate_candidates(rec, two_loops_src)
+    per_loop_guard = {
+        "status": "passed_dynamic_oracle",
+        "reach": {"functions": {"f": 5}, "loops": {0: 3, 1: 0}},
+        "corpus_total": 5,
+        "corpus_replayed": 5,
+        "corpus_sampled": False,
+        "unchecked_clauses": [],
+        "unattributed_ignored_annotations": [],
+    }
+    ls.corpus_filter(two_loops_src, "f", tmp_path / "f.c", two_cands, FakeGuard([per_loop_guard]))
+    assert {c.corpus["verdict"] for c in two_cands if c.loop_index == 0} == {"held"}
+    assert {c.corpus["verdict"] for c in two_cands if c.loop_index == 1} == {"not_reached"}
+
+
+@pytest.mark.unit
+def test_walker_anchor_rejects_struct_by_value_and_member_deref_pointers() -> None:
+    # Struct-by-value formal (like UsefulBuf UB): never anchor pointer walker p to UB.
+    ub_src = "void f(UsefulBuf UB) {\n  const unsigned char *p = (const unsigned char *)UB.ptr;\n  for (; p < end; p++) {}\n}\n"
+    ub_loop = _loop(3, "p < end", [("p", ["p + 1"])], walkers=["p"])
+    ub_rec = {
+        "name": "f",
+        "file": "m.c",
+        "code_lines": [],
+        "formals": [{"name": "UB", "type": "UsefulBuf", "kind": "aggregate"}],
+        "loops": [ub_loop],
+        "derived_pointers": {"p": "UB"},
+    }
+    ub_preds = _predicates(ub_rec, ub_src)
+    assert not any("UB" in pred for pred, _ in ub_preds)
+
+    # Struct-member pointer (like p = field->pData): never anchor p to enclosing struct pointer field.
+    field_src = (
+        "void enc(const pb_field_iter_t *field) {\n"
+        "  const char *p = (const char *)field->pData;\n"
+        "  for (; p < end; p++) {}\n"
+        "}\n"
+    )
+    field_loop = _loop(3, "p < end", [("p", ["p + 1"])], walkers=["p"])
+    field_rec = _record("enc", [field_loop], [("field", "pb_field_iter_t const *")], derived={"p": "field"})
+    field_preds = _predicates(field_rec, field_src)
+    assert not any("field" in pred for pred, _ in field_preds)
+    assert ("p <= end", "guard_upper") in field_preds
+
+    # Direct pointer copy (q = s) still anchors cleanly.
+    direct_src = "void ok(const char *s, const char *lim) {\n  const char *q = s;\n  for (; q < lim; q++) {}\n}\n"
+    direct_loop = _loop(3, "q < lim", [("q", ["q + 1"])], walkers=["q"])
+    direct_rec = _record("ok", [direct_loop], [("s", "char const *"), ("lim", "char const *")], derived={"q": "s"})
+    direct_preds = _predicates(direct_rec, direct_src)
+    assert ("\\at(s, Pre) <= q", "walker_anchor") in direct_preds
+    assert ("\\base_addr(q) == \\base_addr(\\at(s, Pre))", "walker_base") in direct_preds
+
+
+@pytest.mark.unit
+def test_pointer_walker_skips_null_guard_inequalities() -> None:
+    for guard in ("ext != (pb_extension_t *)0", "ext != NULL", "ext != 0"):
+        loop = _loop(3, guard, [], walkers=["ext"])
+        rec = _record("walk_ext", [loop], [("field", "pb_field_iter_t *")], derived={"ext": "field"})
+        src = "void walk_ext(pb_field_iter_t *field) {\n  pb_extension_t *ext = *(pb_extension_t **)field->pData;\n  while (ext != 0) { ext = ext->next; }\n}\n"
+        assert _predicates(rec, src) == [], guard
+
+    # Integer counter `n != 0` with downward step still emits `0 <= n`.
+    int_rec = _record("cnt", [_loop(3, "n != 0", [("n", ["n - 1"])])], [("n", "unsigned int")])
+    assert _predicates(int_rec, "void cnt(unsigned int n) {}\n") == [("0 <= n", "guard_lower")]
+
+
+@pytest.mark.unit
+def test_no_harm_budget_skips_when_remaining_budget_is_too_small(tmp_path: Path) -> None:
+    src = tmp_path / "sum.c"
+    src.write_text(SUM_INT, encoding="utf-8")
+    cands = ls.generate_candidates(_sum_int_record(), SUM_INT)
+    for c in cands:
+        c.wp = {"verdict": "proven", "round": 1}
+
+    def must_not_run(*_a):
+        raise AssertionError("full WP must not run when remaining budget is below NO_HARM_MIN_BUDGET_S")
+
+    check = ls.no_harm(
+        SUM_INT,
+        "sum_int",
+        tmp_path / "copy.c",
+        cands,
+        must_not_run,
+        deadline=time.monotonic() + (ls.NO_HARM_MIN_BUDGET_S - 2),
+    )
+    assert check["status"] == "budget_skipped"
+    assert check["runs"] == []
+    assert all("withheld" not in c.wp for c in cands)
+
+    report = ls.compute(
+        src,
+        "sum_int",
+        _sum_int_record(),
+        FakeWp([{}]),
+        None,
+        tmp_path / "c2",
+        deadline=time.monotonic() + (ls.NO_HARM_MIN_BUDGET_S - 2),
+        run_full=must_not_run,
+    )
+    assert report["no_harm"]["status"] == "budget_skipped"
+    assert report["proven"] != []
+    assert "were not checked" in ls.render(report)
+
+
+@pytest.mark.unit
+def test_default_full_runner_caps_goal_timeout_and_wall_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import run_wp_function
+
+    seen: dict = {}
+
+    def fake_run(**kwargs):
+        seen.update(kwargs)
+        return {"status": "all_proven", "unproven_goals": []}
+
+    monkeypatch.setattr(run_wp_function, "run_wp_on_function", fake_run)
+    monkeypatch.setattr(run_wp_function, "default_wall_timeout", lambda _cli: 3600)
+
+    runner = ls.default_full_runner(
+        Path("agents/p1/scratch/work/src/f.c"), "-I.", tmp_path / "wp_full", time.monotonic() + 40.0
+    )
+    res = runner(tmp_path / "copy" / "f.c", "f")
+    assert res["status"] == "all_proven"
+    assert seen["timeout"] <= ls.NO_HARM_GOAL_TIMEOUT_S
+    assert seen["wall_timeout"] <= ls.NO_HARM_MAX_WALL_S // 2

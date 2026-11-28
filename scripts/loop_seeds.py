@@ -47,6 +47,7 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -86,6 +87,13 @@ MAX_NO_HARM_RUNS = 4
 # a seed that proves does so in milliseconds (measured), and a seed lost to this limit is only a lost hint,
 # while every false candidate costs the whole limit.
 WP_GOAL_TIMEOUT_S = 5
+# No-harm check budget: cap per-goal timeout and wall time so proven seeds finish quickly.
+NO_HARM_GOAL_TIMEOUT_S = 5
+NO_HARM_MIN_BUDGET_S = 6
+NO_HARM_MAX_WALL_S = 15
+NO_HARM_BUDGET_FRACTION = 0.5
+# Minimum remaining seconds required to start an E-ACSL compile + corpus replay.
+MIN_GUARD_BUDGET_S = 5
 
 _AT = "\\at"
 _BASE_ADDR = "\\base_addr"
@@ -322,7 +330,43 @@ def _next_seed_number(span_text: str) -> int:
     return max((int(m.group(1)) for m in _SEED_NAME_RE.finditer(span_text)), default=0) + 1
 
 
-def _loop_candidates(loop: dict, record: dict, literals: set[int]) -> list[tuple[str, str, str | None]]:
+def _is_pointer_formal(formal: dict) -> bool:
+    """True only for object-pointer formals (never struct-by-value, scalar, or function pointer)."""
+    kind = formal.get("kind")
+    if kind is not None:
+        return kind == "pointer"
+    typ = str(formal.get("type") or "")
+    return "*" in typ and "(*" not in typ
+
+
+def _is_direct_pointer_anchor(span_text: str, walker: str, root: str) -> bool:
+    """
+    True when `walker` can share a base object with formal `root`. Rejects pointers loaded from a
+    struct member or pointer dereference of `root` (e.g. `p = field->pData`, `ext = *pp`).
+    """
+    if walker == root or not span_text:
+        return True
+    inits = [m.group(1) for m in re.finditer(rf"\b{re.escape(walker)}\s*(?<![=!<>])=(?!=)\s*([^;,]+)", span_text)]
+    if not inits:
+        return True
+    root_pat = re.escape(root)
+    deref_re = re.compile(rf"\b{root_pat}\s*(?:->|\.)|(?<!&)\b{root_pat}\s*\[|(?<![\w)])\*\s*\(?\s*{root_pat}\b")
+    direct_re = re.compile(rf"\b{root_pat}\b")
+    if any(deref_re.search(rhs) for rhs in inits):
+        return False
+    return any(direct_re.search(rhs) for rhs in inits)
+
+
+def _is_null_operand(op: Operand) -> bool:
+    """True for `NULL`, `0`, or `(T *)0`: never a meaningful pointer ordering bound."""
+    if op.text == "NULL":
+        return True
+    return not op.paths and op.literals == (0,)
+
+
+def _loop_candidates(
+    loop: dict, record: dict, literals: set[int], span_text: str = ""
+) -> list[tuple[str, str, str | None]]:
     """(predicate, template, predicate it relaxes) for one loop, strongest forms first."""
     steps = _steps(loop)
     walkers = [w for w in loop.get("pointer_walkers") or [] if re.fullmatch(_IDENT, w)]
@@ -340,7 +384,13 @@ def _loop_candidates(loop: dict, record: dict, literals: set[int]) -> list[tuple
 
     def anchor(walker: str) -> str | None:
         root = walker if walker in formals else derived.get(walker)
-        return f"{_AT}({root}, Pre)" if root and root in formals else None
+        if not root or root not in formals:
+            return None
+        if not _is_pointer_formal(formals[root]):
+            return None
+        if not _is_direct_pointer_anchor(span_text, walker, root):
+            return None
+        return f"{_AT}({root}, Pre)"
 
     def stable(bound: Operand) -> bool:
         if function_facts._TEMP_RE.search(bound.text):
@@ -374,6 +424,8 @@ def _loop_candidates(loop: dict, record: dict, literals: set[int]) -> list[tuple
         if not lhs.var or not (lhs.var in steps or lhs.var in walkers) or not stable(rhs):
             continue
         var = lhs.var
+        if var in walkers and _is_null_operand(rhs):
+            continue
         direction = steps.get(var, {}).get("direction")
         shown, bound = lhs.text, rhs.text
         base = anchor(var) if var in walkers else None
@@ -453,7 +505,7 @@ def generate_candidates(record: dict, text: str, mapped: Callable[[int], int] | 
     out: list[Candidate] = []
     loops = record.get("loops") or []
     by_index = {lp.get("index"): lp for lp in loops}
-    own = {lp.get("index"): _loop_candidates(lp, record, literals) for lp in loops}
+    own = {lp.get("index"): _loop_candidates(lp, record, literals, span_text) for lp in loops}
     for loop in loops:
         if loop.get("macro_expanded") or not isinstance(loop.get("line"), int):
             continue
@@ -686,9 +738,19 @@ def no_harm(
     `wp["withheld"]` on the seeds left out. A check that cannot run withholds nothing and says so.
     """
     summary: dict = {"status": "ok", "runs": [], "lost": [], "newly_proved": 0}
+    no_harm_deadline: float | None = None
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining < NO_HARM_MIN_BUDGET_S:
+            summary.update(
+                status="budget_skipped",
+                reason=f"remaining budget ({max(0.0, remaining):.1f}s) below {NO_HARM_MIN_BUDGET_S}s minimum",
+            )
+            return summary
+        no_harm_deadline = time.monotonic() + min(remaining * NO_HARM_BUDGET_FRACTION, float(NO_HARM_MAX_WALL_S))
 
     def out_of_time() -> bool:
-        return deadline is not None and time.monotonic() >= deadline
+        return no_harm_deadline is not None and time.monotonic() >= no_harm_deadline
 
     def measure(kept: list[Candidate]) -> tuple[dict, dict[str, int]]:
         seeded, lines, _ = insert_seeds(text, kept, path=copy.name)
@@ -705,12 +767,12 @@ def no_harm(
         )
         return result, lines
 
-    def skip(reason: str) -> dict:
-        summary.update(status="skipped", reason=reason)
+    def skip(reason: str, status: str = "skipped") -> dict:
+        summary.update(status=status, reason=reason)
         return summary
 
     if out_of_time():
-        return skip("no time left")
+        return skip("no time left", status="budget_skipped")
     base, _ = measure([])
     if not _usable(base):
         return skip(f"baseline WP run: {base.get('reason') or base.get('status')}")
@@ -732,7 +794,7 @@ def no_harm(
             seed.wp["withheld"] = reason
 
     if out_of_time():
-        return skip("no time left after the baseline run")
+        return skip("no-harm time budget spent after the baseline run", status="budget_skipped")
     full, lines = measure(proven)
     if not _usable(full):
         return skip(f"seeded WP run: {full.get('reason') or full.get('status')}")
@@ -830,6 +892,33 @@ def _unexecuted_seeds(guard: dict, function: str, copy: Path, testing: list[Cand
     return out
 
 
+def _loop_reached(guard: dict, seed: Candidate) -> bool:
+    """
+    True only when the dynamic oracle explicitly confirms that `seed`'s loop was entered.
+    Function-level reach alone is insufficient: a loop in an untaken branch never evaluates its
+    invariant, so a passing replay says nothing about candidates on that loop.
+    """
+    flag = guard.get("loop_reached")
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, dict):
+        val = flag.get(seed.loop_index, flag.get(str(seed.loop_index)))
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, int):
+            return val > 0
+    loops_reach = (guard.get("reach") or {}).get("loops")
+    if isinstance(loops_reach, dict):
+        val = loops_reach.get(seed.loop_index, loops_reach.get(str(seed.loop_index)))
+        if val is None:
+            val = loops_reach.get(seed.loop_line, loops_reach.get(str(seed.loop_line)))
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, int):
+            return val > 0
+    return False
+
+
 def corpus_filter(
     text: str,
     function: str,
@@ -879,6 +968,11 @@ def corpus_filter(
             "guard_status": status,
         }
         rounds.append(entry)
+        if status == "timeout":
+            summary["status"] = "timeout"
+            summary["reason"] = str(guard.get("reason") or "time budget spent")[:300]
+            leave(summary["reason"])
+            break
         if status == "passed_dynamic_oracle":
             reached = ((guard.get("reach") or {}).get("functions") or {}).get(function)
             replay = {k: guard.get(k) for k in ("corpus_total", "corpus_replayed", "corpus_sampled")}
@@ -892,8 +986,15 @@ def corpus_filter(
                 if seed.name in unexecuted:
                     # No check of this clause is known to have run: the replay did not evaluate it.
                     seed.corpus = {"verdict": "not_executed", "reason": unexecuted[seed.name], **replay}
-                elif ran:
+                elif ran and _loop_reached(guard, seed):
                     seed.corpus = {"verdict": "held", **replay}
+                elif ran:
+                    # Function ran, but loop entry was not confirmed: never emit a false held_on_corpus_unproven.
+                    seed.corpus = {
+                        "verdict": "not_reached",
+                        "reason": "loop entry not confirmed on corpus",
+                        **replay,
+                    }
                 else:
                     # No replayed input ran the function (or its reach is unknown): nothing was tested.
                     seed.corpus = {"verdict": "not_reached", **replay}
@@ -961,19 +1062,23 @@ def default_wp_runner(orig_file: Path, cppflags: str, out_dir: Path, deadline: f
 
 
 def default_full_runner(orig_file: Path, cppflags: str, out_dir: Path, deadline: float | None) -> FullWpRunner:
-    """Every goal of the function, at run_wp_function's own goal timeout (what the prover's run uses)."""
+    """Every goal of the function, with a capped per-goal timeout and wall budget for no-harm."""
     import run_wp_function
 
     def _run(copy: Path, function: str) -> dict:
         wall = run_wp_function.default_wall_timeout(None)
+        per_pass_cap = max(1, NO_HARM_MAX_WALL_S // 2)
+        wall = min(wall, per_pass_cap) if wall else per_pass_cap
         if deadline is not None:
             left = max(1, int(deadline - time.monotonic()))
-            wall = min(wall, left) if wall else left
+            wall = min(wall, left)
+        goal_timeout = min(NO_HARM_GOAL_TIMEOUT_S, wall)
         return run_wp_function.run_wp_on_function(
             c_file=copy,
             fn_name=function,
             out_dir=out_dir,
             cppflags=_with_include(orig_file.parent, cppflags),
+            timeout=goal_timeout,
             warn_unsigned_downcast=False,
             retry_bitwise=False,
             retry_tail=False,
@@ -993,6 +1098,7 @@ def default_guard_runner(
     corpus_dir: Path,
     module: str,
     out_dir: Path,
+    deadline: float | None = None,
 ) -> GuardRunner | None:
     """None when `orig_file` is not one of `sources`: there is nothing to substitute the copy for."""
     target = orig_file.resolve()
@@ -1005,9 +1111,30 @@ def default_guard_runner(
         import run_eacsl_fuzz
         from sandbox_exec import SandboxUnavailable
 
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left < MIN_GUARD_BUDGET_S:
+                return {
+                    "status": "timeout",
+                    "reason": f"remaining budget ({max(0.0, left):.1f}s) below {MIN_GUARD_BUDGET_S}s minimum",
+                }
+
         swapped = list(sources)
         swapped[index] = str(copy)
         out_dir.mkdir(parents=True, exist_ok=True)
+        compile_kwargs: dict = {}
+        if deadline is not None:
+
+            def _bounded_runner(*args, **kwargs):
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    cmd = args[0] if args else kwargs.get("args", ["eacsl"])
+                    raise subprocess.TimeoutExpired(cmd, timeout=0)
+                req = kwargs.get("timeout")
+                kwargs["timeout"] = min(float(req), rem) if req is not None else rem
+                return subprocess.run(*args, **kwargs)
+
+            compile_kwargs["runner"] = _bounded_runner
         try:
             # A plain build on purpose: it checks one seeded loop annotation of `function` on a copy,
             # and never loads the run's MetAcsl properties (only fuzz_build.build_module_binary does,
@@ -1020,9 +1147,22 @@ def default_guard_runner(
                 functions=[function],
                 ldflags_extra=ldflags,
                 use_cache=False,
+                **compile_kwargs,
             )
             if comp.get("returncode") != 0:
+                if deadline is not None and (
+                    comp.get("reason") == "eacsl_build_timeout" or time.monotonic() >= deadline
+                ):
+                    return {"status": "timeout", "reason": comp.get("reason") or "time budget spent"}
                 return {"status": "compile_error", "reason": comp.get("reason")}
+            guard_kwargs: dict = {}
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem < 1.0:
+                    return {"status": "timeout", "reason": "time budget spent after E-ACSL compile"}
+                guard_timeout = max(1, int(rem))
+                guard_kwargs["timeout_s"] = guard_timeout
+                guard_kwargs["per_input_timeout"] = min(run_eacsl_fuzz.GUARDRAIL_PER_INPUT_TIMEOUT_S, guard_timeout)
             # The corpus only, no mutation: "held on every replayed corpus input" means exactly that.
             return run_eacsl_fuzz.run_guardrail_check(
                 Path(comp["binary"]),
@@ -1034,7 +1174,10 @@ def default_guard_runner(
                 functions=[function],
                 # What this build's E-ACSL ignored: a seed among them was not replayed (corpus_filter).
                 ignored_annotations=comp.get("ignored_annotations"),
+                **guard_kwargs,
             )
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "reason": "time budget spent"}
         except SandboxUnavailable as exc:
             return {"status": "sandbox_unavailable", "reason": str(exc)}
 
@@ -1192,7 +1335,7 @@ def render(report: dict) -> str:
             f"without them and proves {check.get('newly_proved', 0)} more.",
             "",
         ]
-    elif check.get("status") == "skipped":
+    elif check.get("status") in ("skipped", "budget_skipped"):
         lines += [
             f"The proven seeds were not checked against the function's other goals ({check.get('reason')}): "
             "if a goal that proved before stops proving after you paste them, remove them.",
@@ -1249,7 +1392,11 @@ def render(report: dict) -> str:
                     name = corpus.get("input") or (corpus.get("input_sha256") or "")[:16] or "?"
                     why += f"; false on corpus input `{name}`"
                 elif corpus.get("verdict") == "not_reached":
-                    why += "; no replayed corpus input reaches this function"
+                    why += (
+                        f"; {corpus['reason']}"
+                        if corpus.get("reason")
+                        else "; no replayed corpus input reaches this function"
+                    )
                 elif corpus.get("verdict") == "not_executed":
                     known = str(corpus.get("reason") or "").startswith(NO_CHECK)
                     detail = "E-ACSL generated no check for it" if known else NO_CHECK_UNKNOWN
@@ -1311,7 +1458,9 @@ def run(
     try:
         guard = None
         if sources and corpus_dir is not None and corpus_dir.is_dir():
-            guard = default_guard_runner(c_file, sources, cppflags, ldflags, corpus_dir, module or "", tmp / "eacsl")
+            guard = default_guard_runner(
+                c_file, sources, cppflags, ldflags, corpus_dir, module or "", tmp / "eacsl", deadline=deadline
+            )
         return compute(
             c_file,
             function,
