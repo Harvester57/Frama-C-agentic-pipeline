@@ -19,6 +19,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,15 @@ from fuzz_common import (
 # Part of the build cache key: the shape of `ignored_annotations` in a build result. Raise it when
 # the list's fields or the rule that attributes an entry to a function change.
 IGNORED_ANNOTATIONS_VERSION = 1
+
+HARNESS_PROBE_ENV = "FRAMAC_HARNESS_PROBE"
+_ON_VALUES = frozenset({"on", "1", "true", "yes"})
+
+
+def harness_probe_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Whether fuzz-only per-case probe telemetry is enabled (`FRAMAC_HARNESS_PROBE`, default off)."""
+    src = os.environ if env is None else env
+    return (src.get(HARNESS_PROBE_ENV) or "").strip().lower() in _ON_VALUES
 
 
 def _decode(data) -> str:
@@ -1765,9 +1775,12 @@ def compile_sanitizer_binary(
     Cached like `compile_eacsl_binary` (binary and compile log) outside agents/*/scratch.
     """
     san_flags = "-fsanitize=fuzzer,address,undefined" if fuzzer_flag else "-fsanitize=address,undefined"
+    instrument_flags = [san_flags, "-fno-sanitize-recover=all"]
+    if fuzzer_flag and harness_probe_enabled():
+        instrument_flags.append("-DFRAMAC_FUZZ_PROBE_TELEMETRY")
     return _compile_clang_binary(
         "sanitizers",
-        [san_flags, "-fno-sanitize-recover=all"],
+        instrument_flags,
         ".sanitizer_compile.log",
         sources,
         out_bin,
