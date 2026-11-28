@@ -520,3 +520,125 @@ def test_package_fail_closed_and_lf_bundle_files(tmp_path: Path, monkeypatch: py
     run_sh = (bundle_dir / "run.sh").read_text(encoding="utf-8")
     assert "#!/usr/bin/env bash" in run_sh
     assert "docker build" in run_sh
+
+
+@pytest.mark.unit
+def test_extract_harness_prelude_preserves_includes_after_glibc_shim() -> None:
+    """Bug 1 regression: __GLIBC_INTERNAL_INT_TYPES_DEFINED shim must not cut target #includes."""
+    template_path = Path(__file__).resolve().parent.parent / "templates" / "harness_dual.c.template"
+    template_text = template_path.read_text(encoding="utf-8")
+    harness_text = template_text.replace("{{MODULE_HEADER}}", "qcbor/qcbor_decode.h").replace(
+        "{{MAX_INPUT_SIZE}}", "4096"
+    )
+    harness_text = harness_text.replace(
+        '#include "qcbor/qcbor_decode.h"',
+        '#include "UsefulBuf.h"\n#include "qcbor/qcbor_decode.h"\ntypedef struct { int x; } custom_ctx_t;',
+    )
+
+    prelude = repro_bundle._extract_harness_prelude(harness_text, {"header": "qcbor/qcbor_decode.h"})
+    assert '#include "UsefulBuf.h"' in prelude
+    assert '#include "qcbor/qcbor_decode.h"' in prelude
+    assert "typedef struct { int x; } custom_ctx_t;" in prelude
+    assert "__GLIBC_INTERNAL_INT_TYPES_DEFINED" not in prelude
+    assert "framac_fuzz_skip_case" not in prelude
+    assert "eva_main" not in prelude
+    assert "LLVMFuzzerTestOneInput" not in prelude
+
+
+@pytest.mark.unit
+def test_try_reproducer_resolves_relative_include_cppflags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug 2 regression: try_reproducer resolves relative -I/-isystem/-iquote/-include paths against run_dir."""
+    import shlex
+
+    run_dir, fp = _make_run_dir(tmp_path)
+    inc_dir = run_dir / "workspace" / "work" / "inc"
+    sys_dir = run_dir / "workspace" / "work" / "sysinc"
+    quote_dir = run_dir / "workspace" / "work" / "qinc"
+    force_hdr = run_dir / "workspace" / "work" / "config.h"
+    for d in (inc_dir, sys_dir, quote_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    force_hdr.write_text("/* config */\n", encoding="utf-8")
+
+    out_dir = tmp_path / "scaf_cppflags"
+    repro_bundle.scaffold_reproducer(run_dir=run_dir, fingerprint=fp, out_dir=out_dir)
+
+    build_spec_path = out_dir / "build_spec.json"
+    build_spec = json.loads(build_spec_path.read_text(encoding="utf-8"))
+    build_spec["cppflags"] = (
+        "-Iworkspace/work/inc "
+        "-I workspace/work/inc "
+        "-isystem workspace/work/sysinc "
+        "-isystemworkspace/work/sysinc "
+        "-iquote workspace/work/qinc "
+        "-iquoteworkspace/work/qinc "
+        "-include workspace/work/config.h "
+        "-I/usr/include "
+        "-Inonexistent/dir "
+        "-Dmain=__framac_module_main_libfoo"
+    )
+    build_spec_path.write_text(json.dumps(build_spec, indent=2), encoding="utf-8")
+
+    # Invoke from a completely separate cwd outside run_dir.
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+
+    captured: dict[str, Any] = {}
+
+    def fake_compile(sources, out_bin, **kwargs):
+        captured["sources"] = list(sources)
+        captured["cppflags"] = kwargs["cppflags"]
+        Path(out_bin).write_bytes(b"fake-bin")
+        return {"engine": "sanitizers", "returncode": 0, "binary": str(out_bin), "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(fuzz_build, "compile_sanitizer_binary", fake_compile)
+    monkeypatch.setattr(
+        sandbox_exec,
+        "run_sandboxed",
+        lambda *a, **kw: SandboxResult(1, "", SAMPLE_ASAN_HEAP_OUTPUT, False, "rlimits", ["repro"]),
+    )
+
+    res = repro_bundle.try_reproducer(
+        c_file=out_dir / "repro.c",
+        expected_path=out_dir / "expected.json",
+        build_spec_path=build_spec_path,
+    )
+    assert res["status"] == repro_bundle.STATUS_SAME_CRASH
+
+    tokens = shlex.split(captured["cppflags"])
+    assert f"-I{inc_dir}" in tokens
+    assert tokens[tokens.index("-I") + 1] == str(inc_dir)
+    assert tokens[tokens.index("-isystem") + 1] == str(sys_dir)
+    assert f"-isystem{sys_dir}" in tokens
+    assert tokens[tokens.index("-iquote") + 1] == str(quote_dir)
+    assert f"-iquote{quote_dir}" in tokens
+    assert tokens[tokens.index("-include") + 1] == str(force_hdr)
+    assert "-I/usr/include" in tokens
+    assert "-Inonexistent/dir" in tokens
+    assert "-Dmain=__framac_module_main_libfoo" in tokens
+
+
+@pytest.mark.unit
+def test_render_repro_c_undefs_main_before_entry() -> None:
+    """Bug 3 regression: repro.c must #undef main before int main(void) for -Dmain=... compatibility."""
+    dispatch_c = repro_bundle._render_repro_c(
+        module="libqcbor_a",
+        fingerprint="src/foo.c#fn::signed_overflow::1234567890",
+        prelude='#include "qcbor/qcbor_decode.h"',
+        payload=b"\x01\x02",
+        case_selector=72,
+        case_body="parse(fuzz_buf, fuzz_len);",
+        fuzzer_entry_fn=None,
+    )
+    assert "#ifdef main\n#undef main\n#endif\nint main(void) {" in dispatch_c
+
+    fallback_c = repro_bundle._render_repro_c(
+        module="libqcbor_a",
+        fingerprint="src/foo.c#fn::signed_overflow::1234567890",
+        prelude='#include "qcbor/qcbor_decode.h"',
+        payload=b"\x01\x02",
+        case_selector=None,
+        case_body=None,
+        fuzzer_entry_fn="int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return 0; }",
+    )
+    assert "#ifdef main\n#undef main\n#endif\nint main(void) {" in fallback_c

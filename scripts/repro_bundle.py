@@ -336,25 +336,29 @@ def _extract_harness_prelude(harness_text: str, sidecar: dict[str, Any]) -> str:
     before the template's runtime-skip / `eva_main` / `LLVMFuzzerTestOneInput` blocks.
     """
     if harness_text:
-        cut_markers = (
-            "#if !defined(__FRAMAC__) || defined(__FRAMAC_EACSL__)",
-            "#if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)",
-            "int eva_main(",
-            "int LLVMFuzzerTestOneInput(",
-        )
-        cut_pos = len(harness_text)
-        for marker in cut_markers:
-            pos = harness_text.find(marker)
-            if pos != -1 and pos < cut_pos:
-                cut_pos = pos
-        head = harness_text[:cut_pos]
-        # Strip Frama-C-only __GLIBC_INTERNAL_INT_TYPES_DEFINED shim if present.
-        head = re.sub(
+        # Strip Frama-C-only __GLIBC_INTERNAL_INT_TYPES_DEFINED shim first so its guard
+        # cannot match before target `#include` directives.
+        text = re.sub(
             r"#if defined\(__FRAMAC__\) && !defined\(__FRAMAC_EACSL__\) && !defined\(__GLIBC_INTERNAL_INT_TYPES_DEFINED\).*?#endif\s*#endif",
             "",
-            head,
+            harness_text,
             flags=re.DOTALL,
         )
+        cut_patterns = (
+            r"^#if !defined\(__FRAMAC__\) \|\| defined\(__FRAMAC_EACSL__\)\s*(?:/\*.*\*/\s*)?$",
+            r"^#if !defined\(__FRAMAC__\) && defined\(FRAMAC_FUZZ_PROBE_TELEMETRY\)\s*(?:/\*.*\*/\s*)?$",
+            r"^#if defined\(__FRAMAC__\) && !defined\(__FRAMAC_EACSL__\)\s*(?:/\*.*\*/\s*)?$",
+            r"\bstatic\s+inline\s+int\s+framac_fuzz_skip_case\s*\(",
+            r"\bstatic\s+void\s+framac_fuzz_dispatch\s*\(",
+            r"\b(?:int|void)\s+eva_main\s*\(",
+            r"\bint\s+LLVMFuzzerTestOneInput\s*\(",
+        )
+        cut_pos = len(text)
+        for pat in cut_patterns:
+            m = re.search(pat, text, flags=re.MULTILINE)
+            if m and m.start() < cut_pos:
+                cut_pos = m.start()
+        head = text[:cut_pos]
         # Drop duplicate standard headers we emit unconditionally at the top.
         out_lines: list[str] = []
         for line in head.splitlines():
@@ -457,6 +461,9 @@ def _render_repro_c(
         lines += [
             array_decl,
             "",
+            "#ifdef main",
+            "#undef main",
+            "#endif",
             "int main(void) {",
             f"    const size_t repro_len = {len_expr};",
             "    uint8_t *alloc_ptr = (uint8_t *)malloc(repro_len > 0U ? repro_len : 1U);",
@@ -509,6 +516,9 @@ def _render_repro_c(
     lines += [
         array_decl,
         "",
+        "#ifdef main",
+        "#undef main",
+        "#endif",
         "int main(void) {",
         f"    const size_t repro_len = {len_expr};",
         "    uint8_t *alloc_ptr = (uint8_t *)malloc(repro_len > 0U ? repro_len : 1U);",
@@ -770,6 +780,56 @@ def _resolve_build_sources(c_file: Path, build_spec: dict[str, Any]) -> list[str
     return sources
 
 
+def _is_abs_path_str(raw: str) -> bool:
+    return raw.startswith("/") or Path(raw).is_absolute()
+
+
+def _resolve_include_path(raw: str, run_dir: Path) -> str:
+    if not raw or _is_abs_path_str(raw):
+        return raw
+    candidate = run_dir / raw
+    if candidate.exists():
+        return str(candidate)
+    return raw
+
+
+def _resolve_cppflags(cppflags: str, run_dir: Path | None) -> str:
+    """Resolve relative `-I`/`-isystem`/`-iquote`/`-include` paths against `run_dir` when present there."""
+    if not cppflags or run_dir is None:
+        return cppflags
+    try:
+        tokens = shlex.split(cppflags)
+    except ValueError:
+        return cppflags
+
+    separate_flags = ("-I", "-isystem", "-iquote", "-include")
+    attached_prefixes = ("-isystem", "-iquote", "-I")
+
+    out: list[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok in separate_flags and i + 1 < n:
+            out.append(tok)
+            out.append(_resolve_include_path(tokens[i + 1], run_dir))
+            i += 2
+            continue
+        matched_prefix: str | None = None
+        for pref in attached_prefixes:
+            if tok.startswith(pref) and len(tok) > len(pref):
+                matched_prefix = pref
+                break
+        if matched_prefix is not None:
+            raw_path = tok[len(matched_prefix) :]
+            out.append(f"{matched_prefix}{_resolve_include_path(raw_path, run_dir)}")
+        else:
+            out.append(tok)
+        i += 1
+
+    return shlex.join(out)
+
+
 def try_reproducer(
     *,
     c_file: Path,
@@ -791,11 +851,11 @@ def try_reproducer(
     if resolved_engine not in ("sanitizers", "eacsl"):
         resolved_engine = "sanitizers"
 
-    sources = _resolve_build_sources(c_file, build_spec)
-    cppflags = str(build_spec.get("cppflags") or "-I.")
-    ldflags = str(build_spec.get("ldflags") or "")
     run_dir_raw = build_spec.get("run_dir")
     run_cwd = Path(str(run_dir_raw)) if run_dir_raw and Path(str(run_dir_raw)).is_dir() else None
+    sources = _resolve_build_sources(c_file, build_spec)
+    cppflags = _resolve_cppflags(str(build_spec.get("cppflags") or "-I."), run_cwd)
+    ldflags = str(build_spec.get("ldflags") or "")
 
     with tempfile.TemporaryDirectory(prefix="framac_repro_try_") as tmp_str:
         tmp_dir = Path(tmp_str)
