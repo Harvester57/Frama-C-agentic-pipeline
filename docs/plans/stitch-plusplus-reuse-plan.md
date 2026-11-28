@@ -1,6 +1,6 @@
 # STITCH++ Reuse Plan: Standalone C Reproducer Oracle & Per-Case Probe Telemetry
 
-- **Status:** Active (Wave 1 merged into `main` in `00120d43`; Wave 2 wiring/reporting and docs/skills in progress; Track 2 `FRAMAC_HARNESS_PROBE` stays default `off` pending Step 0 validation on a real target).
+- **Status:** Active (Wave 1 merged into `main` in `00120d43`; Wave 2 wiring/reporting and docs/skills merged; Track 2 Step 0 validation passed on real QCBOR `libqcbor_a` — 244 cases, 225 `healthy`, 19 `constant_return`, 0 quarantined — and `FRAMAC_HARNESS_PROBE` flipped to default `on`).
 - **Source:** Mechanisms adapted from STITCH++ (`stitch-fuzz` v0.2.0) without adopting its C++17 stub runtime or Docker lifecycle.
 - **Related plans:** [`./backlog.md`](./backlog.md#1h-api-sequence-fuzzing-paper-archiveapi-sequence-fuzzing-papers-generalization-planmd), [`./archive/api-sequence-fuzzing-papers-generalization-plan.md`](./archive/api-sequence-fuzzing-papers-generalization-plan.md), [`./fuzz-budget-design.md`](./fuzz-budget-design.md).
 
@@ -19,7 +19,7 @@ This plan brings two mechanisms from STITCH++ into the Frama-C verification pipe
 
 ### Design Constraints
 
-- **A/B flag defaults:** Track 2 is gated behind `FRAMAC_HARNESS_PROBE` (default **`off`**) until Step 0 validation on a real target (for example QCBOR or nanopb) confirms that known refusal-path cases land in `constant_return` / `init_always_fails` without false positives on healthy cases. Track 1 ([`../../scripts/repro_bundle.py`](../../scripts/repro_bundle.py)) is an explicit CLI tool invoked on demand and changes nothing in Phases 0-3.
+- **A/B flag defaults:** Track 2 is controlled by `FRAMAC_HARNESS_PROBE` (default **`on`**; `=off` for A/B rollback) after Step 0 validation on real QCBOR `libqcbor_a` (244 cases: 225 `healthy`, 19 `constant_return`, 0 quarantined) confirmed refusal-path cases land in `constant_return` without false positives on healthy cases. Track 1 ([`../../scripts/repro_bundle.py`](../../scripts/repro_bundle.py)) is an explicit CLI tool invoked on demand and changes nothing in Phases 0-3.
 - **No third fuzz binary for Track 2:** Rather than compiling a separate probe binary, [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py) passes `-DFRAMAC_FUZZ_PROBE_TELEMETRY` to the existing `.san` sanitizer build when `FRAMAC_HARNESS_PROBE=on`. At runtime, recording macros are a single branch unless `FRAMAC_PROBE_OUT=<path>` is set, and they are compiled out under `__FRAMAC__` (Eva and E-ACSL).
 - **Report-only telemetry:** Track 2 probe classifications (`never_reached`, `init_always_fails`, `constant_return`) are **advisory diagnostics** surfaced in `workspace/reports/smoke/<module>.json` and `REPORT.md`. They never quarantine cases or block Phase 1/2/3.
 
@@ -92,8 +92,8 @@ When the `.san` binary is built with `-DFRAMAC_FUZZ_PROBE_TELEMETRY` and run wit
 
 ### Contract 2: `FRAMAC_HARNESS_PROBE` Environment Variable
 
-- Canonical helper `harness_probe_enabled() -> bool` in [`../../scripts/harness_smoke.py`](../../scripts/harness_smoke.py) (and mirrored in [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py) and [`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py) via `_ON_VALUES = frozenset({"on", "1", "true", "yes"})`):
-  - **Default:** `off` (enabled only when `FRAMAC_HARNESS_PROBE` is one of `on`, `1`, `true`, `yes`, case-insensitive).
+- Canonical helper `harness_probe_enabled() -> bool` in [`../../scripts/harness_smoke.py`](../../scripts/harness_smoke.py) (and mirrored in [`../../scripts/api_harness.py`](../../scripts/api_harness.py), [`../../scripts/fuzz_build.py`](../../scripts/fuzz_build.py), and [`../../scripts/pipeline_make.py`](../../scripts/pipeline_make.py) via `_OFF_VALUES = frozenset({"off", "0", "false", "no"})`):
+  - **Default:** `on` (disabled only when `FRAMAC_HARNESS_PROBE` is one of `off`, `0`, `false`, `no`, case-insensitive).
   - Forwarded in [`../../wrappers/framac-docker.sh`](../../wrappers/framac-docker.sh) and [`../../wrappers/framac-docker.ps1`](../../wrappers/framac-docker.ps1).
 
 ### Contract 3: `expected.json` Schema (Track 1)
@@ -142,7 +142,7 @@ Validated by [`../../schemas/repro_expected.schema.json`](../../schemas/repro_ex
 
 ### Component 3 (Wave 1, `probe-runner` — Done): Probe Pass & Classification in `harness_smoke.py`
 
-- **[`../../scripts/harness_smoke.py`](../../scripts/harness_smoke.py):** adds `harness_probe_enabled()` (default `off`), `--probe-secs <int>` (default `5` when enabled, `0` otherwise), and `_run_health_probe(...)` after a clean or degraded dispatch smoke pass. Runs `.san` under [`../../scripts/sandbox_exec.py`](../../scripts/sandbox_exec.py) with `FRAMAC_PROBE_OUT`, `FRAMAC_FUZZ_SKIP_CASES`, `-ignore_crashes=1`, and per-case selector seeds, then classifies every active (non-quarantined) dispatch case:
+- **[`../../scripts/harness_smoke.py`](../../scripts/harness_smoke.py):** adds `harness_probe_enabled()` (default `on`; `=off` disables), `--probe-secs <int>` (default `5` when enabled, `0` otherwise), and `_run_health_probe(...)` after a clean or degraded dispatch smoke pass. Runs `.san` under [`../../scripts/sandbox_exec.py`](../../scripts/sandbox_exec.py) with `FRAMAC_PROBE_OUT`, `FRAMAC_FUZZ_SKIP_CASES`, `-ignore_crashes=1`, and per-case selector seeds, then classifies every active (non-quarantined) dispatch case:
   - `never_reached`: `runs == 0`.
   - `init_always_fails`: `runs > 0` and `init_fail == runs`.
   - `constant_return`: `runs >= 20`, `ret_kind != "void"`, `not unique_overflow`, and `len(unique_vals) == 1` (records `constant_value`).
@@ -161,7 +161,7 @@ Validated by [`../../schemas/repro_expected.schema.json`](../../schemas/repro_ex
 ### Component 5 (Wave 2, `docs-and-skills`): Documentation & Brief Updates
 
 - Record this plan in `./stitch-plusplus-reuse-plan.md`, register it in [`./README.md`](./README.md), and link it from Section 1h of [`./backlog.md`](./backlog.md).
-- Document `FRAMAC_HARNESS_PROBE` (default `off`) and [`../../scripts/repro_bundle.py`](../../scripts/repro_bundle.py) in [`../guides/resources-and-caching.md`](../guides/resources-and-caching.md) and [`../guides/v2-design.md`](../guides/v2-design.md).
+- Document `FRAMAC_HARNESS_PROBE` (default `on`; `=off` disables) and [`../../scripts/repro_bundle.py`](../../scripts/repro_bundle.py) in [`../guides/resources-and-caching.md`](../guides/resources-and-caching.md) and [`../guides/v2-design.md`](../guides/v2-design.md).
 - Add a concise note in [`../../skills/framac-wp/crash_verifier_brief.md`](../../skills/framac-wp/crash_verifier_brief.md) pointing to `repro_bundle.py` (`scaffold` / `try` / `package`) for standalone plain-C upstream reproducers, and sync mirrors with [`../../tools/sync_skill_mirrors.py`](../../tools/sync_skill_mirrors.py).
 
 ---
@@ -184,4 +184,4 @@ python tools/sync_skill_mirrors.py --check
 ### Step 0 Manual Validation (Post-Merge, Docker)
 
 1. **Track 1 (`repro_bundle.py`) end-to-end check in `framac-analysis:latest`:** run `repro_bundle.py scaffold` + `try` + `package` on a confirmed finding (or seeded benchmark target) and confirm `try` prints `SAME_CRASH` (exit `0`), a fixed `min.c` prints `NO_CRASH` (exit `1`), and `package` emits a runnable `Dockerfile` + `run.sh`.
-2. **Track 2 (`FRAMAC_HARNESS_PROBE=on`) Step 0 measurement:** run `harness_smoke.py run --probe-secs 5` with `FRAMAC_HARNESS_PROBE=on` on QCBOR (decode module) or nanopb, and verify that known refusal-path-only cases (`*InMap*` accessors on fresh contexts) are classified as `constant_return` while working decode/parse cases are classified as `healthy`. Keep `FRAMAC_HARNESS_PROBE` default `off` until this Step 0 check passes.
+2. **Track 2 (`FRAMAC_HARNESS_PROBE`) Step 0 measurement — Passed:** validated on real QCBOR `libqcbor_a` (244 cases: 225 `healthy`, 19 `constant_return`, 0 quarantined); refusal-path cases landed in `constant_return` with zero quarantines, so `FRAMAC_HARNESS_PROBE` was flipped from default `off` to default `on` (`=off` retains A/B rollback).

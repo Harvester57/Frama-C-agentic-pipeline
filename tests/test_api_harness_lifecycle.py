@@ -75,7 +75,9 @@ def test_lifecycle_case_builds_calls_by_input_byte_and_releases():
     assert "if (fc_k == 0U) {" in stmt and "(void)ctx_push((struct ctx *)fc_h, c1a1);" in stmt
     assert "else if (fc_k == 2U) { (void)ctx_sum((struct ctx *)fc_h); }" in stmt
     # Released once, after the loop, and only a constructed handle runs methods.
-    assert stmt.count("ctx_free(") == 1 and stmt.endswith("(void)ctx_free(fc_h); } (void)fuzz_off;")
+    assert stmt.count("ctx_free(") == 1 and stmt.endswith(
+        "(void)ctx_free(fc_h); } else { FRAMAC_PROBE_INIT_FAIL(harness_selector); } (void)fuzz_off;"
+    )
     assert "if (fc_h != 0) {" in stmt
     # No `case` label inside the case: seed_harvest.harness_cases reads them as dispatch cases.
     assert "case " not in stmt and "switch" not in stmt
@@ -281,7 +283,9 @@ def test_the_destructor_that_frees_wins_over_close_and_close_runs_first():
     assert life["calls"] == ["modbus_new_tcp", "modbus_free"]
     # Neither is a method: a free inside the loop would be a use after free the harness makes.
     assert life["methods"] == ["modbus_flush"]
-    assert stmt.endswith("(void)modbus_close(fc_h); (void)modbus_free(fc_h); } (void)fuzz_off;"), stmt
+    assert stmt.endswith(
+        "(void)modbus_close(fc_h); (void)modbus_free(fc_h); } else { FRAMAC_PROBE_INIT_FAIL(harness_selector); } (void)fuzz_off;"
+    ), stmt
     for name in ("modbus_free", "ctx_destroy", "foo_release", "x_unref", "FooFree", "ctx_delete"):
         assert ah._FREEING_DTOR_RE.search(name), name
     for name in ("modbus_close", "ctx_cleanup", "ctx_deinit", "ctx_fini"):

@@ -856,12 +856,12 @@ def test_pipeline_make_forwards_harness_probe_in_modules_mk(tmp_path, monkeypatc
 
     monkeypatch.delenv("FRAMAC_HARNESS_PROBE", raising=False)
     pm.generate(tmp_path)
+    mk_default = (tmp_path / pm.MODULES_MK).read_text(encoding="utf-8")
+    assert "HARNESS_PROBE := 1" in mk_default
+    assert "HARNESS_PROBE_ARGS := --probe-secs 5" in mk_default
+    assert "export FRAMAC_HARNESS_PROBE := on" in mk_default
+
+    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "off")
+    pm.generate(tmp_path)
     mk_off = (tmp_path / pm.MODULES_MK).read_text(encoding="utf-8")
     assert "HARNESS_PROBE" not in mk_off
-
-    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "on")
-    pm.generate(tmp_path)
-    mk_on = (tmp_path / pm.MODULES_MK).read_text(encoding="utf-8")
-    assert "HARNESS_PROBE := 1" in mk_on
-    assert "HARNESS_PROBE_ARGS := --probe-secs 5" in mk_on
-    assert "export FRAMAC_HARNESS_PROBE := on" in mk_on

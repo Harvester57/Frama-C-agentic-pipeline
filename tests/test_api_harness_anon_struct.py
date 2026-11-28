@@ -251,8 +251,8 @@ def test_pointers_to_anonymous_struct_typedefs_get_cases():
         assert "__anon" not in stmt, (name, stmt)
     # One object through the typedef, passed by address (the prototype's `const str_t *` takes it).
     assert "str_t c0a0; memset(&c0a0, 0, sizeof(c0a0));" in cases["str_check"]
-    assert "(void)str_check(&c0a0);" in cases["str_check"]
-    assert "(void)str_first(&c0a0);" in cases["str_first"]
+    assert "str_check(&c0a0)" in cases["str_check"]
+    assert "str_first(&c0a0)" in cases["str_first"]
     assert "num_t c0a0;" in cases["num_get"]
 
 
@@ -283,7 +283,7 @@ def test_outputs_and_sized_objects_are_declared_through_the_typedef():
     stmt = _as_cases(_as_plan(list(AS_API)))["str_copy"]
     # The destination: the call sites' 16 bytes, an array of `str_t`, cast to the header's type, zeroed.
     assert re.search(r"\bstr_t c0a0\[\(16 \+ sizeof\(str_t\) - 1\) / sizeof\(str_t\)\];", stmt), stmt
-    assert "(void)str_copy((str_t *)c0a0, &c0a1);" in stmt, stmt
+    assert "str_copy((str_t *)c0a0, &c0a1)" in stmt, stmt
     assert "c0a0[0].len" not in stmt  # an output is not filled from the input
     assert _clamped(stmt, "c0a1.len"), stmt
 

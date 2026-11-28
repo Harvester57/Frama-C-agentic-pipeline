@@ -305,7 +305,10 @@ def test_heap_buffer_prober_uses_calloc_and_free_for_writable_input() -> None:
     expected_spare = 2 * SPARE + 1024
     assert f"unsigned char *c0a0 = (unsigned char *)calloc(1, {expected_spare}U);" in stmt_a
     assert "if (c0a0 != 0 && rest_n > 0) { memcpy(c0a0, FRAMAC_FUZZ_COPY(fuzz_buf, fuzz_off), rest_n); }" in stmt_a
-    assert "if (c0a0 != 0) { (void)apply_sec((unsigned char *)c0a0, c0a1); } free(c0a0);" in stmt_a
+    assert "if (c0a0 != 0) {" in stmt_a
+    assert "apply_sec((unsigned char *)c0a0, c0a1)" in stmt_a
+    assert "free(c0a0);" in stmt_a
+    assert stmt_a.index("apply_sec((unsigned char *)c0a0, c0a1)") < stmt_a.index("free(c0a0);")
 
     # Direct caller with output-style neutral pair (`check_buf`) also gets heap allocation + free.
     _, stmt_c = by_fn["check_buf"]

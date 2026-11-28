@@ -610,9 +610,9 @@ def test_global_pointer_ownership_heap_freed_static_retained_and_stack_copied() 
     assert "struct arr_cfg_s c0a1; memset(&c0a1, 0, sizeof(c0a1));" in init_stmt
     assert "struct owned_cfg_s *c0a2 = (struct owned_cfg_s *)calloc(1, sizeof(struct owned_cfg_s));" in init_stmt
     assert "if (c0a2 != 0) {" in init_stmt
-    assert "(void)lib_init_with_cfgs(&c0a0, &c0a1, c0a2);" in init_stmt
+    assert "lib_init_with_cfgs(&c0a0, &c0a1, c0a2)" in init_stmt
     assert "(void)lib_shutdown();" in init_stmt
-    assert "} else { free(c0a2); }" in init_stmt
+    assert "} else { free(c0a2); FRAMAC_PROBE_INIT_FAIL(harness_selector); }" in init_stmt
 
     _, ret_stmt = by_fn["lib_register_ext"]
     # `g_retained` is a pointer global not freed by teardown -> `static` storage so it never dangles.

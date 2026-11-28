@@ -250,7 +250,7 @@ def test_mempool_configurator_stays_in_recorded_sequence_and_has_no_single_case(
     assert "_Bool c1a2; memset(&c1a2, 0, sizeof(c1a2));" in stmt
     assert "(void)QCBORDecode_Init((struct _QCBORDecodeContext *)s0, c0a1, c0a2);" in stmt
     assert "(void)QCBORDecode_SetMemPool((struct _QCBORDecodeContext *)s0, c1a1, c1a2);" in stmt
-    assert "(void)QCBORDecode_GetNext((struct _QCBORDecodeContext *)s0, &c2a1);" in stmt
+    assert "QCBORDecode_GetNext((struct _QCBORDecodeContext *)s0, &c2a1)" in stmt
     assert stmt.index("QCBORDecode_Init(") < stmt.index("QCBORDecode_SetMemPool(") < stmt.index("QCBORDecode_GetNext(")
 
     # Configurator consumes no fuzz slots and does not steal `rest` from QCBORDecode_Init.
@@ -750,7 +750,7 @@ def test_qcbor_run1_mempool_sequence_syntax_and_compile(tmp_path: Path, monkeypa
     assert "c1a1.ptr = (void *)c1a1_buf; c1a1.len = (unsigned long)sizeof(c1a1_buf);" in stmt
     assert "(void)QCBORDecode_Init((struct _QCBORDecodeContext *)s0, c0a1, c0a2);" in stmt
     assert "(void)QCBORDecode_SetMemPool((struct _QCBORDecodeContext *)s0, c1a1, c1a2);" in stmt
-    assert "(void)QCBORDecode_GetNext((struct _QCBORDecodeContext *)s0, (struct _QCBORItem *)c2a1);" in stmt
+    assert "QCBORDecode_GetNext((struct _QCBORDecodeContext *)s0, (struct _QCBORItem *)c2a1)" in stmt
     assert lay["rest"] == {"call": 0, "param": 1, "kind": "bytes", "off": 0}
 
     inc_dir = _QCBOR_RUN1_WS / "work" / "inc"

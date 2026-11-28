@@ -546,6 +546,7 @@ def test_sanitizer_build_keeps_its_command_after_sharing_the_clang_builder(tmp_p
         "-fcommon",
         "-fsanitize=fuzzer,address,undefined",
         "-fno-sanitize-recover=all",
+        "-DFRAMAC_FUZZ_PROBE_TELEMETRY",
         "-I.",
         "a.c",
         "-o",

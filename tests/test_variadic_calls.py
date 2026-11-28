@@ -486,7 +486,7 @@ def test_the_case_fixes_the_format_and_declares_the_call_sites_objects():
     # The object of the call site, at its size, on the stack, zeroed, passed by name.
     assert "char c0v0[80]; memset(c0v0, 0, sizeof(c0v0));" in stmt and "static char c0v0" not in stmt
     # The format is the literal; the sentence is the rest of the input, NUL-terminated.
-    assert '(void)scan((char *)c0a0, (char *)"s", c0v0);' in stmt
+    assert 'scan((char *)c0a0, (char *)"s", c0v0)' in stmt
     assert f"static _Alignas(16) unsigned char c0a0[{VA_SPARE}]" in stmt and "c0a0[rest_n] = 0;" in stmt
     assert layout == {
         "kind": "variadic",
@@ -504,11 +504,11 @@ def test_no_input_byte_reaches_the_format_or_an_object():
     assert stmt is not None and layout is not None
     assert "int c0v0; memset(&c0v0, 0, sizeof(c0v0));" in stmt
     assert "struct fl c0v1; memset(&c0v1, 0, sizeof(c0v1));" in stmt
-    assert '(void)scan((char *)c0a0, (char *)"tf", &c0v0, &c0v1);' in stmt
+    assert 'scan((char *)c0a0, (char *)"tf", &c0v0, &c0v1)' in stmt
     # The only copy from the input goes into the sentence's own buffer.
     assert re.findall(r"memcpy\((\w+)", stmt) == ["c0a0"]
     assert not re.search(r"memcpy\(&?c0v", stmt)
-    call = stmt[stmt.index("(void)scan(") :]
+    call = stmt[stmt.index("scan(") :]
     assert "fuzz_buf" not in call and "FRAMAC_FUZZ_COPY" not in call
     assert layout["slots"] == []
 
@@ -544,7 +544,7 @@ def test_a_format_that_is_not_a_const_string_in_the_model_makes_no_case():
     stmt, layout, _ = ah.variadic_case("emit", declared, {**S_SITE, "format_param": 2}, VA_SPARE)
     assert stmt is not None and layout is not None
     # A declaration (`...` in the signature): the other fixed parameters follow the usual rules.
-    assert '(char *)(fuzz_buf + fuzz_off), (unsigned long)(fuzz_len - fuzz_off), (char *)"s", c0v0);' in stmt
+    assert '(char *)(fuzz_buf + fuzz_off), (unsigned long)(fuzz_len - fuzz_off), (char *)"s", c0v0)' in stmt
     assert layout["rest"] == {"call": 0, "param": 0, "kind": "bytes"}
 
 
@@ -684,7 +684,7 @@ def test_generate_reads_the_report_and_the_seeds_come_from_the_literal_data(tmp_
         ("variadic", "tf", ["int", "struct fl"]),
     ]
     harness = (tmp_path / "workspace" / "harnesses" / "harness_lib.c").read_text()
-    assert '(char *)"s", c0v0);' in harness and "char c0v0[8];" in harness
+    assert '(char *)"s", c0v0)' in harness and "char c0v0[8];" in harness
     # Seeds without any recorded call: the selector, then the call sites' literal sentence, for every
     # case of that format.
     out = sh.write([])

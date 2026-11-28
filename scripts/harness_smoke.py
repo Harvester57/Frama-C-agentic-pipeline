@@ -92,7 +92,6 @@ LOG_TAIL_CHARS = 3000
 STACK_TRACE_MAX_CHARS = 4000
 
 _OFF_VALUES = frozenset({"off", "0", "false", "no"})
-_ON_VALUES = frozenset({"on", "1", "true", "yes"})
 PROBE_STATUSES = ("never_reached", "init_always_fails", "constant_return", "low_samples", "healthy")
 PROBE_FLAGGED_STATUSES = frozenset({"never_reached", "init_always_fails", "constant_return"})
 _RUNNING_RE = re.compile(r"^Running:\s+(?P<path>\S+)\s*$", re.MULTILINE)
@@ -109,8 +108,8 @@ def harness_smoke_enabled() -> bool:
 
 
 def harness_probe_enabled() -> bool:
-    """Whether the advisory per-case health probe pass is enabled (`FRAMAC_HARNESS_PROBE`, default off)."""
-    return (os.environ.get("FRAMAC_HARNESS_PROBE") or "").strip().lower() in _ON_VALUES
+    """Whether the advisory per-case health probe pass is enabled (`FRAMAC_HARNESS_PROBE`, default on; `=off` disables)."""
+    return (os.environ.get("FRAMAC_HARNESS_PROBE") or "").strip().lower() not in _OFF_VALUES
 
 
 @dataclass(frozen=True)

@@ -159,7 +159,7 @@ def harness_smoke_enabled() -> bool:
 
 
 def harness_probe_enabled() -> bool:
-    """True when FRAMAC_HARNESS_PROBE enables the advisory per-case health probe (default off; `=on` enables)."""
+    """True when FRAMAC_HARNESS_PROBE enables the advisory per-case health probe (default on; `=off` disables)."""
     return harness_smoke.harness_probe_enabled()
 
 

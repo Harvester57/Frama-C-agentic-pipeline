@@ -117,7 +117,7 @@ def test_byte_array_of_several_call_site_sizes_is_zero_terminated():
     assert stmt is not None and layout is not None
     fill = stmt.index("memcpy(c0a0,")
     term = stmt.index("c0a0[sizeof(c0a0) - 1] = 0;")
-    call = stmt.index("(void)walk(")
+    call = stmt.index("walk(")
     assert fill < term < call
     # The slot layout (what seeds fill) is unchanged: 6 input bytes.
     assert layout["slots"] == [{"call": 0, "param": 0, "size": 6, "kind": "bytes"}]

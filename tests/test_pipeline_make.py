@@ -99,6 +99,9 @@ GOLDEN_MODULES_MK = f"""\
 # a shell word (shlex.quote) with $ and # escaped for make.
 PROFILE := quick
 HARNESS_SMOKE := 1
+HARNESS_PROBE := 1
+HARNESS_PROBE_ARGS := --probe-secs 5
+export FRAMAC_HARNESS_PROBE := on
 FUZZ_EXPLORE_JUDGE := 1
 MODULES := cfg log snmp
 FUZZ_MODULES := cfg log snmp

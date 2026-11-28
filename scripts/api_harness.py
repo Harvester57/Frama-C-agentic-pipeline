@@ -455,13 +455,12 @@ def api_trust_schema_enabled(env: Mapping[str, str] | None = None) -> bool:
 
 
 HARNESS_PROBE_ENV = "FRAMAC_HARNESS_PROBE"
-_ON_VALUES = frozenset({"on", "1", "true", "yes"})
 
 
 def harness_probe_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """Whether fuzz-only per-case probe telemetry is enabled (`FRAMAC_HARNESS_PROBE`, default off)."""
+    """Whether fuzz-only per-case probe telemetry is enabled (`FRAMAC_HARNESS_PROBE`, default on; `=off` disables)."""
     src = os.environ if env is None else env
-    return (src.get(HARNESS_PROBE_ENV) or "").strip().lower() in _ON_VALUES
+    return (src.get(HARNESS_PROBE_ENV) or "").strip().lower() not in _OFF_VALUES
 
 
 def _words(name: str | None) -> list[str]:
@@ -699,7 +698,7 @@ class ApiInfo:
     # Functions whose global_variables type metadata is known, allowing safe single-case global
     # teardown even when the function takes non-const record pointer parameters.
     global_types_known: set[str] = field(default_factory=set)
-    # Fuzz-only per-case probe telemetry (FRAMAC_HARNESS_PROBE, default off).
+    # Fuzz-only per-case probe telemetry (FRAMAC_HARNESS_PROBE, default on; =off disables).
     probe_telemetry: bool = False
 
 

@@ -77,7 +77,7 @@ def test_an_initializers_own_case_releases_the_object():
 def test_a_context_object_is_released_after_the_call_under_test():
     p = _writer_plan()
     stmt = _case_of(p, "w_size")
-    assert stmt.index("w_init(") < stmt.index("(void)w_size(") < stmt.index("(void)w_destroy(&c0a0);")
+    assert stmt.index("w_init(") < stmt.index("w_size(") < stmt.index("(void)w_destroy(&c0a0);")
     lay = p["layouts"][[lay.get("entry") for lay in p["layouts"]].index("w_size")]
     # The release reads no input: the layout (and the seeds it drives) is the one without it.
     assert lay["inits"] == [{"fn": "w_init", "call": 1, "for": {"call": 0, "param": 0}}]

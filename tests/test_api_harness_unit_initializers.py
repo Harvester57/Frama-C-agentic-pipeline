@@ -91,7 +91,7 @@ def test_the_initializer_of_another_cluster_sets_up_the_context():
     p = _plan()
     stmt, lay = _case_and_layout(p, "ctx_size")
     init = stmt.index("(void)ctx_init((struct ctx *)&c0a0,")
-    assert init < stmt.index("(void)ctx_size(&c0a0)") < stmt.index("(void)ctx_destroy(&c0a0)")
+    assert init < stmt.index("ctx_size(&c0a0)") < stmt.index("(void)ctx_destroy(&c0a0)")
     assert [i["fn"] for i in lay["inits"]] == ["ctx_init"]
 
 

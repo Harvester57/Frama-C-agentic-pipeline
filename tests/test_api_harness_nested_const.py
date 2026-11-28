@@ -109,7 +109,7 @@ def _nc_cases(p: dict[str, Any]) -> dict[str, str]:
 
 
 def _nc_args(stmt: str, name: str) -> list[str]:
-    m = re.search(rf"\(void\){name}\(([^;]*)\);", stmt)
+    m = re.search(rf"{name}\(([^;]*?)\)\)?;", stmt)
     assert m, stmt
     return [a.strip() for a in m.group(1).split(",")]
 

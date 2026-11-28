@@ -142,7 +142,7 @@ def test_every_case_on_an_opaque_handle_builds_it_through_its_out_parameter_cons
     get = cases["rec_get_id"]
     assert f"{REC} c0a0 = 0;" in get
     assert "(void)rec_create((struct rec **)&c0a0, c1a1, c1a2);" in get
-    assert "if (c0a0 != 0) { (void)rec_get_id((struct rec *)c0a0); }" in get
+    assert "if (c0a0 != 0) {" in get and "rec_get_id((struct rec *)c0a0)" in get
     assert get.count("rec_destroy(") == 1 and "if (c0a0 != 0) { (void)rec_destroy(c0a0); }" in get
     assert get.index("rec_create(") < get.index("rec_get_id(") < get.index("rec_destroy(")
     lay = next(lay for lay in p["layouts"] if lay.get("entry") == "lib.c#rec_get_id")
@@ -162,7 +162,7 @@ def test_a_child_handle_is_added_to_a_built_parent_and_released_with_it():
     # the record owns it, so only the record is destroyed, after the call.
     assert ttl.index("rec_create(") < ttl.index("rec_rr_add(") < ttl.index("rr_get_ttl(") < ttl.index("rec_destroy(")
     assert f"{RR} c0a0 = 0;" in ttl and "(struct rr **)&c0a0" in ttl
-    assert "if (c0a0 != 0) { (void)rr_get_ttl((struct rr *)c0a0); }" in ttl
+    assert "if (c0a0 != 0) {" in ttl and "rr_get_ttl((struct rr *)c0a0)" in ttl
     assert ttl.count("rec_destroy(") == 1 and "rr_destroy" not in ttl
     # The child's constructor runs only on a built parent.
     assert re.search(r"if \(c0a0p != 0\) \{ \(void\)rec_rr_add\(\(struct rr \*\*\)&c0a0, \(struct rec \*\)c0a0p,", ttl)
@@ -220,7 +220,9 @@ def test_out_parameter_constructors_feed_the_lifecycle_cases():
     assert lay["calls"] == ["rec_create", "rec_destroy"]
     assert f"{REC} fc_h = 0;" in stmt and "(void)rec_create((struct rec **)&fc_h, c0a1, c0a2);" in stmt
     assert "rec_parse" not in lay["methods"] and "rec_rr_add" in lay["methods"]
-    assert stmt.endswith("(void)rec_destroy(fc_h); } (void)fuzz_off;")
+    assert stmt.endswith(
+        "(void)rec_destroy(fc_h); } else { FRAMAC_PROBE_INIT_FAIL(harness_selector); } (void)fuzz_off;"
+    )
     assert [(s["call"], s["param"]) for s in lay["slots"]] == [(0, 1), (0, 2)]
     assert not _STACK_OBJECT_RE.search(stmt)
     lay["selector"] = 0

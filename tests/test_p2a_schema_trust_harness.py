@@ -432,7 +432,7 @@ def test_nanopb_s1_s2_s3_trusted_schema_never_fuzzed_and_capped_at_4(monkeypatch
             "(unsigned long)((fuzz_len > fuzz_off) ? (fuzz_len - fuzz_off) : 0U));" in stmt
         )
         # Trusted descriptor is bound to the real const schema instance, NEVER fuzzed!
-        assert f"pb_decode(&c0a0, &{inst}, (void *)c0a2);" in stmt
+        assert f"pb_decode(&c0a0, &{inst}, (void *)c0a2)" in stmt
         assert lay["slots"] == []
         assert lay["rest"] == {"call": 1, "param": 0, "kind": "bytes"}
         assert lay["inits"] == [{"fn": "pb_istream_from_buffer", "call": 1, "for": {"call": 0, "param": 0}}]
@@ -479,7 +479,7 @@ def test_nanopb_s1_s2_s3_trusted_schema_never_fuzzed_and_capped_at_4(monkeypatch
         inst = lay["schema_instance"]
         assert lay["builder"] == "pb_field_iter_begin"
         assert f"(void)pb_field_iter_begin((struct pb_field_iter_s *)&c0a0, &{inst}," in stmt
-        assert "(void)pb_field_iter_find(&c0a0, c0a1);" in stmt
+        assert "pb_field_iter_find(&c0a0, c0a1)" in stmt
 
     # Schema externs & sources recorded for linking.
     assert "AllTypes_msg" in planned["schema_externs"]
@@ -1293,7 +1293,7 @@ def test_nullable_default_allocator_trusted_pointer_and_strict_schema_guardrail(
     for fn in ("client_message__unpack", "server_message__unpack", "custom_alloc_unpack"):
         assert fn in by_fn
         stmt, lay = by_fn[fn]
-        assert f"{fn}(NULL, (unsigned long)(fuzz_len - fuzz_off), (unsigned char *)(fuzz_buf + fuzz_off));" in stmt
+        assert f"{fn}(NULL, (unsigned long)(fuzz_len - fuzz_off), (unsigned char *)(fuzz_buf + fuzz_off))" in stmt
         assert lay["slots"] == []
         assert lay["rest"] == {"call": 0, "param": 2, "kind": "bytes"}
 

@@ -98,13 +98,13 @@ from fuzz_common import (
 IGNORED_ANNOTATIONS_VERSION = 1
 
 HARNESS_PROBE_ENV = "FRAMAC_HARNESS_PROBE"
-_ON_VALUES = frozenset({"on", "1", "true", "yes"})
+_OFF_VALUES = frozenset({"off", "0", "false", "no"})
 
 
 def harness_probe_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """Whether fuzz-only per-case probe telemetry is enabled (`FRAMAC_HARNESS_PROBE`, default off)."""
+    """Whether fuzz-only per-case probe telemetry is enabled (`FRAMAC_HARNESS_PROBE`, default on; `=off` disables)."""
     src = os.environ if env is None else env
-    return (src.get(HARNESS_PROBE_ENV) or "").strip().lower() in _ON_VALUES
+    return (src.get(HARNESS_PROBE_ENV) or "").strip().lower() not in _OFF_VALUES
 
 
 def _decode(data) -> str:

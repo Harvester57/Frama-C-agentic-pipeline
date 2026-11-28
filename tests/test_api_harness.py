@@ -106,7 +106,7 @@ def test_scalars_structs_and_pointers_to_objects():
     # A pointer to a struct is one object; a pointer to a scalar a small array (`_scalar_array`).
     assert "struct cfg c0a1;" in stmt and "struct ctx c0a2;" in stmt
     assert f"unsigned long c0a3[{ah.ARRAY_ELEMENTS}];" in stmt
-    assert "(void)run(c0a0, c0a1, &c0a2, (unsigned long *)c0a3, 0);" in stmt
+    assert "run(c0a0, c0a1, &c0a2, (unsigned long *)c0a3, 0)" in stmt
     # Without a layout the struct by value may hold pointers: zeroed, with the reason in the notes.
     assert [(s["param"], s["kind"], s["size"]) for s in layout["slots"]] == [(0, "int", 4)]
     assert "struct cfg" in layout["notes"][0] and "zeroed" in layout["notes"][0]
@@ -203,8 +203,8 @@ def test_sequence_case_passes_shared_buffers_between_calls():
     }
     stmt, layout, why = ah.sequence_case(_trace(), [0, 2], records, SPARE)
     assert why is None and stmt is not None and layout is not None
-    assert stmt.index("(void)keypair((unsigned char *)s0, (unsigned char *)s1);") < stmt.index("(void)box(")
-    assert "(unsigned char *)s0, (unsigned char *)s1);" in stmt.split("(void)box(")[1]
+    assert stmt.index("(void)keypair((unsigned char *)s0, (unsigned char *)s1);") < stmt.index("box(")
+    assert "(unsigned char *)s0, (unsigned char *)s1)" in stmt.split("box(")[1]
     assert layout["calls"] == ["keypair", "box"] and layout["kind"] == "sequence"
     # keypair writes the shared buffers; box takes the rest of the input as its message.
     assert layout["rest"] == {"call": 1, "param": 1, "kind": "bytes"}

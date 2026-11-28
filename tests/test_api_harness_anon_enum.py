@@ -139,14 +139,14 @@ def test_pointers_to_anonymous_enums_get_cases_through_the_typedef():
     cls = cases["cls_fromstr"]
     # The model's call sites pass 4 bytes: an array of one `cls_t`, cast to the header's type.
     assert re.search(r"\bcls_t c0a0\[\(4 \+ sizeof\(cls_t\) - 1\) / sizeof\(cls_t\)\];", cls), cls
-    assert "(void)cls_fromstr((cls_t *)c0a0, (char *)c0a1);" in cls
-    assert "(void)rtype_fromstr((rtype_t *)c0a0, (char *)c0a1);" in cases["rtype_fromstr"]
+    assert "cls_fromstr((cls_t *)c0a0, (char *)c0a1)" in cls
+    assert "rtype_fromstr((rtype_t *)c0a0, (char *)c0a1)" in cases["rtype_fromstr"]
 
 
 @pytest.mark.unit
 def test_every_out_parameter_of_query_get_is_bound():
     stmt = _enum_cases(_enum_plan(list(ANON_ENUM_API)))["qrec_query_get"]
-    m = re.search(r"\(void\)qrec_query_get\(([^;]*)\);", stmt)
+    m = re.search(r"qrec_query_get\(([^;]*?)\)\)?;", stmt)
     assert m, stmt
     args = [a.strip() for a in m.group(1).split(",")]
     # `const char **name` keeps its nested `const` (test_api_harness_nested_const.py).
@@ -161,9 +161,9 @@ def test_without_call_site_sizes_the_enum_is_one_object_passed_by_address():
     cases = _enum_cases(_enum_plan(list(ANON_ENUM_API), sizes=False))
     cls = cases["cls_fromstr"]
     assert "cls_t c0a0; memset(&c0a0, 0, sizeof(c0a0));" in cls
-    assert "(void)cls_fromstr(&c0a0, " in cls
+    assert "cls_fromstr(&c0a0, " in cls
     get = cases["qrec_query_get"]
-    assert "rtype_t c0a3;" in get and "cls_t c0a4;" in get and ", &c0a3, &c0a4);" in get
+    assert "rtype_t c0a3;" in get and "cls_t c0a4;" in get and ", &c0a3, &c0a4)" in get
 
 
 @pytest.mark.unit

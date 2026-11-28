@@ -60,8 +60,20 @@ def test_harness_dual_template_has_guarded_probe_telemetry_block():
 # --- api_harness emission checks --------------------------------------------------------------------
 
 
-def test_probe_telemetry_off_by_default_emits_no_probe_macros(monkeypatch):
+def test_probe_telemetry_on_by_default_and_disabled_when_off(monkeypatch):
     monkeypatch.delenv("FRAMAC_HARNESS_PROBE", raising=False)
+    assert ah.harness_probe_enabled()
+    stmt_default, layout_default, why_default = ah.single_case(
+        "parse",
+        {"signature": "int(unsigned char *,unsigned long)", "formals": _formals("const_pointer", "value")},
+        SPARE,
+    )
+    assert why_default is None and stmt_default is not None and layout_default is not None
+    assert stmt_default.startswith("FRAMAC_PROBE_CASE_START(harness_selector);")
+    assert "FRAMAC_PROBE_RET_I64(harness_selector," in stmt_default
+    assert "\n" not in stmt_default and "\r" not in stmt_default
+
+    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "off")
     assert not ah.harness_probe_enabled()
     stmt, layout, why = ah.single_case(
         "parse",
@@ -224,12 +236,8 @@ def test_plan_respects_framac_harness_probe_env(monkeypatch):
 @pytest.mark.parametrize(
     "raw,expected",
     [
-        (None, False),
-        ("", False),
-        ("off", False),
-        ("0", False),
-        ("false", False),
-        ("no", False),
+        (None, True),
+        ("", True),
         ("on", True),
         ("ON", True),
         ("1", True),
@@ -237,6 +245,13 @@ def test_plan_respects_framac_harness_probe_env(monkeypatch):
         ("True", True),
         ("yes", True),
         (" YES ", True),
+        ("off", False),
+        ("OFF", False),
+        ("0", False),
+        ("false", False),
+        ("False", False),
+        ("no", False),
+        (" NO ", False),
     ],
 )
 def test_fuzz_build_harness_probe_enabled_values(raw, expected):
@@ -261,15 +276,23 @@ def test_sanitizer_fuzzer_build_adds_probe_define_only_when_enabled(monkeypatch,
     src = tmp_path / "harness_mod.c"
     src.write_text("int LLVMFuzzerTestOneInput(void) { return 0; }\n", encoding="utf-8")
 
-    # Off by default: no -DFRAMAC_FUZZ_PROBE_TELEMETRY
+    # On by default: adds -DFRAMAC_FUZZ_PROBE_TELEMETRY when fuzzer_flag=True
     monkeypatch.delenv("FRAMAC_HARNESS_PROBE", raising=False)
+    cmds_default: list[list[str]] = []
+    fuzz_build.compile_sanitizer_binary(
+        [str(src)], tmp_path / "mod.san", fuzzer_flag=True, runner=_fake_runner(cmds_default), use_cache=False
+    )
+    assert cmds_default and "-DFRAMAC_FUZZ_PROBE_TELEMETRY" in cmds_default[0]
+
+    # Explicit off: no -DFRAMAC_FUZZ_PROBE_TELEMETRY
+    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "off")
     cmds_off: list[list[str]] = []
     fuzz_build.compile_sanitizer_binary(
         [str(src)], tmp_path / "mod.san", fuzzer_flag=True, runner=_fake_runner(cmds_off), use_cache=False
     )
     assert cmds_off and "-DFRAMAC_FUZZ_PROBE_TELEMETRY" not in cmds_off[0]
 
-    # Enabled + fuzzer_flag=True: adds -DFRAMAC_FUZZ_PROBE_TELEMETRY
+    # Explicit on + fuzzer_flag=True: adds -DFRAMAC_FUZZ_PROBE_TELEMETRY
     monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "on")
     cmds_on: list[list[str]] = []
     fuzz_build.compile_sanitizer_binary(

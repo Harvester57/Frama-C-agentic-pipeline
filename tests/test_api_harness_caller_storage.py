@@ -19,7 +19,9 @@ pytestmark = pytest.mark.unit
 # ---------------------------------------------------------------------------
 
 
-def _useful_buf_layout(*, reversed_order: bool = False, const_ptr: bool = False, bytes_flag: bool | None = True) -> dict[str, Any]:
+def _useful_buf_layout(
+    *, reversed_order: bool = False, const_ptr: bool = False, bytes_flag: bool | None = True
+) -> dict[str, Any]:
     ptr_field: dict[str, Any] = {
         "name": "ptr",
         "kind": "ptr",
@@ -344,7 +346,7 @@ def test_trusted_writable_ptr_len_pair_fixed_capacity(monkeypatch: pytest.Monkey
     spare = ah.spare_bytes(256)
     assert f"_Alignas(16) unsigned char c0a2_buf[{spare}]; memset(c0a2_buf, 0, sizeof(c0a2_buf));" in stmt
     assert "unsigned long c0a3 = (unsigned long)sizeof(c0a2_buf);" in stmt
-    assert f"({ptr_type})c0a2_buf, c0a3);" in stmt
+    assert f"({ptr_type})c0a2_buf, c0a3)" in stmt
     # Neither scratch nor scratch_len consumes fuzz slots; attacker `in_buf` still claims rest.
     assert lay["slots"] == []
     assert lay["rest"] == {"call": 0, "param": 0, "kind": "bytes"}
@@ -379,7 +381,7 @@ def test_trusted_writable_ptr_len_pair_attacker_sized_clamps_to_buffer(monkeypat
     spare = ah.spare_bytes(256)
     assert f"_Alignas(16) unsigned char c0a2_buf[{spare}]; memset(c0a2_buf, 0, sizeof(c0a2_buf));" in stmt
     assert "if ((unsigned long long)c0a3 > sizeof(c0a2_buf)) { c0a3 = (unsigned long)sizeof(c0a2_buf); }" in stmt
-    assert "(void *)c0a2_buf, c0a3);" in stmt
+    assert "(void *)c0a2_buf, c0a3)" in stmt
     assert [s["param"] for s in lay["slots"]] == [3]
     assert lay["rest"] == {"call": 0, "param": 0, "kind": "bytes"}
     assert any(ah.CALLER_STORAGE_NOTE in n and "attacker-sized" in n for n in lay.get("notes") or [])
@@ -445,9 +447,32 @@ def test_writable_ptr_beside_non_length_trusted_scalar_keeps_scalar_zeroed(monke
                     "align": 8,
                     "pointers": True,
                     "fields": [
-                        {"name": "p1", "kind": "ptr", "off": 0, "size": 8, "pointers": True, "const": False, "bytes": True},
-                        {"name": "p2", "kind": "ptr", "off": 8, "size": 8, "pointers": True, "const": False, "bytes": True},
-                        {"name": "len", "kind": "int", "off": 16, "size": 8, "pointers": False, "ctype": "unsigned long"},
+                        {
+                            "name": "p1",
+                            "kind": "ptr",
+                            "off": 0,
+                            "size": 8,
+                            "pointers": True,
+                            "const": False,
+                            "bytes": True,
+                        },
+                        {
+                            "name": "p2",
+                            "kind": "ptr",
+                            "off": 8,
+                            "size": 8,
+                            "pointers": True,
+                            "const": False,
+                            "bytes": True,
+                        },
+                        {
+                            "name": "len",
+                            "kind": "int",
+                            "off": 16,
+                            "size": 8,
+                            "pointers": False,
+                            "ctype": "unsigned long",
+                        },
                     ],
                 }
             },
@@ -465,7 +490,14 @@ def test_writable_ptr_beside_non_length_trusted_scalar_keeps_scalar_zeroed(monke
                     "pointers": True,
                     "fields": [
                         {"name": "cb", "kind": "fnptr", "off": 0, "size": 8, "pointers": True},
-                        {"name": "len", "kind": "int", "off": 8, "size": 8, "pointers": False, "ctype": "unsigned long"},
+                        {
+                            "name": "len",
+                            "kind": "int",
+                            "off": 8,
+                            "size": 8,
+                            "pointers": False,
+                            "ctype": "unsigned long",
+                        },
                     ],
                 }
             },
@@ -483,7 +515,14 @@ def test_writable_ptr_beside_non_length_trusted_scalar_keeps_scalar_zeroed(monke
                     "pointers": True,
                     "fields": [
                         {"name": "items", "kind": "ptr", "off": 0, "size": 8, "pointers": True, "const": False},
-                        {"name": "len", "kind": "int", "off": 8, "size": 8, "pointers": False, "ctype": "unsigned long"},
+                        {
+                            "name": "len",
+                            "kind": "int",
+                            "off": 8,
+                            "size": 8,
+                            "pointers": False,
+                            "ctype": "unsigned long",
+                        },
                     ],
                 }
             },
@@ -500,8 +539,23 @@ def test_writable_ptr_beside_non_length_trusted_scalar_keeps_scalar_zeroed(monke
                     "align": 8,
                     "pointers": True,
                     "fields": [
-                        {"name": "ptr", "kind": "ptr", "off": 0, "size": 8, "pointers": True, "const": False, "bytes": True},
-                        {"name": "flags", "kind": "int", "off": 8, "size": 4, "pointers": False, "ctype": "unsigned int"},
+                        {
+                            "name": "ptr",
+                            "kind": "ptr",
+                            "off": 0,
+                            "size": 8,
+                            "pointers": True,
+                            "const": False,
+                            "bytes": True,
+                        },
+                        {
+                            "name": "flags",
+                            "kind": "int",
+                            "off": 8,
+                            "size": 4,
+                            "pointers": False,
+                            "ctype": "unsigned int",
+                        },
                     ],
                 }
             },
@@ -525,8 +579,23 @@ def test_writable_ptr_beside_non_length_trusted_scalar_keeps_scalar_zeroed(monke
                     "align": 8,
                     "pointers": True,
                     "fields": [
-                        {"name": "ptr", "kind": "ptr", "off": 0, "size": 8, "pointers": True, "const": False, "bytes": True},
-                        {"name": "len", "kind": "int", "off": 0, "size": 8, "pointers": False, "ctype": "unsigned long"},
+                        {
+                            "name": "ptr",
+                            "kind": "ptr",
+                            "off": 0,
+                            "size": 8,
+                            "pointers": True,
+                            "const": False,
+                            "bytes": True,
+                        },
+                        {
+                            "name": "len",
+                            "kind": "int",
+                            "off": 0,
+                            "size": 8,
+                            "pointers": False,
+                            "ctype": "unsigned long",
+                        },
                     ],
                 }
             },
@@ -543,7 +612,14 @@ def test_writable_ptr_beside_non_length_trusted_scalar_keeps_scalar_zeroed(monke
                     "align": 8,
                     "pointers": False,
                     "fields": [
-                        {"name": "offset", "kind": "int", "off": 0, "size": 8, "pointers": False, "ctype": "unsigned long"},
+                        {
+                            "name": "offset",
+                            "kind": "int",
+                            "off": 0,
+                            "size": 8,
+                            "pointers": False,
+                            "ctype": "unsigned long",
+                        },
                         {"name": "depth", "kind": "int", "off": 8, "size": 4, "pointers": False, "ctype": "int"},
                     ],
                 }
@@ -561,8 +637,23 @@ def test_writable_ptr_beside_non_length_trusted_scalar_keeps_scalar_zeroed(monke
                     "align": 8,
                     "pointers": True,
                     "fields": [
-                        {"name": "ptr", "kind": "ptr", "off": 0, "size": 8, "pointers": True, "const": False, "bytes": True},
-                        {"name": "len", "kind": "int", "off": 8, "size": 8, "pointers": False, "ctype": "unsigned long"},
+                        {
+                            "name": "ptr",
+                            "kind": "ptr",
+                            "off": 0,
+                            "size": 8,
+                            "pointers": True,
+                            "const": False,
+                            "bytes": True,
+                        },
+                        {
+                            "name": "len",
+                            "kind": "int",
+                            "off": 8,
+                            "size": 8,
+                            "pointers": False,
+                            "ctype": "unsigned long",
+                        },
                     ],
                 }
             },

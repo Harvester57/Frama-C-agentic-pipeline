@@ -616,8 +616,14 @@ def test_an_opaque_handle_is_constructed_and_released_around_the_call():
     assert stmt is not None and layout is not None
     # The constructor's argument comes from the input; no zeroed byte buffer stands in for the handle.
     assert "unsigned int c1a0;" in stmt and "unsigned char c0a0[" not in stmt
-    call = f"{CTX} c0a0 = seccomp_init(c1a0); (void)seccomp_load((void *)c0a0);"
-    assert f"{call} if (c0a0 != 0) {{ (void)seccomp_release(c0a0); }}" in stmt
+    assert f"{CTX} c0a0 = seccomp_init(c1a0);" in stmt
+    assert "seccomp_load((void *)c0a0)" in stmt
+    assert "if (c0a0 != 0) { (void)seccomp_release(c0a0); }" in stmt
+    assert (
+        stmt.index("seccomp_init(c1a0)")
+        < stmt.index("seccomp_load((void *)c0a0)")
+        < stmt.index("seccomp_release(c0a0)")
+    )
     assert layout["inits"] == [{"fn": "seccomp_init", "call": 1, "for": {"call": 0, "param": 0}}]
     assert [(s["call"], s["param"]) for s in layout["slots"]] == [(1, 0)]
     # Only the handle: the plain `void *` beside it stays a spare buffer.
@@ -635,7 +641,10 @@ def test_the_destructor_and_the_constructor_cases_do_not_release_twice_or_constr
     assert stmt is not None and layout is not None
     assert stmt.count("seccomp_init(") == 1 and "inits" not in layout
     # The handle the constructor's own case makes is released: no leak per run of the case.
-    assert f"{{ {CTX} c0r = seccomp_init(c0a0); if (c0r != 0) {{ (void)seccomp_release(c0r); }} }}" in stmt
+    assert (
+        f"{{ {CTX} c0r = seccomp_init(c0a0); FRAMAC_PROBE_RET_PTR(harness_selector, (const void *)(c0r)); "
+        "if (c0r != 0) { (void)seccomp_release(c0r); } }" in stmt
+    )
 
 
 def test_handles_stay_buffers_when_ownership_or_the_destructor_is_unknown():

@@ -503,7 +503,7 @@ def test_the_growable_output_of_an_initializer_run_first_is_freed_after_the_call
     # hands the buffer over, so it is freed after that call, never before.
     text, _ = _ad_case(ad_plan, "wr_destroy")
     assert "wr_init_growable(" in text and "&c1a1" in text, text
-    assert text.index("wr_destroy(&c0a0);") < text.index("free(c1a1);"), text
+    assert text.index("wr_destroy(&c0a0)") < text.index("free(c1a1);"), text
 
 
 def test_lifecycle_methods_get_the_rules_inside_their_own_branch():

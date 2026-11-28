@@ -73,12 +73,8 @@ def _extract_probe_paths(argv: list[str]) -> list[Path]:
 @pytest.mark.parametrize(
     "val,expected",
     [
-        (None, False),
-        ("", False),
-        ("off", False),
-        ("0", False),
-        ("false", False),
-        ("no", False),
+        (None, True),
+        ("", True),
         ("on", True),
         ("ON", True),
         (" 1 ", True),
@@ -86,6 +82,13 @@ def _extract_probe_paths(argv: list[str]) -> list[Path]:
         ("True", True),
         ("yes", True),
         ("YES", True),
+        ("off", False),
+        ("OFF", False),
+        (" 0 ", False),
+        ("false", False),
+        ("False", False),
+        ("no", False),
+        ("NO", False),
     ],
 )
 def test_harness_probe_enabled_flag(monkeypatch, val, expected):
@@ -318,7 +321,7 @@ def test_classify_probe_cases_all_five_states_and_unique_overflow():
 
 
 def test_run_smoke_probe_off_skips_probe_and_omits_block(tmp_path, monkeypatch):
-    monkeypatch.delenv("FRAMAC_HARNESS_PROBE", raising=False)
+    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "off")
     sidecar = _write_sidecar(tmp_path, "mod_probe_off", dispatch_case_count=3)
     san_bin = _make_fake_bin(tmp_path / "fuzz_mod_probe_off.san")
     out_json = tmp_path / "smoke_off.json"
@@ -344,7 +347,7 @@ def test_run_smoke_probe_off_skips_probe_and_omits_block(tmp_path, monkeypatch):
 
 
 def test_run_smoke_probe_on_skips_quarantined_and_keeps_exit_code(tmp_path, monkeypatch):
-    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "on")
+    monkeypatch.delenv("FRAMAC_HARNESS_PROBE", raising=False)
     api_cases = [
         {"selector": 0, "kind": "single", "calls": ["api_ok"], "slots": [], "rest": None, "entry": "src/a.c::api_ok"},
         {
@@ -475,7 +478,7 @@ def test_run_smoke_probe_on_skips_quarantined_and_keeps_exit_code(tmp_path, monk
 
 
 def test_cli_probe_secs_flag_overrides_env_default(tmp_path, monkeypatch):
-    monkeypatch.delenv("FRAMAC_HARNESS_PROBE", raising=False)
+    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "off")
     sidecar = _write_sidecar(tmp_path, "mod_cli_probe", dispatch_case_count=2)
     san_bin = _make_fake_bin(tmp_path / "fuzz_mod_cli_probe.san")
     out_json = tmp_path / "smoke_cli.json"
