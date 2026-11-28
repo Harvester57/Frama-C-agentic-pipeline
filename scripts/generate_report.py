@@ -650,6 +650,42 @@ def harness_smoke_lines(reports: list[dict] | None) -> list[str]:
     lines.append("")
     if startup_notes:
         lines += ["Startup errors:", "", *startup_notes, ""]
+
+    flagged_rows: list[tuple[str, str, str, str, str, str]] = []
+    for r in reports:
+        raw_probe = r.get("probe")
+        if not isinstance(raw_probe, dict):
+            continue
+        raw_flagged = raw_probe.get("flagged_cases")
+        if not isinstance(raw_flagged, list):
+            continue
+        mod = md_escape(str(r.get("module") or "?"))
+        for item in raw_flagged:
+            if not isinstance(item, dict):
+                continue
+            p_status = str(item.get("status") or "")
+            if p_status not in ("init_always_fails", "constant_return", "never_reached"):
+                continue
+            case_val = item.get("case")
+            case_cell = str(case_val) if isinstance(case_val, int) and not isinstance(case_val, bool) else "?"
+            raw_entry = item.get("entry")
+            entry_cell = f"`{md_escape(str(raw_entry))}`" if isinstance(raw_entry, str) and raw_entry else "n/a"
+            status_cell = f"`{md_escape(p_status)}`"
+            raw_runs = item.get("runs")
+            runs_cell = str(raw_runs) if isinstance(raw_runs, int) and not isinstance(raw_runs, bool) else "0"
+            raw_const = item.get("constant_value")
+            const_cell = f"`{raw_const}`" if isinstance(raw_const, int) and not isinstance(raw_const, bool) else "n/a"
+            flagged_rows.append((mod, case_cell, entry_cell, status_cell, runs_cell, const_cell))
+    if flagged_rows:
+        lines += [
+            "#### Harness Probe Health (Advisory)",
+            "",
+            "| Module | Case | Entry | Status | Runs | Constant value |",
+            "| :--- | ---: | :--- | :--- | ---: | ---: |",
+        ]
+        for mod, case_cell, entry_cell, status_cell, runs_cell, const_cell in flagged_rows:
+            lines.append(f"| `{mod}` | {case_cell} | {entry_cell} | {status_cell} | {runs_cell} | {const_cell} |")
+        lines.append("")
     return lines
 
 

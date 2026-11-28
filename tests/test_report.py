@@ -720,3 +720,148 @@ def test_report_parse_loss_section_in_phase0_parse(tmp_path):
     sec1 = report.split("## 2.")[0]
     assert sec1.count("### Phase 0 parse") == 1
     assert "`libloss.a`" in sec1
+
+
+def test_harness_smoke_lines_probe_health_advisory_table():
+    from generate_report import harness_smoke_lines
+    from validate_artifacts import validate_harness_smoke
+
+    base_report = {
+        "schema_version": 1,
+        "generated_at": "2026-11-28T00:00:00Z",
+        "module": "decode",
+        "harness_digest": "a" * 64,
+        "entry_style": "dispatch",
+        "dispatch_case_count": 5,
+        "status": "ok",
+        "case_engines_checked": ["sanitizers"],
+        "startup": {
+            "ok": True,
+            "engines_checked": ["sanitizers"],
+            "failing_engine": None,
+            "reason": None,
+            "stack_trace": None,
+            "results": {},
+        },
+        "quarantined_cases": [],
+        "candidate_warning_cases": [],
+        "skip_cases_env": "",
+        "case_results": [{"case": i, "status": "passed", "probes_run": 2} for i in range(5)],
+        "counts": {"total": 5, "passed": 5, "quarantined": 0, "candidate_warning": 0},
+        "wall_s": 1.25,
+    }
+
+    # Without probe block: advisory subsection is omitted.
+    assert validate_harness_smoke(base_report) == []
+    text_no_probe = "\n".join(harness_smoke_lines([base_report]))
+    assert "### Harness Smoke Gate" in text_no_probe
+    assert "Harness Probe Health (Advisory)" not in text_no_probe
+
+    # With probe block but no flagged cases: advisory subsection is still omitted.
+    clean_probe_report = {
+        **base_report,
+        "probe": {
+            "enabled": True,
+            "probe_secs": 5,
+            "summary_counts": {
+                "never_reached": 0,
+                "init_always_fails": 0,
+                "constant_return": 0,
+                "low_samples": 1,
+                "healthy": 4,
+            },
+            "flagged_cases": [],
+        },
+    }
+    assert validate_harness_smoke(clean_probe_report) == []
+    text_clean_probe = "\n".join(harness_smoke_lines([clean_probe_report]))
+    assert "Harness Probe Health (Advisory)" not in text_clean_probe
+
+    # With flagged cases: advisory subsection renders all expected columns.
+    flagged_probe: dict[str, object] = {
+        "enabled": True,
+        "probe_secs": 5,
+        "summary_counts": {
+            "never_reached": 1,
+            "init_always_fails": 1,
+            "constant_return": 1,
+            "low_samples": 0,
+            "healthy": 2,
+        },
+        "flagged_cases": [
+            {
+                "case": 0,
+                "entry": "src/decode.c::unreached_fn",
+                "status": "never_reached",
+                "runs": 0,
+                "init_fail": 0,
+                "ret_kind": "void",
+                "constant_value": None,
+            },
+            {
+                "case": 2,
+                "entry": "src/decode.c::bad_init_fn",
+                "status": "init_always_fails",
+                "runs": 40,
+                "init_fail": 40,
+                "ret_kind": "void",
+                "constant_value": None,
+            },
+            {
+                "case": 4,
+                "entry": "src/decode.c::get_in_map",
+                "status": "constant_return",
+                "runs": 64,
+                "init_fail": 0,
+                "ret_kind": "i64",
+                "constant_value": 27,
+            },
+        ],
+    }
+    flagged_probe_report = {**base_report, "probe": flagged_probe}
+    assert validate_harness_smoke(flagged_probe_report) == []
+    text_flagged = "\n".join(harness_smoke_lines([flagged_probe_report]))
+    assert "#### Harness Probe Health (Advisory)" in text_flagged
+    assert "| Module | Case | Entry | Status | Runs | Constant value |" in text_flagged
+    assert "| `decode` | 0 | `src/decode.c::unreached_fn` | `never_reached` | 0 | n/a |" in text_flagged
+    assert "| `decode` | 2 | `src/decode.c::bad_init_fn` | `init_always_fails` | 40 | n/a |" in text_flagged
+    assert "| `decode` | 4 | `src/decode.c::get_in_map` | `constant_return` | 64 | `27` |" in text_flagged
+
+    # Schema rejects invalid probe block (unknown status or extra keys).
+    bad_probe_report = {
+        **flagged_probe_report,
+        "probe": {**flagged_probe, "extra_key": 1},
+    }
+    assert validate_harness_smoke(bad_probe_report)
+
+
+def test_pipeline_make_forwards_harness_probe_in_modules_mk(tmp_path, monkeypatch):
+    import pipeline_make as pm
+
+    src = tmp_path / "workspace/work/src/m.c"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("int m_fn(void) { return 0; }\n", encoding="utf-8")
+    hdir = tmp_path / pm.HARNESS_DIR
+    hdir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        hdir / "harness_m.json",
+        {"module": "m", "sources": ["src/m.c"], "cppflags": "-I.", "ldflags": "", "entry_fn": "m_fn"},
+    )
+    (hdir / "harness_m.c").write_text("int h;\n", encoding="utf-8")
+    write_json(tmp_path / "run-metadata.json", {**metadata(), "profile": "standard", "scope_paths": ["src"]})
+    write_json(
+        tmp_path / pm.DAG_JSON,
+        {"modules": {"m": {"tier": "Tier 1 (High Risk)", "run_eacsl_fuzz": True, "run_eva": True}}},
+    )
+
+    monkeypatch.delenv("FRAMAC_HARNESS_PROBE", raising=False)
+    pm.generate(tmp_path)
+    mk_off = (tmp_path / pm.MODULES_MK).read_text(encoding="utf-8")
+    assert "HARNESS_PROBE" not in mk_off
+
+    monkeypatch.setenv("FRAMAC_HARNESS_PROBE", "on")
+    pm.generate(tmp_path)
+    mk_on = (tmp_path / pm.MODULES_MK).read_text(encoding="utf-8")
+    assert "HARNESS_PROBE := 1" in mk_on
+    assert "HARNESS_PROBE_ARGS := --probe-secs 5" in mk_on
+    assert "export FRAMAC_HARNESS_PROBE := on" in mk_on

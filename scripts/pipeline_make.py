@@ -158,6 +158,11 @@ def harness_smoke_enabled() -> bool:
     return harness_smoke.harness_smoke_enabled()
 
 
+def harness_probe_enabled() -> bool:
+    """True when FRAMAC_HARNESS_PROBE enables the advisory per-case health probe (default off; `=on` enables)."""
+    return harness_smoke.harness_probe_enabled()
+
+
 def fuzz_explore_judge_enabled() -> bool:
     """True when FRAMAC_FUZZ_EXPLORE_JUDGE enables P2/P3/P7f explore/judge and sublinear budgets (default on; `=off` disables)."""
     return resources.fuzz_explore_judge_enabled()
@@ -1552,6 +1557,15 @@ def render_modules_mk(plan: Plan) -> str:
         _assign("PROFILE", plan.profile),
         # Only emitted when enabled so default (flags=off) runs keep the exact modules.mk they always got.
         *([_assign("HARNESS_SMOKE", "1")] if harness_smoke_enabled() else []),
+        *(
+            [
+                _assign("HARNESS_PROBE", "1"),
+                _assign("HARNESS_PROBE_ARGS", "--probe-secs 5"),
+                "export FRAMAC_HARNESS_PROBE := on",
+            ]
+            if harness_probe_enabled()
+            else []
+        ),
         *([_assign("FUZZ_EXPLORE_JUDGE", "1")] if fuzz_explore_judge_enabled() else []),
         _assign("MODULES", " ".join(plan.modules)),
         _assign("FUZZ_MODULES", " ".join(plan.fuzz_modules)),

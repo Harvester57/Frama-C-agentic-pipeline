@@ -43,6 +43,7 @@ NOT_FORWARDED = {
     # C macros and per-process harness filters, not host-forwarded environment variables
     "FRAMAC_FUZZ_SKIP_CASES",
     "FRAMAC_FUZZ_ONLY_CASE",  # runtime per-process harness case filter (same category as FRAMAC_FUZZ_SKIP_CASES)
+    "FRAMAC_PROBE_OUT",  # runtime per-process probe telemetry output path set by harness_smoke.py
     "FRAMAC_EVA_SHARD",
     # the message a link stub prints when called (fuzz_build.LINK_STUB_MARKER), not an environment variable
     "FRAMAC_LINK_STUB_CALLED",
@@ -87,6 +88,7 @@ AB_SWITCHES = (
     "FRAMAC_HARNESS_SCOPE_V2",
     "FRAMAC_API_TRUST_SCHEMA",
     "FRAMAC_HARNESS_SMOKE",
+    "FRAMAC_HARNESS_PROBE",
     "FRAMAC_FUZZ_EXPLORE_JUDGE",
     "FRAMAC_VERIFIER_BREAKER",
     "FRAMAC_JUDGE_FRONTIER",
