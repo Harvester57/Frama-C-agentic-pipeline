@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -443,11 +444,17 @@ def test_monitor_keeps_surviving_workers_alive_on_zero_byte_oom_and_recovers_pla
                 )
                 stderr_writer.write(b"================== Job 1 exited with exit code 71 ============\n")
                 stderr_writer.flush()
+                # Yield briefly so the background stderr drainer thread reads the Job 1 exit line
+                # before the monitor loop checks job_watcher.snapshot() on loaded CI runners.
+                time.sleep(0.02)
                 raise subprocess.TimeoutExpired(self.argv, timeout or 0.05)
             if self._tick == 2:
                 # Tick 2 must still be running (crash-stop did NOT fire on 0-byte OOM).
                 with (scratch / "fuzz-0.log").open("a", encoding="utf-8") as f:
                     f.write("#1700000\tpulse cov: 50 ft: 100 corp: 5/20b exec/s: 5000 rss: 64Mb\n")
+                raise subprocess.TimeoutExpired(self.argv, timeout or 0.05)
+            if self._tick < 20:
+                time.sleep(0.02)
                 raise subprocess.TimeoutExpired(self.argv, timeout or 0.05)
             stderr_writer.close()
             self.returncode = 0

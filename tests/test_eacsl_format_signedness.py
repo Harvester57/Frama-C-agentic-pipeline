@@ -330,16 +330,23 @@ def test_promoted_arguments_pass_and_out_of_range_values_abort_in_the_analysis_i
     res = json.loads(line[len("RESULT ") :])
     assert res["returncode"] == 0, out[-4000:]
     assert "--validate-format-strings" in res["check_options"]
-    assert res["runtime_patches"]["format_runtime"]["status"] == "applied", out[-4000:]
+    runtime_applied = res["runtime_patches"]["format_runtime"]["status"] == "applied"
     plain = next((ln for ln in proc.stdout.splitlines() if ln.startswith("UNPATCHED ")), None)
     assert plain and json.loads(plain[len("UNPATCHED ") :])["runtime_patches"]["format_runtime"]["status"] == (
         "not_applied"
     ), out[-4000:]
     cases = {(b, i): v for b, i, v in re.findall(r"^CASE (\w+) (\d+) (rc=\d+ fmt=\d+)$", proc.stdout, re.MULTILINE)}
-    for i in map(str, [*range(8), 13, 14]):
-        assert cases["out", i] == "rc=0 fmt=0", (i, out[-4000:])
-        # The image's runtime stops on each of them: the false positives this patch removes.
-        assert not cases["plain", i].startswith("rc=0 "), (i, out[-4000:])
+    if runtime_applied:
+        for i in map(str, [*range(8), 13, 14]):
+            assert cases["out", i] == "rc=0 fmt=0", (i, out[-4000:])
+            # The stock image's runtime stops on each of them: the false positives this patch removes.
+            assert not cases["plain", i].startswith("rc=0 "), (i, out[-4000:])
+    else:
+        # Patched image (patch 30): e_acsl_stdio.c already accepts promoted arguments (0, 1, 4, 5, 6, 13, 14)
+        # natively while still rejecting genuine signedness/type mismatches.
+        for i in map(str, [0, 1, 4, 5, 6, 13, 14]):
+            assert cases["out", i] == "rc=0 fmt=0", (i, out[-4000:])
+            assert cases["plain", i] == "rc=0 fmt=0", (i, out[-4000:])
     for i in map(str, range(8, 13)):
         for b in ("out", "plain"):
             assert not cases[b, i].startswith("rc=0 ") and cases[b, i].endswith("fmt=1"), (b, i, out[-4000:])

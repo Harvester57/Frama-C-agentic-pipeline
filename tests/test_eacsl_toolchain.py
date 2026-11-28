@@ -2121,7 +2121,8 @@ def test_register_locals_and_member_alignas_build_and_run_in_the_analysis_image(
     assert line, out[-4000:]
     res = json.loads(line[len("RESULT ") :])
     assert res["returncode"] == 0, out[-4000:]
-    assert res["full_mtracking_defines"] == ["-Dregister="] and res["alignas_rewrites"] == 1
+    # Patch 20 fixes member _Alignas printing in Frama-C itself, so alignas_rewrites is None on patched images.
+    assert res["full_mtracking_defines"] == ["-Dregister="] and res["alignas_rewrites"] in (None, 1)
     assert res["binary"].endswith(".e-acsl")
     assert "LAYOUT_OK" in proc.stdout, out[-4000:]  # the rewrite kept the 16-byte alignment
     assert "RUN_OK" in proc.stdout, out[-4000:]
@@ -2422,7 +2423,8 @@ def test_tail_merged_string_literals_do_not_fail_valid_read_in_the_analysis_imag
     res = json.loads(line[len("RESULT ") :])
     assert res["returncode"] == 0, out[-4000:]
     assert "RUN_OK" in proc.stdout, out[-4000:]
-    assert res["literal_registrations_reordered"], res
+    # Patch 28 fixes tail-merged string literal registration in E-ACSL itself, so the post-pass reorder is None on patched images.
+    assert res["literal_registrations_reordered"] is None or res["literal_registrations_reordered"], res
 
 
 def test_rewrite_sync_builtins_restores_polymorphic_names_and_skips_comments_and_strings():

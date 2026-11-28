@@ -133,6 +133,9 @@ def _build_and_exec(
 
 def _run_full_pipeline(spec: dict[str, Any]) -> dict[str, Any]:
     os.chdir(RUN_DIR)
+    # Synthetic fixtures use kind="executable" with explicit api_* entry_points and no main()/threat model;
+    # keep V1 entry-point scoping so unit_split clusters those declared entry_points.
+    os.environ["FRAMAC_HARNESS_SCOPE_V2"] = "off"
     # Reuse the module-scoped compiled `phase0_dump.cmxs` (compiled from scripts/phase0_dump.ml
     # via the real `phase0_model.compile_dump_module`).
     phase0_model.compile_dump_module = lambda *a, **k: (DUMP_CMXS, "")
@@ -162,7 +165,7 @@ def _run_full_pipeline(spec: dict[str, Any]) -> dict[str, Any]:
         (
             name
             for name, sub in sorted((dag.get("submodules") or {}).items())
-            if target_anchor in (sub.get("anchors") or [])
+            if any(a == target_anchor or a.endswith(f"#{target_anchor}") for a in (sub.get("anchors") or []))
         ),
         None,
     )

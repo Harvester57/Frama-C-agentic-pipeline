@@ -62,7 +62,18 @@ jobs:
               | tar -x --zstd --ignore-zeros --warning=no-unknown-keyword --overwrite -f - -C /tmp/codeql-bundle
             CODEQL_BIN="/tmp/codeql-bundle/codeql/codeql"
           fi
-          printf 'queries:\n  - uses: security-extended\n' > /tmp/codeql-config.yaml
+          # Layer 6 threat-model rules track C variable names under the key "secrets" (never real
+          # credentials), which triggers heuristic clear-text sensitive-data false positives in
+          # trust.py, phase0_model.py, security_props.py, and test fixtures.
+          printf '%s\n' \
+            'queries:' \
+            '  - uses: security-extended' \
+            'query-filters:' \
+            '  - exclude:' \
+            '      id: py/clear-text-logging-sensitive-data' \
+            '  - exclude:' \
+            '      id: py/clear-text-storage-sensitive-data' \
+            > /tmp/codeql-config.yaml
           "${CODEQL_BIN}" database create /tmp/codeql-db \
             --language="${CODEQL_LANG}" \
             --source-root=. \

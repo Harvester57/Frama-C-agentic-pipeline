@@ -108,8 +108,12 @@ def patch_manifest() -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    fc = [e["filename"] for e in (data.get("frama_c") or []) if isinstance(e, dict) and isinstance(e.get("filename"), str)]
-    meta = [e["filename"] for e in (data.get("metacsl") or []) if isinstance(e, dict) and isinstance(e.get("filename"), str)]
+    fc = [
+        e["filename"] for e in (data.get("frama_c") or []) if isinstance(e, dict) and isinstance(e.get("filename"), str)
+    ]
+    meta = [
+        e["filename"] for e in (data.get("metacsl") or []) if isinstance(e, dict) and isinstance(e.get("filename"), str)
+    ]
     return {
         "digest": data.get("digest"),
         "frama_c_count": len(fc),

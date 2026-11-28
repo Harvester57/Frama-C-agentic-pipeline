@@ -216,13 +216,17 @@ def test_guardrail_passes_a_promoted_unsigned_short_printf_in_the_analysis_image
     reports = _guard_reports(proc.stdout)
     assert set(reports) == {"patched", "stock"}, out[-6000:]
     patched, stock = reports["patched"], reports["stock"]
-    assert patched["runtime_patches"]["format_runtime"]["status"] == "applied", out[-6000:]
-    assert re.search(r"^SHARE patched [1-9]", proc.stdout, re.MULTILINE), out[-6000:]
-    # The image's runtime stops on the promoted `unsigned short` of print_header, outside the checked
-    # function, on the empty input libFuzzer runs first: the guardrail cannot test the contract.
-    assert stock["runtime_patches"]["format_runtime"]["status"] == "not_applied", out[-6000:]
-    assert stock["status"] == "guardrail_error", out[-6000:]
-    assert "print_header" in json.dumps(stock), out[-6000:]
-    # The patched runtime lets it through and the contract is tested on every input.
+    if patched["runtime_patches"]["format_runtime"]["status"] == "applied":
+        assert re.search(r"^SHARE patched [1-9]", proc.stdout, re.MULTILINE), out[-6000:]
+        # Stock image: the unpatched runtime stops on the promoted `unsigned short` of print_header,
+        # outside the checked function, on the empty input libFuzzer runs first.
+        assert stock["runtime_patches"]["format_runtime"]["status"] == "not_applied", out[-6000:]
+        assert stock["status"] == "guardrail_error", out[-6000:]
+        assert "print_header" in json.dumps(stock), out[-6000:]
+    else:
+        # Patched image (patch 30): e_acsl_stdio.c already accepts promoted arguments natively.
+        assert stock["status"] == "passed_dynamic_oracle", out[-6000:]
+        assert stock["rc"] == 0 and not stock["excluded_inputs"], out[-6000:]
+    # The patched runtime (or patched image) lets it through and the contract is tested on every input.
     assert patched["status"] == "passed_dynamic_oracle", out[-6000:]
     assert patched["rc"] == 0 and not patched["excluded_inputs"], out[-6000:]

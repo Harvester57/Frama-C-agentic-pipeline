@@ -1043,7 +1043,7 @@ def record(args: argparse.Namespace) -> tuple[dict, int]:
     shutil.rmtree(work, ignore_errors=True)
     out_dir = work / "calls"
     out_dir.mkdir(parents=True)
-    os.chmod(out_dir, 0o1777)
+    os.chmod(out_dir, 0o700)
     headers = _header_index(tree)
     report["functions"] = {"planned": len(plans), "skipped": skipped}
     relinked: dict[str, Any] = {}

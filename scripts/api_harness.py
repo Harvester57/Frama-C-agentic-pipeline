@@ -6575,26 +6575,26 @@ def plan(
             for chain in chains(trace):
                 if not any(trace[k]["fn"] in records for k in chain):
                     continue
-                prefix, td = _global_setup_prefix(trace, chain, records, api, trans_writes, trans_refs)
+                prefix, td_idx = _global_setup_prefix(trace, chain, records, api, trans_writes, trans_refs)
                 prefix = [k for k in prefix if k not in chain]
-                if td is not None and td in chain:
-                    td = None
-                full_chain = [*prefix, *chain, *([td] if td is not None else [])]
-                setup_pos = set(range(len(prefix))) | ({len(full_chain) - 1} if td is not None else set())
+                if td_idx is not None and td_idx in chain:
+                    td_idx = None
+                full_chain: list[int] = [*prefix, *chain, *([td_idx] if td_idx is not None else [])]
+                setup_pos = set(range(len(prefix))) | ({len(full_chain) - 1} if td_idx is not None else set())
                 needs_setup = any(trace[k]["fn"] in global_targets for k in chain)
                 if needs_setup and not prefix:
                     continue
-                fb_td = _fallback_teardown(trace, prefix) if (prefix and td is None) else None
+                fb_td = _fallback_teardown(trace, prefix) if (prefix and td_idx is None) else None
                 if len({trace[k]["fn"] for k in chain}) > 1:
                     multi_fn_chains.append((trace, full_chain, setup_pos, fb_td))
                 else:
                     same_fn_chains.append((trace, full_chain, setup_pos, fb_td))
         for item in global_setups:
-            prefix = list(item["prefix"])
-            td = item["teardown"]
-            full_chain = [*prefix, int(item["target"]), *([int(td)] if td is not None else [])]
-            setup_pos = set(range(len(prefix))) | ({len(full_chain) - 1} if td is not None else set())
-            fb_td = _fallback_teardown(item["trace"], prefix) if td is None else None
+            prefix = [int(k) for k in item["prefix"]]
+            item_td = item["teardown"]
+            full_chain = [*prefix, int(item["target"]), *([int(item_td)] if item_td is not None else [])]
+            setup_pos = set(range(len(prefix))) | ({len(full_chain) - 1} if item_td is not None else set())
+            fb_td = _fallback_teardown(item["trace"], prefix) if item_td is None else None
             _emit_sequence(item["trace"], full_chain, setup_pos, trailing_teardown=fb_td)
         for trace, full_chain, setup_pos, fb_td in multi_fn_chains:
             _emit_sequence(trace, full_chain, setup_pos, trailing_teardown=fb_td)

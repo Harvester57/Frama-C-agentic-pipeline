@@ -5052,7 +5052,7 @@ def name_code_check(item: dict, name: str | None) -> None:
 
 
 METACSL_SET_ASSIGNS = "metacsl_set_assigns"
-_META_675_RE = re.compile(r'Unexpected error \(File "meta_annotate\.ml", line 675\b[^\n]*')
+_META_675_RE = re.compile(r'Unexpected error \(File "meta_annotate\.ml", line \d+\b[^\n]*Assertion failed[^\n]*')
 _ACSL_THEN_DECL_RE = re.compile(r"/\*@((?:(?!\*/).)*)\*/([^;{}()]*?)\b([A-Za-z_]\w*)\s*\(", re.DOTALL)
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
 

@@ -145,45 +145,60 @@ def test_is_pure_harness_crash_rejects_any_target_frame_even_with_harness_failur
 
     # Positive: empty frames or only runtime/signal/libc-without-file frames before LLVMFuzzerTestOneInput.
     assert FI.is_pure_harness_crash(harness_failure, []) is True
-    assert FI.is_pure_harness_crash(
-        harness_failure,
-        [
-            {"function": "raise", "file": "", "line": 0},
-            {"function": "validate_allocated_space", "file": "/share/frama-c/e-acsl/e_acsl_string.c", "line": 102},
-            {"function": "LLVMFuzzerTestOneInput", "file": "/w/fuzz_m.instrumented.c", "line": 999},
-            {"function": "main", "file": "", "line": 0},
-        ],
-    ) is True
-    assert FI.is_pure_harness_crash(
-        harness_failure,
-        [
-            {"function": "memcpy", "file": "", "line": 0},
-            {"function": "LLVMFuzzerTestOneInput", "file": "workspace/harnesses/harness_m.c", "line": 42},
-        ],
-    ) is True
+    assert (
+        FI.is_pure_harness_crash(
+            harness_failure,
+            [
+                {"function": "raise", "file": "", "line": 0},
+                {"function": "validate_allocated_space", "file": "/share/frama-c/e-acsl/e_acsl_string.c", "line": 102},
+                {"function": "LLVMFuzzerTestOneInput", "file": "/w/fuzz_m.instrumented.c", "line": 999},
+                {"function": "main", "file": "", "line": 0},
+            ],
+        )
+        is True
+    )
+    assert (
+        FI.is_pure_harness_crash(
+            harness_failure,
+            [
+                {"function": "memcpy", "file": "", "line": 0},
+                {"function": "LLVMFuzzerTestOneInput", "file": "workspace/harnesses/harness_m.c", "line": 42},
+            ],
+        )
+        is True
+    )
 
     # Negative: target function (source-located, E-ACSL-wrapped, or stripped) before LLVMFuzzerTestOneInput.
-    assert FI.is_pure_harness_crash(
-        harness_failure,
-        [
-            {"function": "parse_packet", "file": "src/parser.c", "line": 88},
-            {"function": "LLVMFuzzerTestOneInput", "file": "workspace/harnesses/harness_m.c", "line": 42},
-        ],
-    ) is False
-    assert FI.is_pure_harness_crash(
-        harness_failure,
-        [
-            {"function": "__gen_e_acsl_QCBORDecode_Init", "file": "/w/fuzz_m.instrumented.c", "line": 1200},
-            {"function": "LLVMFuzzerTestOneInput", "file": "/w/fuzz_m.instrumented.c", "line": 9999},
-        ],
-    ) is False
-    assert FI.is_pure_harness_crash(
-        harness_failure,
-        [
-            {"function": "stripped_target_fn", "file": "", "line": 0},
-            {"function": "LLVMFuzzerTestOneInput", "file": "", "line": 0},
-        ],
-    ) is False
+    assert (
+        FI.is_pure_harness_crash(
+            harness_failure,
+            [
+                {"function": "parse_packet", "file": "src/parser.c", "line": 88},
+                {"function": "LLVMFuzzerTestOneInput", "file": "workspace/harnesses/harness_m.c", "line": 42},
+            ],
+        )
+        is False
+    )
+    assert (
+        FI.is_pure_harness_crash(
+            harness_failure,
+            [
+                {"function": "__gen_e_acsl_QCBORDecode_Init", "file": "/w/fuzz_m.instrumented.c", "line": 1200},
+                {"function": "LLVMFuzzerTestOneInput", "file": "/w/fuzz_m.instrumented.c", "line": 9999},
+            ],
+        )
+        is False
+    )
+    assert (
+        FI.is_pure_harness_crash(
+            harness_failure,
+            [
+                {"function": "stripped_target_fn", "file": "", "line": 0},
+                {"function": "LLVMFuzzerTestOneInput", "file": "", "line": 0},
+            ],
+        )
+        is False
+    )
 
     # Negative: non-harness failure dicts.
     assert FI.is_pure_harness_crash(None, []) is False

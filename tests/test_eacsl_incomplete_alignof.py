@@ -348,8 +348,11 @@ def test_opaque_handle_alignment_builds_under_eacsl_and_the_complete_check_still
     assert res["returncode"] == 0, out[-4000:]
     assert res["binary"].endswith(".e-acsl")
     rec = res["incomplete_alignof"]
-    assert rec["types"] == ["struct evp_md_st", "struct ssl_st", "struct engine_st"]
-    assert {c["function"] for c in rec["checks"]} == {"md_from", "ssl_from", "engine_from"}
-    assert rec["assumption"] == T.INCOMPLETE_ALIGNOF_ASSUMPTION
+    if rec is not None:
+        # Stock Frama-C 34.0~beta emits alignof(incomplete struct), so the Python post-pass rewrites it.
+        # Patched images (patch 05) avoid emitting it in the first place, leaving incomplete_alignof as None.
+        assert rec["types"] == ["struct evp_md_st", "struct ssl_st", "struct engine_st"]
+        assert {c["function"] for c in rec["checks"]} == {"md_from", "ssl_from", "engine_from"}
+        assert rec["assumption"] == T.INCOMPLETE_ALIGNOF_ASSUMPTION
     assert "INCALIGN_EVEN_OK" in proc.stdout, out[-4000:]
     assert "INCALIGN_ODD_CAUGHT" in proc.stdout, out[-4000:]

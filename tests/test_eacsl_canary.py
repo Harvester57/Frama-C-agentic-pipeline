@@ -79,10 +79,17 @@ def test_selftest_fails_when_a_covered_build_step_is_taken_out(tmp_path):
     }
     assert set(results) == set(VARIANTS), out[-4000:]
     assert results["production"]["ok"], results["production"]
-    for name in ("no_result_init", "no_errno_shim"):
-        r = results[name]
-        assert r["checks"]["compiled"] and not r["checks"]["benign_input_clean"] and not r["ok"], r
-    assert "\\\\result.len" in json.dumps(results["no_result_init"]["benign_failure"])
-    assert "canary_errno_synced" in json.dumps(results["no_errno_shim"]["benign_failure"])
+    # Patch 08 fixes struct \result initialization in E-ACSL itself, so no_result_init passes on patched images
+    # and fails with \result.len on stock 34.0~beta.
+    no_res = results["no_result_init"]
+    assert no_res["checks"]["compiled"], no_res
+    if not no_res["ok"]:
+        assert not no_res["checks"]["benign_input_clean"], no_res
+        assert "\\\\result.len" in json.dumps(no_res["benign_failure"])
+    no_errno = results["no_errno_shim"]
+    assert no_errno["checks"]["compiled"] and not no_errno["checks"]["benign_input_clean"] and not no_errno["ok"], (
+        no_errno
+    )
+    assert "canary_errno_synced" in json.dumps(no_errno["benign_failure"])
     # Without the classification define the build itself fails (clang refuses Frama-C's builtin prototypes).
     assert not results["no_snan"]["ok"], results["no_snan"]

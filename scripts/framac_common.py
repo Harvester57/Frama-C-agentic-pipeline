@@ -222,6 +222,9 @@ def atomic_write_json(path: Path, data) -> None:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             json.dump(data, f, indent=2, sort_keys=False, ensure_ascii=False)
             f.write("\n")
+        # mkstemp creates 0o600; make host-readable (0o644) so non-matching host UIDs (e.g. GHA runner 1001 vs container opam 1000) can read artifacts.
+        if os.name == "posix":
+            os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, path)
     except Exception:
         if os.path.exists(tmp_path):

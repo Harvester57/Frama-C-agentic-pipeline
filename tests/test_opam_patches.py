@@ -67,9 +67,7 @@ def test_opam_files_list_patches_and_checksums_in_order() -> None:
 
 
 @pytest.mark.unit
-def test_cache_tools_fallback_includes_patch_manifest_digest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cache_tools_fallback_includes_patch_manifest_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FRAMAC_IMAGE_ID", raising=False)
     monkeypatch.setenv("FRAMAC_SHARE", str(tmp_path))
 
@@ -93,9 +91,7 @@ def test_cache_tools_fallback_includes_patch_manifest_digest(
 
 
 @pytest.mark.unit
-def test_run_metadata_toolchain_reports_patch_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_run_metadata_toolchain_reports_patch_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FRAMAC_SHARE", str(tmp_path))
     monkeypatch.setattr(run_metadata, "_run", lambda cmd, cwd=None: f"{cmd[0]} 1.0")
 
