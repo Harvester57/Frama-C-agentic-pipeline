@@ -443,23 +443,25 @@ def test_mine_after_complete_fills_both_stores_unless_switched_off(
 
 
 @pytest.mark.unit
-def test_curated_enabled_defaults_off_and_respects_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_curated_enabled_defaults_on_and_respects_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
     monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
     assert spec_kb.enabled() is True
-    assert spec_kb.curated_enabled() is False
+    assert spec_kb.curated_enabled() is True
 
-    for truthy in ("on", "1", "true", "yes", "enabled", "ON"):
+    for truthy in ("on", "1", "true", "yes", "enabled", "ON", ""):
         monkeypatch.setenv(spec_kb.CURATED_ENV, truthy)
         assert spec_kb.curated_enabled() is True, truthy
 
-    for falsy in ("off", "0", "false", "no", "disabled", ""):
+    for falsy in ("off", "0", "false", "no", "disabled", "OFF"):
         monkeypatch.setenv(spec_kb.CURATED_ENV, falsy)
         assert spec_kb.curated_enabled() is False, falsy
 
-    # Parent kill-switch FRAMAC_SPEC_KB=off disables curated patterns even when FRAMAC_SPEC_KB_CURATED=on.
-    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+    # Parent kill-switch FRAMAC_SPEC_KB=off disables curated patterns both when unset and when FRAMAC_SPEC_KB_CURATED=on.
+    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
     monkeypatch.setenv(spec_kb.KB_ENV, "off")
+    assert spec_kb.curated_enabled() is False
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
     assert spec_kb.curated_enabled() is False
     record = {"features": {"pointer_len_params": True, "loops": True, "pointer_walk": True}}
     assert spec_kb.curated_patterns_for(record) == []
@@ -514,17 +516,17 @@ def test_curated_patterns_match_features_independent_of_stopwords_and_top_g(
         },
     }
 
-    # Baseline (FRAMAC_SPEC_KB_CURATED unset/off): exact legacy format, no curated slot.
+    # Opt-out (FRAMAC_SPEC_KB_CURATED=off): exact legacy format, no curated slot.
     monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
-    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "off")
     off_section = spec_kb.kb_section_for(overlay, record)
     assert "Curated Specification Patterns" not in off_section
     assert "Manual & Evolved Matches" not in off_section
     assert off_section.count("### Manual Section ") == spec_kb.TOP_G
 
-    # Treatment (FRAMAC_SPEC_KB_CURATED=on): curated items appear in their own bounded slot (<= 2)
+    # Default (FRAMAC_SPEC_KB_CURATED unset): curated items appear in their own bounded slot (<= 2)
     # without evicting any of the TOP_G = 3 manual/evolved items.
-    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
     curated = spec_kb.curated_patterns_for(record)
     assert len(curated) == spec_kb.MAX_CURATED_ITEMS
     on_section = spec_kb.kb_section_for(overlay, record)
@@ -554,10 +556,10 @@ def test_curated_slot_renders_when_seed_has_no_overlap(tmp_path: Path, monkeypat
         "features": {"pointer_len_params": True},
     }
     monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
-    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "off")
     assert spec_kb.kb_section_for(overlay, record) == ""
 
-    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+    monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
     section = spec_kb.kb_section_for(overlay, record)
     assert "## Retrieved ACSL Knowledge" in section
     assert "### Curated Specification Patterns (Feature-Matched)" in section

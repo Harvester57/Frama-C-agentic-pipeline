@@ -872,7 +872,7 @@ def _condition_holds(expr: str, features: dict[str, bool] | None) -> bool:
         if name == "facts":
             value = features is not None
         elif name == "loop_seeds":
-            # An opt-in step, not guidance: without the flag, or without facts to seed from, it is left out.
+            # Requires facts to seed from and FRAMAC_LOOP_SEEDS enabled (default on).
             value = loop_seeds_enabled() and features is not None and bool(features.get("loops"))
         elif features is None:
             value = True
@@ -1327,10 +1327,10 @@ def render_section(
 
 def loop_seeds_enabled() -> bool:
     """
-    FRAMAC_LOOP_SEEDS=on: provers get loop invariant candidates filtered by WP and by the corpus
-    (loop_seeds.py). Off by default.
+    FRAMAC_LOOP_SEEDS=off: disable loop invariant candidates filtered by WP and by the corpus
+    (loop_seeds.py), for A/B comparisons. On by default.
     """
-    return (os.environ.get(LOOP_SEEDS_ENV) or "").strip().lower() in ("on", "1", "true", "yes", "enabled")
+    return (os.environ.get(LOOP_SEEDS_ENV) or "").strip().lower() not in ("off", "0", "false", "no", "disabled")
 
 
 def main(argv: list[str] | None = None) -> int:

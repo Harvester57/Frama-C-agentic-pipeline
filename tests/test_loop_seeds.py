@@ -644,20 +644,20 @@ def test_nothing_to_seed_is_reported_not_raised(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_flag_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flag_is_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(ff.LOOP_SEEDS_ENV, raising=False)
-    assert ff.loop_seeds_enabled() is False
-    for value in ("on", "1", "TRUE", " yes "):
+    assert ff.loop_seeds_enabled() is True
+    for value in ("on", "1", "TRUE", " yes ", ""):
         monkeypatch.setenv(ff.LOOP_SEEDS_ENV, value)
         assert ff.loop_seeds_enabled() is True
-    for value in ("off", "0", "", "maybe"):
+    for value in ("off", "0", "FALSE", " no ", "disabled"):
         monkeypatch.setenv(ff.LOOP_SEEDS_ENV, value)
         assert ff.loop_seeds_enabled() is False
 
 
 @pytest.mark.unit
 def test_cli_is_inert_when_the_flag_is_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    monkeypatch.delenv(ff.LOOP_SEEDS_ENV, raising=False)
+    monkeypatch.setenv(ff.LOOP_SEEDS_ENV, "off")
     monkeypatch.chdir(tmp_path)
     (tmp_path / "sum.c").write_text(SUM_INT, encoding="utf-8")
     monkeypatch.setattr(ls, "default_wp_runner", lambda *a, **k: pytest.fail("WP must not run"))
@@ -785,10 +785,10 @@ def _features(**on) -> dict[str, bool]:
 def test_brief_shows_the_seed_step_only_with_the_flag_and_a_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     marker = "scripts/loop_seeds.py --file agents/{agent_id}/scratch/work/{c_file}"
     assert BRIEF.count(marker) == 1
-    monkeypatch.delenv(ff.LOOP_SEEDS_ENV, raising=False)
+    monkeypatch.setenv(ff.LOOP_SEEDS_ENV, "off")
     assert marker not in ff.render_conditionals(BRIEF, _features(loops=True))
     assert marker not in ff.render_conditionals(BRIEF, None)
-    monkeypatch.setenv(ff.LOOP_SEEDS_ENV, "on")
+    monkeypatch.delenv(ff.LOOP_SEEDS_ENV, raising=False)
     with_loop = ff.render_conditionals(BRIEF, _features(loops=True))
     assert marker in with_loop
     for rule in (

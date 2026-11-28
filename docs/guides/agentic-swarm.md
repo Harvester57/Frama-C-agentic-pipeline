@@ -132,7 +132,7 @@ A function may not reach a prover at all: when an earlier run's `wp-sweep` publi
 
 These are hints. Eva's locations hold only under the harness (`a[0..15]`, not `out[0 .. n - 1]`), so the prover restates them over the formals, and WP remains the only judge of `assigns`.
 
-### Loop Invariant Seeds (`FRAMAC_LOOP_SEEDS=on`, off by default)
+### Loop Invariant Seeds (`FRAMAC_LOOP_SEEDS`, on by default)
 
 Eva does not hold the index-against-length relation at a widened loop head ([`../plans/archive/papers-generalization-plan.md`](../plans/archive/papers-generalization-plan.md), Tier 1, "Step 0 result"), so loop invariant candidates come from the loop facts and are filtered by the two oracles ([`../../scripts/loop_seeds.py`](../../scripts/loop_seeds.py)):
 
@@ -149,7 +149,7 @@ Eva does not hold the index-against-length relation at a widened loop head ([`..
 
 WP runs first because it is the cheaper filter: measured on toy functions, a round on the seed goals costs about one second when nothing fails and about six when a goal times out (the per-goal limit is 5 s), and an E-ACSL build and replay costs about two. A proven candidate needs no corpus check, so the build is paid only for what WP dropped.
 
-**Where it runs.** The prover runs the tool itself, as the first item of Step B, on its scratch overlay. That is the point where the function has the contract and `loop assigns` the seeds are proved under, and where the callees' contracts are already merged. It needs no new task kind and no work under the scheduler's locks. The tool writes nothing but its report (`agents/<agent-id>/scratch/loop_seeds_<function>.json`), works on a copy outside the agent's tree, and never adds a `requires`. `wp_scheduler.py complete` copies the report to `workspace/reports/loop_seeds/<module>/<function>.json`, so the parent stays the only writer outside the scratch overlay and the ledger is not involved. A failure or a timeout only loses hints: the report's `status` says so (`ok`, `partial`, `timeout`, `no_facts`, `no_loops`, `no_candidates`, `disabled`, `error`), and no unit status depends on it. `FRAMAC_PROVER_CONTEXT=off` removes the seeds together with the facts.
+**Where it runs.** The prover runs the tool itself, as the first item of Step B, on its scratch overlay. That is the point where the function has the contract and `loop assigns` the seeds are proved under, and where the callees' contracts are already merged. It needs no new task kind and no work under the scheduler's locks. The tool writes nothing but its report (`agents/<agent-id>/scratch/loop_seeds_<function>.json`), works on a copy outside the agent's tree, and never adds a `requires`. `wp_scheduler.py complete` copies the report to `workspace/reports/loop_seeds/<module>/<function>.json`, so the parent stays the only writer outside the scratch overlay and the ledger is not involved. A failure or a timeout only loses hints: the report's `status` says so (`ok`, `partial`, `timeout`, `no_facts`, `no_loops`, `no_candidates`, `disabled`, `error`), and no unit status depends on it. Set `FRAMAC_LOOP_SEEDS=off` to disable for A/B comparisons; `FRAMAC_PROVER_CONTEXT=off` removes the seeds together with the facts.
 
 ---
 

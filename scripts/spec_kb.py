@@ -89,9 +89,9 @@ def enabled() -> bool:
 
 
 def curated_enabled() -> bool:
-    """FRAMAC_SPEC_KB_CURATED=on: include the feature-matched curated ACSL pattern slot in prover briefs.
-    Off by default until Phase 3 A/B passes, and off whenever FRAMAC_SPEC_KB=off disables the KB."""
-    wanted = (os.environ.get(CURATED_ENV) or "").strip().lower() in ("on", "1", "true", "yes", "enabled")
+    """FRAMAC_SPEC_KB_CURATED=off: disable the feature-matched curated ACSL pattern slot in prover briefs.
+    On by default, and off whenever FRAMAC_SPEC_KB=off disables the KB."""
+    wanted = (os.environ.get(CURATED_ENV) or "").strip().lower() not in ("off", "0", "false", "no", "disabled")
     return wanted and enabled()
 
 

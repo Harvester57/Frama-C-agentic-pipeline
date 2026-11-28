@@ -36,8 +36,8 @@ It prints the surviving clauses ready to paste. Without --out-json the report go
 workspace/reports/loop_seeds/<module>/<function>.json, where the scheduler also copies a prover's
 report when the prover completes.
 
-Gated by FRAMAC_LOOP_SEEDS=on (function_facts.loop_seeds_enabled; FRAMAC_PROVER_CONTEXT=off turns
-it off too). Default: off.
+Gated by FRAMAC_LOOP_SEEDS (function_facts.loop_seeds_enabled; FRAMAC_PROVER_CONTEXT=off turns
+it off too). Default: on (`=off` disables).
 """
 
 from __future__ import annotations
@@ -1465,7 +1465,7 @@ def run(
     shown_file = c_file.as_posix()
     if not function_facts.loop_seeds_enabled():
         return _base_report(
-            function, shown_file, module, "disabled", f"{function_facts.LOOP_SEEDS_ENV} is not on (or facts are off)"
+            function, shown_file, module, "disabled", f"{function_facts.LOOP_SEEDS_ENV} is off (or facts are off)"
         )
     record = find_facts(facts_overlay, module, shown_file, function)
     import run_wp_function
