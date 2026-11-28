@@ -87,6 +87,7 @@ Candidates produced by LibFuzzer + E-ACSL, Frama-C Eva (`Invalid`), or Prover/Br
      - Check the decision point by patch and replay (see "Checking the Decision Point" below). It is optional, but expected before you return `confirmed`.
      - Optionally write a unified diff fix against `workspace/baseline/` to `agents/{agent_id}/scratch/{candidate_short}.fix.patch` and reference it in `record.remediation.fix_patch` (the parent promotes it to `agents/{agent_id}/artifacts/` and never applies it to `workspace/work/`). The fix belongs at or just after the decision point (the missing validation), not at the sink.
      - Return `decision: "confirmed"`.
+     - **Standalone plain-C upstream reproducers (post-confirmation):** once a finding is `confirmed` in `findings.json`, `/opt/framac-pipeline/scripts/repro_bundle.py` turns its crash artifact into a standalone plain-C `main()` reproducer and frozen disclosure bundle outside the verification verdict itself: `repro_bundle.py scaffold --run-dir . --fingerprint <fp> --out <dir>` generates `repro.c`, `expected.json`, and `build_spec.json`; `repro_bundle.py try --file <c_file> --expected <expected.json> --build-spec <build_spec.json>` acts as a deterministic crash oracle (`SAME_CRASH` / `DIFFERENT_CRASH` / `NO_CRASH` / `COMPILE_ERROR`) while shrinking `repro.c`; and `repro_bundle.py package` verifies `SAME_CRASH` and emits `repro.c`, `Dockerfile`, `run.sh`, and `ISSUE.md`.
 
 ### Case B — Witness-Less Candidate (`origin: "eva"`, `"prover"`, or `"breaker"` `fault_hypothesis`)
 
