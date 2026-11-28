@@ -1,0 +1,47 @@
+{
+  "$comment": "Contract for expected.json written by scripts/repro_bundle.py scaffold and consumed by try and package (Contract 3).",
+  "type": "object",
+  "properties": {
+    "schema_version": {"const": 1},
+    "fingerprint": {
+      "type": "string",
+      "minLength": 16,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@+-]*#[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+::[0-9a-f]{10}$"
+    },
+    "module": {"type": "string", "minLength": 1},
+    "engine": {"type": "string", "enum": ["sanitizers", "eacsl"]},
+    "kind": {"type": "string", "minLength": 1},
+    "file": {"type": "string", "minLength": 1},
+    "line": {"type": "integer", "minimum": 0},
+    "function": {"type": "string", "minLength": 1},
+    "predicate": {"type": "string"},
+    "frames_top": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "case_selector": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 4095
+    },
+    "artifact_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "required": [
+    "schema_version",
+    "fingerprint",
+    "module",
+    "engine",
+    "kind",
+    "file",
+    "line",
+    "function",
+    "predicate",
+    "frames_top",
+    "case_selector",
+    "artifact_sha256"
+  ],
+  "additionalProperties": false
+}
