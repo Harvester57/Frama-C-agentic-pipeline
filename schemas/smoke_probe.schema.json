@@ -1,0 +1,80 @@
+{
+  "$comment": "Contract for per-case harness health probe telemetry (FRAMAC_PROBE_OUT JSON, Contract 1) and the advisory 'probe' summary block attached to workspace/reports/smoke/<module>.json by scripts/harness_smoke.py when FRAMAC_HARNESS_PROBE is enabled.",
+  "definitions": {
+    "telemetry_case": {
+      "type": "object",
+      "properties": {
+        "runs": {"type": "integer", "minimum": 0},
+        "init_fail": {"type": "integer", "minimum": 0},
+        "ret_kind": {"type": "string", "enum": ["void", "i64", "ptr"]},
+        "unique_overflow": {"type": "boolean"},
+        "unique_vals": {
+          "type": "array",
+          "items": {"type": "integer"},
+          "maxItems": 8
+        }
+      },
+      "required": ["runs", "init_fail", "ret_kind", "unique_overflow", "unique_vals"],
+      "additionalProperties": false
+    },
+    "telemetry_file": {
+      "type": "object",
+      "properties": {
+        "schema_version": {"const": 1},
+        "cases": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/definitions/telemetry_case"}
+        }
+      },
+      "required": ["schema_version", "cases"],
+      "additionalProperties": false
+    },
+    "summary_counts": {
+      "type": "object",
+      "properties": {
+        "never_reached": {"type": "integer", "minimum": 0},
+        "init_always_fails": {"type": "integer", "minimum": 0},
+        "constant_return": {"type": "integer", "minimum": 0},
+        "low_samples": {"type": "integer", "minimum": 0},
+        "healthy": {"type": "integer", "minimum": 0}
+      },
+      "required": ["never_reached", "init_always_fails", "constant_return", "low_samples", "healthy"],
+      "additionalProperties": false
+    },
+    "flagged_case": {
+      "type": "object",
+      "properties": {
+        "case": {"type": "integer", "minimum": 0},
+        "entry": {"type": ["string", "null"]},
+        "status": {
+          "type": "string",
+          "enum": ["never_reached", "init_always_fails", "constant_return"]
+        },
+        "runs": {"type": "integer", "minimum": 0},
+        "init_fail": {"type": "integer", "minimum": 0},
+        "ret_kind": {"type": "string", "enum": ["void", "i64", "ptr"]},
+        "constant_value": {"type": ["integer", "null"]}
+      },
+      "required": ["case", "entry", "status", "runs", "init_fail", "ret_kind", "constant_value"],
+      "additionalProperties": false
+    },
+    "probe_summary": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "probe_secs": {"type": "integer", "minimum": 0},
+        "summary_counts": {"$ref": "#/definitions/summary_counts"},
+        "flagged_cases": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/flagged_case"}
+        }
+      },
+      "required": ["enabled", "probe_secs", "summary_counts", "flagged_cases"],
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/definitions/telemetry_file"},
+    {"$ref": "#/definitions/probe_summary"}
+  ]
+}
