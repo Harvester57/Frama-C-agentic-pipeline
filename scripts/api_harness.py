@@ -454,6 +454,16 @@ def api_trust_schema_enabled(env: Mapping[str, str] | None = None) -> bool:
     return (src.get(API_TRUST_SCHEMA_ENV) or "").strip().lower() not in _OFF_VALUES
 
 
+HARNESS_PROBE_ENV = "FRAMAC_HARNESS_PROBE"
+_ON_VALUES = frozenset({"on", "1", "true", "yes"})
+
+
+def harness_probe_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Whether fuzz-only per-case probe telemetry is enabled (`FRAMAC_HARNESS_PROBE`, default off)."""
+    src = os.environ if env is None else env
+    return (src.get(HARNESS_PROBE_ENV) or "").strip().lower() in _ON_VALUES
+
+
 def _words(name: str | None) -> list[str]:
     """The lowercase words of an identifier (`max_message_nodes`, `maxNodes`, `mpack_expect_cstr`)."""
     return [w.lower() for w in _NAME_WORD_RE.findall(name or "")]
@@ -689,15 +699,31 @@ class ApiInfo:
     # Functions whose global_variables type metadata is known, allowing safe single-case global
     # teardown even when the function takes non-const record pointer parameters.
     global_types_known: set[str] = field(default_factory=set)
+    # Fuzz-only per-case probe telemetry (FRAMAC_HARNESS_PROBE, default off).
+    probe_telemetry: bool = False
 
 
 class _Case:
     """One dispatch case under construction: its statements, input slots and the rest-of-input binding."""
 
-    def __init__(self, spare: int, api: ApiInfo | None = None, calls: int = 1) -> None:
+    def __init__(
+        self,
+        spare: int,
+        api: ApiInfo | None = None,
+        calls: int = 1,
+        *,
+        probe_telemetry: bool | None = None,
+        probe_selector: str = "harness_selector",
+    ) -> None:
         self.spare = spare
         self.api = api or ApiInfo()
         self.ncalls = calls
+        self.probe_telemetry: bool = (
+            bool(probe_telemetry)
+            if probe_telemetry is not None
+            else (self.api.probe_telemetry or harness_probe_enabled())
+        )
+        self.probe_selector: str = probe_selector
         self.decls: list[str] = []
         self.post: list[str] = []
         self.slots: list[dict[str, Any]] = []
@@ -761,7 +787,8 @@ class _Case:
         return out
 
     def statements(self, calls: list[str]) -> str:
-        body = ["size_t fuzz_off = 0;", *self.decls, *self.post, *calls, "(void)fuzz_off;"]
+        prefix = [f"FRAMAC_PROBE_CASE_START({self.probe_selector});"] if self.probe_telemetry else []
+        body = [*prefix, "size_t fuzz_off = 0;", *self.decls, *self.post, *calls, "(void)fuzz_off;"]
         return " ".join(body)
 
 
@@ -1949,6 +1976,20 @@ def _return_type(rec: dict) -> str:
     return " ".join(parts[0].split()) if parts else ""
 
 
+def _probe_ret_kind(rec: dict) -> str:
+    """Return telemetry kind ('ptr', 'i64', or 'void') for a function record's return type."""
+    ret = _return_type(rec)
+    if not ret:
+        return "void"
+    classified = classify_type(ret)
+    kind = classified.get("kind")
+    if kind == "ptr":
+        return "ptr"
+    if kind == "int":
+        return "i64"
+    return "void"
+
+
 def _realloc_like(
     name: str, params: list[dict], formals: list[dict], rec: dict, api: ApiInfo
 ) -> tuple[list[int], list[int]] | None:
@@ -2730,9 +2771,7 @@ def _param_roles(
             elif i + 1 < n and _len_ptr_params(params, i, formals, rec) and _name(formals, i + 1) in att:
                 roles.append("attacker")
             elif (
-                i > 0
-                and roles[i - 1] == "caller_storage"
-                and _is_caller_storage_pair(params, i - 1, formals, rec, api)
+                i > 0 and roles[i - 1] == "caller_storage" and _is_caller_storage_pair(params, i - 1, formals, rec, api)
             ):
                 roles.append("caller_storage_len")
             elif p["kind"] == "struct":
@@ -2798,6 +2837,7 @@ def _bind_call(
     schema_bindings: dict[int, tuple[str, bool]] | None = None,
     builder_schema: dict[int, dict[str, Any]] | None = None,
     builder_rest: bool = False,
+    record_ret: bool = False,
 ) -> str:
     """
     The declarations and slots of one call's arguments (added to `case`); returns the call statement,
@@ -3178,13 +3218,7 @@ def _bind_call(
                 args += _array_args(case, call, params, formals, rec, i, j)
                 i = j + 1
                 continue
-            if (
-                api.trust_schema
-                and role == "caller_storage"
-                and pair
-                and nxt is not None
-                and (i + 1) not in shared
-            ):
+            if api.trust_schema and role == "caller_storage" and pair and nxt is not None and (i + 1) not in shared:
                 # S2 caller-storage shape (b): trusted writable `(void */byte *, size_t)` scratch pair.
                 buf_var = case.declare(f"{v}_buf")
                 case.decls.append(_byte_buffer("static ", buf_var, case.spare))
@@ -3639,16 +3673,25 @@ def _bind_call(
     made = case.api.returns.get(name) if allow_init else None
     made_struct = _made_struct(name, rec, params, api) if allow_init else None
     produced = _produced_struct(name, rec, params, api) if allow_init and made_struct is None else None
+    sel = case.probe_selector
+    probe_ret = case.probe_telemetry and record_ret
+    rk = _probe_ret_kind(rec) if probe_ret else "void"
     if made is not None and made in case.api.dtors:
         # The call under test makes a handle: release it, or every run of the case leaks one.
         r = f"c{call}r"
-        own = f"{{ {made} {r} = {name}({', '.join(args)}); {_handle_release(api, made, r)} }}"
+        probe_stmt = (
+            f" FRAMAC_PROBE_RET_PTR({sel}, (const void *)({r}));"
+            if rk == "ptr"
+            else (f" FRAMAC_PROBE_RET_I64({sel}, (int64_t)({r}));" if rk == "i64" else "")
+        )
+        own = f"{{ {made} {r} = {name}({', '.join(args)});{probe_stmt} {_handle_release(api, made, r)} }}"
     elif made_struct is not None:
         # The call under test makes a struct object its caller frees (libmodbus's modbus_mapping_new*).
         r = f"c{call}r"
         freer = api.struct_freers[made_struct]
         made_c = _anon_record_spelling(api, made_struct)
-        own = f"{{ {made_c} * {r} = {name}({', '.join(args)}); if ({r} != 0) {{ (void){freer}({r}); }} }}"
+        probe_stmt = f" FRAMAC_PROBE_RET_PTR({sel}, (const void *)({r}));" if probe_ret else ""
+        own = f"{{ {made_c} * {r} = {name}({', '.join(args)});{probe_stmt} if ({r} != 0) {{ (void){freer}({r}); }} }}"
         case.notes.append(f"call {call} result: a {made_struct} the caller owns, released with {freer}")
     elif produced is not None:
         # Rule G: the object a producer returns is freed by the destructor that takes its tables
@@ -3656,20 +3699,33 @@ def _bind_call(
         r = f"c{call}r"
         made_c = _anon_record_spelling(api, produced)
         release = _owner_release(case, call, produced, r)
-        own = f"{{ {made_c} * {r} = {name}({', '.join(args)}); if ({r} != 0) {{ {release} }} }}"
+        probe_stmt = f" FRAMAC_PROBE_RET_PTR({sel}, (const void *)({r}));" if probe_ret else ""
+        own = f"{{ {made_c} * {r} = {name}({', '.join(args)});{probe_stmt} if ({r} != 0) {{ {release} }} }}"
         case.notes.append(f"call {call} result: a {produced} the caller owns, released with {api.owners[produced]}")
     elif realloc_old is not None:
         # Rule E: the result is freed; on failure (a new size of at least 1) the old pointer still is the caller's.
         r = f"c{call}r"
+        probe_stmt = f" FRAMAC_PROBE_RET_PTR({sel}, (const void *)({r}));" if probe_ret else ""
+        realloc_fail = f" else {{ FRAMAC_PROBE_INIT_FAIL({sel}); }}" if probe_ret else ""
         own = (
-            f"if ({realloc_old} != 0) {{ void *{r} = (void *){name}({', '.join(args)}); "
-            f"if ({r} != 0) {{ free({r}); }} else {{ free({realloc_old}); }} }}"
+            f"if ({realloc_old} != 0) {{ void *{r} = (void *){name}({', '.join(args)});{probe_stmt} "
+            f"if ({r} != 0) {{ free({r}); }} else {{ free({realloc_old}); }} }}{realloc_fail}"
         )
     elif allow_init and _owned_result(name, rec, params, formals, api):
         # Rule F: a heap result the caller owns, freed, or every run of the case leaks it.
         r = f"c{call}r"
-        own = f"{{ void *{r} = (void *){name}({', '.join(args)}); free({r}); }}"
+        probe_stmt = f" FRAMAC_PROBE_RET_PTR({sel}, (const void *)({r}));" if probe_ret else ""
+        own = f"{{ void *{r} = (void *){name}({', '.join(args)});{probe_stmt} free({r}); }}"
         case.notes.append(f"call {call} result: a heap object the caller owns, freed after the call")
+    elif rk == "ptr":
+        r = f"c{call}pr"
+        own = (
+            f"{{ const void *{r} = (const void *)({name}({', '.join(args)})); "
+            f"FRAMAC_PROBE_RET_PTR({sel}, {r}); (void){r}; }}"
+        )
+    elif rk == "i64":
+        r = f"c{call}pr"
+        own = f"{{ int64_t {r} = (int64_t)({name}({', '.join(args)})); FRAMAC_PROBE_RET_I64({sel}, {r}); (void){r}; }}"
     else:
         own = f"(void){name}({', '.join(args)});"
     if allow_init:
@@ -3697,9 +3753,11 @@ def _bind_call(
     if guards:
         # Only on handles an out-parameter constructor built or calloc'd global-pointer args:
         # on partial allocation failure, free every heap-allocated global-pointer argument.
-        if global_heap_vars:
-            oom_free = " ".join(f"free({v});" for v in global_heap_vars)
-            own = f"if ({' && '.join(guards)}) {{ {own} }} else {{ {oom_free} }}"
+        fail_parts: list[str] = [f"free({v});" for v in global_heap_vars]
+        if probe_ret:
+            fail_parts.append(f"FRAMAC_PROBE_INIT_FAIL({sel});")
+        if fail_parts:
+            own = f"if ({' && '.join(guards)}) {{ {own} }} else {{ {' '.join(fail_parts)} }}"
         else:
             own = f"if ({' && '.join(guards)}) {{ {own} }}"
     return " ".join([*before, own, *after])
@@ -3926,12 +3984,13 @@ def single_case(
     entry_trust: _EntryTrust | None = None,
     schema_bindings: dict[int, tuple[str, bool]] | None = None,
     builder_schema: dict[int, dict[str, Any]] | None = None,
+    probe_telemetry: bool | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """(statements, layout, why not) of the case that calls one API function."""
     params, why = plan_params(str(model_rec.get("signature") or ""), model_rec.get("formals"))
     if params is None:
         return None, None, why
-    case = _Case(spare, api, calls=1)
+    case = _Case(spare, api, calls=1, probe_telemetry=probe_telemetry)
     try:
         call = _bind_call(
             case,
@@ -3943,6 +4002,7 @@ def single_case(
             entry_trust=entry_trust,
             schema_bindings=schema_bindings,
             builder_schema=builder_schema,
+            record_ret=True,
         )
     except _CaseError as e:
         return None, None, str(e)
@@ -4036,7 +4096,9 @@ def _single_cases_for_entry(
     if not direct_schema_opts and not builder_schema_opts:
         case = _Case(spare, api, calls=1)
         try:
-            call_stmt = _bind_call(case, 0, name, params_raw, formals, model_rec, entry_trust=entry_trust)
+            call_stmt = _bind_call(
+                case, 0, name, params_raw, formals, model_rec, entry_trust=entry_trust, record_ret=True
+            )
         except _AutoExempt as exc:
             return [], str(exc), True, set()
         except _CaseError as exc:
@@ -4093,6 +4155,7 @@ def _single_cases_for_entry(
                 entry_trust=entry_trust,
                 schema_bindings=sb,
                 builder_schema=bs,
+                record_ret=True,
             )
         except _AutoExempt as exc:
             last_err, last_exempt = str(exc), True
@@ -4207,7 +4270,7 @@ def variadic_case(
         }
         rec = {**model_rec, "param_sizes": sizes}
         literal = c_string_literal(fmt_bytes)
-        call = _bind_call(case, 0, name, params, formals, rec, {fmt_at: literal}, extra_args=extra)
+        call = _bind_call(case, 0, name, params, formals, rec, {fmt_at: literal}, extra_args=extra, record_ret=True)
     except _CaseError as e:
         return None, None, str(e)
     layout = case.layout(VARIADIC_KIND, [name])
@@ -5534,6 +5597,8 @@ def sequence_case(
     trust: Mapping[str, _EntryTrust] | None = None,
     setup_positions: Collection[int] | None = None,
     trailing_teardown: str | None = None,
+    *,
+    probe_telemetry: bool | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
     """
     The case that replays one chain of a trace: one buffer per shared address (the largest size the
@@ -5550,7 +5615,17 @@ def sequence_case(
     `trailing_teardown`, when given, appends a 0-arg global teardown call after the chain.
     """
     try:
-        return _sequence_case(trace, chain, records, spare, api, trust, setup_positions, trailing_teardown)
+        return _sequence_case(
+            trace,
+            chain,
+            records,
+            spare,
+            api,
+            trust,
+            setup_positions,
+            trailing_teardown,
+            probe_telemetry=probe_telemetry,
+        )
     except _CaseError as e:
         return None, None, str(e)
 
@@ -5564,8 +5639,10 @@ def _sequence_case(
     trust: Mapping[str, _EntryTrust] | None = None,
     setup_positions: Collection[int] | None = None,
     trailing_teardown: str | None = None,
+    *,
+    probe_telemetry: bool | None = None,
 ) -> tuple[str | None, dict | None, str | None]:
-    case = _Case(spare, api, calls=len(chain))
+    case = _Case(spare, api, calls=len(chain), probe_telemetry=probe_telemetry)
     case.recorded_scalars = True
     buffers: dict[str, str] = {}
     calls: list[str] = []
@@ -5573,6 +5650,10 @@ def _sequence_case(
     setup_pos = set(setup_positions or ())
     if not any(trace[k]["fn"] in records for pos, k in enumerate(chain) if pos not in setup_pos):
         return None, None, "sequence has no API entry point"
+    last_entry_pos = max(
+        (pos for pos, k in enumerate(chain) if pos not in setup_pos and trace[k]["fn"] in records),
+        default=-1,
+    )
     seen_addr: dict[str, int] = {}
     for pos, k in enumerate(chain):
         if pos in setup_pos:
@@ -5650,7 +5731,17 @@ def _sequence_case(
             et: _EntryTrust | None = _EntryTrust(input_role="entry", attacker_params=[])
         else:
             et = (trust or {}).get(name)
-        bound = _bind_call(case, pos, name, params, list(rec.get("formals") or []), rec, shared, entry_trust=et)
+        bound = _bind_call(
+            case,
+            pos,
+            name,
+            params,
+            list(rec.get("formals") or []),
+            rec,
+            shared,
+            entry_trust=et,
+            record_ret=(pos == last_entry_pos),
+        )
         calls.append(" ".join([*before, bound]))
         names.append(name)
     if trailing_teardown and (not names or names[-1] != trailing_teardown):
@@ -5755,11 +5846,12 @@ def _lifecycle_case(
         branches.append(f"if (fc_k == {k}U) {{ {' '.join([*sub.decls, *sub.post, call])} }}")
     closer = api.closers.get(htype)
     release = f"(void){closer}(fc_h); (void){dtor}(fc_h);" if closer else f"(void){dtor}(fc_h);"
+    init_fail_else = f" else {{ FRAMAC_PROBE_INIT_FAIL({case.probe_selector}); }}" if case.probe_telemetry else ""
     loop = (
         f"if (fc_h != 0) {{ for (unsigned int fc_i = 0; fc_i < {max_calls}U; fc_i++) {{ unsigned char fc_op = 0;"
         f" if (fuzz_len < fuzz_off + 1) {{ break; }} memcpy(&fc_op, {FUZZ_COPY}, 1); fuzz_off += 1;"
         f" unsigned int fc_k = (unsigned int)fc_op % {len(methods)}U; {' else '.join(branches)} }}"
-        f" {release} }}"
+        f" {release} }}{init_fail_else}"
     )
     layout = case.layout("lifecycle", [ctor, dtor])
     layout.update(handle=htype, methods=list(methods), max_calls=max_calls)
@@ -6125,6 +6217,7 @@ def plan(
     global_variables: dict[str, dict] | None = None,
     trust: dict[str, Any] | None = None,
     trust_schema: bool | None = None,
+    probe_telemetry: bool | None = None,
 ) -> dict[str, Any]:
     """
     The cases of a module's API harness: {entries, cases, layouts, skipped, stubs, variadic_dropped}.
@@ -6143,6 +6236,7 @@ def plan(
     single case.
     """
     effective_trust_schema = api_trust_schema_enabled() if trust_schema is None else bool(trust_schema)
+    effective_probe_telemetry = harness_probe_enabled() if probe_telemetry is None else bool(probe_telemetry)
     max_cases = max(0, MAX_CASES - reserve)
     from module_map import ModuleMap
 
@@ -6330,6 +6424,7 @@ def plan(
         global_freed_ptrs=global_freed_ptrs,
         global_retained_ptrs=global_retained_ptrs,
         global_types_known=global_types_known,
+        probe_telemetry=effective_probe_telemetry,
     )
     # Each function's threat-model roles by name, for the sequence cases (bound as in its single case).
     trust_by_name: dict[str, _EntryTrust] = {}
@@ -7997,6 +8092,7 @@ def generate(
     global_variables: dict[str, dict] | None = None,
     trust: dict[str, Any] | None = None,
     trust_schema: bool | None = None,
+    probe_telemetry: bool | None = None,
 ) -> dict[str, Any]:
     """
     Write harness_<module>.{c,json} for the module's whole API; the generate_harness result plus counts.
@@ -8071,6 +8167,7 @@ def generate(
         reports = dag_file.parent
         variadic = ensure(reports / "variadic_calls.json", model_path, reports / "build_capture.json")
     effective_trust_schema = api_trust_schema_enabled() if trust_schema is None else bool(trust_schema)
+    effective_probe_telemetry = harness_probe_enabled() if probe_telemetry is None else bool(probe_telemetry)
     p = plan(
         dag,
         model,
@@ -8086,6 +8183,7 @@ def generate(
         global_variables=global_variables,
         trust=trust,
         trust_schema=effective_trust_schema,
+        probe_telemetry=effective_probe_telemetry,
     )
     if not p["cases"]:
         raise ApiHarnessError(f"module {module!r}: no API entry point the generator can call: {p['skipped']}")
@@ -8191,6 +8289,7 @@ def generate(
                         global_variables=global_variables,
                         trust=trust,
                         trust_schema=effective_trust_schema,
+                        probe_telemetry=effective_probe_telemetry,
                     )
                     if p["cases"]:
                         cases, layouts, skipped = with_custom(p)
@@ -8225,6 +8324,7 @@ def generate(
                     global_variables=global_variables,
                     trust=trust,
                     trust_schema=effective_trust_schema,
+                    probe_telemetry=effective_probe_telemetry,
                 )
                 layouts_probed = None
                 if p["cases"]:

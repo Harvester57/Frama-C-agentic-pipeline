@@ -109,6 +109,143 @@ static inline int framac_fuzz_skip_case(unsigned int c) {
 }
 #endif
 
+#if !defined(__FRAMAC__) && defined(FRAMAC_FUZZ_PROBE_TELEMETRY)
+#include <stdio.h>
+#define FRAMAC_PROBE_MAX_CASES 4096U
+#define FRAMAC_PROBE_MAX_UNIQUE 8U
+typedef struct {
+    unsigned long long runs;
+    unsigned long long init_fail;
+    int64_t unique_vals[FRAMAC_PROBE_MAX_UNIQUE];
+    unsigned char unique_len;
+    unsigned char unique_overflow;
+    unsigned char ret_kind; /* 0=void, 1=i64, 2=ptr */
+} framac_probe_slot_t;
+static framac_probe_slot_t framac_probe_slots[FRAMAC_PROBE_MAX_CASES];
+static int framac_probe_init_done = 0;
+static const char *framac_probe_out_path = NULL;
+
+static void framac_probe_flush(void) {
+    if (framac_probe_out_path == NULL || framac_probe_out_path[0] == '\0') {
+        return;
+    }
+    FILE *fp = fopen(framac_probe_out_path, "w");
+    if (fp == NULL) {
+        return;
+    }
+    fputs("{\"schema_version\":1,\"cases\":{", fp);
+    int first_case = 1;
+    for (unsigned int i = 0U; i < FRAMAC_PROBE_MAX_CASES; i++) {
+        const framac_probe_slot_t *s = &framac_probe_slots[i];
+        if (s->runs == 0ULL) {
+            continue;
+        }
+        const char *rk = (s->ret_kind == 1U) ? "i64" : ((s->ret_kind == 2U) ? "ptr" : "void");
+        if (!first_case) {
+            fputc(',', fp);
+        }
+        first_case = 0;
+        fprintf(
+            fp,
+            "\"%u\":{\"runs\":%llu,\"init_fail\":%llu,\"ret_kind\":\"%s\",\"unique_overflow\":%s,\"unique_vals\":[",
+            i,
+            s->runs,
+            s->init_fail,
+            rk,
+            s->unique_overflow ? "true" : "false"
+        );
+        for (unsigned char j = 0U; j < s->unique_len && j < FRAMAC_PROBE_MAX_UNIQUE; j++) {
+            if (j > 0U) {
+                fputc(',', fp);
+            }
+            fprintf(fp, "%lld", (long long)s->unique_vals[j]);
+        }
+        fputs("]}", fp);
+    }
+    fputs("}}\n", fp);
+    fclose(fp);
+}
+
+static inline int framac_probe_active(void) {
+    if (!framac_probe_init_done) {
+        framac_probe_init_done = 1;
+        const char *p = getenv("FRAMAC_PROBE_OUT");
+        if (p != NULL && p[0] != '\0') {
+            framac_probe_out_path = p;
+            atexit(framac_probe_flush);
+        }
+    }
+    return framac_probe_out_path != NULL;
+}
+
+#if (defined(__GNUC__) || defined(__clang__))
+__attribute__((unused))
+#endif
+static inline void framac_probe_case_start(unsigned int c) {
+    if (!framac_probe_active() || c >= FRAMAC_PROBE_MAX_CASES) {
+        return;
+    }
+    framac_probe_slots[c].runs++;
+}
+
+#if (defined(__GNUC__) || defined(__clang__))
+__attribute__((unused))
+#endif
+static inline void framac_probe_init_fail(unsigned int c) {
+    if (!framac_probe_active() || c >= FRAMAC_PROBE_MAX_CASES) {
+        return;
+    }
+    framac_probe_slots[c].init_fail++;
+}
+
+static inline void framac_probe_record_val(framac_probe_slot_t *s, int64_t v) {
+    for (unsigned char j = 0U; j < s->unique_len; j++) {
+        if (s->unique_vals[j] == v) {
+            return;
+        }
+    }
+    if (s->unique_len < FRAMAC_PROBE_MAX_UNIQUE) {
+        s->unique_vals[s->unique_len++] = v;
+    } else {
+        s->unique_overflow = 1U;
+    }
+}
+
+#if (defined(__GNUC__) || defined(__clang__))
+__attribute__((unused))
+#endif
+static inline void framac_probe_ret_i64(unsigned int c, int64_t v) {
+    if (!framac_probe_active() || c >= FRAMAC_PROBE_MAX_CASES) {
+        return;
+    }
+    framac_probe_slot_t *s = &framac_probe_slots[c];
+    s->ret_kind = 1U;
+    framac_probe_record_val(s, v);
+}
+
+#if (defined(__GNUC__) || defined(__clang__))
+__attribute__((unused))
+#endif
+static inline void framac_probe_ret_ptr(unsigned int c, const void *p) {
+    if (!framac_probe_active() || c >= FRAMAC_PROBE_MAX_CASES) {
+        return;
+    }
+    framac_probe_slot_t *s = &framac_probe_slots[c];
+    s->ret_kind = 2U;
+    framac_probe_record_val(s, (p != NULL) ? (int64_t)1 : (int64_t)0);
+}
+
+#define FRAMAC_PROBE_CASE_START(c) framac_probe_case_start((unsigned int)(c))
+#define FRAMAC_PROBE_INIT_FAIL(c)  framac_probe_init_fail((unsigned int)(c))
+#define FRAMAC_PROBE_RET_I64(c, v) framac_probe_ret_i64((unsigned int)(c), (int64_t)(v))
+#define FRAMAC_PROBE_RET_PTR(c, p) framac_probe_ret_ptr((unsigned int)(c), (const void *)(p))
+#else
+#define FRAMAC_PROBE_CASE_START(c) ((void)0)
+#define FRAMAC_PROBE_INIT_FAIL(c)  ((void)0)
+#define FRAMAC_PROBE_RET_I64(c, v) ((void)0)
+#define FRAMAC_PROBE_RET_PTR(c, p) ((void)0)
+#endif
+
 #if defined(__FRAMAC__) && !defined(__FRAMAC_EACSL__)
 #include "__fc_builtin.h"
 

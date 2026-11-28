@@ -80,6 +80,8 @@ from sandbox_exec import Limits, SandboxResult, SandboxUnavailable  # noqa: E402
 
 SCHEMA_VERSION = 1
 DEFAULT_SMOKE_TIMEOUT_S = 10
+DEFAULT_PROBE_SECS = 5
+PROBE_MIN_SAMPLES_CONSTANT = 20
 SMOKE_BATCH_CASES = 32
 EACSL_SMOKE_BATCH_CASES = 256
 ZERO_PAYLOAD_LEN = 64
@@ -90,6 +92,9 @@ LOG_TAIL_CHARS = 3000
 STACK_TRACE_MAX_CHARS = 4000
 
 _OFF_VALUES = frozenset({"off", "0", "false", "no"})
+_ON_VALUES = frozenset({"on", "1", "true", "yes"})
+PROBE_STATUSES = ("never_reached", "init_always_fails", "constant_return", "low_samples", "healthy")
+PROBE_FLAGGED_STATUSES = frozenset({"never_reached", "init_always_fails", "constant_return"})
 _RUNNING_RE = re.compile(r"^Running:\s+(?P<path>\S+)\s*$", re.MULTILINE)
 _ERROR_LINE_RE = re.compile(
     r"(?:==\d+==ERROR:|SUMMARY:|runtime error:|Error:|Aborted\b|Segmentation fault|"
@@ -101,6 +106,11 @@ _ERROR_LINE_RE = re.compile(
 def harness_smoke_enabled() -> bool:
     """Whether the standalone harness smoke gate is enabled (`FRAMAC_HARNESS_SMOKE`, default on; `=off` disables)."""
     return (os.environ.get("FRAMAC_HARNESS_SMOKE") or "").strip().lower() not in _OFF_VALUES
+
+
+def harness_probe_enabled() -> bool:
+    """Whether the advisory per-case health probe pass is enabled (`FRAMAC_HARNESS_PROBE`, default off)."""
+    return (os.environ.get("FRAMAC_HARNESS_PROBE") or "").strip().lower() in _ON_VALUES
 
 
 @dataclass(frozen=True)
@@ -994,6 +1004,204 @@ def _counts_for(case_results: Sequence[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def classify_probe_cases(
+    probe_data: dict[str, Any] | None,
+    n_cases: int,
+    *,
+    quarantined_cases: Sequence[int] = (),
+    entry_map: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    """
+    Classify every active (non-quarantined) dispatch case `0..n_cases-1` from `FRAMAC_PROBE_OUT`
+    telemetry (`probe_data`) per Contract 1.
+
+    Returns a dict with:
+      - `summary_counts`: counts for each of the 5 probe statuses (`never_reached`,
+        `init_always_fails`, `constant_return`, `low_samples`, `healthy`).
+      - `flagged_cases`: list of `{case, entry, status, runs, init_fail, ret_kind, constant_value}`
+        for cases classified as `never_reached`, `init_always_fails`, or `constant_return`.
+      - `case_classifications`: mapping `case_idx -> status` for every active case.
+    """
+    quarantined_set = {int(k) for k in quarantined_cases}
+    entries = entry_map or {}
+    raw_cases = probe_data.get("cases") if isinstance(probe_data, dict) else None
+    cases_map: dict[Any, Any] = raw_cases if isinstance(raw_cases, dict) else {}
+
+    summary_counts: dict[str, int] = {status: 0 for status in PROBE_STATUSES}
+    flagged_cases: list[dict[str, Any]] = []
+    case_classifications: dict[int, str] = {}
+
+    for k in range(max(0, int(n_cases))):
+        if k in quarantined_set:
+            continue
+        slot = cases_map.get(str(k))
+        if slot is None and k in cases_map:
+            slot = cases_map[k]
+        slot_dict: dict[str, Any] = slot if isinstance(slot, dict) else {}
+
+        raw_runs = slot_dict.get("runs", 0)
+        runs = raw_runs if isinstance(raw_runs, int) and not isinstance(raw_runs, bool) and raw_runs > 0 else 0
+
+        raw_init_fail = slot_dict.get("init_fail", 0)
+        init_fail = (
+            raw_init_fail
+            if isinstance(raw_init_fail, int) and not isinstance(raw_init_fail, bool) and raw_init_fail > 0
+            else 0
+        )
+
+        raw_ret_kind = slot_dict.get("ret_kind")
+        ret_kind = raw_ret_kind if raw_ret_kind in ("void", "i64", "ptr") else "void"
+
+        unique_overflow = bool(slot_dict.get("unique_overflow", False))
+        raw_vals = slot_dict.get("unique_vals")
+        unique_vals = (
+            [v for v in raw_vals if isinstance(v, int) and not isinstance(v, bool)]
+            if isinstance(raw_vals, list)
+            else []
+        )
+
+        constant_value: int | None = None
+        if runs <= 0:
+            status = "never_reached"
+        elif init_fail >= runs:
+            status = "init_always_fails"
+        elif (
+            runs >= PROBE_MIN_SAMPLES_CONSTANT and ret_kind != "void" and not unique_overflow and len(unique_vals) == 1
+        ):
+            status = "constant_return"
+            constant_value = unique_vals[0]
+        elif 0 < runs < PROBE_MIN_SAMPLES_CONSTANT and not unique_overflow and len(unique_vals) <= 1:
+            status = "low_samples"
+        else:
+            status = "healthy"
+
+        summary_counts[status] += 1
+        case_classifications[k] = status
+        if status in PROBE_FLAGGED_STATUSES:
+            flagged_cases.append(
+                {
+                    "case": k,
+                    "entry": entries.get(k),
+                    "status": status,
+                    "runs": runs,
+                    "init_fail": init_fail,
+                    "ret_kind": ret_kind,
+                    "constant_value": constant_value,
+                }
+            )
+
+    return {
+        "summary_counts": summary_counts,
+        "flagged_cases": flagged_cases,
+        "case_classifications": case_classifications,
+    }
+
+
+def _run_health_probe(
+    san_bin: Path,
+    n_cases: int,
+    selector: str,
+    width: int,
+    entry_map: dict[int, str],
+    quarantined_cases: Sequence[int],
+    seeds_dir: Path | None,
+    scratch: Path,
+    *,
+    probe_secs: int,
+    timeout_s: int,
+    module: str,
+) -> dict[str, Any]:
+    """
+    Execute an advisory bounded-time health probe on `san_bin` via `sandbox_exec.py` with
+    `FRAMAC_PROBE_OUT` set, parse the resulting telemetry, and return the `"probe"` summary block.
+    Never raises on sandbox or telemetry parse errors (report-only).
+    """
+    quarantined_set = {int(k) for k in quarantined_cases}
+    probe_corpus = scratch / "probe_corpus"
+    probe_corpus.mkdir(parents=True, exist_ok=True)
+    probe_out_dir = scratch / "probe_out"
+    probe_out_dir.mkdir(parents=True, exist_ok=True)
+    probe_out = probe_out_dir / "probe.json"
+
+    for k in range(max(0, int(n_cases))):
+        if k in quarantined_set:
+            continue
+        sel_bytes = encode_selector(k, width)
+        (probe_corpus / f"probe_seed_{k:04d}.bin").write_bytes(sel_bytes + (b"\x00" * ZERO_PAYLOAD_LEN))
+
+    if seeds_dir is not None and seeds_dir.is_dir():
+        for idx, path in enumerate(
+            sorted(p for p in seeds_dir.iterdir() if p.is_file() and not p.name.startswith("."))
+        ):
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            if len(raw) >= width:
+                case_idx = dispatch_case_of_bytes(raw[:width], n_cases, selector)
+                if case_idx is not None and case_idx in quarantined_set:
+                    continue
+            (probe_corpus / f"harvested_{idx:04d}_{path.name}").write_bytes(raw)
+
+    seed = derive_seed(san_bin, f"{module}:probe")
+    per_input_timeout = max(1, int(timeout_s))
+    dur = max(1, int(probe_secs))
+    wall = max(dur + 15, per_input_timeout + 10)
+    env = dict(SANITIZER_RUNTIME_ENV)
+    env["FRAMAC_PROBE_OUT"] = str(probe_out)
+    if quarantined_set:
+        env["FRAMAC_FUZZ_SKIP_CASES"] = ",".join(str(k) for k in sorted(quarantined_set))
+
+    art_dir = replay_artifact_dir(scratch)
+    argv = [
+        str(san_bin.resolve()),
+        f"-max_total_time={dur}",
+        "-ignore_crashes=1",
+        f"-timeout={per_input_timeout}",
+        f"-rss_limit_mb={FUZZ_RSS_LIMIT_MB}",
+        f"-seed={seed}",
+        f"-artifact_prefix={art_dir}/",
+        str(probe_corpus),
+    ]
+    probe_cwd = Path(tempfile.mkdtemp(prefix="probe_cwd_", dir=scratch))
+    probe_data: dict[str, Any] | None = None
+    try:
+        try:
+            sandbox_exec.run_sandboxed(
+                argv,
+                writable=[probe_cwd, probe_corpus, probe_out_dir, art_dir],
+                cwd=probe_cwd,
+                timeout_s=wall,
+                limits=Limits(cpu_seconds=wall * 2, ignore_sigpipe=True),
+                extra_env=env,
+            )
+        except (SandboxUnavailable, OSError):
+            pass
+
+        if probe_out.is_file():
+            try:
+                loaded = json.loads(probe_out.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    probe_data = loaded
+            except (OSError, json.JSONDecodeError):
+                probe_data = None
+    finally:
+        shutil.rmtree(probe_cwd, ignore_errors=True)
+
+    classified = classify_probe_cases(
+        probe_data,
+        n_cases,
+        quarantined_cases=quarantined_cases,
+        entry_map=entry_map,
+    )
+    return {
+        "enabled": True,
+        "probe_secs": dur,
+        "summary_counts": classified["summary_counts"],
+        "flagged_cases": classified["flagged_cases"],
+    }
+
+
 def run_smoke(
     *,
     module: str,
@@ -1004,12 +1212,16 @@ def run_smoke(
     build_json: Path | None = None,
     seeds_dir: Path | None = None,
     timeout_s: int = DEFAULT_SMOKE_TIMEOUT_S,
+    probe_secs: int | None = None,
 ) -> tuple[dict[str, Any], int]:
     """
     Execute the standalone harness smoke gate for `module`, write the report atomically to
     `out_json`, and return `(report, exit_code)`.
     """
     t0 = time.monotonic()
+    effective_probe_secs = (
+        (DEFAULT_PROBE_SECS if harness_probe_enabled() else 0) if probe_secs is None else max(0, int(probe_secs))
+    )
     sidecar = load_json_strict(sidecar_path)
     if not isinstance(sidecar, dict):
         raise ArtifactError(f"sidecar is not a JSON object: {sidecar_path}")
@@ -1029,6 +1241,7 @@ def run_smoke(
         case_results: list[dict[str, Any]],
         exit_code: int,
         case_engines_checked: list[str] | None = None,
+        probe: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], int]:
         if is_dispatch:
             quarantined = sorted(c["case"] for c in case_results if c.get("status") == "quarantined")
@@ -1055,6 +1268,8 @@ def run_smoke(
             "counts": _counts_for(case_results),
             "wall_s": round(max(0.0, time.monotonic() - t0), 3),
         }
+        if probe is not None:
+            report["probe"] = probe
         atomic_write_json(out_json, report)
         return report, exit_code
 
@@ -1085,6 +1300,7 @@ def run_smoke(
         }
         return _finish("failed", startup, [], 1)
 
+    probe_report: dict[str, Any] | None = None
     with tempfile.TemporaryDirectory(prefix=f"framac_smoke_{module}_") as tmp_dir:
         scratch = Path(tmp_dir)
         startup_probe = scratch / "startup_probe.bin"
@@ -1144,6 +1360,23 @@ def run_smoke(
             }
             return _finish("failed", startup, [], 3)
 
+        if is_dispatch and escalation is None and effective_probe_secs > 0 and has_san and resolved_san is not None:
+            quarantined_for_probe = sorted(c["case"] for c in case_results if c.get("status") == "quarantined")
+            if len(quarantined_for_probe) < n_cases:
+                probe_report = _run_health_probe(
+                    resolved_san,
+                    n_cases,
+                    selector,
+                    width,
+                    entry_map,
+                    quarantined_for_probe,
+                    seeds_dir,
+                    scratch,
+                    probe_secs=effective_probe_secs,
+                    timeout_s=timeout_s,
+                    module=module,
+                )
+
     if escalation is not None:
         _apply_startup_escalation(startup, escalation)
         return _finish("startup_error", startup, case_results, 1, case_engines)
@@ -1151,9 +1384,9 @@ def run_smoke(
     quarantined_count = sum(1 for c in case_results if c.get("status") == "quarantined")
     if is_dispatch:
         if quarantined_count == 0:
-            return _finish("ok", startup, case_results, 0, case_engines)
+            return _finish("ok", startup, case_results, 0, case_engines, probe=probe_report)
         if quarantined_count < n_cases:
-            return _finish("degraded", startup, case_results, 0, case_engines)
+            return _finish("degraded", startup, case_results, 0, case_engines, probe=probe_report)
         return _finish("failed", startup, case_results, 1, case_engines)
 
     if quarantined_count > 0:
@@ -1185,6 +1418,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SMOKE_TIMEOUT_S,
         help=f"Per-probe timeout in seconds (default: {DEFAULT_SMOKE_TIMEOUT_S})",
     )
+    p_run.add_argument(
+        "--probe-secs",
+        type=int,
+        default=DEFAULT_PROBE_SECS if harness_probe_enabled() else 0,
+        help=(
+            "Duration in seconds for the advisory per-case health probe pass "
+            f"(default: {DEFAULT_PROBE_SECS} when FRAMAC_HARNESS_PROBE is enabled, 0 otherwise)"
+        ),
+    )
     return parser
 
 
@@ -1203,6 +1445,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             build_json=args.build_json,
             seeds_dir=args.seeds_dir,
             timeout_s=args.timeout,
+            probe_secs=args.probe_secs,
         )
         return rc
     return 1
