@@ -36,8 +36,7 @@ It prints the surviving clauses ready to paste. Without --out-json the report go
 workspace/reports/loop_seeds/<module>/<function>.json, where the scheduler also copies a prover's
 report when the prover completes.
 
-Gated by FRAMAC_LOOP_SEEDS (function_facts.loop_seeds_enabled; FRAMAC_PROVER_CONTEXT=off turns
-it off too). Default: on (`=off` disables).
+Gated by FRAMAC_LOOP_SEEDS (function_facts.loop_seeds_enabled). Default: on (`=off` disables).
 """
 
 from __future__ import annotations

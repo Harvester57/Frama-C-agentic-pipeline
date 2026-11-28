@@ -22,7 +22,7 @@ CLI (from the run directory; the Make target `facts-<module>` runs it):
 
 The result is cached by content (namespace `facts`): toolchain, flags, dependency manifest and the
 Eva flows it was built from. A failure is reported in the JSON and only means a brief without
-facts, the same brief a prover gets with FRAMAC_PROVER_CONTEXT=off.
+facts.
 """
 
 from __future__ import annotations

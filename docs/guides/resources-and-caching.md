@@ -195,42 +195,39 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY` | Cap for the whole pipeline pool | measured |
-| `FRAMAC_RESERVE_CPUS`, `FRAMAC_RESERVE_MEMORY` | Headroom kept free | max(0.5, 5 %), max(1 GiB, 10 %) |
-| `FRAMAC_MAX_AGENTS` | Cap on recommended concurrent LLM subagents | 16 (scales to 32 on $\ge 32$ CPUs, 64 on $\ge 64$ CPUs) |
-| `FRAMAC_CONTAINER_ENGINE` | `docker`, `podman` or `auto` | `auto` |
-| `FRAMAC_PIN` | `auto`, `on`, `off` | `auto` |
-| `FRAMAC_BROKER` | `off` disables the broker | on |
-| `FRAMAC_BROKER_DIR` | Lease state directory (local disk only) | `/tmp/framac-pipeline-$UID/broker`, `%LOCALAPPDATA%\framac-pipeline\broker` |
-| `FRAMAC_CACHE` | `off` disables every cache, including per-run | on inside a run |
+| `FRAMAC_POOL_CPUS`, `FRAMAC_POOL_MEMORY` | Explicit CPU and memory cap for the whole pipeline pool (e.g. `8`, `16g`) | measured |
+| `FRAMAC_RESERVE_CPUS`, `FRAMAC_RESERVE_MEMORY` | Headroom kept free for the orchestrator and OS (absolute value or `N%`) | max(0.5, 5 %), max(1 GiB, 10 %) |
+| `FRAMAC_MAX_AGENTS` | Cap on recommended concurrent LLM subagents (`wp_scheduler.py --slots auto`) | 16 (scales to 32 on ≥ 32 CPUs, 64 on ≥ 64 CPUs) |
+| `FRAMAC_CONTAINER_ENGINE` | Container engine selection (`docker`, `podman`, or `auto`: picks `docker` when usable, else `podman`); `--engine` / `-Engine` overrides | `auto` |
+| `FRAMAC_PIN` | CPU pinning policy (`auto`, `on`, or `off`): `auto` pins exclusive whole cores per lease on multi-NUMA/L3 native Linux and preserves affinity/cpuset confinement; `on`/`off` forces it (Section 3) | `auto` |
+| `FRAMAC_BROKER` | `off` disables the host broker and restores legacy static per-container limits (same as `--no-broker` / `-NoBroker`, Section 3) | on |
+| `FRAMAC_BROKER_DIR` | Lease state directory for the host or container broker (local filesystem only) | `/tmp/framac-pipeline-$UID/broker`, `%LOCALAPPDATA%\framac-pipeline\broker` (container: `/tmp/framac-broker`) |
+| `FRAMAC_CACHE` | `off` disables every cache, including per-run; `on` enables caching even outside a run directory | on inside a run |
 | `FRAMAC_CACHE_DIR` | Shared cross-run store (one partition per repository key under `repos/`), `off` to disable | `~/.cache/framac-pipeline` |
-| `FRAMAC_CACHE_VOLUME` | `auto`, `on` or `off`: keep the shared store in the named volume `framac-cache-<repo key>` instead of bind-mounting `FRAMAC_CACHE_DIR` (Section 5) | `auto` |
-| `FRAMAC_CACHE_RW` | `off` mounts the shared store read-only for every command, trusted steps included | on |
-| `FRAMAC_CACHE_MAX` | Size cap for a cache store | min(20 GiB, 25 % of (free disk + the store's size)) |
-| `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR` | Set by the broker inside the container: how the shared store is mounted, and where | — |
-| `FRAMAC_PYTHON` | Host Python the wrappers use for the broker | first `python3` ≥ 3.10 (`py -3` on Windows) |
-| `FRAMAC_RESOURCES_VERBOSE` | `1` prints every lease, not only those that waited | off |
+| `FRAMAC_CACHE_VOLUME` | `auto`, `on` or `off`: keep the shared store in the named volume `framac-cache-<repo key>` instead of bind-mounting `FRAMAC_CACHE_DIR` (`auto` picks the volume when the engine runs in a VM, is remote, or the cache dir is on a network filesystem; Section 5) | `auto` |
+| `FRAMAC_CACHE_RW` | `off` mounts the shared store read-only for every command, allowlisted trusted steps included | on |
+| `FRAMAC_CACHE_MAX` | Size cap for a cache store (bytes or size suffix such as `5G`) | min(20 GiB, 25 % of (free disk + the store's size)) |
+| `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR` | Set by the broker inside the container: how the shared store is mounted (`rw`, `ro`, or `off`), and its mount path (`/framac-cache`) | — |
+| `FRAMAC_PYTHON` | Host Python interpreter the wrappers use for the broker | first `python3` ≥ 3.10 (`py -3`, `python3`, `python` on Windows) |
+| `FRAMAC_RESOURCES_VERBOSE` | `1` prints every broker lease grant, not only those that waited in the queue | off |
 | `FRAMAC_ORPHAN_GRACE_S` | Seconds a container may keep running after its `exec` client died before a reaping pass kills it; `off` keeps such containers running | 60 |
-| `FRAMAC_SCHEDULER` | `waves` restores wave-by-wave dispatch with barriers | continuous reactive sliding-window loop |
-| `FRAMAC_SELINUX_TARGET` | `relabel` or `disable` for the read-only target mount on SELinux hosts | required there |
-| `FRAMAC_ALLOW_UNENFORCED_LIMITS` | Allow target-executing classes without memory/pids limits | off |
-| `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE` | Run-lock wait and heartbeat staleness (seconds) | 1800, 120 |
-| `FRAMAC_WP_WALL_TIMEOUT` | Wall-clock limit for one WP run (seconds) | 3600 |
-| `FRAMAC_PARENT_WP_WALL_TIMEOUT` | Wall-clock limit for a parent WP merge re-check (`0`/`off` disables; seconds) | 600 |
+| `FRAMAC_SCHEDULER` | `waves` restores wave-by-wave dispatch with barriers in [`../../scripts/wp_scheduler.py`](../../scripts/wp_scheduler.py) | `ready_queue` (continuous reactive sliding-window loop) |
+| `FRAMAC_SELINUX_TARGET` | `relabel` (`:z`) or `disable` (`label=disable`) for the read-only target mount on SELinux enforcing hosts | required there |
+| `FRAMAC_ALLOW_UNENFORCED_LIMITS` | `1` allows target-executing classes to run when the container engine cannot enforce memory or pids limits | off |
+| `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE` | Run-lock wait timeout and heartbeat staleness threshold (seconds) in [`../../scripts/framac_common.py`](../../scripts/framac_common.py) | 1800, 120 |
+| `FRAMAC_WP_WALL_TIMEOUT` | Wall-clock limit for one WP run in [`../../scripts/run_wp_function.py`](../../scripts/run_wp_function.py) (`0` disables; seconds) | 3600 |
+| `FRAMAC_PARENT_WP_WALL_TIMEOUT` | Wall-clock limit for a parent WP merge re-check in [`../../scripts/workspace_overlay.py`](../../scripts/workspace_overlay.py) (`0`/`off` disables; seconds) | 600 |
 | `FRAMAC_WP_OUT_DIR_LOCK_STALE` | Stale threshold for `run_wp_function.py` `--out-dir` lock across container hostnames (seconds) | 180 |
 | `FRAMAC_PROVER_WALL_BUDGET_S` | Wall-clock budget for one prover subagent session across retries (seconds) | 600 (`quick`), 900 (`standard`), 1800 (`deep`); 300 for a `shell_unverifiable_wp` function when this variable is unset |
-| `FRAMAC_PROVER_CONTEXT` | `off` renders prover briefs without function facts and reading slice and with every conditional part, for A/B comparisons | on |
-| `FRAMAC_FRAME_SKELETON` | `off` drops the frame skeleton (AST-projected `assigns`/`\from`) from function facts, for A/B comparisons | on |
-| `FRAMAC_LOOP_TEMPLATES` | `off` drops the loop templates and loop dependence graph from function facts, for A/B comparisons | on |
-| `FRAMAC_SPEC_KB` | `off` disables the ACSL knowledge base (retrieved knowledge in prover briefs, repair hints from failed goals), for A/B comparisons | on |
-| `FRAMAC_SPEC_KB_CURATED` | `off` disables the feature-matched curated ACSL pattern slot in [`scripts/spec_kb.py`](../../scripts/spec_kb.py) without toggling `obstructions.json`, for A/B comparisons | on |
-| `FRAMAC_NEGOTIATE_EVIDENCE` | `off` drops the seam evidence (callers' unproven call-site goals, the callee's previous prover run) from negotiate briefs, for A/B comparisons | on |
-| `FRAMAC_MUTATION_STUB` | `off` drops the trivial-stub mutant (a body that does nothing) from `scripts/mutation_check.py`, for A/B comparisons; the corrected rejection criterion applies either way | on |
-| `FRAMAC_CANDIDATE_RANK` | `legacy` restores the prover candidate rank `(failed, invalid, -proved)`, in which clauses that hold whatever the code does (`\true`, `x == x`) earn credit, for A/B comparisons | `trivial_aware` |
-| `FRAMAC_PROOF_CARRY` | `off` disables cross-run proof carry-forward: `wp-sweep` publishes nothing to the `proofs` cache and `wp-replay` replays nothing (Section 5), for A/B comparisons | on |
-| `FRAMAC_LOOP_SEEDS` | `off` disables seeding each prover with loop invariant candidates filtered by WP (Houdini) and by a corpus replay (`scripts/loop_seeds.py`), for A/B comparisons | on |
-| `FRAMAC_REJECTION_REOPEN` | `off` restores the old behaviour in which a rejected candidate is never reopened by later tool evidence (`ledger.py`) | on |
-| `FRAMAC_WP_GOAL_COSTS` | `off` removes the two verdict-kind hints (fast Unknown: probably false; Timeout with the only prover: probably too large) from `run_wp_function.py`; the `unproven_goal_costs` and `slowest_proved_goals` fields stay ([`./agentic-swarm.md`](./agentic-swarm.md)), for A/B comparisons | on |
+| `FRAMAC_FRAME_SKELETON` | `off` drops the frame skeleton (AST-projected `assigns`/`\from`) from function facts ([`../../scripts/frame_skeleton.py`](../../scripts/frame_skeleton.py)), for A/B comparisons | on |
+| `FRAMAC_SPEC_KB` | `off` disables the ACSL knowledge base (retrieved knowledge in prover briefs, repair hints from failed goals, mining) in [`../../scripts/spec_kb.py`](../../scripts/spec_kb.py), for A/B comparisons | on |
+| `FRAMAC_SPEC_KB_CURATED` | `off` disables the feature-matched curated ACSL pattern slot in [`../../scripts/spec_kb.py`](../../scripts/spec_kb.py) without toggling `obstructions.json` (also disabled when `FRAMAC_SPEC_KB=off`), for A/B comparisons | on |
+| `FRAMAC_NEGOTIATE_EVIDENCE` | `off` drops the seam evidence (callers' unproven call-site goals, the callee's previous prover run) from negotiate briefs in [`../../scripts/wp_scheduler.py`](../../scripts/wp_scheduler.py), for A/B comparisons | on |
+| `FRAMAC_MUTATION_STUB` | `off` drops the trivial-stub mutant (a body that does nothing) from [`../../scripts/mutation_check.py`](../../scripts/mutation_check.py), for A/B comparisons; the corrected rejection criterion applies either way | on |
+| `FRAMAC_CANDIDATE_RANK` | `legacy` restores the prover candidate rank `(failed, invalid, -proved)` in [`../../scripts/prover_candidates.py`](../../scripts/prover_candidates.py), in which clauses that hold whatever the code does (`\true`, `x == x`) earn credit, for A/B comparisons | `trivial_aware` |
+| `FRAMAC_PROOF_CARRY` | `off` disables cross-run proof carry-forward in [`../../scripts/proof_carry.py`](../../scripts/proof_carry.py): `wp-sweep` publishes nothing to the `proofs` cache and `wp-replay` replays nothing (Section 5), for A/B comparisons | on |
+| `FRAMAC_LOOP_SEEDS` | `off` disables seeding each prover with loop invariant candidates filtered by WP (Houdini) and by a corpus replay ([`../../scripts/loop_seeds.py`](../../scripts/loop_seeds.py)), for A/B comparisons | on |
+| `FRAMAC_REJECTION_REOPEN` | `off` restores the old behaviour in [`../../scripts/ledger.py`](../../scripts/ledger.py) in which a rejected candidate is never reopened by later tool evidence | on |
 | `FRAMAC_HARNESS_SCOPE_V2` | `off` disables P1 unit-visibility scoping (`executable`, `plugin_so`, `public_lib`, `internal_convenience`), `THREAT_MODEL.md` boundary alignment, and first-class `tf_*` reach credit in [`../../scripts/trust.py`](../../scripts/trust.py), [`../../scripts/build_callgraph_dag.py`](../../scripts/build_callgraph_dag.py), and [`../../scripts/harness_reach.py`](../../scripts/harness_reach.py) (see [`./slicing-and-onboarding.md`](./slicing-and-onboarding.md)), for A/B rollback | on |
 | `FRAMAC_API_TRUST_SCHEMA` | `off` disables P2A deterministic `--api` upgrades (S1–S3 threat-model/schema binding, caller-owned writable scratch/output buffer builder, recorded sequence configurator calls, backend-matched handle constructors, refcount helper skips, `TAILQ_HEAD`/`STAILQ_HEAD` empty-list init) in [`../../scripts/api_harness.py`](../../scripts/api_harness.py), [`../../scripts/generate_harness.py`](../../scripts/generate_harness.py), and [`../../scripts/fuzz_assets.py`](../../scripts/fuzz_assets.py) (see [`./slicing-and-onboarding.md`](./slicing-and-onboarding.md)), for A/B rollback | on |
 | `FRAMAC_HARNESS_SMOKE` | `off` disables the P3 standalone Harness Smoke Gate ([`../../scripts/harness_smoke.py`](../../scripts/harness_smoke.py), Make stage `smoke` before `fuzz` and `eva`, `phase0_gates.py record-smoke`, including exact-slot `rest_n == 0` probes across `.san` and `.e-acsl`) that catches startup/init aborts and quarantines broken harness setup cases before fuzzing (see [`./v2-design.md`](./v2-design.md)), for A/B rollback | on |
@@ -240,7 +237,7 @@ An OOM in a tool always shows up in its report (`analysis_error`, `reason: oom_k
 | `FRAMAC_JUDGE_FRONTIER` | `off` disables two-tier coverage-frontier E-ACSL judge selection (read-only `.san` `-merge=1` frontier up to 2,048 / 8,192 / 16,384, Tier 2 value-diverse replay scaled toward 30 s / 120 s / 300 s hard-capped at 16,384, and `frontier_total` / `frontier_judged` / `not_judged_by_case` reporting for granular ledger credit) in [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) (Section 2; [`../plans/phase1-qcbor-lessons-plan.md`](../plans/phase1-qcbor-lessons-plan.md)), restoring uniform case-stratified sampling (512 / 2,048 / 4,096 caps) for A/B rollback | on |
 | `FRAMAC_FUZZ_PLATEAU_STOP` | `off` disables hardware-independent execution-counted plateau stopping during multi-worker shared-pass fuzzing (`min_execs_per_worker` 1M / 3M / 10M, stagnation window `W` 1.5M / 4M / 8M with 0 new `cov` edges and `< 0.5%` relative `ft` growth across every active worker, recording `stopped_reason` and `cpu_saved_s`) in [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) (Section 2; [`../plans/phase1-qcbor-lessons-plan.md`](../plans/phase1-qcbor-lessons-plan.md)), for A/B rollback | on |
 | `FRAMAC_FUZZ_CRASH_STOP` | `off` disables prompt multi-worker (`-jobs=N -workers=N`) round-stop on fatal worker crash in [`../../scripts/run_eacsl_fuzz.py`](../../scripts/run_eacsl_fuzz.py) (which otherwise sends `SIGTERM` to surviving workers once a worker exits with a fatal dispatch artifact so `run_campaign_rounds` skips the crashed case and restarts all workers immediately; effective worker-time budget accounting still recovers lost worker-seconds when off), for rollback | on |
-| `FRAMAC_CPUS`, `FRAMAC_MEMORY`, `FRAMAC_PIDS_LIMIT`, `FRAMAC_CONCURRENT_AGENTS` | Legacy per-container sizing, used only on the no-broker path | — |
+| `FRAMAC_CPUS`, `FRAMAC_MEMORY`, `FRAMAC_PIDS_LIMIT`, `FRAMAC_CONCURRENT_AGENTS` | Legacy per-container sizing (used on the `--no-broker` path; on the broker path, `FRAMAC_CPUS`/`FRAMAC_MEMORY`/`FRAMAC_PIDS_LIMIT` request a fixed grant and `FRAMAC_CONCURRENT_AGENTS` is deprecated and ignored) | — |
 
 Set every knob on the host, where you run the wrapper. The container's environment is an allowlist, so the wrappers forward exactly those knobs that scripts read inside the container: `FRAMAC_CACHE`, `FRAMAC_CACHE_MAX`, `FRAMAC_MAX_AGENTS`, `FRAMAC_SCHEDULER`, `FRAMAC_LOCK_TIMEOUT`, `FRAMAC_LOCK_STALE`, `FRAMAC_WP_WALL_TIMEOUT`, `FRAMAC_PARENT_WP_WALL_TIMEOUT`, `FRAMAC_WP_OUT_DIR_LOCK_STALE`, `FRAMAC_PROVER_WALL_BUDGET_S`, `FRAMAC_FRAME_SKELETON`, `FRAMAC_SPEC_KB`, `FRAMAC_SPEC_KB_CURATED`, `FRAMAC_NEGOTIATE_EVIDENCE`, `FRAMAC_MUTATION_STUB`, `FRAMAC_CANDIDATE_RANK`, `FRAMAC_PROOF_CARRY`, `FRAMAC_LOOP_SEEDS`, `FRAMAC_REJECTION_REOPEN`, `FRAMAC_HARNESS_SCOPE_V2`, `FRAMAC_API_TRUST_SCHEMA`, `FRAMAC_HARNESS_SMOKE`, `FRAMAC_HARNESS_PROBE`, `FRAMAC_FUZZ_EXPLORE_JUDGE`, `FRAMAC_VERIFIER_BREAKER`, `FRAMAC_JUDGE_FRONTIER`, `FRAMAC_FUZZ_PLATEAU_STOP`, `FRAMAC_FUZZ_CRASH_STOP` and `FRAMAC_RESOURCES_VERBOSE` (the same list in both wrappers, checked by `tests/test_remediation_p2_container.py`; all A/B flags now default to `on`, with `FRAMAC_CANDIDATE_RANK` defaulting to `trivial_aware`). The others are read by the wrappers or the host broker, or set by them (`FRAMAC_RUN_ID`, `FRAMAC_REPO`, `FRAMAC_REPO_KEY`, `FRAMAC_RUN_TAG`, `FRAMAC_TARGET_*`, `FRAMAC_OUTER_SANDBOX`, `FRAMAC_JOB_*`, `FRAMAC_POOL_*`, `FRAMAC_SUBLEASE_ID`, `FRAMAC_CGROUP_ENFORCED`, `FRAMAC_CACHE_MODE`, `FRAMAC_SHARED_CACHE_DIR`, `FRAMAC_IMAGE_ID`).
 

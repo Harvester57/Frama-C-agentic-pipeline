@@ -151,7 +151,7 @@ This adds per-wave function rates, stalls, dispatches, WP containers and goal co
 
 ## A/B testing frame skeletons
 
-The projected frame skeleton (`scripts/frame_skeleton.py`, facts schema 2) can be switched off per run with `FRAMAC_FRAME_SKELETON=off` (same pattern as `FRAMAC_PROVER_CONTEXT=off`), so an A/B run measures exactly the skeleton's contribution to `l3_frame` pass rates and to merge rejections, not the LLM's. Likewise `FRAMAC_LOOP_TEMPLATES=off` disables the loop templates/graph (facts schema 3) and `FRAMAC_SPEC_KB=off` disables the specification knowledge base (`scripts/spec_kb.py`). `FRAMAC_MUTATION_STUB=off` drops the trivial-stub mutant from `scripts/mutation_check.py` (evaluative only; it changes the `mutation` totals, not the proofs).
+The projected frame skeleton (`scripts/frame_skeleton.py`, facts schema 2) can be switched off per run with `FRAMAC_FRAME_SKELETON=off`, so an A/B run measures exactly the skeleton's contribution to `l3_frame` pass rates and to merge rejections, not the LLM's. Likewise `FRAMAC_SPEC_KB=off` disables the specification knowledge base (`scripts/spec_kb.py`) and `FRAMAC_MUTATION_STUB=off` drops the trivial-stub mutant from `scripts/mutation_check.py` (evaluative only; it changes the `mutation` totals, not the proofs).
 
 ## A/B testing prover briefs
 
