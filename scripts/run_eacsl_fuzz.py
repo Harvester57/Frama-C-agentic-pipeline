@@ -3413,15 +3413,40 @@ def derive_eacsl_diagnostic_hints(res: dict) -> list[str]:
     return hints
 
 
-def corpus_manifest(corpus_dir: Path) -> list[list[str | int]]:
-    """Sorted `[name, sha256, size]` manifest of regular non-hidden files in `corpus_dir`."""
-    if not Path(corpus_dir).is_dir():
+def _list_corpus_names(corpus_dir: Path) -> list[str]:
+    """Sorted names of regular non-hidden files in `corpus_dir` (lightweight scandir, no file reads)."""
+    names: list[str] = []
+    try:
+        with os.scandir(corpus_dir) as it:
+            for entry in it:
+                if entry.name.startswith("."):
+                    continue
+                with contextlib.suppress(OSError):
+                    if entry.is_file(follow_symlinks=False):
+                        names.append(entry.name)
+    except OSError:
         return []
+    names.sort()
+    return names
+
+
+def corpus_manifest(corpus_dir: Path, names: Iterable[str] | None = None) -> list[list[str | int]]:
+    """Sorted `[name, sha256, size]` manifest of regular non-hidden files in `corpus_dir`.
+
+    When `names` is given, only those filenames are inspected and hashed instead of the whole directory.
+    """
+    corpus_path = Path(corpus_dir)
+    if not corpus_path.is_dir():
+        return []
+    candidate_names = _list_corpus_names(corpus_path) if names is None else sorted(set(names))
     entries: list[list[str | int]] = []
-    for p in sorted(Path(corpus_dir).iterdir()):
-        if not p.is_file() or p.is_symlink() or p.name.startswith("."):
+    for name in candidate_names:
+        if name.startswith("."):
             continue
+        p = corpus_path / name
         with contextlib.suppress(OSError):
+            if not p.is_file() or p.is_symlink():
+                continue
             st = p.stat()
             entries.append([p.name, cache.file_digest(p) or sha256_file(p), st.st_size])
     return entries
@@ -3752,11 +3777,17 @@ def run_guardrail_check(
     corpus_dir.mkdir(parents=True, exist_ok=True)
     seed = derive_seed(binary, module) if seed is None else seed
 
-    corpus_entries = corpus_manifest(corpus_dir)
-    chosen_names, sampled = select_replay_inputs([str(e[0]) for e in corpus_entries], max_corpus_inputs)
-    chosen_set = set(chosen_names)
-    replay_manifest = [e for e in corpus_entries if e[0] in chosen_set]
-    selection = corpus_selection_fields(len(corpus_entries), len(replay_manifest), sampled)
+    corpus_names = _list_corpus_names(corpus_dir)
+    chosen_names, sampled = select_replay_inputs(corpus_names, max_corpus_inputs)
+    replay_manifest: list[list[str | int]] | None = None
+
+    def get_replay_manifest() -> list[list[str | int]]:
+        nonlocal replay_manifest
+        if replay_manifest is None:
+            replay_manifest = corpus_manifest(corpus_dir, names=chosen_names)
+        return replay_manifest
+
+    selection = corpus_selection_fields(len(corpus_names), len(chosen_names), sampled)
 
     g_key: str | None = None
     g_material: dict | None = None
@@ -3764,10 +3795,11 @@ def run_guardrail_check(
     if use_cache and use_verdict_cache and cache.enabled() and not _in_agent_scratch(binary):
         bin_sha = cache.file_digest(binary)
         if bin_sha is not None:
+            manifest = get_replay_manifest()
             g_material = {
                 "kind": "guardrail",
                 "binary_sha256": bin_sha,
-                "corpus": replay_manifest,
+                "corpus": manifest,
                 "scratch_corpus": corpus_manifest(scratch_corpus),
                 "extra_runs": int(runs),
                 "per_input_timeout": int(per_input_timeout),
@@ -3782,7 +3814,7 @@ def run_guardrail_check(
                 cached = dict(entry.data.get("verdict") or {})
                 if cached.get("status") == "passed_dynamic_oracle":
                     cached.update(selection)
-                    cached["corpus_replayed"] = max(0, len(replay_manifest) - len(cached.get("excluded_inputs") or []))
+                    cached["corpus_replayed"] = max(0, len(manifest) - len(cached.get("excluded_inputs") or []))
                     cached["corpus_dir"] = str(corpus_dir)
                     cached["crash_input"] = None
                     cached["cache"] = {"hit": True, "key": g_key}
@@ -3852,7 +3884,7 @@ def run_guardrail_check(
         hang = replay_hang(combined_out, crash_input)
         if hang is not None:
             still = set(replay_names)
-            hung = _replayed_inputs_of(crash_input, [e for e in replay_manifest if e[0] in still])
+            hung = _replayed_inputs_of(crash_input, [e for e in get_replay_manifest() if e[0] in still])
             if not hung and mutation_runs > 0:
                 # A mutation of the burst: the seed is fixed, so the burst would hang there every time.
                 mutations_skipped = {"crash_input": crash_input, "kind": "timeout", "crash": hang}
@@ -3907,7 +3939,7 @@ def run_guardrail_check(
                 "failure": None,
             }
         still = set(replay_names)
-        name = _replayed_input_of(crash_input, [e for e in replay_manifest if e[0] in still])
+        name = _replayed_input_of(crash_input, [e for e in get_replay_manifest() if e[0] in still])
         if name is None:
             if crash_input is None or mutation_runs <= 0:
                 break
@@ -3953,7 +3985,7 @@ def run_guardrail_check(
             ),
             replay_hang={"crash": "wall limit", "crash_input": crash_input},
         )
-    selection = corpus_selection_fields(len(corpus_entries), len(replay_names), sampled)
+    selection = corpus_selection_fields(len(corpus_names), len(replay_names), sampled)
     verdict.update(
         {
             "excluded_inputs": excluded,
