@@ -110,7 +110,7 @@ static inline int framac_fuzz_skip_case(unsigned int c) {
 #endif
 
 #if !defined(__FRAMAC__) && defined(FRAMAC_FUZZ_PROBE_TELEMETRY)
-#include <stdio.h>
+#  include <stdio.h>
 #define FRAMAC_PROBE_MAX_CASES 4096U
 #define FRAMAC_PROBE_MAX_UNIQUE 8U
 typedef struct {

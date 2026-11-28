@@ -85,6 +85,7 @@ known-first-party = [
     "promote_artifact",
     "proof_carry",
     "prover_candidates",
+    "repro_bundle",
     "resources",
     "run_eacsl_fuzz",
     "run_eva_slice",
