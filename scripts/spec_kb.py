@@ -278,6 +278,15 @@ Pair a running-result universal invariant with an existential witness (`\exists 
 
 _INT_RETURN_RE = re.compile(r"\b(?:int|long|short|s?size_t|ptrdiff_t|off_t|u?int[A-Za-z0-9_]*)\b")
 _DECREMENT_RE = re.compile(r"--|-=\s*1\b|-\s*1\b")
+_BYTE_BUFFER_TYPE_RE = re.compile(r"\b(?:(?:un)?signed\s+char|char|void|u?int8_t|pb_byte_t|byte_t|uint8|int8)\b")
+_LENGTH_TYPE_RE = re.compile(
+    r"\b(?:s?size_t|ptrdiff_t|off_t|int|unsigned(?:\s+(?:int|long|short))?|long|short|u?int(?:16|32|64)_t)\b"
+)
+_LENGTH_NAME_RE = re.compile(
+    r"(?:^|_)(?:len|length|size|sz|cap|capacity|cnt|count|num|amount|bytes|nbytes|rem|remain|remaining|max|limit|off|offset|pos|idx|index|n)(?:$|_|\d)"
+    r"|(?:Len|Length|Size|Count|Amount|Bytes|Remain|Max|Limit|Offset)$"
+)
+_PTR_INDEX_DEREF_RE = re.compile(r"\*\s*\([^)]*[+-]")
 
 
 def _is_integer_return_type(ret: Any) -> bool:
@@ -289,8 +298,90 @@ def _is_integer_return_type(ret: Any) -> bool:
     return bool(_INT_RETURN_RE.search(text))
 
 
+def _is_byte_pointer_return_type(ret: Any) -> bool:
+    """True for cursor-returning byte/char/void pointers (e.g. `const void *`, `const uint8_t *`)."""
+    text = " ".join(str(ret or "").split())
+    if text.count("*") != 1:
+        return False
+    if any(tok in text.split() for tok in ("struct", "union", "enum")):
+        return False
+    return bool(_BYTE_BUFFER_TYPE_RE.search(text))
+
+
+def _is_byte_buffer_formal(formal: dict[str, Any]) -> bool:
+    """True for a single-indirection byte/char/void buffer pointer formal, not `struct Foo *` or `char **`."""
+    if formal.get("kind") != "pointer":
+        return False
+    pointee = " ".join(str(formal.get("pointee") or "").split())
+    pointee_canon = " ".join(str(formal.get("pointee_canon") or "").split())
+    if "*" in pointee or "*" in pointee_canon:
+        return False
+    if "char_like" in formal:
+        return bool(formal.get("char_like"))
+    for candidate in (pointee_canon, pointee):
+        if candidate:
+            if any(tok in candidate.split() for tok in ("struct", "union", "enum")):
+                return False
+            return bool(_BYTE_BUFFER_TYPE_RE.search(candidate))
+    ftype = " ".join(str(formal.get("type") or "").split())
+    if ftype:
+        if ftype.count("*") != 1 or any(tok in ftype.split() for tok in ("struct", "union", "enum")):
+            return False
+        return bool(_BYTE_BUFFER_TYPE_RE.search(ftype))
+    return False
+
+
+def _is_length_scalar_formal(formal: dict[str, Any]) -> bool:
+    """True for an integer length/size scalar formal (excluding booleans, floats, enums, and 1-byte tags)."""
+    if formal.get("kind") != "scalar":
+        return False
+    ftype = " ".join(str(formal.get("type") or "").split())
+    if ftype:
+        if "*" in ftype or any(
+            tok in ftype.split() for tok in ("struct", "union", "enum", "float", "double", "_Bool", "bool")
+        ):
+            return False
+        return bool(_LENGTH_TYPE_RE.search(ftype))
+    return bool(_LENGTH_NAME_RE.search(str(formal.get("name") or "")))
+
+
 def _pointer_formal_count(record: dict[str, Any]) -> int:
     return sum(1 for f in record.get("formals") or [] if isinstance(f, dict) and f.get("kind") == "pointer")
+
+
+def _expr_has_indexing(expr: Any) -> bool:
+    text = str(expr or "")
+    return "[" in text or bool(_PTR_INDEX_DEREF_RE.search(text))
+
+
+def _loop_has_indexed_access(loop: dict[str, Any]) -> bool:
+    if loop.get("pointer_walkers") or loop.get("in_place") or loop.get("strided_writes"):
+        return True
+    for entry in loop.get("memory_writes") or []:
+        if isinstance(entry, dict) and _expr_has_indexing(entry.get("lval")):
+            return True
+    for entry in loop.get("reads") or []:
+        if isinstance(entry, dict) and _expr_has_indexing(entry.get("lval")):
+            return True
+    for ex in loop.get("exits") or []:
+        if isinstance(ex, dict) and _expr_has_indexing(ex.get("condition")):
+            return True
+    return _expr_has_indexing(loop.get("guard"))
+
+
+def _has_buffer_loop_evidence(record: dict[str, Any], feats: dict[str, Any]) -> bool:
+    """Genuine pointer/buffer/array loop evidence; never uses `feats['arrays']` (which aliases `loops`)."""
+    if (
+        bool(feats.get("pointer_walk"))
+        or bool(feats.get("in_place_loop"))
+        or bool(feats.get("loop_reads_earlier_writes"))
+        or bool(feats.get("strided_writes"))
+        or bool(feats.get("strings"))
+        or bool(record.get("derived_pointers"))
+    ):
+        return True
+    loops = [lp for lp in record.get("loops") or [] if isinstance(lp, dict)]
+    return any(_loop_has_indexed_access(lp) for lp in loops)
 
 
 def _loop_has_decrement(loop: dict[str, Any]) -> bool:
@@ -320,13 +411,27 @@ def _has_search_or_backward_loop(record: dict[str, Any]) -> bool:
 
 def _curated_match_score(pattern_id: str, record: dict[str, Any], feats: dict[str, Any]) -> int:
     if pattern_id == "curated:parser_progress":
-        base = bool(feats.get("pointer_len_params")) or (bool(feats.get("pointer_walk")) and bool(feats.get("strings")))
+        formals = [f for f in record.get("formals") or [] if isinstance(f, dict)]
+        has_byte_buf = any(_is_byte_buffer_formal(f) for f in formals)
+        has_len = any(_is_length_scalar_formal(f) for f in formals)
+        has_ptr = any(f.get("kind") == "pointer" for f in formals)
+        returns_cursor = _is_byte_pointer_return_type(record.get("return_type"))
+        has_out_ptr = _pointer_formal_count(record) >= 2
+        base = (
+            (has_byte_buf and has_len)
+            or (returns_cursor and has_ptr and has_len)
+            or (
+                has_byte_buf
+                and (bool(feats.get("pointer_walk")) or bool(feats.get("strings")))
+                and (has_out_ptr or _is_integer_return_type(record.get("return_type")) or returns_cursor)
+            )
+        )
         if not base:
             return 0
-        if str(record.get("return_type") or "").strip() == "void" and _pointer_formal_count(record) < 2:
+        if str(record.get("return_type") or "").strip() == "void" and not has_out_ptr:
             return 0
         score = 1
-        if _is_integer_return_type(record.get("return_type")):
+        if _is_integer_return_type(record.get("return_type")) or returns_cursor:
             score += 2
         if len(record.get("return_paths") or []) >= 2:
             score += 1
@@ -335,31 +440,23 @@ def _curated_match_score(pattern_id: str, record: dict[str, Any], feats: dict[st
         return score
 
     if pattern_id == "curated:quantified_base_restate":
-        base = bool(feats.get("loops")) and (
-            bool(feats.get("pointer_walk"))
-            or bool(feats.get("in_place_loop"))
-            or bool(feats.get("loop_reads_earlier_writes"))
-            or bool(feats.get("arrays"))
-            or bool(feats.get("strings"))
-        )
-        if not base:
+        if not (bool(feats.get("loops")) and _has_buffer_loop_evidence(record, feats)):
             return 0
         score = 1
         if bool(feats.get("pointer_walk")) or bool(record.get("derived_pointers")):
             score += 3
         if bool(feats.get("in_place_loop")) or bool(feats.get("loop_reads_earlier_writes")):
             score += 2
-        if bool(feats.get("arrays")) or bool(feats.get("strings")):
+        if bool(feats.get("strided_writes")) or bool(feats.get("strings")):
             score += 1
         return score
 
     if pattern_id == "curated:search_loop_witness":
-        base = (
+        if not (
             bool(feats.get("loops"))
-            and (bool(feats.get("read_only_loop")) or bool(feats.get("strings")) or bool(feats.get("arrays")))
+            and _has_buffer_loop_evidence(record, feats)
             and (_has_search_or_backward_loop(record) or bool(feats.get("read_only_loop")))
-        )
-        if not base:
+        ):
             return 0
         loops = [lp for lp in record.get("loops") or [] if isinstance(lp, dict)]
         score = 1

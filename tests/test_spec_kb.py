@@ -491,8 +491,8 @@ def test_curated_patterns_match_features_independent_of_stopwords_and_top_g(
     record = {
         "return_type": "int",
         "formals": [
-            {"name": "buf", "kind": "pointer"},
-            {"name": "len", "kind": "scalar"},
+            {"name": "buf", "type": "const uint8_t *", "kind": "pointer", "char_like": True},
+            {"name": "len", "type": "size_t", "kind": "scalar"},
         ],
         "derived_pointers": {"p": "buf"},
         "return_paths": [{"value": "-1", "in_loop": True}, {"value": "0", "in_loop": False}],
@@ -500,6 +500,7 @@ def test_curated_patterns_match_features_independent_of_stopwords_and_top_g(
             {
                 "header": "while (i >= 0)",
                 "scalars": [{"var": "i", "updates": ["i - 1"]}],
+                "reads": [{"lval": "*(buf + i)", "root": "buf", "root_kind": "formal"}],
                 "exits": [{"kind": "return", "condition": "a[i] == target", "line": 10}],
             }
         ],
@@ -544,7 +545,14 @@ def test_curated_slot_renders_when_seed_has_no_overlap(tmp_path: Path, monkeypat
     (kb_dir / "seed.json").write_text(
         json.dumps({"schema": spec_kb.KB_SCHEMA, "kind": "seed", "items": []}), encoding="utf-8"
     )
-    record = {"features": {"pointer_len_params": True}}
+    record = {
+        "return_type": "int",
+        "formals": [
+            {"name": "buf", "type": "const uint8_t *", "kind": "pointer", "char_like": True},
+            {"name": "len", "type": "size_t", "kind": "scalar"},
+        ],
+        "features": {"pointer_len_params": True},
+    }
     monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
     monkeypatch.delenv(spec_kb.CURATED_ENV, raising=False)
     assert spec_kb.kb_section_for(overlay, record) == ""
@@ -563,10 +571,13 @@ def test_curated_patterns_feature_and_metadata_precision(monkeypatch: pytest.Mon
     monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
 
     # 1. void function with < 2 pointer formals is excluded from parser_progress;
-    #    void function with >= 2 pointer formals (input + output pointer) matches.
+    #    void function with >= 2 pointer formals (input byte buffer + output pointer) matches.
     void_logger = {
         "return_type": "void",
-        "formals": [{"name": "buf", "kind": "pointer"}, {"name": "len", "kind": "scalar"}],
+        "formals": [
+            {"name": "buf", "type": "const uint8_t *", "kind": "pointer", "char_like": True},
+            {"name": "len", "type": "size_t", "kind": "scalar"},
+        ],
         "features": {"pointer_len_params": True},
     }
     assert spec_kb.curated_patterns_for(void_logger) == []
@@ -574,9 +585,9 @@ def test_curated_patterns_feature_and_metadata_precision(monkeypatch: pytest.Mon
     void_parser = {
         "return_type": "void",
         "formals": [
-            {"name": "buf", "kind": "pointer"},
-            {"name": "len", "kind": "scalar"},
-            {"name": "eaten", "kind": "pointer"},
+            {"name": "buf", "type": "const uint8_t *", "kind": "pointer", "char_like": True},
+            {"name": "len", "type": "size_t", "kind": "scalar"},
+            {"name": "eaten", "type": "size_t *", "kind": "pointer", "char_like": False},
         ],
         "features": {"pointer_len_params": True},
     }
@@ -585,12 +596,16 @@ def test_curated_patterns_feature_and_metadata_precision(monkeypatch: pytest.Mon
     # 2. Backward-scanning search loop ranks search_loop_witness first and caps at MAX_CURATED_ITEMS.
     backward_search = {
         "return_type": "int",
-        "formals": [{"name": "a", "kind": "pointer"}, {"name": "n", "kind": "scalar"}],
+        "formals": [
+            {"name": "a", "type": "const uint8_t *", "kind": "pointer", "char_like": True},
+            {"name": "n", "type": "size_t", "kind": "scalar"},
+        ],
         "return_paths": [{"value": "i", "in_loop": True}, {"value": "-1", "in_loop": False}],
         "loops": [
             {
                 "header": "while (i >= 0)",
                 "scalars": [{"var": "i", "updates": ["i - 1"]}],
+                "reads": [{"lval": "*(a + i)", "root": "a", "root_kind": "formal"}],
                 "exits": [{"kind": "return", "condition": "a[i] == target", "line": 7}],
             }
         ],
@@ -599,19 +614,298 @@ def test_curated_patterns_feature_and_metadata_precision(monkeypatch: pytest.Mon
     got = [p["id"] for p in spec_kb.curated_patterns_for(backward_search)]
     assert got == ["curated:search_loop_witness", "curated:parser_progress"]
 
-    # 3. Non-search write loop (arrays=True only, read_only_loop=False, no exits/decrements)
-    #    matches quantified_base_restate and does NOT spuriously match search_loop_witness.
+    # 3. Non-search indexed write loop matches quantified_base_restate and does NOT match search_loop_witness.
     write_loop = {
         "return_type": "void",
-        "formals": [{"name": "a", "kind": "pointer"}, {"name": "n", "kind": "scalar"}],
-        "loops": [{"header": "for (i = 0; i < n; i++)", "scalars": [{"var": "i", "updates": ["i + 1"]}], "exits": []}],
+        "formals": [
+            {"name": "a", "type": "uint8_t *", "kind": "pointer", "char_like": True},
+            {"name": "n", "type": "size_t", "kind": "scalar"},
+        ],
+        "loops": [
+            {
+                "header": "for (i = 0; i < n; i++)",
+                "scalars": [{"var": "i", "updates": ["i + 1"]}],
+                "memory_writes": [{"lval": "*(a + i)", "root": "a", "root_kind": "formal"}],
+                "exits": [],
+            }
+        ],
         "features": {"loops": True, "arrays": True, "read_only_loop": False, "pointer_len_params": True},
     }
     assert [p["id"] for p in spec_kb.curated_patterns_for(write_loop)] == ["curated:quantified_base_restate"]
 
-    # 4. Minimal features-only record degrades gracefully.
+    # 4. Minimal features-only record with genuine pointer_walk degrades gracefully.
     minimal = {"features": {"loops": True, "pointer_walk": True}}
     assert [p["id"] for p in spec_kb.curated_patterns_for(minimal)] == ["curated:quantified_base_restate"]
+
+
+@pytest.mark.unit
+def test_curated_patterns_positive_real_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+
+    # Genuine byte-buffer parser with length and *eaten out-parameter.
+    byte_parser = {
+        "return_type": "int",
+        "formals": [
+            {
+                "name": "buf",
+                "type": "uint8_t const *",
+                "kind": "pointer",
+                "pointee_canon": "unsigned char",
+                "char_like": True,
+            },
+            {"name": "len", "type": "size_t", "kind": "scalar"},
+            {
+                "name": "eaten",
+                "type": "size_t *",
+                "kind": "pointer",
+                "pointee_canon": "unsigned long",
+                "char_like": False,
+            },
+        ],
+        "return_paths": [{"value": "-1", "in_loop": False}, {"value": "0", "in_loop": False}],
+        "features": {"pointer_len_params": True, "pointer_params": True},
+    }
+    assert [p["id"] for p in spec_kb.curated_patterns_for(byte_parser)] == ["curated:parser_progress"]
+
+    # QCBOR UsefulInputBuf_GetBytes(UsefulInputBuf *me, size_t uAmount) -> const void *: cursor-returning consumer.
+    useful_get_bytes = {
+        "return_type": "void const *",
+        "formals": [
+            {
+                "name": "me",
+                "type": "UsefulInputBuf *",
+                "kind": "pointer",
+                "pointee_canon": "struct __anonstruct_UsefulInputBuf_1",
+                "char_like": False,
+            },
+            {"name": "uAmount", "type": "size_t", "kind": "scalar"},
+        ],
+        "return_paths": [{"value": "(void const *)0", "in_loop": False}, {"value": "p", "in_loop": False}],
+        "features": {"pointer_len_params": True, "pointer_params": True},
+    }
+    assert [p["id"] for p in spec_kb.curated_patterns_for(useful_get_bytes)] == ["curated:parser_progress"]
+
+    # nanopb pb_encode_string(pb_ostream_t *stream, const pb_byte_t *buffer, size_t size) -> bool.
+    pb_encode_string = {
+        "return_type": "_Bool",
+        "formals": [
+            {
+                "name": "stream",
+                "type": "pb_ostream_t *",
+                "kind": "pointer",
+                "pointee_canon": "struct pb_ostream_s",
+                "char_like": False,
+            },
+            {
+                "name": "buffer",
+                "type": "pb_byte_t const *",
+                "kind": "pointer",
+                "pointee_canon": "unsigned char",
+                "char_like": True,
+            },
+            {"name": "size", "type": "size_t", "kind": "scalar"},
+        ],
+        "features": {"pointer_len_params": True, "pointer_params": True},
+    }
+    assert [p["id"] for p in spec_kb.curated_patterns_for(pb_encode_string)] == ["curated:parser_progress"]
+
+    # nanopb pb_check_proto3_default_value(const pb_field_iter_t *field): pointer-walk array scan with early return.
+    pb_check_default = {
+        "return_type": "_Bool",
+        "formals": [
+            {
+                "name": "field",
+                "type": "pb_field_iter_t const *",
+                "kind": "pointer",
+                "pointee_canon": "struct pb_field_iter_s",
+                "char_like": False,
+            },
+        ],
+        "derived_pointers": {"p": "field"},
+        "return_paths": [{"value": "0", "in_loop": True}, {"value": "1", "in_loop": False}],
+        "loops": [
+            {
+                "header": "while (size > 0)",
+                "scalars": [{"var": "size", "updates": ["size - 1"]}],
+                "pointer_walkers": ["p"],
+                "reads": [{"lval": "*p", "root": "field", "root_kind": "formal"}],
+                "exits": [{"kind": "return", "condition": "*p != 0", "line": 42}],
+            }
+        ],
+        "features": {
+            "loops": True,
+            "arrays": True,
+            "pointer_walk": True,
+            "read_only_loop": True,
+            "pointer_params": True,
+        },
+    }
+    assert set(p["id"] for p in spec_kb.curated_patterns_for(pb_check_default)) == {
+        "curated:quantified_base_restate",
+        "curated:search_loop_witness",
+    }
+
+    # QCBOR DecodeNesting_LevelUpBounded(QCBORDecodeNesting *pNesting): backward pointer scan with break.
+    level_up_bounded = {
+        "return_type": "void",
+        "formals": [
+            {
+                "name": "pNesting",
+                "type": "QCBORDecodeNesting *",
+                "kind": "pointer",
+                "pointee_canon": "struct QCBORDecodeNesting",
+                "char_like": False,
+            },
+        ],
+        "loops": [
+            {
+                "header": "while (pCurrent > pNesting->pMin)",
+                "scalars": [{"var": "pCurrent", "updates": ["pCurrent - 1"]}],
+                "pointer_walkers": ["pCurrent"],
+                "exits": [{"kind": "break", "condition": "pCurrent->uMajorType == 4", "line": 88}],
+            }
+        ],
+        "features": {"loops": True, "arrays": True, "pointer_walk": True, "pointer_params": True},
+    }
+    assert set(p["id"] for p in spec_kb.curated_patterns_for(level_up_bounded)) == {
+        "curated:search_loop_witness",
+        "curated:quantified_base_restate",
+    }
+
+
+@pytest.mark.unit
+def test_curated_patterns_reject_scalar_loops_and_struct_methods(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(spec_kb.KB_ENV, raising=False)
+    monkeypatch.setenv(spec_kb.CURATED_ENV, "on")
+
+    # QCBOR IEEE754_HalfToDouble(uint16_t): pure scalar bit-shift loop with exp-- and break.
+    # function_facts.py sets arrays=True and read_only_loop=True on every pure scalar loop.
+    half_to_double = {
+        "return_type": "double",
+        "formals": [{"name": "uHalfPrecision", "type": "uint16_t", "kind": "scalar"}],
+        "loops": [
+            {
+                "header": "while ((uSignificand & 0x0400) == 0)",
+                "scalars": [
+                    {"var": "uSignificand", "updates": ["uSignificand << 1"]},
+                    {"var": "nExp", "updates": ["nExp - 1"]},
+                ],
+                "memory_writes": [],
+                "reads": [],
+                "exits": [{"kind": "break", "condition": "nExp <= 0", "line": 30}],
+            }
+        ],
+        "features": {"loops": True, "arrays": True, "read_only_loop": True, "bitwise": True, "floats": True},
+    }
+    assert spec_kb.curated_patterns_for(half_to_double) == []
+
+    # nanopb pb_decode_varint32_eof(pb_istream_t*, uint32_t*, bool*): scalar varint loop calling pb_readbyte.
+    varint_loop = {
+        "return_type": "_Bool",
+        "formals": [
+            {
+                "name": "stream",
+                "type": "pb_istream_t *",
+                "kind": "pointer",
+                "pointee_canon": "struct pb_istream_s",
+                "char_like": False,
+            },
+            {
+                "name": "dest",
+                "type": "uint32_t *",
+                "kind": "pointer",
+                "pointee_canon": "unsigned int",
+                "char_like": False,
+            },
+            {"name": "eof", "type": "_Bool *", "kind": "pointer", "pointee_canon": "_Bool", "char_like": False},
+        ],
+        "return_paths": [{"value": "0", "in_loop": True}, {"value": "1", "in_loop": False}],
+        "loops": [
+            {
+                "header": "do",
+                "scalars": [
+                    {"var": "bitpos", "updates": ["bitpos + 7"]},
+                    {"var": "result", "updates": ["result | ((uint32_t)(byte & 0x7F) << bitpos)"]},
+                ],
+                "memory_writes": [{"lval": "*eof", "root": "eof", "root_kind": "formal"}],
+                "reads": [],
+                "calls": ["pb_readbyte"],
+                "exits": [{"kind": "return", "condition": "!tmp", "line": 55}],
+            }
+        ],
+        "features": {"loops": True, "arrays": True, "bitwise": True, "pointer_params": True},
+    }
+    assert spec_kb.curated_patterns_for(varint_loop) == []
+
+    # QCBOR DecodeNesting_IsBoundedType(const QCBORDecodeNesting *pNesting, uint8_t uType): struct predicate.
+    is_bounded = {
+        "return_type": "_Bool",
+        "formals": [
+            {
+                "name": "pNesting",
+                "type": "QCBORDecodeNesting const *",
+                "kind": "pointer",
+                "pointee_canon": "struct QCBORDecodeNesting",
+                "char_like": False,
+            },
+            {"name": "uType", "type": "uint8_t", "kind": "scalar"},
+        ],
+        "features": {"pointer_len_params": True, "pointer_params": True},
+    }
+    assert spec_kb.curated_patterns_for(is_bounded) == []
+
+    # nanopb pb_encode_svarint(pb_ostream_t *stream, int64_t value): zig-zag integer encoder.
+    encode_svarint = {
+        "return_type": "_Bool",
+        "formals": [
+            {
+                "name": "stream",
+                "type": "pb_ostream_t *",
+                "kind": "pointer",
+                "pointee_canon": "struct pb_ostream_s",
+                "char_like": False,
+            },
+            {"name": "value", "type": "int64_t", "kind": "scalar"},
+        ],
+        "features": {"pointer_len_params": True, "pointer_params": True, "bitwise": True},
+    }
+    assert spec_kb.curated_patterns_for(encode_svarint) == []
+
+    # Generic C method (struct Foo *self, int flag) -> int must not trigger parser_progress.
+    struct_method = {
+        "return_type": "int",
+        "formals": [
+            {
+                "name": "self",
+                "type": "struct Foo *",
+                "kind": "pointer",
+                "pointee_canon": "struct Foo",
+                "char_like": False,
+            },
+            {"name": "flag", "type": "int", "kind": "scalar"},
+        ],
+        "features": {"pointer_len_params": True, "pointer_params": True},
+    }
+    assert spec_kb.curated_patterns_for(struct_method) == []
+
+    # Pointer-to-pointer (int argc, char **argv) must not trigger parser_progress.
+    argv_fn = {
+        "return_type": "int",
+        "formals": [
+            {"name": "argc", "type": "int", "kind": "scalar"},
+            {
+                "name": "argv",
+                "type": "char **",
+                "kind": "pointer",
+                "pointee": "char *",
+                "pointee_canon": "char *",
+                "char_like": False,
+            },
+        ],
+        "features": {"pointer_len_params": True, "pointer_params": True},
+    }
+    assert spec_kb.curated_patterns_for(argv_fn) == []
 
 
 @pytest.mark.unit
@@ -666,6 +960,10 @@ def test_curated_toggle_leaves_obstructions_active(tmp_path: Path, monkeypatch: 
                     "mod.c#parse_hdr": {
                         "name": "parse_hdr",
                         "return_type": "int",
+                        "formals": [
+                            {"name": "buf", "type": "unsigned char const *", "kind": "pointer", "char_like": True},
+                            {"name": "len", "type": "int", "kind": "scalar"},
+                        ],
                         "features": {"loops": True, "pointer_len_params": True},
                         "frame_skeleton": {"status": "ok", "separated": [], "assigns": []},
                         "loops": [],
